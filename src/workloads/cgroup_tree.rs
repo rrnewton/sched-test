@@ -42,6 +42,12 @@ impl SystemConstraints {
     }
 }
 
+/// Default maximum depth for randomly generated cgroup trees.
+pub const DEFAULT_MAX_TREE_DEPTH: usize = 7;
+
+/// Default maximum number of children per node in randomly generated cgroup trees.
+pub const DEFAULT_MAX_CHILDREN: usize = 4;
+
 /// A node in a cgroup tree hierarchy.
 #[derive(Debug, Clone)]
 pub struct CGroupTreeNode {
@@ -105,6 +111,52 @@ impl CGroupTreeNode {
         } else {
             1 + self.children.iter().map(|child| child.max_depth()).max().unwrap_or(0)
         }
+    }
+}
+
+/// Implement Arbitrary for CGroupTreeNode to enable use with QuickCheck macros.
+///
+/// Note: This performs I/O to detect system constraints. The default implementation
+/// uses `DEFAULT_MAX_TREE_DEPTH` and `DEFAULT_MAX_CHILDREN` as tree generation parameters.
+impl Arbitrary for CGroupTreeNode {
+    fn arbitrary(g: &mut Gen) -> Self {
+        let constraints = SystemConstraints::detect();
+        Self::arbitrary_tree(g, &constraints, DEFAULT_MAX_TREE_DEPTH, DEFAULT_MAX_CHILDREN)
+    }
+
+    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+        // Shrinking strategy: try smaller trees
+        let mut shrunk = Vec::new();
+
+        // Strategy 1: Remove all children (shrink to just root)
+        if !self.children.is_empty() {
+            shrunk.push(CGroupTreeNode {
+                resources: self.resources.clone(),
+                children: Vec::new(),
+            });
+        }
+
+        // Strategy 2: Keep only one child at a time
+        for child in &self.children {
+            shrunk.push(CGroupTreeNode {
+                resources: self.resources.clone(),
+                children: vec![child.clone()],
+            });
+        }
+
+        // Strategy 3: Recursively shrink children
+        for (i, child) in self.children.iter().enumerate() {
+            for shrunk_child in child.shrink() {
+                let mut new_children = self.children.clone();
+                new_children[i] = shrunk_child;
+                shrunk.push(CGroupTreeNode {
+                    resources: self.resources.clone(),
+                    children: new_children,
+                });
+            }
+        }
+
+        Box::new(shrunk.into_iter())
     }
 }
 
@@ -495,5 +547,84 @@ mod tests {
         }
 
         quickcheck(prop_tree_respects_constraints as fn(u64) -> TestResult);
+    }
+
+    #[test]
+    fn test_arbitrary_cgroup_tree() {
+        // Test that the Arbitrary implementation works
+        let mut gen = quickcheck::Gen::new(789);
+        let tree = CGroupTreeNode::arbitrary(&mut gen);
+
+        println!("Generated tree via Arbitrary with {} nodes", tree.node_count());
+        println!("Tree depth: {}", tree.max_depth());
+
+        assert!(tree.max_depth() <= DEFAULT_MAX_TREE_DEPTH,
+                "Tree depth {} should not exceed DEFAULT_MAX_TREE_DEPTH {}",
+                tree.max_depth(), DEFAULT_MAX_TREE_DEPTH);
+        assert!(tree.node_count() >= 1, "Tree should have at least the root node");
+    }
+
+    #[test]
+    fn test_arbitrary_with_quickcheck_macro() {
+        // Test that CGroupTreeNode works with quickcheck! macro
+        fn prop_arbitrary_tree_valid(tree: CGroupTreeNode) -> TestResult {
+            // Basic validity checks
+            if tree.node_count() < 1 {
+                return TestResult::failed();
+            }
+
+            if tree.max_depth() > DEFAULT_MAX_TREE_DEPTH {
+                return TestResult::failed();
+            }
+
+            // Check that no node has too many children
+            fn check_max_children(node: &CGroupTreeNode) -> bool {
+                if node.children.len() > DEFAULT_MAX_CHILDREN {
+                    return false;
+                }
+                node.children.iter().all(check_max_children)
+            }
+
+            if !check_max_children(&tree) {
+                return TestResult::failed();
+            }
+
+            TestResult::passed()
+        }
+
+        quickcheck(prop_arbitrary_tree_valid as fn(CGroupTreeNode) -> TestResult);
+    }
+
+    #[test]
+    fn test_tree_shrinking() {
+        // Test the shrink implementation
+        let mut gen = quickcheck::Gen::new(321);
+        let constraints = SystemConstraints {
+            num_cpus: 4,
+            total_memory_bytes: 8 * 1024 * 1024 * 1024,
+        };
+
+        // Generate a tree with some depth
+        let tree = CGroupTreeNode::arbitrary_tree(&mut gen, &constraints, 2, 2);
+
+        if tree.children.is_empty() {
+            println!("Tree has no children, skipping shrink test");
+            return;
+        }
+
+        let original_nodes = tree.node_count();
+        println!("Original tree has {} nodes", original_nodes);
+
+        let shrunk: Vec<_> = tree.shrink().take(5).collect();
+        println!("Generated {} shrunk variants", shrunk.len());
+
+        // At least one shrunk variant should be smaller
+        let has_smaller = shrunk.iter().any(|t| t.node_count() < original_nodes);
+        assert!(has_smaller, "Shrinking should produce smaller trees");
+
+        // All shrunk trees should be valid
+        for shrunk_tree in shrunk {
+            assert!(shrunk_tree.node_count() >= 1, "Shrunk tree should have at least root");
+        }
     }
 }
