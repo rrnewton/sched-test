@@ -42,3 +42,7 @@ path = "src/lib.rs"
 [[bin]]
 name = "schtest"
 path = "src/main.rs"
+
+[[bin]]
+name = "benchmark_cpu"
+path = "src/bin/benchmark_cpu.rs"
