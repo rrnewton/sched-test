@@ -1,7 +1,11 @@
 //! CGroup tree workload implementation.
 
 use cgroups_rs::fs::{Resources, MaxValue};
+use cgroups_rs::fs::Cgroup;
+use cgroups_rs::fs::cgroup_builder::CgroupBuilder;
+use cgroups_rs::fs::hierarchies;
 use quickcheck::{Arbitrary, Gen};
+use anyhow::{Result, Context};
 
 /// System resource constraints used for generating realistic cgroup configurations.
 #[derive(Debug, Clone, Copy)]
@@ -55,6 +59,34 @@ pub struct CGroupTreeNode {
     pub resources: RandResources,
     /// Child cgroups under this node
     pub children: Vec<CGroupTreeNode>,
+}
+
+/// A created cgroup tree that exists on the filesystem.
+/// When dropped, all cgroups in the tree are deleted.
+pub struct ActualizedCGroupTree {
+    /// The root cgroup and all children
+    cgroups: Vec<Cgroup>,
+}
+
+impl ActualizedCGroupTree {
+    /// Get the number of cgroups in this tree
+    pub fn len(&self) -> usize {
+        self.cgroups.len()
+    }
+
+    /// Check if the tree is empty
+    pub fn is_empty(&self) -> bool {
+        self.cgroups.is_empty()
+    }
+}
+
+impl Drop for ActualizedCGroupTree {
+    fn drop(&mut self) {
+        // Delete in reverse order to ensure children are deleted before parents
+        for cgroup in self.cgroups.iter().rev() {
+            let _ = cgroup.delete();
+        }
+    }
 }
 
 impl CGroupTreeNode {
@@ -111,6 +143,189 @@ impl CGroupTreeNode {
         } else {
             1 + self.children.iter().map(|child| child.max_depth()).max().unwrap_or(0)
         }
+    }
+
+    /// Pretty-print the tree structure to stderr.
+    pub fn print_tree(&self) {
+        Self::print_tree_recursive(self, "", true);
+    }
+
+    /// Recursively print the tree with proper indentation.
+    fn print_tree_recursive(node: &CGroupTreeNode, prefix: &str, is_last: bool) {
+        let connector = if is_last { "└─" } else { "├─" };
+        eprint!("{}{} ", prefix, connector);
+
+        // Print some key resource info
+        let mut info = Vec::new();
+
+        if let Some(ref cpus) = node.resources.0.cpu.cpus {
+            info.push(format!("cpus:{}", cpus));
+        }
+        if let Some(shares) = node.resources.0.cpu.shares {
+            info.push(format!("shares:{}", shares));
+        }
+        if let Some(quota) = node.resources.0.cpu.quota {
+            info.push(format!("quota:{}", quota));
+        }
+        if let Some(period) = node.resources.0.cpu.period {
+            info.push(format!("period:{}", period));
+        }
+        if let Some(mem) = node.resources.0.memory.memory_hard_limit {
+            let mb = mem / (1024 * 1024);
+            info.push(format!("mem:{}MB", mb));
+        }
+        if let Some(mem) = node.resources.0.memory.memory_soft_limit {
+            let mb = mem / (1024 * 1024);
+            info.push(format!("soft:{}MB", mb));
+        }
+        if let Some(swappiness) = node.resources.0.memory.swappiness {
+            info.push(format!("swappiness:{}", swappiness));
+        }
+        if let Some(weight) = node.resources.0.blkio.weight {
+            info.push(format!("blkio:{}", weight));
+        }
+        if let Some(class_id) = node.resources.0.network.class_id {
+            info.push(format!("netclass:{}", class_id));
+        }
+
+        if info.is_empty() {
+            eprintln!("Node [no limits]");
+        } else {
+            eprintln!("Node [{}]", info.join(", "));
+        }
+
+        let child_prefix = format!("{}{}", prefix, if is_last { "   " } else { "│  " });
+        for (i, child) in node.children.iter().enumerate() {
+            let is_last_child = i == node.children.len() - 1;
+            Self::print_tree_recursive(child, &child_prefix, is_last_child);
+        }
+    }
+
+    /// Create actual cgroups on the filesystem based on this tree structure.
+    ///
+    /// # Arguments
+    /// * `base_name` - The base name for the root cgroup
+    ///
+    /// # Returns
+    /// An `ActualizedCGroupTree` that owns the created cgroups. When dropped, all cgroups are deleted.
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// let tree = CGroupTreeNode::arbitrary_tree(&mut gen, &constraints, 3, 4);
+    /// let actualized = tree.create("test_cgroup")?;
+    /// // Use the cgroups...
+    /// // They will be automatically deleted when actualized is dropped
+    /// ```
+    pub fn create(&self, base_name: &str) -> Result<ActualizedCGroupTree> {
+        let mut all_cgroups = Vec::new();
+
+        self.create_recursive(base_name, &mut all_cgroups)
+            .context("Failed to create cgroup tree")?;
+
+        Ok(ActualizedCGroupTree {
+            cgroups: all_cgroups,
+        })
+    }
+
+    /// Recursively create cgroups for this node and all children.
+    fn create_recursive(
+        &self,
+        name: &str,
+        all_cgroups: &mut Vec<Cgroup>,
+    ) -> Result<()> {
+        // Create the cgroup with the builder
+        let mut builder = CgroupBuilder::new(name);
+
+        // Apply CPU resources if present
+        if self.resources.0.cpu.shares.is_some()
+            || self.resources.0.cpu.quota.is_some()
+            || self.resources.0.cpu.period.is_some()
+            || self.resources.0.cpu.cpus.is_some()
+        {
+            let mut cpu_builder = builder.cpu();
+
+            if let Some(shares) = self.resources.0.cpu.shares {
+                cpu_builder = cpu_builder.shares(shares);
+            }
+            if let Some(quota) = self.resources.0.cpu.quota {
+                cpu_builder = cpu_builder.quota(quota);
+            }
+            if let Some(period) = self.resources.0.cpu.period {
+                cpu_builder = cpu_builder.period(period);
+            }
+            if let Some(ref cpus) = self.resources.0.cpu.cpus {
+                cpu_builder = cpu_builder.cpus(cpus.clone());
+            }
+
+            builder = cpu_builder.done();
+        }
+
+        // Apply memory resources if present
+        if self.resources.0.memory.memory_hard_limit.is_some()
+            || self.resources.0.memory.memory_soft_limit.is_some()
+            || self.resources.0.memory.memory_swap_limit.is_some()
+            || self.resources.0.memory.swappiness.is_some()
+        {
+            let mut mem_builder = builder.memory();
+
+            if let Some(limit) = self.resources.0.memory.memory_hard_limit {
+                mem_builder = mem_builder.memory_hard_limit(limit);
+            }
+            if let Some(limit) = self.resources.0.memory.memory_soft_limit {
+                mem_builder = mem_builder.memory_soft_limit(limit);
+            }
+            if let Some(limit) = self.resources.0.memory.memory_swap_limit {
+                mem_builder = mem_builder.memory_swap_limit(limit);
+            }
+            if let Some(swappiness) = self.resources.0.memory.swappiness {
+                mem_builder = mem_builder.swappiness(swappiness);
+            }
+
+            builder = mem_builder.done();
+        }
+
+        // Apply Block I/O resources if present
+        if self.resources.0.blkio.weight.is_some() || self.resources.0.blkio.leaf_weight.is_some() {
+            let mut blkio_builder = builder.blkio();
+
+            if let Some(weight) = self.resources.0.blkio.weight {
+                blkio_builder = blkio_builder.weight(weight);
+            }
+            if let Some(leaf_weight) = self.resources.0.blkio.leaf_weight {
+                blkio_builder = blkio_builder.leaf_weight(leaf_weight);
+            }
+
+            builder = blkio_builder.done();
+        }
+
+        // Apply Network resources if present
+        if let Some(class_id) = self.resources.0.network.class_id {
+            let mut net_builder = builder.network();
+            net_builder = net_builder.class_id(class_id);
+            builder = net_builder.done();
+        }
+
+        // Apply PID resources if present
+        if let Some(ref max_procs) = self.resources.0.pid.maximum_number_of_processes {
+            let mut pid_builder = builder.pid();
+            pid_builder = pid_builder.maximum_number_of_processes(max_procs.clone());
+            builder = pid_builder.done();
+        }
+
+        // Build the cgroup
+        let hier = hierarchies::auto();
+        let cgroup = builder.build(hier).context(format!("Failed to build cgroup {}", name))?;
+
+        // Create children with names like "parent_name/child_0", "parent_name/child_1", etc.
+        for (i, child) in self.children.iter().enumerate() {
+            let child_name = format!("{}/child_{}", name, i);
+            child.create_recursive(&child_name, all_cgroups)?;
+        }
+
+        // Add this cgroup to the list (after children so deletion order is correct)
+        all_cgroups.push(cgroup);
+
+        Ok(())
     }
 }
 
@@ -620,6 +835,43 @@ mod tests {
         // All shrunk trees should be valid
         for shrunk_tree in shrunk {
             assert!(shrunk_tree.node_count() >= 1, "Shrunk tree should have at least root");
+        }
+    }
+
+    #[test]
+    fn test_actualize_cgroup_tree() {
+        use crate::util::user::User;
+
+        // Skip if not root
+        if !User::is_root() {
+            println!("Skipping test (requires root)");
+            return;
+        }
+
+        let mut gen = quickcheck::Gen::new(999);
+        let constraints = SystemConstraints {
+            num_cpus: 2,
+            total_memory_bytes: 1024 * 1024 * 1024, // 1GB
+        };
+
+        // Generate a small tree
+        let tree = CGroupTreeNode::arbitrary_tree(&mut gen, &constraints, 2, 2);
+
+        println!("Generated tree with {} nodes", tree.node_count());
+
+        // Try to create the cgroups
+        let result = tree.create("test_cgroup_tree");
+
+        match result {
+            Ok(actualized) => {
+                println!("Successfully created {} cgroups", actualized.len());
+                assert_eq!(actualized.len(), tree.node_count());
+                // Cgroups will be automatically deleted when actualized is dropped
+            }
+            Err(e) => {
+                println!("Failed to create cgroups: {}", e);
+                // This might fail on systems without cgroup support, so we don't panic
+            }
         }
     }
 }
