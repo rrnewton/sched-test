@@ -107,11 +107,11 @@ fn create_cgroup_tree() -> Result<()> {
     let ops_width = max_ops.to_string().len().max(3); // "ops" is 3 chars
 
     // Print header
-    eprintln!("{:>width1$},{:>width2$}", "node_id", "ops", width1 = node_id_width, width2 = ops_width);
+    eprintln!("{:>width1$}, {:>width2$}", "node_id", "ops", width1 = node_id_width, width2 = ops_width);
 
     // Print rows
     for (node_id, ops) in results {
-        eprintln!("{:>width1$},{:>width2$}", node_id, ops, width1 = node_id_width, width2 = ops_width);
+        eprintln!("{:>width1$}, {:>width2$}", node_id, ops, width1 = node_id_width, width2 = ops_width);
     }
 
     // Cgroups will be automatically deleted when actualized is dropped
@@ -205,11 +205,11 @@ fn simple_cgroup_test() -> Result<()> {
     let ops_width = max_ops.to_string().len().max(3); // "ops" is 3 chars
 
     // Print header
-    eprintln!("{:>width1$},{:>width2$}", "node_id", "ops", width1 = node_id_width, width2 = ops_width);
+    eprintln!("{:>width1$}, {:>width2$}", "node_id", "ops", width1 = node_id_width, width2 = ops_width);
 
     // Print rows
     for (node_id, ops) in &results {
-        eprintln!("{:>width1$},{:>width2$}", node_id, ops, width1 = node_id_width, width2 = ops_width);
+        eprintln!("{:>width1$}, {:>width2$}", node_id, ops, width1 = node_id_width, width2 = ops_width);
     }
 
     // Calculate and show ratio
