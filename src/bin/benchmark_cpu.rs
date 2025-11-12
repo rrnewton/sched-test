@@ -272,7 +272,8 @@ fn print_results(worker_start: Instant, slices: Vec<(u64, u64)>, count: u64, cpu
         }
 
         // Final partial window
-        if cur_win_cycles > 0 {
+        let has_partial_window = cur_win_cycles > 0;
+        if has_partial_window {
             windows.push(cur_win_cycles);
             if verbose {
                 let start_time_secs = (cur_win_start - first_cycle) as f64 / cpu_hz as f64;
@@ -285,10 +286,15 @@ fn print_results(worker_start: Instant, slices: Vec<(u64, u64)>, count: u64, cpu
             }
         }
 
-        // Print window stats in chronological order
+        // Print window stats in chronological order (excluding partial final window)
         if verbose && !window_stats.is_empty() {
             println!("\nPer-window statistics:");
-            for stat in &window_stats {
+            let stats_to_print = if has_partial_window && window_stats.len() > 1 {
+                &window_stats[..window_stats.len() - 1]  // Exclude last partial window
+            } else {
+                &window_stats[..]
+            };
+            for stat in stats_to_print {
                 let utilization = stat.cycles as f64 / window_cycles as f64;
                 let max_gap_ns = (stat.max_gap_cycles as f64 / cpu_hz as f64 * 1e9) as u64;
                 println!("  Window {:.1}s: {} slices, max gap: {} ns, util: {:.2}%",
@@ -296,15 +302,24 @@ fn print_results(worker_start: Instant, slices: Vec<(u64, u64)>, count: u64, cpu
             }
         }
 
-        // Compute percentiles
-        let mut utilizations: Vec<f64> = windows.iter().map(|&cyc| cyc as f64 / window_cycles as f64).collect();
-        utilizations.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let percentiles = [1, 25, 50, 75, 99];
-        println!("Windowed utilization percentiles ({}ms windows):", WINDOW_SIZE_MS);
-        for &p in &percentiles {
-            let idx = ((utilizations.len() as f64) * (p as f64 / 100.0)).floor() as usize;
-            let idx = idx.min(utilizations.len().saturating_sub(1));
-            println!("p{:02}: {:.2}%", p, utilizations.get(idx).copied().unwrap_or(0.0) * 100.0);
+        // Compute percentiles, excluding final partial window if present
+        let utilization_windows = if has_partial_window && windows.len() > 1 {
+            &windows[..windows.len() - 1]  // Exclude last partial window
+        } else {
+            &windows[..]
+        };
+        
+        if !utilization_windows.is_empty() {
+            let mut utilizations: Vec<f64> = utilization_windows.iter().map(|&cyc| cyc as f64 / window_cycles as f64).collect();
+            utilizations.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let percentiles = [1, 25, 50, 75, 99];
+            println!("Windowed utilization percentiles ({}ms windows, {} complete windows):", 
+                WINDOW_SIZE_MS, utilizations.len());
+            for &p in &percentiles {
+                let idx = ((utilizations.len() as f64) * (p as f64 / 100.0)).floor() as usize;
+                let idx = idx.min(utilizations.len().saturating_sub(1));
+                println!("p{:02}: {:.2}%", p, utilizations.get(idx).copied().unwrap_or(0.0) * 100.0);
+            }
         }
     }
 }
