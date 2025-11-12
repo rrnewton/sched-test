@@ -6,10 +6,11 @@ use cgroups_rs::fs::cgroup_builder::CgroupBuilder;
 use cgroups_rs::fs::hierarchies;
 use quickcheck::{Arbitrary, Gen};
 use anyhow::{Result, Context};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use crate::util::child::Child;
 use crate::util::shared::SharedBox;
+use crate::workloads::spinner_utilization;
 
 /// System resource constraints used for generating realistic cgroup configurations.
 #[derive(Debug, Clone, Copy)]
@@ -67,27 +68,25 @@ pub struct CGroupTreeNode {
     pub children: Vec<CGroupTreeNode>,
 }
 
-/// Simple CPU hog workload that spins using Instant::now() and counts operations
+/// CPU hog workload using spinner_utilization to measure actual scheduled time
 fn cpu_hog_workload(
     duration: Duration,
     start_signal: SharedBox<AtomicU32>,
-    ops_counter: SharedBox<AtomicU64>,
+    scheduled_ns_out: SharedBox<AtomicU64>,
 ) {
+    // Get TSC frequency (non-verbose)
+    let tsc_hz = spinner_utilization::get_tsc_hz(false);
+
     // Wait for start signal
     while start_signal.load(Ordering::Acquire) == 0 {
         std::hint::spin_loop();
     }
 
-    // Spin for the specified duration, counting iterations
-    let start = Instant::now();
-    let mut ops: u64 = 0;
-    while start.elapsed() < duration {
-        ops += 1;
-        std::hint::spin_loop();
-    }
+    // Run spinner for the specified duration
+    let results = spinner_utilization::run_spinner(duration, tsc_hz, false);
 
-    // Write ops count to shared memory
-    ops_counter.store(ops, Ordering::Release);
+    // Write scheduled time (in nanoseconds) to shared memory
+    scheduled_ns_out.store(results.time_scheduled_ns, Ordering::Release);
 }
 
 /// A handle to a launched CPU hog process
@@ -95,8 +94,8 @@ pub struct CGroupHog {
     child: Child,
     /// Node ID this hog is running in
     pub node_id: usize,
-    /// Shared memory location for ops count
-    pub ops_counter: SharedBox<AtomicU64>,
+    /// Shared memory location for scheduled time in nanoseconds
+    pub scheduled_ns: SharedBox<AtomicU64>,
 }
 
 impl CGroupHog {
@@ -142,7 +141,7 @@ impl ActualizedCGroupTree {
     /// # Arguments
     /// * `duration` - How long each hog should spin
     /// * `start_signal` - Shared atomic flag to signal when to start
-    /// * `ops_counters` - Shared array of atomic counters for ops counts
+    /// * `scheduled_ns_counters` - Shared array of atomic counters for scheduled time (nanoseconds)
     ///
     /// # Returns
     /// Vector of hog handles that can be waited on
@@ -150,7 +149,7 @@ impl ActualizedCGroupTree {
         &self,
         duration: Duration,
         start_signal: SharedBox<AtomicU32>,
-        ops_counters: Vec<SharedBox<AtomicU64>>,
+        scheduled_ns_counters: Vec<SharedBox<AtomicU64>>,
     ) -> Result<Vec<CGroupHog>> {
         let mut hogs = Vec::new();
         let mut leaf_index = 0;
@@ -159,7 +158,7 @@ impl ActualizedCGroupTree {
             0,
             duration,
             start_signal.clone(),
-            &ops_counters,
+            &scheduled_ns_counters,
             &mut leaf_index,
             &mut hogs,
         )?;
@@ -199,7 +198,7 @@ impl ActualizedCGroupTree {
         cgroup_index: usize,
         duration: Duration,
         start_signal: SharedBox<AtomicU32>,
-        ops_counters: &[SharedBox<AtomicU64>],
+        scheduled_ns_counters: &[SharedBox<AtomicU64>],
         leaf_index: &mut usize,
         hogs: &mut Vec<CGroupHog>,
     ) -> Result<usize> {
@@ -210,13 +209,13 @@ impl ActualizedCGroupTree {
             let cgroup = &self.cgroups[current_index];
             let cgroup_path_str = cgroup.path();
             let start_signal_clone = start_signal.clone();
-            let ops_counter = ops_counters[*leaf_index].clone();
+            let scheduled_ns_out = scheduled_ns_counters[*leaf_index].clone();
             let node_id = node.node_id;
 
             let child = Child::run(
                 move || {
                     // Just run the CPU hog - parent will add us to cgroup
-                    cpu_hog_workload(duration, start_signal_clone, ops_counter);
+                    cpu_hog_workload(duration, start_signal_clone, scheduled_ns_out);
                     Ok(())
                 },
                 None,
@@ -233,7 +232,7 @@ impl ActualizedCGroupTree {
             hogs.push(CGroupHog {
                 child,
                 node_id,
-                ops_counter: ops_counters[*leaf_index].clone(),
+                scheduled_ns: scheduled_ns_counters[*leaf_index].clone(),
             });
             *leaf_index += 1;
             Ok(current_index + 1)
@@ -246,7 +245,7 @@ impl ActualizedCGroupTree {
                     next_index,
                     duration,
                     start_signal.clone(),
-                    ops_counters,
+                    scheduled_ns_counters,
                     leaf_index,
                     hogs,
                 )?;
