@@ -158,6 +158,50 @@ pub fn run_spinner(duration: Duration, tsc_hz: u64, verbose: bool) -> BenchmarkR
     compute_results(worker_start, slices, count, tsc_hz, verbose)
 }
 
+/// Worker loop with shutdown flag: runs until flag is set, records time slices
+pub fn run_spinner_with_shutdown(
+    shutdown_flag: *const std::sync::atomic::AtomicU32,
+    tsc_hz: u64,
+    verbose: bool,
+) -> BenchmarkResults {
+    use std::sync::atomic::Ordering;
+    
+    let worker_start = Instant::now();
+    let mut count: u64 = 0;
+    let mut slices = Vec::new();
+    let mut last_cycle = rdtsc();
+    let mut in_slice = false;
+    let mut slice_start_cycle = 0u64;
+
+    while unsafe { (*shutdown_flag).load(Ordering::Relaxed) == 0 } {
+        count += 1;
+        let cur_cycle = rdtsc();
+        let gap = cur_cycle - last_cycle;
+
+        // If gap is large, treat as deschedule event
+        if gap > MIN_DESCHEDULE_CYCLES {
+            if in_slice {
+                let slice_end_cycle = last_cycle;
+                slices.push((slice_start_cycle, slice_end_cycle));
+                in_slice = false;
+            }
+        } else {
+            if !in_slice {
+                slice_start_cycle = cur_cycle;
+                in_slice = true;
+            }
+        }
+        last_cycle = cur_cycle;
+    }
+
+    // Final slice
+    if in_slice {
+        slices.push((slice_start_cycle, last_cycle));
+    }
+
+    compute_results(worker_start, slices, count, tsc_hz, verbose)
+}
+
 /// Compute benchmark results and statistics
 pub fn compute_results_from_slices(
     worker_start: Instant,
