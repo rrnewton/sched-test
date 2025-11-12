@@ -12,7 +12,38 @@ use nix::unistd::{fork, ForkResult, Pid};
 use nix::sys::wait::waitpid;
 use libc;
 use clap::Parser;
+use serde::{Serialize, Deserialize};
 // use std::ffi::CStr; // kept for future diagnostics if needed
+
+/// Per-window statistics
+#[derive(Debug, Serialize, Deserialize)]
+struct WindowStat {
+    start_time_ns: u64,
+    num_slices: usize,
+    max_gap_ns: u64,
+    util_pct: f64,
+}
+
+/// Percentile statistics
+#[derive(Debug, Serialize, Deserialize)]
+struct Percentiles {
+    p01: f64,
+    p25: f64,
+    p50: f64,
+    p75: f64,
+    p99: f64,
+}
+
+/// Complete benchmark results
+#[derive(Debug, Serialize, Deserialize)]
+struct BenchmarkResults {
+    tsc_frequency: u64,
+    time_scheduled_ns: u64,
+    total_iterations: u64,
+    total_tsc_ticks: u64,
+    per_window_stats: Vec<WindowStat>,
+    percentiles: Percentiles,
+}
 
 /// CPU bandwidth benchmark for cgroup scheduling
 #[derive(Parser, Debug)]
@@ -191,17 +222,19 @@ fn worker_shared(shutdown_flag: *const AtomicU32, cpu_hz: u64, verbose: bool) {
     print_results(worker_start, slices, count, cpu_hz, verbose);
 }
 
-/// Print benchmark results with statistics
+/// Print benchmark results with statistics and output JSON
 fn print_results(worker_start: Instant, slices: Vec<(u64, u64)>, count: u64, cpu_hz: u64, verbose: bool) {
-    // Print results
+    // Print human-readable results to stderr
     let elapsed_secs = worker_start.elapsed().as_secs_f64();
     let total_cycles: u64 = slices.iter().map(|(start, end)| end - start).sum();
 
     // Convert total cycles to scheduled time
     let scheduled_secs = total_cycles as f64 / cpu_hz as f64;
-    println!("Elapsed time: {:.3} seconds", elapsed_secs);
-    println!("Worker was scheduled for {:.3} seconds, {} iterations", scheduled_secs, format_with_commas(count));
-    println!("Total cycles: {}", format_with_commas(total_cycles));
+    let scheduled_ns = (scheduled_secs * 1e9) as u64;
+    
+    eprintln!("Elapsed time: {:.3} seconds", elapsed_secs);
+    eprintln!("Worker was scheduled for {:.3} seconds, {} iterations", scheduled_secs, format_with_commas(count));
+    eprintln!("Total TSC ticks: {}", format_with_commas(total_cycles));
 
     // Windowed utilization with optional per-window stats
     // Now working entirely in cycle space, convert to time later
@@ -287,17 +320,18 @@ fn print_results(worker_start: Instant, slices: Vec<(u64, u64)>, count: u64, cpu
         }
 
         // Print window stats in chronological order (excluding partial final window)
-        if verbose && !window_stats.is_empty() {
-            println!("\nPer-window statistics:");
-            let stats_to_print = if has_partial_window && window_stats.len() > 1 {
-                &window_stats[..window_stats.len() - 1]  // Exclude last partial window
-            } else {
-                &window_stats[..]
-            };
-            for stat in stats_to_print {
+        let stats_to_export = if has_partial_window && window_stats.len() > 1 {
+            &window_stats[..window_stats.len() - 1]  // Exclude last partial window
+        } else {
+            &window_stats[..]
+        };
+        
+        if verbose && !stats_to_export.is_empty() {
+            eprintln!("\nPer-window statistics:");
+            for stat in stats_to_export {
                 let utilization = stat.cycles as f64 / window_cycles as f64;
                 let max_gap_ns = (stat.max_gap_cycles as f64 / cpu_hz as f64 * 1e9) as u64;
-                println!("  Window {:.1}s: {} slices, max gap: {} ns, util: {:.2}%",
+                eprintln!("  Window {:.1}s: {} slices, max gap: {} ns, util: {:.2}%",
                     stat.start_time_secs, stat.slices, format_with_commas(max_gap_ns), utilization * 100.0);
             }
         }
@@ -309,18 +343,80 @@ fn print_results(worker_start: Instant, slices: Vec<(u64, u64)>, count: u64, cpu
             &windows[..]
         };
         
-        if !utilization_windows.is_empty() {
+        let percentile_values = if !utilization_windows.is_empty() {
             let mut utilizations: Vec<f64> = utilization_windows.iter().map(|&cyc| cyc as f64 / window_cycles as f64).collect();
             utilizations.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            let percentiles = [1, 25, 50, 75, 99];
-            println!("Windowed utilization percentiles ({}ms windows, {} complete windows):", 
+            let percentile_keys = [1, 25, 50, 75, 99];
+            eprintln!("Windowed utilization percentiles ({}ms windows, {} complete windows):", 
                 WINDOW_SIZE_MS, utilizations.len());
-            for &p in &percentiles {
+            
+            let mut pcts = [0.0; 5];
+            for (i, &p) in percentile_keys.iter().enumerate() {
                 let idx = ((utilizations.len() as f64) * (p as f64 / 100.0)).floor() as usize;
                 let idx = idx.min(utilizations.len().saturating_sub(1));
-                println!("p{:02}: {:.2}%", p, utilizations.get(idx).copied().unwrap_or(0.0) * 100.0);
+                let val = utilizations.get(idx).copied().unwrap_or(0.0) * 100.0;
+                pcts[i] = val;
+                eprintln!("p{:02}: {:.2}%", p, val);
             }
-        }
+            
+            Percentiles {
+                p01: pcts[0],
+                p25: pcts[1],
+                p50: pcts[2],
+                p75: pcts[3],
+                p99: pcts[4],
+            }
+        } else {
+            Percentiles {
+                p01: 0.0,
+                p25: 0.0,
+                p50: 0.0,
+                p75: 0.0,
+                p99: 0.0,
+            }
+        };
+        
+        // Build JSON output
+        let json_window_stats: Vec<WindowStat> = stats_to_export.iter().map(|stat| {
+            let start_time_ns = (stat.start_time_secs * 1e9) as u64;
+            let max_gap_ns = (stat.max_gap_cycles as f64 / cpu_hz as f64 * 1e9) as u64;
+            let util_pct = stat.cycles as f64 / window_cycles as f64 * 100.0;
+            WindowStat {
+                start_time_ns,
+                num_slices: stat.slices,
+                max_gap_ns,
+                util_pct,
+            }
+        }).collect();
+        
+        let results = BenchmarkResults {
+            tsc_frequency: cpu_hz,
+            time_scheduled_ns: scheduled_ns,
+            total_iterations: count,
+            total_tsc_ticks: total_cycles,
+            per_window_stats: json_window_stats,
+            percentiles: percentile_values,
+        };
+        
+        // Output JSON to stdout
+        println!("{}", serde_json::to_string_pretty(&results).unwrap());
+    } else {
+        // No slices, empty results
+        let results = BenchmarkResults {
+            tsc_frequency: cpu_hz,
+            time_scheduled_ns: scheduled_ns,
+            total_iterations: count,
+            total_tsc_ticks: total_cycles,
+            per_window_stats: vec![],
+            percentiles: Percentiles {
+                p01: 0.0,
+                p25: 0.0,
+                p50: 0.0,
+                p75: 0.0,
+                p99: 0.0,
+            },
+        };
+        println!("{}", serde_json::to_string_pretty(&results).unwrap());
     }
 }
 
