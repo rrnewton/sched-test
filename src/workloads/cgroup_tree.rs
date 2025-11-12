@@ -7,7 +7,7 @@ use cgroups_rs::fs::hierarchies;
 use quickcheck::{Arbitrary, Gen};
 use anyhow::{Result, Context};
 use std::time::{Duration, Instant};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use crate::util::child::Child;
 use crate::util::shared::SharedBox;
 
@@ -59,30 +59,44 @@ pub const DEFAULT_MAX_CHILDREN: usize = 4;
 /// A node in a cgroup tree hierarchy.
 #[derive(Debug, Clone)]
 pub struct CGroupTreeNode {
+    /// Unique node ID for tracking
+    pub node_id: usize,
     /// The resource limits for this cgroup
     pub resources: RandResources,
     /// Child cgroups under this node
     pub children: Vec<CGroupTreeNode>,
 }
 
-/// Simple CPU hog workload that spins using Instant::now()
-fn cpu_hog_workload(duration: Duration, start_signal: SharedBox<AtomicU32>) {
+/// Simple CPU hog workload that spins using Instant::now() and counts operations
+fn cpu_hog_workload(
+    duration: Duration,
+    start_signal: SharedBox<AtomicU32>,
+    ops_counter: SharedBox<AtomicU64>,
+) {
     // Wait for start signal
     while start_signal.load(Ordering::Acquire) == 0 {
         std::hint::spin_loop();
     }
 
-    // Spin for the specified duration
+    // Spin for the specified duration, counting iterations
     let start = Instant::now();
+    let mut ops: u64 = 0;
     while start.elapsed() < duration {
-        // Just spin, checking time
+        ops += 1;
         std::hint::spin_loop();
     }
+
+    // Write ops count to shared memory
+    ops_counter.store(ops, Ordering::Release);
 }
 
 /// A handle to a launched CPU hog process
 pub struct CGroupHog {
     child: Child,
+    /// Node ID this hog is running in
+    pub node_id: usize,
+    /// Shared memory location for ops count
+    pub ops_counter: SharedBox<AtomicU64>,
 }
 
 impl CGroupHog {
@@ -128,6 +142,7 @@ impl ActualizedCGroupTree {
     /// # Arguments
     /// * `duration` - How long each hog should spin
     /// * `start_signal` - Shared atomic flag to signal when to start
+    /// * `ops_counters` - Shared array of atomic counters for ops counts
     ///
     /// # Returns
     /// Vector of hog handles that can be waited on
@@ -135,9 +150,19 @@ impl ActualizedCGroupTree {
         &self,
         duration: Duration,
         start_signal: SharedBox<AtomicU32>,
+        ops_counters: Vec<SharedBox<AtomicU64>>,
     ) -> Result<Vec<CGroupHog>> {
         let mut hogs = Vec::new();
-        self.launch_leaf_hogs_recursive(&self.tree, 0, duration, start_signal.clone(), &mut hogs)?;
+        let mut leaf_index = 0;
+        self.launch_leaf_hogs_recursive(
+            &self.tree,
+            0,
+            duration,
+            start_signal.clone(),
+            &ops_counters,
+            &mut leaf_index,
+            &mut hogs,
+        )?;
         Ok(hogs)
     }
 
@@ -174,6 +199,8 @@ impl ActualizedCGroupTree {
         cgroup_index: usize,
         duration: Duration,
         start_signal: SharedBox<AtomicU32>,
+        ops_counters: &[SharedBox<AtomicU64>],
+        leaf_index: &mut usize,
         hogs: &mut Vec<CGroupHog>,
     ) -> Result<usize> {
         let current_index = cgroup_index;
@@ -183,11 +210,13 @@ impl ActualizedCGroupTree {
             let cgroup = &self.cgroups[current_index];
             let cgroup_path_str = cgroup.path();
             let start_signal_clone = start_signal.clone();
+            let ops_counter = ops_counters[*leaf_index].clone();
+            let node_id = node.node_id;
 
             let child = Child::run(
                 move || {
                     // Just run the CPU hog - parent will add us to cgroup
-                    cpu_hog_workload(duration, start_signal_clone);
+                    cpu_hog_workload(duration, start_signal_clone, ops_counter);
                     Ok(())
                 },
                 None,
@@ -201,7 +230,12 @@ impl ActualizedCGroupTree {
             std::fs::write(&procs_path, pid.to_string())
                 .context(format!("Failed to write PID {} to {:?}", pid, procs_path))?;
 
-            hogs.push(CGroupHog { child });
+            hogs.push(CGroupHog {
+                child,
+                node_id,
+                ops_counter: ops_counters[*leaf_index].clone(),
+            });
+            *leaf_index += 1;
             Ok(current_index + 1)
         } else {
             // Interior node - recurse to children
@@ -212,6 +246,8 @@ impl ActualizedCGroupTree {
                     next_index,
                     duration,
                     start_signal.clone(),
+                    ops_counters,
+                    leaf_index,
                     hogs,
                 )?;
             }
@@ -249,6 +285,19 @@ impl CGroupTreeNode {
         max_depth: usize,
         max_children: usize,
     ) -> Self {
+        let mut tree = Self::arbitrary_tree_impl(g, constraints, max_depth, max_children, 0).0;
+        Self::assign_ids(&mut tree, &mut 0);
+        tree
+    }
+
+    /// Internal implementation that doesn't assign IDs
+    fn arbitrary_tree_impl(
+        g: &mut Gen,
+        constraints: &SystemConstraints,
+        max_depth: usize,
+        max_children: usize,
+        _depth: usize,
+    ) -> (Self, usize) {
         let resources = RandResources::arbitrary_with_constraints(g, constraints);
 
         let children = if max_depth == 0 {
@@ -264,11 +313,59 @@ impl CGroupTreeNode {
 
             // Recursively generate children with reduced depth
             (0..num_children)
-                .map(|_| Self::arbitrary_tree(g, constraints, max_depth - 1, max_children))
+                .map(|_| Self::arbitrary_tree_impl(g, constraints, max_depth - 1, max_children, _depth + 1).0)
                 .collect()
         };
 
-        Self { resources, children }
+        (Self { node_id: 0, resources, children }, 0)
+    }
+
+    /// Assign node IDs in preorder traversal
+    fn assign_ids(node: &mut CGroupTreeNode, next_id: &mut usize) {
+        node.node_id = *next_id;
+        *next_id += 1;
+        for child in &mut node.children {
+            Self::assign_ids(child, next_id);
+        }
+    }
+
+    /// Create a simple deterministic tree for testing with 2 leaves:
+    /// - Root (no limits)
+    ///   - Leaf 1: cpu.max = 25%
+    ///   - Leaf 2: cpu.max = 50%
+    pub fn simple_test_tree() -> Self {
+        let root_resources = Resources::default();
+
+        // Leaf 1: 25% CPU (quota=25000, period=100000)
+        let mut leaf1_resources = Resources::default();
+        leaf1_resources.cpu.quota = Some(25000);
+        leaf1_resources.cpu.period = Some(100000);
+
+        // Leaf 2: 50% CPU (quota=50000, period=100000)
+        let mut leaf2_resources = Resources::default();
+        leaf2_resources.cpu.quota = Some(50000);
+        leaf2_resources.cpu.period = Some(100000);
+
+        let mut tree = Self {
+            node_id: 0,
+            resources: RandResources(root_resources),
+            children: vec![
+                Self {
+                    node_id: 0,
+                    resources: RandResources(leaf1_resources),
+                    children: vec![],
+                },
+                Self {
+                    node_id: 0,
+                    resources: RandResources(leaf2_resources),
+                    children: vec![],
+                },
+            ],
+        };
+
+        // Assign IDs
+        Self::assign_ids(&mut tree, &mut 0);
+        tree
     }
 
     /// Count the total number of nodes in this tree.
@@ -293,7 +390,7 @@ impl CGroupTreeNode {
     /// Recursively print the tree with proper indentation.
     fn print_tree_recursive(node: &CGroupTreeNode, prefix: &str, is_last: bool) {
         let connector = if is_last { "└─" } else { "├─" };
-        eprint!("{}{} ", prefix, connector);
+        eprint!("{}{} Node #{} [", prefix, connector, node.node_id);
 
         // Print some key resource info
         let mut info = Vec::new();
@@ -335,9 +432,9 @@ impl CGroupTreeNode {
         }
 
         if info.is_empty() {
-            eprintln!("Node [no limits]");
+            eprintln!("no limits]");
         } else {
-            eprintln!("Node [{}]", info.join(", "));
+            eprintln!("{}]", info.join(", "));
         }
 
         let child_prefix = format!("{}{}", prefix, if is_last { "   " } else { "│  " });
@@ -494,6 +591,7 @@ impl Arbitrary for CGroupTreeNode {
             // Shrink the children Vec using Vec's shrinker
             for shrunk_vec in children_vec.shrink() {
                 all_shrinks.push(CGroupTreeNode {
+                    node_id: 0, // Will be reassigned later
                     resources: self.resources.clone(),
                     children: shrunk_vec,
                 });
@@ -507,6 +605,7 @@ impl Arbitrary for CGroupTreeNode {
                     let mut new_children = children.clone();
                     new_children[i] = shrunk_child;
                     all_shrinks.push(CGroupTreeNode {
+                        node_id: 0, // Will be reassigned later
                         resources: resources.clone(),
                         children: new_children,
                     });
