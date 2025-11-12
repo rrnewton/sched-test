@@ -22,6 +22,14 @@ struct Args {
     /// Enable verbose per-window statistics
     #[arg(short, long)]
     verbose: bool,
+
+    /// Duration to run the benchmark in seconds
+    #[arg(long, default_value = "3")]
+    seconds: u64,
+
+    /// Optional: CPU limit percentage (e.g., 50 for 50%). If specified, forks child into a cgroup with this limit.
+    #[arg(long)]
+    cgroup_cpu: Option<u64>,
 }
 
 /// Minimum TSC cycle gap to consider as a descheduling event
@@ -42,7 +50,7 @@ fn rdtsc() -> u64 {
 }
 
 /// Read CPU frequency from Linux system files
-fn read_cpu_hz() -> u64 {
+fn _read_cpu_hz() -> u64 {
     // Try reading from /proc/cpuinfo first
     if let Ok(cpuinfo) = std::fs::read_to_string("/proc/cpuinfo") {
         for line in cpuinfo.lines() {
@@ -68,6 +76,33 @@ fn read_cpu_hz() -> u64 {
     3_000_000_000
 }
 
+/// Read invariant TSC frequency (Hz) from sysfs if available
+fn read_tsc_hz() -> Option<u64> {
+    let path = "/sys/devices/system/cpu/cpu0/tsc_freq_khz";
+    if let Ok(khz_str) = std::fs::read_to_string(path) {
+        if let Ok(khz) = khz_str.trim().parse::<u64>() {
+            return Some(khz * 1000);
+        }
+    }
+    None
+}
+
+/// Calibrate TSC frequency over a short interval; returns measured Hz and elapsed seconds
+fn calibrate_tsc_short(duration_ms: u64) -> (u64, f64) {
+    let target = std::time::Duration::from_millis(duration_ms);
+    let t0 = Instant::now();
+    let c0 = rdtsc();
+    // Busy-wait until target elapsed; Instant is vDSO-accelerated
+    loop {
+        if t0.elapsed() >= target { break; }
+        std::hint::spin_loop();
+    }
+    let c1 = rdtsc();
+    let elapsed = t0.elapsed().as_secs_f64();
+    let measured_hz = ((c1 - c0) as f64 / elapsed) as u64;
+    (measured_hz, elapsed)
+}
+
 /// Format a number with comma separators for readability
 fn format_with_commas(n: u64) -> String {
     n.to_string()
@@ -79,7 +114,46 @@ fn format_with_commas(n: u64) -> String {
         .join(",")
 }
 
-/// Worker loop: runs until shutdown, records time slices
+/// Worker loop: runs for specified duration, records time slices
+fn worker(duration: Duration, cpu_hz: u64, verbose: bool) {
+    let worker_start = Instant::now();
+    let deadline = worker_start + duration;
+    let mut count: u64 = 0;
+    let mut slices = Vec::new();
+    let mut last_cycle = rdtsc();
+    let mut in_slice = false;
+    let mut slice_start_cycle = 0u64;
+
+    while Instant::now() < deadline {
+        count += 1;
+        let cur_cycle = rdtsc();
+        let gap = cur_cycle - last_cycle;
+
+        // If gap is large, treat as deschedule event
+        if gap > MIN_DESCHEDULE_CYCLES {
+            if in_slice {
+                let slice_end_cycle = last_cycle;
+                slices.push((slice_start_cycle, slice_end_cycle));
+                in_slice = false;
+            }
+        } else {
+            if !in_slice {
+                slice_start_cycle = cur_cycle;
+                in_slice = true;
+            }
+        }
+        last_cycle = cur_cycle;
+    }
+
+    // Final slice
+    if in_slice {
+        slices.push((slice_start_cycle, last_cycle));
+    }
+
+    print_results(worker_start, slices, count, cpu_hz, verbose);
+}
+
+/// Worker loop for fork mode: runs until shutdown flag set, records time slices
 fn worker_shared(shutdown_flag: *const AtomicU32, cpu_hz: u64, verbose: bool) {
     let worker_start = Instant::now();
     let mut count: u64 = 0;
@@ -114,6 +188,11 @@ fn worker_shared(shutdown_flag: *const AtomicU32, cpu_hz: u64, verbose: bool) {
         slices.push((slice_start_cycle, last_cycle));
     }
 
+    print_results(worker_start, slices, count, cpu_hz, verbose);
+}
+
+/// Print benchmark results with statistics
+fn print_results(worker_start: Instant, slices: Vec<(u64, u64)>, count: u64, cpu_hz: u64, verbose: bool) {
     // Print results
     let elapsed_secs = worker_start.elapsed().as_secs_f64();
     let total_cycles: u64 = slices.iter().map(|(start, end)| end - start).sum();
@@ -248,6 +327,38 @@ fn print_rusage(label: &str, who: i32) {
 fn main() {
     let args = Args::parse();
 
+    // Prefer sysfs TSC if available, else calibrate
+    let tsc_hz = match read_tsc_hz() {
+        Some(hz) => {
+            eprintln!("TSC frequency: {} Hz (from sysfs)", format_with_commas(hz));
+            hz
+        }
+        None => {
+            eprintln!("TSC frequency: sysfs unavailable, calibrating...");
+            let calib_ms = 5u64;
+            let (measured_hz, elapsed) = calibrate_tsc_short(calib_ms);
+            eprintln!(
+                "TSC frequency: {} Hz (measured over {:.3} ms)",
+                format_with_commas(measured_hz),
+                elapsed * 1000.0
+            );
+            measured_hz
+        }
+    };
+
+    let duration = Duration::from_secs(args.seconds);
+
+    // If --cgroup-cpu specified, fork into a cgroup with specified limit
+    if let Some(cpu_percent) = args.cgroup_cpu {
+        run_with_cgroup(cpu_percent, duration, tsc_hz, args.verbose);
+    } else {
+        // Direct worker call, no fork, no cgroup
+        worker(duration, tsc_hz, args.verbose);
+    }
+}
+
+/// Run worker in a forked child with cgroup CPU limit
+fn run_with_cgroup(cpu_percent: u64, duration: Duration, tsc_hz: u64, verbose: bool) {
     // Create shared shutdown flag using anonymous shared mmap
     let flag_size = std::mem::size_of::<AtomicU32>();
     let shutdown_ptr = unsafe {
@@ -271,28 +382,29 @@ fn main() {
     let cg = Cgroup::create().expect("Failed to create cgroup");
     let cg_path = cg.info().path().clone();
 
-    // Configure ~50% CPU cap (cgroup v2 cpu.max or v1 cfs quota/period)
+    // Configure CPU cap based on percentage (cgroup v2 cpu.max or v1 cfs quota/period)
+    let quota = cpu_percent * 1000;  // e.g., 50% -> 50000 per 100000
+    let period = 100000u64;
+    
     let cpu_max = cg_path.join("cpu.max");
     if cpu_max.exists() {
         // format: quota period
-        let _ = std::fs::write(&cpu_max, "50000 100000");
+        let _ = std::fs::write(&cpu_max, format!("{} {}", quota, period));
     } else {
         let cfs_quota = cg_path.join("cpu.cfs_quota_us");
         let cfs_period = cg_path.join("cpu.cfs_period_us");
         if cfs_quota.exists() && cfs_period.exists() {
-            let _ = std::fs::write(&cfs_quota, "50000");
-            let _ = std::fs::write(&cfs_period, "100000");
+            let _ = std::fs::write(&cfs_quota, quota.to_string());
+            let _ = std::fs::write(&cfs_period, period.to_string());
         }
     }
-
-    let cpu_hz = read_cpu_hz();
 
     // Fork child (shares address space mappings)
     match unsafe { fork() } {
         Ok(ForkResult::Child) => {
             // In the child: run worker and print our own rusage before exit so
             // we can compare kernel accounting with external `time` output.
-            worker_shared(shutdown_ptr, cpu_hz, args.verbose);
+            worker_shared(shutdown_ptr, tsc_hz, verbose);
             print_rusage("child_self", libc::RUSAGE_SELF);
             // Exit explicitly
             std::process::exit(0);
@@ -307,8 +419,8 @@ fn main() {
             std::fs::write(&procs, format!("{}", child.as_raw()))
                 .expect("Failed to add child to cgroup");
 
-            // Let it run for 3 seconds
-            thread::sleep(Duration::from_secs(3));
+            // Let it run for specified duration
+            thread::sleep(duration);
 
             // Signal shutdown via shared flag
             unsafe { (*(shutdown_ptr as *mut AtomicU32)).store(1, Ordering::Relaxed); }
