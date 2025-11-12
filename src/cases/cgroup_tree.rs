@@ -92,12 +92,26 @@ fn create_cgroup_tree() -> Result<()> {
         }
     }
 
-    // Print ops table
+    // Print ops table with right-justified columns
     eprintln!("\nLeaf Node Operations Completed:");
-    eprintln!("node_id,ops");
-    for (node_id, ops_counter) in hog_results {
-        let ops = ops_counter.load(Ordering::Acquire);
-        eprintln!("{},{}", node_id, ops);
+
+    // Collect results first to find column widths
+    let results: Vec<(usize, u64)> = hog_results.iter()
+        .map(|(node_id, ops_counter)| (*node_id, ops_counter.load(Ordering::Acquire)))
+        .collect();
+
+    // Find max widths
+    let max_node_id = results.iter().map(|(id, _)| *id).max().unwrap_or(0);
+    let max_ops = results.iter().map(|(_, ops)| *ops).max().unwrap_or(0);
+    let node_id_width = max_node_id.to_string().len().max(7); // "node_id" is 7 chars
+    let ops_width = max_ops.to_string().len().max(3); // "ops" is 3 chars
+
+    // Print header
+    eprintln!("{:>width1$},{:>width2$}", "node_id", "ops", width1 = node_id_width, width2 = ops_width);
+
+    // Print rows
+    for (node_id, ops) in results {
+        eprintln!("{:>width1$},{:>width2$}", node_id, ops, width1 = node_id_width, width2 = ops_width);
     }
 
     // Cgroups will be automatically deleted when actualized is dropped
@@ -176,18 +190,32 @@ fn simple_cgroup_test() -> Result<()> {
         }
     }
 
-    // Print ops table
+    // Print ops table with right-justified columns
     eprintln!("\nLeaf Node Operations Completed:");
-    eprintln!("node_id,ops");
-    for (node_id, ops_counter) in &hog_results {
-        let ops = ops_counter.load(Ordering::Acquire);
-        eprintln!("{},{}", node_id, ops);
+
+    // Collect results first to find column widths
+    let results: Vec<(usize, u64)> = hog_results.iter()
+        .map(|(node_id, ops_counter)| (*node_id, ops_counter.load(Ordering::Acquire)))
+        .collect();
+
+    // Find max widths
+    let max_node_id = results.iter().map(|(id, _)| *id).max().unwrap_or(0);
+    let max_ops = results.iter().map(|(_, ops)| *ops).max().unwrap_or(0);
+    let node_id_width = max_node_id.to_string().len().max(7); // "node_id" is 7 chars
+    let ops_width = max_ops.to_string().len().max(3); // "ops" is 3 chars
+
+    // Print header
+    eprintln!("{:>width1$},{:>width2$}", "node_id", "ops", width1 = node_id_width, width2 = ops_width);
+
+    // Print rows
+    for (node_id, ops) in &results {
+        eprintln!("{:>width1$},{:>width2$}", node_id, ops, width1 = node_id_width, width2 = ops_width);
     }
 
     // Calculate and show ratio
-    if hog_results.len() == 2 {
-        let ops1 = hog_results[0].1.load(Ordering::Acquire);
-        let ops2 = hog_results[1].1.load(Ordering::Acquire);
+    if results.len() == 2 {
+        let ops1 = results[0].1;
+        let ops2 = results[1].1;
         let ratio = if ops1 > 0 { ops2 as f64 / ops1 as f64 } else { 0.0 };
         eprintln!("\nRatio (leaf2/leaf1): {:.2} (expected ~2.0)", ratio);
     }
