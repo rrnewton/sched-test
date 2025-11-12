@@ -252,6 +252,10 @@ impl ActualizedCGroupTree {
         let mut parent_map: std::collections::HashMap<Option<usize>, Vec<usize>> = std::collections::HashMap::new();
         self.build_parent_map(&self.tree, None, &mut parent_map);
 
+        // Build node tree map to find parent's effective_cpu_max
+        let mut node_to_parent_max = std::collections::HashMap::new();
+        self.build_parent_max_map(&self.tree, None, &mut node_to_parent_max);
+
         // Create a map from node_id to index in all_stats for quick lookup
         let mut node_to_index = std::collections::HashMap::new();
         for (idx, stat) in all_stats.iter().enumerate() {
@@ -264,6 +268,13 @@ impl ActualizedCGroupTree {
             if child_ids.len() <= 1 {
                 continue;
             }
+
+            // Get parent's effective_cpu_max from one of the children
+            // All siblings have the same parent, so we can look at any child's parent_max
+            let parent_effective_cpu_max = child_ids.get(0)
+                .and_then(|&child_id| node_to_parent_max.get(&child_id))
+                .copied()
+                .flatten();
 
             // Collect stats for all siblings: (node_id, total_time_ns, cpu_weight, effective_cpu_max)
             let mut sibling_info: Vec<(usize, u64, u64, Option<f64>)> = Vec::new();
@@ -278,7 +289,7 @@ impl ActualizedCGroupTree {
             let sibling_total_time: u64 = sibling_info.iter().map(|(_, time, _, _)| time).sum();
 
             // Compute expected shares accounting for both cpu.weight and cpu.max
-            let expected_shares = Self::compute_expected_shares(&sibling_info);
+            let expected_shares = Self::compute_expected_shares(&sibling_info, parent_effective_cpu_max);
 
             // Update each sibling's stats
             for ((node_id, total_time_ns, _cpu_weight, _cpu_max), expected_share) in
@@ -308,63 +319,86 @@ impl ActualizedCGroupTree {
         }
     }
 
+    /// Build a map from node_id to parent's effective_cpu_max
+    fn build_parent_max_map(&self, node: &CGroupTreeNode, parent_max: Option<f64>, map: &mut std::collections::HashMap<usize, Option<f64>>) {
+        // Compute this node's effective_cpu_max
+        let this_max = if let (Some(quota), Some(period)) = (node.resources.0.cpu.quota, node.resources.0.cpu.period) {
+            Some(quota as f64 / period as f64)
+        } else {
+            None
+        };
+
+        let node_effective_max = match (this_max, parent_max) {
+            (Some(this), Some(parent)) => Some(this.min(parent)),
+            (Some(this), None) => Some(this),
+            (None, Some(parent)) => Some(parent),
+            (None, None) => None,
+        };
+
+        // Map each child to this node's effective_cpu_max (which is the child's parent_max)
+        for child in &node.children {
+            map.insert(child.node_id, node_effective_max);
+            self.build_parent_max_map(child, node_effective_max, map);
+        }
+    }
+
     /// Compute expected shares among siblings accounting for cpu.weight and cpu.max interaction
     ///
-    /// Algorithm: Iteratively allocate capacity to siblings based on weights, capping those
-    /// that hit their cpu.max limit, and redistributing remaining capacity among uncapped siblings.
-    fn compute_expected_shares(siblings: &[(usize, u64, u64, Option<f64>)]) -> Vec<f64> {
+    /// Siblings compete for their parent's capacity, distributed according to weights, but each
+    /// is capped by their cpu.max limit. The algorithm:
+    /// 1. Start with parent's capacity (normalized to 1.0)
+    /// 2. Allocate proportionally based on weights
+    /// 3. Cap siblings that exceed their limits (normalized to parent's capacity)
+    /// 4. Redistribute leftover capacity among uncapped siblings
+    /// 5. Repeat until convergence
+    fn compute_expected_shares(siblings: &[(usize, u64, u64, Option<f64>)], parent_max: Option<f64>) -> Vec<f64> {
         // siblings: (node_id, total_time_ns, cpu_weight, effective_cpu_max)
         let n = siblings.len();
-        let mut allocated = vec![0.0; n];  // Effective capacity each sibling can use
+        let mut allocated = vec![0.0; n];  // Fraction of parent's capacity each sibling gets
         let mut is_capped = vec![false; n];
+        let mut remaining_capacity = 1.0;  // Normalized: 100% of parent's capacity
         let mut remaining_weight: u64 = siblings.iter().map(|(_, _, w, _)| w).sum();
+
+        // Normalize child caps relative to parent capacity
+        // If child's effective_cpu_max > parent_max, then child is not constrained beyond parent
+        let normalized_caps: Vec<Option<f64>> = siblings.iter().map(|(_, _, _, child_max)| {
+            match (*child_max, parent_max) {
+                (Some(child), Some(parent)) if parent > 0.0 => {
+                    // Child can use at most child/parent of the parent's capacity
+                    Some((child / parent).min(1.0))
+                }
+                (Some(_), Some(_)) => {
+                    // Parent has zero or negative limit (shouldn't happen, but handle it)
+                    None
+                }
+                (Some(_), None) => {
+                    // Parent has no limit, so child's limit doesn't constrain it relative to siblings
+                    None
+                }
+                (None, _) => None,
+            }
+        }).collect();
 
         // Iteratively allocate capacity
         loop {
             let mut any_newly_capped = false;
 
-            // Compute total uncapped capacity
-            let total_uncapped_capacity: f64 = siblings.iter().enumerate()
-                .filter(|(i, _)| !is_capped[*i])
-                .map(|(_, (_, _, _, max))| max.unwrap_or(f64::INFINITY))
-                .sum();
-
-            // If all siblings are either capped or have infinite capacity
-            if total_uncapped_capacity.is_infinite() {
-                // Distribute based on weights among uncapped siblings
-                for i in 0..n {
-                    if !is_capped[i] {
-                        let (_, _, weight, cpu_max) = siblings[i];
-                        let fair_share = weight as f64 / remaining_weight as f64;
-
-                        if let Some(max_cap) = cpu_max {
-                            // Check if fair share would exceed cap
-                            // This shouldn't happen in the infinite case, but check anyway
-                            allocated[i] = max_cap;
-                            is_capped[i] = true;
-                        } else {
-                            // No cap, gets proportional share
-                            allocated[i] = fair_share;
-                        }
-                    }
-                }
-                break;
-            }
-
-            // Try to allocate based on weights
+            // Try to allocate remaining capacity based on weights
             for i in 0..n {
                 if is_capped[i] {
                     continue;
                 }
 
-                let (_, _, weight, cpu_max) = siblings[i];
-                let fair_share_of_uncapped = (weight as f64 / remaining_weight as f64) * total_uncapped_capacity;
+                let (_, _, weight, _) = siblings[i];
+                let fair_share = (weight as f64 / remaining_weight as f64) * remaining_capacity;
 
-                if let Some(max_cap) = cpu_max {
-                    if fair_share_of_uncapped > max_cap {
+                // Check if this exceeds the normalized cap
+                if let Some(cap) = normalized_caps[i] {
+                    if fair_share > cap {
                         // This sibling hits its cap
-                        allocated[i] = max_cap;
+                        allocated[i] = cap;
                         is_capped[i] = true;
+                        remaining_capacity -= cap;
                         remaining_weight -= weight;
                         any_newly_capped = true;
                     }
@@ -376,14 +410,14 @@ impl ActualizedCGroupTree {
                 for i in 0..n {
                     if !is_capped[i] {
                         let (_, _, weight, _) = siblings[i];
-                        allocated[i] = (weight as f64 / remaining_weight as f64) * total_uncapped_capacity;
+                        allocated[i] = (weight as f64 / remaining_weight as f64) * remaining_capacity;
                     }
                 }
                 break;
             }
         }
 
-        // Convert allocated capacities to fractions of total
+        // Return allocated fractions (already normalized to sum to 1.0 or less)
         let total_allocated: f64 = allocated.iter().sum();
         if total_allocated > 0.0 {
             allocated.iter().map(|a| a / total_allocated).collect()
@@ -744,6 +778,14 @@ impl CGroupTreeNode {
         // Assign IDs
         Self::assign_ids(&mut tree, &mut 0);
         tree
+    }
+
+    /// Create a fixed random tree for reproducible debugging
+    /// Uses a fixed seed to generate the same tree every time
+    pub fn fixed_random_tree() -> Self {
+        let mut gen = Gen::new(42);  // Fixed seed for reproducibility
+        let constraints = SystemConstraints::detect();
+        Self::arbitrary_tree(&mut gen, &constraints, 3, 3)
     }
 
     /// Count the total number of nodes in this tree.
