@@ -298,18 +298,19 @@ impl CGroupTreeNode {
         // Print some key resource info
         let mut info = Vec::new();
 
-        if let Some(ref cpus) = node.resources.0.cpu.cpus {
-            info.push(format!("cpus:{}", cpus));
-        }
+        // CPU resources
         if let Some(shares) = node.resources.0.cpu.shares {
             info.push(format!("shares:{}", shares));
         }
         if let Some(quota) = node.resources.0.cpu.quota {
-            info.push(format!("quota:{}", quota));
+            if let Some(period) = node.resources.0.cpu.period {
+                // Show as percentage of one CPU
+                let percent = (quota as f64 / period as f64) * 100.0;
+                info.push(format!("cpu.max:{:.1}%", percent));
+            }
         }
-        if let Some(period) = node.resources.0.cpu.period {
-            info.push(format!("period:{}", period));
-        }
+
+        // Memory resources
         if let Some(mem) = node.resources.0.memory.memory_hard_limit {
             let mb = mem / (1024 * 1024);
             info.push(format!("mem:{}MB", mb));
@@ -321,6 +322,8 @@ impl CGroupTreeNode {
         if let Some(swappiness) = node.resources.0.memory.swappiness {
             info.push(format!("swappiness:{}", swappiness));
         }
+
+        // Other resources
         if let Some(weight) = node.resources.0.blkio.weight {
             info.push(format!("blkio:{}", weight));
         }
@@ -570,44 +573,42 @@ impl RandResources {
 
         let mut resources = Resources::default();
 
-        // Randomly set CPU resources
-        if bool::arbitrary(g) {
-            // CPU shares (typically 1-1024, with 100 being default)
-            resources.cpu.shares = if bool::arbitrary(g) {
-                let shares: u16 = u16::arbitrary(g);
-                Some(std::cmp::max(shares % 1024, 1) as u64) // 1-1024
-            } else {
-                None
-            };
-
-            // CPU quota and period should be set together
-            if bool::arbitrary(g) {
-                let period: u32 = u32::arbitrary(g);
-                let period = ((period % 999000) + 1000) as u64; // 1000-1000000 microseconds
-                let quota_factor: u32 = u32::arbitrary(g);
-                let quota = ((quota_factor % period as u32) + 1000) as i64; // 1000 to period
-                resources.cpu.quota = Some(quota);
-                resources.cpu.period = Some(period);
-            }
-
-            // CPUSET - specific CPUs (simple format like "0", "0-2", "0,2,4")
-            // Now respects actual CPU count on the system!
-            if bool::arbitrary(g) && max_cpu > 0 {
-                let cpu_type: u8 = u8::arbitrary(g);
-                if cpu_type % 2 == 0 {
-                    // Single CPU
-                    let cpu_num: u64 = u64::arbitrary(g);
-                    resources.cpu.cpus = Some(format!("{}", cpu_num % (max_cpu as u64 + 1)));
-                } else {
-                    // CPU range
-                    let start: u64 = u64::arbitrary(g);
-                    let len: u64 = u64::arbitrary(g);
-                    let start = start % (max_cpu as u64 + 1);
-                    let end = std::cmp::min(start + (len % 4) + 1, max_cpu as u64);
-                    resources.cpu.cpus = Some(format!("{}-{}", start, end));
-                }
-            }
+        // CPU shares (cpu.weight) - 60% probability
+        // CPU shares (typically 1-1024, with 100 being default)
+        if (u8::arbitrary(g) % 100) < 60 {
+            let shares: u16 = u16::arbitrary(g);
+            resources.cpu.shares = Some(std::cmp::max(shares % 1024, 1) as u64); // 1-1024
         }
+
+        // CPU quota/period (cpu.max) - 30% probability
+        // CPU quota and period should be set together
+        if (u8::arbitrary(g) % 100) < 30 {
+            let period: u32 = u32::arbitrary(g);
+            let period = ((period % 999000) + 1000) as u64; // 1000-1000000 microseconds
+            let quota_factor: u32 = u32::arbitrary(g);
+            let quota = ((quota_factor % period as u32) + 1000) as i64; // 1000 to period
+            resources.cpu.quota = Some(quota);
+            resources.cpu.period = Some(period);
+        }
+
+        // CPUSET - specific CPUs (simple format like "0", "0-2", "0,2,4")
+        // Now respects actual CPU count on the system!
+        // Disabled for now - just use shares and quota
+        // if bool::arbitrary(g) && max_cpu > 0 {
+        //     let cpu_type: u8 = u8::arbitrary(g);
+        //     if cpu_type % 2 == 0 {
+        //         // Single CPU
+        //         let cpu_num: u64 = u64::arbitrary(g);
+        //         resources.cpu.cpus = Some(format!("{}", cpu_num % (max_cpu as u64 + 1)));
+        //     } else {
+        //         // CPU range
+        //         let start: u64 = u64::arbitrary(g);
+        //         let len: u64 = u64::arbitrary(g);
+        //         let start = start % (max_cpu as u64 + 1);
+        //         let end = std::cmp::min(start + (len % 4) + 1, max_cpu as u64);
+        //         resources.cpu.cpus = Some(format!("{}-{}", start, end));
+        //     }
+        // }
 
         // Randomly set Memory resources
         // Now respects actual system memory!
