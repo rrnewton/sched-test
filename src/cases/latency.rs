@@ -4,7 +4,7 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::Result;
-use crate::{process, test, util, workloads};
+use crate::{process, util, workloads};
 use util::stats::Distribution;
 use util::system::CPUMask;
 use util::system::CPUSet;

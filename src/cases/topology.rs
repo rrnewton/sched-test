@@ -5,7 +5,7 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::Result;
-use crate::{converge, process, test, util, workloads};
+use crate::{converge, process, util, workloads};
 use util::system::CPUSet;
 use util::system::System;
 use workloads::context::Context;

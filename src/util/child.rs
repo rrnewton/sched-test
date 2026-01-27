@@ -247,16 +247,10 @@ impl Child {
                     let buffer_str = String::from_utf8_lossy(&buffer);
                     Err(anyhow!("Child process error: {}", buffer_str))
                 }
-            } else if exit_code.is_some() {
-                Err(anyhow!(
-                    "Child process exited with code {}",
-                    exit_code.unwrap()
-                ))
-            } else if signal.is_some() {
-                Err(anyhow!(
-                    "Child process was killed by signal {}",
-                    signal.unwrap()
-                ))
+            } else if let Some(code) = exit_code {
+                Err(anyhow!("Child process exited with code {}", code))
+            } else if let Some(sig) = signal {
+                Err(anyhow!("Child process was killed by signal {}", sig))
             } else {
                 Err(anyhow!("Child process exited with unknown status"))
             };
