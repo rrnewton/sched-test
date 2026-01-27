@@ -57,11 +57,8 @@ struct Args {
 fn run(args: Vec<String>) -> Result<Child> {
     // Check if a scheduler is already installed.
     let scheduler = SchedExt::installed().with_context(|| "unable to query scheduler")?;
-    if scheduler.is_some() {
-        return Err(anyhow!(
-            "scheduler already installed: {}",
-            scheduler.unwrap()
-        ));
+    if let Some(sched) = scheduler {
+        return Err(anyhow!("scheduler already installed: {}", sched));
     }
 
     // Run the given binary safely.
