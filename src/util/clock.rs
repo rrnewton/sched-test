@@ -1,7 +1,9 @@
 //! Clock and timer utilities.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+use std::time::Instant;
 
 /// A thread-safe timer for measuring elapsed time.
 pub struct Timer {
@@ -149,8 +151,9 @@ impl<const S: usize> Default for SplitTimer<S> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::time::Duration;
+
+    use super::*;
 
     #[test]
     fn test_timer() {

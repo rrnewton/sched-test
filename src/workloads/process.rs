@@ -1,18 +1,19 @@
 //! Process management for workloads.
 
-use anyhow::{anyhow, Result};
+use std::sync::atomic::AtomicU32;
+use crate::{util, workloads::{context::Context, semaphore::Semaphore}};
+use std::sync::atomic::Ordering;
+
+use anyhow::Result;
+use anyhow::anyhow;
 use libc;
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
-use std::sync::atomic::{AtomicU32, Ordering};
-
-use crate::util::cgroups::Cgroup;
-use crate::util::child::Child;
-use crate::util::sched::{Sched, SchedStats};
-use crate::util::shared::SharedBox;
-use crate::util::system::{CPUSet, System};
-use crate::workloads::context::Context;
-use crate::workloads::semaphore::Semaphore;
+use util::cgroups::Cgroup;
+use util::child::Child;
+use util::sched::Sched;
+use util::sched::SchedStats;
+use util::shared::SharedBox;
 
 /// A spec for a process to be started.
 #[derive(Default)]
@@ -69,28 +70,6 @@ impl ProcessHandle {
     /// Return stats for the process.
     pub fn stats(&self) -> Result<SchedStats> {
         Sched::get_process_thread_stats(Some(self.pid))
-    }
-
-    /// Set the affinity of this process to a specific CPU set.
-    ///
-    /// # Arguments
-    ///
-    /// * `set` - The CPU set to pin this process to
-    ///
-    /// # Returns
-    ///
-    /// A Result indicating success or failure.
-    pub fn set_affinity<T: CPUSet>(&self, set: &T) -> Result<()> {
-        set.set_affinity_for_pid(self.pid.as_raw())
-    }
-
-    /// Clear the affinity of this process (set it to all CPUs).
-    ///
-    /// # Returns
-    ///
-    /// A Result indicating success or failure.
-    pub fn clear_affinity(&self) -> Result<()> {
-        System::clear_affinity_for_pid(self.pid.as_raw())
     }
 }
 
@@ -242,19 +221,27 @@ impl Drop for Process {
 macro_rules! process {
     ($ctx:expr, $spec:expr, ($($var:ident),*), $func:expr) => {{
         $(let $var = $var.clone();)*
-        let p = $crate::workloads::process::Process::create($ctx, $func, $spec)?;
+        let p = $crate::__Process::create($ctx, $func, $spec)?;
         $ctx.add(p)
     }};
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicU32;
+    use std::sync::atomic::Ordering;
+    use crate::{util, workloads::context::Context};
+    use util::user::User;
+
     use super::*;
-    use crate::workloads::context::Context;
-    use std::sync::atomic::{AtomicU32, Ordering};
 
     #[test]
     fn test_process_iterations() -> Result<()> {
+        // Skip if not root.
+        if !User::is_root() {
+            return Ok(());
+        }
+
         let ctx = Context::create()?;
         let iter_count = ctx.allocate(AtomicU32::new(0))?;
         let iter_values = ctx.allocate_vec(2, |_| AtomicU32::new(0))?;

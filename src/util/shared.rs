@@ -2,11 +2,14 @@
 
 use std::alloc::Layout;
 use std::ptr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
-use crate::util::memfd::MemFd;
-use anyhow::{anyhow, Result};
+use anyhow::Result;
+use anyhow::anyhow;
+
+use super::memfd::MemFd;
 
 /// A bump allocator that uses a memfd as backing storage.
 ///
@@ -55,33 +58,35 @@ impl BumpAllocator {
     /// This function is unsafe because it returns a raw pointer that the caller must
     /// properly manage.
     pub unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // Calculate the next aligned address.
-        let align = layout.align();
-        let size = layout.size();
+        unsafe {
+            // Calculate the next aligned address.
+            let align = layout.align();
+            let size = layout.size();
 
-        // Get the current position and align it.
-        let current = self.next.load(Ordering::Relaxed);
-        let aligned = (current + align - 1) & !(align - 1);
+            // Get the current position and align it.
+            let current = self.next.load(Ordering::Relaxed);
+            let aligned = (current + align - 1) & !(align - 1);
 
-        // Check if we have enough space.
-        if aligned + size > self.memfd.size() {
-            return ptr::null_mut();
-        }
-
-        // Try to update the next pointer.
-        match self.next.compare_exchange(
-            current,
-            aligned + size,
-            Ordering::SeqCst,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => {
-                // We successfully claimed this memory.
-                self.memfd.data().add(aligned)
+            // Check if we have enough space.
+            if aligned + size > self.memfd.size() {
+                return ptr::null_mut();
             }
-            Err(_) => {
-                // Someone else updated the pointer, try again.
-                self.alloc(layout)
+
+            // Try to update the next pointer.
+            match self.next.compare_exchange(
+                current,
+                aligned + size,
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    // We successfully claimed this memory.
+                    self.memfd.data().add(aligned)
+                }
+                Err(_) => {
+                    // Someone else updated the pointer, try again.
+                    self.alloc(layout)
+                }
             }
         }
     }

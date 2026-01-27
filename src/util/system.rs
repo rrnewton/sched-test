@@ -1,28 +1,34 @@
-//! System topology and affinity utilties.
+//! System topology and affinity utilities.
 
-use anyhow::{anyhow, Result};
 use std::fmt;
 use std::fs;
 use std::io::Read;
 use std::path::Path;
 
+use anyhow::Result;
+use anyhow::anyhow;
+
 unsafe fn cpu_set(cpu: usize, set: &mut libc::cpu_set_t) {
-    // Calculate which element in the array contains this CPU's bit.
-    let cpu_elem = cpu / (8 * std::mem::size_of::<libc::c_ulong>());
-    // Calculate the bit position within that element.
-    let cpu_bit = cpu % (8 * std::mem::size_of::<libc::c_ulong>());
-    // Get a pointer to the array of c_ulong elements.
-    let set_ptr = set as *mut libc::cpu_set_t as *mut libc::c_ulong;
-    // Set the bit.
-    *set_ptr.add(cpu_elem) |= 1 << cpu_bit;
+    unsafe {
+        // Calculate which element in the array contains this CPU's bit.
+        let cpu_elem = cpu / (8 * std::mem::size_of::<libc::c_ulong>());
+        // Calculate the bit position within that element.
+        let cpu_bit = cpu % (8 * std::mem::size_of::<libc::c_ulong>());
+        // Get a pointer to the array of c_ulong elements.
+        let set_ptr = set as *mut libc::cpu_set_t as *mut libc::c_ulong;
+        // Set the bit.
+        *set_ptr.add(cpu_elem) |= 1 << cpu_bit;
+    }
 }
 
 unsafe fn cpu_or(dest: &mut libc::cpu_set_t, src: &libc::cpu_set_t) {
-    let dest_ptr = dest as *mut libc::cpu_set_t as *mut libc::c_ulong;
-    let src_ptr = src as *const libc::cpu_set_t as *const libc::c_ulong;
-    let size = std::mem::size_of::<libc::cpu_set_t>() / std::mem::size_of::<libc::c_ulong>();
-    for i in 0..size {
-        *dest_ptr.add(i) |= *src_ptr.add(i);
+    unsafe {
+        let dest_ptr = dest as *mut libc::cpu_set_t as *mut libc::c_ulong;
+        let src_ptr = src as *const libc::cpu_set_t as *const libc::c_ulong;
+        let size = std::mem::size_of::<libc::cpu_set_t>() / std::mem::size_of::<libc::c_ulong>();
+        for i in 0..size {
+            *dest_ptr.add(i) |= *src_ptr.add(i);
+        }
     }
 }
 
@@ -85,34 +91,6 @@ pub trait CPUSet {
     /// Migrate the current thread to this set.
     fn migrate(&self) -> Result<()> {
         self.run(|| {})
-    }
-
-    /// Set the affinity of a specific process/thread to this CPU set.
-    ///
-    /// # Arguments
-    ///
-    /// * `pid` - The process ID (or 0 for current process)
-    ///
-    /// # Returns
-    ///
-    /// A Result indicating success or failure.
-    fn set_affinity_for_pid(&self, pid: i32) -> Result<()> {
-        let target = self.mask();
-        let rc = unsafe {
-            libc::sched_setaffinity(
-                pid,
-                std::mem::size_of::<libc::cpu_set_t>(),
-                &target,
-            )
-        };
-        if rc < 0 {
-            return Err(anyhow!(
-                "unable to set CPU affinity for pid {}: {}",
-                pid,
-                std::io::Error::last_os_error()
-            ));
-        }
-        Ok(())
     }
 }
 
@@ -337,21 +315,6 @@ pub struct System {
 }
 
 impl System {
-    /// Clear the affinity for a specific process (set it to all CPUs).
-    ///
-    /// # Arguments
-    ///
-    /// * `pid` - The process ID (or 0 for current process)
-    ///
-    /// # Returns
-    ///
-    /// A Result indicating success or failure.
-    pub fn clear_affinity_for_pid(pid: i32) -> Result<()> {
-        // Load the system to get all CPUs
-        let system = System::load()?;
-        system.set_affinity_for_pid(pid)
-    }
-
     /// Get the current CPU ID.
     pub fn current_cpu() -> Result<i32> {
         let cpu = unsafe { libc::sched_getcpu() };

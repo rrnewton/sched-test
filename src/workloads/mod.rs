@@ -8,3 +8,10 @@ pub mod context;
 pub mod process;
 pub mod semaphore;
 pub mod spinner;
+
+// Re-exports at module/crate root for macro $crate:: path resolution.
+// In Buck, this module IS the crate root, so $crate::__converge works.
+// In Cargo, these are re-exported again from lib.rs.
+pub use benchmark::converge as __converge;
+pub use benchmark::measure as __measure;
+pub use process::Process as __Process;

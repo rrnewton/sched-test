@@ -1,11 +1,17 @@
 //! Helpers for creating and managing cgroups.
 
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
+use std::fs::File;
+use std::fs::{self};
+use std::io::BufRead;
+use std::io::BufReader;
+use std::io::Write;
+use std::path::Path;
+use std::path::PathBuf;
 use std::process;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::anyhow;
 use rand::Rng;
 
 /// CgroupInfo contains information about a cgroup.
@@ -71,16 +77,16 @@ impl Cgroup {
 
         // Generate a new unique name, based on a random number.
         let mut rng = rand::thread_rng();
-        let name = format!("schtest-{}", rng.gen::<u32>());
+        let name = format!("schtest-{}", rng.r#gen::<u32>());
 
         // Create the new cgroup path.
         let cgroup_mount = PathBuf::from("/sys/fs/cgroup");
         // Note: joining "/" in the middle will remove the /sys/fs/cgroup prefix and cause an error:
         let new_cgroup_path = if current_cgroup == "/" {
-                cgroup_mount.join(&name)
-            } else {
-                cgroup_mount.join(&current_cgroup).join(&name)
-            };
+            cgroup_mount.join(&name)
+        } else {
+            cgroup_mount.join(&current_cgroup).join(&name)
+        };
 
         fs::create_dir_all(&new_cgroup_path).context("failed to create cgroup directory")?;
 

@@ -3,14 +3,17 @@
 //! This module provides utilities for benchmarking workloads and measuring
 //! performance metrics.
 
-use anyhow::Result;
-use criterion::{Criterion, SamplingMode, Throughput};
-use std::{
-    io::{self, Write},
-    time::{Duration, Instant},
-};
+use std::io::Write;
+use crate::util;
+use std::io::{self};
+use std::time::Duration;
+use std::time::Instant;
 
-use crate::util::stats::Distribution;
+use anyhow::Result;
+use criterion::Criterion;
+use criterion::SamplingMode;
+use criterion::Throughput;
+use util::stats::Distribution;
 
 /// Represents the result of a benchmark measurement.
 pub enum BenchResult {
@@ -168,7 +171,8 @@ where
             group.finish();
         }
         Ok(BenchResult::Count(_)) => {
-            use std::sync::{Arc, Mutex};
+            use std::sync::Arc;
+            use std::sync::Mutex;
             let last_throughput = Arc::new(Mutex::new(None));
             let last_throughput_clone = last_throughput.clone();
             let mut group = c.benchmark_group(args.name);
@@ -206,12 +210,7 @@ macro_rules! converge {
     (($min:expr, $max:expr), $threshold:expr, $measure:expr) => {{
         let min_time = std::time::Duration::from_secs_f64($min);
         let max_time = std::time::Duration::from_secs_f64($max);
-        let result = $crate::workloads::benchmark::converge(
-            Some(min_time),
-            Some(max_time),
-            Some($threshold),
-            $measure,
-        );
+        let result = $crate::__converge(Some(min_time), Some(max_time), Some($threshold), $measure);
         match result {
             Ok(metric) => {
                 assert!(
@@ -231,7 +230,7 @@ macro_rules! converge {
 macro_rules! measure {
     ($ctx:expr, $args:expr, $name:expr, ($($var:ident),*), $func:expr) => {{
         $(let $var = $var.clone();)*
-        $crate::workloads::benchmark::measure($args, $name, move |iters: u32| {
+        $crate::__measure($args, $name, move |iters: u32| {
             $ctx.start(iters);
             $ctx.wait()?;
             $func(iters)
@@ -241,8 +240,10 @@ macro_rules! measure {
 
 #[cfg(test)]
 mod tests {
+    use std::thread;
+    use std::time::Duration;
+
     use super::*;
-    use std::{thread, time::Duration};
 
     #[test]
     fn test_converge_reaches_threshold() {

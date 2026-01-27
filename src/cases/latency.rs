@@ -1,19 +1,18 @@
 //! Tests for latency scenarios.
 
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Result;
-
-use crate::test;
-use crate::util::stats::Distribution;
-use crate::util::system::{CPUMask, CPUSet, System};
-use crate::workloads::benchmark::converge;
-use crate::workloads::context::Context;
-use crate::workloads::semaphore::Semaphore;
-use crate::workloads::spinner::Spinner;
-
-use crate::process;
+use crate::{process, test, util, workloads};
+use util::stats::Distribution;
+use util::system::CPUMask;
+use util::system::CPUSet;
+use util::system::System;
+use workloads::benchmark::converge;
+use workloads::context::Context;
+use workloads::semaphore::Semaphore;
+use workloads::spinner::Spinner;
 
 /// Test that verifies the scheduler favors threads with lower expected execution.
 ///
@@ -46,7 +45,7 @@ fn adaptive_priority() -> Result<()> {
                 let slow_sem_copy = slow_sem.clone();
                 let slow_sem_ret_copy = slow_sem_ret.clone();
                 s.spawn(move || {
-                    let spinner = Spinner::new(Instant::now());
+                    let spinner = Spinner::default();
                     mask_copy.run(move || {
                         loop {
                             slow_sem_copy.consume(1, 1, None);
@@ -56,11 +55,13 @@ fn adaptive_priority() -> Result<()> {
                         }
                     })
                 });
-                mask.run(move || loop {
-                    let iters = get_iters();
-                    for _ in 0..iters {
-                        slow_sem.produce(1, 1, None);
-                        slow_sem_ret.consume(1, 1, None);
+                mask.run(move || {
+                    loop {
+                        let iters = get_iters();
+                        for _ in 0..iters {
+                            slow_sem.produce(1, 1, None);
+                            slow_sem_ret.consume(1, 1, None);
+                        }
                     }
                 })
             })
@@ -78,7 +79,7 @@ fn adaptive_priority() -> Result<()> {
                 let fast_sem_copy = fast_sem.clone();
                 let fast_sem_ret_copy = fast_sem_ret.clone();
                 s.spawn(move || {
-                    let spinner = Spinner::new(Instant::now());
+                    let spinner = Spinner::default();
                     mask_copy.run(move || {
                         loop {
                             fast_sem_copy.consume(1, 1, None);
@@ -89,11 +90,13 @@ fn adaptive_priority() -> Result<()> {
                         }
                     })
                 });
-                mask.run(move || loop {
-                    let iters = get_iters();
-                    for _ in 0..iters {
-                        fast_sem.produce(1, 1, None);
-                        fast_sem_ret.consume(1, 1, None);
+                mask.run(move || {
+                    loop {
+                        let iters = get_iters();
+                        for _ in 0..iters {
+                            fast_sem.produce(1, 1, None);
+                            fast_sem_ret.consume(1, 1, None);
+                        }
                     }
                 })
             })

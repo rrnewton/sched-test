@@ -5,11 +5,15 @@ edition = "2021"
 description = "Scheduler testing framework"
 authors = ["Original authors of schtest"]
 
+[features]
+default = ["cargo_build"]
+cargo_build = []
+
 [dependencies]
 clap = { version = "4.4", features = ["derive"] }
 anyhow = "1.0"
 thiserror = "1.0"
-nix = { version = "0.27", features = ["user", "mman", "fs", "process", "signal", "sched"] }
+nix = { version = "0.30", features = ["user", "mman", "fs", "process", "signal", "sched"] }
 libc = "0.2"
 crossbeam = "0.8"
 parking_lot = "0.12"

@@ -1,13 +1,16 @@
 //! Semaphore implementation.
 
-use libc;
 use std::mem::MaybeUninit;
+use crate::util;
 use std::os::raw::c_int;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use crate::util::clock::SplitTimer;
-use crate::util::stats::{Distribution, ReservoirSampler};
+use libc;
+use util::clock::SplitTimer;
+use util::stats::Distribution;
+use util::stats::ReservoirSampler;
 
 /// A lock-free semaphore for synchronizing threads.
 pub struct Semaphore<const S: usize = 256, const R: usize = 1024> {
@@ -268,8 +271,9 @@ impl<const S: usize> Default for Semaphore<S> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::thread;
+
+    use super::*;
 
     #[test]
     fn test_semaphore_produce_consume() {

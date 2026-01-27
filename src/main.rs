@@ -1,13 +1,16 @@
-use anyhow::{anyhow, Context, Result};
-use clap::{ArgAction, Parser};
-use once_cell::sync::Lazy;
-use schtest::cases;
-use schtest::util::child::Child;
-use schtest::util::sched::SchedExt;
-use schtest::util::user::User;
 use std::collections::HashSet;
 use std::sync::Mutex;
-use std::{thread, time::Duration};
+use std::thread;
+use std::time::Duration;
+
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::anyhow;
+use clap::ArgAction;
+use clap::Parser;
+use once_cell::sync::Lazy;
+use schtest::{cases, workloads::benchmark::BenchArgs};
+use schtest::util::{child::Child, sched::SchedExt, user::User};
 
 /// Command line arguments for the schtest binary.
 #[derive(Parser, Debug)]
@@ -140,7 +143,6 @@ fn run_tests(args: &Args) -> libtest_with::Conclusion {
     };
     let mut libtest_tests = Vec::new();
     if args.benchmarks {
-        use schtest::workloads::benchmark::BenchArgs;
         for t in inventory::iter::<cases::Benchmark> {
             #[allow(clippy::redundant_field_names)]
             let name = intern_string((t.name)());

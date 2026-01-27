@@ -1,11 +1,14 @@
-use nix::unistd::Pid;
-use procfs::{process::Process, ticks_per_second};
 use std::fs;
 use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::anyhow;
+use nix::unistd::Pid;
+use procfs::process::Process;
+use procfs::ticks_per_second;
 
 /// Scheduler statistics for a thread.
 #[derive(Debug, Default, Clone)]
@@ -341,10 +344,12 @@ impl SchedExt {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use more_asserts::assert_gt;
     use std::thread;
     use std::time::Duration;
+
+    use more_asserts::assert_gt;
+
+    use super::*;
 
     #[test]
     fn test_available() {

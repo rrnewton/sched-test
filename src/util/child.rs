@@ -1,14 +1,23 @@
 //! Child process management, including function execution.
 
-use crate::util::user::User;
-use anyhow::{anyhow, Context, Result};
+use std::ffi::CString;
+use std::os::unix::io::AsRawFd;
+use std::os::unix::io::BorrowedFd;
+use std::os::unix::io::OwnedFd;
+
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::anyhow;
 use libc;
 use nix::sched::CloneFlags;
-use nix::sys::signal::{self, Signal};
-use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
+use nix::sys::signal::Signal;
+use nix::sys::signal::{self};
+use nix::sys::wait::WaitPidFlag;
+use nix::sys::wait::WaitStatus;
+use nix::sys::wait::waitpid;
 use nix::unistd::Pid;
-use std::ffi::CString;
-use std::os::unix::io::RawFd;
+
+use super::user::User;
 
 /// A wrapper around a notification file descriptor.
 ///
@@ -16,10 +25,10 @@ use std::os::unix::io::RawFd;
 /// parent and child processes.
 struct NotificationFd {
     /// The read end of the notification pipe.
-    read_fd: Option<RawFd>,
+    read_fd: Option<OwnedFd>,
 
     /// The write end of the notification pipe.
-    write_fd: Option<RawFd>,
+    write_fd: Option<OwnedFd>,
 }
 
 impl NotificationFd {
@@ -36,23 +45,12 @@ impl NotificationFd {
 
     /// Close the write end of the notification pipe.
     fn close_write(&mut self) {
-        if let Some(fd) = self.write_fd.take() {
-            let _ = nix::unistd::close(fd);
-        }
+        let _ = self.write_fd.take();
     }
 
     /// Close the read end of the notification pipe.
     fn close_read(&mut self) {
-        if let Some(fd) = self.read_fd.take() {
-            let _ = nix::unistd::close(fd);
-        }
-    }
-}
-
-impl Drop for NotificationFd {
-    fn drop(&mut self) {
-        self.close_write();
-        self.close_read();
+        let _ = self.read_fd.take();
     }
 }
 
@@ -108,7 +106,8 @@ impl Child {
     {
         // Create a notification pipe for result communication.
         let mut notification = NotificationFd::new()?;
-        let write_fd = notification.write_fd.unwrap();
+
+        let write_fd = notification.write_fd.as_ref().unwrap().as_raw_fd();
 
         // Call clone with the given flags.
         let flags = extra_flags.unwrap_or(CloneFlags::empty());
@@ -123,15 +122,18 @@ impl Child {
             let result = f();
             match result {
                 Ok(()) => {
-                    let _ = nix::unistd::close(write_fd);
+                    let _ = unsafe { libc::close(write_fd) };
                 }
                 Err(error) => {
                     // Error case: serialize the error message as a string.
                     let error_msg = error.to_string();
-                    let _ = nix::unistd::write(write_fd, error_msg.as_bytes());
+                    let _ = nix::unistd::write(
+                        unsafe { BorrowedFd::borrow_raw(write_fd) },
+                        error_msg.as_bytes(),
+                    );
                 }
             }
-            std::process::exit(0);
+            unsafe { libc::_exit(0) };
         }
         if pid < 0 {
             return Err(anyhow!(
@@ -226,7 +228,10 @@ impl Child {
             let mut temp_buf = [0u8; 1024];
 
             loop {
-                match nix::unistd::read(self.notification.read_fd.unwrap(), &mut temp_buf) {
+                let read_result = nix::unistd::read(self.notification.read_fd.as_ref().unwrap(), &mut temp_buf);
+
+                match read_result
+                {
                     Ok(0) => break, // End of file.
                     Ok(n) => buffer.extend_from_slice(&temp_buf[..n]),
                     Err(nix::errno::Errno::EINTR) => continue, // Interrupted, try again.
@@ -377,7 +382,7 @@ mod tests {
         let mut child = Child::run(move || Err(anyhow!("Test error")), None).unwrap();
 
         let result = child.wait(true, false).unwrap();
-        assert!(!result.is_ok());
+        assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("Test error"));
     }

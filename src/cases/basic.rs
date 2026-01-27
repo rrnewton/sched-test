@@ -1,21 +1,19 @@
 //! Basic tests.
 
-use std::time::{Duration, Instant};
-
-use crate::util::stats::Distribution;
-use crate::util::system::{CPUMask, CPUSet, System};
-
-use crate::workloads::benchmark::BenchArgs;
-use crate::workloads::benchmark::BenchResult::{Count, Latency};
-use crate::workloads::spinner::Spinner;
-use crate::workloads::{context::Context, semaphore::Semaphore};
-
-use crate::benchmark;
-use crate::measure;
-use crate::process;
-use crate::test;
+use std::time::Duration;
 
 use anyhow::Result;
+use crate::{benchmark, measure, process, test, util, workloads};
+use util::stats::Distribution;
+use util::system::CPUMask;
+use util::system::CPUSet;
+use util::system::System;
+use workloads::benchmark::BenchArgs;
+use workloads::benchmark::BenchResult::Count;
+use workloads::benchmark::BenchResult::Latency;
+use workloads::context::Context;
+use workloads::semaphore::Semaphore;
+use workloads::spinner::Spinner;
 
 fn self_test() -> Result<()> {
     Ok(())
@@ -26,7 +24,7 @@ test!("self_test", self_test);
 fn self_bench(args: &BenchArgs) -> Result<()> {
     let mut ctx = Context::create()?;
     measure!(&mut ctx, &args, "1ms", (), |iters| {
-        let spinner = Spinner::new(Instant::now());
+        let spinner = Spinner::default();
         spinner.spin(Duration::from_millis(iters as u64));
         Ok(Count(iters as u64))
     })
@@ -80,20 +78,24 @@ fn ping_pong(args: &BenchArgs, wake_type: WakeType) -> Result<()> {
     };
 
     process!(&mut ctx, None, (mask, sem1, sem2), move |mut get_iters| {
-        mask.run(|| loop {
-            let iters = get_iters();
-            for _ in 0..iters {
-                sem1.produce(1, 1, None);
-                sem2.consume(1, 1, None);
+        mask.run(|| {
+            loop {
+                let iters = get_iters();
+                for _ in 0..iters {
+                    sem1.produce(1, 1, None);
+                    sem2.consume(1, 1, None);
+                }
             }
         })
     });
     process!(&mut ctx, None, (mask, sem1, sem2), move |mut get_iters| {
-        mask.run(|| loop {
-            let iters = get_iters();
-            for _ in 0..iters {
-                sem2.produce(1, 1, None);
-                sem1.consume(1, 1, None);
+        mask.run(|| {
+            loop {
+                let iters = get_iters();
+                for _ in 0..iters {
+                    sem2.produce(1, 1, None);
+                    sem1.consume(1, 1, None);
+                }
             }
         })
     });

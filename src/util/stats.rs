@@ -3,7 +3,8 @@
 use std::cmp::PartialOrd;
 use std::fmt;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use rand::Rng;
@@ -175,20 +176,18 @@ where
             .quantiles
             .iter()
             .find(|(p, _)| (*p - 0.001).abs() < 1e-6)
-            .map(|(_, v)| format!("{v:?}"))
-            .unwrap_or_else(|| "min".to_string());
+            .map_or_else(|| "min".to_string(), |(_, v)| format!("{v:?}"));
         let max_label = self
             .quantiles
             .iter()
             .find(|(p, _)| (*p - 0.999).abs() < 1e-6)
-            .map(|(_, v)| format!("{v:?}"))
-            .unwrap_or_else(|| "max".to_string());
+            .map_or_else(|| "max".to_string(), |(_, v)| format!("{v:?}"));
         let p50_label = self
             .quantiles
             .iter()
             .find(|(p, _)| (*p - 0.5).abs() < 1e-6)
             .map(|(_, v)| format!("{v:?}"));
-        let p50_len = p50_label.as_ref().map(|s| s.len() + 2).unwrap_or(0); // spaces around p50
+        let p50_len = p50_label.as_ref().map_or(0, |s| s.len() + 2); // spaces around p50
         let bar_space = width
             .or_else(|| term_size::dimensions().map(|(w, _)| w))
             .unwrap_or(64)
@@ -272,8 +271,7 @@ where
                     (i, (v - p50_v).abs())
                 })
                 .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
-                .map(|(i, _)| i)
-                .unwrap_or(bar_width / 2)
+                .map_or(bar_width / 2, |(i, _)| i)
         } else {
             bar_width / 2
         };
@@ -373,12 +371,12 @@ fn distance(a_quantiles: &[(f64, f64)], b_quantiles: &[(f64, f64)]) -> f64 {
 
     // Calculate the total range of values.
     let total_min = f64::min(
-        a_quantiles.first().map(|q| q.1).unwrap_or(0.0),
-        b_quantiles.first().map(|q| q.1).unwrap_or(0.0),
+        a_quantiles.first().map_or(0.0, |q| q.1),
+        b_quantiles.first().map_or(0.0, |q| q.1),
     );
     let total_max = f64::max(
-        a_quantiles.last().map(|q| q.1).unwrap_or(0.0),
-        b_quantiles.last().map(|q| q.1).unwrap_or(0.0),
+        a_quantiles.last().map_or(0.0, |q| q.1),
+        b_quantiles.last().map_or(0.0, |q| q.1),
     );
 
     // If the range is zero, the distributions are identical.
@@ -611,9 +609,12 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use more_asserts::{assert_gt, assert_lt};
     use std::time::Duration;
+
+    use more_asserts::assert_gt;
+    use more_asserts::assert_lt;
+
+    use super::*;
 
     #[test]
     fn test_distribution_empty() {

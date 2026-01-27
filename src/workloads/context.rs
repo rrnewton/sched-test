@@ -1,11 +1,14 @@
 //! Context for running workloads.
 
-use anyhow::Result;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use crate::{util, workloads::process::{Process, ProcessHandle}};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
-use crate::util::shared::{BumpAllocator, SharedBox, SharedVec};
-use crate::workloads::process::{Process, ProcessHandle};
+use anyhow::Result;
+use util::shared::BumpAllocator;
+use util::shared::SharedBox;
+use util::shared::SharedVec;
 
 /// Whether the context is running.
 #[derive(Clone)]
