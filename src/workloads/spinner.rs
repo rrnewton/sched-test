@@ -13,7 +13,7 @@ pub struct Spinner {
 
 impl Spinner {
     /// Default duration is 99 years.
-    pub const DEFAULT_DURATION: Duration = Duration::from_secs(60 * 60 * 24 * 365 * 99);
+    pub const DEFAULT_DURATION: Duration = Duration::from_hours(24 * 365 * 99);
 
     /// Spin for the specified duration.
     ///
