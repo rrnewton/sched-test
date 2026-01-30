@@ -61,7 +61,7 @@ fn fairness() -> Result<()> {
             .collect();
         let mean = times.iter().sum::<f64>() / times.len() as f64;
         let estimates = d.estimates();
-        eprintln!("{}", estimates.visualize(None));
+        eprintln!("{}", estimates.visualize(None, None));
         // Return the p10 of the runtimes as a fraction of the average runtime.
         if let Some(p10) = estimates.percentile(0.1) {
             Ok(p10.as_secs_f64() / mean)

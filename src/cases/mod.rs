@@ -108,6 +108,7 @@ macro_rules! benchmark {
 pub mod basic;
 pub mod fairness;
 pub mod latency;
+pub mod timedwakeups_lowutil;
 pub mod topology;
 
 inventory::collect!(Test);

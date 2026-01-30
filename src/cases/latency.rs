@@ -116,9 +116,9 @@ fn adaptive_priority() -> Result<()> {
         let fast_est = d_fast.estimates();
         let slow_est = d_slow.estimates();
         eprintln!("Fast semaphore wake estimates:");
-        eprintln!("{}", fast_est.visualize(None));
+        eprintln!("{}", fast_est.visualize(None, None));
         eprintln!("Slow semaphore wake estimates:");
-        eprintln!("{}", slow_est.visualize(None));
+        eprintln!("{}", slow_est.visualize(None, None));
         let p90_fast = fast_est
             .percentile(0.9)
             .ok_or_else(|| anyhow::anyhow!("No p90 for fast semaphore"))?;

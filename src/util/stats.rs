@@ -3,6 +3,7 @@
 use std::cmp::PartialOrd;
 use std::fmt;
 use std::mem::MaybeUninit;
+use std::ops::RangeInclusive;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -66,7 +67,7 @@ impl<T: Copy, const N: usize> ReservoirSampler<T, N> {
             }
         } else {
             // Reservoir is full, use reservoir sampling algorithm.
-            let random_index = rand::thread_rng().gen_range(0..N);
+            let random_index = rand::rng().random_range(0..N);
             unsafe {
                 std::ptr::write(self.samples[random_index].as_ptr() as *mut T, item);
             }
@@ -166,22 +167,38 @@ where
         None
     }
 
-    /// Visualize the density of the distribution as text.
-    pub fn visualize(&self, width: Option<usize>) -> String
-    where
-        T: std::fmt::Debug,
-    {
-        const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-        let min_label = self
+    /// Returns a suitable (min, max) range.
+    pub fn range(&self) -> RangeInclusive<T> {
+        let min = self
             .quantiles
             .iter()
             .find(|(p, _)| (*p - 0.001).abs() < 1e-6)
-            .map_or_else(|| "min".to_string(), |(_, v)| format!("{v:?}"));
-        let max_label = self
+            .unwrap()
+            .1;
+        let max = self
             .quantiles
             .iter()
             .find(|(p, _)| (*p - 0.999).abs() < 1e-6)
-            .map_or_else(|| "max".to_string(), |(_, v)| format!("{v:?}"));
+            .unwrap()
+            .1;
+        min..=max
+    }
+
+    /// Visualize the density of the distribution as text.
+    pub fn visualize(&self, width: Option<usize>, range: Option<RangeInclusive<T>>) -> String
+    where
+        T: std::fmt::Debug,
+    {
+        let range = if let Some(range) = range {
+            range
+        } else {
+            self.range()
+        };
+        let min = range.start();
+        let max = range.end();
+        const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+        let min_label = format!("{min:?}");
+        let max_label = format!("{max:?}");
         let p50_label = self
             .quantiles
             .iter()
@@ -217,8 +234,8 @@ where
         let bar_indices: Vec<usize> = (0..n)
             .map(|i| if i <= n / 2 { i } else { n - 1 - i })
             .collect();
-        let min = quantile_points[0].1;
-        let max = quantile_points[n - 1].1;
+        let min = to_f64(*min);
+        let max = to_f64(*max);
         let range = if (max - min).abs() < f64::EPSILON {
             1.0
         } else {
@@ -257,8 +274,6 @@ where
             .find(|(p, _)| (*p - 0.5).abs() < 1e-6)
             .map(|(_, v)| to_f64(*v));
         let p50_pos = if let Some(p50_v) = p50_value {
-            let min = quantile_points[0].1;
-            let max = quantile_points[n - 1].1;
             let range = if (max - min).abs() < f64::EPSILON {
                 1.0
             } else {
@@ -704,7 +719,7 @@ mod tests {
         dist.add(3.0);
         dist.add(5.0);
         let estimates = dist.estimates();
-        let bars = estimates.visualize(None);
+        let bars = estimates.visualize(None, None);
         println!("{}", bars);
     }
 }

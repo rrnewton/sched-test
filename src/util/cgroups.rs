@@ -76,8 +76,8 @@ impl Cgroup {
             current_cgroup.ok_or_else(|| anyhow!("failed to determine current cgroup"))?;
 
         // Generate a new unique name, based on a random number.
-        let mut rng = rand::thread_rng();
-        let name = format!("schtest-{}", rng.r#gen::<u32>());
+        let mut rng = rand::rng();
+        let name = format!("schtest-{}", rng.random::<u32>());
 
         // Create the new cgroup path.
         let cgroup_mount = PathBuf::from("/sys/fs/cgroup");

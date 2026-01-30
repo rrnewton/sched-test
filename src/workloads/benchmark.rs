@@ -155,7 +155,7 @@ where
                     };
                     if let BenchResult::Latency(dist) = result {
                         let est = dist.estimates();
-                        let s = est.visualize(None);
+                        let s = est.visualize(None, None);
                         eprintln!("{s}");
                         let latency = est
                             .percentile(args.percentile)
