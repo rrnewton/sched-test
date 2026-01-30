@@ -37,6 +37,10 @@ struct Args {
     #[arg(long, action = ArgAction::SetTrue)]
     benchmarks: bool,
 
+    /// Skip root check.
+    #[arg(long, action = ArgAction::SetTrue)]
+    skip_root_check: bool,
+
     /// Binary to run (with optional arguments).
     #[arg(trailing_var_arg = true)]
     binary: Vec<String>,
@@ -52,6 +56,10 @@ struct Args {
     /// Percentile for benchmarks.
     #[arg(long, default_value_t = 0.50)]
     percentile: f64,
+
+    /// Comma-separated list of test names (or parts of names) to skip.
+    #[arg(long, value_delimiter = ',', default_value = None)]
+    skip_filters: Option<Vec<String>>,
 }
 
 fn run(args: Vec<String>) -> Result<Child> {
@@ -133,7 +141,7 @@ fn run_tests(args: &Args) -> libtest_with::Conclusion {
         quiet: false,
         test_threads: Some(1),
         logfile: None,
-        skip: vec![],
+        skip: args.skip_filters.clone().unwrap_or_default(),
         color: None,
         format: None,
         filter: args.filter.clone(),
@@ -175,7 +183,7 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     // We require root privileges to create cgroups, install the custom scheduler.
-    if !User::is_root() {
+    if !(args.skip_root_check || User::is_root()) {
         return Err(anyhow!("must run as root"));
     }
 
