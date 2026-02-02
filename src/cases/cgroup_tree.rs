@@ -1,7 +1,7 @@
 //! Tests for cgroup tree creation and resource management.
 
-use crate::workloads::cgroup_tree::{CGroupTreeNode, SystemConstraints, ActualizedCGroupTree};
 use crate::util::shared::{BumpAllocator, SharedBox};
+use crate::workloads::cgroup_tree::{ActualizedCGroupTree, CGroupTreeNode, SystemConstraints};
 use anyhow::Result;
 use quickcheck::Gen;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -19,16 +19,19 @@ fn create_cgroup_tree() -> Result<()> {
     let mut gen = Gen::new(42);
     let constraints = SystemConstraints::detect();
 
-    eprintln!("Detected {} CPUs, {} bytes memory",
-              constraints.num_cpus,
-              constraints.total_memory_bytes);
+    eprintln!(
+        "Detected {} CPUs, {} bytes memory",
+        constraints.num_cpus, constraints.total_memory_bytes
+    );
 
     // Generate a modest-sized tree: max depth 3, max 3 children per node
     let tree = CGroupTreeNode::arbitrary_tree(&mut gen, &constraints, 3, 3);
 
-    eprintln!("\nGenerated tree with {} nodes, depth {}",
-              tree.node_count(),
-              tree.max_depth());
+    eprintln!(
+        "\nGenerated tree with {} nodes, depth {}",
+        tree.node_count(),
+        tree.max_depth()
+    );
 
     eprintln!("\nCGroup Tree Structure:");
     tree.print_tree();
@@ -40,8 +43,11 @@ fn create_cgroup_tree() -> Result<()> {
     eprintln!("Successfully created {} cgroups", actualized.len());
 
     // Verify the number of cgroups created matches the tree
-    assert_eq!(actualized.len(), tree.node_count(),
-               "Number of created cgroups should match tree node count");
+    assert_eq!(
+        actualized.len(),
+        tree.node_count(),
+        "Number of created cgroups should match tree node count"
+    );
 
     // Create shared memory for start signal and scheduled time counters
     let allocator = BumpAllocator::new("cgroup_test", 1024 * 1024)?;
@@ -56,15 +62,26 @@ fn create_cgroup_tree() -> Result<()> {
 
     // Launch CPU hogs in all leaf cgroups (placeholder: 2 second duration)
     let hog_duration = Duration::from_secs(2);
-    eprintln!("\nLaunching CPU hogs in {} leaf cgroups for {:?}...",
-              num_leaves,
-              hog_duration);
+    eprintln!(
+        "\nLaunching CPU hogs in {} leaf cgroups for {:?}...",
+        num_leaves, hog_duration
+    );
 
-    let hogs = actualized.launch_leaf_hogs(hog_duration, start_signal.clone(), scheduled_ns_counters.clone())?;
+    let hogs = actualized.launch_leaf_hogs(
+        hog_duration,
+        start_signal.clone(),
+        scheduled_ns_counters.clone(),
+    )?;
 
-    eprintln!("Launched {} CPU hogs (waiting for start signal)", hogs.len());
-    assert_eq!(hogs.len(), actualized.count_leaves(),
-               "Should have one hog per leaf cgroup");
+    eprintln!(
+        "Launched {} CPU hogs (waiting for start signal)",
+        hogs.len()
+    );
+    assert_eq!(
+        hogs.len(),
+        actualized.count_leaves(),
+        "Should have one hog per leaf cgroup"
+    );
 
     // Give hogs a moment to initialize and enter their cgroups
     std::thread::sleep(Duration::from_millis(100));
@@ -75,7 +92,8 @@ fn create_cgroup_tree() -> Result<()> {
 
     // Wait for all hogs to complete
     eprintln!("Waiting for hogs to complete...");
-    let hog_results: Vec<(usize, SharedBox<AtomicU64>)> = hogs.iter()
+    let hog_results: Vec<(usize, SharedBox<AtomicU64>)> = hogs
+        .iter()
         .map(|h| (h.node_id, h.scheduled_ns.clone()))
         .collect();
 
@@ -86,7 +104,10 @@ fn create_cgroup_tree() -> Result<()> {
         Err(e) => {
             // Some hogs may have been OOM-killed due to strict memory limits
             // This is actually expected and shows that cgroup limits are working!
-            eprintln!("Some hogs were killed (likely OOM from memory limits): {}", e);
+            eprintln!(
+                "Some hogs were killed (likely OOM from memory limits): {}",
+                e
+            );
             eprintln!("This demonstrates that cgroup resource limits are being enforced!");
         }
     }
@@ -95,7 +116,8 @@ fn create_cgroup_tree() -> Result<()> {
     eprintln!("\nLeaf Node Scheduled Time:");
 
     // Collect results first to find column widths
-    let results: Vec<(usize, u64)> = hog_results.iter()
+    let results: Vec<(usize, u64)> = hog_results
+        .iter()
         .map(|(node_id, scheduled_ns)| (*node_id, scheduled_ns.load(Ordering::Acquire)))
         .collect();
 
@@ -106,11 +128,23 @@ fn create_cgroup_tree() -> Result<()> {
     let ns_width = max_ns.to_string().len().max(13); // "scheduled_ns" is 12 chars
 
     // Print header
-    eprintln!("{:>width1$}, {:>width2$}", "node_id", "scheduled_ns", width1 = node_id_width, width2 = ns_width);
+    eprintln!(
+        "{:>width1$}, {:>width2$}",
+        "node_id",
+        "scheduled_ns",
+        width1 = node_id_width,
+        width2 = ns_width
+    );
 
     // Print rows
     for (node_id, scheduled_ns) in &results {
-        eprintln!("{:>width1$}, {:>width2$}", node_id, scheduled_ns, width1 = node_id_width, width2 = ns_width);
+        eprintln!(
+            "{:>width1$}, {:>width2$}",
+            node_id,
+            scheduled_ns,
+            width1 = node_id_width,
+            width2 = ns_width
+        );
     }
 
     // Compute and print oracle statistics
@@ -134,9 +168,10 @@ test!("create_cgroup_tree", create_cgroup_tree);
 fn simple_cgroup_test() -> Result<()> {
     let constraints = SystemConstraints::detect();
 
-    eprintln!("Detected {} CPUs, {} bytes memory",
-              constraints.num_cpus,
-              constraints.total_memory_bytes);
+    eprintln!(
+        "Detected {} CPUs, {} bytes memory",
+        constraints.num_cpus, constraints.total_memory_bytes
+    );
 
     // Create simple deterministic tree
     let tree = CGroupTreeNode::simple_test_tree();
@@ -163,13 +198,21 @@ fn simple_cgroup_test() -> Result<()> {
 
     // Launch CPU hogs in all leaf cgroups (5 second duration for more stable results)
     let hog_duration = Duration::from_secs(5);
-    eprintln!("\nLaunching CPU hogs in {} leaf cgroups for {:?}...",
-              num_leaves,
-              hog_duration);
+    eprintln!(
+        "\nLaunching CPU hogs in {} leaf cgroups for {:?}...",
+        num_leaves, hog_duration
+    );
 
-    let hogs = actualized.launch_leaf_hogs(hog_duration, start_signal.clone(), scheduled_ns_counters.clone())?;
+    let hogs = actualized.launch_leaf_hogs(
+        hog_duration,
+        start_signal.clone(),
+        scheduled_ns_counters.clone(),
+    )?;
 
-    eprintln!("Launched {} CPU hogs (waiting for start signal)", hogs.len());
+    eprintln!(
+        "Launched {} CPU hogs (waiting for start signal)",
+        hogs.len()
+    );
 
     // Give hogs a moment to initialize
     std::thread::sleep(Duration::from_millis(100));
@@ -180,7 +223,8 @@ fn simple_cgroup_test() -> Result<()> {
 
     // Wait for all hogs to complete
     eprintln!("Waiting for hogs to complete...");
-    let hog_results: Vec<(usize, SharedBox<AtomicU64>)> = hogs.iter()
+    let hog_results: Vec<(usize, SharedBox<AtomicU64>)> = hogs
+        .iter()
         .map(|h| (h.node_id, h.scheduled_ns.clone()))
         .collect();
 
@@ -197,7 +241,8 @@ fn simple_cgroup_test() -> Result<()> {
     eprintln!("\nLeaf Node Scheduled Time:");
 
     // Collect results first to find column widths
-    let results: Vec<(usize, u64)> = hog_results.iter()
+    let results: Vec<(usize, u64)> = hog_results
+        .iter()
         .map(|(node_id, scheduled_ns)| (*node_id, scheduled_ns.load(Ordering::Acquire)))
         .collect();
 
@@ -208,18 +253,34 @@ fn simple_cgroup_test() -> Result<()> {
     let ns_width = max_ns.to_string().len().max(13); // "scheduled_ns" is 12 chars
 
     // Print header
-    eprintln!("{:>width1$}, {:>width2$}", "node_id", "scheduled_ns", width1 = node_id_width, width2 = ns_width);
+    eprintln!(
+        "{:>width1$}, {:>width2$}",
+        "node_id",
+        "scheduled_ns",
+        width1 = node_id_width,
+        width2 = ns_width
+    );
 
     // Print rows
     for (node_id, scheduled_ns) in &results {
-        eprintln!("{:>width1$}, {:>width2$}", node_id, scheduled_ns, width1 = node_id_width, width2 = ns_width);
+        eprintln!(
+            "{:>width1$}, {:>width2$}",
+            node_id,
+            scheduled_ns,
+            width1 = node_id_width,
+            width2 = ns_width
+        );
     }
 
     // Calculate and show ratio
     if results.len() == 2 {
         let ns1 = results[0].1;
         let ns2 = results[1].1;
-        let ratio = if ns1 > 0 { ns2 as f64 / ns1 as f64 } else { 0.0 };
+        let ratio = if ns1 > 0 {
+            ns2 as f64 / ns1 as f64
+        } else {
+            0.0
+        };
         eprintln!("\nRatio (leaf2/leaf1): {:.2} (expected ~2.0)", ratio);
     }
 
@@ -239,9 +300,10 @@ test!("simple_cgroup_test", simple_cgroup_test);
 fn fixed_random_tree_test() -> Result<()> {
     let constraints = SystemConstraints::detect();
 
-    eprintln!("Detected {} CPUs, {} bytes memory",
-              constraints.num_cpus,
-              constraints.total_memory_bytes);
+    eprintln!(
+        "Detected {} CPUs, {} bytes memory",
+        constraints.num_cpus, constraints.total_memory_bytes
+    );
 
     // Create fixed random tree (seed = 42)
     let tree = CGroupTreeNode::fixed_random_tree();
@@ -268,13 +330,21 @@ fn fixed_random_tree_test() -> Result<()> {
 
     // Launch CPU hogs in all leaf cgroups (5 second duration for stable results)
     let hog_duration = Duration::from_secs(5);
-    eprintln!("\nLaunching CPU hogs in {} leaf cgroups for {:?}...",
-              num_leaves,
-              hog_duration);
+    eprintln!(
+        "\nLaunching CPU hogs in {} leaf cgroups for {:?}...",
+        num_leaves, hog_duration
+    );
 
-    let hogs = actualized.launch_leaf_hogs(hog_duration, start_signal.clone(), scheduled_ns_counters.clone())?;
+    let hogs = actualized.launch_leaf_hogs(
+        hog_duration,
+        start_signal.clone(),
+        scheduled_ns_counters.clone(),
+    )?;
 
-    eprintln!("Launched {} CPU hogs (waiting for start signal)", hogs.len());
+    eprintln!(
+        "Launched {} CPU hogs (waiting for start signal)",
+        hogs.len()
+    );
 
     // Give hogs a moment to initialize
     std::thread::sleep(Duration::from_millis(100));
@@ -285,7 +355,8 @@ fn fixed_random_tree_test() -> Result<()> {
 
     // Wait for all hogs to complete
     eprintln!("Waiting for hogs to complete...");
-    let hog_results: Vec<(usize, SharedBox<AtomicU64>)> = hogs.iter()
+    let hog_results: Vec<(usize, SharedBox<AtomicU64>)> = hogs
+        .iter()
         .map(|h| (h.node_id, h.scheduled_ns.clone()))
         .collect();
 
@@ -301,7 +372,8 @@ fn fixed_random_tree_test() -> Result<()> {
     // Print scheduled time table
     eprintln!("\nLeaf Node Scheduled Time:");
 
-    let results: Vec<(usize, u64)> = hog_results.iter()
+    let results: Vec<(usize, u64)> = hog_results
+        .iter()
         .map(|(node_id, scheduled_ns)| (*node_id, scheduled_ns.load(Ordering::Acquire)))
         .collect();
 
@@ -310,10 +382,22 @@ fn fixed_random_tree_test() -> Result<()> {
     let node_id_width = max_node_id.to_string().len().max(7);
     let ns_width = max_ns.to_string().len().max(13);
 
-    eprintln!("{:>width1$}, {:>width2$}", "node_id", "scheduled_ns", width1 = node_id_width, width2 = ns_width);
+    eprintln!(
+        "{:>width1$}, {:>width2$}",
+        "node_id",
+        "scheduled_ns",
+        width1 = node_id_width,
+        width2 = ns_width
+    );
 
     for (node_id, scheduled_ns) in &results {
-        eprintln!("{:>width1$}, {:>width2$}", node_id, scheduled_ns, width1 = node_id_width, width2 = ns_width);
+        eprintln!(
+            "{:>width1$}, {:>width2$}",
+            node_id,
+            scheduled_ns,
+            width1 = node_id_width,
+            width2 = ns_width
+        );
     }
 
     // Compute and print oracle statistics

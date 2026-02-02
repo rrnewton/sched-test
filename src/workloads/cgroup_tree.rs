@@ -1,16 +1,16 @@
 //! CGroup tree workload implementation.
 
-use cgroups_rs::fs::{Resources, MaxValue};
-use cgroups_rs::fs::Cgroup;
-use cgroups_rs::fs::cgroup_builder::CgroupBuilder;
-use cgroups_rs::fs::hierarchies;
-use quickcheck::{Arbitrary, Gen};
-use anyhow::{Result, Context};
-use std::time::Duration;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use crate::util::child::Child;
 use crate::util::shared::SharedBox;
 use crate::workloads::spinner_utilization;
+use anyhow::{Context, Result};
+use cgroups_rs::fs::cgroup_builder::CgroupBuilder;
+use cgroups_rs::fs::hierarchies;
+use cgroups_rs::fs::Cgroup;
+use cgroups_rs::fs::{MaxValue, Resources};
+use quickcheck::{Arbitrary, Gen};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::time::Duration;
 
 /// System resource constraints used for generating realistic cgroup configurations.
 #[derive(Debug, Clone, Copy)]
@@ -96,27 +96,6 @@ pub struct CGroupTreeNode {
     pub resources: RandResources,
     /// Child cgroups under this node
     pub children: Vec<CGroupTreeNode>,
-}
-
-/// CPU hog workload using spinner_utilization to measure actual scheduled time
-fn cpu_hog_workload(
-    duration: Duration,
-    start_signal: SharedBox<AtomicU32>,
-    scheduled_ns_out: SharedBox<AtomicU64>,
-) {
-    // Get TSC frequency (non-verbose)
-    let tsc_hz = spinner_utilization::get_tsc_hz(false);
-
-    // Wait for start signal
-    while start_signal.load(Ordering::Acquire) == 0 {
-        std::hint::spin_loop();
-    }
-
-    // Run spinner for the specified duration
-    let results = spinner_utilization::run_spinner(duration, tsc_hz, false);
-
-    // Write scheduled time (in nanoseconds) to shared memory
-    scheduled_ns_out.store(results.time_scheduled_ns, Ordering::Release);
 }
 
 /// A handle to a launched CPU hog process
@@ -239,8 +218,15 @@ impl ActualizedCGroupTree {
     }
 
     /// Build parent-to-children mapping from the tree
-    fn build_parent_map(&self, node: &CGroupTreeNode, parent_id: Option<usize>, map: &mut std::collections::HashMap<Option<usize>, Vec<usize>>) {
-        map.entry(parent_id).or_default().push(node.node_id);
+    fn build_parent_map(
+        &self,
+        node: &CGroupTreeNode,
+        parent_id: Option<usize>,
+        map: &mut std::collections::HashMap<Option<usize>, Vec<usize>>,
+    ) {
+        map.entry(parent_id)
+            .or_default()
+            .push(node.node_id);
         for child in &node.children {
             self.build_parent_map(child, Some(node.node_id), map);
         }
@@ -249,7 +235,8 @@ impl ActualizedCGroupTree {
     /// Second pass: compute sibling fractions and deviations
     fn compute_sibling_fractions(&self, all_stats: &mut [NodeStats]) {
         // Build parent-to-children map
-        let mut parent_map: std::collections::HashMap<Option<usize>, Vec<usize>> = std::collections::HashMap::new();
+        let mut parent_map: std::collections::HashMap<Option<usize>, Vec<usize>> =
+            std::collections::HashMap::new();
         self.build_parent_map(&self.tree, None, &mut parent_map);
 
         // Build node tree map to find parent's effective_cpu_max
@@ -271,7 +258,8 @@ impl ActualizedCGroupTree {
 
             // Get parent's effective_cpu_max from one of the children
             // All siblings have the same parent, so we can look at any child's parent_max
-            let parent_effective_cpu_max = child_ids.first()
+            let parent_effective_cpu_max = child_ids
+                .first()
                 .and_then(|&child_id| node_to_parent_max.get(&child_id))
                 .copied()
                 .flatten();
@@ -281,7 +269,12 @@ impl ActualizedCGroupTree {
             for &child_id in child_ids {
                 if let Some(&idx) = node_to_index.get(&child_id) {
                     let stat = &all_stats[idx];
-                    sibling_info.push((stat.node_id, stat.total_time_ns, stat.cpu_weight, stat.effective_cpu_max));
+                    sibling_info.push((
+                        stat.node_id,
+                        stat.total_time_ns,
+                        stat.cpu_weight,
+                        stat.effective_cpu_max,
+                    ));
                 }
             }
 
@@ -289,11 +282,13 @@ impl ActualizedCGroupTree {
             let sibling_total_time: u64 = sibling_info.iter().map(|(_, time, _, _)| time).sum();
 
             // Compute expected shares accounting for both cpu.weight and cpu.max
-            let expected_shares = Self::compute_expected_shares(&sibling_info, parent_effective_cpu_max);
+            let expected_shares =
+                Self::compute_expected_shares(&sibling_info, parent_effective_cpu_max);
 
             // Update each sibling's stats
             for ((node_id, total_time_ns, _cpu_weight, _cpu_max), expected_share) in
-                sibling_info.iter().zip(expected_shares.iter()) {
+                sibling_info.iter().zip(expected_shares.iter())
+            {
                 if let Some(&idx) = node_to_index.get(node_id) {
                     let stat = &mut all_stats[idx];
 
@@ -320,9 +315,16 @@ impl ActualizedCGroupTree {
     }
 
     /// Build a map from node_id to parent's effective_cpu_max
-    fn build_parent_max_map(&self, node: &CGroupTreeNode, parent_max: Option<f64>, map: &mut std::collections::HashMap<usize, Option<f64>>) {
+    fn build_parent_max_map(
+        &self,
+        node: &CGroupTreeNode,
+        parent_max: Option<f64>,
+        map: &mut std::collections::HashMap<usize, Option<f64>>,
+    ) {
         // Compute this node's effective_cpu_max
-        let this_max = if let (Some(quota), Some(period)) = (node.resources.0.cpu.quota, node.resources.0.cpu.period) {
+        let this_max = if let (Some(quota), Some(period)) =
+            (node.resources.0.cpu.quota, node.resources.0.cpu.period)
+        {
             Some(quota as f64 / period as f64)
         } else {
             None
@@ -351,33 +353,39 @@ impl ActualizedCGroupTree {
     /// 3. Cap siblings that exceed their limits (normalized to parent's capacity)
     /// 4. Redistribute leftover capacity among uncapped siblings
     /// 5. Repeat until convergence
-    fn compute_expected_shares(siblings: &[(usize, u64, u64, Option<f64>)], parent_max: Option<f64>) -> Vec<f64> {
+    fn compute_expected_shares(
+        siblings: &[(usize, u64, u64, Option<f64>)],
+        parent_max: Option<f64>,
+    ) -> Vec<f64> {
         // siblings: (node_id, total_time_ns, cpu_weight, effective_cpu_max)
         let n = siblings.len();
-        let mut allocated = vec![0.0; n];  // Fraction of parent's capacity each sibling gets
+        let mut allocated = vec![0.0; n]; // Fraction of parent's capacity each sibling gets
         let mut is_capped = vec![false; n];
-        let mut remaining_capacity = 1.0;  // Normalized: 100% of parent's capacity
+        let mut remaining_capacity = 1.0; // Normalized: 100% of parent's capacity
         let mut remaining_weight: u64 = siblings.iter().map(|(_, _, w, _)| w).sum();
 
         // Normalize child caps relative to parent capacity
         // If child's effective_cpu_max > parent_max, then child is not constrained beyond parent
-        let normalized_caps: Vec<Option<f64>> = siblings.iter().map(|(_, _, _, child_max)| {
-            match (*child_max, parent_max) {
-                (Some(child), Some(parent)) if parent > 0.0 => {
-                    // Child can use at most child/parent of the parent's capacity
-                    Some((child / parent).min(1.0))
+        let normalized_caps: Vec<Option<f64>> = siblings
+            .iter()
+            .map(|(_, _, _, child_max)| {
+                match (*child_max, parent_max) {
+                    (Some(child), Some(parent)) if parent > 0.0 => {
+                        // Child can use at most child/parent of the parent's capacity
+                        Some((child / parent).min(1.0))
+                    }
+                    (Some(_), Some(_)) => {
+                        // Parent has zero or negative limit (shouldn't happen, but handle it)
+                        None
+                    }
+                    (Some(_), None) => {
+                        // Parent has no limit, so child's limit doesn't constrain it relative to siblings
+                        None
+                    }
+                    (None, _) => None,
                 }
-                (Some(_), Some(_)) => {
-                    // Parent has zero or negative limit (shouldn't happen, but handle it)
-                    None
-                }
-                (Some(_), None) => {
-                    // Parent has no limit, so child's limit doesn't constrain it relative to siblings
-                    None
-                }
-                (None, _) => None,
-            }
-        }).collect();
+            })
+            .collect();
 
         // Iteratively allocate capacity
         loop {
@@ -410,7 +418,8 @@ impl ActualizedCGroupTree {
                 for i in 0..n {
                     if !is_capped[i] {
                         let (_, _, weight, _) = siblings[i];
-                        allocated[i] = (weight as f64 / remaining_weight as f64) * remaining_capacity;
+                        allocated[i] =
+                            (weight as f64 / remaining_weight as f64) * remaining_capacity;
                     }
                 }
                 break;
@@ -457,9 +466,11 @@ impl ActualizedCGroupTree {
     fn print_node_stat(stat: &NodeStats) {
         eprintln!("\nNode {}", stat.node_id);
         eprintln!("  total_time_ns:       {}", stat.total_time_ns);
-        eprintln!("  total_time_fraction: {:.4} ({:.2}%)",
-                  stat.total_time_fraction,
-                  stat.total_time_fraction * 100.0);
+        eprintln!(
+            "  total_time_fraction: {:.4} ({:.2}%)",
+            stat.total_time_fraction,
+            stat.total_time_fraction * 100.0
+        );
         eprintln!("  cpu_weight:          {}", stat.cpu_weight);
 
         if let Some(cpu_max) = stat.effective_cpu_max {
@@ -470,21 +481,30 @@ impl ActualizedCGroupTree {
 
         // Print sibling-related stats if available
         if let Some(sibling_frac) = stat.sibling_fraction {
-            eprintln!("  sibling_fraction:    {:.4} ({:.2}%)",
-                      sibling_frac,
-                      sibling_frac * 100.0);
+            eprintln!(
+                "  sibling_fraction:    {:.4} ({:.2}%)",
+                sibling_frac,
+                sibling_frac * 100.0
+            );
         }
 
         if let Some(expected_share) = stat.expected_sibling_share {
-            eprintln!("  expected_share:      {:.4} ({:.2}%)",
-                      expected_share,
-                      expected_share * 100.0);
+            eprintln!(
+                "  expected_share:      {:.4} ({:.2}%)",
+                expected_share,
+                expected_share * 100.0
+            );
         }
 
         if let Some(deviation) = stat.share_deviation {
             let sign = if deviation >= 0.0 { "+" } else { "" };
-            eprintln!("  share_deviation:     {}{:.4} ({}{:.2}%)",
-                      sign, deviation, sign, deviation * 100.0);
+            eprintln!(
+                "  share_deviation:     {}{:.4} ({}{:.2}%)",
+                sign,
+                deviation,
+                sign,
+                deviation * 100.0
+            );
 
             // Highlight significant deviations (>10%)
             if deviation.abs() > 0.10 {
@@ -493,9 +513,11 @@ impl ActualizedCGroupTree {
         }
 
         if let Some(utilization) = stat.cpu_max_utilization {
-            eprintln!("  cpu_max_utilization: {:.4} ({:.2}%)",
-                      utilization,
-                      utilization * 100.0);
+            eprintln!(
+                "  cpu_max_utilization: {:.4} ({:.2}%)",
+                utilization,
+                utilization * 100.0
+            );
 
             // Highlight violations (>1.0)
             if utilization > 1.0 {
@@ -517,7 +539,8 @@ impl ActualizedCGroupTree {
 
         // Get this node's cpu.max (quota/period as fraction of one core)
         let this_cpu_max = if let (Some(quota), Some(period)) =
-            (node.resources.0.cpu.quota, node.resources.0.cpu.period) {
+            (node.resources.0.cpu.quota, node.resources.0.cpu.period)
+        {
             Some(quota as f64 / period as f64)
         } else {
             None
@@ -567,7 +590,7 @@ impl ActualizedCGroupTree {
             // We need to compare to the duration the test ran for
             // For now, we'll just track the effective limit
             // TODO: Need duration to compute actual utilization
-            None  // Will implement this properly when we have duration
+            None // Will implement this properly when we have duration
         } else {
             None
         };
@@ -600,7 +623,10 @@ impl ActualizedCGroupTree {
         if node.children.is_empty() {
             1
         } else {
-            node.children.iter().map(Self::count_leaves_recursive).sum()
+            node.children
+                .iter()
+                .map(Self::count_leaves_recursive)
+                .sum()
         }
     }
 
@@ -625,11 +651,18 @@ impl ActualizedCGroupTree {
             let start_signal_clone = start_signal.clone();
             let scheduled_ns_out = scheduled_ns_counters[*leaf_index].clone();
             let node_id = node.node_id;
+            let worker_name = format!("node_{}", node_id);
 
             let child = Child::run(
                 move || {
                     // Just run the CPU hog - parent will add us to cgroup
-                    cpu_hog_workload(duration, start_signal_clone, scheduled_ns_out);
+                    spinner_utilization::cpu_hog_workload(
+                        &worker_name,
+                        duration,
+                        start_signal_clone,
+                        scheduled_ns_out,
+                        None,
+                    );
                     Ok(())
                 },
                 None,
@@ -726,11 +759,27 @@ impl CGroupTreeNode {
 
             // Recursively generate children with reduced depth
             (0..num_children)
-                .map(|_| Self::arbitrary_tree_impl(g, constraints, max_depth - 1, max_children, _depth + 1).0)
+                .map(|_| {
+                    Self::arbitrary_tree_impl(
+                        g,
+                        constraints,
+                        max_depth - 1,
+                        max_children,
+                        _depth + 1,
+                    )
+                    .0
+                })
                 .collect()
         };
 
-        (Self { node_id: 0, resources, children }, 0)
+        (
+            Self {
+                node_id: 0,
+                resources,
+                children,
+            },
+            0,
+        )
     }
 
     /// Assign node IDs in preorder traversal
@@ -784,14 +833,18 @@ impl CGroupTreeNode {
     /// Create a fixed random tree for reproducible debugging
     /// Uses a fixed seed to generate the same tree every time
     pub fn fixed_random_tree() -> Self {
-        let mut gen = Gen::new(42);  // Fixed seed for reproducibility
+        let mut gen = Gen::new(42); // Fixed seed for reproducibility
         let constraints = SystemConstraints::detect();
         Self::arbitrary_tree(&mut gen, &constraints, 3, 3)
     }
 
     /// Count the total number of nodes in this tree.
     pub fn node_count(&self) -> usize {
-        1 + self.children.iter().map(|child| child.node_count()).sum::<usize>()
+        1 + self
+            .children
+            .iter()
+            .map(|child| child.node_count())
+            .sum::<usize>()
     }
 
     /// Get the maximum depth of this tree.
@@ -799,7 +852,12 @@ impl CGroupTreeNode {
         if self.children.is_empty() {
             0
         } else {
-            1 + self.children.iter().map(|child| child.max_depth()).max().unwrap_or(0)
+            1 + self
+                .children
+                .iter()
+                .map(|child| child.max_depth())
+                .max()
+                .unwrap_or(0)
         }
     }
 
@@ -893,11 +951,7 @@ impl CGroupTreeNode {
     }
 
     /// Recursively create cgroups for this node and all children.
-    fn create_recursive(
-        &self,
-        name: &str,
-        all_cgroups: &mut Vec<Cgroup>,
-    ) -> Result<()> {
+    fn create_recursive(&self, name: &str, all_cgroups: &mut Vec<Cgroup>) -> Result<()> {
         // Create the cgroup with the builder
         let mut builder = CgroupBuilder::new(name);
 
@@ -979,7 +1033,9 @@ impl CGroupTreeNode {
 
         // Build the cgroup
         let hier = hierarchies::auto();
-        let cgroup = builder.build(hier).context(format!("Failed to build cgroup {}", name))?;
+        let cgroup = builder
+            .build(hier)
+            .context(format!("Failed to build cgroup {}", name))?;
 
         // Add this cgroup to the list FIRST (preorder traversal)
         all_cgroups.push(cgroup);
@@ -1001,39 +1057,44 @@ impl CGroupTreeNode {
 impl Arbitrary for CGroupTreeNode {
     fn arbitrary(g: &mut Gen) -> Self {
         let constraints = SystemConstraints::detect();
-        Self::arbitrary_tree(g, &constraints, DEFAULT_MAX_TREE_DEPTH, DEFAULT_MAX_CHILDREN)
+        Self::arbitrary_tree(
+            g,
+            &constraints,
+            DEFAULT_MAX_TREE_DEPTH,
+            DEFAULT_MAX_CHILDREN,
+        )
     }
 
     fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
         // 1. Shrink the children Vec using Vec's shrinker
         let children_vec = self.children.clone();
-            let mut all_shrinks = Vec::new();
+        let mut all_shrinks = Vec::new();
 
-            // Shrink the children Vec using Vec's shrinker
-            for shrunk_vec in children_vec.shrink() {
+        // Shrink the children Vec using Vec's shrinker
+        for shrunk_vec in children_vec.shrink() {
+            all_shrinks.push(CGroupTreeNode {
+                node_id: 0, // Will be reassigned later
+                resources: self.resources.clone(),
+                children: shrunk_vec,
+            });
+        }
+
+        // Recursively shrink each child, keeping others unchanged
+        let resources = self.resources.clone();
+        let children = self.children.clone();
+        for (i, child) in children.iter().enumerate() {
+            for shrunk_child in child.shrink() {
+                let mut new_children = children.clone();
+                new_children[i] = shrunk_child;
                 all_shrinks.push(CGroupTreeNode {
                     node_id: 0, // Will be reassigned later
-                    resources: self.resources.clone(),
-                    children: shrunk_vec,
+                    resources: resources.clone(),
+                    children: new_children,
                 });
             }
+        }
 
-            // Recursively shrink each child, keeping others unchanged
-            let resources = self.resources.clone();
-            let children = self.children.clone();
-            for (i, child) in children.iter().enumerate() {
-                for shrunk_child in child.shrink() {
-                    let mut new_children = children.clone();
-                    new_children[i] = shrunk_child;
-                    all_shrinks.push(CGroupTreeNode {
-                        node_id: 0, // Will be reassigned later
-                        resources: resources.clone(),
-                        children: new_children,
-                    });
-                }
-            }
-
-            Box::new(all_shrinks.into_iter())
+        Box::new(all_shrinks.into_iter())
     }
 }
 
@@ -1100,7 +1161,8 @@ impl RandResources {
         // CPU shares (typically 1-1024, with 100 being default)
         if (u8::arbitrary(g) % 100) < 60 {
             let shares: u16 = u16::arbitrary(g);
-            resources.cpu.shares = Some(std::cmp::max(shares % 1024, 1) as u64); // 1-1024
+            resources.cpu.shares = Some(std::cmp::max(shares % 1024, 1) as u64);
+            // 1-1024
         }
 
         // CPU quota/period (cpu.max) - 30% probability
@@ -1153,7 +1215,9 @@ impl RandResources {
 
             // Memory soft limit (should be <= hard limit if both are set)
             resources.memory.memory_soft_limit = if bool::arbitrary(g) {
-                let limit = resources.memory.memory_hard_limit
+                let limit = resources
+                    .memory
+                    .memory_hard_limit
                     .unwrap_or(max_memory.min(1024 * 1024 * 1024) as i64);
                 let soft_factor: u64 = u64::arbitrary(g);
                 let soft_limit = (soft_factor as i64 % limit).max(1024 * 1024);
@@ -1291,7 +1355,10 @@ mod tests {
             // Validate memory constraints
             if let Some(mem_limit) = rand_resources.0.memory.memory_hard_limit {
                 if mem_limit < 0 || mem_limit as u64 > constraints.total_memory_bytes {
-                    println!("Memory limit out of bounds: {} > {}", mem_limit, constraints.total_memory_bytes);
+                    println!(
+                        "Memory limit out of bounds: {} > {}",
+                        mem_limit, constraints.total_memory_bytes
+                    );
                     return TestResult::failed();
                 }
             }
@@ -1306,12 +1373,17 @@ mod tests {
     fn test_system_constraints_detection() {
         let constraints = SystemConstraints::detect();
         println!("Detected {} CPUs", constraints.num_cpus);
-        println!("Detected {} bytes of memory ({} GB)",
-                 constraints.total_memory_bytes,
-                 constraints.total_memory_bytes / (1024 * 1024 * 1024));
+        println!(
+            "Detected {} bytes of memory ({} GB)",
+            constraints.total_memory_bytes,
+            constraints.total_memory_bytes / (1024 * 1024 * 1024)
+        );
 
         assert!(constraints.num_cpus > 0, "Should detect at least 1 CPU");
-        assert!(constraints.total_memory_bytes > 0, "Should detect some memory");
+        assert!(
+            constraints.total_memory_bytes > 0,
+            "Should detect some memory"
+        );
     }
 
     #[test]
@@ -1340,7 +1412,7 @@ mod tests {
 
     #[test]
     fn test_cgroup_tree_generation() {
-        let mut gen = quickcheck::Gen::new(456);  // Changed seed for more variety
+        let mut gen = quickcheck::Gen::new(456); // Changed seed for more variety
         let constraints = SystemConstraints {
             num_cpus: 8,
             total_memory_bytes: 16 * 1024 * 1024 * 1024, // 16GB
@@ -1370,7 +1442,14 @@ mod tests {
                 info.push(format!("mem:{}MB", mb));
             }
 
-            println!("Node [{}]", if info.is_empty() { "no limits".to_string() } else { info.join(", ") });
+            println!(
+                "Node [{}]",
+                if info.is_empty() {
+                    "no limits".to_string()
+                } else {
+                    info.join(", ")
+                }
+            );
 
             let child_prefix = format!("{}{}", prefix, if is_last { "   " } else { "│  " });
             for (i, child) in node.children.iter().enumerate() {
@@ -1382,8 +1461,14 @@ mod tests {
         println!("\nTree structure:");
         print_tree(&tree, "", true);
 
-        assert!(tree.max_depth() <= max_depth, "Tree should not exceed max depth");
-        assert!(tree.node_count() >= 1, "Tree should have at least the root node");
+        assert!(
+            tree.max_depth() <= max_depth,
+            "Tree should not exceed max depth"
+        );
+        assert!(
+            tree.node_count() >= 1,
+            "Tree should have at least the root node"
+        );
     }
 
     #[test]
@@ -1398,7 +1483,8 @@ mod tests {
             let max_depth = 2;
             let max_children = 3;
 
-            let tree = CGroupTreeNode::arbitrary_tree(&mut gen, &constraints, max_depth, max_children);
+            let tree =
+                CGroupTreeNode::arbitrary_tree(&mut gen, &constraints, max_depth, max_children);
 
             // Property 1: Tree depth should not exceed max_depth
             if tree.max_depth() > max_depth {
@@ -1415,7 +1501,9 @@ mod tests {
                 if node.children.len() > max {
                     return false;
                 }
-                node.children.iter().all(|child| check_children_count(child, max))
+                node.children
+                    .iter()
+                    .all(|child| check_children_count(child, max))
             }
 
             if !check_children_count(&tree, max_children) {
@@ -1434,13 +1522,22 @@ mod tests {
         let mut gen = quickcheck::Gen::new(789);
         let tree = CGroupTreeNode::arbitrary(&mut gen);
 
-        println!("Generated tree via Arbitrary with {} nodes", tree.node_count());
+        println!(
+            "Generated tree via Arbitrary with {} nodes",
+            tree.node_count()
+        );
         println!("Tree depth: {}", tree.max_depth());
 
-        assert!(tree.max_depth() <= DEFAULT_MAX_TREE_DEPTH,
-                "Tree depth {} should not exceed DEFAULT_MAX_TREE_DEPTH {}",
-                tree.max_depth(), DEFAULT_MAX_TREE_DEPTH);
-        assert!(tree.node_count() >= 1, "Tree should have at least the root node");
+        assert!(
+            tree.max_depth() <= DEFAULT_MAX_TREE_DEPTH,
+            "Tree depth {} should not exceed DEFAULT_MAX_TREE_DEPTH {}",
+            tree.max_depth(),
+            DEFAULT_MAX_TREE_DEPTH
+        );
+        assert!(
+            tree.node_count() >= 1,
+            "Tree should have at least the root node"
+        );
     }
 
     #[test]
@@ -1503,7 +1600,10 @@ mod tests {
 
         // All shrunk trees should be valid
         for shrunk_tree in shrunk {
-            assert!(shrunk_tree.node_count() >= 1, "Shrunk tree should have at least root");
+            assert!(
+                shrunk_tree.node_count() >= 1,
+                "Shrunk tree should have at least root"
+            );
         }
     }
 

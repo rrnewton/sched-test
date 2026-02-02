@@ -3,12 +3,14 @@
 //! This module provides a CPU-intensive workload that measures its own scheduling
 //! behavior by tracking time slices and descheduling events via TSC (Time Stamp Counter).
 
-use std::time::{Duration, Instant};
+use crate::util::shared::SharedBox;
+use serde::{Deserialize, Serialize};
 use std::arch::asm;
-use serde::{Serialize, Deserialize};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 /// Minimum TSC cycle gap to consider as a descheduling event
-const MIN_DESCHEDULE_CYCLES: u64 = 1000;
+const MIN_DESCHEDULE_CYCLES: u64 = 3000;
 
 /// Window size in milliseconds for utilization calculation
 const WINDOW_SIZE_MS: u64 = 100;
@@ -37,10 +39,13 @@ pub struct Percentiles {
 pub struct BenchmarkResults {
     pub tsc_frequency: u64,
     pub time_scheduled_ns: u64,
-    pub total_iterations: u64,
+    /// Number of loop iterations completed (bogo ops) - represents work done,
+    /// distinct from time_scheduled_ns which measures how long the process was scheduled
+    pub bogo_ops: u64,
     pub total_tsc_ticks: u64,
     pub per_window_stats: Vec<WindowStat>,
-    pub percentiles: Percentiles,
+    pub utilization_pcts: Percentiles,
+    pub timeslice_pcts: Percentiles,
 }
 
 /// Read the current cycle count using rdtsc
@@ -72,7 +77,9 @@ pub fn calibrate_tsc_short(duration_ms: u64) -> (u64, f64) {
     let c0 = rdtsc();
     // Busy-wait until target elapsed; Instant is vDSO-accelerated
     loop {
-        if t0.elapsed() >= target { break; }
+        if t0.elapsed() >= target {
+            break;
+        }
         std::hint::spin_loop();
     }
     let c1 = rdtsc();
@@ -169,7 +176,7 @@ pub unsafe fn run_spinner_with_shutdown(
     verbose: bool,
 ) -> BenchmarkResults {
     use std::sync::atomic::Ordering;
-    
+
     let worker_start = Instant::now();
     let mut count: u64 = 0;
     let mut slices = Vec::new();
@@ -268,6 +275,27 @@ fn compute_results(
             let mut seg_start = start_cycle;
             let mut seg_cycles = end_cycle - start_cycle;
 
+            // Skip windows that end before this segment starts
+            while cur_win_end <= seg_start {
+                // Finalize current window even if empty
+                if cur_win_cycles > 0 {
+                    windows.push(cur_win_cycles);
+                    let start_time_secs = (cur_win_start - first_cycle) as f64 / tsc_hz as f64;
+                    window_stats.push(InternalWindowStats {
+                        start_time_secs,
+                        slices: cur_win_slices,
+                        max_gap_cycles: cur_win_max_gap_cycles,
+                        cycles: cur_win_cycles,
+                    });
+                }
+                // Move to next window
+                cur_win_start = cur_win_end;
+                cur_win_end += window_cycles;
+                cur_win_cycles = 0;
+                cur_win_slices = 0;
+                cur_win_max_gap_cycles = 0;
+            }
+
             // Handle case where slice spans multiple windows
             while seg_start + seg_cycles > cur_win_end {
                 let win_cycles = cur_win_end - seg_start;
@@ -356,7 +384,7 @@ fn compute_results(
                 .collect();
             utilizations.sort_by(|a, b| a.partial_cmp(b).unwrap());
             let percentile_keys = [1, 25, 50, 75, 99];
-            
+
             if verbose {
                 eprintln!(
                     "Windowed utilization percentiles ({}ms windows, {} complete windows):",
@@ -373,6 +401,53 @@ fn compute_results(
                 pcts[i] = val;
                 if verbose {
                     eprintln!("p{:02}: {:.2}%", p, val);
+                }
+            }
+
+            Percentiles {
+                p01: pcts[0],
+                p25: pcts[1],
+                p50: pcts[2],
+                p75: pcts[3],
+                p99: pcts[4],
+            }
+        } else {
+            Percentiles {
+                p01: 0.0,
+                p25: 0.0,
+                p50: 0.0,
+                p75: 0.0,
+                p99: 0.0,
+            }
+        };
+
+        // Compute timeslice length percentiles
+        let timeslice_percentiles = if !slices.is_empty() {
+            let mut slice_lengths_ms: Vec<f64> = slices
+                .iter()
+                .map(|(start, end)| {
+                    let cycles = end - start;
+                    cycles as f64 / tsc_hz as f64 * 1e3
+                })
+                .collect();
+            slice_lengths_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let percentile_keys = [1, 25, 50, 75, 99];
+
+            if verbose {
+                eprintln!(
+                    "\nTimeslice length percentiles ({} slices):",
+                    slice_lengths_ms.len()
+                );
+            }
+
+            let mut pcts = [0.0; 5];
+            for (i, &p) in percentile_keys.iter().enumerate() {
+                let idx = ((slice_lengths_ms.len() as f64) * (p as f64 / 100.0)).floor() as usize;
+                let idx = idx.min(slice_lengths_ms.len().saturating_sub(1));
+                let val_ms = slice_lengths_ms.get(idx).copied().unwrap_or(0.0);
+                pcts[i] = val_ms;
+                if verbose {
+                    eprintln!("p{:02}: {:.3} ms", p, val_ms);
                 }
             }
 
@@ -412,20 +487,28 @@ fn compute_results(
         BenchmarkResults {
             tsc_frequency: tsc_hz,
             time_scheduled_ns: scheduled_ns,
-            total_iterations: count,
+            bogo_ops: count,
             total_tsc_ticks: total_cycles,
             per_window_stats: json_window_stats,
-            percentiles: percentile_values,
+            utilization_pcts: percentile_values,
+            timeslice_pcts: timeslice_percentiles,
         }
     } else {
         // No slices, empty results
         BenchmarkResults {
             tsc_frequency: tsc_hz,
             time_scheduled_ns: scheduled_ns,
-            total_iterations: count,
+            bogo_ops: count,
             total_tsc_ticks: total_cycles,
             per_window_stats: vec![],
-            percentiles: Percentiles {
+            utilization_pcts: Percentiles {
+                p01: 0.0,
+                p25: 0.0,
+                p50: 0.0,
+                p75: 0.0,
+                p99: 0.0,
+            },
+            timeslice_pcts: Percentiles {
                 p01: 0.0,
                 p25: 0.0,
                 p50: 0.0,
@@ -434,4 +517,85 @@ fn compute_results(
             },
         }
     }
+}
+
+/// CPU hog workload using spinner_utilization to measure actual scheduled time.
+///
+/// This function waits for a start signal, then runs a CPU-intensive spinner
+/// for the specified duration, measuring the actual time scheduled via TSC.
+/// The scheduled time (in nanoseconds) and bogo_ops are written to shared memory.
+/// Upon completion, prints summary statistics including slice count.
+///
+/// # Arguments
+/// * `name` - Descriptive name for this worker (e.g., "victim", "control")
+/// * `duration` - How long to run the spinner
+/// * `start_signal` - Shared atomic flag; spins until this becomes non-zero
+/// * `scheduled_ns_out` - Shared atomic where the scheduled time (ns) will be written
+/// * `bogo_ops_out` - Optional shared atomic where the bogo ops count will be written
+pub fn cpu_hog_workload(
+    name: &str,
+    duration: Duration,
+    start_signal: SharedBox<AtomicU32>,
+    scheduled_ns_out: SharedBox<AtomicU64>,
+    bogo_ops_out: Option<SharedBox<AtomicU64>>,
+) {
+    // Get TSC frequency (non-verbose)
+    let tsc_hz = get_tsc_hz(false);
+
+    // Wait for start signal
+    while start_signal.load(Ordering::Acquire) == 0 {
+        std::hint::spin_loop();
+    }
+
+    // Run spinner for the specified duration
+    let results = run_spinner(duration, tsc_hz, false);
+
+    // Write scheduled time (in nanoseconds) to shared memory
+    scheduled_ns_out.store(results.time_scheduled_ns, Ordering::Release);
+
+    // Write bogo_ops if output location provided
+    if let Some(bogo_ops) = bogo_ops_out {
+        bogo_ops.store(results.bogo_ops, Ordering::Release);
+    }
+
+    // Add small random delay (0.0-0.5 seconds) to space out parallel worker summaries
+    let delay_ms = (rand::random::<f64>() * 500.0) as u64;
+    std::thread::sleep(Duration::from_millis(delay_ms));
+
+    // Build summary output in a buffer for atomic printing
+    use std::fmt::Write;
+    let mut output = String::new();
+
+    writeln!(output, "\n=== Worker '{}' Summary ===", name).unwrap();
+    writeln!(output, "  Scheduled time:  {:.3} seconds", results.time_scheduled_ns as f64 / 1e9).unwrap();
+    writeln!(output, "  Bogo ops:        {}", format_with_commas(results.bogo_ops)).unwrap();
+    writeln!(output, "  Total slices:    {}", results.per_window_stats.iter().map(|w| w.num_slices).sum::<usize>()).unwrap();
+    writeln!(output, "  Windows:         {}", results.per_window_stats.len()).unwrap();
+
+    // Find max gap across all windows
+    let max_gap_ns = results.per_window_stats
+        .iter()
+        .map(|w| w.max_gap_ns)
+        .max()
+        .unwrap_or(0);
+    writeln!(output, "  Max gap:         {} ns", format_with_commas(max_gap_ns)).unwrap();
+
+    // Print utilization percentiles
+    writeln!(output, "  Utilization percentiles:").unwrap();
+    writeln!(output, "    p01: {:.2}%", results.utilization_pcts.p01).unwrap();
+    writeln!(output, "    p25: {:.2}%", results.utilization_pcts.p25).unwrap();
+    writeln!(output, "    p50: {:.2}%", results.utilization_pcts.p50).unwrap();
+    writeln!(output, "    p75: {:.2}%", results.utilization_pcts.p75).unwrap();
+    writeln!(output, "    p99: {:.2}%", results.utilization_pcts.p99).unwrap();
+
+    // Print timeslice length percentiles
+    writeln!(output, "  Timeslice length percentiles:").unwrap();
+    writeln!(output, "    p01: {:.3} ms", results.timeslice_pcts.p01).unwrap();
+    writeln!(output, "    p25: {:.3} ms", results.timeslice_pcts.p25).unwrap();
+    writeln!(output, "    p50: {:.3} ms", results.timeslice_pcts.p50).unwrap();
+    writeln!(output, "    p75: {:.3} ms", results.timeslice_pcts.p75).unwrap();
+    writeln!(output, "    p99: {:.3} ms", results.timeslice_pcts.p99).unwrap();
+
+    // Atomically print the entire summary with a single eprintln! call
+    eprintln!("{}", output);
 }
