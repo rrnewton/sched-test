@@ -240,14 +240,14 @@ impl ActualizedCGroupTree {
 
     /// Build parent-to-children mapping from the tree
     fn build_parent_map(&self, node: &CGroupTreeNode, parent_id: Option<usize>, map: &mut std::collections::HashMap<Option<usize>, Vec<usize>>) {
-        map.entry(parent_id).or_insert_with(Vec::new).push(node.node_id);
+        map.entry(parent_id).or_default().push(node.node_id);
         for child in &node.children {
             self.build_parent_map(child, Some(node.node_id), map);
         }
     }
 
     /// Second pass: compute sibling fractions and deviations
-    fn compute_sibling_fractions(&self, all_stats: &mut Vec<NodeStats>) {
+    fn compute_sibling_fractions(&self, all_stats: &mut [NodeStats]) {
         // Build parent-to-children map
         let mut parent_map: std::collections::HashMap<Option<usize>, Vec<usize>> = std::collections::HashMap::new();
         self.build_parent_map(&self.tree, None, &mut parent_map);
@@ -271,7 +271,7 @@ impl ActualizedCGroupTree {
 
             // Get parent's effective_cpu_max from one of the children
             // All siblings have the same parent, so we can look at any child's parent_max
-            let parent_effective_cpu_max = child_ids.get(0)
+            let parent_effective_cpu_max = child_ids.first()
                 .and_then(|&child_id| node_to_parent_max.get(&child_id))
                 .copied()
                 .flatten();
@@ -600,11 +600,12 @@ impl ActualizedCGroupTree {
         if node.children.is_empty() {
             1
         } else {
-            node.children.iter().map(|child| Self::count_leaves_recursive(child)).sum()
+            node.children.iter().map(Self::count_leaves_recursive).sum()
         }
     }
 
     /// Recursively launch hogs in leaf nodes
+    #[allow(clippy::too_many_arguments)]
     fn launch_leaf_hogs_recursive(
         &self,
         node: &CGroupTreeNode,
@@ -972,7 +973,7 @@ impl CGroupTreeNode {
         // Apply PID resources if present
         if let Some(ref max_procs) = self.resources.0.pid.maximum_number_of_processes {
             let mut pid_builder = builder.pid();
-            pid_builder = pid_builder.maximum_number_of_processes(max_procs.clone());
+            pid_builder = pid_builder.maximum_number_of_processes(*max_procs);
             builder = pid_builder.done();
         }
 
@@ -1122,7 +1123,7 @@ impl RandResources {
         // Now respects actual CPU count on the system!
         if (u8::arbitrary(g) % 100) < 20 && max_cpu > 0 {
             let cpu_type: u8 = u8::arbitrary(g);
-            if cpu_type % 2 == 0 {
+            if cpu_type.is_multiple_of(2) {
                 // Single CPU
                 let cpu_num: u64 = u64::arbitrary(g);
                 resources.cpu.cpus = Some(format!("{}", cpu_num % (max_cpu as u64 + 1)));

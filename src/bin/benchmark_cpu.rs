@@ -8,7 +8,6 @@ use std::thread;
 use schtest::workloads::spinner_utilization;
 use nix::unistd::{fork, ForkResult};
 use nix::sys::wait::waitpid;
-use libc;
 use clap::Parser;
 use rand::Rng;
 
@@ -66,8 +65,8 @@ fn run_with_cgroup(cpu_pct: u64, duration: Duration, verbose: bool) {
     }
 
     // Create cgroup at root level with a unique name
-    let mut rng = rand::thread_rng();
-    let name = format!("schtest-{}", rng.gen::<u32>());
+    let mut rng = rand::rng();
+    let name = format!("schtest-{}", rng.random::<u32>());
     let cg_path = std::path::PathBuf::from("/sys/fs/cgroup").join(&name);
     
     if let Err(e) = std::fs::create_dir_all(&cg_path) {
@@ -117,7 +116,8 @@ fn run_with_cgroup(cpu_pct: u64, duration: Duration, verbose: bool) {
             }
             
             // Now run the benchmark until shutdown flag set
-            let results = spinner_utilization::run_spinner_with_shutdown(shutdown_flag, tsc_hz, verbose);
+            // SAFETY: shutdown_flag points to valid shared memory that remains valid until process exit
+            let results = unsafe { spinner_utilization::run_spinner_with_shutdown(shutdown_flag, tsc_hz, verbose) };
             
             // Output JSON to stdout
             println!("{}", serde_json::to_string_pretty(&results).unwrap());
