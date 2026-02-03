@@ -157,7 +157,11 @@ pub fn run_spinner(duration: Duration, tsc_hz: u64, verbose: bool) -> BenchmarkR
 }
 
 /// Worker loop with shutdown flag: runs until flag is set, records time slices
-pub fn run_spinner_with_shutdown(
+///
+/// # Safety
+/// The caller must ensure that `shutdown_flag` points to a valid `AtomicU32`
+/// that remains valid for the duration of this function call.
+pub unsafe fn run_spinner_with_shutdown(
     shutdown_flag: *const std::sync::atomic::AtomicU32,
     tsc_hz: u64,
     verbose: bool,
@@ -183,11 +187,9 @@ pub fn run_spinner_with_shutdown(
                 slices.push((slice_start_cycle, slice_end_cycle));
                 in_slice = false;
             }
-        } else {
-            if !in_slice {
-                slice_start_cycle = cur_cycle;
-                in_slice = true;
-            }
+        } else if !in_slice {
+            slice_start_cycle = cur_cycle;
+            in_slice = true;
         }
         last_cycle = cur_cycle;
     }
