@@ -12,6 +12,7 @@ use nix::unistd::{fork, ForkResult, Pid};
 use nix::sys::wait::waitpid;
 use libc;
 use clap::Parser;
+// use std::ffi::CStr; // kept for future diagnostics if needed
 
 /// CPU bandwidth benchmark for cgroup scheduling
 #[derive(Parser, Debug)]
@@ -54,14 +55,14 @@ fn read_cpu_hz() -> u64 {
             }
         }
     }
-    
+
     // Fallback: try reading from sysfs (CPU 0)
     if let Ok(khz_str) = std::fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq") {
         if let Ok(khz) = khz_str.trim().parse::<u64>() {
             return khz * 1000;
         }
     }
-    
+
     // Last resort: assume a common frequency (3 GHz)
     eprintln!("Warning: Could not read CPU frequency, assuming 3.0 GHz");
     3_000_000_000
@@ -86,12 +87,12 @@ fn worker_shared(shutdown_flag: *const AtomicU32, cpu_hz: u64, verbose: bool) {
     let mut last_cycle = rdtsc();
     let mut in_slice = false;
     let mut slice_start_cycle = 0u64;
-    
+
     while unsafe { (*shutdown_flag).load(Ordering::Relaxed) == 0 } {
         count += 1;
         let cur_cycle = rdtsc();
         let gap = cur_cycle - last_cycle;
-        
+
         // If gap is large, treat as deschedule event
         if gap > MIN_DESCHEDULE_CYCLES {
             if in_slice {
@@ -107,30 +108,30 @@ fn worker_shared(shutdown_flag: *const AtomicU32, cpu_hz: u64, verbose: bool) {
         }
         last_cycle = cur_cycle;
     }
-    
+
     // Final slice
     if in_slice {
         slices.push((slice_start_cycle, last_cycle));
     }
-    
+
     // Print results
     let elapsed_secs = worker_start.elapsed().as_secs_f64();
     let total_cycles: u64 = slices.iter().map(|(start, end)| end - start).sum();
-    
+
     // Convert total cycles to scheduled time
     let scheduled_secs = total_cycles as f64 / cpu_hz as f64;
     println!("Elapsed time: {:.3} seconds", elapsed_secs);
     println!("Worker was scheduled for {:.3} seconds, {} iterations", scheduled_secs, format_with_commas(count));
     println!("Total cycles: {}", format_with_commas(total_cycles));
-    
+
     // Windowed utilization with optional per-window stats
     // Now working entirely in cycle space, convert to time later
     let window_cycles = (cpu_hz as f64 * (WINDOW_SIZE_MS as f64 / 1000.0)) as u64;
     let mut windows = Vec::new();
-    
+
     if !slices.is_empty() {
         let first_cycle = slices[0].0;
-        
+
         // Store window stats for later printing in chronological order
         struct WindowStats {
             start_time_secs: f64,
@@ -139,32 +140,32 @@ fn worker_shared(shutdown_flag: *const AtomicU32, cpu_hz: u64, verbose: bool) {
             cycles: u64,
         }
         let mut window_stats = Vec::new();
-        
+
         let mut cur_win_start = first_cycle;
         let mut cur_win_end = cur_win_start + window_cycles;
         let mut cur_win_cycles = 0u64;
         let mut cur_win_slices = 0usize;
         let mut cur_win_max_gap_cycles = 0u64;
-        
+
         for (slice_idx, &(start_cycle, end_cycle)) in slices.iter().enumerate() {
             let mut seg_start = start_cycle;
             let mut seg_cycles = end_cycle - start_cycle;
-            
+
             // Handle case where slice spans multiple windows
             while seg_start + seg_cycles > cur_win_end {
                 let win_cycles = cur_win_end - seg_start;
                 cur_win_cycles += win_cycles;
                 cur_win_slices += 1;
-                
+
                 // Calculate gap to next slice in cycles
                 if slice_idx + 1 < slices.len() {
                     let next_start = slices[slice_idx + 1].0;
                     let gap_cycles = next_start - end_cycle;
                     cur_win_max_gap_cycles = cur_win_max_gap_cycles.max(gap_cycles);
                 }
-                
+
                 windows.push(cur_win_cycles);
-                
+
                 if verbose {
                     let start_time_secs = (cur_win_start - first_cycle) as f64 / cpu_hz as f64;
                     window_stats.push(WindowStats {
@@ -174,23 +175,23 @@ fn worker_shared(shutdown_flag: *const AtomicU32, cpu_hz: u64, verbose: bool) {
                         cycles: cur_win_cycles,
                     });
                 }
-                
+
                 // Move to next window
                 cur_win_start = cur_win_end;
                 cur_win_end += window_cycles;
                 cur_win_cycles = 0;
                 cur_win_slices = 0;
                 cur_win_max_gap_cycles = 0;
-                
+
                 seg_start = cur_win_start;
                 seg_cycles -= win_cycles;
             }
-            
+
             // Add remaining segment to current window
             cur_win_cycles += seg_cycles;
             cur_win_slices += 1;
         }
-        
+
         // Final partial window
         if cur_win_cycles > 0 {
             windows.push(cur_win_cycles);
@@ -204,7 +205,7 @@ fn worker_shared(shutdown_flag: *const AtomicU32, cpu_hz: u64, verbose: bool) {
                 });
             }
         }
-        
+
         // Print window stats in chronological order
         if verbose && !window_stats.is_empty() {
             println!("\nPer-window statistics:");
@@ -215,7 +216,7 @@ fn worker_shared(shutdown_flag: *const AtomicU32, cpu_hz: u64, verbose: bool) {
                     stat.start_time_secs, stat.slices, format_with_commas(max_gap_ns), utilization * 100.0);
             }
         }
-        
+
         // Compute percentiles
         let mut utilizations: Vec<f64> = windows.iter().map(|&cyc| cyc as f64 / window_cycles as f64).collect();
         utilizations.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -229,10 +230,24 @@ fn worker_shared(shutdown_flag: *const AtomicU32, cpu_hz: u64, verbose: bool) {
     }
 }
 
+/// Print rusage for given who (RUSAGE_SELF or RUSAGE_CHILDREN)
+fn print_rusage(label: &str, who: i32) {
+    unsafe {
+        let mut ru: libc::rusage = std::mem::zeroed();
+        if libc::getrusage(who, &mut ru) == 0 {
+            let ut = ru.ru_utime.tv_sec as f64 + (ru.ru_utime.tv_usec as f64) / 1e6;
+            let st = ru.ru_stime.tv_sec as f64 + (ru.ru_stime.tv_usec as f64) / 1e6;
+            eprintln!("rusage {}: user={:.6}s sys={:.6}s", label, ut, st);
+        } else {
+            eprintln!("rusage {}: getrusage failed", label);
+        }
+    }
+}
+
 /// Main benchmark entry point
 fn main() {
     let args = Args::parse();
-    
+
     // Create shared shutdown flag using anonymous shared mmap
     let flag_size = std::mem::size_of::<AtomicU32>();
     let shutdown_ptr = unsafe {
@@ -275,7 +290,11 @@ fn main() {
     // Fork child (shares address space mappings)
     match unsafe { fork() } {
         Ok(ForkResult::Child) => {
+            // In the child: run worker and print our own rusage before exit so
+            // we can compare kernel accounting with external `time` output.
             worker_shared(shutdown_ptr, cpu_hz, args.verbose);
+            print_rusage("child_self", libc::RUSAGE_SELF);
+            // Exit explicitly
             std::process::exit(0);
         }
         Ok(ForkResult::Parent { child }) => {
@@ -296,6 +315,9 @@ fn main() {
 
             // Wait for child to exit
             let _ = waitpid(Pid::from_raw(child.as_raw()), None);
+            // Print aggregated rusage for children so we can see how the kernel
+            // accounted the child's CPU time.
+            print_rusage("children", libc::RUSAGE_CHILDREN);
             // Cleanup by dropping cg
         }
         Err(e) => {
