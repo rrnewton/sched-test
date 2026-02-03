@@ -6,6 +6,10 @@ use cgroups_rs::fs::cgroup_builder::CgroupBuilder;
 use cgroups_rs::fs::hierarchies;
 use quickcheck::{Arbitrary, Gen};
 use anyhow::{Result, Context};
+use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicU32, Ordering};
+use crate::util::child::Child;
+use crate::util::shared::SharedBox;
 
 /// System resource constraints used for generating realistic cgroup configurations.
 #[derive(Debug, Clone, Copy)]
@@ -61,11 +65,50 @@ pub struct CGroupTreeNode {
     pub children: Vec<CGroupTreeNode>,
 }
 
+/// Simple CPU hog workload that spins using Instant::now()
+fn cpu_hog_workload(duration: Duration, start_signal: SharedBox<AtomicU32>) {
+    // Wait for start signal
+    while start_signal.load(Ordering::Acquire) == 0 {
+        std::hint::spin_loop();
+    }
+
+    // Spin for the specified duration
+    let start = Instant::now();
+    while start.elapsed() < duration {
+        // Just spin, checking time
+        std::hint::spin_loop();
+    }
+}
+
+/// A handle to a launched CPU hog process
+pub struct CGroupHog {
+    child: Child,
+}
+
+impl CGroupHog {
+    /// Wait for the hog to complete
+    pub fn wait(mut self) -> Result<()> {
+        let result = self.child.wait(true, false);
+        match result {
+            Some(Ok(())) => Ok(()),
+            Some(Err(e)) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// Check if the hog is still alive
+    pub fn alive(&mut self) -> bool {
+        self.child.alive()
+    }
+}
+
 /// A created cgroup tree that exists on the filesystem.
 /// When dropped, all cgroups in the tree are deleted.
 pub struct ActualizedCGroupTree {
     /// The root cgroup and all children
     cgroups: Vec<Cgroup>,
+    /// The tree structure (kept for traversal)
+    tree: CGroupTreeNode,
 }
 
 impl ActualizedCGroupTree {
@@ -77,6 +120,103 @@ impl ActualizedCGroupTree {
     /// Check if the tree is empty
     pub fn is_empty(&self) -> bool {
         self.cgroups.is_empty()
+    }
+
+    /// Launch CPU hog workloads in leaf cgroups only.
+    /// The hogs will wait for a start signal before actually spinning.
+    ///
+    /// # Arguments
+    /// * `duration` - How long each hog should spin
+    /// * `start_signal` - Shared atomic flag to signal when to start
+    ///
+    /// # Returns
+    /// Vector of hog handles that can be waited on
+    pub fn launch_leaf_hogs(
+        &self,
+        duration: Duration,
+        start_signal: SharedBox<AtomicU32>,
+    ) -> Result<Vec<CGroupHog>> {
+        let mut hogs = Vec::new();
+        self.launch_leaf_hogs_recursive(&self.tree, 0, duration, start_signal.clone(), &mut hogs)?;
+        Ok(hogs)
+    }
+
+    /// Signal all hogs to start running
+    pub fn start_hogs(start_signal: &SharedBox<AtomicU32>) {
+        start_signal.store(1, Ordering::Release);
+    }
+
+    /// Wait for all hogs to complete
+    pub fn wait_for_hogs(hogs: Vec<CGroupHog>) -> Result<()> {
+        for hog in hogs {
+            hog.wait()?;
+        }
+        Ok(())
+    }
+
+    /// Count the number of leaf nodes in the tree
+    pub fn count_leaves(&self) -> usize {
+        Self::count_leaves_recursive(&self.tree)
+    }
+
+    fn count_leaves_recursive(node: &CGroupTreeNode) -> usize {
+        if node.children.is_empty() {
+            1
+        } else {
+            node.children.iter().map(|child| Self::count_leaves_recursive(child)).sum()
+        }
+    }
+
+    /// Recursively launch hogs in leaf nodes
+    fn launch_leaf_hogs_recursive(
+        &self,
+        node: &CGroupTreeNode,
+        cgroup_index: usize,
+        duration: Duration,
+        start_signal: SharedBox<AtomicU32>,
+        hogs: &mut Vec<CGroupHog>,
+    ) -> Result<usize> {
+        let current_index = cgroup_index;
+
+        if node.children.is_empty() {
+            // This is a leaf - launch a hog
+            let cgroup = &self.cgroups[current_index];
+            let cgroup_path_str = cgroup.path();
+            let start_signal_clone = start_signal.clone();
+
+            let child = Child::run(
+                move || {
+                    // Just run the CPU hog - parent will add us to cgroup
+                    cpu_hog_workload(duration, start_signal_clone);
+                    Ok(())
+                },
+                None,
+            )?;
+
+            // Add the child process to the cgroup from the parent
+            let pid = child.pid().as_raw();
+            let procs_path = std::path::Path::new("/sys/fs/cgroup")
+                .join(cgroup_path_str)
+                .join("cgroup.procs");
+            std::fs::write(&procs_path, pid.to_string())
+                .context(format!("Failed to write PID {} to {:?}", pid, procs_path))?;
+
+            hogs.push(CGroupHog { child });
+            Ok(current_index + 1)
+        } else {
+            // Interior node - recurse to children
+            let mut next_index = current_index + 1;
+            for child in &node.children {
+                next_index = self.launch_leaf_hogs_recursive(
+                    child,
+                    next_index,
+                    duration,
+                    start_signal.clone(),
+                    hogs,
+                )?;
+            }
+            Ok(next_index)
+        }
     }
 }
 
@@ -224,6 +364,7 @@ impl CGroupTreeNode {
 
         Ok(ActualizedCGroupTree {
             cgroups: all_cgroups,
+            tree: self.clone(),
         })
     }
 
@@ -316,14 +457,14 @@ impl CGroupTreeNode {
         let hier = hierarchies::auto();
         let cgroup = builder.build(hier).context(format!("Failed to build cgroup {}", name))?;
 
+        // Add this cgroup to the list FIRST (preorder traversal)
+        all_cgroups.push(cgroup);
+
         // Create children with names like "parent_name/child_0", "parent_name/child_1", etc.
         for (i, child) in self.children.iter().enumerate() {
             let child_name = format!("{}/child_{}", name, i);
             child.create_recursive(&child_name, all_cgroups)?;
         }
-
-        // Add this cgroup to the list (after children so deletion order is correct)
-        all_cgroups.push(cgroup);
 
         Ok(())
     }
