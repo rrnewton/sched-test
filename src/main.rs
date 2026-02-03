@@ -1,16 +1,13 @@
+use anyhow::{anyhow, Context, Result};
+use clap::{ArgAction, Parser};
+use once_cell::sync::Lazy;
+use schtest::cases;
+use schtest::util::child::Child;
+use schtest::util::sched::SchedExt;
+use schtest::util::user::User;
 use std::collections::HashSet;
 use std::sync::Mutex;
-use std::thread;
-use std::time::Duration;
-
-use anyhow::Context;
-use anyhow::Result;
-use anyhow::anyhow;
-use clap::ArgAction;
-use clap::Parser;
-use once_cell::sync::Lazy;
-use schtest::{cases, workloads::benchmark::BenchArgs};
-use schtest::util::{child::Child, sched::SchedExt, user::User};
+use std::{thread, time::Duration};
 
 /// Command line arguments for the schtest binary.
 #[derive(Parser, Debug)]
@@ -37,10 +34,6 @@ struct Args {
     #[arg(long, action = ArgAction::SetTrue)]
     benchmarks: bool,
 
-    /// Skip root check.
-    #[arg(long, action = ArgAction::SetTrue)]
-    skip_root_check: bool,
-
     /// Binary to run (with optional arguments).
     #[arg(trailing_var_arg = true)]
     binary: Vec<String>,
@@ -56,10 +49,6 @@ struct Args {
     /// Percentile for benchmarks.
     #[arg(long, default_value_t = 0.50)]
     percentile: f64,
-
-    /// Comma-separated list of test names (or parts of names) to skip.
-    #[arg(long, value_delimiter = ',', default_value = None)]
-    skip_filters: Option<Vec<String>>,
 }
 
 fn run(args: Vec<String>) -> Result<Child> {
@@ -141,13 +130,14 @@ fn run_tests(args: &Args) -> libtest_with::Conclusion {
         quiet: false,
         test_threads: Some(1),
         logfile: None,
-        skip: args.skip_filters.clone().unwrap_or_default(),
+        skip: vec![],
         color: None,
         format: None,
         filter: args.filter.clone(),
     };
     let mut libtest_tests = Vec::new();
     if args.benchmarks {
+        use schtest::workloads::benchmark::BenchArgs;
         for t in inventory::iter::<cases::Benchmark> {
             #[allow(clippy::redundant_field_names)]
             let name = intern_string((t.name)());
@@ -183,7 +173,7 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     // We require root privileges to create cgroups, install the custom scheduler.
-    if !(args.skip_root_check || User::is_root()) {
+    if !User::is_root() {
         return Err(anyhow!("must run as root"));
     }
 

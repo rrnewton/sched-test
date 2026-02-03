@@ -1,34 +1,88 @@
-//! System topology and affinity utilities.
+//! System topology and affinity utilties.
 
+use anyhow::{anyhow, Result};
 use std::fmt;
 use std::fs;
 use std::io::Read;
 use std::path::Path;
 
-use anyhow::Result;
-use anyhow::anyhow;
+/// Get the kernel version as a tuple (major, minor, patch).
+///
+/// Parses the version from /proc/version or falls back to uname.
+pub fn kernel_version() -> Result<(u32, u32, u32)> {
+    // Try reading from /proc/version first
+    if let Ok(version_str) = fs::read_to_string("/proc/version") {
+        if let Some(version) = parse_kernel_version(&version_str) {
+            return Ok(version);
+        }
+    }
 
-unsafe fn cpu_set(cpu: usize, set: &mut libc::cpu_set_t) {
-    unsafe {
-        // Calculate which element in the array contains this CPU's bit.
-        let cpu_elem = cpu / (8 * std::mem::size_of::<libc::c_ulong>());
-        // Calculate the bit position within that element.
-        let cpu_bit = cpu % (8 * std::mem::size_of::<libc::c_ulong>());
-        // Get a pointer to the array of c_ulong elements.
-        let set_ptr = set as *mut libc::cpu_set_t as *mut libc::c_ulong;
-        // Set the bit.
-        *set_ptr.add(cpu_elem) |= 1 << cpu_bit;
+    // Fall back to uname
+    let mut utsname: libc::utsname = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::uname(&mut utsname) };
+    if rc != 0 {
+        return Err(anyhow!(
+            "failed to get kernel version: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let release = unsafe {
+        std::ffi::CStr::from_ptr(utsname.release.as_ptr())
+            .to_string_lossy()
+            .into_owned()
+    };
+
+    parse_kernel_version(&release)
+        .ok_or_else(|| anyhow!("failed to parse kernel version from: {}", release))
+}
+
+/// Parse a kernel version string into (major, minor, patch).
+fn parse_kernel_version(s: &str) -> Option<(u32, u32, u32)> {
+    // Look for pattern like "6.16.7" or "Linux version 6.16.7-..."
+    let version_re = regex::Regex::new(r"(\d+)\.(\d+)\.(\d+)").ok()?;
+    let caps = version_re.captures(s)?;
+
+    let major = caps.get(1)?.as_str().parse().ok()?;
+    let minor = caps.get(2)?.as_str().parse().ok()?;
+    let patch = caps.get(3)?.as_str().parse().ok()?;
+
+    Some((major, minor, patch))
+}
+
+/// Get the name of the default Linux scheduler for the running kernel.
+///
+/// Returns "EEVDF" for kernel 6.6+ (when EEVDF replaced CFS), or "CFS" for older kernels.
+pub fn default_scheduler_name() -> &'static str {
+    match kernel_version() {
+        Ok((major, minor, _)) => {
+            if major > 6 || (major == 6 && minor >= 6) {
+                "EEVDF"
+            } else {
+                "CFS"
+            }
+        }
+        Err(_) => "CFS", // Conservative fallback
     }
 }
 
+unsafe fn cpu_set(cpu: usize, set: &mut libc::cpu_set_t) {
+    // Calculate which element in the array contains this CPU's bit.
+    let cpu_elem = cpu / (8 * std::mem::size_of::<libc::c_ulong>());
+    // Calculate the bit position within that element.
+    let cpu_bit = cpu % (8 * std::mem::size_of::<libc::c_ulong>());
+    // Get a pointer to the array of c_ulong elements.
+    let set_ptr = set as *mut libc::cpu_set_t as *mut libc::c_ulong;
+    // Set the bit.
+    *set_ptr.add(cpu_elem) |= 1 << cpu_bit;
+}
+
 unsafe fn cpu_or(dest: &mut libc::cpu_set_t, src: &libc::cpu_set_t) {
-    unsafe {
-        let dest_ptr = dest as *mut libc::cpu_set_t as *mut libc::c_ulong;
-        let src_ptr = src as *const libc::cpu_set_t as *const libc::c_ulong;
-        let size = std::mem::size_of::<libc::cpu_set_t>() / std::mem::size_of::<libc::c_ulong>();
-        for i in 0..size {
-            *dest_ptr.add(i) |= *src_ptr.add(i);
-        }
+    let dest_ptr = dest as *mut libc::cpu_set_t as *mut libc::c_ulong;
+    let src_ptr = src as *const libc::cpu_set_t as *const libc::c_ulong;
+    let size = std::mem::size_of::<libc::cpu_set_t>() / std::mem::size_of::<libc::c_ulong>();
+    for i in 0..size {
+        *dest_ptr.add(i) |= *src_ptr.add(i);
     }
 }
 

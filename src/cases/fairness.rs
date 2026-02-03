@@ -3,14 +3,15 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use crate::{process, util, workloads};
-use util::stats::Distribution;
-use util::system::CPUMask;
-use util::system::CPUSet;
-use util::system::System;
-use workloads::benchmark::converge;
-use workloads::context::Context;
-use workloads::spinner::Spinner;
+
+use crate::util::stats::Distribution;
+use crate::util::system::CPUMask;
+use crate::util::system::{CPUSet, System};
+use crate::workloads::benchmark::converge;
+use crate::workloads::context::Context;
+use crate::workloads::spinner::Spinner;
+
+use crate::process;
 
 /// Test that ensures basic fairness for affinitized vs. non-affinitized tasks.
 ///
