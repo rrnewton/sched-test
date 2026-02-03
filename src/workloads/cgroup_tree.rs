@@ -684,11 +684,16 @@ impl RandResources {
 
         // CPU quota/period (cpu.max) - 30% probability
         // CPU quota and period should be set together
+        // Max quota is period * num_cpus (100% of all cores)
         if (u8::arbitrary(g) % 100) < 30 {
             let period: u32 = u32::arbitrary(g);
             let period = ((period % 999000) + 1000) as u64; // 1000-1000000 microseconds
-            let quota_factor: u32 = u32::arbitrary(g);
-            let quota = ((quota_factor % period as u32) + 1000) as i64; // 1000 to period
+
+            // Allow quota up to period * num_cpus (100% of all cores)
+            let max_quota = period * constraints.num_cpus as u64;
+            let quota_factor: u64 = u64::arbitrary(g);
+            let quota = ((quota_factor % max_quota) + 1000) as i64; // 1000 to period * num_cpus
+
             resources.cpu.quota = Some(quota);
             resources.cpu.period = Some(period);
         }
