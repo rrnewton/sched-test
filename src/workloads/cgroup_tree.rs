@@ -57,6 +57,124 @@ pub const DEFAULT_MAX_TREE_DEPTH: usize = 7;
 /// Default maximum number of children per node in randomly generated cgroup trees.
 pub const DEFAULT_MAX_CHILDREN: usize = 4;
 
+/// Spinner allocation for leaves, computed to ensure CPU contention.
+#[derive(Debug, Clone)]
+pub struct SpinnerAllocation {
+    /// Number of spinners to launch per leaf (indexed by leaf order in tree traversal)
+    pub spinners_per_leaf: Vec<usize>,
+    /// Node IDs corresponding to each leaf (same order as spinners_per_leaf)
+    pub leaf_node_ids: Vec<usize>,
+    /// Effective cpuset size for each leaf (None means unconstrained)
+    pub leaf_cpuset_sizes: Vec<Option<usize>>,
+    /// Warnings generated during validation
+    pub warnings: Vec<String>,
+    /// Total number of spinners across all leaves
+    pub total_spinners: usize,
+    /// System CPU count used for allocation
+    pub system_cpus: usize,
+}
+
+impl SpinnerAllocation {
+    /// Print allocation summary to stderr
+    pub fn print_summary(&self) {
+        eprintln!("\n=== Spinner Allocation ===");
+        eprintln!("System CPUs: {}", self.system_cpus);
+        eprintln!("Total spinners: {}", self.total_spinners);
+        eprintln!("Leaves: {}", self.spinners_per_leaf.len());
+        eprintln!();
+
+        for (i, ((node_id, count), cpuset_size)) in self.leaf_node_ids.iter()
+            .zip(self.spinners_per_leaf.iter())
+            .zip(self.leaf_cpuset_sizes.iter())
+            .enumerate()
+        {
+            let effective_cpus = cpuset_size.unwrap_or(self.system_cpus);
+            let oversubscription = if effective_cpus > 0 {
+                *count as f64 / effective_cpus as f64
+            } else {
+                0.0
+            };
+            let cpuset_str = match cpuset_size {
+                Some(n) => format!("{} CPUs", n),
+                None => format!("all {} CPUs", self.system_cpus),
+            };
+            eprintln!("  Leaf {}: Node #{}, {} spinners, cpuset: {}, oversubscription: {:.1}x",
+                      i, node_id, count, cpuset_str, oversubscription);
+        }
+
+        if !self.warnings.is_empty() {
+            eprintln!();
+            for warning in &self.warnings {
+                eprintln!("  WARNING: {}", warning);
+            }
+        }
+    }
+}
+
+/// Parse a cpuset string (e.g., "0", "0-3", "0,2,4", "0-2,4,6-8") and count the CPUs.
+///
+/// Returns the number of CPUs in the set.
+fn parse_cpuset_count(cpuset: &str) -> usize {
+    parse_cpuset_to_set(cpuset).len()
+}
+
+/// Parse a cpuset string into a set of CPU numbers.
+///
+/// Handles formats like "0", "0-3", "0,2,4", "0-2,4,6-8".
+fn parse_cpuset_to_set(cpuset: &str) -> std::collections::BTreeSet<usize> {
+    let mut cpus = std::collections::BTreeSet::new();
+    for part in cpuset.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some((start, end)) = part.split_once('-') {
+            if let (Ok(s), Ok(e)) = (start.trim().parse::<usize>(), end.trim().parse::<usize>()) {
+                for cpu in s..=e {
+                    cpus.insert(cpu);
+                }
+            }
+        } else if let Ok(cpu) = part.parse::<usize>() {
+            cpus.insert(cpu);
+        }
+    }
+    cpus
+}
+
+/// Convert a set of CPU numbers to a compact cpuset string.
+///
+/// Produces output like "0-3,5,7-9" from a set of CPUs.
+fn cpuset_to_string(cpus: &std::collections::BTreeSet<usize>) -> String {
+    if cpus.is_empty() {
+        return String::new();
+    }
+
+    let mut result = Vec::new();
+    let mut iter = cpus.iter().peekable();
+
+    while let Some(&start) = iter.next() {
+        let mut end = start;
+
+        // Find the end of this contiguous range
+        while let Some(&&next) = iter.peek() {
+            if next == end + 1 {
+                end = next;
+                iter.next();
+            } else {
+                break;
+            }
+        }
+
+        if start == end {
+            result.push(start.to_string());
+        } else {
+            result.push(format!("{}-{}", start, end));
+        }
+    }
+
+    result.join(",")
+}
+
 /// Statistics collected for each node in the tree (both leaf and interior nodes).
 #[derive(Debug, Clone)]
 pub struct NodeStats {
@@ -98,7 +216,10 @@ pub struct CGroupTreeNode {
     pub children: Vec<CGroupTreeNode>,
 }
 
-/// CPU hog workload using spinner_utilization to measure actual scheduled time
+/// CPU hog workload using spinner_utilization to measure actual scheduled time.
+///
+/// Uses fetch_add to accumulate scheduled time, allowing multiple hogs per leaf
+/// to aggregate their results into a single counter.
 fn cpu_hog_workload(
     duration: Duration,
     start_signal: SharedBox<AtomicU32>,
@@ -115,8 +236,9 @@ fn cpu_hog_workload(
     // Run spinner for the specified duration
     let results = spinner_utilization::run_spinner(duration, tsc_hz, false);
 
-    // Write scheduled time (in nanoseconds) to shared memory
-    scheduled_ns_out.store(results.time_scheduled_ns, Ordering::Release);
+    // Add scheduled time (in nanoseconds) to shared memory counter
+    // Using fetch_add allows multiple hogs to aggregate their results
+    scheduled_ns_out.fetch_add(results.time_scheduled_ns, Ordering::Release);
 }
 
 /// A handle to a launched CPU hog process
@@ -189,6 +311,41 @@ impl ActualizedCGroupTree {
             duration,
             start_signal.clone(),
             &scheduled_ns_counters,
+            &mut leaf_index,
+            &mut hogs,
+        )?;
+        Ok(hogs)
+    }
+
+    /// Launch CPU hog workloads in leaf cgroups using a pre-computed allocation.
+    ///
+    /// This method launches multiple spinners per leaf to ensure CPU contention,
+    /// using the counts specified in the SpinnerAllocation.
+    ///
+    /// # Arguments
+    /// * `duration` - How long each hog should spin
+    /// * `start_signal` - Shared atomic flag to signal when to start
+    /// * `scheduled_ns_counters` - Shared array of atomic counters for scheduled time (one per leaf)
+    /// * `allocation` - Pre-computed spinner allocation specifying how many spinners per leaf
+    ///
+    /// # Returns
+    /// Vector of hog handles that can be waited on
+    pub fn launch_leaf_hogs_with_allocation(
+        &self,
+        duration: Duration,
+        start_signal: SharedBox<AtomicU32>,
+        scheduled_ns_counters: Vec<SharedBox<AtomicU64>>,
+        allocation: &SpinnerAllocation,
+    ) -> Result<Vec<CGroupHog>> {
+        let mut hogs = Vec::new();
+        let mut leaf_index = 0;
+        self.launch_leaf_hogs_with_allocation_recursive(
+            &self.tree,
+            0,
+            duration,
+            start_signal.clone(),
+            &scheduled_ns_counters,
+            allocation,
             &mut leaf_index,
             &mut hogs,
         )?;
@@ -667,6 +824,81 @@ impl ActualizedCGroupTree {
             Ok(next_index)
         }
     }
+
+    /// Recursively launch hogs in leaf nodes using allocation counts
+    #[allow(clippy::too_many_arguments)]
+    fn launch_leaf_hogs_with_allocation_recursive(
+        &self,
+        node: &CGroupTreeNode,
+        cgroup_index: usize,
+        duration: Duration,
+        start_signal: SharedBox<AtomicU32>,
+        scheduled_ns_counters: &[SharedBox<AtomicU64>],
+        allocation: &SpinnerAllocation,
+        leaf_index: &mut usize,
+        hogs: &mut Vec<CGroupHog>,
+    ) -> Result<usize> {
+        let current_index = cgroup_index;
+
+        if node.children.is_empty() {
+            // This is a leaf - launch multiple hogs based on allocation
+            let cgroup = &self.cgroups[current_index];
+            let cgroup_path_str = cgroup.path();
+            let node_id = node.node_id;
+
+            // Get the number of spinners for this leaf
+            let num_spinners = allocation.spinners_per_leaf.get(*leaf_index).copied().unwrap_or(1);
+
+            // All spinners for this leaf share the same scheduled_ns counter
+            let scheduled_ns_out = scheduled_ns_counters[*leaf_index].clone();
+
+            for _ in 0..num_spinners {
+                let start_signal_clone = start_signal.clone();
+                let scheduled_ns_clone = scheduled_ns_out.clone();
+
+                let child = Child::run(
+                    move || {
+                        cpu_hog_workload(duration, start_signal_clone, scheduled_ns_clone);
+                        Ok(())
+                    },
+                    None,
+                )?;
+
+                // Add the child process to the cgroup from the parent
+                let pid = child.pid().as_raw();
+                let procs_path = std::path::Path::new("/sys/fs/cgroup")
+                    .join(&cgroup_path_str)
+                    .join("cgroup.procs");
+                std::fs::write(&procs_path, pid.to_string())
+                    .context(format!("Failed to write PID {} to {:?}", pid, procs_path))?;
+
+                hogs.push(CGroupHog {
+                    child,
+                    node_id,
+                    scheduled_ns: scheduled_ns_out.clone(),
+                });
+            }
+
+            *leaf_index += 1;
+            Ok(current_index + 1)
+        } else {
+            // Interior node - recurse to children
+            let mut next_index = current_index + 1;
+            for child in &node.children {
+                next_index = self.launch_leaf_hogs_with_allocation_recursive(
+                    child,
+                    next_index,
+                    duration,
+                    start_signal.clone(),
+                    scheduled_ns_counters,
+                    allocation,
+                    leaf_index,
+                    hogs,
+                )?;
+            }
+            Ok(next_index)
+        }
+    }
 }
 
 impl Drop for ActualizedCGroupTree {
@@ -800,6 +1032,189 @@ impl CGroupTreeNode {
             0
         } else {
             1 + self.children.iter().map(|child| child.max_depth()).max().unwrap_or(0)
+        }
+    }
+
+    /// Sanitize cpuset constraints to ensure valid parent-child relationships.
+    ///
+    /// In Linux cgroups v2, a child's cpuset must be a subset of the parent's.
+    /// If a child specifies a cpuset with no intersection with the parent's,
+    /// the kernel treats it as empty and the child inherits the parent's cpuset.
+    ///
+    /// This method fixes such conflicts by:
+    /// 1. Computing the intersection of child's cpuset with parent's effective cpuset
+    /// 2. If the intersection is empty, replacing the child's cpuset with the parent's
+    /// 3. Recursively applying this to all descendants
+    ///
+    /// # Arguments
+    /// * `num_cpus` - Total number of CPUs on the system (used as default for unconstrained nodes)
+    ///
+    /// # Returns
+    /// Number of cpuset conflicts that were fixed.
+    pub fn sanitize_cpusets(&mut self, num_cpus: usize) -> usize {
+        // Default parent cpuset is all CPUs
+        let all_cpus: std::collections::BTreeSet<usize> = (0..num_cpus).collect();
+        self.sanitize_cpusets_recursive(&all_cpus)
+    }
+
+    /// Recursive helper for cpuset sanitization.
+    fn sanitize_cpusets_recursive(
+        &mut self,
+        parent_effective_cpuset: &std::collections::BTreeSet<usize>,
+    ) -> usize {
+        let mut fixes = 0;
+
+        // Compute this node's effective cpuset
+        let this_cpuset = if let Some(ref cpus) = self.resources.0.cpu.cpus {
+            parse_cpuset_to_set(cpus)
+        } else {
+            parent_effective_cpuset.clone()
+        };
+
+        // Compute intersection with parent
+        let effective_cpuset: std::collections::BTreeSet<usize> = this_cpuset
+            .intersection(parent_effective_cpuset)
+            .copied()
+            .collect();
+
+        // If intersection is empty but we had a cpuset specified, fix it
+        if effective_cpuset.is_empty() && self.resources.0.cpu.cpus.is_some() {
+            // Replace with parent's cpuset (or a subset if parent has many CPUs)
+            let new_cpuset = cpuset_to_string(parent_effective_cpuset);
+            eprintln!(
+                "  Sanitizing Node #{}: cpuset '{}' has no intersection with parent '{}', replacing with '{}'",
+                self.node_id,
+                self.resources.0.cpu.cpus.as_ref().unwrap(),
+                cpuset_to_string(parent_effective_cpuset),
+                new_cpuset
+            );
+            self.resources.0.cpu.cpus = if new_cpuset.is_empty() {
+                None
+            } else {
+                Some(new_cpuset)
+            };
+            fixes += 1;
+        }
+
+        // Compute the effective cpuset to pass to children
+        let child_parent_cpuset = if effective_cpuset.is_empty() {
+            parent_effective_cpuset.clone()
+        } else {
+            effective_cpuset
+        };
+
+        // Recursively sanitize children
+        for child in &mut self.children {
+            fixes += child.sanitize_cpusets_recursive(&child_parent_cpuset);
+        }
+
+        fixes
+    }
+
+    /// Target oversubscription ratio per leaf (spinners = TARGET_OVERSUBSCRIPTION * effective_cpus)
+    const TARGET_OVERSUBSCRIPTION: usize = 2;
+
+    /// Maximum total spinners as a multiple of system CPUs
+    const MAX_TOTAL_SPINNERS_FACTOR: usize = 10;
+
+    /// Compute spinner allocation to ensure CPU contention.
+    ///
+    /// Algorithm:
+    /// - For each leaf, target spinners = TARGET_OVERSUBSCRIPTION * effective_cpus
+    /// - If total exceeds MAX_TOTAL_SPINNERS_FACTOR * num_cpus, return an error
+    ///
+    /// This ensures proportional contention based on each leaf's available CPUs.
+    ///
+    /// # Arguments
+    /// * `num_cpus` - Number of CPUs on the system
+    ///
+    /// # Returns
+    /// A `SpinnerAllocation` containing per-leaf spinner counts and any warnings.
+    pub fn compute_spinner_allocation(&self, num_cpus: usize) -> SpinnerAllocation {
+        // First pass: collect leaf info (node_id, effective cpuset size)
+        let mut leaf_info: Vec<(usize, Option<usize>)> = Vec::new();
+        self.collect_leaf_cpusets(&mut leaf_info, None);
+
+        let num_leaves = leaf_info.len();
+        if num_leaves == 0 {
+            return SpinnerAllocation {
+                spinners_per_leaf: vec![],
+                leaf_node_ids: vec![],
+                leaf_cpuset_sizes: vec![],
+                warnings: vec!["No leaves in tree".to_string()],
+                total_spinners: 0,
+                system_cpus: num_cpus,
+            };
+        }
+
+        // Compute spinners per leaf based on effective cpuset size
+        // Target: 2x oversubscription relative to available CPUs
+        let mut spinners_per_leaf = Vec::with_capacity(num_leaves);
+        for (_node_id, cpuset_size) in &leaf_info {
+            let effective_cpus = cpuset_size.unwrap_or(num_cpus);
+            let target_spinners = Self::TARGET_OVERSUBSCRIPTION * effective_cpus;
+            spinners_per_leaf.push(target_spinners.max(1)); // At least 1 spinner
+        }
+
+        let total_spinners: usize = spinners_per_leaf.iter().sum();
+        let max_allowed = Self::MAX_TOTAL_SPINNERS_FACTOR * num_cpus;
+
+        // Check if we exceed the cap
+        let mut warnings = Vec::new();
+        if total_spinners > max_allowed {
+            warnings.push(format!(
+                "ERROR: Total spinners ({}) exceeds cap of {}x CPUs ({}). \
+                 TODO: Implement tree pruning or rebalancing to reduce spinner count.",
+                total_spinners, Self::MAX_TOTAL_SPINNERS_FACTOR, max_allowed
+            ));
+            // For now, we still return the allocation but with the error warning
+            // A future implementation could prune the tree or reduce oversubscription
+        }
+
+        let leaf_node_ids: Vec<usize> = leaf_info.iter().map(|(id, _)| *id).collect();
+        let leaf_cpuset_sizes: Vec<Option<usize>> = leaf_info.iter().map(|(_, size)| *size).collect();
+
+        SpinnerAllocation {
+            spinners_per_leaf,
+            leaf_node_ids,
+            leaf_cpuset_sizes,
+            warnings,
+            total_spinners,
+            system_cpus: num_cpus,
+        }
+    }
+
+    /// Recursively collect leaf node IDs and their effective cpuset sizes.
+    ///
+    /// The effective cpuset is inherited from ancestors if not set on the leaf.
+    fn collect_leaf_cpusets(
+        &self,
+        results: &mut Vec<(usize, Option<usize>)>,
+        inherited_cpuset: Option<usize>,
+    ) {
+        // Compute this node's effective cpuset
+        let this_cpuset = if let Some(ref cpus) = self.resources.0.cpu.cpus {
+            Some(parse_cpuset_count(cpus))
+        } else {
+            None
+        };
+
+        // Effective cpuset: this node's constraint, or inherited, taking the smaller
+        let effective_cpuset = match (this_cpuset, inherited_cpuset) {
+            (Some(this), Some(inherited)) => Some(this.min(inherited)),
+            (Some(this), None) => Some(this),
+            (None, Some(inherited)) => Some(inherited),
+            (None, None) => None,
+        };
+
+        if self.children.is_empty() {
+            // Leaf node
+            results.push((self.node_id, effective_cpuset));
+        } else {
+            // Interior node - recurse to children
+            for child in &self.children {
+                child.collect_leaf_cpusets(results, effective_cpuset);
+            }
         }
     }
 

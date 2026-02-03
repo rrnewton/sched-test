@@ -7,6 +7,32 @@ use quickcheck::Gen;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
+/// Environment variable name for controlling the random seed.
+/// If set, the tree generation will use this seed for reproducibility.
+/// If not set, a random seed based on current time will be used.
+const SEED_ENV_VAR: &str = "SCHTEST_SEED";
+
+/// Get the seed for random tree generation.
+/// Checks SCHTEST_SEED environment variable first, falls back to time-based random seed.
+fn get_seed() -> usize {
+    if let Ok(seed_str) = std::env::var(SEED_ENV_VAR) {
+        if let Ok(seed) = seed_str.parse::<usize>() {
+            eprintln!("Using seed from {}: {}", SEED_ENV_VAR, seed);
+            return seed;
+        } else {
+            eprintln!("Warning: {} value '{}' is not a valid usize, using random seed",
+                      SEED_ENV_VAR, seed_str);
+        }
+    }
+    // Use current time as a random seed
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as usize)
+        .unwrap_or(42);
+    eprintln!("Using random seed: {} (set {}={} to reproduce)", seed, SEED_ENV_VAR, seed);
+    seed
+}
+
 /// Test that we can successfully create a cgroup tree.
 ///
 /// This test generates a random cgroup tree and verifies that:
@@ -16,7 +42,8 @@ use std::time::Duration;
 /// 4. The hogs can be started and stopped via shared memory signaling
 /// 5. The cgroups are cleaned up when done
 fn create_cgroup_tree() -> Result<()> {
-    let mut gen = Gen::new(42);
+    let seed = get_seed();
+    let mut gen = Gen::new(seed);
     let constraints = SystemConstraints::detect();
 
     eprintln!("Detected {} CPUs, {} bytes memory",
@@ -24,20 +51,35 @@ fn create_cgroup_tree() -> Result<()> {
               constraints.total_memory_bytes);
 
     // Generate a modest-sized tree: max depth 3, max 3 children per node
-    let tree = CGroupTreeNode::arbitrary_tree(&mut gen, &constraints, 3, 3);
+    let mut tree = CGroupTreeNode::arbitrary_tree(&mut gen, &constraints, 3, 3);
 
     eprintln!("\nGenerated tree with {} nodes, depth {}",
               tree.node_count(),
               tree.max_depth());
 
-    eprintln!("\nCGroup Tree Structure:");
+    eprintln!("\nCGroup Tree Structure (before sanitization):");
     tree.print_tree();
+
+    // Sanitize cpusets to fix parent-child conflicts
+    eprintln!("\nSanitizing cpuset constraints...");
+    let fixes = tree.sanitize_cpusets(constraints.num_cpus);
+    if fixes > 0 {
+        eprintln!("Fixed {} cpuset conflict(s)", fixes);
+        eprintln!("\nCGroup Tree Structure (after sanitization):");
+        tree.print_tree();
+    } else {
+        eprintln!("No cpuset conflicts found");
+    }
     eprintln!();
+
+    // Compute spinner allocation to ensure CPU contention
+    let allocation = tree.compute_spinner_allocation(constraints.num_cpus);
+    allocation.print_summary();
 
     // Create the actual cgroups
     let actualized = tree.create("schtest_cgroup_tree")?;
 
-    eprintln!("Successfully created {} cgroups", actualized.len());
+    eprintln!("\nSuccessfully created {} cgroups", actualized.len());
 
     // Verify the number of cgroups created matches the tree
     assert_eq!(actualized.len(), tree.node_count(),
@@ -54,17 +96,23 @@ fn create_cgroup_tree() -> Result<()> {
         scheduled_ns_counters.push(SharedBox::new(allocator.clone(), AtomicU64::new(0))?);
     }
 
-    // Launch CPU hogs in all leaf cgroups (placeholder: 2 second duration)
+    // Launch CPU hogs in all leaf cgroups
     let hog_duration = Duration::from_secs(2);
-    eprintln!("\nLaunching CPU hogs in {} leaf cgroups for {:?}...",
+    eprintln!("\nLaunching {} total CPU hogs in {} leaf cgroups for {:?}...",
+              allocation.total_spinners,
               num_leaves,
               hog_duration);
 
-    let hogs = actualized.launch_leaf_hogs(hog_duration, start_signal.clone(), scheduled_ns_counters.clone())?;
+    let hogs = actualized.launch_leaf_hogs_with_allocation(
+        hog_duration,
+        start_signal.clone(),
+        scheduled_ns_counters.clone(),
+        &allocation,
+    )?;
 
     eprintln!("Launched {} CPU hogs (waiting for start signal)", hogs.len());
-    assert_eq!(hogs.len(), actualized.count_leaves(),
-               "Should have one hog per leaf cgroup");
+    assert_eq!(hogs.len(), allocation.total_spinners,
+               "Should have launched the allocated number of hogs");
 
     // Give hogs a moment to initialize and enter their cgroups
     std::thread::sleep(Duration::from_millis(100));
@@ -75,9 +123,6 @@ fn create_cgroup_tree() -> Result<()> {
 
     // Wait for all hogs to complete
     eprintln!("Waiting for hogs to complete...");
-    let hog_results: Vec<(usize, SharedBox<AtomicU64>)> = hogs.iter()
-        .map(|h| (h.node_id, h.scheduled_ns.clone()))
-        .collect();
 
     match ActualizedCGroupTree::wait_for_hogs(hogs) {
         Ok(()) => {
@@ -94,9 +139,10 @@ fn create_cgroup_tree() -> Result<()> {
     // Print scheduled time table with right-justified columns
     eprintln!("\nLeaf Node Scheduled Time:");
 
-    // Collect results first to find column widths
-    let results: Vec<(usize, u64)> = hog_results.iter()
-        .map(|(node_id, scheduled_ns)| (*node_id, scheduled_ns.load(Ordering::Acquire)))
+    // Collect results from the per-leaf counters (each counter aggregates all spinners for that leaf)
+    let results: Vec<(usize, u64)> = allocation.leaf_node_ids.iter()
+        .zip(scheduled_ns_counters.iter())
+        .map(|(&node_id, counter)| (node_id, counter.load(Ordering::Acquire)))
         .collect();
 
     // Find max widths
@@ -139,16 +185,27 @@ fn simple_cgroup_test() -> Result<()> {
               constraints.total_memory_bytes);
 
     // Create simple deterministic tree
-    let tree = CGroupTreeNode::simple_test_tree();
+    let mut tree = CGroupTreeNode::simple_test_tree();
 
     eprintln!("\nSimple Test Tree (2 leaves with 25% and 50% CPU limits):");
     tree.print_tree();
+
+    // Sanitize cpusets (should be no-op for this simple tree)
+    let fixes = tree.sanitize_cpusets(constraints.num_cpus);
+    if fixes > 0 {
+        eprintln!("\nFixed {} cpuset conflict(s)", fixes);
+        tree.print_tree();
+    }
     eprintln!();
+
+    // Compute spinner allocation to ensure CPU contention
+    let allocation = tree.compute_spinner_allocation(constraints.num_cpus);
+    allocation.print_summary();
 
     // Create the actual cgroups
     let actualized = tree.create("schtest_simple")?;
 
-    eprintln!("Successfully created {} cgroups", actualized.len());
+    eprintln!("\nSuccessfully created {} cgroups", actualized.len());
 
     // Create shared memory for start signal and scheduled time counters
     let allocator = BumpAllocator::new("cgroup_simple", 1024 * 1024)?;
@@ -163,11 +220,17 @@ fn simple_cgroup_test() -> Result<()> {
 
     // Launch CPU hogs in all leaf cgroups (5 second duration for more stable results)
     let hog_duration = Duration::from_secs(5);
-    eprintln!("\nLaunching CPU hogs in {} leaf cgroups for {:?}...",
+    eprintln!("\nLaunching {} total CPU hogs in {} leaf cgroups for {:?}...",
+              allocation.total_spinners,
               num_leaves,
               hog_duration);
 
-    let hogs = actualized.launch_leaf_hogs(hog_duration, start_signal.clone(), scheduled_ns_counters.clone())?;
+    let hogs = actualized.launch_leaf_hogs_with_allocation(
+        hog_duration,
+        start_signal.clone(),
+        scheduled_ns_counters.clone(),
+        &allocation,
+    )?;
 
     eprintln!("Launched {} CPU hogs (waiting for start signal)", hogs.len());
 
@@ -180,9 +243,6 @@ fn simple_cgroup_test() -> Result<()> {
 
     // Wait for all hogs to complete
     eprintln!("Waiting for hogs to complete...");
-    let hog_results: Vec<(usize, SharedBox<AtomicU64>)> = hogs.iter()
-        .map(|h| (h.node_id, h.scheduled_ns.clone()))
-        .collect();
 
     match ActualizedCGroupTree::wait_for_hogs(hogs) {
         Ok(()) => {
@@ -196,9 +256,10 @@ fn simple_cgroup_test() -> Result<()> {
     // Print scheduled time table with right-justified columns
     eprintln!("\nLeaf Node Scheduled Time:");
 
-    // Collect results first to find column widths
-    let results: Vec<(usize, u64)> = hog_results.iter()
-        .map(|(node_id, scheduled_ns)| (*node_id, scheduled_ns.load(Ordering::Acquire)))
+    // Collect results from the per-leaf counters (each counter aggregates all spinners for that leaf)
+    let results: Vec<(usize, u64)> = allocation.leaf_node_ids.iter()
+        .zip(scheduled_ns_counters.iter())
+        .map(|(&node_id, counter)| (node_id, counter.load(Ordering::Acquire)))
         .collect();
 
     // Find max widths
@@ -244,16 +305,31 @@ fn fixed_random_tree_test() -> Result<()> {
               constraints.total_memory_bytes);
 
     // Create fixed random tree (seed = 42)
-    let tree = CGroupTreeNode::fixed_random_tree();
+    let mut tree = CGroupTreeNode::fixed_random_tree();
 
-    eprintln!("\nFixed Random Tree (seed=42):");
+    eprintln!("\nFixed Random Tree (seed=42, before sanitization):");
     tree.print_tree();
+
+    // Sanitize cpusets to fix parent-child conflicts
+    eprintln!("\nSanitizing cpuset constraints...");
+    let fixes = tree.sanitize_cpusets(constraints.num_cpus);
+    if fixes > 0 {
+        eprintln!("Fixed {} cpuset conflict(s)", fixes);
+        eprintln!("\nFixed Random Tree (after sanitization):");
+        tree.print_tree();
+    } else {
+        eprintln!("No cpuset conflicts found");
+    }
     eprintln!();
+
+    // Compute spinner allocation to ensure CPU contention
+    let allocation = tree.compute_spinner_allocation(constraints.num_cpus);
+    allocation.print_summary();
 
     // Create the actual cgroups
     let actualized = tree.create("schtest_fixed")?;
 
-    eprintln!("Successfully created {} cgroups", actualized.len());
+    eprintln!("\nSuccessfully created {} cgroups", actualized.len());
 
     // Create shared memory for start signal and scheduled time counters
     let allocator = BumpAllocator::new("cgroup_fixed", 1024 * 1024)?;
@@ -268,11 +344,17 @@ fn fixed_random_tree_test() -> Result<()> {
 
     // Launch CPU hogs in all leaf cgroups (5 second duration for stable results)
     let hog_duration = Duration::from_secs(5);
-    eprintln!("\nLaunching CPU hogs in {} leaf cgroups for {:?}...",
+    eprintln!("\nLaunching {} total CPU hogs in {} leaf cgroups for {:?}...",
+              allocation.total_spinners,
               num_leaves,
               hog_duration);
 
-    let hogs = actualized.launch_leaf_hogs(hog_duration, start_signal.clone(), scheduled_ns_counters.clone())?;
+    let hogs = actualized.launch_leaf_hogs_with_allocation(
+        hog_duration,
+        start_signal.clone(),
+        scheduled_ns_counters.clone(),
+        &allocation,
+    )?;
 
     eprintln!("Launched {} CPU hogs (waiting for start signal)", hogs.len());
 
@@ -285,9 +367,6 @@ fn fixed_random_tree_test() -> Result<()> {
 
     // Wait for all hogs to complete
     eprintln!("Waiting for hogs to complete...");
-    let hog_results: Vec<(usize, SharedBox<AtomicU64>)> = hogs.iter()
-        .map(|h| (h.node_id, h.scheduled_ns.clone()))
-        .collect();
 
     match ActualizedCGroupTree::wait_for_hogs(hogs) {
         Ok(()) => {
@@ -301,8 +380,10 @@ fn fixed_random_tree_test() -> Result<()> {
     // Print scheduled time table
     eprintln!("\nLeaf Node Scheduled Time:");
 
-    let results: Vec<(usize, u64)> = hog_results.iter()
-        .map(|(node_id, scheduled_ns)| (*node_id, scheduled_ns.load(Ordering::Acquire)))
+    // Collect results from the per-leaf counters (each counter aggregates all spinners for that leaf)
+    let results: Vec<(usize, u64)> = allocation.leaf_node_ids.iter()
+        .zip(scheduled_ns_counters.iter())
+        .map(|(&node_id, counter)| (node_id, counter.load(Ordering::Acquire)))
         .collect();
 
     let max_node_id = results.iter().map(|(id, _)| *id).max().unwrap_or(0);
