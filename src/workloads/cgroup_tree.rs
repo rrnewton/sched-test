@@ -57,6 +57,36 @@ pub const DEFAULT_MAX_TREE_DEPTH: usize = 7;
 /// Default maximum number of children per node in randomly generated cgroup trees.
 pub const DEFAULT_MAX_CHILDREN: usize = 4;
 
+/// Statistics collected for each node in the tree (both leaf and interior nodes).
+#[derive(Debug, Clone)]
+pub struct NodeStats {
+    /// Node ID
+    pub node_id: usize,
+    /// Actual scheduled time in nanoseconds for this node
+    /// For leaf nodes: directly measured
+    /// For interior nodes: sum of all descendant leaves
+    pub total_time_ns: u64,
+    /// Fraction of total work across ALL leaves (informational)
+    pub total_time_fraction: f64,
+    /// This node's cpu.shares value (defaults to 100 if not set)
+    pub cpu_shares: u64,
+    /// Effective cpu.max bandwidth limit (as fraction of one core, e.g., 0.5 = 50%)
+    /// This is the minimum of this node's limit and all ancestor limits
+    pub effective_cpu_max: Option<f64>,
+    /// Fraction of sibling work this node performed (only if has siblings)
+    pub sibling_fraction: Option<f64>,
+    /// Expected fair share among siblings based on cpu.shares (only if has siblings)
+    pub expected_sibling_share: Option<f64>,
+    /// Deviation from expected share: (actual - expected) / expected
+    /// Positive means got more than fair share, negative means less
+    pub share_deviation: Option<f64>,
+    /// Actual utilization vs cpu.max limit (only if cpu.max applies)
+    /// > 1.0 indicates a violation
+    pub cpu_max_utilization: Option<f64>,
+    /// Whether this is a leaf node
+    pub is_leaf: bool,
+}
+
 /// A node in a cgroup tree hierarchy.
 #[derive(Debug, Clone)]
 pub struct CGroupTreeNode {
@@ -176,6 +206,275 @@ impl ActualizedCGroupTree {
             hog.wait()?;
         }
         Ok(())
+    }
+
+    /// Compute oracle statistics for all nodes given leaf scheduled times
+    pub fn compute_oracle_stats(
+        &self,
+        leaf_times: &[(usize, u64)], // (node_id, scheduled_ns)
+    ) -> Vec<NodeStats> {
+        // First, compute the total time across all leaves
+        let total_ns: u64 = leaf_times.iter().map(|(_, ns)| ns).sum();
+
+        // Build a map from node_id to scheduled_ns for quick lookup
+        let mut leaf_time_map = std::collections::HashMap::new();
+        for &(node_id, ns) in leaf_times {
+            leaf_time_map.insert(node_id, ns);
+        }
+
+        // First pass: recursively compute stats for all nodes
+        let mut all_stats = Vec::new();
+        self.compute_node_stats_recursive(
+            &self.tree,
+            None, // No parent cpu.max yet
+            total_ns,
+            &leaf_time_map,
+            &mut all_stats,
+        );
+
+        // Second pass: compute sibling fractions
+        self.compute_sibling_fractions(&mut all_stats);
+
+        all_stats
+    }
+
+    /// Build parent-to-children mapping from the tree
+    fn build_parent_map(&self, node: &CGroupTreeNode, parent_id: Option<usize>, map: &mut std::collections::HashMap<Option<usize>, Vec<usize>>) {
+        map.entry(parent_id).or_insert_with(Vec::new).push(node.node_id);
+        for child in &node.children {
+            self.build_parent_map(child, Some(node.node_id), map);
+        }
+    }
+
+    /// Second pass: compute sibling fractions and deviations
+    fn compute_sibling_fractions(&self, all_stats: &mut Vec<NodeStats>) {
+        // Build parent-to-children map
+        let mut parent_map: std::collections::HashMap<Option<usize>, Vec<usize>> = std::collections::HashMap::new();
+        self.build_parent_map(&self.tree, None, &mut parent_map);
+
+        // Create a map from node_id to index in all_stats for quick lookup
+        let mut node_to_index = std::collections::HashMap::new();
+        for (idx, stat) in all_stats.iter().enumerate() {
+            node_to_index.insert(stat.node_id, idx);
+        }
+
+        // For each parent, compute sibling statistics
+        for (_parent_id, child_ids) in parent_map.iter() {
+            // Skip if only one child (no siblings)
+            if child_ids.len() <= 1 {
+                continue;
+            }
+
+            // Collect stats for all siblings
+            let mut sibling_stats: Vec<(usize, u64, u64)> = Vec::new(); // (node_id, total_time_ns, cpu_shares)
+            for &child_id in child_ids {
+                if let Some(&idx) = node_to_index.get(&child_id) {
+                    let stat = &all_stats[idx];
+                    sibling_stats.push((stat.node_id, stat.total_time_ns, stat.cpu_shares));
+                }
+            }
+
+            // Compute total time and total shares across siblings
+            let sibling_total_time: u64 = sibling_stats.iter().map(|(_, time, _)| time).sum();
+            let sibling_total_shares: u64 = sibling_stats.iter().map(|(_, _, shares)| shares).sum();
+
+            // Update each sibling's stats
+            for (node_id, total_time_ns, cpu_shares) in sibling_stats {
+                if let Some(&idx) = node_to_index.get(&node_id) {
+                    let stat = &mut all_stats[idx];
+
+                    // Compute actual fraction of sibling work
+                    let sibling_fraction = if sibling_total_time > 0 {
+                        total_time_ns as f64 / sibling_total_time as f64
+                    } else {
+                        0.0
+                    };
+
+                    // Compute expected share based on cpu.shares
+                    let expected_sibling_share = if sibling_total_shares > 0 {
+                        cpu_shares as f64 / sibling_total_shares as f64
+                    } else {
+                        0.0
+                    };
+
+                    // Compute deviation: (actual - expected) / expected
+                    let share_deviation = if expected_sibling_share > 0.0 {
+                        Some((sibling_fraction - expected_sibling_share) / expected_sibling_share)
+                    } else {
+                        None
+                    };
+
+                    stat.sibling_fraction = Some(sibling_fraction);
+                    stat.expected_sibling_share = Some(expected_sibling_share);
+                    stat.share_deviation = share_deviation;
+                }
+            }
+        }
+    }
+
+    /// Print oracle statistics for all nodes
+    pub fn print_oracle_stats(stats: &[NodeStats]) {
+        // Separate leaves and interior nodes
+        let mut leaves: Vec<&NodeStats> = stats.iter().filter(|s| s.is_leaf).collect();
+        let mut interior: Vec<&NodeStats> = stats.iter().filter(|s| !s.is_leaf).collect();
+
+        // Sort by node_id for consistent output
+        leaves.sort_by_key(|s| s.node_id);
+        interior.sort_by_key(|s| s.node_id);
+
+        // Print leaf node statistics
+        if !leaves.is_empty() {
+            eprintln!("\n=== Leaf Node Statistics ===");
+            for stat in leaves {
+                Self::print_node_stat(stat);
+            }
+        }
+
+        // Print interior node statistics
+        if !interior.is_empty() {
+            eprintln!("\n=== Interior Node Statistics ===");
+            for stat in interior {
+                Self::print_node_stat(stat);
+            }
+        }
+    }
+
+    /// Print statistics for a single node
+    fn print_node_stat(stat: &NodeStats) {
+        eprintln!("\nNode {}", stat.node_id);
+        eprintln!("  total_time_ns:       {}", stat.total_time_ns);
+        eprintln!("  total_time_fraction: {:.4} ({:.2}%)",
+                  stat.total_time_fraction,
+                  stat.total_time_fraction * 100.0);
+        eprintln!("  cpu_shares:          {}", stat.cpu_shares);
+
+        if let Some(cpu_max) = stat.effective_cpu_max {
+            eprintln!("  effective_cpu_max:   {:.2}%", cpu_max * 100.0);
+        } else {
+            eprintln!("  effective_cpu_max:   none");
+        }
+
+        // Print sibling-related stats if available
+        if let Some(sibling_frac) = stat.sibling_fraction {
+            eprintln!("  sibling_fraction:    {:.4} ({:.2}%)",
+                      sibling_frac,
+                      sibling_frac * 100.0);
+        }
+
+        if let Some(expected_share) = stat.expected_sibling_share {
+            eprintln!("  expected_share:      {:.4} ({:.2}%)",
+                      expected_share,
+                      expected_share * 100.0);
+        }
+
+        if let Some(deviation) = stat.share_deviation {
+            let sign = if deviation >= 0.0 { "+" } else { "" };
+            eprintln!("  share_deviation:     {}{:.4} ({}{:.2}%)",
+                      sign, deviation, sign, deviation * 100.0);
+
+            // Highlight significant deviations (>10%)
+            if deviation.abs() > 0.10 {
+                eprintln!("    WARNING: Deviation exceeds 10%!");
+            }
+        }
+
+        if let Some(utilization) = stat.cpu_max_utilization {
+            eprintln!("  cpu_max_utilization: {:.4} ({:.2}%)",
+                      utilization,
+                      utilization * 100.0);
+
+            // Highlight violations (>1.0)
+            if utilization > 1.0 {
+                eprintln!("    VIOLATION: Exceeded cpu.max limit!");
+            }
+        }
+    }
+
+    /// Recursively compute statistics for a node and its children
+    fn compute_node_stats_recursive(
+        &self,
+        node: &CGroupTreeNode,
+        parent_cpu_max: Option<f64>,
+        total_ns: u64,
+        leaf_time_map: &std::collections::HashMap<usize, u64>,
+        all_stats: &mut Vec<NodeStats>,
+    ) -> u64 {
+        let is_leaf = node.children.is_empty();
+
+        // Get this node's cpu.max (quota/period as fraction of one core)
+        let this_cpu_max = if let (Some(quota), Some(period)) =
+            (node.resources.0.cpu.quota, node.resources.0.cpu.period) {
+            Some(quota as f64 / period as f64)
+        } else {
+            None
+        };
+
+        // Effective cpu.max is minimum of this node's and parent's limit
+        let effective_cpu_max = match (this_cpu_max, parent_cpu_max) {
+            (Some(this), Some(parent)) => Some(this.min(parent)),
+            (Some(this), None) => Some(this),
+            (None, Some(parent)) => Some(parent),
+            (None, None) => None,
+        };
+
+        // Get cpu.shares (defaults to 100)
+        let cpu_shares = node.resources.0.cpu.shares.unwrap_or(100);
+
+        // Compute total_time_ns for this node
+        let total_time_ns = if is_leaf {
+            // Leaf: directly from measurement
+            *leaf_time_map.get(&node.node_id).unwrap_or(&0)
+        } else {
+            // Interior: sum of all children (recursively)
+            let mut sum = 0u64;
+            for child in &node.children {
+                sum += self.compute_node_stats_recursive(
+                    child,
+                    effective_cpu_max,
+                    total_ns,
+                    leaf_time_map,
+                    all_stats,
+                );
+            }
+            sum
+        };
+
+        // Compute total_time_fraction
+        let total_time_fraction = if total_ns > 0 {
+            total_time_ns as f64 / total_ns as f64
+        } else {
+            0.0
+        };
+
+        // Compute cpu_max_utilization if a limit applies
+        let cpu_max_utilization = if let Some(_max_fraction) = effective_cpu_max {
+            // max_fraction is in terms of single core (e.g., 0.5 = 50% of one core)
+            // total_time_ns is actual scheduled time
+            // We need to compare to the duration the test ran for
+            // For now, we'll just track the effective limit
+            // TODO: Need duration to compute actual utilization
+            None  // Will implement this properly when we have duration
+        } else {
+            None
+        };
+
+        // Create initial stats (sibling-related fields will be computed in second pass)
+        let stats = NodeStats {
+            node_id: node.node_id,
+            total_time_ns,
+            total_time_fraction,
+            cpu_shares,
+            effective_cpu_max,
+            sibling_fraction: None,
+            expected_sibling_share: None,
+            share_deviation: None,
+            cpu_max_utilization,
+            is_leaf,
+        };
+
+        all_stats.push(stats);
+
+        total_time_ns
     }
 
     /// Count the number of leaf nodes in the tree

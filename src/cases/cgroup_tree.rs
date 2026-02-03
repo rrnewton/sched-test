@@ -110,9 +110,13 @@ fn create_cgroup_tree() -> Result<()> {
     eprintln!("{:>width1$}, {:>width2$}", "node_id", "scheduled_ns", width1 = node_id_width, width2 = ns_width);
 
     // Print rows
-    for (node_id, scheduled_ns) in results {
+    for (node_id, scheduled_ns) in &results {
         eprintln!("{:>width1$}, {:>width2$}", node_id, scheduled_ns, width1 = node_id_width, width2 = ns_width);
     }
+
+    // Compute and print oracle statistics
+    let oracle_stats = actualized.compute_oracle_stats(&results);
+    ActualizedCGroupTree::print_oracle_stats(&oracle_stats);
 
     // Cgroups will be automatically deleted when actualized is dropped
     Ok(())
@@ -219,6 +223,10 @@ fn simple_cgroup_test() -> Result<()> {
         let ratio = if ns1 > 0 { ns2 as f64 / ns1 as f64 } else { 0.0 };
         eprintln!("\nRatio (leaf2/leaf1): {:.2} (expected ~2.0)", ratio);
     }
+
+    // Compute and print oracle statistics
+    let oracle_stats = actualized.compute_oracle_stats(&results);
+    ActualizedCGroupTree::print_oracle_stats(&oracle_stats);
 
     Ok(())
 }
