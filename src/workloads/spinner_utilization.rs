@@ -141,11 +141,9 @@ pub fn run_spinner(duration: Duration, tsc_hz: u64, verbose: bool) -> BenchmarkR
                 slices.push((slice_start_cycle, slice_end_cycle));
                 in_slice = false;
             }
-        } else {
-            if !in_slice {
-                slice_start_cycle = cur_cycle;
-                in_slice = true;
-            }
+        } else if !in_slice {
+            slice_start_cycle = cur_cycle;
+            in_slice = true;
         }
         last_cycle = cur_cycle;
     }
