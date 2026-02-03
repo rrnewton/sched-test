@@ -84,142 +84,148 @@ fn worker_shared(shutdown_flag: *const AtomicU32, cpu_hz: u64, verbose: bool) {
     let mut count: u64 = 0;
     let mut slices = Vec::new();
     let mut last_cycle = rdtsc();
-    let mut last_time = Instant::now();
     let mut in_slice = false;
-    let mut slice_start = 0u64;
-    let mut slice_start_time = last_time;
+    let mut slice_start_cycle = 0u64;
+    
     while unsafe { (*shutdown_flag).load(Ordering::Relaxed) == 0 } {
         count += 1;
         let cur_cycle = rdtsc();
-        let cur_time = Instant::now();
         let gap = cur_cycle - last_cycle;
+        
         // If gap is large, treat as deschedule event
         if gap > MIN_DESCHEDULE_CYCLES {
             if in_slice {
-                let slice_end = last_cycle;
-                let slice_end_time = last_time;
-                slices.push((slice_start, slice_end, slice_start_time, slice_end_time));
+                let slice_end_cycle = last_cycle;
+                slices.push((slice_start_cycle, slice_end_cycle));
                 in_slice = false;
             }
         } else {
             if !in_slice {
-                slice_start = cur_cycle;
-                slice_start_time = cur_time;
+                slice_start_cycle = cur_cycle;
                 in_slice = true;
             }
         }
         last_cycle = cur_cycle;
-        last_time = cur_time;
     }
+    
     // Final slice
     if in_slice {
-        slices.push((slice_start, last_cycle, slice_start_time, last_time));
+        slices.push((slice_start_cycle, last_cycle));
     }
+    
     // Print results
     let elapsed_secs = worker_start.elapsed().as_secs_f64();
-    let total_cycles: u64 = slices.iter().map(|(start, end, _, _)| end - start).sum();
-    let total_time: f64 = slices
-        .iter()
-        .map(|(_, _, t0, t1)| t1.duration_since(*t0).as_secs_f64())
-        .sum();
-    let scheduled_secs = total_time;
+    let total_cycles: u64 = slices.iter().map(|(start, end)| end - start).sum();
+    
+    // Convert total cycles to scheduled time
+    let scheduled_secs = total_cycles as f64 / cpu_hz as f64;
     println!("Elapsed time: {:.3} seconds", elapsed_secs);
     println!("Worker was scheduled for {:.3} seconds, {} iterations", scheduled_secs, format_with_commas(count));
     println!("Total cycles: {}", format_with_commas(total_cycles));
+    
     // Windowed utilization with optional per-window stats
-    let window = Duration::from_millis(WINDOW_SIZE_MS);
+    // Now working entirely in cycle space, convert to time later
+    let window_cycles = (cpu_hz as f64 * (WINDOW_SIZE_MS as f64 / 1000.0)) as u64;
     let mut windows = Vec::new();
-    let first_slice_start = slices.first().map(|(_,_,t0,_)| *t0).unwrap_or(Instant::now());
-    let mut cur_win_start = first_slice_start;
-    let mut cur_win_end = cur_win_start + window;
-    let mut cur_win_cycles = 0u64;
-    let mut cur_win_slices = 0usize;
-    let mut cur_win_max_gap_ns = 0u64;
-    let mut slice_idx = 0;
     
-    // Store window stats for later printing in chronological order
-    struct WindowStats {
-        start_time_secs: f64,
-        slices: usize,
-        max_gap_ns: u64,
-        cycles: u64,
-    }
-    let mut window_stats = Vec::new();
-    
-    for (start, end, t0, t1) in &slices {
-        let mut seg_start = *t0;
-        let seg_end = *t1;
-        let mut seg_cycles = end - start;
+    if !slices.is_empty() {
+        let first_cycle = slices[0].0;
         
-        while seg_end > cur_win_end {
-            let seg_dur = cur_win_end.duration_since(seg_start).as_secs_f64();
-            let seg_frac = seg_dur / t1.duration_since(*t0).as_secs_f64();
-            let win_cycles = (seg_cycles as f64 * seg_frac) as u64;
-            cur_win_cycles += win_cycles;
-            cur_win_slices += 1;
+        // Store window stats for later printing in chronological order
+        struct WindowStats {
+            start_time_secs: f64,
+            slices: usize,
+            max_gap_cycles: u64,
+            cycles: u64,
+        }
+        let mut window_stats = Vec::new();
+        
+        let mut cur_win_start = first_cycle;
+        let mut cur_win_end = cur_win_start + window_cycles;
+        let mut cur_win_cycles = 0u64;
+        let mut cur_win_slices = 0usize;
+        let mut cur_win_max_gap_cycles = 0u64;
+        
+        for (slice_idx, &(start_cycle, end_cycle)) in slices.iter().enumerate() {
+            let mut seg_start = start_cycle;
+            let mut seg_cycles = end_cycle - start_cycle;
             
-            // Calculate gap to next slice if there is one
-            if slice_idx + 1 < slices.len() {
-                let (_, _, next_t0, _) = slices[slice_idx + 1];
-                let gap_ns = next_t0.duration_since(*t1).as_nanos() as u64;
-                cur_win_max_gap_ns = cur_win_max_gap_ns.max(gap_ns);
+            // Handle case where slice spans multiple windows
+            while seg_start + seg_cycles > cur_win_end {
+                let win_cycles = cur_win_end - seg_start;
+                cur_win_cycles += win_cycles;
+                cur_win_slices += 1;
+                
+                // Calculate gap to next slice in cycles
+                if slice_idx + 1 < slices.len() {
+                    let next_start = slices[slice_idx + 1].0;
+                    let gap_cycles = next_start - end_cycle;
+                    cur_win_max_gap_cycles = cur_win_max_gap_cycles.max(gap_cycles);
+                }
+                
+                windows.push(cur_win_cycles);
+                
+                if verbose {
+                    let start_time_secs = (cur_win_start - first_cycle) as f64 / cpu_hz as f64;
+                    window_stats.push(WindowStats {
+                        start_time_secs,
+                        slices: cur_win_slices,
+                        max_gap_cycles: cur_win_max_gap_cycles,
+                        cycles: cur_win_cycles,
+                    });
+                }
+                
+                // Move to next window
+                cur_win_start = cur_win_end;
+                cur_win_end += window_cycles;
+                cur_win_cycles = 0;
+                cur_win_slices = 0;
+                cur_win_max_gap_cycles = 0;
+                
+                seg_start = cur_win_start;
+                seg_cycles -= win_cycles;
             }
             
+            // Add remaining segment to current window
+            cur_win_cycles += seg_cycles;
+            cur_win_slices += 1;
+        }
+        
+        // Final partial window
+        if cur_win_cycles > 0 {
             windows.push(cur_win_cycles);
-            
             if verbose {
-                let start_time_secs = cur_win_start.duration_since(first_slice_start).as_secs_f64();
+                let start_time_secs = (cur_win_start - first_cycle) as f64 / cpu_hz as f64;
                 window_stats.push(WindowStats {
                     start_time_secs,
                     slices: cur_win_slices,
-                    max_gap_ns: cur_win_max_gap_ns,
+                    max_gap_cycles: cur_win_max_gap_cycles,
                     cycles: cur_win_cycles,
                 });
             }
-            
-            cur_win_start = cur_win_end;
-            cur_win_end += window;
-            cur_win_cycles = 0;
-            cur_win_slices = 0;
-            cur_win_max_gap_ns = 0;
-            seg_start = cur_win_start;
-            seg_cycles -= win_cycles;
         }
-        cur_win_cycles += seg_cycles;
-        cur_win_slices += 1;
-        slice_idx += 1;
-    }
-    if cur_win_cycles > 0 {
-        windows.push(cur_win_cycles);
-        if verbose {
-            let start_time_secs = cur_win_start.duration_since(first_slice_start).as_secs_f64();
-            window_stats.push(WindowStats {
-                start_time_secs,
-                slices: cur_win_slices,
-                max_gap_ns: cur_win_max_gap_ns,
-                cycles: cur_win_cycles,
-            });
+        
+        // Print window stats in chronological order
+        if verbose && !window_stats.is_empty() {
+            println!("\nPer-window statistics:");
+            for stat in &window_stats {
+                let utilization = stat.cycles as f64 / window_cycles as f64;
+                let max_gap_ns = (stat.max_gap_cycles as f64 / cpu_hz as f64 * 1e9) as u64;
+                println!("  Window {:.1}s: {} slices, max gap: {} ns, util: {:.2}%",
+                    stat.start_time_secs, stat.slices, format_with_commas(max_gap_ns), utilization * 100.0);
+            }
         }
-    }
-    
-    // Print window stats in chronological order
-    if verbose && !window_stats.is_empty() {
-        println!("\nPer-window statistics:");
-        for stat in &window_stats {
-            let utilization = stat.cycles as f64 / (cpu_hz as f64 * window.as_secs_f64());
-            println!("  Window {:.1}s: {} slices, max gap: {} ns, util: {:.2}%",
-                stat.start_time_secs, stat.slices, format_with_commas(stat.max_gap_ns), utilization * 100.0);
+        
+        // Compute percentiles
+        let mut utilizations: Vec<f64> = windows.iter().map(|&cyc| cyc as f64 / window_cycles as f64).collect();
+        utilizations.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let percentiles = [1, 25, 50, 75, 99];
+        println!("Windowed utilization percentiles ({}ms windows):", WINDOW_SIZE_MS);
+        for &p in &percentiles {
+            let idx = ((utilizations.len() as f64) * (p as f64 / 100.0)).floor() as usize;
+            let idx = idx.min(utilizations.len().saturating_sub(1));
+            println!("p{:02}: {:.2}%", p, utilizations.get(idx).copied().unwrap_or(0.0) * 100.0);
         }
-    }
-    // Compute percentiles
-    let mut utilizations: Vec<f64> = windows.iter().map(|&cyc| cyc as f64 / (cpu_hz as f64 * window.as_secs_f64())).collect();
-    utilizations.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let percentiles = [1, 25, 50, 75, 99];
-    println!("Windowed utilization percentiles ({}ms windows):", window.as_millis());
-    for &p in &percentiles {
-        let idx = ((utilizations.len() as f64) * (p as f64 / 100.0)).floor() as usize;
-        let idx = idx.min(utilizations.len().saturating_sub(1));
-        println!("p{:02}: {:.2}%", p, utilizations.get(idx).copied().unwrap_or(0.0) * 100.0);
     }
 }
 
