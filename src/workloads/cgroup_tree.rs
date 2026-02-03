@@ -125,38 +125,33 @@ impl Arbitrary for CGroupTreeNode {
     }
 
     fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
-        // Shrinking strategy: try smaller trees
-        let mut shrunk = Vec::new();
+        // 1. Shrink the children Vec using Vec's shrinker
+        let children_vec = self.children.clone();
+            let mut all_shrinks = Vec::new();
 
-        // Strategy 1: Remove all children (shrink to just root)
-        if !self.children.is_empty() {
-            shrunk.push(CGroupTreeNode {
-                resources: self.resources.clone(),
-                children: Vec::new(),
-            });
-        }
-
-        // Strategy 2: Keep only one child at a time
-        for child in &self.children {
-            shrunk.push(CGroupTreeNode {
-                resources: self.resources.clone(),
-                children: vec![child.clone()],
-            });
-        }
-
-        // Strategy 3: Recursively shrink children
-        for (i, child) in self.children.iter().enumerate() {
-            for shrunk_child in child.shrink() {
-                let mut new_children = self.children.clone();
-                new_children[i] = shrunk_child;
-                shrunk.push(CGroupTreeNode {
+            // Shrink the children Vec using Vec's shrinker
+            for shrunk_vec in children_vec.shrink() {
+                all_shrinks.push(CGroupTreeNode {
                     resources: self.resources.clone(),
-                    children: new_children,
+                    children: shrunk_vec,
                 });
             }
-        }
 
-        Box::new(shrunk.into_iter())
+            // Recursively shrink each child, keeping others unchanged
+            let resources = self.resources.clone();
+            let children = self.children.clone();
+            for (i, child) in children.iter().enumerate() {
+                for shrunk_child in child.shrink() {
+                    let mut new_children = children.clone();
+                    new_children[i] = shrunk_child;
+                    all_shrinks.push(CGroupTreeNode {
+                        resources: resources.clone(),
+                        children: new_children,
+                    });
+                }
+            }
+
+            Box::new(all_shrinks.into_iter())
     }
 }
 
