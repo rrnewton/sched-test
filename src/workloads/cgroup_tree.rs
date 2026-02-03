@@ -299,6 +299,9 @@ impl CGroupTreeNode {
         let mut info = Vec::new();
 
         // CPU resources
+        if let Some(ref cpus) = node.resources.0.cpu.cpus {
+            info.push(format!("cpus:{}", cpus));
+        }
         if let Some(shares) = node.resources.0.cpu.shares {
             info.push(format!("shares:{}", shares));
         }
@@ -591,24 +594,23 @@ impl RandResources {
             resources.cpu.period = Some(period);
         }
 
-        // CPUSET - specific CPUs (simple format like "0", "0-2", "0,2,4")
+        // CPUSET - specific CPUs (simple format like "0", "0-2", "0,2,4") - 20% probability
         // Now respects actual CPU count on the system!
-        // Disabled for now - just use shares and quota
-        // if bool::arbitrary(g) && max_cpu > 0 {
-        //     let cpu_type: u8 = u8::arbitrary(g);
-        //     if cpu_type % 2 == 0 {
-        //         // Single CPU
-        //         let cpu_num: u64 = u64::arbitrary(g);
-        //         resources.cpu.cpus = Some(format!("{}", cpu_num % (max_cpu as u64 + 1)));
-        //     } else {
-        //         // CPU range
-        //         let start: u64 = u64::arbitrary(g);
-        //         let len: u64 = u64::arbitrary(g);
-        //         let start = start % (max_cpu as u64 + 1);
-        //         let end = std::cmp::min(start + (len % 4) + 1, max_cpu as u64);
-        //         resources.cpu.cpus = Some(format!("{}-{}", start, end));
-        //     }
-        // }
+        if (u8::arbitrary(g) % 100) < 20 && max_cpu > 0 {
+            let cpu_type: u8 = u8::arbitrary(g);
+            if cpu_type % 2 == 0 {
+                // Single CPU
+                let cpu_num: u64 = u64::arbitrary(g);
+                resources.cpu.cpus = Some(format!("{}", cpu_num % (max_cpu as u64 + 1)));
+            } else {
+                // CPU range
+                let start: u64 = u64::arbitrary(g);
+                let len: u64 = u64::arbitrary(g);
+                let start = start % (max_cpu as u64 + 1);
+                let end = std::cmp::min(start + (len % 4) + 1, max_cpu as u64);
+                resources.cpu.cpus = Some(format!("{}-{}", start, end));
+            }
+        }
 
         // Randomly set Memory resources
         // Now respects actual system memory!
