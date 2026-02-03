@@ -68,14 +68,14 @@ pub struct NodeStats {
     pub total_time_ns: u64,
     /// Fraction of total work across ALL leaves (informational)
     pub total_time_fraction: f64,
-    /// This node's cpu.shares value (defaults to 100 if not set)
-    pub cpu_shares: u64,
+    /// This node's cpu.weight value (defaults to 100 if not set, called cpu.shares in v1)
+    pub cpu_weight: u64,
     /// Effective cpu.max bandwidth limit (as fraction of one core, e.g., 0.5 = 50%)
     /// This is the minimum of this node's limit and all ancestor limits
     pub effective_cpu_max: Option<f64>,
     /// Fraction of sibling work this node performed (only if has siblings)
     pub sibling_fraction: Option<f64>,
-    /// Expected fair share among siblings based on cpu.shares (only if has siblings)
+    /// Expected fair share among siblings based on cpu.weight and cpu.max interaction
     pub expected_sibling_share: Option<f64>,
     /// Deviation from expected share: (actual - expected) / expected
     /// Positive means got more than fair share, negative means less
@@ -265,50 +265,130 @@ impl ActualizedCGroupTree {
                 continue;
             }
 
-            // Collect stats for all siblings
-            let mut sibling_stats: Vec<(usize, u64, u64)> = Vec::new(); // (node_id, total_time_ns, cpu_shares)
+            // Collect stats for all siblings: (node_id, total_time_ns, cpu_weight, effective_cpu_max)
+            let mut sibling_info: Vec<(usize, u64, u64, Option<f64>)> = Vec::new();
             for &child_id in child_ids {
                 if let Some(&idx) = node_to_index.get(&child_id) {
                     let stat = &all_stats[idx];
-                    sibling_stats.push((stat.node_id, stat.total_time_ns, stat.cpu_shares));
+                    sibling_info.push((stat.node_id, stat.total_time_ns, stat.cpu_weight, stat.effective_cpu_max));
                 }
             }
 
-            // Compute total time and total shares across siblings
-            let sibling_total_time: u64 = sibling_stats.iter().map(|(_, time, _)| time).sum();
-            let sibling_total_shares: u64 = sibling_stats.iter().map(|(_, _, shares)| shares).sum();
+            // Compute total time across siblings
+            let sibling_total_time: u64 = sibling_info.iter().map(|(_, time, _, _)| time).sum();
+
+            // Compute expected shares accounting for both cpu.weight and cpu.max
+            let expected_shares = Self::compute_expected_shares(&sibling_info);
 
             // Update each sibling's stats
-            for (node_id, total_time_ns, cpu_shares) in sibling_stats {
-                if let Some(&idx) = node_to_index.get(&node_id) {
+            for ((node_id, total_time_ns, _cpu_weight, _cpu_max), expected_share) in
+                sibling_info.iter().zip(expected_shares.iter()) {
+                if let Some(&idx) = node_to_index.get(node_id) {
                     let stat = &mut all_stats[idx];
 
                     // Compute actual fraction of sibling work
                     let sibling_fraction = if sibling_total_time > 0 {
-                        total_time_ns as f64 / sibling_total_time as f64
-                    } else {
-                        0.0
-                    };
-
-                    // Compute expected share based on cpu.shares
-                    let expected_sibling_share = if sibling_total_shares > 0 {
-                        cpu_shares as f64 / sibling_total_shares as f64
+                        *total_time_ns as f64 / sibling_total_time as f64
                     } else {
                         0.0
                     };
 
                     // Compute deviation: (actual - expected) / expected
-                    let share_deviation = if expected_sibling_share > 0.0 {
-                        Some((sibling_fraction - expected_sibling_share) / expected_sibling_share)
+                    let share_deviation = if *expected_share > 0.0 {
+                        Some((sibling_fraction - expected_share) / expected_share)
                     } else {
                         None
                     };
 
                     stat.sibling_fraction = Some(sibling_fraction);
-                    stat.expected_sibling_share = Some(expected_sibling_share);
+                    stat.expected_sibling_share = Some(*expected_share);
                     stat.share_deviation = share_deviation;
                 }
             }
+        }
+    }
+
+    /// Compute expected shares among siblings accounting for cpu.weight and cpu.max interaction
+    ///
+    /// Algorithm: Iteratively allocate capacity to siblings based on weights, capping those
+    /// that hit their cpu.max limit, and redistributing remaining capacity among uncapped siblings.
+    fn compute_expected_shares(siblings: &[(usize, u64, u64, Option<f64>)]) -> Vec<f64> {
+        // siblings: (node_id, total_time_ns, cpu_weight, effective_cpu_max)
+        let n = siblings.len();
+        let mut allocated = vec![0.0; n];  // Effective capacity each sibling can use
+        let mut is_capped = vec![false; n];
+        let mut remaining_weight: u64 = siblings.iter().map(|(_, _, w, _)| w).sum();
+
+        // Iteratively allocate capacity
+        loop {
+            let mut any_newly_capped = false;
+
+            // Compute total uncapped capacity
+            let total_uncapped_capacity: f64 = siblings.iter().enumerate()
+                .filter(|(i, _)| !is_capped[*i])
+                .map(|(_, (_, _, _, max))| max.unwrap_or(f64::INFINITY))
+                .sum();
+
+            // If all siblings are either capped or have infinite capacity
+            if total_uncapped_capacity.is_infinite() {
+                // Distribute based on weights among uncapped siblings
+                for i in 0..n {
+                    if !is_capped[i] {
+                        let (_, _, weight, cpu_max) = siblings[i];
+                        let fair_share = weight as f64 / remaining_weight as f64;
+
+                        if let Some(max_cap) = cpu_max {
+                            // Check if fair share would exceed cap
+                            // This shouldn't happen in the infinite case, but check anyway
+                            allocated[i] = max_cap;
+                            is_capped[i] = true;
+                        } else {
+                            // No cap, gets proportional share
+                            allocated[i] = fair_share;
+                        }
+                    }
+                }
+                break;
+            }
+
+            // Try to allocate based on weights
+            for i in 0..n {
+                if is_capped[i] {
+                    continue;
+                }
+
+                let (_, _, weight, cpu_max) = siblings[i];
+                let fair_share_of_uncapped = (weight as f64 / remaining_weight as f64) * total_uncapped_capacity;
+
+                if let Some(max_cap) = cpu_max {
+                    if fair_share_of_uncapped > max_cap {
+                        // This sibling hits its cap
+                        allocated[i] = max_cap;
+                        is_capped[i] = true;
+                        remaining_weight -= weight;
+                        any_newly_capped = true;
+                    }
+                }
+            }
+
+            // If no new siblings were capped, allocate remaining capacity
+            if !any_newly_capped {
+                for i in 0..n {
+                    if !is_capped[i] {
+                        let (_, _, weight, _) = siblings[i];
+                        allocated[i] = (weight as f64 / remaining_weight as f64) * total_uncapped_capacity;
+                    }
+                }
+                break;
+            }
+        }
+
+        // Convert allocated capacities to fractions of total
+        let total_allocated: f64 = allocated.iter().sum();
+        if total_allocated > 0.0 {
+            allocated.iter().map(|a| a / total_allocated).collect()
+        } else {
+            vec![0.0; n]
         }
     }
 
@@ -346,7 +426,7 @@ impl ActualizedCGroupTree {
         eprintln!("  total_time_fraction: {:.4} ({:.2}%)",
                   stat.total_time_fraction,
                   stat.total_time_fraction * 100.0);
-        eprintln!("  cpu_shares:          {}", stat.cpu_shares);
+        eprintln!("  cpu_weight:          {}", stat.cpu_weight);
 
         if let Some(cpu_max) = stat.effective_cpu_max {
             eprintln!("  effective_cpu_max:   {:.2}%", cpu_max * 100.0);
@@ -417,8 +497,8 @@ impl ActualizedCGroupTree {
             (None, None) => None,
         };
 
-        // Get cpu.shares (defaults to 100)
-        let cpu_shares = node.resources.0.cpu.shares.unwrap_or(100);
+        // Get cpu.weight (defaults to 100; called cpu.shares in cgroups v1)
+        let cpu_weight = node.resources.0.cpu.shares.unwrap_or(100);
 
         // Compute total_time_ns for this node
         let total_time_ns = if is_leaf {
@@ -463,7 +543,7 @@ impl ActualizedCGroupTree {
             node_id: node.node_id,
             total_time_ns,
             total_time_fraction,
-            cpu_shares,
+            cpu_weight,
             effective_cpu_max,
             sibling_fraction: None,
             expected_sibling_share: None,
