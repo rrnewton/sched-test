@@ -44,15 +44,15 @@ fn create_cgroup_tree() -> Result<()> {
     assert_eq!(actualized.len(), tree.node_count(),
                "Number of created cgroups should match tree node count");
 
-    // Create shared memory for start signal and ops counters
+    // Create shared memory for start signal and scheduled time counters
     let allocator = BumpAllocator::new("cgroup_test", 1024 * 1024)?;
     let start_signal = SharedBox::new(allocator.clone(), AtomicU32::new(0))?;
 
-    // Allocate ops counters (one per leaf)
+    // Allocate scheduled_ns counters (one per leaf)
     let num_leaves = actualized.count_leaves();
-    let mut ops_counters = Vec::new();
+    let mut scheduled_ns_counters = Vec::new();
     for _ in 0..num_leaves {
-        ops_counters.push(SharedBox::new(allocator.clone(), AtomicU64::new(0))?);
+        scheduled_ns_counters.push(SharedBox::new(allocator.clone(), AtomicU64::new(0))?);
     }
 
     // Launch CPU hogs in all leaf cgroups (placeholder: 2 second duration)
@@ -61,7 +61,7 @@ fn create_cgroup_tree() -> Result<()> {
               num_leaves,
               hog_duration);
 
-    let hogs = actualized.launch_leaf_hogs(hog_duration, start_signal.clone(), ops_counters.clone())?;
+    let hogs = actualized.launch_leaf_hogs(hog_duration, start_signal.clone(), scheduled_ns_counters.clone())?;
 
     eprintln!("Launched {} CPU hogs (waiting for start signal)", hogs.len());
     assert_eq!(hogs.len(), actualized.count_leaves(),
@@ -77,7 +77,7 @@ fn create_cgroup_tree() -> Result<()> {
     // Wait for all hogs to complete
     eprintln!("Waiting for hogs to complete...");
     let hog_results: Vec<(usize, SharedBox<AtomicU64>)> = hogs.iter()
-        .map(|h| (h.node_id, h.ops_counter.clone()))
+        .map(|h| (h.node_id, h.scheduled_ns.clone()))
         .collect();
 
     match ActualizedCGroupTree::wait_for_hogs(hogs) {
@@ -92,26 +92,26 @@ fn create_cgroup_tree() -> Result<()> {
         }
     }
 
-    // Print ops table with right-justified columns
-    eprintln!("\nLeaf Node Operations Completed:");
+    // Print scheduled time table with right-justified columns
+    eprintln!("\nLeaf Node Scheduled Time:");
 
     // Collect results first to find column widths
     let results: Vec<(usize, u64)> = hog_results.iter()
-        .map(|(node_id, ops_counter)| (*node_id, ops_counter.load(Ordering::Acquire)))
+        .map(|(node_id, scheduled_ns)| (*node_id, scheduled_ns.load(Ordering::Acquire)))
         .collect();
 
     // Find max widths
     let max_node_id = results.iter().map(|(id, _)| *id).max().unwrap_or(0);
-    let max_ops = results.iter().map(|(_, ops)| *ops).max().unwrap_or(0);
+    let max_ns = results.iter().map(|(_, ns)| *ns).max().unwrap_or(0);
     let node_id_width = max_node_id.to_string().len().max(7); // "node_id" is 7 chars
-    let ops_width = max_ops.to_string().len().max(3); // "ops" is 3 chars
+    let ns_width = max_ns.to_string().len().max(13); // "scheduled_ns" is 12 chars
 
     // Print header
-    eprintln!("{:>width1$}, {:>width2$}", "node_id", "ops", width1 = node_id_width, width2 = ops_width);
+    eprintln!("{:>width1$}, {:>width2$}", "node_id", "scheduled_ns", width1 = node_id_width, width2 = ns_width);
 
     // Print rows
-    for (node_id, ops) in results {
-        eprintln!("{:>width1$}, {:>width2$}", node_id, ops, width1 = node_id_width, width2 = ops_width);
+    for (node_id, scheduled_ns) in results {
+        eprintln!("{:>width1$}, {:>width2$}", node_id, scheduled_ns, width1 = node_id_width, width2 = ns_width);
     }
 
     // Cgroups will be automatically deleted when actualized is dropped
@@ -147,15 +147,15 @@ fn simple_cgroup_test() -> Result<()> {
 
     eprintln!("Successfully created {} cgroups", actualized.len());
 
-    // Create shared memory for start signal and ops counters
+    // Create shared memory for start signal and scheduled time counters
     let allocator = BumpAllocator::new("cgroup_simple", 1024 * 1024)?;
     let start_signal = SharedBox::new(allocator.clone(), AtomicU32::new(0))?;
 
-    // Allocate ops counters (one per leaf)
+    // Allocate scheduled_ns counters (one per leaf)
     let num_leaves = actualized.count_leaves();
-    let mut ops_counters = Vec::new();
+    let mut scheduled_ns_counters = Vec::new();
     for _ in 0..num_leaves {
-        ops_counters.push(SharedBox::new(allocator.clone(), AtomicU64::new(0))?);
+        scheduled_ns_counters.push(SharedBox::new(allocator.clone(), AtomicU64::new(0))?);
     }
 
     // Launch CPU hogs in all leaf cgroups (5 second duration for more stable results)
@@ -164,7 +164,7 @@ fn simple_cgroup_test() -> Result<()> {
               num_leaves,
               hog_duration);
 
-    let hogs = actualized.launch_leaf_hogs(hog_duration, start_signal.clone(), ops_counters.clone())?;
+    let hogs = actualized.launch_leaf_hogs(hog_duration, start_signal.clone(), scheduled_ns_counters.clone())?;
 
     eprintln!("Launched {} CPU hogs (waiting for start signal)", hogs.len());
 
@@ -178,7 +178,7 @@ fn simple_cgroup_test() -> Result<()> {
     // Wait for all hogs to complete
     eprintln!("Waiting for hogs to complete...");
     let hog_results: Vec<(usize, SharedBox<AtomicU64>)> = hogs.iter()
-        .map(|h| (h.node_id, h.ops_counter.clone()))
+        .map(|h| (h.node_id, h.scheduled_ns.clone()))
         .collect();
 
     match ActualizedCGroupTree::wait_for_hogs(hogs) {
@@ -190,33 +190,33 @@ fn simple_cgroup_test() -> Result<()> {
         }
     }
 
-    // Print ops table with right-justified columns
-    eprintln!("\nLeaf Node Operations Completed:");
+    // Print scheduled time table with right-justified columns
+    eprintln!("\nLeaf Node Scheduled Time:");
 
     // Collect results first to find column widths
     let results: Vec<(usize, u64)> = hog_results.iter()
-        .map(|(node_id, ops_counter)| (*node_id, ops_counter.load(Ordering::Acquire)))
+        .map(|(node_id, scheduled_ns)| (*node_id, scheduled_ns.load(Ordering::Acquire)))
         .collect();
 
     // Find max widths
     let max_node_id = results.iter().map(|(id, _)| *id).max().unwrap_or(0);
-    let max_ops = results.iter().map(|(_, ops)| *ops).max().unwrap_or(0);
+    let max_ns = results.iter().map(|(_, ns)| *ns).max().unwrap_or(0);
     let node_id_width = max_node_id.to_string().len().max(7); // "node_id" is 7 chars
-    let ops_width = max_ops.to_string().len().max(3); // "ops" is 3 chars
+    let ns_width = max_ns.to_string().len().max(13); // "scheduled_ns" is 12 chars
 
     // Print header
-    eprintln!("{:>width1$}, {:>width2$}", "node_id", "ops", width1 = node_id_width, width2 = ops_width);
+    eprintln!("{:>width1$}, {:>width2$}", "node_id", "scheduled_ns", width1 = node_id_width, width2 = ns_width);
 
     // Print rows
-    for (node_id, ops) in &results {
-        eprintln!("{:>width1$}, {:>width2$}", node_id, ops, width1 = node_id_width, width2 = ops_width);
+    for (node_id, scheduled_ns) in &results {
+        eprintln!("{:>width1$}, {:>width2$}", node_id, scheduled_ns, width1 = node_id_width, width2 = ns_width);
     }
 
     // Calculate and show ratio
     if results.len() == 2 {
-        let ops1 = results[0].1;
-        let ops2 = results[1].1;
-        let ratio = if ops1 > 0 { ops2 as f64 / ops1 as f64 } else { 0.0 };
+        let ns1 = results[0].1;
+        let ns2 = results[1].1;
+        let ratio = if ns1 > 0 { ns2 as f64 / ns1 as f64 } else { 0.0 };
         eprintln!("\nRatio (leaf2/leaf1): {:.2} (expected ~2.0)", ratio);
     }
 
