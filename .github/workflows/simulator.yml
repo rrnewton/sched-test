@@ -1,0 +1,48 @@
+name: scx_simulator
+
+on:
+  push:
+    branches:
+      - '**'
+    paths:
+      - 'rust/scx_simulator/**'
+      - 'lib/scxtest/**'
+      - 'scheds/**'
+  pull_request:
+    branches:
+      - '**'
+    paths:
+      - 'rust/scx_simulator/**'
+      - 'lib/scxtest/**'
+      - 'scheds/**'
+
+jobs:
+  simulator:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang llvm libelf-dev
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            rust/scx_simulator/target/
+          key: ${{ runner.os }}-simulator-${{ hashFiles('rust/scx_simulator/Cargo.lock') }}
+
+      - name: Validate scx_simulator
+        if: hashFiles('rust/scx_simulator/validate.sh') != ''
+        working-directory: rust/scx_simulator
+        run: bash validate.sh
+
+      - name: Build scx_simulator (no validate.sh yet)
+        if: hashFiles('rust/scx_simulator/validate.sh') == ''
+        working-directory: rust/scx_simulator
+        run: cargo build --workspace
