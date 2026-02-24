@@ -5,3 +5,8 @@ bpf_trace.log
 .vscode-ctags
 bug_finding/output/
 __pycache__/
+
+# Allow Claude agent definitions to be tracked
+!.claude/
+!.claude/agents/
+!.claude/agents/**
