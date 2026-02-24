@@ -284,12 +284,13 @@ impl PreemptionTrace {
             };
             writeln!(
                 w,
-                "seq={} ops={} kfunc={} structop={}:{} rbc={} timeslice={} rip=0x{:x} rip_offset=0x{:x} insn={} cpu={} worker={}",
+                "seq={} ops={} kfunc={} structop={}:{} kfunc_count={} rbc={} timeslice={} rip=0x{:x} rip_offset=0x{:x} insn={} cpu={} worker={}",
                 rec.sequence,
                 rec.ops_context.short_name(),
                 kfn,
                 rec.structop_local,
                 rec.structop_global,
+                rec.kfunc_count,
                 rec.structop_rbc,
                 rec.rbc_count,
                 rec.instruction_pointer,
@@ -394,6 +395,7 @@ fn parse_preemption_line(line: &str, so_base: u64) -> Result<PreemptionRecord, S
     let mut structop_rbc: u64 = 0;
     let mut ops_context = OpsContext::None;
     let mut kfunc_name: &'static str = "";
+    let mut kfunc_count: u32 = 0;
     let mut insn_bytes = [0u8; INSN_BYTES_LEN];
 
     /// Leak a short parsed string to get a `&'static str`.
@@ -449,6 +451,8 @@ fn parse_preemption_line(line: &str, so_base: u64) -> Result<PreemptionRecord, S
             }
         } else if let Some(val) = part.strip_prefix("ops=") {
             ops_context = OpsContext::from_short_name(val);
+        } else if let Some(val) = part.strip_prefix("kfunc_count=") {
+            kfunc_count = val.parse().map_err(|e| format!("kfunc_count: {e}"))?;
         } else if let Some(val) = part.strip_prefix("kfunc=") {
             kfunc_name = leak_str(val);
         } else if let Some(val) = part.strip_prefix("insn=") {
@@ -485,6 +489,7 @@ fn parse_preemption_line(line: &str, so_base: u64) -> Result<PreemptionRecord, S
         structop_rbc,
         ops_context,
         kfunc_name,
+        kfunc_count,
         insn_bytes,
     })
 }
@@ -544,6 +549,7 @@ mod tests {
             structop_rbc: srbc,
             ops_context: OpsContext::None,
             kfunc_name: "",
+            kfunc_count: 0,
             insn_bytes: [0u8; INSN_BYTES_LEN],
         }
     }
@@ -669,7 +675,7 @@ mod tests {
     #[test]
     fn test_parse_preemption_line_new_format() {
         let line =
-            "seq=5 structop=2:3 rbc=100 timeslice=42 rip=0x1000 rip_offset=0x100 insn=48890424ff cpu=1 worker=0";
+            "seq=5 structop=2:3 kfunc_count=7 rbc=100 timeslice=42 rip=0x1000 rip_offset=0x100 insn=48890424ff cpu=1 worker=0";
         let rec = parse_preemption_line(line, 0x2000).unwrap();
         assert_eq!(rec.sequence, 5);
         assert_eq!(rec.rbc_count, 42); // timeslice takes precedence
@@ -679,6 +685,7 @@ mod tests {
         assert_eq!(rec.worker_id, WorkerId(0));
         assert_eq!(rec.structop_local, 2);
         assert_eq!(rec.structop_global, 3);
+        assert_eq!(rec.kfunc_count, 7);
         assert_eq!(rec.insn_bytes, [0x48, 0x89, 0x04, 0x24, 0xff]);
     }
 
