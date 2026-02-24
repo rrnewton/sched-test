@@ -72,6 +72,41 @@ mb close sim-XXXXX          # When work is done and merged
 Worktree Management
 ========================================
 
+Symlink Setup
+----------------------------------------
+
+When the orchestrator runs from the parent `work/` directory (which contains all
+worktrees), it needs access to the project's `.claude/` config (including this
+agent file) and `CLAUDE.md`. These live inside the project subdirectory of the
+first worktree.
+
+Set up symlinks from the parent `work/` directory into worktree #1's project:
+
+```bash
+# From the parent work/ directory:
+ln -s <WORKTREE_1>/<PROJECT>/.claude .claude
+ln -s <WORKTREE_1>/<PROJECT>/CLAUDE.md CLAUDE.md
+```
+
+For example:
+```bash
+# From <MULTI_SCX>/work/:
+ln -s sched-test1/scx-sim/.claude .claude
+ln -s sched-test1/scx-sim/CLAUDE.md CLAUDE.md
+```
+
+This way:
+- Starting Claude Code from `work/` picks up the project's CLAUDE.md and 
+  `.claude/agents/orchestrator.md`
+- The orchestrator can see and manage all worktrees (sched-test1/ through 
+  sched-test4/)
+- Worktree #1 is the canonical source for project configuration, consistent
+  with its role as the integration branch
+
+**Important:** These symlinks point into worktree #1, so worktree #1's copy of
+these files is authoritative. Changes to CLAUDE.md or agent files should be
+committed in worktree #1.
+
 Directory Structure
 ----------------------------------------
 
