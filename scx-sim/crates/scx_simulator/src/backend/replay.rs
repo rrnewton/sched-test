@@ -276,4 +276,18 @@ impl PreemptionBackend for ReplayBackend {
             "replay interleave: complete"
         );
     }
+
+    fn is_precise(&self) -> bool {
+        true
+    }
+
+    fn read_count(&self, ctx: &ReplayWorkerCtx) -> u64 {
+        ctx.timer.as_ref().and_then(|t| t.read().ok()).unwrap_or(0)
+    }
+
+    fn reset_count(&self, ctx: &mut ReplayWorkerCtx) {
+        if let Some(ref t) = ctx.timer {
+            let _ = t.reset();
+        }
+    }
 }
