@@ -2012,6 +2012,10 @@ struct ReplayCtx {
     /// Pointer to the per-worker replay cursor.
     /// Raw pointer because it must be accessible from a signal handler.
     cursor: *const ReplayCursor,
+    /// When true, use breakpoint-only mode (no PMU timer signal).
+    /// In PMU mode the timer is disabled before the breakpoint fires,
+    /// so the RBC count is frozen and must NOT be checked.
+    no_pmu_signal: bool,
 }
 
 // Raw pointers are Send — access serialized by token passing.
@@ -2028,6 +2032,7 @@ pub fn install_replay(
     timer_fd: RawFd,
     bp_fd: RawFd,
     cursor: &ReplayCursor,
+    no_pmu_signal: bool,
 ) {
     REPLAY_CTX.with(|c| {
         c.set(Some(ReplayCtx {
@@ -2036,6 +2041,7 @@ pub fn install_replay(
             timer_fd,
             bp_fd,
             cursor: cursor as *const ReplayCursor,
+            no_pmu_signal,
         }));
     });
 }
@@ -2370,17 +2376,25 @@ extern "C" fn replay_bp_handler(
         None => return,
     };
 
-    // 2a. RBC count check for breakpoint-only mode.
+    // 2a. RBC count check -- breakpoint-only mode only.
     //
-    // In breakpoint-only mode (no PMU timer), the breakpoint fires on
-    // every execution of the target instruction. We check the RBC count
+    // In breakpoint-only mode (no PMU timer signal), the breakpoint fires
+    // on every execution of the target instruction. We check the RBC count
     // to find the right dynamic instance. If the current count is below
     // the target, re-enable the breakpoint and return.
-    let current_rbc = read_rbc_count(rctx.timer_fd);
-    if current_rbc < target.structop_rbc {
-        // Not the right instance yet — re-enable breakpoint and return.
-        arm_breakpoint(rctx.bp_fd, target.instruction_pointer);
-        return;
+    //
+    // In PMU mode this check MUST be skipped: the PMU handler disabled the
+    // timer before arming the breakpoint, so the RBC counter is frozen at
+    // approximately `target_rbc - REPLAY_MARGIN + skid`. Checking it here
+    // would always fail (frozen count < target) and cause an infinite loop
+    // of breakpoint re-arms -- the root cause of the replay hang bug.
+    if rctx.no_pmu_signal {
+        let current_rbc = read_rbc_count(rctx.timer_fd);
+        if current_rbc < target.structop_rbc {
+            // Not the right instance yet -- re-enable breakpoint and return.
+            arm_breakpoint(rctx.bp_fd, target.instruction_pointer);
+            return;
+        }
     }
 
     // 3. Save SimulatorState context.

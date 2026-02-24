@@ -205,7 +205,7 @@ impl PreemptionBackend for ReplayBackend {
         );
 
         // Install replay context (replaces normal preempt context).
-        preempt::install_replay(ring, worker_id, timer_fd, bp_fd, cursor);
+        preempt::install_replay(ring, worker_id, timer_fd, bp_fd, cursor, self.no_pmu_signal);
 
         ReplayWorkerCtx {
             timer,
