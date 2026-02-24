@@ -1,17 +1,9 @@
 /*
  * e9_rbc_trampoline.c — e9patch call trampoline for software RBC counting.
  *
- * Compiled with e9compile.sh into a trampoline binary that e9tool injects
- * into each instrumented scheduler .so. Called at every Jcc instruction.
- *
- * On init(), resolves the shared state struct (E9_SHARED_RBC) and the yield
- * function (e9_preempt_yield) from the main binary via dlsym. The fast path
- * (counter > 0) is a single decrement + branch with no function calls.
- * The slow path (counter expired) calls e9_preempt_yield via dlcall() to
- * handle ABI alignment differences.
- *
- * Global (not TLS) state is fine because the PreemptRing token protocol
- * guarantees only one worker is active at a time.
+ * Compiled with e9compile.sh. Called at every instrumented Jcc instruction.
+ * Uses a magic global array that the Rust backend writes the E9_SHARED_RBC
+ * pointer and e9_preempt_yield function pointer into after loading the .so.
  *
  * Must be compiled from the e9patch directory so #include "stdlib.c" resolves:
  *   cd third_party/e9patch && ./e9compile.sh <path>/e9_rbc_trampoline.c
@@ -19,6 +11,8 @@
 
 #include <stdint.h>
 
+/* Need LIBDL for dlcall() which handles ABI alignment when calling
+ * e9_preempt_yield (stack alignment, SSE save/restore). */
 #define LIBDL
 #include "stdlib.c"
 
@@ -33,50 +27,46 @@ struct e9_shared_rbc {
 	void   *ring_ptr;
 };
 
-/* Resolved pointers — set once during init(), used on every Jcc. */
-static struct e9_shared_rbc *state = NULL;
-static void *yield_fn = NULL;
-
 /* ------------------------------------------------------------------ */
-/* init — called once by e9tool's loader when the patched .so loads.   */
-/* Resolves E9_SHARED_RBC and e9_preempt_yield from the main binary.   */
+/* Magic mailbox: the Rust backend writes pointers here after dlopen.  */
+/*                                                                     */
+/* e9_mailbox[0] = pointer to E9_SHARED_RBC struct                    */
+/* e9_mailbox[1] = pointer to e9_preempt_yield function               */
+/*                                                                     */
+/* NOT static — exported via --export-dynamic so the Rust backend can  */
+/* find it in /proc/self/maps by searching for the magic sentinel.     */
+/* Initialized with a known magic value so the Rust backend can locate */
+/* this array by scanning the trampoline's data pages.                 */
 /* ------------------------------------------------------------------ */
 
-void init(int argc, char **argv, char **envp, void *dynamic)
-{
-	(void)argc; (void)argv; (void)envp;
-	if (dlinit(dynamic) < 0)
-		return;
-
-	void *handle = dlopen(NULL, 0x00001); /* RTLD_LAZY */
-	if (!handle)
-		return;
-
-	state = (struct e9_shared_rbc *)dlsym(handle, "E9_SHARED_RBC");
-	yield_fn = dlsym(handle, "e9_preempt_yield");
-}
+#define E9_MAILBOX_MAGIC  0xE90A7C00C0FFEEULL
+volatile uint64_t e9_mailbox[4] = {
+	E9_MAILBOX_MAGIC, /* [0]: magic sentinel (replaced with state ptr) */
+	0,                /* [1]: yield_fn ptr (set by Rust)                */
+	0,                /* [2]: reserved                                  */
+	0,                /* [3]: reserved                                  */
+};
 
 /* ------------------------------------------------------------------ */
 /* rbc_trampoline — called at each instrumented Jcc by e9tool.         */
-/*                                                                     */
-/* Fast path: decrement counter, return if > 0. Integer ops only,      */
-/* safe under e9tool's "clean" ABI (no SSE save needed).               */
-/*                                                                     */
-/* Slow path: call e9_preempt_yield via dlcall() for proper ABI        */
-/* alignment (16-byte stack, SSE save/restore).                        */
 /* ------------------------------------------------------------------ */
 
 void rbc_trampoline(void)
 {
-	if (__builtin_expect(state == NULL, 0))
+	struct e9_shared_rbc *state =
+		(struct e9_shared_rbc *)(uintptr_t)e9_mailbox[0];
+	if (__builtin_expect(state == NULL ||
+	                     (uintptr_t)state == E9_MAILBOX_MAGIC, 0))
 		return;
 	if (__builtin_expect(--(state->counter) > 0, 1))
 		return;
 	if (__builtin_expect(!state->armed, 0))
 		return;
+	void *yield_fn = (void *)(uintptr_t)e9_mailbox[1];
 	if (__builtin_expect(yield_fn == NULL, 0))
 		return;
-	/* Counter expired — yield via Rust, get new timeslice. */
+	/* Counter expired — yield via Rust, get new timeslice.
+	 * Use dlcall for proper ABI alignment (16-byte stack). */
 	state->counter = (int64_t)dlcall(yield_fn,
 		state->ring_ptr, (intptr_t)state->worker_id);
 }
