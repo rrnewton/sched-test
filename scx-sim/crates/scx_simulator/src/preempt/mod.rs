@@ -57,6 +57,10 @@ pub mod trace;
 /// This is a fixed-size ring buffer to avoid allocation in signal handlers.
 const MAX_PREEMPTION_RECORDS: usize = 4096;
 
+/// Number of instruction bytes captured at each preemption point.
+/// Used to detect .so version mismatches during replay.
+pub const INSN_BYTES_LEN: usize = 5;
+
 /// A record of a single preemption point (PMU or cooperative kfunc yield).
 ///
 /// Captures all relevant state at the moment of preemption for verifying
@@ -87,13 +91,72 @@ pub struct PreemptionRecord {
     pub ops_context: OpsContext,
     /// Name of the kfunc being called (empty if unknown or PMU preemption).
     pub kfunc_name: &'static str,
+    /// First [`INSN_BYTES_LEN`] bytes of the instruction at the RIP.
+    /// Used to detect .so version mismatches during replay.
+    pub insn_bytes: [u8; INSN_BYTES_LEN],
+}
+
+/// Pack instruction bytes into a `u64` for signal-safe atomic storage.
+///
+/// The first [`INSN_BYTES_LEN`] bytes are stored in the low bytes of the u64.
+pub fn pack_insn_bytes(bytes: [u8; INSN_BYTES_LEN]) -> u64 {
+    let mut val: u64 = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        val |= (b as u64) << (i * 8);
+    }
+    val
+}
+
+/// Unpack instruction bytes from a `u64` stored by [`pack_insn_bytes`].
+pub fn unpack_insn_bytes(val: u64) -> [u8; INSN_BYTES_LEN] {
+    let mut bytes = [0u8; INSN_BYTES_LEN];
+    for (i, b) in bytes.iter_mut().enumerate() {
+        *b = ((val >> (i * 8)) & 0xff) as u8;
+    }
+    bytes
+}
+
+/// Read [`INSN_BYTES_LEN`] bytes from the given instruction pointer.
+///
+/// The RIP is in the process's own address space (scheduler .so code),
+/// so we can dereference it directly. Returns all zeros if `rip` is 0.
+///
+/// # Safety
+///
+/// The caller must ensure `rip` points to a valid, readable address
+/// in the process address space. This is guaranteed for RIPs captured
+/// from `ucontext` in the signal handler — they point into the loaded
+/// scheduler .so's executable mapping.
+pub fn read_insn_bytes_at(rip: u64) -> [u8; INSN_BYTES_LEN] {
+    if rip == 0 {
+        return [0u8; INSN_BYTES_LEN];
+    }
+    let mut bytes = [0u8; INSN_BYTES_LEN];
+    // SAFETY: rip comes from a ucontext captured by the kernel signal
+    // delivery mechanism, pointing into the loaded scheduler .so's
+    // executable text segment. The .so remains loaded for the duration
+    // of the simulation.
+    unsafe {
+        std::ptr::copy_nonoverlapping(rip as *const u8, bytes.as_mut_ptr(), INSN_BYTES_LEN);
+    }
+    bytes
+}
+
+/// Format instruction bytes as a hex string (e.g. "48890424ff").
+pub fn format_insn_bytes(bytes: &[u8; INSN_BYTES_LEN]) -> String {
+    let mut s = String::with_capacity(INSN_BYTES_LEN * 2);
+    for b in bytes {
+        use std::fmt::Write;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 impl std::fmt::Display for PreemptionRecord {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "seq={} ops={} kfunc={} structop={}:{} rbc={} rip=0x{:x} cpu={} worker={}",
+            "seq={} ops={} kfunc={} structop={}:{} rbc={} rip=0x{:x} insn={} cpu={} worker={}",
             self.sequence,
             self.ops_context.short_name(),
             if self.kfunc_name.is_empty() {
@@ -105,6 +168,7 @@ impl std::fmt::Display for PreemptionRecord {
             self.structop_global,
             self.structop_rbc,
             self.instruction_pointer,
+            format_insn_bytes(&self.insn_bytes),
             self.cpu_id.0,
             self.worker_id.0
         )
@@ -112,7 +176,7 @@ impl std::fmt::Display for PreemptionRecord {
 }
 
 /// Number of AtomicU64 slots per preemption record.
-const RECORD_FIELDS: usize = 11;
+const RECORD_FIELDS: usize = 12;
 
 /// Global monotonic sequence counter shared across all `PreemptionRecordStore`
 /// instances. Ensures unique, globally-ordered sequence numbers even when
@@ -162,6 +226,7 @@ impl PreemptionRecordStore {
         cpu_id: CpuId,
         worker_id: WorkerId,
         sinfo: StructopInfo,
+        insn_bytes: [u8; INSN_BYTES_LEN],
     ) -> Option<u64> {
         let idx = self.count.fetch_add(1, SeqCst);
         if idx >= MAX_PREEMPTION_RECORDS {
@@ -183,6 +248,7 @@ impl PreemptionRecordStore {
         // Store kfunc_name as ptr+len — safe because all names are &'static str.
         self.records[base + 9].store(sinfo.kfunc_name.as_ptr() as u64, SeqCst);
         self.records[base + 10].store(sinfo.kfunc_name.len() as u64, SeqCst);
+        self.records[base + 11].store(pack_insn_bytes(insn_bytes), SeqCst);
         Some(seq)
     }
 
@@ -217,6 +283,7 @@ impl PreemptionRecordStore {
                 structop_rbc: self.records[base + 7].load(SeqCst),
                 ops_context: OpsContext::from_discriminant(ops_disc),
                 kfunc_name,
+                insn_bytes: unpack_insn_bytes(self.records[base + 11].load(SeqCst)),
             });
         }
         // Sort by sequence number to ensure deterministic ordering.
@@ -949,6 +1016,55 @@ pub fn scheduler_so_base() -> u64 {
     0
 }
 
+/// Find the file path of the scheduler .so in the current process.
+///
+/// Parses `/proc/self/maps` looking for the first executable mapping from
+/// a `libscx_*.so` file. Returns `None` if not found.
+pub fn scheduler_so_path() -> Option<String> {
+    let maps = match std::fs::read_to_string("/proc/self/maps") {
+        Ok(s) => s,
+        Err(_) => return None,
+    };
+    for line in maps.lines() {
+        if !line.contains("libscx_") {
+            continue;
+        }
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        if !parts[1].contains('x') {
+            continue;
+        }
+        // The path is the last field.
+        if let Some(path) = parts.last() {
+            return Some(path.to_string());
+        }
+    }
+    None
+}
+
+/// Compute an FNV-1a hash of the scheduler .so file contents.
+///
+/// Returns 0 if the .so file cannot be found or read.
+pub fn compute_so_hash() -> u64 {
+    let path = match scheduler_so_path() {
+        Some(p) => p,
+        None => return 0,
+    };
+    compute_so_hash_from_path(&path)
+}
+
+/// Compute an FNV-1a hash of a .so file at the given path.
+///
+/// Returns 0 if the file cannot be read.
+pub fn compute_so_hash_from_path(path: &str) -> u64 {
+    match std::fs::read(path) {
+        Ok(bytes) => fnv1a_hash_bytes(&bytes),
+        Err(_) => 0,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // PreemptRing — futex-based token ring (signal-safe)
 // ---------------------------------------------------------------------------
@@ -1082,7 +1198,8 @@ impl PreemptRing {
     /// Record a preemption point (signal-safe).
     ///
     /// Called from the signal handler or cooperative yield path to capture
-    /// the preemption state including structop context.
+    /// the preemption state including structop context. Reads instruction
+    /// bytes at the RIP for .so version mismatch detection during replay.
     ///
     /// Returns the sequence number assigned, or None if the buffer is full.
     pub fn record_preemption(
@@ -1093,9 +1210,15 @@ impl PreemptRing {
         worker_id: WorkerId,
         sinfo: StructopInfo,
     ) -> Option<u64> {
-        let seq =
-            self.preemption_records
-                .push(rbc_count, instruction_pointer, cpu_id, worker_id, sinfo);
+        let insn_bytes = read_insn_bytes_at(instruction_pointer);
+        let seq = self.preemption_records.push(
+            rbc_count,
+            instruction_pointer,
+            cpu_id,
+            worker_id,
+            sinfo,
+            insn_bytes,
+        );
         // Also collect to global store for test instrumentation.
         if let Some(s) = seq {
             maybe_collect_global(PreemptionRecord {
@@ -1109,6 +1232,7 @@ impl PreemptRing {
                 structop_rbc: sinfo.rbc_total,
                 ops_context: sinfo.ops_context,
                 kfunc_name: sinfo.kfunc_name,
+                insn_bytes,
             });
         }
         seq
@@ -2020,6 +2144,79 @@ extern "C" fn replay_pmu_handler(
     // 4. Return from signal handler — execution resumes with breakpoint armed.
 }
 
+/// Validate structop name and count match between trace and replay.
+///
+/// Async-signal-safe: uses only StackWriter + write_stderr + abort.
+/// Panics (aborts) with a clear message on mismatch.
+fn replay_validate_structop(target: &PreemptionRecord, sinfo: &StructopInfo) {
+    // Validate ops context matches.
+    if target.ops_context != sinfo.ops_context {
+        let mut buf = [0u8; 512];
+        let mut w = StackWriter::new(&mut buf);
+        let _ = writeln!(
+            w,
+            "REPLAY MISMATCH: ops context at seq={}: trace={}, replay={}",
+            target.sequence,
+            target.ops_context.short_name(),
+            sinfo.ops_context.short_name(),
+        );
+        write_stderr(w.as_bytes());
+        unsafe { libc::abort() };
+    }
+
+    // Validate structop counts match.
+    if target.structop_local != sinfo.cpu_count || target.structop_global != sinfo.global_count {
+        let mut buf = [0u8; 512];
+        let mut w = StackWriter::new(&mut buf);
+        let _ = writeln!(
+            w,
+            "REPLAY MISMATCH: structop at seq={}: trace={}:{}, replay={}:{}",
+            target.sequence,
+            target.structop_local,
+            target.structop_global,
+            sinfo.cpu_count,
+            sinfo.global_count,
+        );
+        write_stderr(w.as_bytes());
+        unsafe { libc::abort() };
+    }
+}
+
+/// Validate instruction bytes at the current RIP match the trace record.
+///
+/// Async-signal-safe: uses only StackWriter + write_stderr + abort.
+/// Detects .so version mismatches by comparing the first [`INSN_BYTES_LEN`]
+/// bytes of the instruction at the breakpoint address.
+fn replay_validate_insn_bytes(target: &PreemptionRecord) {
+    if target.instruction_pointer == 0 {
+        return;
+    }
+    // Skip validation if the trace record has all-zero insn_bytes (old trace).
+    if target.insn_bytes == [0u8; INSN_BYTES_LEN] {
+        return;
+    }
+    let current = read_insn_bytes_at(target.instruction_pointer);
+    if current != target.insn_bytes {
+        let mut buf = [0u8; 512];
+        let mut w = StackWriter::new(&mut buf);
+        let _ = write!(
+            w,
+            "REPLAY MISMATCH: instruction bytes at seq={} rip=0x{:x}: trace=",
+            target.sequence, target.instruction_pointer,
+        );
+        for b in &target.insn_bytes {
+            let _ = write!(w, "{:02x}", b);
+        }
+        let _ = write!(w, ", replay=");
+        for b in &current {
+            let _ = write!(w, "{:02x}", b);
+        }
+        let _ = writeln!(w, " -- .so version mismatch?");
+        write_stderr(w.as_bytes());
+        unsafe { libc::abort() };
+    }
+}
+
 /// Breakpoint signal handler for replay mode (SIGTRAP).
 ///
 /// Fires when execution hits the target instruction pointer. Preempts
@@ -2068,7 +2265,11 @@ extern "C" fn replay_bp_handler(
     set_current_ops_context(saved_ops_ctx);
     let sinfo = structop_info();
 
-    // 4a. Record the preemption point (with structop context).
+    // 4a. Replay sanity checks (async-signal-safe: StackWriter + abort).
+    replay_validate_structop(&target, &sinfo);
+    replay_validate_insn_bytes(&target);
+
+    // 4b. Record the preemption point (with structop context).
     ring.record_preemption(
         target.rbc_count,
         target.instruction_pointer,
