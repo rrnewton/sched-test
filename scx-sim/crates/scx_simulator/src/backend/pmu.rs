@@ -8,7 +8,7 @@ use std::os::unix::io::RawFd;
 
 use tracing::debug;
 
-use crate::backend::{PreemptionBackend, StructopDelta};
+use crate::backend::{PreemptTarget, PreemptionBackend, RbcTarget, RelativeRbc, StructopDelta};
 use crate::interleave::WorkerId;
 use crate::perf::{self, PmuEvent, RbcTimer};
 use crate::preempt::{self, is_determinism_mode_enabled, PreemptRing};
@@ -96,15 +96,34 @@ impl PreemptionBackend for PmuBackend {
         }
     }
 
-    fn arm(&self, ctx: &mut PmuWorkerCtx, ring: &PreemptRing) {
-        // Arm the PMU timer before entering scheduler C code.
-        if ctx.timer_fd >= 0 {
-            let ts = ring.roll_timeslice(self.timeslice_min, self.timeslice_max);
-            if let Some(ref t) = ctx.timer {
-                let _ = t.reset();
-                let _ = t.set_period(ts);
-                let _ = t.enable();
+    fn build_target(&self, ctx: &PmuWorkerCtx, ring: &PreemptRing) -> Option<PreemptTarget> {
+        // Only arm if we have a valid PMU timer fd.
+        if ctx.timer_fd < 0 {
+            // Still consume PRNG to keep deterministic sequencing.
+            let _ts = ring.roll_timeslice(self.timeslice_min, self.timeslice_max);
+            return None;
+        }
+        let timeslice = ring.roll_timeslice(self.timeslice_min, self.timeslice_max);
+        Some(PreemptTarget {
+            count_rbc: RbcTarget::Relative(RelativeRbc(timeslice)),
+            target_rip: None,
+        })
+    }
+
+    fn arm(&self, ctx: &mut PmuWorkerCtx, target: PreemptTarget) {
+        // Extract the relative RBC count for the PMU timer period.
+        let timeslice = match target.count_rbc {
+            RbcTarget::Relative(RelativeRbc(n)) => n,
+            RbcTarget::Absolute(_) => {
+                panic!("PmuBackend::arm() expects RbcTarget::Relative, got Absolute");
             }
+        };
+
+        // Arm the PMU timer before entering scheduler C code.
+        if let Some(ref t) = ctx.timer {
+            let _ = t.reset();
+            let _ = t.set_period(timeslice);
+            let _ = t.enable();
         }
 
         // Enable measurement counter before entering C code.

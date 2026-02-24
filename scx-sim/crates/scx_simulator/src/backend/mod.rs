@@ -85,13 +85,14 @@ pub struct PreemptTarget {
 /// 1. [`worker_setup`] — create instrumentation state, install TLS
 /// 2. `ring.wait_for_token(worker_id)` — acquire execution token
 /// 3. `enter_sim(state, cpu)` — enter simulation context
-/// 4. [`arm`] — enable instrumentation (timer, stalker, etc.)
+/// 4. [`build_target`] + [`arm`] — construct and apply preemption target
 /// 5. Worker body runs (dispatch or batch event processing)
 /// 6. [`disarm`] — disable instrumentation, return accounting deltas
 /// 7. Common: drain structop, clear ops_context, finish, exit_sim
 /// 8. [`worker_teardown`] — uninstall TLS, close fds
 ///
 /// [`worker_setup`]: PreemptionBackend::worker_setup
+/// [`build_target`]: PreemptionBackend::build_target
 /// [`arm`]: PreemptionBackend::arm
 /// [`disarm`]: PreemptionBackend::disarm
 /// [`worker_teardown`]: PreemptionBackend::worker_teardown
@@ -109,9 +110,19 @@ pub(crate) trait PreemptionBackend: Sync {
     /// Create per-worker instrumentation state and install preemption TLS.
     fn worker_setup(&self, ring: &PreemptRing, worker_id: WorkerId) -> Self::WorkerCtx;
 
-    /// Arm instrumentation before entering scheduler code.
-    /// Called after the worker acquires the token and enters sim.
-    fn arm(&self, ctx: &mut Self::WorkerCtx, ring: &PreemptRing);
+    /// Build the preemption target for this worker, consuming PRNG state
+    /// from the ring to maintain deterministic sequencing.
+    ///
+    /// Returns `None` if no preemption should be armed (e.g. replay cursor
+    /// exhausted). The generic drivers call this before [`arm`].
+    fn build_target(&self, ctx: &Self::WorkerCtx, ring: &PreemptRing) -> Option<PreemptTarget>;
+
+    /// Arm instrumentation with the given preemption target.
+    ///
+    /// Called after the worker acquires the token and enters sim. The
+    /// target is constructed by [`build_target`], which handles PRNG
+    /// consumption and cursor advancement.
+    fn arm(&self, ctx: &mut Self::WorkerCtx, target: PreemptTarget);
 
     /// Disarm instrumentation after scheduler code returns.
     /// Returns structop accounting deltas to merge into `structop_accum`.
@@ -123,8 +134,6 @@ pub(crate) trait PreemptionBackend: Sync {
 
     /// Log the completion summary after all workers finish.
     fn log_completion(&self, ring: &PreemptRing);
-
-    // -- Phase 1 additions (sim-80ce04) -- default impls, non-breaking --
 
     /// Whether this backend supports precise (exact RBC) targeting.
     ///
@@ -138,14 +147,24 @@ pub(crate) trait PreemptionBackend: Sync {
     ///
     /// For PMU: reads from the measurement perf fd.
     /// For replay: reads from the timer perf fd.
-    #[allow(dead_code)] // TODO(sim-80ce04): used by Phase 2 arm() refactor
+    #[allow(dead_code)] // TODO(sim-80ce04): used by Phase 3 clean-up
     fn read_count(&self, _ctx: &Self::WorkerCtx) -> u64 {
         0
     }
 
     /// Reset the RBC counter to zero. Called at the start of each structop.
-    #[allow(dead_code)] // TODO(sim-80ce04): used by Phase 2 arm() refactor
+    #[allow(dead_code)] // TODO(sim-80ce04): used by Phase 3 clean-up
     fn reset_count(&self, _ctx: &mut Self::WorkerCtx) {}
+}
+
+/// Build a target and arm instrumentation for the current worker.
+///
+/// Shared by [`run_preemptive_dispatch`] and [`run_preemptive_batch`] to
+/// avoid duplicating the `build_target` + `arm` sequence.
+fn build_and_arm<B: PreemptionBackend>(backend: &B, ctx: &mut B::WorkerCtx, ring: &PreemptRing) {
+    if let Some(target) = backend.build_target(ctx, ring) {
+        backend.arm(ctx, target);
+    }
 }
 
 /// Run concurrent dispatch using a [`PreemptionBackend`].
@@ -186,7 +205,7 @@ pub(crate) fn run_preemptive_dispatch<S, B>(
                 // SimulatorState.current_cpu with other workers.
                 unsafe { kfuncs::enter_sim(&mut *sp, cpu) };
 
-                backend.arm(&mut ctx, ring_ref);
+                build_and_arm(backend, &mut ctx, ring_ref);
 
                 unsafe {
                     debug!(cpu = cpu.0, "enter:structop dispatch (preemptive)");
@@ -272,7 +291,7 @@ pub(crate) fn run_preemptive_batch<S, B>(
 
                 unsafe { kfuncs::enter_sim(&mut *sp, cpu) };
 
-                backend.arm(&mut ctx, ring_ref);
+                build_and_arm(backend, &mut ctx, ring_ref);
 
                 unsafe {
                     batch_worker_body(
