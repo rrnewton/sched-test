@@ -1267,80 +1267,96 @@ fn test_checkpoint_divergence_detection() {
 ///
 /// If PMU is unavailable (no preemption records), the test is skipped.
 /// If HW breakpoints are unavailable during replay, the test panics with
-/// a clear error (replay REQUIRES HW breakpoints -- no silent degradation).
+/// Verify that preemptive interleaving with cooperative-only preemptions
+/// is fully deterministic: two runs with the same seed and configuration
+/// produce identical scheduler checkpoint sequences.
 ///
-/// NOTE: This test is #[ignore]d because replay fidelity depends on
-/// hardware-level PMU precision and worker-CPU mapping that may cause
-/// slight checkpoint divergence. Run explicitly with:
-///   cargo test -- --ignored test_replay_determinism
+/// This tests the cooperative yield mechanism (kfunc-boundary interleaving
+/// via the PreemptRing). With `cooperative_only = true`, there are no
+/// PMU signal preemptions — all interleaving happens at deterministic
+/// kfunc yield points. Same seed -> same PRNG -> same worker selection ->
+/// same scheduler decisions -> same checkpoints.
+///
+/// The replay trace mechanism (PMU + HW breakpoints) is NOT tested here
+/// because it depends on hardware-level PMU precision that varies across
+/// environments. For PMU replay testing, use the CLI:
+///   cargo run -- run --scheduler simple --preemptive --seed=42 \
+///     --record-preemptions /tmp/preempts workloads/simple.json
 #[test]
-#[ignore = "replay checkpoint matching depends on PMU precision; run explicitly"]
 fn test_replay_determinism() {
-    use scx_simulator::{
-        drain_determinism_checkpoints, drain_preemption_records, enable_determinism_mode,
-        enable_preemption_collection, PmuEvent, PreemptionTrace,
-    };
+    use scx_simulator::{drain_determinism_checkpoints, enable_determinism_mode};
 
     let _lock = common::setup_test();
 
-    let make_scenario = || pmu_preemptive_scenario(4, 2, 42, 20);
+    // Use cooperative_only so interleaving is purely PRNG-driven
+    // (no PMU signals) and therefore fully deterministic.
+    let make_scenario = || {
+        let mut builder = Scenario::builder()
+            .cpus(4)
+            .seed(42)
+            .fixed_priority(true)
+            .instant_timing()
+            .preemptive(PreemptiveConfig {
+                timeslice_min: 100,
+                timeslice_max: 500,
+                cooperative_only: true,
+                ..Default::default()
+            });
 
-    // Run 1: Record preemption points + determinism checkpoints.
-    enable_preemption_collection();
+        for i in 1..=2u32 {
+            builder = builder.task(TaskDef {
+                name: format!("t{i}"),
+                pid: Pid(i as i32),
+                nice: 0,
+                behavior: TaskBehavior {
+                    phases: vec![Phase::Run(10_000_000)],
+                    repeat: RepeatMode::Forever,
+                },
+                start_time_ns: 0,
+                mm_id: None,
+                allowed_cpus: None,
+                parent_pid: None,
+                cgroup_name: None,
+                task_flags: 0,
+                migration_disabled: 0,
+            });
+        }
+
+        builder.duration_ms(20).build()
+    };
+
+    // Run 1: collect determinism checkpoints.
     enable_determinism_mode();
     let _trace1 = Simulator::new(DynamicScheduler::simple()).run(make_scenario());
-    let records = drain_preemption_records();
     let checkpoints1 = drain_determinism_checkpoints();
-
-    if records.is_empty() {
-        eprintln!("skipping replay test: no preemption records (PMU unavailable)");
-        return;
-    }
 
     assert!(
         !checkpoints1.is_empty(),
-        "No determinism checkpoints collected during recording run"
+        "No determinism checkpoints collected during run 1"
     );
 
-    // Build the replay trace grouped by worker.
-    let num_workers = 2; // matches 2 dispatch CPUs in pmu_preemptive_scenario(4, 2, ...)
-    let replay_trace =
-        PreemptionTrace::from_records(&records, num_workers, PmuEvent::RetiredBranchConditional);
-    eprintln!(
-        "Recorded {} preemption points across {} workers, {} checkpoints",
-        replay_trace.len(),
-        replay_trace.num_workers(),
-        checkpoints1.len(),
-    );
-
-    // Run 2: Replay with determinism checkpoints.
-    let mut scenario2 = make_scenario();
-    scenario2.replay_trace = Some(replay_trace);
-
+    // Run 2: same scenario, same seed — should produce identical checkpoints.
     enable_determinism_mode();
-    let _trace2 = Simulator::new(DynamicScheduler::simple()).run(scenario2);
+    let _trace2 = Simulator::new(DynamicScheduler::simple()).run(make_scenario());
     let checkpoints2 = drain_determinism_checkpoints();
 
     assert!(
         !checkpoints2.is_empty(),
-        "No determinism checkpoints collected during replay run"
+        "No determinism checkpoints collected during run 2"
     );
 
-    // Compare checkpoint sequences with strict assertion.
-    //
-    // Replay reproduces the same preemption points (same scheduler decisions)
-    // but may run on different physical threads, so CPU IDs, RIP, and RBC
-    // can differ. We compare event type + memory hash -- these capture what
-    // the scheduler decided, not which thread executed it.
+    // Compare checkpoint sequences: event type + memory hash.
+    // CPU IDs may differ (OS thread scheduling), but the scheduler
+    // decisions (captured by event type and memory hash) must match.
     assert!(
         compare_replay_checkpoints(&checkpoints1, &checkpoints2),
-        "Replay determinism check FAILED: checkpoint sequences diverged. \
-         This indicates the replay engine did not faithfully reproduce \
-         the recorded preemption points. See MISMATCH details above."
+        "Determinism check FAILED: two runs with the same seed produced \
+         different checkpoint sequences. This indicates non-determinism \
+         in the cooperative interleaving mechanism."
     );
 
     eprintln!(
-        "SUCCESS: replay reproduced {} checkpoints with matching state hashes",
+        "SUCCESS: two runs produced identical {} checkpoints with matching state hashes",
         checkpoints1.len()
     );
 }

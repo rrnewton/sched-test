@@ -1890,11 +1890,10 @@ fn enable_measurement(fd: RawFd) {
 
 /// Re-arm the PMU timer with a fresh random timeslice.
 ///
-/// In replay mode, resets the counter and re-enables (keeping the existing
-/// period from `arm_replay_timer`). This mirrors the recording's behavior
-/// where `resume_timer` resets the counter at each kfunc return — the
-/// recorded `rbc_count` measures branches from the last reset, so replay
-/// must reset at the same points.
+/// In replay mode, re-enables the counter without resetting. Replay uses
+/// cumulative RBC values (`structop_rbc`) from the recording, so the
+/// counter runs continuously from `arm()`. Resetting at kfunc boundaries
+/// would destroy the cumulative count that the replay handlers need.
 fn rearm_timer(ring: &PreemptRing, ctx: &PreemptCtx) {
     let fd = ctx.timer_fd;
     if fd < 0 {
@@ -1903,11 +1902,11 @@ fn rearm_timer(ring: &PreemptRing, ctx: &PreemptCtx) {
     // Always consume the PRNG to keep token-passing deterministic.
     let _timeslice = ring.roll_timeslice(ctx.timeslice_min, ctx.timeslice_max);
     if ctx.replay_mode {
-        // Replay mode: reset counter to zero (matching the recording's
-        // resume_timer behavior), keep the existing period from
-        // arm_replay_timer, and re-enable.
+        // Replay mode: re-enable without resetting. The counter runs
+        // continuously from arm() and replay handlers compare against
+        // cumulative structop_rbc values. Resetting at kfunc boundaries
+        // would destroy the cumulative count needed for RBC verification.
         unsafe {
-            libc::ioctl(fd, scx_perf::PERF_IOC_RESET, 0 as libc::c_ulong);
             libc::ioctl(fd, scx_perf::PERF_IOC_ENABLE, 0 as libc::c_ulong);
         }
         return;
@@ -2202,9 +2201,11 @@ extern "C" fn replay_pmu_handler(
         None => return, // No more targets.
     };
 
-    // 3. Read current RBC count and check for overshoot.
+    // 3. Read current cumulative RBC and check for overshoot.
+    //    Uses structop_rbc (cumulative from arm()) because the counter
+    //    runs continuously without resets at kfunc boundaries.
     let current_rbc = read_rbc_count(rctx.timer_fd);
-    if current_rbc > target.rbc_count {
+    if current_rbc > target.structop_rbc {
         // PMU skid overshot the target. Mark the overshoot flag and
         // return without arming the breakpoint. The outer retry loop
         // will detect this and retry the dispatch round.
@@ -2216,7 +2217,7 @@ extern "C" fn replay_pmu_handler(
             "REPLAY OVERSHOOT: PMU skid overshot target \
              (current_rbc={} > target_rbc={} at seq={}). \
              This replay attempt is corrupted.",
-            current_rbc, target.rbc_count, target.sequence,
+            current_rbc, target.structop_rbc, target.sequence,
         );
         write_stderr(w.as_bytes());
         return;
@@ -2225,7 +2226,14 @@ extern "C" fn replay_pmu_handler(
     // 4. Arm the hardware breakpoint at the target instruction pointer.
     arm_breakpoint(rctx.bp_fd, target.instruction_pointer);
 
-    // 5. Return from signal handler — execution resumes with breakpoint armed.
+    // 5. Re-enable the PMU counter (without resetting) so that
+    //    read_rbc_count() in the breakpoint handler returns the live
+    //    cumulative value, not the frozen value from disable_timer().
+    unsafe {
+        libc::ioctl(rctx.timer_fd, scx_perf::PERF_IOC_ENABLE, 0 as libc::c_ulong);
+    }
+
+    // 6. Return from signal handler — execution resumes with bp armed.
 }
 
 /// Validate structop name and count match between trace and replay.
@@ -2233,6 +2241,11 @@ extern "C" fn replay_pmu_handler(
 /// Async-signal-safe: uses only StackWriter + write_stderr + abort.
 /// Panics (aborts) with a clear message on mismatch.
 fn replay_validate_structop(target: &PreemptionRecord, sinfo: &StructopInfo) {
+    // Skip validation if overshoot detected (possibly concurrent).
+    if REPLAY_OVERSHOT.load(SeqCst) {
+        return;
+    }
+
     // Validate ops context matches.
     if target.ops_context != sinfo.ops_context {
         let mut buf = [0u8; 512];
@@ -2291,6 +2304,10 @@ fn replay_validate_insn_bytes(target: &PreemptionRecord) {
     if target.instruction_pointer == 0 {
         return;
     }
+    // Skip validation if overshoot detected (run is corrupt).
+    if REPLAY_OVERSHOT.load(SeqCst) {
+        return;
+    }
     // Skip validation if the trace record has all-zero insn_bytes (old trace).
     if target.insn_bytes == [0u8; INSN_BYTES_LEN] {
         return;
@@ -2338,6 +2355,12 @@ extern "C" fn replay_bp_handler(
     let cursor = unsafe { &*rctx.cursor };
     let ring = unsafe { &*rctx.ring };
 
+    // 0. If a PMU overshoot was already detected (possibly by a
+    //    concurrent worker), this run is corrupt — bail out.
+    if REPLAY_OVERSHOT.load(SeqCst) {
+        return;
+    }
+
     // 1. Disable breakpoint to prevent re-firing immediately.
     disable_timer(rctx.bp_fd);
 
@@ -2354,7 +2377,7 @@ extern "C" fn replay_bp_handler(
     // to find the right dynamic instance. If the current count is below
     // the target, re-enable the breakpoint and return.
     let current_rbc = read_rbc_count(rctx.timer_fd);
-    if current_rbc < target.rbc_count {
+    if current_rbc < target.structop_rbc {
         // Not the right instance yet — re-enable breakpoint and return.
         arm_breakpoint(rctx.bp_fd, target.instruction_pointer);
         return;
@@ -2403,9 +2426,10 @@ extern "C" fn replay_bp_handler(
     }
 
     // 7. Advance cursor and arm timer/breakpoint for next target.
+    let counter_now = read_rbc_count(rctx.timer_fd);
     if cursor.advance() {
         if let Some(next) = cursor.current_target() {
-            arm_replay_next_target(rctx.timer_fd, rctx.bp_fd, next);
+            arm_replay_next_target(rctx.timer_fd, rctx.bp_fd, next, counter_now);
         }
     }
 }
@@ -2415,9 +2439,22 @@ extern "C" fn replay_bp_handler(
 /// In normal (PMU) mode: arms the PMU timer to fire at
 /// `target_rbc - REPLAY_MARGIN`. In breakpoint-only mode (timer_fd < 0):
 /// arms the breakpoint directly at the target instruction pointer.
-fn arm_replay_next_target(timer_fd: RawFd, bp_fd: RawFd, target: &PreemptionRecord) {
+fn arm_replay_next_target(
+    timer_fd: RawFd,
+    bp_fd: RawFd,
+    target: &PreemptionRecord,
+    current_counter: u64,
+) {
     if timer_fd >= 0 {
-        arm_replay_timer(timer_fd, target.rbc_count);
+        // Compute delta period: fire when the counter approaches
+        // target.structop_rbc (cumulative). Don't reset the counter.
+        let absolute_target = target.structop_rbc.saturating_sub(REPLAY_MARGIN);
+        let delta = absolute_target.saturating_sub(current_counter).max(1);
+        let mut period = delta;
+        unsafe {
+            libc::ioctl(timer_fd, scx_perf::PERF_IOC_PERIOD, &mut period as *mut u64);
+            libc::ioctl(timer_fd, scx_perf::PERF_IOC_ENABLE, 0 as libc::c_ulong);
+        }
     } else {
         arm_breakpoint(bp_fd, target.instruction_pointer);
     }
