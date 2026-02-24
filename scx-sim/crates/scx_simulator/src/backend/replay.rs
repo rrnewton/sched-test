@@ -232,9 +232,10 @@ impl PreemptionBackend for ReplayBackend {
                     preempt::arm_replay_breakpoint_pub(ctx.bp_fd, first.instruction_pointer);
                 }
             } else {
-                // Normal mode: arm the PMU timer to fire near the target.
+                // Normal mode: arm the PMU timer to fire near the
+                // target's cumulative RBC (structop_rbc).
                 if ctx.timer_fd >= 0 && ctx.bp_fd >= 0 {
-                    preempt::arm_replay_timer_pub(ctx.timer_fd, first.rbc_count);
+                    preempt::arm_replay_timer_pub(ctx.timer_fd, first.structop_rbc);
                 }
             }
         }
