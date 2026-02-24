@@ -39,6 +39,9 @@ pub struct TraceMetadata {
     /// FNV-1a hash of the scheduler .so file contents.
     /// Used to detect .so version mismatches before replay begins.
     pub so_hash: Option<u64>,
+    /// Absolute path to the scheduler .so file used during recording.
+    /// Used by replay to load the same .so without requiring `--scheduler`.
+    pub so_path: Option<String>,
 }
 
 /// A replayable preemption trace, grouped by worker.
@@ -259,6 +262,9 @@ impl PreemptionTrace {
         if let Some(hash) = self.metadata.so_hash {
             writeln!(w, "# so_hash: 0x{hash:016x}")?;
         }
+        if let Some(ref so_path) = self.metadata.so_path {
+            writeln!(w, "# so_path: {so_path}")?;
+        }
 
         // Flatten and sort by sequence for canonical output order.
         let mut all: Vec<&PreemptionRecord> =
@@ -343,6 +349,8 @@ impl PreemptionTrace {
                     metadata.timeslice_max = rest.trim().parse().ok();
                 } else if let Some(rest) = line.strip_prefix("# so_hash: ") {
                     metadata.so_hash = parse_hex_or_dec(rest.trim()).ok();
+                } else if let Some(rest) = line.strip_prefix("# so_path: ") {
+                    metadata.so_path = Some(rest.trim().to_string());
                 }
                 continue;
             }
@@ -757,6 +765,7 @@ mod tests {
             timeslice_min: Some(1),
             timeslice_max: Some(500),
             so_hash: Some(0xdeadbeef12345678),
+            so_path: Some("/path/to/libscx_simple.so".to_string()),
         });
 
         // Serialize.
@@ -773,6 +782,7 @@ mod tests {
         assert!(text.contains("# timeslice_min: 1"));
         assert!(text.contains("# timeslice_max: 500"));
         assert!(text.contains("# so_hash: 0xdeadbeef12345678"));
+        assert!(text.contains("# so_path: /path/to/libscx_simple.so"));
 
         // Deserialize and verify metadata is preserved.
         let mut cursor = std::io::Cursor::new(buf);
@@ -786,6 +796,7 @@ mod tests {
         assert_eq!(m.timeslice_min, Some(1));
         assert_eq!(m.timeslice_max, Some(500));
         assert_eq!(m.so_hash, Some(0xdeadbeef12345678));
+        assert_eq!(m.so_path, Some("/path/to/libscx_simple.so".to_string()));
     }
 
     #[test]
@@ -800,6 +811,7 @@ mod tests {
             timeslice_min: Some(1),
             timeslice_max: Some(500),
             so_hash: Some(0xaabbccdd),
+            so_path: None,
         });
 
         // Matching parameters should not panic.
@@ -812,6 +824,7 @@ mod tests {
             timeslice_min: Some(1),
             timeslice_max: Some(500),
             so_hash: Some(0xaabbccdd),
+            so_path: None,
         });
     }
 
@@ -828,6 +841,7 @@ mod tests {
             timeslice_min: None,
             timeslice_max: None,
             so_hash: None,
+            so_path: None,
         });
 
         // Mismatched nr_cpus should panic.
@@ -840,6 +854,7 @@ mod tests {
             timeslice_min: None,
             timeslice_max: None,
             so_hash: None,
+            so_path: None,
         });
     }
 
@@ -860,6 +875,7 @@ mod tests {
             timeslice_min: Some(50),
             timeslice_max: Some(100),
             so_hash: Some(0xdeadbeef),
+            so_path: None,
         });
     }
 
