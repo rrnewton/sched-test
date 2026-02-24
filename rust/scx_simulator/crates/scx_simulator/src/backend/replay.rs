@@ -31,6 +31,14 @@ pub(crate) struct ReplayBackend {
     cursors: Vec<ReplayCursor>,
     /// The PMU event type used during recording.
     break_on: perf::PmuEvent,
+    /// Minimum timeslice from the recording scenario.
+    ///
+    /// Needed to keep PRNG consumption in `rearm_timer` in sync with the
+    /// recording run (cooperative yields consume one PRNG via
+    /// `roll_timeslice` even though the result is discarded in replay mode).
+    timeslice_min: u64,
+    /// Maximum timeslice from the recording scenario.
+    timeslice_max: u64,
 }
 
 /// Per-worker state for the replay backend.
@@ -45,7 +53,14 @@ impl ReplayBackend {
     /// Create a new replay backend from a recorded preemption trace.
     ///
     /// Builds per-worker cursors from the trace, one per dispatch CPU.
-    pub fn new(trace: &PreemptionTrace, num_workers: usize) -> Self {
+    /// `timeslice_min` / `timeslice_max` must match the recording scenario's
+    /// preemptive config to keep the PRNG sequence in sync.
+    pub fn new(
+        trace: &PreemptionTrace,
+        num_workers: usize,
+        timeslice_min: u64,
+        timeslice_max: u64,
+    ) -> Self {
         let cursors = (0..num_workers)
             .map(|i| {
                 let targets = trace.worker_trace(WorkerId(i)).to_vec();
@@ -55,6 +70,8 @@ impl ReplayBackend {
         ReplayBackend {
             cursors,
             break_on: trace.break_on(),
+            timeslice_min,
+            timeslice_max,
         }
     }
 }
@@ -125,6 +142,19 @@ impl PreemptionBackend for ReplayBackend {
             "replay: PMU + breakpoint armed"
         );
 
+        // Install PREEMPT_CTX for cooperative yields at kfunc boundaries.
+        // This enables pause_timer/resume_timer and maybe_yield_preemptive
+        // which are essential for reproducing the same interleaving pattern.
+        // The replay_mode flag prevents rearm_timer from overwriting the
+        // replay timer period with random timeslices.
+        preempt::install_replay_preempt(
+            ring,
+            worker_id,
+            timer_fd,
+            self.timeslice_min,
+            self.timeslice_max,
+        );
+
         // Install replay context (replaces normal preempt context).
         preempt::install_replay(ring, worker_id, timer_fd, bp_fd, cursor);
 
@@ -136,8 +166,13 @@ impl PreemptionBackend for ReplayBackend {
         }
     }
 
-    fn arm(&self, ctx: &mut ReplayWorkerCtx, _ring: &PreemptRing) {
+    fn arm(&self, ctx: &mut ReplayWorkerCtx, ring: &PreemptRing) {
         let cursor = &self.cursors[ctx.worker_idx];
+
+        // Consume the PRNG to match the recording's PmuBackend::arm() which
+        // calls rearm_timer → roll_timeslice.  Without this, the PRNG
+        // sequences diverge and pick_next returns different worker IDs.
+        let _timeslice = ring.roll_timeslice(self.timeslice_min, self.timeslice_max);
 
         // Arm PMU timer for the first replay target.
         if ctx.timer_fd >= 0 && ctx.bp_fd >= 0 {
@@ -171,6 +206,7 @@ impl PreemptionBackend for ReplayBackend {
             unsafe { libc::close(ctx.bp_fd) };
         }
         preempt::uninstall_replay();
+        preempt::uninstall();
         // timer dropped here — closes the perf fd
     }
 
