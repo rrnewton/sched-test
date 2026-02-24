@@ -8,8 +8,9 @@ use scx_simulator::scenario::{parse_duration_ns, parse_seed};
 use scx_simulator::{
     compare_checkpoints, compute_so_hash, discover_schedulers, drain_determinism_checkpoints,
     drain_preemption_records, enable_determinism_mode, enable_preemption_collection, load_rtapp,
-    scheduler_so_base, DynamicScheduler, Phase, PmuEvent, PreemptionTrace, PreemptiveConfig,
-    RepeatMode, Scenario, SimFormat, Simulator, TaskBehavior, TraceMetadata, TraceStats, SIM_LOCK,
+    scheduler_so_base, scheduler_so_path, DynamicScheduler, Phase, PmuEvent, PreemptionTrace,
+    PreemptiveConfig, RepeatMode, Scenario, SimFormat, Simulator, TaskBehavior, TraceMetadata,
+    TraceStats, SIM_LOCK,
 };
 
 mod real_run;
@@ -237,9 +238,9 @@ struct ReplayArgs {
     /// Path to a preemption trace file (produced by `run --record-preemptions`).
     trace_file: PathBuf,
 
-    /// Path to the scheduler .so to load.
-    #[arg(long)]
-    scheduler: PathBuf,
+    /// Override the scheduler .so file path stored in the trace. Only needed if the .so has moved since recording.
+    #[arg(long = "scheduler-file")]
+    scheduler_file: Option<PathBuf>,
 
     /// Print detailed per-task and per-CPU statistics after simulation.
     #[arg(long)]
@@ -387,33 +388,66 @@ fn scheduler_prefix_from_path(path: &Path) -> String {
         .to_string()
 }
 
+/// Resolve the scheduler .so path for replay.
+///
+/// Priority: CLI `--scheduler-file` override > trace metadata `so_path`.
+/// Panics if neither is available. Validates that the resolved path exists.
+fn resolve_scheduler_path(
+    cli_override: Option<&Path>,
+    metadata: &TraceMetadata,
+) -> Result<PathBuf, String> {
+    let path = if let Some(cli_path) = cli_override {
+        eprintln!(
+            "replay: using --scheduler-file override: {}",
+            cli_path.display()
+        );
+        cli_path.to_path_buf()
+    } else if let Some(ref so_path) = metadata.so_path {
+        eprintln!("replay: using scheduler .so from trace: {so_path}");
+        PathBuf::from(so_path)
+    } else {
+        return Err(
+            "no scheduler .so path available: trace file has no so_path metadata              and --scheduler-file was not provided. Re-record the trace with a newer              scxsim to embed the .so path, or pass --scheduler-file <path>."
+                .into(),
+        );
+    };
+
+    if !path.exists() {
+        return Err(format!(
+            "scheduler .so not found: {}. Pass --scheduler-file <path> to override.",
+            path.display()
+        ));
+    }
+
+    Ok(path)
+}
+
 fn replay_simulation(args: &ReplayArgs) -> Result<(), String> {
     use std::io::BufReader;
 
-    // Load the scheduler .so first so scheduler_so_base() works.
-    let scheduler_path = &args.scheduler;
-    let prefix = scheduler_prefix_from_path(scheduler_path);
+    // Load the trace file first to read metadata (including so_path).
+    let file = std::fs::File::open(&args.trace_file)
+        .map_err(|e| format!("cannot open trace file {}: {e}", args.trace_file.display()))?;
+
+    // Peek at trace metadata first (nr_cpus, so_path) to know how many CPUs
+    // the scheduler needs and which .so to load. We deserialize with so_base=0
+    // initially, read metadata, then re-deserialize after loading the scheduler
+    // with the correct so_base.
+    let mut reader = BufReader::new(file);
+    let pre_trace = PreemptionTrace::deserialize(&mut reader, 0)
+        .map_err(|e| format!("failed to parse trace file: {e}"))?;
+
+    let metadata = pre_trace.metadata();
+
+    // Resolve scheduler .so path: CLI --scheduler-file overrides trace metadata.
+    let scheduler_path = resolve_scheduler_path(args.scheduler_file.as_deref(), metadata)?;
+    let prefix = scheduler_prefix_from_path(&scheduler_path);
     let so_path_str = scheduler_path.to_str().unwrap_or_else(|| {
         panic!(
             "scheduler path is not valid UTF-8: {}",
             scheduler_path.display()
         )
     });
-
-    // Load the trace file.
-    let file = std::fs::File::open(&args.trace_file)
-        .map_err(|e| format!("cannot open trace file {}: {e}", args.trace_file.display()))?;
-
-    // We need the so_base for ASLR-resilient RIP reconstruction, but the .so
-    // must be loaded first. Load the scheduler, capture so_base, then deserialize.
-    // Peek at trace metadata first (nr_cpus) to know how many CPUs the scheduler needs.
-    // We deserialize with so_base=0 initially, read metadata, then re-deserialize
-    // after loading the scheduler with the correct nr_cpus.
-    let mut reader = BufReader::new(file);
-    let pre_trace = PreemptionTrace::deserialize(&mut reader, 0)
-        .map_err(|e| format!("failed to parse trace file: {e}"))?;
-
-    let metadata = pre_trace.metadata();
 
     // Extract required metadata fields, panicking on missing values.
     let nr_cpus = metadata
@@ -509,6 +543,7 @@ fn replay_simulation(args: &ReplayArgs) -> Result<(), String> {
         } else {
             None
         },
+        so_path: Some(so_path_str.to_string()),
     };
 
     let sim_trace = Simulator::new(sched).run(scenario);
@@ -670,6 +705,7 @@ fn run_simulation(args: &RunArgs, scenario: Scenario) -> Result<(), String> {
 
     // Capture scenario metadata before the scenario is consumed by run().
     let current_so_hash = compute_so_hash();
+    let so_abs_path = scheduler_so_path();
     let scenario_metadata = TraceMetadata {
         nr_cpus: Some(scenario.nr_cpus),
         nr_tasks: Some(scenario.tasks.len() as u32),
@@ -683,6 +719,7 @@ fn run_simulation(args: &RunArgs, scenario: Scenario) -> Result<(), String> {
         } else {
             None
         },
+        so_path: so_abs_path,
     };
 
     let trace = Simulator::new(sched).run(scenario);
