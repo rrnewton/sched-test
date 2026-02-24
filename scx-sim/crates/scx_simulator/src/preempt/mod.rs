@@ -160,7 +160,7 @@ impl std::fmt::Display for PreemptionRecord {
             self.sequence,
             self.ops_context.short_name(),
             if self.kfunc_name.is_empty() {
-                "-"
+                "none"
             } else {
                 self.kfunc_name
             },
@@ -1513,7 +1513,7 @@ fn cooperative_yield_impl(phase: KfuncYieldPhase) {
     let sinfo = structop_info();
     let ops = sinfo.ops_context.short_name();
     let kfn = if sinfo.kfunc_name.is_empty() {
-        "-"
+        "none"
     } else {
         sinfo.kfunc_name
     };
@@ -1784,7 +1784,7 @@ extern "C" fn preempt_handler(
     if tracing::level_filters::LevelFilter::current() >= tracing::Level::TRACE {
         let ops = sinfo.ops_context.short_name();
         let kfn = if sinfo.kfunc_name.is_empty() {
-            "-"
+            "none"
         } else {
             sinfo.kfunc_name
         };
