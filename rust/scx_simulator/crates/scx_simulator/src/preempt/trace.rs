@@ -14,6 +14,30 @@ use crate::types::CpuId;
 
 use super::{PreemptionRecord, PreemptionRecordStore};
 
+/// Scenario metadata stored in the trace file header.
+///
+/// When loading a trace for replay, these parameters are validated against
+/// the current scenario to catch mismatches that would produce incorrect
+/// results. The philosophy: replay ONLY takes a trace file and everything
+/// else comes from the trace file.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TraceMetadata {
+    /// Number of CPUs in the scenario.
+    pub nr_cpus: Option<u32>,
+    /// Number of tasks in the scenario.
+    pub nr_tasks: Option<u32>,
+    /// PRNG seed.
+    pub seed: Option<u32>,
+    /// Simulation duration in nanoseconds.
+    pub duration_ns: Option<u64>,
+    /// Scheduler name or .so path.
+    pub scheduler: Option<String>,
+    /// Minimum preemptive timeslice (PMU events).
+    pub timeslice_min: Option<u64>,
+    /// Maximum preemptive timeslice (PMU events).
+    pub timeslice_max: Option<u64>,
+}
+
 /// A replayable preemption trace, grouped by worker.
 ///
 /// During recording, preemption points are captured globally. For replay,
@@ -27,6 +51,8 @@ pub struct PreemptionTrace {
     /// Which PMU event was used for preemption timing.
     /// All records in the trace share the same event type.
     break_on: PmuEvent,
+    /// Scenario metadata for replay validation.
+    metadata: TraceMetadata,
 }
 
 impl PreemptionTrace {
@@ -54,6 +80,7 @@ impl PreemptionTrace {
         PreemptionTrace {
             per_worker,
             break_on,
+            metadata: TraceMetadata::default(),
         }
     }
 
@@ -96,6 +123,86 @@ impl PreemptionTrace {
         self.break_on
     }
 
+    /// Get the scenario metadata stored in this trace.
+    pub fn metadata(&self) -> &TraceMetadata {
+        &self.metadata
+    }
+
+    /// Set scenario metadata for serialization.
+    pub fn set_metadata(&mut self, metadata: TraceMetadata) {
+        self.metadata = metadata;
+    }
+
+    /// Validate that the trace metadata matches the current scenario parameters.
+    ///
+    /// Panics with a clear error message if any parameter in the trace
+    /// metadata does not match the expected value. Parameters that are
+    /// absent from either the trace or the expected metadata are skipped.
+    ///
+    /// The philosophy: replay ONLY takes a trace file and everything else
+    /// comes from the trace file. Mismatched parameters produce incorrect
+    /// results, so we fail fatally rather than silently degrade.
+    pub fn validate_metadata(&self, expected: &TraceMetadata) {
+        let m = &self.metadata;
+        let mut mismatches = Vec::new();
+
+        if let (Some(trace_val), Some(expect_val)) = (m.nr_cpus, expected.nr_cpus) {
+            if trace_val != expect_val {
+                mismatches.push(format!("nr_cpus: trace={trace_val}, scenario={expect_val}"));
+            }
+        }
+        if let (Some(trace_val), Some(expect_val)) = (m.nr_tasks, expected.nr_tasks) {
+            if trace_val != expect_val {
+                mismatches.push(format!(
+                    "nr_tasks: trace={trace_val}, scenario={expect_val}"
+                ));
+            }
+        }
+        if let (Some(trace_val), Some(expect_val)) = (m.seed, expected.seed) {
+            if trace_val != expect_val {
+                mismatches.push(format!("seed: trace={trace_val}, scenario={expect_val}"));
+            }
+        }
+        if let (Some(trace_val), Some(expect_val)) = (m.duration_ns, expected.duration_ns) {
+            if trace_val != expect_val {
+                mismatches.push(format!(
+                    "duration_ns: trace={trace_val}, scenario={expect_val}"
+                ));
+            }
+        }
+        if let (Some(ref trace_val), Some(ref expect_val)) = (&m.scheduler, &expected.scheduler) {
+            if trace_val != expect_val {
+                mismatches.push(format!(
+                    "scheduler: trace={trace_val:?}, scenario={expect_val:?}"
+                ));
+            }
+        }
+        if let (Some(trace_val), Some(expect_val)) = (m.timeslice_min, expected.timeslice_min) {
+            if trace_val != expect_val {
+                mismatches.push(format!(
+                    "timeslice_min: trace={trace_val}, scenario={expect_val}"
+                ));
+            }
+        }
+        if let (Some(trace_val), Some(expect_val)) = (m.timeslice_max, expected.timeslice_max) {
+            if trace_val != expect_val {
+                mismatches.push(format!(
+                    "timeslice_max: trace={trace_val}, scenario={expect_val}"
+                ));
+            }
+        }
+
+        if !mismatches.is_empty() {
+            panic!(
+                "Replay trace metadata mismatch -- the trace was recorded with \
+                 different scenario parameters. Replay with mismatched parameters \
+                 produces incorrect results.\n\
+                 Mismatches:\n  {}",
+                mismatches.join("\n  ")
+            );
+        }
+    }
+
     /// Serialize the trace to a line-oriented text format.
     ///
     /// Format:
@@ -116,6 +223,29 @@ impl PreemptionTrace {
         writeln!(w, "# workers: {}", self.per_worker.len())?;
         writeln!(w, "# break_on: {}", self.break_on.short_name())?;
         writeln!(w, "# total: {total}")?;
+
+        // Write scenario metadata for replay validation.
+        if let Some(nr_cpus) = self.metadata.nr_cpus {
+            writeln!(w, "# nr_cpus: {nr_cpus}")?;
+        }
+        if let Some(nr_tasks) = self.metadata.nr_tasks {
+            writeln!(w, "# nr_tasks: {nr_tasks}")?;
+        }
+        if let Some(seed) = self.metadata.seed {
+            writeln!(w, "# seed: {seed}")?;
+        }
+        if let Some(duration_ns) = self.metadata.duration_ns {
+            writeln!(w, "# duration_ns: {duration_ns}")?;
+        }
+        if let Some(ref scheduler) = self.metadata.scheduler {
+            writeln!(w, "# scheduler: {scheduler}")?;
+        }
+        if let Some(ts_min) = self.metadata.timeslice_min {
+            writeln!(w, "# timeslice_min: {ts_min}")?;
+        }
+        if let Some(ts_max) = self.metadata.timeslice_max {
+            writeln!(w, "# timeslice_max: {ts_max}")?;
+        }
 
         // Flatten and sort by sequence for canonical output order.
         let mut all: Vec<&PreemptionRecord> =
@@ -163,6 +293,7 @@ impl PreemptionTrace {
     pub fn deserialize(r: &mut impl BufRead, so_base: u64) -> std::io::Result<Self> {
         let mut num_workers: usize = 0;
         let mut break_on = PmuEvent::RetiredBranchConditional; // default for old traces
+        let mut metadata = TraceMetadata::default();
         let mut records = Vec::new();
 
         for line in r.lines() {
@@ -182,6 +313,20 @@ impl PreemptionTrace {
                     if let Some(event) = PmuEvent::from_short_name(rest.trim()) {
                         break_on = event;
                     }
+                } else if let Some(rest) = line.strip_prefix("# nr_cpus: ") {
+                    metadata.nr_cpus = rest.trim().parse().ok();
+                } else if let Some(rest) = line.strip_prefix("# nr_tasks: ") {
+                    metadata.nr_tasks = rest.trim().parse().ok();
+                } else if let Some(rest) = line.strip_prefix("# seed: ") {
+                    metadata.seed = rest.trim().parse().ok();
+                } else if let Some(rest) = line.strip_prefix("# duration_ns: ") {
+                    metadata.duration_ns = rest.trim().parse().ok();
+                } else if let Some(rest) = line.strip_prefix("# scheduler: ") {
+                    metadata.scheduler = Some(rest.trim().to_string());
+                } else if let Some(rest) = line.strip_prefix("# timeslice_min: ") {
+                    metadata.timeslice_min = rest.trim().parse().ok();
+                } else if let Some(rest) = line.strip_prefix("# timeslice_max: ") {
+                    metadata.timeslice_max = rest.trim().parse().ok();
                 }
                 continue;
             }
@@ -200,7 +345,9 @@ impl PreemptionTrace {
             num_workers = records.iter().map(|r| r.worker_id.0).max().unwrap_or(0) + 1;
         }
 
-        Ok(Self::from_records(&records, num_workers, break_on))
+        let mut trace = Self::from_records(&records, num_workers, break_on);
+        trace.metadata = metadata;
+        Ok(trace)
     }
 }
 
@@ -547,5 +694,124 @@ mod tests {
         assert_eq!(PmuEvent::from_short_name("unknown"), None);
         assert_eq!(PmuEvent::RetiredBranchConditional.short_name(), "rbc");
         assert_eq!(PmuEvent::InstructionsRetired.short_name(), "insn");
+    }
+
+    #[test]
+    fn test_metadata_serialize_roundtrip() {
+        let records = vec![
+            make_record(0, 100, 0x7f000010c0, 0, 0, 1, 1, 100),
+            make_record(1, 200, 0x7f000020d0, 1, 1, 1, 2, 200),
+        ];
+
+        let mut trace =
+            PreemptionTrace::from_records(&records, 2, PmuEvent::RetiredBranchConditional);
+        let so_base: u64 = 0x7f00000000;
+
+        // Set metadata.
+        trace.set_metadata(TraceMetadata {
+            nr_cpus: Some(4),
+            nr_tasks: Some(3),
+            seed: Some(42),
+            duration_ns: Some(100_000_000),
+            scheduler: Some("simple".to_string()),
+            timeslice_min: Some(1),
+            timeslice_max: Some(500),
+        });
+
+        // Serialize.
+        let mut buf = Vec::new();
+        trace.serialize(&mut buf, so_base).unwrap();
+        let text = String::from_utf8(buf.clone()).unwrap();
+
+        // Verify metadata headers are present.
+        assert!(text.contains("# nr_cpus: 4"));
+        assert!(text.contains("# nr_tasks: 3"));
+        assert!(text.contains("# seed: 42"));
+        assert!(text.contains("# duration_ns: 100000000"));
+        assert!(text.contains("# scheduler: simple"));
+        assert!(text.contains("# timeslice_min: 1"));
+        assert!(text.contains("# timeslice_max: 500"));
+
+        // Deserialize and verify metadata is preserved.
+        let mut cursor = std::io::Cursor::new(buf);
+        let trace2 = PreemptionTrace::deserialize(&mut cursor, so_base).unwrap();
+        let m = trace2.metadata();
+        assert_eq!(m.nr_cpus, Some(4));
+        assert_eq!(m.nr_tasks, Some(3));
+        assert_eq!(m.seed, Some(42));
+        assert_eq!(m.duration_ns, Some(100_000_000));
+        assert_eq!(m.scheduler, Some("simple".to_string()));
+        assert_eq!(m.timeslice_min, Some(1));
+        assert_eq!(m.timeslice_max, Some(500));
+    }
+
+    #[test]
+    fn test_metadata_validation_passes() {
+        let mut trace = PreemptionTrace::from_records(&[], 2, PmuEvent::RetiredBranchConditional);
+        trace.set_metadata(TraceMetadata {
+            nr_cpus: Some(4),
+            nr_tasks: Some(2),
+            seed: Some(42),
+            duration_ns: Some(100_000_000),
+            scheduler: Some("simple".to_string()),
+            timeslice_min: Some(1),
+            timeslice_max: Some(500),
+        });
+
+        // Matching parameters should not panic.
+        trace.validate_metadata(&TraceMetadata {
+            nr_cpus: Some(4),
+            nr_tasks: Some(2),
+            seed: Some(42),
+            duration_ns: Some(100_000_000),
+            scheduler: Some("simple".to_string()),
+            timeslice_min: Some(1),
+            timeslice_max: Some(500),
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "Replay trace metadata mismatch")]
+    fn test_metadata_validation_fails_on_mismatch() {
+        let mut trace = PreemptionTrace::from_records(&[], 2, PmuEvent::RetiredBranchConditional);
+        trace.set_metadata(TraceMetadata {
+            nr_cpus: Some(4),
+            nr_tasks: Some(2),
+            seed: Some(42),
+            duration_ns: Some(100_000_000),
+            scheduler: Some("simple".to_string()),
+            timeslice_min: None,
+            timeslice_max: None,
+        });
+
+        // Mismatched nr_cpus should panic.
+        trace.validate_metadata(&TraceMetadata {
+            nr_cpus: Some(8),
+            nr_tasks: Some(2),
+            seed: Some(42),
+            duration_ns: Some(100_000_000),
+            scheduler: Some("simple".to_string()),
+            timeslice_min: None,
+            timeslice_max: None,
+        });
+    }
+
+    #[test]
+    fn test_metadata_absent_skips_validation() {
+        // Old trace with no metadata -- validation should pass
+        // because absent fields are skipped.
+        let trace = PreemptionTrace::from_records(&[], 2, PmuEvent::RetiredBranchConditional);
+        assert_eq!(trace.metadata(), &TraceMetadata::default());
+
+        // Any values should pass since all metadata fields are None in the trace.
+        trace.validate_metadata(&TraceMetadata {
+            nr_cpus: Some(99),
+            nr_tasks: Some(99),
+            seed: Some(999),
+            duration_ns: Some(999_999),
+            scheduler: Some("anything".to_string()),
+            timeslice_min: Some(50),
+            timeslice_max: Some(100),
+        });
     }
 }

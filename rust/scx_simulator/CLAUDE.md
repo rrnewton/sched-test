@@ -109,6 +109,26 @@ Common tools already available:
 Every TODO in source code MUST reference an issue: `TODO(sim-XXXXX)`. Do not
 leave TODOs without a tracking issue — file one first, then add the TODO.
 
+No Silent Failures
+========================================
+
+We AVOID silent failures at all cost. We prefer fatal errors with clear
+messages. When something fails that would produce incorrect results, panic or
+return an error -- never silently degrade.
+
+Examples:
+- If a hardware breakpoint cannot be created in replay mode, PANIC with a
+  message explaining that replay requires HW breakpoints. Do NOT fall back to
+  cooperative-only mode with a `tracing::warn()` -- that produces wrong results.
+- If a trace file's parameters (CPUs, tasks, seed, duration) do not match the
+  current scenario, PANIC with a clear mismatch message. Do NOT silently
+  proceed with mismatched parameters.
+- If a PMU timer fd is invalid in replay mode, PANIC. Without it, preemption
+  points cannot be reproduced.
+
+The philosophy: it is better to crash loudly with a clear error than to
+silently produce incorrect results that waste hours of debugging.
+
 Kernel Fidelity
 ========================================
 
