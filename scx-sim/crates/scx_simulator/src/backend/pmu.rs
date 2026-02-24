@@ -147,6 +147,23 @@ impl PreemptionBackend for PmuBackend {
             "preemptive interleave: complete"
         );
     }
+
+    fn is_precise(&self) -> bool {
+        false
+    }
+
+    fn read_count(&self, ctx: &PmuWorkerCtx) -> u64 {
+        ctx.measure_counter
+            .as_ref()
+            .and_then(|mc| mc.read().ok())
+            .unwrap_or(0)
+    }
+
+    fn reset_count(&self, ctx: &mut PmuWorkerCtx) {
+        if let Some(ref mc) = ctx.measure_counter {
+            let _ = mc.reset();
+        }
+    }
 }
 
 /// Create a per-thread PMU timer for preemption signals.

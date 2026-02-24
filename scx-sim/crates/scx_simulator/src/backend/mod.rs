@@ -41,6 +41,37 @@ pub(crate) struct StructopDelta {
     pub interleave_count: u64,
 }
 
+/// Relative RBC count -- branches to execute from the current counter position.
+///
+/// Used by [`PmuBackend`](pmu::PmuBackend) for random timeslices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RelativeRbc(pub u64);
+
+/// Absolute RBC count -- cumulative branches from the start of the current structop.
+///
+/// Used by [`ReplayBackend`](replay::ReplayBackend) for precise targeting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AbsoluteRbc(pub u64);
+
+/// RBC target: either relative (from current position) or absolute (from structop start).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RbcTarget {
+    /// Relative count from the current counter position.
+    Relative(RelativeRbc),
+    /// Absolute count from the start of the current structop.
+    Absolute(AbsoluteRbc),
+}
+
+/// Target for preemption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreemptTarget {
+    /// RBC count to preempt at (relative or absolute).
+    pub count_rbc: RbcTarget,
+    /// For precise backends with a known target RIP (replay).
+    /// `None` for first-time recording where we don't know where we'll stop.
+    pub target_rip: Option<u64>,
+}
+
 /// Trait for preemption interleaving backends.
 ///
 /// A backend determines how worker threads are preempted during concurrent
@@ -92,6 +123,29 @@ pub(crate) trait PreemptionBackend: Sync {
 
     /// Log the completion summary after all workers finish.
     fn log_completion(&self, ring: &PreemptRing);
+
+    // -- Phase 1 additions (sim-80ce04) -- default impls, non-breaking --
+
+    /// Whether this backend supports precise (exact RBC) targeting.
+    ///
+    /// PMU backends return `false` (skid). Breakpoint/Frida backends return
+    /// `true`.
+    fn is_precise(&self) -> bool {
+        false
+    }
+
+    /// Read the current RBC count from the backend's counter.
+    ///
+    /// For PMU: reads from the measurement perf fd.
+    /// For replay: reads from the timer perf fd.
+    #[allow(dead_code)] // TODO(sim-80ce04): used by Phase 2 arm() refactor
+    fn read_count(&self, _ctx: &Self::WorkerCtx) -> u64 {
+        0
+    }
+
+    /// Reset the RBC counter to zero. Called at the start of each structop.
+    #[allow(dead_code)] // TODO(sim-80ce04): used by Phase 2 arm() refactor
+    fn reset_count(&self, _ctx: &mut Self::WorkerCtx) {}
 }
 
 /// Run concurrent dispatch using a [`PreemptionBackend`].
