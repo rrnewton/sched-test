@@ -1,19 +1,14 @@
 /*
- * sim_rbc_trampoline.c — Software RBC trampoline for e9patch preemption.
+ * sim_rbc_trampoline.c — e9patch arm/disarm/setup functions for the .so.
  *
- * This file is compiled into each scheduler .so. The rbc_trampoline()
- * function is called by e9patch at every instrumented Jcc (conditional
- * branch) instruction. It decrements a global counter and, when
- * the counter expires, calls into Rust to yield via the PreemptRing.
+ * This file is compiled into each scheduler .so. It provides:
+ * - e9_worker_setup / e9_arm / e9_disarm: called by the Rust backend
+ *   (E9PatchBackend) via libloading-resolved function pointers.
+ * - e9_so_init: dummy DT_INIT entry so e9tool can inject its loader.
  *
- * Global (not TLS) state is used because the PreemptRing token protocol
- * guarantees only one worker is active at a time. The same globals are
- * accessed by both the Rust backend (via e9_arm/e9_disarm) and the
- * trampoline (rbc_trampoline), ensuring consistent state.
- *
- * The trampoline and supporting functions are placed in the .text.rbc
- * section so that e9tool can exclude them from instrumentation (preventing
- * infinite recursion).
+ * All state lives in E9_SHARED_RBC, a global struct exported by the main
+ * binary (Rust) via #[no_mangle]. The e9patch trampoline binary reads the
+ * same struct (resolved via dlsym), ensuring consistent state.
  *
  * This file does NOT include sim_wrapper.h or vmlinux.h to avoid conflicts
  * with standard C headers.
@@ -22,51 +17,50 @@
 #include <stdint.h>
 
 /* ------------------------------------------------------------------ */
-/* Global software RBC state (single active worker via token ring)    */
+/* Shared state — defined in Rust (preempt/mod.rs), exported via       */
+/* -rdynamic and --undefined=E9_SHARED_RBC.                            */
 /* ------------------------------------------------------------------ */
 
-static int64_t  rbc_counter   = INT64_MAX;  /* disarmed initially */
-static int      rbc_armed     = 0;
-static void    *rbc_ring_ptr  = (void *)0;  /* *const PreemptRing  */
-static int      rbc_worker_id = -1;
+struct e9_shared_rbc {
+	int64_t counter;
+	int32_t armed;
+	int32_t worker_id;
+	void   *ring_ptr;
+};
+
+extern struct e9_shared_rbc E9_SHARED_RBC;
 
 /* ------------------------------------------------------------------ */
-/* Declared in Rust (preempt/mod.rs), exported via -rdynamic           */
+/* Functions called from Rust backend to configure shared state        */
 /* ------------------------------------------------------------------ */
 
-extern uint64_t e9_preempt_yield(void *ring, int worker_id);
-
-/* ------------------------------------------------------------------ */
-/* Functions called from Rust backend to configure state               */
-/* ------------------------------------------------------------------ */
-
-__attribute__((section(".text.rbc"), used, visibility("default")))
+__attribute__((used, visibility("default")))
 void e9_worker_setup(void *ring, int worker)
 {
-	rbc_ring_ptr  = ring;
-	rbc_worker_id = worker;
-	rbc_counter   = INT64_MAX;
-	rbc_armed     = 0;
+	E9_SHARED_RBC.ring_ptr  = ring;
+	E9_SHARED_RBC.worker_id = worker;
+	E9_SHARED_RBC.counter   = INT64_MAX;
+	E9_SHARED_RBC.armed     = 0;
 }
 
-__attribute__((section(".text.rbc"), used, visibility("default")))
+__attribute__((used, visibility("default")))
 void e9_arm(uint64_t timeslice)
 {
-	rbc_counter = (int64_t)timeslice;
-	rbc_armed   = 1;
+	E9_SHARED_RBC.counter = (int64_t)timeslice;
+	E9_SHARED_RBC.armed   = 1;
 }
 
-__attribute__((section(".text.rbc"), used, visibility("default")))
+__attribute__((used, visibility("default")))
 void e9_disarm(void)
 {
-	rbc_armed   = 0;
-	rbc_counter = INT64_MAX;
+	E9_SHARED_RBC.armed   = 0;
+	E9_SHARED_RBC.counter = INT64_MAX;
 }
 
-__attribute__((section(".text.rbc"), used, visibility("default")))
+__attribute__((used, visibility("default")))
 int64_t e9_read_counter(void)
 {
-	return rbc_counter;
+	return E9_SHARED_RBC.counter;
 }
 
 /* ------------------------------------------------------------------ */
@@ -78,18 +72,3 @@ int64_t e9_read_counter(void)
 
 __attribute__((used, visibility("default")))
 void e9_so_init(void) {}
-
-/* ------------------------------------------------------------------ */
-/* The trampoline — called at each instrumented Jcc                    */
-/* ------------------------------------------------------------------ */
-
-__attribute__((section(".text.rbc"), used, visibility("default")))
-void rbc_trampoline(void)
-{
-	if (__builtin_expect(--rbc_counter > 0, 1))
-		return;
-	if (__builtin_expect(!rbc_armed, 0))
-		return;
-	/* Counter expired — yield via Rust, get new timeslice. */
-	rbc_counter = (int64_t)e9_preempt_yield(rbc_ring_ptr, rbc_worker_id);
-}

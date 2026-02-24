@@ -2567,8 +2567,43 @@ pub fn arm_replay_breakpoint_pub(bp_fd: RawFd, addr: u64) {
 }
 
 // ---------------------------------------------------------------------------
-// e9patch preemption — extern "C" entry point for software RBC trampoline
+// e9patch preemption — shared state and extern "C" entry point
 // ---------------------------------------------------------------------------
+
+/// Shared RBC state accessed by both the e9patch trampoline (C code injected
+/// into the .so by e9tool) and the Rust backend (`E9PatchBackend`).
+///
+/// The e9 trampoline resolves this struct via `dlsym(NULL, "E9_SHARED_RBC")`
+/// in its `init()` function. The Rust backend and the `.so`'s `e9_arm()` /
+/// `e9_disarm()` / `e9_worker_setup()` write to this struct. The trampoline's
+/// `rbc_trampoline()` reads `counter` and `armed` on the fast path.
+///
+/// Global (not per-thread) because the PreemptRing token protocol guarantees
+/// only one worker is active at a time.
+#[repr(C)]
+pub struct E9SharedRbc {
+    pub counter: i64,
+    pub armed: i32,
+    pub worker_id: i32,
+    pub ring_ptr: *mut std::ffi::c_void,
+}
+
+// SAFETY: single-writer access enforced by PreemptRing token passing.
+unsafe impl Send for E9SharedRbc {}
+unsafe impl Sync for E9SharedRbc {}
+
+/// Global shared RBC state, exported to C via `#[no_mangle]`.
+///
+/// The e9patch trampoline resolves this symbol via `dlsym` to share state
+/// with the Rust backend. The `.so`'s `e9_arm()` / `e9_disarm()` functions
+/// also access it via `extern` declarations.
+#[no_mangle]
+pub static mut E9_SHARED_RBC: E9SharedRbc = E9SharedRbc {
+    counter: i64::MAX,
+    armed: 0,
+    worker_id: -1,
+    ring_ptr: std::ptr::null_mut(),
+};
 
 /// Called from the C trampoline (`rbc_trampoline()`) when the software RBC
 /// counter expires at an instrumented Jcc instruction.
