@@ -69,6 +69,7 @@ pub use monitor::{Monitor, ProbeContext, ProbePoint};
 pub use perf::PmuEvent;
 pub use perf::RbcCounter;
 pub use preempt::trace::PreemptionTrace;
+pub use preempt::trace::TraceMetadata;
 pub use preempt::{
     compare_checkpoints, drain_determinism_checkpoints, drain_preemption_records,
     enable_determinism_mode, enable_preemption_collection, fnv1a_combine, fnv1a_hash_bytes,

@@ -244,6 +244,13 @@ pub struct SimulatorState {
     /// random PMU timeslices, enabling exact reproduction of preemption
     /// points via hardware breakpoints.
     pub replay_trace: Option<crate::preempt::trace::PreemptionTrace>,
+    /// Persistent replay backend (created once, reused across dispatch rounds).
+    ///
+    /// The `ReplayBackend` holds per-worker `ReplayCursor`s that track
+    /// which preemption target is next. Creating a fresh backend each
+    /// round would reset cursors to index 0, causing targets from all
+    /// rounds to be replayed from the beginning every time.
+    pub(crate) replay_backend: Option<crate::backend::replay::ReplayBackend>,
     /// Per-CPU structop accumulators that persist across dispatch rounds.
     /// Indexed by CpuId.0. Seeded into worker thread-locals at the start
     /// of each dispatch round and drained back at the end.
@@ -1746,6 +1753,7 @@ mod tests {
             interleave: false,
             preemptive: None,
             replay_trace: None,
+            replay_backend: None,
             structop_accum: vec![crate::preempt::StructopInfo::default(); nr_cpus as usize],
             in_concurrent_batch: false,
         }

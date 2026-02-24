@@ -818,12 +818,26 @@ impl<S: Scheduler> Simulator<S> {
             interleave: scenario.interleave,
             preemptive: scenario.preemptive.clone(),
             replay_trace: scenario.replay_trace.clone(),
+            replay_backend: None, // Initialized below after state is built.
             structop_accum: vec![
                 crate::preempt::StructopInfo::default();
                 scenario.nr_cpus as usize
             ],
             in_concurrent_batch: false,
         };
+
+        // Build the persistent ReplayBackend once if we have a replay trace.
+        // This must happen after state construction because the backend holds
+        // cursors that track progress across dispatch rounds -- creating a
+        // fresh backend each round would reset cursors to index 0.
+        //
+        // We create cursors for nr_cpus workers (the maximum possible), not
+        // trace.num_workers(). In any given round, only a subset of CPUs may
+        // need dispatch, and the worker count varies. Extra workers beyond the
+        // trace's worker count get empty cursors (no targets to replay).
+        if let Some(ref trace) = state.replay_trace {
+            state.replay_backend = Some(ReplayBackend::new(trace, nr_cpus as usize));
+        }
 
         // Set CPU ID width for log formatting
         kfuncs::set_sim_cpu_width(nr_cpus);
@@ -2916,14 +2930,13 @@ impl<S: Scheduler> Simulator<S> {
         let interleave_seed = state.next_prng();
 
         if let Some(ref preemptive_cfg) = state.preemptive {
-            if let Some(ref trace) = state.replay_trace {
-                let backend = ReplayBackend::new(trace, dispatch_cpus.len());
+            if let Some(ref backend) = state.replay_backend {
                 crate::backend::run_preemptive_dispatch(
                     &dispatch_cpus,
                     &state_send,
                     &sched_send,
                     interleave_seed,
-                    &backend,
+                    backend,
                 );
             } else {
                 let backend = PmuBackend {
@@ -3127,8 +3140,7 @@ impl<S: Scheduler> Simulator<S> {
         let cgroup_send = SendPtr(cgroup_registry as *mut CgroupRegistry);
 
         if let Some(ref preemptive_cfg) = state.preemptive.clone() {
-            if let Some(ref trace) = state.replay_trace {
-                let backend = ReplayBackend::new(trace, cpu_ids.len());
+            if let Some(ref backend) = state.replay_backend {
                 crate::backend::run_preemptive_batch(
                     &per_cpu,
                     &cpu_ids,
@@ -3141,7 +3153,7 @@ impl<S: Scheduler> Simulator<S> {
                     watchdog_timeout,
                     duration_ns,
                     max_cgroups,
-                    &backend,
+                    backend,
                 );
             } else {
                 let backend = PmuBackend {

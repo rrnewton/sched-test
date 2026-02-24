@@ -5,8 +5,9 @@
 //! [`REPLAY_MARGIN`](crate::preempt::REPLAY_MARGIN) branches of the target,
 //! then a hardware breakpoint catches the exact instruction pointer.
 //!
-//! Falls back to cooperative-only interleaving when PMU or hardware
-//! breakpoints are unavailable (VMs, containers).
+//! Both PMU timer and HW breakpoint are REQUIRED. If either is unavailable
+//! (VMs, containers, missing perf permissions), replay panics with a clear
+//! error message rather than silently degrading to cooperative-only mode.
 
 use std::os::unix::io::RawFd;
 
@@ -76,6 +77,19 @@ impl PreemptionBackend for ReplayBackend {
         // Create per-thread PMU timer.
         let (timer, timer_fd) = setup_pmu_timer(false, self.break_on);
 
+        // Fatal: replay requires a working PMU timer to approach the
+        // target RBC count before arming the hardware breakpoint.
+        // Without it, preemption points cannot be reproduced.
+        if timer_fd < 0 {
+            panic!(
+                "replay: PMU timer unavailable on worker {i}. \
+                 Replay mode requires PMU counters to reproduce preemption \
+                 points. This environment (VM, container, or missing perf \
+                 permissions) cannot support replay. Use --preemptive \
+                 (non-replay) mode instead."
+            );
+        }
+
         // Create per-thread hardware breakpoint (at dummy addr 0x1).
         let bp_fd = {
             let bp = perf::try_create_hw_breakpoint(0x1);
@@ -88,28 +102,28 @@ impl PreemptionBackend for ReplayBackend {
                     fd
                 }
                 None => {
-                    tracing::warn!(
-                        worker = i,
-                        "replay: HW breakpoint unavailable, cooperative-only fallback"
+                    // Fatal: replay requires HW breakpoints to catch the
+                    // exact instruction pointer at the recorded preemption
+                    // point. Without breakpoints, replay CANNOT reproduce
+                    // preemption points and will produce wrong results.
+                    panic!(
+                        "replay: HW breakpoint unavailable on worker {i}. \
+                         Replay mode requires hardware breakpoints (perf \
+                         hw_breakpoint) to catch exact preemption instruction \
+                         pointers. This environment (VM, container, or \
+                         missing perf permissions) cannot support replay."
                     );
-                    -1
                 }
             }
         };
 
-        if timer_fd >= 0 && bp_fd >= 0 {
-            debug!(
-                worker = i,
-                targets = cursor.len(),
-                "replay: PMU + breakpoint armed"
-            );
-        } else {
-            debug!(
-                worker = i,
-                targets = cursor.len(),
-                "replay: cooperative-only (PMU or BP unavailable)"
-            );
-        }
+        // Both timer_fd and bp_fd are guaranteed valid at this point
+        // (we panic above if either is unavailable).
+        debug!(
+            worker = i,
+            targets = cursor.len(),
+            "replay: PMU + breakpoint armed"
+        );
 
         // Install replay context (replaces normal preempt context).
         preempt::install_replay(ring, worker_id, timer_fd, bp_fd, cursor);
