@@ -12,7 +12,7 @@ use crate::kfuncs::OpsContext;
 use crate::perf::PmuEvent;
 use crate::types::CpuId;
 
-use super::{PreemptionRecord, PreemptionRecordStore};
+use super::{format_insn_bytes, PreemptionRecord, PreemptionRecordStore, INSN_BYTES_LEN};
 
 /// Scenario metadata stored in the trace file header.
 ///
@@ -36,6 +36,9 @@ pub struct TraceMetadata {
     pub timeslice_min: Option<u64>,
     /// Maximum preemptive timeslice (PMU events).
     pub timeslice_max: Option<u64>,
+    /// FNV-1a hash of the scheduler .so file contents.
+    /// Used to detect .so version mismatches before replay begins.
+    pub so_hash: Option<u64>,
 }
 
 /// A replayable preemption trace, grouped by worker.
@@ -191,6 +194,13 @@ impl PreemptionTrace {
                 ));
             }
         }
+        if let (Some(trace_val), Some(expect_val)) = (m.so_hash, expected.so_hash) {
+            if trace_val != expect_val {
+                mismatches.push(format!(
+                    "so_hash: trace=0x{trace_val:016x}, current=0x{expect_val:016x}                      -- scheduler .so has changed since recording"
+                ));
+            }
+        }
 
         if !mismatches.is_empty() {
             panic!(
@@ -246,6 +256,9 @@ impl PreemptionTrace {
         if let Some(ts_max) = self.metadata.timeslice_max {
             writeln!(w, "# timeslice_max: {ts_max}")?;
         }
+        if let Some(hash) = self.metadata.so_hash {
+            writeln!(w, "# so_hash: 0x{hash:016x}")?;
+        }
 
         // Flatten and sort by sequence for canonical output order.
         let mut all: Vec<&PreemptionRecord> =
@@ -265,7 +278,7 @@ impl PreemptionTrace {
             };
             writeln!(
                 w,
-                "seq={} ops={} kfunc={} structop={}:{} rbc={} timeslice={} rip=0x{:x} rip_offset=0x{:x} cpu={} worker={}",
+                "seq={} ops={} kfunc={} structop={}:{} rbc={} timeslice={} rip=0x{:x} rip_offset=0x{:x} insn={} cpu={} worker={}",
                 rec.sequence,
                 rec.ops_context.short_name(),
                 kfn,
@@ -275,6 +288,7 @@ impl PreemptionTrace {
                 rec.rbc_count,
                 rec.instruction_pointer,
                 rip_offset,
+                format_insn_bytes(&rec.insn_bytes),
                 rec.cpu_id.0,
                 rec.worker_id.0,
             )?;
@@ -327,6 +341,8 @@ impl PreemptionTrace {
                     metadata.timeslice_min = rest.trim().parse().ok();
                 } else if let Some(rest) = line.strip_prefix("# timeslice_max: ") {
                     metadata.timeslice_max = rest.trim().parse().ok();
+                } else if let Some(rest) = line.strip_prefix("# so_hash: ") {
+                    metadata.so_hash = parse_hex_or_dec(rest.trim()).ok();
                 }
                 continue;
             }
@@ -370,6 +386,7 @@ fn parse_preemption_line(line: &str, so_base: u64) -> Result<PreemptionRecord, S
     let mut structop_rbc: u64 = 0;
     let mut ops_context = OpsContext::None;
     let mut kfunc_name: &'static str = "";
+    let mut insn_bytes = [0u8; INSN_BYTES_LEN];
 
     /// Leak a short parsed string to get a `&'static str`.
     ///
@@ -426,6 +443,8 @@ fn parse_preemption_line(line: &str, so_base: u64) -> Result<PreemptionRecord, S
             ops_context = OpsContext::from_short_name(val);
         } else if let Some(val) = part.strip_prefix("kfunc=") {
             kfunc_name = leak_str(val);
+        } else if let Some(val) = part.strip_prefix("insn=") {
+            insn_bytes = parse_insn_hex(val)?;
         }
     }
 
@@ -458,7 +477,25 @@ fn parse_preemption_line(line: &str, so_base: u64) -> Result<PreemptionRecord, S
         structop_rbc,
         ops_context,
         kfunc_name,
+        insn_bytes,
     })
+}
+
+/// Parse instruction bytes hex string (e.g. "48890424ff") into a fixed-size array.
+fn parse_insn_hex(s: &str) -> Result<[u8; INSN_BYTES_LEN], String> {
+    let mut bytes = [0u8; INSN_BYTES_LEN];
+    if s.len() != INSN_BYTES_LEN * 2 {
+        return Err(format!(
+            "insn hex string must be {} chars, got {}: {s:?}",
+            INSN_BYTES_LEN * 2,
+            s.len()
+        ));
+    }
+    for (i, b) in bytes.iter_mut().enumerate() {
+        let hex = &s[i * 2..i * 2 + 2];
+        *b = u8::from_str_radix(hex, 16).map_err(|e| format!("insn byte {i}: {e}"))?;
+    }
+    Ok(bytes)
 }
 
 /// Parse a string as hex (0x prefix) or decimal.
@@ -499,6 +536,7 @@ mod tests {
             structop_rbc: srbc,
             ops_context: OpsContext::None,
             kfunc_name: "",
+            insn_bytes: [0u8; INSN_BYTES_LEN],
         }
     }
 
@@ -560,10 +598,11 @@ mod tests {
         assert!(text.contains("# break_on: rbc"));
         assert!(text.contains("# total: 3"));
 
-        // Verify structop and rip_offset are present.
+        // Verify structop, rip_offset, insn, and timeslice are present.
         assert!(text.contains("structop="));
         assert!(text.contains("rip_offset="));
         assert!(text.contains("timeslice="));
+        assert!(text.contains("insn="));
 
         // Deserialize with same so_base — should get same absolute RIPs.
         let mut cursor = std::io::Cursor::new(buf);
@@ -622,7 +661,7 @@ mod tests {
     #[test]
     fn test_parse_preemption_line_new_format() {
         let line =
-            "seq=5 structop=2:3 rbc=100 timeslice=42 rip=0x1000 rip_offset=0x100 cpu=1 worker=0";
+            "seq=5 structop=2:3 rbc=100 timeslice=42 rip=0x1000 rip_offset=0x100 insn=48890424ff cpu=1 worker=0";
         let rec = parse_preemption_line(line, 0x2000).unwrap();
         assert_eq!(rec.sequence, 5);
         assert_eq!(rec.rbc_count, 42); // timeslice takes precedence
@@ -632,6 +671,7 @@ mod tests {
         assert_eq!(rec.worker_id, WorkerId(0));
         assert_eq!(rec.structop_local, 2);
         assert_eq!(rec.structop_global, 3);
+        assert_eq!(rec.insn_bytes, [0x48, 0x89, 0x04, 0x24, 0xff]);
     }
 
     #[test]
@@ -716,6 +756,7 @@ mod tests {
             scheduler: Some("simple".to_string()),
             timeslice_min: Some(1),
             timeslice_max: Some(500),
+            so_hash: Some(0xdeadbeef12345678),
         });
 
         // Serialize.
@@ -731,6 +772,7 @@ mod tests {
         assert!(text.contains("# scheduler: simple"));
         assert!(text.contains("# timeslice_min: 1"));
         assert!(text.contains("# timeslice_max: 500"));
+        assert!(text.contains("# so_hash: 0xdeadbeef12345678"));
 
         // Deserialize and verify metadata is preserved.
         let mut cursor = std::io::Cursor::new(buf);
@@ -743,6 +785,7 @@ mod tests {
         assert_eq!(m.scheduler, Some("simple".to_string()));
         assert_eq!(m.timeslice_min, Some(1));
         assert_eq!(m.timeslice_max, Some(500));
+        assert_eq!(m.so_hash, Some(0xdeadbeef12345678));
     }
 
     #[test]
@@ -756,6 +799,7 @@ mod tests {
             scheduler: Some("simple".to_string()),
             timeslice_min: Some(1),
             timeslice_max: Some(500),
+            so_hash: Some(0xaabbccdd),
         });
 
         // Matching parameters should not panic.
@@ -767,6 +811,7 @@ mod tests {
             scheduler: Some("simple".to_string()),
             timeslice_min: Some(1),
             timeslice_max: Some(500),
+            so_hash: Some(0xaabbccdd),
         });
     }
 
@@ -782,6 +827,7 @@ mod tests {
             scheduler: Some("simple".to_string()),
             timeslice_min: None,
             timeslice_max: None,
+            so_hash: None,
         });
 
         // Mismatched nr_cpus should panic.
@@ -793,6 +839,7 @@ mod tests {
             scheduler: Some("simple".to_string()),
             timeslice_min: None,
             timeslice_max: None,
+            so_hash: None,
         });
     }
 
@@ -812,6 +859,68 @@ mod tests {
             scheduler: Some("anything".to_string()),
             timeslice_min: Some(50),
             timeslice_max: Some(100),
+            so_hash: Some(0xdeadbeef),
         });
+    }
+
+    #[test]
+    fn test_insn_bytes_roundtrip() {
+        use super::format_insn_bytes;
+
+        let bytes = [0x48, 0x89, 0x04, 0x24, 0xff];
+        let hex = format_insn_bytes(&bytes);
+        assert_eq!(hex, "48890424ff");
+
+        // Parse roundtrip.
+        let parsed = parse_insn_hex(&hex).unwrap();
+        assert_eq!(parsed, bytes);
+    }
+
+    #[test]
+    fn test_insn_bytes_zero_default() {
+        // Old format line without insn= should have zero insn_bytes.
+        let line = "seq=0 rbc=100 rip=0x1000 cpu=0 worker=0";
+        let rec = parse_preemption_line(line, 0).unwrap();
+        assert_eq!(rec.insn_bytes, [0u8; INSN_BYTES_LEN]);
+    }
+
+    #[test]
+    fn test_so_hash_metadata_roundtrip() {
+        let mut trace = PreemptionTrace::from_records(&[], 1, PmuEvent::RetiredBranchConditional);
+        trace.set_metadata(TraceMetadata {
+            so_hash: Some(0xcafebabe12345678),
+            ..TraceMetadata::default()
+        });
+
+        let mut buf = Vec::new();
+        trace.serialize(&mut buf, 0).unwrap();
+        let text = String::from_utf8(buf.clone()).unwrap();
+        assert!(text.contains("# so_hash: 0xcafebabe12345678"));
+
+        let mut cursor = std::io::Cursor::new(buf);
+        let trace2 = PreemptionTrace::deserialize(&mut cursor, 0).unwrap();
+        assert_eq!(trace2.metadata().so_hash, Some(0xcafebabe12345678));
+    }
+
+    #[test]
+    #[should_panic(expected = "so_hash")]
+    fn test_so_hash_mismatch_panics() {
+        let mut trace = PreemptionTrace::from_records(&[], 1, PmuEvent::RetiredBranchConditional);
+        trace.set_metadata(TraceMetadata {
+            so_hash: Some(0xaaaa),
+            ..TraceMetadata::default()
+        });
+        trace.validate_metadata(&TraceMetadata {
+            so_hash: Some(0xbbbb),
+            ..TraceMetadata::default()
+        });
+    }
+
+    #[test]
+    fn test_parse_insn_hex_errors() {
+        // Wrong length.
+        assert!(parse_insn_hex("aabb").is_err());
+        // Invalid hex chars.
+        assert!(parse_insn_hex("gghhiijjkk").is_err());
     }
 }

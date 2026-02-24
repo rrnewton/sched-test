@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use scx_simulator::scenario::{parse_duration_ns, parse_seed};
 use scx_simulator::{
-    compare_checkpoints, discover_schedulers, drain_determinism_checkpoints,
+    compare_checkpoints, compute_so_hash, discover_schedulers, drain_determinism_checkpoints,
     drain_preemption_records, enable_determinism_mode, enable_preemption_collection, load_rtapp,
     scheduler_so_base, DynamicScheduler, Phase, PmuEvent, PreemptionTrace, PreemptiveConfig,
     RepeatMode, Scenario, SimFormat, Simulator, TaskBehavior, TraceMetadata, TraceStats, SIM_LOCK,
@@ -446,6 +446,16 @@ fn replay_simulation(args: &ReplayArgs) -> Result<(), String> {
         args.trace_file.display()
     );
 
+    // Validate .so hash matches the recording.
+    let current_so_hash = compute_so_hash();
+    if current_so_hash != 0 {
+        let expected = TraceMetadata {
+            so_hash: Some(current_so_hash),
+            ..TraceMetadata::default()
+        };
+        trace.validate_metadata(&expected);
+    }
+
     // Build a scenario from trace metadata with N identical compute tasks.
     let compute_phase = Phase::Run(10_000_000);
     let behavior = TaskBehavior {
@@ -485,6 +495,11 @@ fn replay_simulation(args: &ReplayArgs) -> Result<(), String> {
         scheduler: Some(prefix.clone()),
         timeslice_min: scenario.preemptive.as_ref().map(|p| p.timeslice_min),
         timeslice_max: scenario.preemptive.as_ref().map(|p| p.timeslice_max),
+        so_hash: if current_so_hash != 0 {
+            Some(current_so_hash)
+        } else {
+            None
+        },
     };
 
     let sim_trace = Simulator::new(sched).run(scenario);
@@ -645,6 +660,7 @@ fn run_simulation(args: &RunArgs, scenario: Scenario) -> Result<(), String> {
     }
 
     // Capture scenario metadata before the scenario is consumed by run().
+    let current_so_hash = compute_so_hash();
     let scenario_metadata = TraceMetadata {
         nr_cpus: Some(scenario.nr_cpus),
         nr_tasks: Some(scenario.tasks.len() as u32),
@@ -653,6 +669,11 @@ fn run_simulation(args: &RunArgs, scenario: Scenario) -> Result<(), String> {
         scheduler: Some(args.scheduler.clone()),
         timeslice_min: scenario.preemptive.as_ref().map(|p| p.timeslice_min),
         timeslice_max: scenario.preemptive.as_ref().map(|p| p.timeslice_max),
+        so_hash: if current_so_hash != 0 {
+            Some(current_so_hash)
+        } else {
+            None
+        },
     };
 
     let trace = Simulator::new(sched).run(scenario);

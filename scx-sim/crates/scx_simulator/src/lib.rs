@@ -71,11 +71,12 @@ pub use perf::RbcCounter;
 pub use preempt::trace::PreemptionTrace;
 pub use preempt::trace::TraceMetadata;
 pub use preempt::{
-    compare_checkpoints, drain_determinism_checkpoints, drain_preemption_records,
-    enable_determinism_mode, enable_preemption_collection, fnv1a_combine, fnv1a_hash_bytes,
-    fnv1a_hash_u64, is_determinism_mode_enabled, record_checkpoint, reset_preemption_sequence,
-    scheduler_so_base, CheckpointDivergence, CheckpointEvent, DeterminismCheckpoint,
-    DivergenceType, PreemptionRecord, StructopInfo,
+    compare_checkpoints, compute_so_hash, compute_so_hash_from_path, drain_determinism_checkpoints,
+    drain_preemption_records, enable_determinism_mode, enable_preemption_collection, fnv1a_combine,
+    fnv1a_hash_bytes, fnv1a_hash_u64, is_determinism_mode_enabled, record_checkpoint,
+    reset_preemption_sequence, scheduler_so_base, scheduler_so_path, CheckpointDivergence,
+    CheckpointEvent, DeterminismCheckpoint, DivergenceType, PreemptionRecord, StructopInfo,
+    INSN_BYTES_LEN,
 };
 pub use rtapp::load_rtapp;
 pub use scenario::{
