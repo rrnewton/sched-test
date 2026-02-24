@@ -85,7 +85,15 @@ pub struct PreemptionRecord {
     pub structop_local: u64,
     /// Global structop count (1-based) at the time of preemption.
     pub structop_global: u64,
-    /// Cumulative RBC within the current structop at the time of preemption.
+    /// Cumulative per-worker RBC across the entire dispatch round.
+    ///
+    /// This is the total of all `rbc_count` values accumulated via
+    /// `record_rbc_preemption()` on this worker up to this point.
+    /// NOT per-structop — the counter is never reset at structop boundaries.
+    ///
+    /// In replay mode, the PMU counter runs continuously without resets at
+    /// kfunc boundaries, and replay handlers compare against this cumulative
+    /// value to find the correct preemption point.
     pub structop_rbc: u64,
     /// Which ops callback was active at the time of preemption.
     pub ops_context: OpsContext,
@@ -781,7 +789,13 @@ pub struct StructopInfo {
     pub cpu_count: u64,
     /// Global structop call count across all CPUs (monotonically increasing).
     pub global_count: u64,
-    /// Cumulative RBC count on this CPU (monotonically increasing).
+    /// Cumulative RBC count on this worker (monotonically increasing).
+    ///
+    /// Sum of per-preemption `rbc_count` values. In recording mode, each
+    /// `rbc_count` is a per-reset delta (branches since the last
+    /// `rearm_timer`). In replay mode, each `rbc_count` is the recorded
+    /// delta from the trace. This value is stored as `structop_rbc` in
+    /// [`PreemptionRecord`] (despite the name, it is NOT per-structop).
     pub rbc_total: u64,
     /// Cumulative cooperative yield count on this CPU (monotonically increasing).
     pub kfunc_count: u64,
@@ -825,6 +839,13 @@ pub fn seed_structop(base: &StructopInfo) {
 }
 
 /// Begin a new structop: increment per-CPU and global counts.
+///
+/// Note: does NOT reset `STRUCTOP_RBC_TOTAL`. Despite the "structop" prefix,
+/// the RBC counter (`rbc_total` / `structop_rbc`) is cumulative across the
+/// entire dispatch round, not per-structop. In recording mode, the PMU
+/// counter is reset per-kfunc via `rearm_timer`, and `rbc_count` deltas
+/// accumulate into the cumulative total. In replay mode, the counter runs
+/// continuously without any resets.
 fn begin_structop() {
     STRUCTOP_CPU_COUNT.with(|c| c.set(c.get() + 1));
     STRUCTOP_GLOBAL_COUNT.fetch_add(1, SeqCst);
@@ -909,10 +930,14 @@ pub fn print_structop_summary(accum: &[StructopInfo]) {
     );
 }
 
-/// Record RBC consumed by a preemption on this worker.
+/// Accumulate RBC consumed by a preemption into the per-worker total.
 ///
-/// Called from the signal handler. Accumulates into the monotonic
-/// per-CPU RBC total.
+/// Called from the signal handler with the per-reset `rbc_count` delta.
+/// The running total (`STRUCTOP_RBC_TOTAL`) becomes `structop_rbc` in
+/// the preemption record. Despite the name, this is cumulative across
+/// the entire dispatch round, not per-structop.
+///
+/// **Async-signal-safe**: uses only a thread-local cell.
 pub fn record_rbc_preemption(timeslice: u64) {
     STRUCTOP_RBC_TOTAL.with(|c| c.set(c.get() + timeslice));
 }
@@ -1352,12 +1377,20 @@ struct PreemptCtx {
     /// Raw fd of the RBC measurement counter (for cumulative C-code RBC).
     /// -1 if unavailable (no PMU support).
     measure_fd: RawFd,
-    /// Timeslice range for re-arming the timer after preemption.
+    /// Timeslice range for PRNG consumption in `rearm_timer`.
+    ///
+    /// In recording mode, these bounds produce the random timeslice period.
+    /// In replay mode, the timeslice is discarded (replay manages its own
+    /// timer periods) but must be consumed to keep the PRNG sequence in
+    /// sync with the recording run.
     timeslice_min: u64,
     timeslice_max: u64,
-    /// When true, `rearm_timer` just re-enables the timer without resetting
-    /// or changing the period. Used by the replay backend, where the timer
-    /// period is set by the replay engine (not random timeslices).
+    /// Controls `rearm_timer` behavior at kfunc boundaries.
+    ///
+    /// When false (recording): reset counter, set new random period, enable.
+    /// When true (replay): re-enable only — no reset, no period change.
+    ///
+    /// See `rearm_timer` docs for the full explanation of this asymmetry.
     replay_mode: bool,
 }
 
@@ -1398,12 +1431,15 @@ pub fn uninstall() {
 /// Install preemptive interleave context for replay mode.
 ///
 /// Like [`install`], but sets `replay_mode = true` so that `rearm_timer`
-/// just re-enables the timer without resetting or changing the period.
+/// re-enables the counter without resetting or changing the period (see
+/// `rearm_timer` docs for the full recording/replay asymmetry explanation).
 /// The replay backend manages the timer period directly via
-/// [`arm_replay_timer_pub`].
+/// [`arm_replay_timer_pub`] and [`arm_replay_next_target`].
 ///
 /// `timeslice_min` and `timeslice_max` must match the recording scenario's
-/// values to keep the PRNG consumption in sync with the recording run.
+/// values so that `rearm_timer`'s PRNG consumption produces the same
+/// sequence as the recording run. The rolled timeslice is discarded in
+/// replay mode, but consuming it keeps `pick_next()` deterministic.
 /// Also sets `measure_fd = -1` (replay doesn't use a measurement counter).
 pub fn install_replay_preempt(
     ring: &PreemptRing,
@@ -1591,7 +1627,10 @@ pub fn pause_timer() {
 /// Resume the preemption timer after kfunc execution completes.
 ///
 /// Called by `with_sim()` just before returning to scheduler C code.
-/// Re-arms the PMU timer with a fresh random timeslice. No-op if
+/// Delegates to `rearm_timer`, which handles the recording/replay
+/// difference: recording resets the counter with a new random period,
+/// while replay just re-enables without resetting. In both modes,
+/// one PRNG value is consumed for deterministic sequencing. No-op if
 /// preemptive interleaving is not active on this thread.
 pub fn resume_timer() {
     if let Some(ctx) = PREEMPT_CTX.with(|c| c.get()) {
@@ -1888,36 +1927,52 @@ fn enable_measurement(fd: RawFd) {
     }
 }
 
-/// Re-arm the PMU timer with a fresh random timeslice.
+/// Re-arm the PMU timer after returning from a kfunc to scheduler C code.
 ///
-/// In replay mode, re-enables the counter without resetting. Replay uses
-/// cumulative RBC values (`structop_rbc`) from the recording, so the
-/// counter runs continuously from `arm()`. Resetting at kfunc boundaries
-/// would destroy the cumulative count that the replay handlers need.
+/// Called from `resume_timer()` and post-kfunc cooperative yield. Always
+/// consumes one PRNG value (`roll_timeslice`) to keep the deterministic
+/// token-passing sequence in sync between recording and replay.
+///
+/// # Recording vs replay counter semantics
+///
+/// **Recording mode**: resets the PMU counter to zero and programs a new
+/// random timeslice period. Each kfunc boundary starts a fresh counting
+/// window. The signal handler reads the counter as `rbc_count` (a
+/// per-reset delta), and accumulates it into the cumulative
+/// `STRUCTOP_RBC_TOTAL` (stored as `structop_rbc` in the trace).
+///
+/// **Replay mode**: re-enables the counter WITHOUT resetting. The PMU
+/// counter runs continuously from `arm()` across all kfunc boundaries
+/// within a dispatch round. Replay signal handlers compare the live
+/// counter against cumulative `structop_rbc` values from the trace.
+/// Resetting at kfunc boundaries would destroy the cumulative count
+/// that the replay handlers need for targeting. The PRNG is still
+/// consumed (result discarded) to keep the deterministic sequence in
+/// sync with recording.
+///
+/// This asymmetry is intentional and correct: recording accumulates
+/// per-reset deltas into a cumulative total, while replay uses the
+/// cumulative total directly as a continuous counter target.
 fn rearm_timer(ring: &PreemptRing, ctx: &PreemptCtx) {
     let fd = ctx.timer_fd;
     if fd < 0 {
         return;
     }
-    // Always consume the PRNG to keep token-passing deterministic.
-    let _timeslice = ring.roll_timeslice(ctx.timeslice_min, ctx.timeslice_max);
+    // Consume PRNG unconditionally for deterministic sequencing.
+    let timeslice = ring.roll_timeslice(ctx.timeslice_min, ctx.timeslice_max);
     if ctx.replay_mode {
-        // Replay mode: re-enable without resetting. The counter runs
-        // continuously from arm() and replay handlers compare against
-        // cumulative structop_rbc values. Resetting at kfunc boundaries
-        // would destroy the cumulative count needed for RBC verification.
+        // Re-enable only — counter must run continuously for replay
+        // handlers that compare against cumulative structop_rbc targets.
         unsafe {
             libc::ioctl(fd, scx_perf::PERF_IOC_ENABLE, 0 as libc::c_ulong);
         }
         return;
     }
-    let mut period = _timeslice;
+    // Recording: reset + new period + enable.
+    let mut period = timeslice;
     unsafe {
-        // Reset counter to zero.
         libc::ioctl(fd, scx_perf::PERF_IOC_RESET, 0 as libc::c_ulong);
-        // Set new period.
         libc::ioctl(fd, scx_perf::PERF_IOC_PERIOD, &mut period as *mut u64);
-        // Enable.
         libc::ioctl(fd, scx_perf::PERF_IOC_ENABLE, 0 as libc::c_ulong);
     }
 }
