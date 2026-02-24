@@ -39,6 +39,13 @@ pub(crate) struct ReplayBackend {
     timeslice_min: u64,
     /// Maximum timeslice from the recording scenario.
     timeslice_max: u64,
+    /// Skip PMU timer and use hardware breakpoint stepping only.
+    ///
+    /// When true, the PMU timer is not armed and the hardware breakpoint
+    /// fires on every execution of the target instruction. The RBC count
+    /// is checked in the breakpoint handler to find the right dynamic
+    /// instance. Slower but deterministic (no PMU skid).
+    no_pmu_signal: bool,
 }
 
 /// Per-worker state for the replay backend.
@@ -60,6 +67,7 @@ impl ReplayBackend {
         num_workers: usize,
         timeslice_min: u64,
         timeslice_max: u64,
+        no_pmu_signal: bool,
     ) -> Self {
         let cursors = (0..num_workers)
             .map(|i| {
@@ -72,6 +80,37 @@ impl ReplayBackend {
             break_on: trace.break_on(),
             timeslice_min,
             timeslice_max,
+            no_pmu_signal,
+        }
+    }
+
+    /// Whether this backend is in breakpoint-only mode.
+    pub fn no_pmu_signal(&self) -> bool {
+        self.no_pmu_signal
+    }
+
+    /// Create a copy of this backend with `no_pmu_signal` forced on.
+    ///
+    /// Used by the retry logic when PMU signal attempts are exhausted
+    /// and we fall back to breakpoint-only mode.
+    pub fn with_bp_only(&self) -> Self {
+        ReplayBackend {
+            cursors: self
+                .cursors
+                .iter()
+                .map(|c| ReplayCursor::new(c.clone_targets()))
+                .collect(),
+            break_on: self.break_on,
+            timeslice_min: self.timeslice_min,
+            timeslice_max: self.timeslice_max,
+            no_pmu_signal: true,
+        }
+    }
+
+    /// Reset all cursors to the beginning for a retry attempt.
+    pub fn reset_cursors(&self) {
+        for c in &self.cursors {
+            c.reset();
         }
     }
 }
@@ -80,11 +119,19 @@ impl PreemptionBackend for ReplayBackend {
     type WorkerCtx = ReplayWorkerCtx;
 
     fn global_setup(&self) {
-        preempt::install_replay_signal_handlers();
+        if self.no_pmu_signal {
+            preempt::install_replay_bp_only_handlers();
+        } else {
+            preempt::install_replay_signal_handlers();
+        }
     }
 
     fn global_teardown(&self) {
-        preempt::uninstall_replay_signal_handlers();
+        if self.no_pmu_signal {
+            preempt::uninstall_replay_bp_only_handlers();
+        } else {
+            preempt::uninstall_replay_signal_handlers();
+        }
     }
 
     fn worker_setup(&self, ring: &PreemptRing, worker_id: WorkerId) -> ReplayWorkerCtx {
@@ -94,16 +141,18 @@ impl PreemptionBackend for ReplayBackend {
         // Create per-thread PMU timer.
         let (timer, timer_fd) = setup_pmu_timer(false, self.break_on);
 
-        // Fatal: replay requires a working PMU timer to approach the
+        // In normal mode, the PMU timer is required to approach the
         // target RBC count before arming the hardware breakpoint.
-        // Without it, preemption points cannot be reproduced.
-        if timer_fd < 0 {
+        // In breakpoint-only mode, we still create the timer for RBC
+        // measurement (read_rbc_count) but do not arm it for signals.
+        if timer_fd < 0 && !self.no_pmu_signal {
             panic!(
                 "replay: PMU timer unavailable on worker {i}. \
                  Replay mode requires PMU counters to reproduce preemption \
                  points. This environment (VM, container, or missing perf \
                  permissions) cannot support replay. Use --preemptive \
-                 (non-replay) mode instead."
+                 (non-replay) mode instead, or use --no-pmu-signal for \
+                 breakpoint-only replay."
             );
         }
 
@@ -174,10 +223,19 @@ impl PreemptionBackend for ReplayBackend {
         // sequences diverge and pick_next returns different worker IDs.
         let _timeslice = ring.roll_timeslice(self.timeslice_min, self.timeslice_max);
 
-        // Arm PMU timer for the first replay target.
-        if ctx.timer_fd >= 0 && ctx.bp_fd >= 0 {
-            if let Some(first) = cursor.current_target() {
-                preempt::arm_replay_timer_pub(ctx.timer_fd, first.rbc_count);
+        if let Some(first) = cursor.current_target() {
+            if self.no_pmu_signal {
+                // Breakpoint-only mode: arm the HW breakpoint directly at
+                // the target RIP. The breakpoint handler checks the RBC
+                // count on each hit to find the right dynamic instance.
+                if ctx.bp_fd >= 0 {
+                    preempt::arm_replay_breakpoint_pub(ctx.bp_fd, first.instruction_pointer);
+                }
+            } else {
+                // Normal mode: arm the PMU timer to fire near the target.
+                if ctx.timer_fd >= 0 && ctx.bp_fd >= 0 {
+                    preempt::arm_replay_timer_pub(ctx.timer_fd, first.rbc_count);
+                }
             }
         }
     }

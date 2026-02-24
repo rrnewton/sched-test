@@ -495,6 +495,7 @@ pub fn load_rtapp(json_str: &str, nr_cpus: u32) -> Result<Scenario, RtAppError> 
         interleave: false,
         preemptive: None,
         replay_trace: None,
+        no_pmu_signal: false,
         max_cgroups: crate::cgroup::DEFAULT_MAX_CGROUPS,
         irq_events: Vec::new(),
     })
