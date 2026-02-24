@@ -167,12 +167,15 @@ $(foreach s,$(SCHEDS),$(eval $(call RBC_TRAMPOLINE_RULE,$(s))))
 $(foreach s,$(SCHEDS),$(eval $(call SO_RULE,$(s))))
 
 # --- e9patch post-processing ---
-# Instrument Jcc instructions, forwarding each to the .so's rbc_trampoline().
+# Instrument Jcc instructions with a software RBC counter trampoline.
 #
-# The e9 trampoline stub is compiled with e9compile.sh — it's a minimal
-# forwarder that calls the .so's rbc_trampoline() (from sim_rbc_trampoline.c).
-# The .so's rbc_trampoline uses global state configured by the Rust backend
-# via e9_arm/e9_disarm/e9_worker_setup (also in the .so).
+# The trampoline binary is compiled with e9compile.sh from e9patch. It uses
+# dlsym to resolve E9_SHARED_RBC (shared state struct in the main binary) and
+# e9_preempt_yield (yield function in the main binary). The fast path
+# (counter > 0) is a single decrement + branch with no external calls.
+#
+# The .so's e9_arm/e9_disarm/e9_worker_setup (from sim_rbc_trampoline.c)
+# write to the same E9_SHARED_RBC struct, ensuring consistent state.
 #
 # Usage: make e9  (requires e9tool; builds _e9.so for all schedulers)
 
@@ -180,17 +183,18 @@ E9COMPILE ?= $(SIMULATOR_DIR)/third_party/e9patch/e9compile.sh
 E9_TRAMPOLINE_SRC := $(SIMULATOR_DIR)/csrc/e9_rbc_trampoline.c
 E9_TRAMPOLINE_BIN := $(BUILD_DIR)/e9_rbc_trampoline
 
-# Build the e9patch trampoline stub using gcc (same flags as e9compile.sh).
+# Build the trampoline binary using e9compile.sh (must run from e9patch dir
+# so that #include "stdlib.c" resolves to e9patch/examples/stdlib.c).
 $(E9_TRAMPOLINE_BIN): $(E9_TRAMPOLINE_SRC) | $(BUILD_DIR)
-	gcc -fno-stack-protector -fno-builtin -fno-exceptions -fpie -O2 \
-		-Wno-unused-function -U_FORTIFY_SOURCE -mno-mmx -mno-sse \
-		-mno-avx -mno-avx2 -mno-avx512f -msoft-float \
-		-mstringop-strategy=loop -fno-tree-vectorize -fomit-frame-pointer \
-		-c -o $(BUILD_DIR)/e9_rbc_trampoline.o $(E9_TRAMPOLINE_SRC)
-	gcc $(BUILD_DIR)/e9_rbc_trampoline.o -o $(E9_TRAMPOLINE_BIN) \
-		-pie -nostdlib -Wl,-z -Wl,max-page-size=4096 -Wl,-z -Wl,norelro \
-		-Wl,-z -Wl,stack-size=0 -Wl,--export-dynamic -Wl,--entry=0x0 \
-		-Wl,--strip-all -Wl,--unresolved-symbols=ignore-all
+	@if [ ! -f "$(E9COMPILE)" ]; then \
+		echo "ERROR: e9compile.sh not found. Build e9patch: cd third_party/e9patch && ./build.sh"; \
+		exit 1; \
+	fi
+	cp $(E9_TRAMPOLINE_SRC) $(SIMULATOR_DIR)/third_party/e9patch/e9_rbc_trampoline.c
+	cd $(SIMULATOR_DIR)/third_party/e9patch && $(E9COMPILE) e9_rbc_trampoline.c
+	mv $(SIMULATOR_DIR)/third_party/e9patch/e9_rbc_trampoline $(E9_TRAMPOLINE_BIN)
+	rm -f $(SIMULATOR_DIR)/third_party/e9patch/e9_rbc_trampoline.c \
+	      $(SIMULATOR_DIR)/third_party/e9patch/e9_rbc_trampoline.o
 
 define E9_RULE
 $(BUILD_DIR)/libscx_$(1)_e9.so: $(BUILD_DIR)/libscx_$(1).so $(E9_TRAMPOLINE_BIN)
@@ -200,7 +204,7 @@ $(BUILD_DIR)/libscx_$(1)_e9.so: $(BUILD_DIR)/libscx_$(1).so $(E9_TRAMPOLINE_BIN)
 	fi
 	E9PATCH=$(E9PATCH) $(E9TOOL) \
 		-M 'jcc' \
-		-P 'entry()@$(E9_TRAMPOLINE_BIN)' \
+		-P 'rbc_trampoline()@$(E9_TRAMPOLINE_BIN)' \
 		-o $$@ $$<
 endef
 $(foreach s,$(SCHEDS),$(eval $(call E9_RULE,$(s))))
