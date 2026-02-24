@@ -5,14 +5,14 @@ on:
     branches:
       - '**'
     paths:
-      - 'rust/scx_simulator/**'
+      - 'scx-sim/**'
       - 'lib/scxtest/**'
       - 'scheds/**'
   pull_request:
     branches:
       - '**'
     paths:
-      - 'rust/scx_simulator/**'
+      - 'scx-sim/**'
       - 'lib/scxtest/**'
       - 'scheds/**'
 
@@ -37,15 +37,15 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-            rust/scx_simulator/target/
-          key: ${{ runner.os }}-simulator-${{ hashFiles('rust/scx_simulator/Cargo.lock') }}
+            scx-sim/target/
+          key: ${{ runner.os }}-simulator-${{ hashFiles('scx-sim/Cargo.lock') }}
 
       - name: Validate scx_simulator
-        if: hashFiles('rust/scx_simulator/validate.sh') != ''
-        working-directory: rust/scx_simulator
+        if: hashFiles('scx-sim/validate.sh') != ''
+        working-directory: scx-sim
         run: bash validate.sh
 
       - name: Build scx_simulator (no validate.sh yet)
-        if: hashFiles('rust/scx_simulator/validate.sh') == ''
-        working-directory: rust/scx_simulator
+        if: hashFiles('scx-sim/validate.sh') == ''
+        working-directory: scx-sim
         run: cargo build --workspace

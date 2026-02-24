@@ -17,7 +17,7 @@ CLAUDE.md
 **/*.s
 **/*.tmp
 .agent/
-rust/scx_simulator/schedulers/cosmos/cosmos_main_patched.c
+scx-sim/schedulers/cosmos/cosmos_main_patched.c
 mp3-*.log
 rt-app-*.log
 *.profraw

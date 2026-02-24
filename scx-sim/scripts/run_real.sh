@@ -20,7 +20,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SIM_DIR="$(dirname "$SCRIPT_DIR")"
-REPO_ROOT="$(cd "$SIM_DIR/../.." && pwd)"
+REPO_ROOT="$(cd "$SIM_DIR/.." && pwd)"
 
 WORKLOAD="${1:-$SIM_DIR/workloads/two_runners.json}"
 SCHEDULER="${2:-mitosis}"
