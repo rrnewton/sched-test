@@ -1089,7 +1089,7 @@ impl<S: Scheduler> Simulator<S> {
 
         // Log interleaving mode
         if let Some(ref cfg) = state.preemptive {
-            if !cfg.cooperative_only {
+            if !cfg.cooperative_only && scenario.replay_trace.is_none() {
                 warn!(
                     timeslice_min = cfg.timeslice_min,
                     timeslice_max = cfg.timeslice_max,
