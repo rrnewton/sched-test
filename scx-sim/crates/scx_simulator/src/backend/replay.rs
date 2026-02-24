@@ -35,11 +35,17 @@ pub(crate) struct ReplayBackend {
     break_on: perf::PmuEvent,
     /// Minimum timeslice from the recording scenario.
     ///
-    /// Needed to keep PRNG consumption in `rearm_timer` in sync with the
-    /// recording run (cooperative yields consume one PRNG via
-    /// `roll_timeslice` even though the result is discarded in replay mode).
+    /// Required for two PRNG sync points:
+    /// 1. `rearm_timer()` at kfunc boundaries (cooperative yields consume
+    ///    one PRNG via `roll_timeslice`; the result is discarded in replay
+    ///    mode but the consumption must match recording).
+    /// 2. `build_target()` consumes one PRNG to match recording's
+    ///    `PmuBackend::build_target()` / `arm()` sequence.
+    ///
+    /// Cannot be removed: without matching PRNG consumption, `pick_next()`
+    /// returns different worker IDs and replay diverges.
     timeslice_min: u64,
-    /// Maximum timeslice from the recording scenario.
+    /// Maximum timeslice from the recording scenario (see `timeslice_min`).
     timeslice_max: u64,
     /// Skip PMU timer and use hardware breakpoint stepping only.
     ///
