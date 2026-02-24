@@ -11,6 +11,7 @@ use rand::rngs::SmallRng;
 use rand::{RngCore, SeedableRng};
 use tracing::{debug, info, trace, warn};
 
+use crate::backend::e9patch::E9PatchBackend;
 use crate::backend::pmu::PmuBackend;
 use crate::backend::replay::ReplayBackend;
 use crate::backend::{PreemptionBackend, SendPtr};
@@ -24,7 +25,7 @@ use crate::monitor::{Monitor, ProbeContext, ProbePoint};
 use crate::perf;
 use crate::preempt::{is_determinism_mode_enabled, record_checkpoint, CheckpointEvent};
 use crate::scenario::{
-    CgroupCpusetChangeEvent, CgroupCreateEvent, CgroupDestroyEvent, IrqType, Scenario,
+    CgroupCpusetChangeEvent, CgroupCreateEvent, CgroupDestroyEvent, IrqType, PreemptMode, Scenario,
 };
 use crate::task::{OpsTaskState, Phase, SimTask, TaskState};
 use crate::trace::{DsqSampleTrigger, Trace, TraceKind};
@@ -819,6 +820,7 @@ impl<S: Scheduler> Simulator<S> {
             preemptive: scenario.preemptive.clone(),
             replay_trace: scenario.replay_trace.clone(),
             replay_backend: None, // Initialized below after state is built.
+            e9_fns: None,         // Initialized below if e9patch mode is active.
             structop_accum: vec![
                 crate::preempt::StructopInfo::default();
                 scenario.nr_cpus as usize
@@ -848,6 +850,21 @@ impl<S: Scheduler> Simulator<S> {
                 ts_max,
                 scenario.no_pmu_signal,
             ));
+        }
+
+        // Resolve e9patch function pointers if e9patch mode is active.
+        if state
+            .preemptive
+            .as_ref()
+            .is_some_and(|cfg| cfg.preempt_mode == PreemptMode::E9patch)
+        {
+            state.e9_fns = self.scheduler.resolve_e9_fns();
+            if state.e9_fns.is_none() {
+                panic!(
+                    "e9patch mode requires e9 trampoline symbols in the scheduler .so. \
+                     Rebuild with: make -C schedulers e9"
+                );
+            }
         }
 
         // Set CPU ID width for log formatting
@@ -2950,6 +2967,19 @@ impl<S: Scheduler> Simulator<S> {
                     interleave_seed,
                     backend,
                 );
+            } else if preemptive_cfg.preempt_mode == PreemptMode::E9patch {
+                let backend = E9PatchBackend {
+                    timeslice_min: preemptive_cfg.timeslice_min,
+                    timeslice_max: preemptive_cfg.timeslice_max,
+                    fns: state.e9_fns.expect("e9_fns must be resolved"),
+                };
+                crate::backend::run_preemptive_dispatch(
+                    &dispatch_cpus,
+                    &state_send,
+                    &sched_send,
+                    interleave_seed,
+                    &backend,
+                );
             } else {
                 let backend = PmuBackend {
                     timeslice_min: preemptive_cfg.timeslice_min,
@@ -3166,6 +3196,26 @@ impl<S: Scheduler> Simulator<S> {
                     duration_ns,
                     max_cgroups,
                     backend,
+                );
+            } else if preemptive_cfg.preempt_mode == PreemptMode::E9patch {
+                let backend = E9PatchBackend {
+                    timeslice_min: preemptive_cfg.timeslice_min,
+                    timeslice_max: preemptive_cfg.timeslice_max,
+                    fns: state.e9_fns.expect("e9_fns must be resolved"),
+                };
+                crate::backend::run_preemptive_batch(
+                    &per_cpu,
+                    &cpu_ids,
+                    &sim_send,
+                    &state_send,
+                    &tasks_send,
+                    &events_send,
+                    &cgroup_send,
+                    interleave_seed,
+                    watchdog_timeout,
+                    duration_ns,
+                    max_cgroups,
+                    &backend,
                 );
             } else {
                 let backend = PmuBackend {

@@ -8,9 +8,9 @@ use scx_simulator::scenario::{parse_duration_ns, parse_seed};
 use scx_simulator::{
     compare_checkpoints, compute_so_hash, discover_schedulers, drain_determinism_checkpoints,
     drain_preemption_records, enable_determinism_mode, enable_preemption_collection, load_rtapp,
-    scheduler_so_base, scheduler_so_path, DynamicScheduler, Phase, PmuEvent, PreemptionTrace,
-    PreemptiveConfig, RepeatMode, Scenario, SimFormat, Simulator, TaskBehavior, TraceMetadata,
-    TraceStats, SIM_LOCK,
+    scheduler_so_base, scheduler_so_path, DynamicScheduler, Phase, PmuEvent, PreemptMode,
+    PreemptionTrace, PreemptiveConfig, RepeatMode, Scenario, SimFormat, Simulator, TaskBehavior,
+    TraceMetadata, TraceStats, SIM_LOCK,
 };
 
 mod real_run;
@@ -41,6 +41,25 @@ impl BreakOn {
         match self {
             BreakOn::Rbc => PmuEvent::RetiredBranchConditional,
             BreakOn::Insn => PmuEvent::InstructionsRetired,
+        }
+    }
+}
+
+/// Which preemption mechanism to use for mid-C-code preemption.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub enum PreemptModeArg {
+    /// PMU hardware timer (default, nondeterministic).
+    #[default]
+    Pmu,
+    /// e9patch software RBC (deterministic, debugger-compatible).
+    E9patch,
+}
+
+impl PreemptModeArg {
+    fn to_preempt_mode(self) -> PreemptMode {
+        match self {
+            PreemptModeArg::Pmu => PreemptMode::Pmu,
+            PreemptModeArg::E9patch => PreemptMode::E9patch,
         }
     }
 }
@@ -173,6 +192,14 @@ struct RunArgs {
     /// insn: Instructions retired (higher frequency — use larger timeslice).
     #[arg(long, value_enum, default_value_t = BreakOn::Rbc, requires = "preemptive")]
     break_on: BreakOn,
+
+    /// Preemption mechanism for mid-C-code preemption.
+    ///
+    /// pmu: Hardware PMU timer (default, nondeterministic due to skid).
+    /// e9patch: Software RBC via e9patch-instrumented .so (deterministic,
+    ///          debugger-compatible, requires _e9.so variant).
+    #[arg(long, value_enum, default_value_t = PreemptModeArg::Pmu, requires = "preemptive")]
+    preempt_mode: PreemptModeArg,
 
     /// List available schedulers and exit.
     #[arg(long)]
@@ -314,6 +341,7 @@ fn run(args: &RunArgs) -> Result<(), String> {
             timeslice_max: args.timeslice_max,
             cooperative_only: false,
             break_on: args.break_on.to_pmu_event(),
+            preempt_mode: args.preempt_mode.to_preempt_mode(),
         });
         scenario.interleave = true;
     }
@@ -514,6 +542,7 @@ fn replay_simulation(args: &ReplayArgs) -> Result<(), String> {
             timeslice_max,
             cooperative_only: false,
             break_on: trace.break_on(),
+            preempt_mode: PreemptMode::Pmu,
         });
 
     for i in 0..nr_tasks {
@@ -588,10 +617,11 @@ fn replay_simulation(args: &ReplayArgs) -> Result<(), String> {
 
 fn run_determinism_check(args: &RunArgs, scenario: Scenario) -> Result<(), String> {
     let _lock = SIM_LOCK.lock().unwrap();
+    let use_e9 = args.preemptive && args.preempt_mode == PreemptModeArg::E9patch;
 
     // Run 1: collect checkpoints
     enable_determinism_mode();
-    let sched1 = load_scheduler(&args.scheduler, args.cpus)?;
+    let sched1 = load_scheduler(&args.scheduler, args.cpus, use_e9)?;
     let trace1 = Simulator::new(sched1).run(scenario.clone());
     let checkpoints1 = drain_determinism_checkpoints();
 
@@ -604,7 +634,7 @@ fn run_determinism_check(args: &RunArgs, scenario: Scenario) -> Result<(), Strin
 
     // Run 2: collect checkpoints with same configuration
     enable_determinism_mode();
-    let sched2 = load_scheduler(&args.scheduler, args.cpus)?;
+    let sched2 = load_scheduler(&args.scheduler, args.cpus, use_e9)?;
     let trace2 = Simulator::new(sched2).run(scenario);
     let checkpoints2 = drain_determinism_checkpoints();
 
@@ -690,7 +720,8 @@ fn print_determinism_failure(
 }
 
 fn run_simulation(args: &RunArgs, scenario: Scenario) -> Result<(), String> {
-    let sched = load_scheduler(&args.scheduler, args.cpus)?;
+    let use_e9 = args.preemptive && args.preempt_mode == PreemptModeArg::E9patch;
+    let sched = load_scheduler(&args.scheduler, args.cpus, use_e9)?;
     let _lock = SIM_LOCK.lock().unwrap();
 
     // Capture .so base address BEFORE the simulation runs. The scheduler
@@ -774,11 +805,18 @@ fn run_simulation(args: &RunArgs, scenario: Scenario) -> Result<(), String> {
     Ok(())
 }
 
-fn load_scheduler(name: &str, nr_cpus: u32) -> Result<DynamicScheduler, String> {
+fn load_scheduler(name: &str, nr_cpus: u32, e9patch: bool) -> Result<DynamicScheduler, String> {
     let dir = env!("SCHEDULER_SO_DIR");
-    let so_path = format!("{dir}/libscx_{name}.so");
+    let suffix = if e9patch { "_e9" } else { "" };
+    let so_path = format!("{dir}/libscx_{name}{suffix}.so");
     if Path::new(&so_path).exists() {
         Ok(DynamicScheduler::load(&so_path, name, nr_cpus))
+    } else if e9patch {
+        Err(format!(
+            "e9patch scheduler variant not found: {so_path}\n\
+             Build with: make -C schedulers e9\n\
+             (requires e9tool: third_party/e9patch/e9tool)"
+        ))
     } else {
         Err(format!(
             "unknown scheduler {name:?}; use --list-schedulers to see available schedulers"

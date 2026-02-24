@@ -251,6 +251,9 @@ pub struct SimulatorState {
     /// round would reset cursors to index 0, causing targets from all
     /// rounds to be replayed from the beginning every time.
     pub(crate) replay_backend: Option<crate::backend::replay::ReplayBackend>,
+    /// Resolved e9patch C trampoline function pointers (from the loaded `.so`).
+    /// Set during `Simulator::run()` when e9patch mode is active.
+    pub(crate) e9_fns: Option<crate::backend::e9patch::E9PatchFns>,
     /// Per-CPU structop accumulators that persist across dispatch rounds.
     /// Indexed by CpuId.0. Seeded into worker thread-locals at the start
     /// of each dispatch round and drained back at the end.
@@ -1759,6 +1762,7 @@ mod tests {
             preemptive: None,
             replay_trace: None,
             replay_backend: None,
+            e9_fns: None,
             structop_accum: vec![crate::preempt::StructopInfo::default(); nr_cpus as usize],
             in_concurrent_batch: false,
         }

@@ -5,6 +5,8 @@ bpf_trace.log
 .vscode-ctags
 bug_finding/output/
 __pycache__/
+third_party/
+csrc/e9_rbc_trampoline
 
 # Allow Claude agent definitions to be tracked
 !.claude/
