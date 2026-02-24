@@ -167,7 +167,15 @@ $(foreach s,$(SCHEDS),$(eval $(call RBC_TRAMPOLINE_RULE,$(s))))
 $(foreach s,$(SCHEDS),$(eval $(call SO_RULE,$(s))))
 
 # --- e9patch post-processing ---
-# Instrument Jcc instructions with a software RBC counter trampoline.
+# Instrument all conditional branches with a software RBC counter trampoline.
+#
+# The e9tool 'jcc' matcher covers all instructions that increment the PMU's
+# BR_INST_RETIRED.COND counter (Zydis COND_BR category):
+#   - Jcc (JE, JNE, JG, JL, JA, JB, etc.) — the common case
+#   - LOOP, LOOPE/LOOPZ, LOOPNE/LOOPNZ — legacy loop instructions
+#   - JCXZ, JECXZ, JRCXZ — counter-register conditional jumps
+# Modern compilers never emit LOOP/JRCXZ (confirmed: 0 instances across
+# all scheduler .so files), but the matcher handles them for correctness.
 #
 # The trampoline binary is compiled with e9compile.sh from e9patch. It uses
 # dlsym to resolve E9_SHARED_RBC (shared state struct in the main binary) and
