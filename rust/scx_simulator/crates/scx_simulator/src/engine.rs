@@ -836,7 +836,13 @@ impl<S: Scheduler> Simulator<S> {
         // need dispatch, and the worker count varies. Extra workers beyond the
         // trace's worker count get empty cursors (no targets to replay).
         if let Some(ref trace) = state.replay_trace {
-            state.replay_backend = Some(ReplayBackend::new(trace, nr_cpus as usize));
+            let (ts_min, ts_max) = state
+                .preemptive
+                .as_ref()
+                .map(|cfg| (cfg.timeslice_min, cfg.timeslice_max))
+                .unwrap_or((100, 500));
+            state.replay_backend =
+                Some(ReplayBackend::new(trace, nr_cpus as usize, ts_min, ts_max));
         }
 
         // Set CPU ID width for log formatting

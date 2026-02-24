@@ -1214,6 +1214,10 @@ struct PreemptCtx {
     /// Timeslice range for re-arming the timer after preemption.
     timeslice_min: u64,
     timeslice_max: u64,
+    /// When true, `rearm_timer` just re-enables the timer without resetting
+    /// or changing the period. Used by the replay backend, where the timer
+    /// period is set by the replay engine (not random timeslices).
+    replay_mode: bool,
 }
 
 // Raw pointer is Send — access serialized by token passing.
@@ -1240,6 +1244,7 @@ pub fn install(
             measure_fd,
             timeslice_min,
             timeslice_max,
+            replay_mode: false,
         }));
     });
 }
@@ -1247,6 +1252,36 @@ pub fn install(
 /// Remove preemptive interleave context from the current thread.
 pub fn uninstall() {
     PREEMPT_CTX.with(|c| c.set(None));
+}
+
+/// Install preemptive interleave context for replay mode.
+///
+/// Like [`install`], but sets `replay_mode = true` so that `rearm_timer`
+/// just re-enables the timer without resetting or changing the period.
+/// The replay backend manages the timer period directly via
+/// [`arm_replay_timer_pub`].
+///
+/// `timeslice_min` and `timeslice_max` must match the recording scenario's
+/// values to keep the PRNG consumption in sync with the recording run.
+/// Also sets `measure_fd = -1` (replay doesn't use a measurement counter).
+pub fn install_replay_preempt(
+    ring: &PreemptRing,
+    worker_id: WorkerId,
+    timer_fd: RawFd,
+    timeslice_min: u64,
+    timeslice_max: u64,
+) {
+    PREEMPT_CTX.with(|c| {
+        c.set(Some(PreemptCtx {
+            ring: ring as *const PreemptRing,
+            worker_id,
+            timer_fd,
+            measure_fd: -1,
+            timeslice_min,
+            timeslice_max,
+            replay_mode: true,
+        }));
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1713,13 +1748,30 @@ fn enable_measurement(fd: RawFd) {
 }
 
 /// Re-arm the PMU timer with a fresh random timeslice.
+///
+/// In replay mode, resets the counter and re-enables (keeping the existing
+/// period from `arm_replay_timer`). This mirrors the recording's behavior
+/// where `resume_timer` resets the counter at each kfunc return — the
+/// recorded `rbc_count` measures branches from the last reset, so replay
+/// must reset at the same points.
 fn rearm_timer(ring: &PreemptRing, ctx: &PreemptCtx) {
     let fd = ctx.timer_fd;
     if fd < 0 {
         return;
     }
-    let timeslice = ring.roll_timeslice(ctx.timeslice_min, ctx.timeslice_max);
-    let mut period = timeslice;
+    // Always consume the PRNG to keep token-passing deterministic.
+    let _timeslice = ring.roll_timeslice(ctx.timeslice_min, ctx.timeslice_max);
+    if ctx.replay_mode {
+        // Replay mode: reset counter to zero (matching the recording's
+        // resume_timer behavior), keep the existing period from
+        // arm_replay_timer, and re-enable.
+        unsafe {
+            libc::ioctl(fd, scx_perf::PERF_IOC_RESET, 0 as libc::c_ulong);
+            libc::ioctl(fd, scx_perf::PERF_IOC_ENABLE, 0 as libc::c_ulong);
+        }
+        return;
+    }
+    let mut period = _timeslice;
     unsafe {
         // Reset counter to zero.
         libc::ioctl(fd, scx_perf::PERF_IOC_RESET, 0 as libc::c_ulong);
