@@ -272,6 +272,18 @@ extern unsigned long long sim_bpf_ktime_get_ns(void);
 #define bpf_ktime_get_ns() sim_bpf_ktime_get_ns()
 
 /*
+ * bpf_get_prandom_u32 override.
+ *
+ * In BPF, this is a helper returning a pseudo-random u32.
+ * overrides.h stubs it to 0, but the simulator has a deterministic
+ * PRNG in the Rust engine. Route to it so scheduler code that
+ * uses randomness exercises real (deterministic) random paths.
+ */
+extern unsigned int sim_bpf_get_prandom_u32(void);
+#undef bpf_get_prandom_u32
+#define bpf_get_prandom_u32() sim_bpf_get_prandom_u32()
+
+/*
  * BPF_PROG override for tracepoint/fentry programs.
  *
  * BPF_PROG from bpf_tracing.h uses ___bpf_ctx_cast and
