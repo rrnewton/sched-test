@@ -139,9 +139,10 @@ fn main() {
     println!("cargo:rustc-link-arg=-Wl,--undefined=scx_task_free");
     println!("cargo:rustc-link-arg=-Wl,--undefined=scx_arena_subprog_init");
 
-    // Force e9_preempt_yield into the binary so the e9patch-instrumented
-    // .so files can resolve it via -rdynamic.
+    // Force e9_preempt_yield and E9_SHARED_RBC into the binary so the
+    // e9patch-instrumented .so files can resolve them via -rdynamic.
     println!("cargo:rustc-link-arg=-Wl,--undefined=e9_preempt_yield");
+    println!("cargo:rustc-link-arg=-Wl,--undefined=E9_SHARED_RBC");
 
     // Link the clang profile runtime when coverage is enabled.
     // This provides __llvm_profile_* symbols for the instrumented .so files.
