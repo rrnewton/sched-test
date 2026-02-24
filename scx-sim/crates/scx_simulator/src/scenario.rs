@@ -490,6 +490,12 @@ pub struct Scenario {
     /// random PMU timeslices, enabling exact reproduction of preemption
     /// points via hardware breakpoints.
     pub replay_trace: Option<crate::preempt::trace::PreemptionTrace>,
+    /// Skip PMU timer in replay mode, using hardware breakpoint stepping only.
+    ///
+    /// When true, replay arms the hardware breakpoint directly at each
+    /// target instruction pointer and checks the RBC count on every hit
+    /// to find the right dynamic instance. Slower but deterministic.
+    pub no_pmu_signal: bool,
     /// Maximum number of cgroups that can have BPF map entries allocated.
     ///
     /// This simulates BPF hash map capacity limits. In production LAVD,
@@ -527,6 +533,7 @@ pub struct ScenarioBuilder {
     interleave: bool,
     preemptive: Option<PreemptiveConfig>,
     replay_trace: Option<crate::preempt::trace::PreemptionTrace>,
+    no_pmu_signal: bool,
     max_cgroups: u32,
     irq_events: Vec<IrqEvent>,
 }
@@ -556,6 +563,7 @@ impl Scenario {
             interleave: false,
             preemptive: None,
             replay_trace: None,
+            no_pmu_signal: false,
             max_cgroups: DEFAULT_MAX_CGROUPS,
             irq_events: Vec::new(),
         }
@@ -1067,6 +1075,7 @@ impl ScenarioBuilder {
             interleave: self.interleave,
             preemptive: self.preemptive,
             replay_trace: self.replay_trace,
+            no_pmu_signal: self.no_pmu_signal,
             max_cgroups: self.max_cgroups,
             irq_events: self.irq_events,
         }

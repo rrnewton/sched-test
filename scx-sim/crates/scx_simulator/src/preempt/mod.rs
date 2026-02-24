@@ -1971,6 +1971,17 @@ impl ReplayCursor {
     pub fn overhead(&self) -> u64 {
         self.total_overhead.load(SeqCst)
     }
+
+    /// Clone the target list (for creating reset copies of cursors).
+    pub fn clone_targets(&self) -> Vec<PreemptionRecord> {
+        self.targets.clone()
+    }
+
+    /// Reset the cursor to the beginning (for retry logic).
+    pub fn reset(&self) {
+        self.next_idx.store(0, SeqCst);
+        self.total_overhead.store(0, SeqCst);
+    }
 }
 
 /// Thread-local context for a worker in REPLAY mode.
@@ -2111,10 +2122,34 @@ fn arm_breakpoint(bp_fd: RawFd, addr: u64) {
     }
 }
 
+/// Whether the PMU-skid warning has been shown during this replay run.
+///
+/// Set to `true` after the first PMU signal handler invocation so the
+/// warning prints at most once per replay run.
+static REPLAY_PMU_WARNING_SHOWN: AtomicBool = AtomicBool::new(false);
+
+/// Set by `replay_pmu_handler` when PMU skid overshoots the target RBC.
+///
+/// The outer retry loop in the replay dispatch code checks this flag
+/// after each dispatch round completes. When set, the round's results
+/// are discarded and retried (up to the configured attempt limits).
+pub static REPLAY_OVERSHOT: AtomicBool = AtomicBool::new(false);
+
+/// Reset replay overshoot / warning state for a new replay attempt.
+///
+/// Call before each retry in the outer replay loop.
+pub fn reset_replay_state() {
+    REPLAY_PMU_WARNING_SHOWN.store(false, SeqCst);
+    REPLAY_OVERSHOT.store(false, SeqCst);
+}
+
 /// PMU signal handler for replay mode (SIGSTKFLT).
 ///
 /// Fires when we're within REPLAY_MARGIN branches of the target. Arms
 /// the hardware breakpoint at the target's instruction pointer.
+///
+/// Emits a one-time warning about non-deterministic PMU skid and detects
+/// overshoot conditions where the PMU fires past the target RBC.
 ///
 /// All operations are async-signal-safe.
 extern "C" fn replay_pmu_handler(
@@ -2131,6 +2166,18 @@ extern "C" fn replay_pmu_handler(
     // 1. Disable PMU timer to prevent recursive signals.
     disable_timer(rctx.timer_fd);
 
+    // 1a. One-time warning about non-deterministic PMU skid.
+    if !REPLAY_PMU_WARNING_SHOWN.swap(true, SeqCst) {
+        let mut buf = [0u8; 256];
+        let mut w = StackWriter::new(&mut buf);
+        let _ = writeln!(
+            w,
+            "WARNING: replay using PMU signal approach — non-deterministic skid may \
+             cause overshoot. Use --no-pmu-signal for guaranteed determinism.",
+        );
+        write_stderr(w.as_bytes());
+    }
+
     // 2. Look up the next target from the cursor.
     let cursor = unsafe { &*rctx.cursor };
     let target = match cursor.current_target() {
@@ -2138,10 +2185,30 @@ extern "C" fn replay_pmu_handler(
         None => return, // No more targets.
     };
 
-    // 3. Arm the hardware breakpoint at the target instruction pointer.
+    // 3. Read current RBC count and check for overshoot.
+    let current_rbc = read_rbc_count(rctx.timer_fd);
+    if current_rbc > target.rbc_count {
+        // PMU skid overshot the target. Mark the overshoot flag and
+        // return without arming the breakpoint. The outer retry loop
+        // will detect this and retry the dispatch round.
+        REPLAY_OVERSHOT.store(true, SeqCst);
+        let mut buf = [0u8; 256];
+        let mut w = StackWriter::new(&mut buf);
+        let _ = writeln!(
+            w,
+            "REPLAY OVERSHOOT: PMU skid overshot target \
+             (current_rbc={} > target_rbc={} at seq={}). \
+             This replay attempt is corrupted.",
+            current_rbc, target.rbc_count, target.sequence,
+        );
+        write_stderr(w.as_bytes());
+        return;
+    }
+
+    // 4. Arm the hardware breakpoint at the target instruction pointer.
     arm_breakpoint(rctx.bp_fd, target.instruction_pointer);
 
-    // 4. Return from signal handler — execution resumes with breakpoint armed.
+    // 5. Return from signal handler — execution resumes with breakpoint armed.
 }
 
 /// Validate structop name and count match between trace and replay.
@@ -2247,6 +2314,19 @@ extern "C" fn replay_bp_handler(
         None => return,
     };
 
+    // 2a. RBC count check for breakpoint-only mode.
+    //
+    // In breakpoint-only mode (no PMU timer), the breakpoint fires on
+    // every execution of the target instruction. We check the RBC count
+    // to find the right dynamic instance. If the current count is below
+    // the target, re-enable the breakpoint and return.
+    let current_rbc = read_rbc_count(rctx.timer_fd);
+    if current_rbc < target.rbc_count {
+        // Not the right instance yet — re-enable breakpoint and return.
+        arm_breakpoint(rctx.bp_fd, target.instruction_pointer);
+        return;
+    }
+
     // 3. Save SimulatorState context.
     let sim_ptr = match crate::kfuncs::sim_state_ptr() {
         Some(p) => p,
@@ -2289,12 +2369,62 @@ extern "C" fn replay_bp_handler(
         (*sim_ptr).waker_task_raw = saved_waker;
     }
 
-    // 7. Advance cursor and arm timer for next target.
+    // 7. Advance cursor and arm timer/breakpoint for next target.
     if cursor.advance() {
         if let Some(next) = cursor.current_target() {
-            arm_replay_timer(rctx.timer_fd, next.rbc_count);
+            arm_replay_next_target(rctx.timer_fd, rctx.bp_fd, next);
         }
     }
+}
+
+/// Arm the next replay target using either PMU timer or breakpoint-only mode.
+///
+/// In normal (PMU) mode: arms the PMU timer to fire at
+/// `target_rbc - REPLAY_MARGIN`. In breakpoint-only mode (timer_fd < 0):
+/// arms the breakpoint directly at the target instruction pointer.
+fn arm_replay_next_target(timer_fd: RawFd, bp_fd: RawFd, target: &PreemptionRecord) {
+    if timer_fd >= 0 {
+        arm_replay_timer(timer_fd, target.rbc_count);
+    } else {
+        arm_breakpoint(bp_fd, target.instruction_pointer);
+    }
+}
+
+/// Install replay signal handlers for breakpoint-only mode.
+///
+/// Installs only the breakpoint handler (SIGTRAP). No PMU signal handler
+/// is installed since breakpoint-only mode does not use the PMU timer.
+pub fn install_replay_bp_only_handlers() {
+    // Breakpoint handler: fires on every execution of the target instruction.
+    let sa_bp = libc::sigaction {
+        sa_sigaction: replay_bp_handler as *const () as libc::sighandler_t,
+        sa_mask: unsafe { std::mem::zeroed() },
+        sa_flags: libc::SA_SIGINFO | libc::SA_RESTART,
+        sa_restorer: None,
+    };
+    let ret = unsafe { libc::sigaction(REPLAY_BP_SIGNAL, &sa_bp, std::ptr::null_mut()) };
+    assert_eq!(ret, 0, "failed to install replay breakpoint handler");
+}
+
+/// Remove the replay breakpoint-only signal handler.
+pub fn uninstall_replay_bp_only_handlers() {
+    let sa_default = libc::sigaction {
+        sa_sigaction: libc::SIG_DFL,
+        sa_mask: unsafe { std::mem::zeroed() },
+        sa_flags: 0,
+        sa_restorer: None,
+    };
+    unsafe {
+        libc::sigaction(REPLAY_BP_SIGNAL, &sa_default, std::ptr::null_mut());
+    }
+}
+
+/// Arm a hardware breakpoint directly for breakpoint-only replay mode.
+///
+/// Public wrapper for the backend to arm the first target without using
+/// the PMU timer.
+pub fn arm_replay_breakpoint_pub(bp_fd: RawFd, addr: u64) {
+    arm_breakpoint(bp_fd, addr);
 }
 
 // ---------------------------------------------------------------------------
