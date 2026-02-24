@@ -2,14 +2,14 @@
 
 use std::path::{Path, PathBuf};
 
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 
 use scx_simulator::scenario::{parse_duration_ns, parse_seed};
 use scx_simulator::{
     compare_checkpoints, discover_schedulers, drain_determinism_checkpoints,
     drain_preemption_records, enable_determinism_mode, enable_preemption_collection, load_rtapp,
-    scheduler_so_base, DynamicScheduler, PmuEvent, PreemptionTrace, PreemptiveConfig, SimFormat,
-    Simulator, TraceMetadata, TraceStats, SIM_LOCK,
+    scheduler_so_base, DynamicScheduler, Phase, PmuEvent, PreemptionTrace, PreemptiveConfig,
+    RepeatMode, Scenario, SimFormat, Simulator, TaskBehavior, TraceMetadata, TraceStats, SIM_LOCK,
 };
 
 mod real_run;
@@ -44,10 +44,25 @@ impl BreakOn {
     }
 }
 
-/// Run sched_ext scheduler simulations from rt-app workloads.
+/// sched_ext simulator.
 #[derive(Parser)]
-#[command(name = "scxsim")]
+#[command(name = "scxsim", about = "sched_ext simulator")]
 struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Run a simulation from an rt-app workload.
+    Run(RunArgs),
+    /// Replay a recorded preemption trace.
+    Replay(ReplayArgs),
+}
+
+/// Arguments for the `run` subcommand.
+#[derive(Parser)]
+struct RunArgs {
     /// Path to an rt-app JSON workload file.
     workload: Option<PathBuf>,
 
@@ -207,14 +222,6 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     record_preemptions: Option<PathBuf>,
 
-    /// Replay preemption points from a recorded trace file.
-    ///
-    /// Reads a preemption trace (produced by --record-preemptions) and
-    /// replays the exact preemption points using a hybrid PMU + hardware
-    /// breakpoint approach for deterministic reproduction.
-    #[arg(long, value_name = "PATH", requires = "preemptive")]
-    replay_preemptions: Option<PathBuf>,
-
     /// Print detailed per-task and per-CPU statistics after simulation.
     ///
     /// By default, only a brief trace summary is printed. This flag
@@ -224,23 +231,47 @@ struct Cli {
     verbose_summary: bool,
 }
 
+/// Arguments for the `replay` subcommand.
+#[derive(Parser)]
+struct ReplayArgs {
+    /// Path to a preemption trace file (produced by `run --record-preemptions`).
+    trace_file: PathBuf,
+
+    /// Path to the scheduler .so to load.
+    #[arg(long)]
+    scheduler: PathBuf,
+
+    /// Print detailed per-task and per-CPU statistics after simulation.
+    #[arg(long)]
+    verbose_summary: bool,
+
+    /// Re-record preemption points during replay to a new trace file.
+    #[arg(long, value_name = "PATH")]
+    record_preemptions: Option<PathBuf>,
+}
+
 fn main() {
     let cli = Cli::parse();
     init_tracing();
 
-    if let Err(e) = run(&cli) {
+    let result = match cli.command {
+        Command::Run(args) => run(&args),
+        Command::Replay(args) => replay_simulation(&args),
+    };
+
+    if let Err(e) = result {
         eprintln!("error: {e}");
         std::process::exit(1);
     }
 }
 
-fn run(cli: &Cli) -> Result<(), String> {
-    if cli.list_schedulers {
+fn run(args: &RunArgs) -> Result<(), String> {
+    if args.list_schedulers {
         list_schedulers();
         return Ok(());
     }
 
-    let workload_path = cli
+    let workload_path = args
         .workload
         .as_ref()
         .ok_or("missing required argument: <WORKLOAD>")?;
@@ -249,93 +280,259 @@ fn run(cli: &Cli) -> Result<(), String> {
         .map_err(|e| format!("failed to read {}: {e}", workload_path.display()))?;
 
     let mut scenario =
-        load_rtapp(&json, cli.cpus).map_err(|e| format!("failed to parse workload: {e}"))?;
+        load_rtapp(&json, args.cpus).map_err(|e| format!("failed to parse workload: {e}"))?;
 
     // Override scenario fields from CLI flags.
-    scenario.smt_threads_per_core = cli.smt;
-    if cli.no_noise {
+    scenario.smt_threads_per_core = args.smt;
+    if args.no_noise {
         scenario.noise.enabled = false;
     }
-    if cli.no_overhead {
+    if args.no_overhead {
         scenario.overhead.enabled = false;
     }
-    if let Some(ref seed_str) = cli.seed {
+    if let Some(ref seed_str) = args.seed {
         scenario.seed = parse_seed(Some(seed_str));
     }
-    if cli.fixed_priority {
+    if args.fixed_priority {
         scenario.fixed_priority = true;
     }
-    if cli.interleave {
+    if args.interleave {
         scenario.interleave = true;
     }
-    if cli.preemptive {
+    if args.preemptive {
         scenario.preemptive = Some(PreemptiveConfig {
-            timeslice_min: cli.timeslice_min,
-            timeslice_max: cli.timeslice_max,
+            timeslice_min: args.timeslice_min,
+            timeslice_max: args.timeslice_max,
             cooperative_only: false,
-            break_on: cli.break_on.to_pmu_event(),
+            break_on: args.break_on.to_pmu_event(),
         });
         scenario.interleave = true;
     }
-    if let Some(ref end_time) = cli.end_time {
+    if let Some(ref end_time) = args.end_time {
         scenario.duration_ns =
             parse_duration_ns(end_time).map_err(|e| format!("--end-time: {e}"))?;
     }
-    if let Some(rbc_ns) = cli.rbc_ns {
+    if let Some(rbc_ns) = args.rbc_ns {
         scenario.sched_overhead_rbc_ns = Some(rbc_ns);
     }
-    if cli.no_rbc {
+    if args.no_rbc {
         scenario.sched_overhead_rbc_ns = Some(0);
     }
-    if let Some(ref timeout) = cli.watchdog_timeout {
+    if let Some(ref timeout) = args.watchdog_timeout {
         scenario.watchdog_timeout_ns =
             Some(parse_duration_ns(timeout).map_err(|e| format!("--watchdog-timeout: {e}"))?);
     }
 
     // Validate --wprof and --bpf-trace require --real-run vm
-    if cli.wprof && cli.real_run != RealRunMode::Vm {
+    if args.wprof && args.real_run != RealRunMode::Vm {
         return Err("--wprof requires --real-run vm".into());
     }
-    if cli.bpf_trace && cli.real_run != RealRunMode::Vm {
+    if args.bpf_trace && args.real_run != RealRunMode::Vm {
         return Err("--bpf-trace requires --real-run vm".into());
     }
 
     // Determine trace mode
-    let trace_mode = if cli.wprof {
+    let trace_mode = if args.wprof {
         real_run::TraceMode::Wprof
-    } else if cli.bpf_trace {
+    } else if args.bpf_trace {
         real_run::TraceMode::BpfTrace
     } else {
         real_run::TraceMode::None
     };
 
     // Handle --determinism-check mode
-    if cli.determinism_check {
-        if cli.real_run != RealRunMode::Off {
+    if args.determinism_check {
+        if args.real_run != RealRunMode::Off {
             return Err("--determinism-check conflicts with --real-run".into());
         }
-        return run_determinism_check(cli, scenario);
+        return run_determinism_check(args, scenario);
     }
 
     // Handle --real-run mode
-    match cli.real_run {
+    match args.real_run {
         RealRunMode::Off => {
-            run_simulation(cli, scenario)?;
+            run_simulation(args, scenario)?;
         }
         RealRunMode::Vm => {
-            real_run::run_vm(workload_path, &cli.scheduler, cli.cpus, trace_mode)?;
+            real_run::run_vm(workload_path, &args.scheduler, args.cpus, trace_mode)?;
         }
     }
 
     Ok(())
 }
 
-fn run_determinism_check(cli: &Cli, scenario: scx_simulator::Scenario) -> Result<(), String> {
+/// Extract the scheduler prefix from a .so path.
+///
+/// Given a path like `/path/to/libscx_simple.so`, returns `"simple"`.
+/// Panics if the filename does not match the `libscx_<name>.so` pattern.
+fn scheduler_prefix_from_path(path: &Path) -> String {
+    let filename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_else(|| panic!("invalid scheduler path: {}", path.display()));
+    filename
+        .strip_prefix("libscx_")
+        .and_then(|s| s.strip_suffix(".so"))
+        .unwrap_or_else(|| {
+            panic!("scheduler .so filename must match libscx_<name>.so, got: {filename}")
+        })
+        .to_string()
+}
+
+fn replay_simulation(args: &ReplayArgs) -> Result<(), String> {
+    use std::io::BufReader;
+
+    // Load the scheduler .so first so scheduler_so_base() works.
+    let scheduler_path = &args.scheduler;
+    let prefix = scheduler_prefix_from_path(scheduler_path);
+    let so_path_str = scheduler_path.to_str().unwrap_or_else(|| {
+        panic!(
+            "scheduler path is not valid UTF-8: {}",
+            scheduler_path.display()
+        )
+    });
+
+    // Load the trace file.
+    let file = std::fs::File::open(&args.trace_file)
+        .map_err(|e| format!("cannot open trace file {}: {e}", args.trace_file.display()))?;
+
+    // We need the so_base for ASLR-resilient RIP reconstruction, but the .so
+    // must be loaded first. Load the scheduler, capture so_base, then deserialize.
+    // Peek at trace metadata first (nr_cpus) to know how many CPUs the scheduler needs.
+    // We deserialize with so_base=0 initially, read metadata, then re-deserialize
+    // after loading the scheduler with the correct nr_cpus.
+    let mut reader = BufReader::new(file);
+    let pre_trace = PreemptionTrace::deserialize(&mut reader, 0)
+        .map_err(|e| format!("failed to parse trace file: {e}"))?;
+
+    let metadata = pre_trace.metadata();
+
+    // Extract required metadata fields, panicking on missing values.
+    let nr_cpus = metadata
+        .nr_cpus
+        .unwrap_or_else(|| panic!("trace file missing required metadata: nr_cpus"));
+    let nr_tasks = metadata
+        .nr_tasks
+        .unwrap_or_else(|| panic!("trace file missing required metadata: nr_tasks"));
+    let seed = metadata
+        .seed
+        .unwrap_or_else(|| panic!("trace file missing required metadata: seed"));
+    let duration_ns = metadata
+        .duration_ns
+        .unwrap_or_else(|| panic!("trace file missing required metadata: duration_ns"));
+    let timeslice_min = metadata
+        .timeslice_min
+        .unwrap_or_else(|| panic!("trace file missing required metadata: timeslice_min"));
+    let timeslice_max = metadata
+        .timeslice_max
+        .unwrap_or_else(|| panic!("trace file missing required metadata: timeslice_max"));
+
+    // Now load the scheduler with the correct nr_cpus.
+    let sched = DynamicScheduler::load(so_path_str, &prefix, nr_cpus);
+    let _lock = SIM_LOCK.lock().unwrap();
+    let so_base = scheduler_so_base();
+
+    // Re-deserialize the trace with the correct so_base for ASLR-resilient RIP.
+    let file2 = std::fs::File::open(&args.trace_file)
+        .map_err(|e| format!("cannot open trace file {}: {e}", args.trace_file.display()))?;
+    let mut reader2 = BufReader::new(file2);
+    let trace = PreemptionTrace::deserialize(&mut reader2, so_base)
+        .map_err(|e| format!("failed to parse trace file: {e}"))?;
+
+    eprintln!(
+        "replay: loaded {} preemption points for {} workers from {}",
+        trace.len(),
+        trace.num_workers(),
+        args.trace_file.display()
+    );
+
+    // Build a scenario from trace metadata with N identical compute tasks.
+    let compute_phase = Phase::Run(10_000_000);
+    let behavior = TaskBehavior {
+        phases: vec![compute_phase],
+        repeat: RepeatMode::Forever,
+    };
+
+    let mut builder = Scenario::builder()
+        .cpus(nr_cpus)
+        .seed(seed)
+        .duration_ns(duration_ns)
+        .preemptive(PreemptiveConfig {
+            timeslice_min,
+            timeslice_max,
+            cooperative_only: false,
+            break_on: trace.break_on(),
+        });
+
+    for i in 0..nr_tasks {
+        builder = builder.add_task(&format!("task-{i}"), 0, behavior.clone());
+    }
+
+    let mut scenario = builder.build();
+    scenario.replay_trace = Some(trace);
+
+    // Enable preemption recording if --record-preemptions is set.
+    if args.record_preemptions.is_some() {
+        enable_preemption_collection();
+    }
+
+    // Capture scenario metadata before the scenario is consumed by run().
+    let scenario_metadata = TraceMetadata {
+        nr_cpus: Some(scenario.nr_cpus),
+        nr_tasks: Some(scenario.tasks.len() as u32),
+        seed: Some(scenario.seed),
+        duration_ns: Some(scenario.duration_ns),
+        scheduler: Some(prefix.clone()),
+        timeslice_min: scenario.preemptive.as_ref().map(|p| p.timeslice_min),
+        timeslice_max: scenario.preemptive.as_ref().map(|p| p.timeslice_max),
+    };
+
+    let sim_trace = Simulator::new(sched).run(scenario);
+
+    // Record preemption trace if requested.
+    if let Some(path) = &args.record_preemptions {
+        let records = drain_preemption_records();
+        let num_workers = nr_cpus as usize;
+        let break_on_event = pre_trace.break_on();
+        let mut preemption_trace =
+            PreemptionTrace::from_records(&records, num_workers, break_on_event);
+        preemption_trace.set_metadata(scenario_metadata);
+
+        let mut file = std::fs::File::create(path)
+            .map_err(|e| format!("failed to create {}: {e}", path.display()))?;
+        preemption_trace
+            .serialize(&mut file, so_base)
+            .map_err(|e| format!("failed to write preemption trace: {e}"))?;
+        eprintln!(
+            "wrote {} preemption records to {}",
+            preemption_trace.len(),
+            path.display()
+        );
+    }
+
+    // Print simulation summary.
+    if args.verbose_summary {
+        let stats = TraceStats::from_trace(&sim_trace);
+        println!();
+        stats.print_summary();
+    } else {
+        println!();
+        println!("{}", sim_trace.summary());
+    }
+
+    if sim_trace.has_error() {
+        return Err(format!("simulation error: {:?}", sim_trace.exit_kind()));
+    }
+
+    Ok(())
+}
+
+fn run_determinism_check(args: &RunArgs, scenario: Scenario) -> Result<(), String> {
     let _lock = SIM_LOCK.lock().unwrap();
 
     // Run 1: collect checkpoints
     enable_determinism_mode();
-    let sched1 = load_scheduler(&cli.scheduler, cli.cpus)?;
+    let sched1 = load_scheduler(&args.scheduler, args.cpus)?;
     let trace1 = Simulator::new(sched1).run(scenario.clone());
     let checkpoints1 = drain_determinism_checkpoints();
 
@@ -348,7 +545,7 @@ fn run_determinism_check(cli: &Cli, scenario: scx_simulator::Scenario) -> Result
 
     // Run 2: collect checkpoints with same configuration
     enable_determinism_mode();
-    let sched2 = load_scheduler(&cli.scheduler, cli.cpus)?;
+    let sched2 = load_scheduler(&args.scheduler, args.cpus)?;
     let trace2 = Simulator::new(sched2).run(scenario);
     let checkpoints2 = drain_determinism_checkpoints();
 
@@ -361,7 +558,7 @@ fn run_determinism_check(cli: &Cli, scenario: scx_simulator::Scenario) -> Result
 
     // Compare checkpoints
     if let Some(divergence) = compare_checkpoints(&checkpoints1, &checkpoints2) {
-        print_determinism_failure(cli, &divergence, &checkpoints1, &checkpoints2);
+        print_determinism_failure(args, &divergence, &checkpoints1, &checkpoints2);
         return Err("determinism check failed".into());
     }
 
@@ -374,12 +571,12 @@ fn run_determinism_check(cli: &Cli, scenario: scx_simulator::Scenario) -> Result
 
 /// Print detailed determinism failure report.
 fn print_determinism_failure(
-    cli: &Cli,
+    args: &RunArgs,
     divergence: &scx_simulator::CheckpointDivergence,
     _checkpoints1: &[scx_simulator::DeterminismCheckpoint],
     _checkpoints2: &[scx_simulator::DeterminismCheckpoint],
 ) {
-    let seed = cli.seed.as_deref().unwrap_or("42");
+    let seed = args.seed.as_deref().unwrap_or("42");
     eprintln!("DETERMINISM FAILURE at seed {}:", seed);
     eprintln!(
         "  Divergence at checkpoint {} ({} event):",
@@ -433,8 +630,8 @@ fn print_determinism_failure(
     }
 }
 
-fn run_simulation(cli: &Cli, mut scenario: scx_simulator::Scenario) -> Result<(), String> {
-    let sched = load_scheduler(&cli.scheduler, cli.cpus)?;
+fn run_simulation(args: &RunArgs, scenario: Scenario) -> Result<(), String> {
+    let sched = load_scheduler(&args.scheduler, args.cpus)?;
     let _lock = SIM_LOCK.lock().unwrap();
 
     // Capture .so base address BEFORE the simulation runs. The scheduler
@@ -442,39 +639,8 @@ fn run_simulation(cli: &Cli, mut scenario: scx_simulator::Scenario) -> Result<()
     // must be called while the library is still mapped.
     let so_base = scheduler_so_base();
 
-    // Load replay trace if --replay-preemptions is set.
-    if let Some(ref path) = cli.replay_preemptions {
-        use std::io::BufReader;
-
-        let file = std::fs::File::open(path)
-            .map_err(|e| format!("--replay-preemptions: cannot open {}: {e}", path.display()))?;
-        let trace = PreemptionTrace::deserialize(&mut BufReader::new(file), so_base)
-            .map_err(|e| format!("--replay-preemptions: parse error: {e}"))?;
-        eprintln!(
-            "replay: loaded {} preemption points for {} workers from {}",
-            trace.len(),
-            trace.num_workers(),
-            path.display()
-        );
-
-        // Validate trace metadata against current scenario parameters.
-        // Mismatched parameters produce incorrect replay results.
-        let current_metadata = TraceMetadata {
-            nr_cpus: Some(scenario.nr_cpus),
-            nr_tasks: Some(scenario.tasks.len() as u32),
-            seed: Some(scenario.seed),
-            duration_ns: Some(scenario.duration_ns),
-            scheduler: Some(cli.scheduler.clone()),
-            timeslice_min: scenario.preemptive.as_ref().map(|p| p.timeslice_min),
-            timeslice_max: scenario.preemptive.as_ref().map(|p| p.timeslice_max),
-        };
-        trace.validate_metadata(&current_metadata);
-
-        scenario.replay_trace = Some(trace);
-    }
-
     // Enable preemption recording if --record-preemptions is set.
-    if cli.record_preemptions.is_some() {
+    if args.record_preemptions.is_some() {
         enable_preemption_collection();
     }
 
@@ -484,18 +650,18 @@ fn run_simulation(cli: &Cli, mut scenario: scx_simulator::Scenario) -> Result<()
         nr_tasks: Some(scenario.tasks.len() as u32),
         seed: Some(scenario.seed),
         duration_ns: Some(scenario.duration_ns),
-        scheduler: Some(cli.scheduler.clone()),
+        scheduler: Some(args.scheduler.clone()),
         timeslice_min: scenario.preemptive.as_ref().map(|p| p.timeslice_min),
         timeslice_max: scenario.preemptive.as_ref().map(|p| p.timeslice_max),
     };
 
     let trace = Simulator::new(sched).run(scenario);
 
-    if cli.dump_trace {
+    if args.dump_trace {
         trace.dump();
     }
 
-    if let Some(path) = &cli.perfetto {
+    if let Some(path) = &args.perfetto {
         let mut file = std::fs::File::create(path)
             .map_err(|e| format!("failed to create {}: {e}", path.display()))?;
         trace
@@ -505,11 +671,11 @@ fn run_simulation(cli: &Cli, mut scenario: scx_simulator::Scenario) -> Result<()
     }
 
     // Record preemption trace if requested.
-    if let Some(path) = &cli.record_preemptions {
+    if let Some(path) = &args.record_preemptions {
         let records = drain_preemption_records();
-        let num_workers = cli.cpus as usize;
+        let num_workers = args.cpus as usize;
         let mut preemption_trace =
-            PreemptionTrace::from_records(&records, num_workers, cli.break_on.to_pmu_event());
+            PreemptionTrace::from_records(&records, num_workers, args.break_on.to_pmu_event());
         preemption_trace.set_metadata(scenario_metadata);
 
         let mut file = std::fs::File::create(path)
@@ -525,7 +691,7 @@ fn run_simulation(cli: &Cli, mut scenario: scx_simulator::Scenario) -> Result<()
     }
 
     // Print simulation summary.
-    if cli.verbose_summary {
+    if args.verbose_summary {
         let stats = TraceStats::from_trace(&trace);
         println!();
         stats.print_summary();
