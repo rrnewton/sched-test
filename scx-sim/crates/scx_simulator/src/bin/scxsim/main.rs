@@ -248,6 +248,14 @@ struct ReplayArgs {
     /// Re-record preemption points during replay to a new trace file.
     #[arg(long, value_name = "PATH")]
     record_preemptions: Option<PathBuf>,
+
+    /// Skip PMU timer and use hardware breakpoint stepping only.
+    ///
+    /// Slower but guarantees deterministic replay by avoiding PMU skid.
+    /// The breakpoint fires on every execution of the target instruction
+    /// and checks the RBC count to find the right dynamic instance.
+    #[arg(long)]
+    no_pmu_signal: bool,
 }
 
 fn main() {
@@ -480,6 +488,7 @@ fn replay_simulation(args: &ReplayArgs) -> Result<(), String> {
 
     let mut scenario = builder.build();
     scenario.replay_trace = Some(trace);
+    scenario.no_pmu_signal = args.no_pmu_signal;
 
     // Enable preemption recording if --record-preemptions is set.
     if args.record_preemptions.is_some() {

@@ -841,8 +841,13 @@ impl<S: Scheduler> Simulator<S> {
                 .as_ref()
                 .map(|cfg| (cfg.timeslice_min, cfg.timeslice_max))
                 .unwrap_or((100, 500));
-            state.replay_backend =
-                Some(ReplayBackend::new(trace, nr_cpus as usize, ts_min, ts_max));
+            state.replay_backend = Some(ReplayBackend::new(
+                trace,
+                nr_cpus as usize,
+                ts_min,
+                ts_max,
+                scenario.no_pmu_signal,
+            ));
         }
 
         // Set CPU ID width for log formatting
@@ -2937,7 +2942,7 @@ impl<S: Scheduler> Simulator<S> {
 
         if let Some(ref preemptive_cfg) = state.preemptive {
             if let Some(ref backend) = state.replay_backend {
-                crate::backend::run_preemptive_dispatch(
+                replay_dispatch_with_retry(
                     &dispatch_cpus,
                     &state_send,
                     &sched_send,
@@ -3709,4 +3714,97 @@ impl<S: Scheduler> Simulator<S> {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Replay dispatch with overshoot retry logic
+// ---------------------------------------------------------------------------
+
+/// Maximum number of PMU signal retry attempts before falling back to
+/// breakpoint-only mode.
+const REPLAY_PMU_MAX_RETRIES: u32 = 3;
+
+/// Maximum number of breakpoint-only retry attempts after PMU retries
+/// are exhausted.
+const REPLAY_BP_ONLY_MAX_RETRIES: u32 = 2;
+
+/// Run replay dispatch with automatic retry on PMU overshoot.
+///
+/// Uses a two-tier retry strategy:
+/// 1. Up to [`REPLAY_PMU_MAX_RETRIES`] attempts with the PMU signal approach
+/// 2. Up to [`REPLAY_BP_ONLY_MAX_RETRIES`] attempts with breakpoint-only mode
+///
+/// If all attempts fail, panics with a clear message.
+fn replay_dispatch_with_retry<S: Scheduler>(
+    dispatch_cpus: &[CpuId],
+    state_send: &SendPtr<SimulatorState>,
+    sched_send: &SendPtr<S>,
+    seed: u32,
+    backend: &ReplayBackend,
+) {
+    use crate::preempt::{reset_replay_state, REPLAY_OVERSHOT};
+    use std::sync::atomic::Ordering::SeqCst;
+
+    // If already in breakpoint-only mode, no retry needed for PMU overshoot.
+    if backend.no_pmu_signal() {
+        reset_replay_state();
+        crate::backend::run_preemptive_dispatch(
+            dispatch_cpus,
+            state_send,
+            sched_send,
+            seed,
+            backend,
+        );
+        return;
+    }
+
+    // Tier 1: PMU signal attempts.
+    for attempt in 1..=REPLAY_PMU_MAX_RETRIES {
+        reset_replay_state();
+        backend.reset_cursors();
+        crate::backend::run_preemptive_dispatch(
+            dispatch_cpus,
+            state_send,
+            sched_send,
+            seed,
+            backend,
+        );
+        if !REPLAY_OVERSHOT.load(SeqCst) {
+            return; // Success — no overshoot.
+        }
+        eprintln!(
+            "replay: PMU overshoot on attempt {attempt}/{REPLAY_PMU_MAX_RETRIES}, retrying..."
+        );
+    }
+
+    // Tier 2: breakpoint-only fallback.
+    eprintln!(
+        "replay: all {REPLAY_PMU_MAX_RETRIES} PMU attempts overshot, \
+         falling back to breakpoint-only mode"
+    );
+    let bp_backend = backend.with_bp_only();
+    for attempt in 1..=REPLAY_BP_ONLY_MAX_RETRIES {
+        reset_replay_state();
+        crate::backend::run_preemptive_dispatch(
+            dispatch_cpus,
+            state_send,
+            sched_send,
+            seed,
+            &bp_backend,
+        );
+        if !REPLAY_OVERSHOT.load(SeqCst) {
+            return; // Success.
+        }
+        eprintln!(
+            "replay: breakpoint-only overshoot on attempt \
+             {attempt}/{REPLAY_BP_ONLY_MAX_RETRIES}, retrying..."
+        );
+    }
+
+    let total = REPLAY_PMU_MAX_RETRIES + REPLAY_BP_ONLY_MAX_RETRIES;
+    panic!(
+        "replay: all {total} attempts failed due to overshoot. \
+         This should not happen in breakpoint-only mode — \
+         please report this as a bug."
+    );
 }
