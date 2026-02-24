@@ -6,6 +6,7 @@
 //! the generic [`run_preemptive_dispatch`] and [`run_preemptive_batch`]
 //! drivers handle the common worker lifecycle.
 
+pub mod e9patch;
 pub mod pmu;
 pub mod replay;
 

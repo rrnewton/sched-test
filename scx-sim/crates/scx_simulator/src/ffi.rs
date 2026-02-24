@@ -277,6 +277,14 @@ pub trait Scheduler {
     /// # Safety
     /// Calls into C code.
     unsafe fn cpu_offline(&self, _cpu: i32) {}
+
+    /// Resolve e9patch C trampoline function pointers from the loaded library.
+    ///
+    /// Returns `None` by default (no e9patch support). `DynamicScheduler`
+    /// overrides this to probe the loaded `.so` for the trampoline symbols.
+    fn resolve_e9_fns(&self) -> Option<crate::backend::e9patch::E9PatchFns> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -439,6 +447,7 @@ impl DynamicScheduler {
     pub unsafe fn get_symbol<T>(&self, name: &[u8]) -> Option<libloading::Symbol<'_, T>> {
         self._lib.get(name).ok()
     }
+
     /// Load a scheduler from a `.so` file.
     ///
     /// - `path`: path to the `.so` file
@@ -949,5 +958,9 @@ impl Scheduler for DynamicScheduler {
         if let Some(f) = self.ops.cpu_offline {
             f(cpu);
         }
+    }
+
+    fn resolve_e9_fns(&self) -> Option<crate::backend::e9patch::E9PatchFns> {
+        unsafe { crate::backend::e9patch::E9PatchFns::resolve(&self._lib) }
     }
 }

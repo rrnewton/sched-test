@@ -190,6 +190,17 @@ impl NoiseConfig {
     }
 }
 
+/// Which preemption mechanism to use for mid-C-code preemption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PreemptMode {
+    /// PMU hardware timer (near-zero overhead, nondeterministic due to skid).
+    #[default]
+    Pmu,
+    /// e9patch software RBC (deterministic, debugger-compatible, requires
+    /// `_e9.so` variant of the scheduler).
+    E9patch,
+}
+
 /// Configuration for preemptive interleaving via PMU timer signals.
 ///
 /// When enabled, dispatch callbacks are preempted at random PMU event
@@ -219,6 +230,8 @@ pub struct PreemptiveConfig {
     /// every conditional branch), so `timeslice_min`/`timeslice_max` may
     /// need to be larger to avoid excessive preemption overhead.
     pub break_on: PmuEvent,
+    /// Which preemption mechanism to use. Default: `Pmu`.
+    pub preempt_mode: PreemptMode,
 }
 
 impl Default for PreemptiveConfig {
@@ -228,6 +241,7 @@ impl Default for PreemptiveConfig {
             timeslice_max: 1,
             cooperative_only: false,
             break_on: PmuEvent::RetiredBranchConditional,
+            preempt_mode: PreemptMode::Pmu,
         }
     }
 }
