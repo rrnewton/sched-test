@@ -2605,6 +2605,14 @@ pub static mut E9_SHARED_RBC: E9SharedRbc = E9SharedRbc {
     ring_ptr: std::ptr::null_mut(),
 };
 
+// Atomic counter of e9_preempt_yield calls (for debugging).
+static E9_YIELD_CALL_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Read the e9_preempt_yield call count (for diagnostics).
+pub fn e9_yield_call_count() -> u64 {
+    E9_YIELD_CALL_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Called from the C trampoline (`rbc_trampoline()`) when the software RBC
 /// counter expires at an instrumented Jcc instruction.
 ///
@@ -2614,9 +2622,12 @@ pub static mut E9_SHARED_RBC: E9SharedRbc = E9SharedRbc {
 /// Returns a new timeslice for the C trampoline to load into `rbc_counter`.
 ///
 /// # Safety
+///
 /// `ring` must be a valid pointer to a `PreemptRing`.
 #[no_mangle]
 pub unsafe extern "C" fn e9_preempt_yield(ring: *const PreemptRing, worker_id: i32) -> u64 {
+    E9_YIELD_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
     let ring = unsafe { &*ring };
     let wid = WorkerId(worker_id as usize);
 
