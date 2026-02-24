@@ -14,7 +14,9 @@ use std::os::unix::io::RawFd;
 use tracing::debug;
 
 use crate::backend::pmu::setup_pmu_timer;
-use crate::backend::{PreemptionBackend, StructopDelta};
+use crate::backend::{
+    AbsoluteRbc, PreemptTarget, PreemptionBackend, RbcTarget, RelativeRbc, StructopDelta,
+};
 use crate::interleave::WorkerId;
 use crate::perf;
 use crate::preempt::trace::PreemptionTrace;
@@ -215,28 +217,58 @@ impl PreemptionBackend for ReplayBackend {
         }
     }
 
-    fn arm(&self, ctx: &mut ReplayWorkerCtx, ring: &PreemptRing) {
-        let cursor = &self.cursors[ctx.worker_idx];
-
+    fn build_target(&self, ctx: &ReplayWorkerCtx, ring: &PreemptRing) -> Option<PreemptTarget> {
         // Consume the PRNG to match the recording's PmuBackend::arm() which
-        // calls rearm_timer → roll_timeslice.  Without this, the PRNG
-        // sequences diverge and pick_next returns different worker IDs.
+        // calls roll_timeslice. Without this, the PRNG sequences diverge
+        // and pick_next returns different worker IDs.
         let _timeslice = ring.roll_timeslice(self.timeslice_min, self.timeslice_max);
 
-        if let Some(first) = cursor.current_target() {
-            if self.no_pmu_signal {
-                // Breakpoint-only mode: arm the HW breakpoint directly at
-                // the target RIP. The breakpoint handler checks the RBC
-                // count on each hit to find the right dynamic instance.
-                if ctx.bp_fd >= 0 {
-                    preempt::arm_replay_breakpoint_pub(ctx.bp_fd, first.instruction_pointer);
-                }
-            } else {
+        let cursor = &self.cursors[ctx.worker_idx];
+        let first = cursor.current_target()?;
+
+        if self.no_pmu_signal {
+            // Breakpoint-only mode: use a relative count of 0 (the
+            // breakpoint handler checks RBC on each hit). The target
+            // RIP is the instruction pointer from the recorded trace.
+            Some(PreemptTarget {
+                count_rbc: RbcTarget::Relative(RelativeRbc(0)),
+                target_rip: Some(first.instruction_pointer),
+            })
+        } else {
+            // Normal mode: use the absolute structop RBC count from
+            // the recorded trace. The PMU timer fires near this count,
+            // then the breakpoint catches the exact RIP.
+            Some(PreemptTarget {
+                count_rbc: RbcTarget::Absolute(AbsoluteRbc(first.structop_rbc)),
+                target_rip: Some(first.instruction_pointer),
+            })
+        }
+    }
+
+    fn arm(&self, ctx: &mut ReplayWorkerCtx, target: PreemptTarget) {
+        match target.count_rbc {
+            RbcTarget::Absolute(AbsoluteRbc(structop_rbc)) => {
                 // Normal mode: arm the PMU timer to fire near the
                 // target's cumulative RBC (structop_rbc).
                 if ctx.timer_fd >= 0 && ctx.bp_fd >= 0 {
-                    preempt::arm_replay_timer_pub(ctx.timer_fd, first.structop_rbc);
+                    preempt::arm_replay_timer_pub(ctx.timer_fd, structop_rbc);
                 }
+            }
+            RbcTarget::Relative(RelativeRbc(0)) => {
+                // Breakpoint-only mode: arm the HW breakpoint directly
+                // at the target RIP. The breakpoint handler checks the
+                // RBC count on each hit to find the right instance.
+                if let Some(rip) = target.target_rip {
+                    if ctx.bp_fd >= 0 {
+                        preempt::arm_replay_breakpoint_pub(ctx.bp_fd, rip);
+                    }
+                }
+            }
+            RbcTarget::Relative(RelativeRbc(n)) => {
+                panic!(
+                    "ReplayBackend::arm() received unexpected \
+                     RbcTarget::Relative({n}) -- expected Absolute or Relative(0)"
+                );
             }
         }
     }
