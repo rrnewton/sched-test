@@ -55,7 +55,7 @@ pub enum TsKind {
 ///
 /// When a CPU ID is present, the suffix includes the zero-padded CPU number:
 /// - `[  988_779_026:cpu01]` — CPU 1, 2-digit padding
-/// - `[  988_779_026:cpu]`   — no CPU context (e.g. timer events)
+/// - `[  988_779_026:cpu?]`  — no CPU context (e.g. timer events)
 /// - `[  988_779_026:G]`     — global timestamp
 pub struct FmtTs {
     pub ns: TimeNs,
@@ -104,7 +104,7 @@ impl fmt::Display for FmtTs {
                 write!(f, "{:>15}:cpu{:0>w$}", grouped, cpu.0, w = w)
             }
             TsKind::Local(None, _) => {
-                write!(f, "{:>15}:cpu", grouped)
+                write!(f, "{:>15}:cpu?", grouped)
             }
             TsKind::Global => {
                 write!(f, "{:>15}:G", grouped)
@@ -267,10 +267,10 @@ mod tests {
         use crate::types::CpuId;
 
         // No CPU context (e.g. timer events)
-        assert_eq!(FmtTs::local(0, None, 1).to_string(), "              0:cpu");
+        assert_eq!(FmtTs::local(0, None, 1).to_string(), "              0:cpu?");
         assert_eq!(
             FmtTs::local(10_000, None, 1).to_string(),
-            "         10_000:cpu"
+            "         10_000:cpu?"
         );
 
         // With CPU ID, width=1

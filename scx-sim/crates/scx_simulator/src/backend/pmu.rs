@@ -64,7 +64,7 @@ impl PreemptionBackend for PmuBackend {
             debug!(
                 worker = worker_id.0,
                 break_on = %self.break_on,
-                "preempt: PMU timer armed"
+                "preempt: PMU timer created"
             );
         } else if is_determinism_mode_enabled() {
             tracing::warn!(
