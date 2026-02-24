@@ -13,7 +13,7 @@ use tracing::{debug, info, trace, warn};
 
 use crate::backend::pmu::PmuBackend;
 use crate::backend::replay::ReplayBackend;
-use crate::backend::SendPtr;
+use crate::backend::{PreemptionBackend, SendPtr};
 use crate::cgroup::{clear_cgroup_registry, install_cgroup_registry, CgroupId, CgroupRegistry};
 use crate::cpu::{IrqContext, LastStopReason, SimCpu};
 use crate::dsq::DsqManager;
@@ -2942,6 +2942,7 @@ impl<S: Scheduler> Simulator<S> {
 
         if let Some(ref preemptive_cfg) = state.preemptive {
             if let Some(ref backend) = state.replay_backend {
+                assert!(backend.is_precise(), "replay requires a precise backend");
                 replay_dispatch_with_retry(
                     &dispatch_cpus,
                     &state_send,
