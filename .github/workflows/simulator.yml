@@ -27,6 +27,9 @@ jobs:
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y clang llvm libelf-dev
 
+      - name: Install cargo-nextest
+        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+
       - uses: actions/cache@v4
         with:
           path: |
