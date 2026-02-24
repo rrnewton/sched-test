@@ -9,7 +9,7 @@ use scx_simulator::{
     compare_checkpoints, discover_schedulers, drain_determinism_checkpoints,
     drain_preemption_records, enable_determinism_mode, enable_preemption_collection, load_rtapp,
     scheduler_so_base, DynamicScheduler, PmuEvent, PreemptionTrace, PreemptiveConfig, SimFormat,
-    Simulator, TraceStats, SIM_LOCK,
+    Simulator, TraceMetadata, TraceStats, SIM_LOCK,
 };
 
 mod real_run;
@@ -456,6 +456,20 @@ fn run_simulation(cli: &Cli, mut scenario: scx_simulator::Scenario) -> Result<()
             trace.num_workers(),
             path.display()
         );
+
+        // Validate trace metadata against current scenario parameters.
+        // Mismatched parameters produce incorrect replay results.
+        let current_metadata = TraceMetadata {
+            nr_cpus: Some(scenario.nr_cpus),
+            nr_tasks: Some(scenario.tasks.len() as u32),
+            seed: Some(scenario.seed),
+            duration_ns: Some(scenario.duration_ns),
+            scheduler: Some(cli.scheduler.clone()),
+            timeslice_min: scenario.preemptive.as_ref().map(|p| p.timeslice_min),
+            timeslice_max: scenario.preemptive.as_ref().map(|p| p.timeslice_max),
+        };
+        trace.validate_metadata(&current_metadata);
+
         scenario.replay_trace = Some(trace);
     }
 
@@ -463,6 +477,17 @@ fn run_simulation(cli: &Cli, mut scenario: scx_simulator::Scenario) -> Result<()
     if cli.record_preemptions.is_some() {
         enable_preemption_collection();
     }
+
+    // Capture scenario metadata before the scenario is consumed by run().
+    let scenario_metadata = TraceMetadata {
+        nr_cpus: Some(scenario.nr_cpus),
+        nr_tasks: Some(scenario.tasks.len() as u32),
+        seed: Some(scenario.seed),
+        duration_ns: Some(scenario.duration_ns),
+        scheduler: Some(cli.scheduler.clone()),
+        timeslice_min: scenario.preemptive.as_ref().map(|p| p.timeslice_min),
+        timeslice_max: scenario.preemptive.as_ref().map(|p| p.timeslice_max),
+    };
 
     let trace = Simulator::new(sched).run(scenario);
 
@@ -483,8 +508,9 @@ fn run_simulation(cli: &Cli, mut scenario: scx_simulator::Scenario) -> Result<()
     if let Some(path) = &cli.record_preemptions {
         let records = drain_preemption_records();
         let num_workers = cli.cpus as usize;
-        let preemption_trace =
+        let mut preemption_trace =
             PreemptionTrace::from_records(&records, num_workers, cli.break_on.to_pmu_event());
+        preemption_trace.set_metadata(scenario_metadata);
 
         let mut file = std::fs::File::create(path)
             .map_err(|e| format!("failed to create {}: {e}", path.display()))?;
