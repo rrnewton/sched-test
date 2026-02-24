@@ -2567,6 +2567,87 @@ pub fn arm_replay_breakpoint_pub(bp_fd: RawFd, addr: u64) {
 }
 
 // ---------------------------------------------------------------------------
+// e9patch preemption — extern "C" entry point for software RBC trampoline
+// ---------------------------------------------------------------------------
+
+/// Called from the C trampoline (`rbc_trampoline()`) when the software RBC
+/// counter expires at an instrumented Jcc instruction.
+///
+/// Replicates `preempt_handler` logic but callable from regular C code
+/// (not a signal handler — can use full Rust, including `tracing`).
+///
+/// Returns a new timeslice for the C trampoline to load into `rbc_counter`.
+///
+/// # Safety
+/// `ring` must be a valid pointer to a `PreemptRing`.
+#[no_mangle]
+pub unsafe extern "C" fn e9_preempt_yield(ring: *const PreemptRing, worker_id: i32) -> u64 {
+    let ring = unsafe { &*ring };
+    let wid = WorkerId(worker_id as usize);
+
+    // 1. Save SimulatorState context.
+    let sim_ptr = match crate::kfuncs::sim_state_ptr() {
+        Some(p) => p,
+        None => {
+            // Not inside a simulator context — return a large timeslice to
+            // avoid spinning. This shouldn't happen in practice.
+            return u64::MAX;
+        }
+    };
+
+    let (saved_cpu, saved_ops_ctx, saved_waker) = unsafe {
+        (
+            (*sim_ptr).current_cpu,
+            (*sim_ptr).ops_context,
+            (*sim_ptr).waker_task_raw,
+        )
+    };
+
+    // 2. Track structop and record preemption point.
+    let saved_ops = current_ops_context();
+    set_current_ops_context(saved_ops);
+    // The timeslice that just expired is not directly available here,
+    // so we record 0 for rbc_count (no hardware RBC measurement).
+    record_rbc_preemption(0);
+    let sinfo = structop_info();
+    ring.record_preemption(0, 0, saved_cpu, wid, sinfo);
+
+    // 3. Trace log (safe — not in a signal handler).
+    tracing::debug!(
+        "preempt:e9patch ops={} kfunc={} structop#{}:{}",
+        sinfo.ops_context.short_name(),
+        if sinfo.kfunc_name.is_empty() {
+            "none"
+        } else {
+            sinfo.kfunc_name
+        },
+        sinfo.cpu_count,
+        sinfo.global_count,
+    );
+
+    // 4. Yield token (futex-based).
+    ring.inc_signal_preempt();
+    if ring.yield_token(wid) {
+        inc_interleave();
+    }
+
+    // 5. Restore SimulatorState context.
+    unsafe {
+        (*sim_ptr).current_cpu = saved_cpu;
+        (*sim_ptr).ops_context = saved_ops_ctx;
+        (*sim_ptr).waker_task_raw = saved_waker;
+    }
+
+    // 6. Roll new timeslice from PRNG and return it.
+    let pctx = PREEMPT_CTX.with(|c| c.get());
+    let (ts_min, ts_max) = match pctx {
+        Some(ctx) => (ctx.timeslice_min, ctx.timeslice_max),
+        None => (1, 1),
+    };
+    ring.roll_timeslice(ts_min, ts_max)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

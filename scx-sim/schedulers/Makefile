@@ -74,9 +74,14 @@ SHARED_SRCS := $(SIMULATOR_DIR)/csrc/sim_bpf_stubs.c \
 .DEFAULT_GOAL := all
 $(foreach s,$(SCHEDS),$(eval -include $(s)/config.mk))
 
+# --- e9patch tool path ---
+# Look for e9tool in third_party/ first, then fall back to PATH.
+E9TOOL ?= $(or $(wildcard $(SIMULATOR_DIR)/third_party/e9patch/e9tool),$(shell which e9tool 2>/dev/null))
+E9PATCH ?= $(or $(wildcard $(SIMULATOR_DIR)/third_party/e9patch/e9patch),$(shell which e9patch 2>/dev/null))
+
 # --- Build rules ---
 
-.PHONY: all clean $(SCHEDS)
+.PHONY: all clean e9 $(SCHEDS)
 
 ifeq ($(BPF_INCLUDE),)
 all $(SO_TARGETS):
@@ -131,13 +136,26 @@ $(BUILD_DIR)/$(1)_overrides.o: $(ROOT_DIR)/lib/scxtest/overrides.c | $(BUILD_DIR
 		-c -o $$@ $$<
 endef
 
+# Per-scheduler sim_rbc_trampoline.c -> <name>_sim_rbc_trampoline.o
+# NOTE: compiled WITHOUT $(INCLUDES) to avoid vmlinux.h conflicts.
+# NOTE: compiled WITHOUT coverage flags — the trampoline is called on every
+# instrumented Jcc and must have minimal overhead.
+define RBC_TRAMPOLINE_RULE
+$(BUILD_DIR)/$(1)_sim_rbc_trampoline.o: $(SIMULATOR_DIR)/csrc/sim_rbc_trampoline.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS_BASE) \
+		-MMD -MF $(BUILD_DIR)/$(1)_sim_rbc_trampoline.d \
+		-c -o $$@ $$<
+endef
+
 # Link .o files into .so
 # NOTE: sim_sdt_stubs.o is NOT linked here — SDT functions resolve from the
 # main binary via -rdynamic. This ensures there's only one copy of the SDT
 # hash table state, allowing sim_sdt_reset() to work correctly.
+# NOTE: -Wl,--init=e9_so_init creates a DT_INIT entry so e9tool can inject
+# its loader. Without it, -nostdlib .so files have no init section.
 define SO_RULE
-$(BUILD_DIR)/libscx_$(1).so: $(BUILD_DIR)/$(1)_wrapper.o $(BUILD_DIR)/$(1)_sim_bpf_stubs.o $(BUILD_DIR)/$(1)_sim_sigfpe.o $(BUILD_DIR)/$(1)_overrides.o
-	$(CC) $(LDFLAGS_SO) -o $$@ $$^
+$(BUILD_DIR)/libscx_$(1).so: $(BUILD_DIR)/$(1)_wrapper.o $(BUILD_DIR)/$(1)_sim_bpf_stubs.o $(BUILD_DIR)/$(1)_sim_sigfpe.o $(BUILD_DIR)/$(1)_overrides.o $(BUILD_DIR)/$(1)_sim_rbc_trampoline.o
+	$(CC) $(LDFLAGS_SO) -Wl,--init=e9_so_init -o $$@ $$^
 endef
 
 # Instantiate rules for each scheduler
@@ -145,7 +163,51 @@ $(foreach s,$(SCHEDS),$(eval $(call WRAPPER_RULE,$(s))))
 $(foreach s,$(SCHEDS),$(eval $(call STUBS_RULE,$(s))))
 $(foreach s,$(SCHEDS),$(eval $(call SIGFPE_RULE,$(s))))
 $(foreach s,$(SCHEDS),$(eval $(call OVERRIDES_RULE,$(s))))
+$(foreach s,$(SCHEDS),$(eval $(call RBC_TRAMPOLINE_RULE,$(s))))
 $(foreach s,$(SCHEDS),$(eval $(call SO_RULE,$(s))))
+
+# --- e9patch post-processing ---
+# Instrument Jcc instructions, forwarding each to the .so's rbc_trampoline().
+#
+# The e9 trampoline stub is compiled with e9compile.sh — it's a minimal
+# forwarder that calls the .so's rbc_trampoline() (from sim_rbc_trampoline.c).
+# The .so's rbc_trampoline uses global state configured by the Rust backend
+# via e9_arm/e9_disarm/e9_worker_setup (also in the .so).
+#
+# Usage: make e9  (requires e9tool; builds _e9.so for all schedulers)
+
+E9COMPILE ?= $(SIMULATOR_DIR)/third_party/e9patch/e9compile.sh
+E9_TRAMPOLINE_SRC := $(SIMULATOR_DIR)/csrc/e9_rbc_trampoline.c
+E9_TRAMPOLINE_BIN := $(BUILD_DIR)/e9_rbc_trampoline
+
+# Build the e9patch trampoline stub using gcc (same flags as e9compile.sh).
+$(E9_TRAMPOLINE_BIN): $(E9_TRAMPOLINE_SRC) | $(BUILD_DIR)
+	gcc -fno-stack-protector -fno-builtin -fno-exceptions -fpie -O2 \
+		-Wno-unused-function -U_FORTIFY_SOURCE -mno-mmx -mno-sse \
+		-mno-avx -mno-avx2 -mno-avx512f -msoft-float \
+		-mstringop-strategy=loop -fno-tree-vectorize -fomit-frame-pointer \
+		-c -o $(BUILD_DIR)/e9_rbc_trampoline.o $(E9_TRAMPOLINE_SRC)
+	gcc $(BUILD_DIR)/e9_rbc_trampoline.o -o $(E9_TRAMPOLINE_BIN) \
+		-pie -nostdlib -Wl,-z -Wl,max-page-size=4096 -Wl,-z -Wl,norelro \
+		-Wl,-z -Wl,stack-size=0 -Wl,--export-dynamic -Wl,--entry=0x0 \
+		-Wl,--strip-all -Wl,--unresolved-symbols=ignore-all
+
+define E9_RULE
+$(BUILD_DIR)/libscx_$(1)_e9.so: $(BUILD_DIR)/libscx_$(1).so $(E9_TRAMPOLINE_BIN)
+	@if [ -z "$(E9TOOL)" ]; then \
+		echo "ERROR: e9tool not found. Build it: cd third_party/e9patch && ./build.sh"; \
+		exit 1; \
+	fi
+	E9PATCH=$(E9PATCH) $(E9TOOL) \
+		-M 'jcc' \
+		-P 'entry()@$(E9_TRAMPOLINE_BIN)' \
+		-o $$@ $$<
+endef
+$(foreach s,$(SCHEDS),$(eval $(call E9_RULE,$(s))))
+
+E9_TARGETS := $(foreach s,$(SCHEDS),$(BUILD_DIR)/libscx_$(s)_e9.so)
+e9: $(E9_TARGETS)
+	@echo "Built $(words $(E9_TARGETS)) e9patch scheduler(s): $(SCHEDS)"
 
 # Create build directory
 $(BUILD_DIR):
