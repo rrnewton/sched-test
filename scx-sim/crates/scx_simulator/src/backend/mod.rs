@@ -147,13 +147,24 @@ pub(crate) trait PreemptionBackend: Sync {
     ///
     /// For PMU: reads from the measurement perf fd.
     /// For replay: reads from the timer perf fd.
-    #[allow(dead_code)] // TODO(sim-80ce04): used by Phase 3 clean-up
+    ///
+    /// Currently unused but part of the Phase 1 trait surface for future
+    /// per-structop RBC accounting. The current architecture uses
+    /// cumulative counting (via `rearm_timer` in recording mode and
+    /// continuous counters in replay mode).
+    #[allow(dead_code)] // Phase 1 surface; callers TBD in Phase 3
     fn read_count(&self, _ctx: &Self::WorkerCtx) -> u64 {
         0
     }
 
-    /// Reset the RBC counter to zero. Called at the start of each structop.
-    #[allow(dead_code)] // TODO(sim-80ce04): used by Phase 3 clean-up
+    /// Reset the RBC counter to zero.
+    ///
+    /// Intended for per-structop RBC accounting at structop boundaries.
+    /// Currently unused: recording uses per-kfunc resets via `rearm_timer`,
+    /// and replay uses cumulative counting without resets. If per-structop
+    /// RBC tracking is added, this should be called from `begin_structop()`
+    /// in the generic dispatch/batch drivers.
+    #[allow(dead_code)] // Phase 1 surface; callers TBD in Phase 3
     fn reset_count(&self, _ctx: &mut Self::WorkerCtx) {}
 }
 
