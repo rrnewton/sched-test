@@ -845,6 +845,11 @@ where
         // and re-arms on resume.
         crate::preempt::maybe_yield_preemptive_post();
 
+        // Clear kfunc name now that the kfunc is complete. PMU preemptions
+        // fire between kfuncs (while C scheduler code runs), so the name
+        // must be empty to avoid stale names in preemption records.
+        crate::preempt::set_current_kfunc("");
+
         result
     })
 }

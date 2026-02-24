@@ -91,6 +91,9 @@ pub struct PreemptionRecord {
     pub ops_context: OpsContext,
     /// Name of the kfunc being called (empty if unknown or PMU preemption).
     pub kfunc_name: &'static str,
+    /// Number of kfuncs executed within the current structop at preemption.
+    /// Resets when a new structop begins. Used as a sub-coordinate for replay.
+    pub kfunc_count: u32,
     /// First [`INSN_BYTES_LEN`] bytes of the instruction at the RIP.
     /// Used to detect .so version mismatches during replay.
     pub insn_bytes: [u8; INSN_BYTES_LEN],
@@ -156,7 +159,7 @@ impl std::fmt::Display for PreemptionRecord {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "seq={} ops={} kfunc={} structop={}:{} rbc={} rip=0x{:x} insn={} cpu={} worker={}",
+            "seq={} ops={} kfunc={} structop={}:{} kfunc_count={} rbc={} rip=0x{:x} insn={} cpu={} worker={}",
             self.sequence,
             self.ops_context.short_name(),
             if self.kfunc_name.is_empty() {
@@ -166,6 +169,7 @@ impl std::fmt::Display for PreemptionRecord {
             },
             self.structop_local,
             self.structop_global,
+            self.kfunc_count,
             self.structop_rbc,
             self.instruction_pointer,
             format_insn_bytes(&self.insn_bytes),
@@ -176,7 +180,7 @@ impl std::fmt::Display for PreemptionRecord {
 }
 
 /// Number of AtomicU64 slots per preemption record.
-const RECORD_FIELDS: usize = 12;
+const RECORD_FIELDS: usize = 13;
 
 /// Global monotonic sequence counter shared across all `PreemptionRecordStore`
 /// instances. Ensures unique, globally-ordered sequence numbers even when
@@ -249,6 +253,7 @@ impl PreemptionRecordStore {
         self.records[base + 9].store(sinfo.kfunc_name.as_ptr() as u64, SeqCst);
         self.records[base + 10].store(sinfo.kfunc_name.len() as u64, SeqCst);
         self.records[base + 11].store(pack_insn_bytes(insn_bytes), SeqCst);
+        self.records[base + 12].store(sinfo.kfunc_count_local, SeqCst);
         Some(seq)
     }
 
@@ -283,6 +288,7 @@ impl PreemptionRecordStore {
                 structop_rbc: self.records[base + 7].load(SeqCst),
                 ops_context: OpsContext::from_discriminant(ops_disc),
                 kfunc_name,
+                kfunc_count: self.records[base + 12].load(SeqCst) as u32,
                 insn_bytes: unpack_insn_bytes(self.records[base + 11].load(SeqCst)),
             });
         }
@@ -785,6 +791,9 @@ pub struct StructopInfo {
     pub ops_context: OpsContext,
     /// Name of the kfunc about to be called (empty string if unknown).
     pub kfunc_name: &'static str,
+    /// Per-structop kfunc count (resets at each structop boundary).
+    /// Tracks how many kfuncs have executed within the current structop.
+    pub kfunc_count_local: u64,
 }
 
 thread_local! {
@@ -792,6 +801,8 @@ thread_local! {
     static STRUCTOP_RBC_TOTAL: Cell<u64> = const { Cell::new(0) };
     static STRUCTOP_KFUNC_COUNT: Cell<u64> = const { Cell::new(0) };
     static STRUCTOP_INTERLEAVE_COUNT: Cell<u64> = const { Cell::new(0) };
+    /// Per-structop kfunc count (resets at each structop boundary).
+    static STRUCTOP_KFUNC_COUNT_LOCAL: Cell<u64> = const { Cell::new(0) };
     static IN_STRUCTOP: Cell<bool> = const { Cell::new(false) };
     /// Current kfunc name, set before each `maybe_yield()` call.
     static CURRENT_KFUNC_NAME: Cell<&'static str> = const { Cell::new("") };
@@ -809,6 +820,7 @@ pub fn seed_structop(base: &StructopInfo) {
     STRUCTOP_INTERLEAVE_COUNT.with(|c| c.set(base.interleave_count));
     IN_STRUCTOP.with(|c| c.set(false));
     CURRENT_KFUNC_NAME.with(|c| c.set(""));
+    STRUCTOP_KFUNC_COUNT_LOCAL.with(|c| c.set(0));
     CURRENT_OPS_CONTEXT.with(|c| c.set(OpsContext::None));
 }
 
@@ -816,6 +828,7 @@ pub fn seed_structop(base: &StructopInfo) {
 fn begin_structop() {
     STRUCTOP_CPU_COUNT.with(|c| c.set(c.get() + 1));
     STRUCTOP_GLOBAL_COUNT.fetch_add(1, SeqCst);
+    STRUCTOP_KFUNC_COUNT_LOCAL.with(|c| c.set(0));
 }
 
 /// Read current structop tracking state.
@@ -828,6 +841,7 @@ pub fn structop_info() -> StructopInfo {
         interleave_count: STRUCTOP_INTERLEAVE_COUNT.with(|c| c.get()),
         ops_context: CURRENT_OPS_CONTEXT.with(|c| c.get()),
         kfunc_name: CURRENT_KFUNC_NAME.with(|c| c.get()),
+        kfunc_count_local: STRUCTOP_KFUNC_COUNT_LOCAL.with(|c| c.get()),
     }
 }
 
@@ -908,6 +922,7 @@ pub fn record_rbc_preemption(timeslice: u64) {
 /// Called from `maybe_yield_preemptive()` on each cooperative yield.
 pub fn inc_structop_kfunc() {
     STRUCTOP_KFUNC_COUNT.with(|c| c.set(c.get() + 1));
+    STRUCTOP_KFUNC_COUNT_LOCAL.with(|c| c.set(c.get() + 1));
 }
 
 /// Increment the per-CPU interleave counter (monotonic).
@@ -939,6 +954,7 @@ pub fn reset_structop_cpu_count() {
     STRUCTOP_INTERLEAVE_COUNT.with(|c| c.set(0));
     IN_STRUCTOP.with(|c| c.set(false));
     CURRENT_KFUNC_NAME.with(|c| c.set(""));
+    STRUCTOP_KFUNC_COUNT_LOCAL.with(|c| c.set(0));
     CURRENT_OPS_CONTEXT.with(|c| c.set(OpsContext::None));
 }
 
@@ -1232,6 +1248,7 @@ impl PreemptRing {
                 structop_rbc: sinfo.rbc_total,
                 ops_context: sinfo.ops_context,
                 kfunc_name: sinfo.kfunc_name,
+                kfunc_count: sinfo.kfunc_count_local as u32,
                 insn_bytes,
             });
         }
@@ -2246,6 +2263,22 @@ fn replay_validate_structop(target: &PreemptionRecord, sinfo: &StructopInfo) {
         );
         write_stderr(w.as_bytes());
         unsafe { libc::abort() };
+    }
+
+    // Soft-check kfunc_count: warn but don't abort on mismatch.
+    // This is a sub-coordinate for replay verification — divergence
+    // here suggests the scheduler took a different kfunc path, which
+    // may or may not be fatal depending on the scheduler's logic.
+    let replay_kfunc_count = sinfo.kfunc_count_local as u32;
+    if target.kfunc_count != 0 && replay_kfunc_count != target.kfunc_count {
+        let mut buf = [0u8; 512];
+        let mut w = StackWriter::new(&mut buf);
+        let _ = writeln!(
+            w,
+            "REPLAY WARNING: kfunc_count at seq={}: trace={}, replay={}",
+            target.sequence, target.kfunc_count, replay_kfunc_count,
+        );
+        write_stderr(w.as_bytes());
     }
 }
 
