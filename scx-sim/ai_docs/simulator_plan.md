@@ -122,7 +122,7 @@ The GitHub topic [cpu-simulation](https://github.com/topics/cpu-simulation) list
 ### Files Created
 
 ```
-rust/scx_simulator/
+scx-sim/
 ├── Cargo.toml
 ├── build.rs                         # Compiles scheduler C code via cc crate
 ├── csrc/
@@ -147,7 +147,7 @@ rust/scx_simulator/
     └── simple_preemption.rs         # 3 tests: slice preemption, interleaving, sleep/wake
 ```
 
-Workspace root `Cargo.toml` modified to add `rust/scx_simulator` member.
+Workspace root `Cargo.toml` modified to add `scx-sim` member.
 
 ### Build System (`build.rs`)
 

@@ -13,7 +13,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 SCRIPT_DIR="$(pwd)"
-PROJ_ROOT="$(cd ../.. && pwd)"
+PROJ_ROOT="$(cd .. && pwd)"
 COVERAGE_OUT="$SCRIPT_DIR/coverage-out"
 
 # --- Parse flags ---
