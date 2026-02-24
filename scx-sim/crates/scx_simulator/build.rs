@@ -6,8 +6,8 @@ fn main() {
     let manifest_dir: PathBuf = env::var("CARGO_MANIFEST_DIR").unwrap().into();
     // Workspace root is two levels up from crates/scx_simulator
     let workspace_dir = manifest_dir.join("../..").canonicalize().unwrap();
-    // SCX repo root is two levels up from the workspace
-    let root_dir = workspace_dir.join("../..").canonicalize().unwrap();
+    // Repo root is one level up from the workspace (scx-sim/)
+    let root_dir = workspace_dir.join("..").canonicalize().unwrap();
     let out_dir: PathBuf = env::var("OUT_DIR").unwrap().into();
 
     let coverage = env::var("SCX_SIM_COVERAGE").as_deref() == Ok("1");

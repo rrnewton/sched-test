@@ -5,7 +5,7 @@
 #
 # Invoked by build.rs:
 #   make -C schedulers/ BUILD_DIR=<out_dir>/schedulers \
-#        SIMULATOR_DIR=.. ROOT_DIR=../../../ \
+#        SIMULATOR_DIR=.. ROOT_DIR=../../ \
 #        BPF_INCLUDE=<DEP_BPF_INCLUDE path> CC=clang
 #
 # Or standalone (defaults assume relative paths from this directory):
@@ -13,7 +13,7 @@
 
 # --- Paths (overridable by build.rs) ---
 SIMULATOR_DIR ?= ..
-ROOT_DIR      ?= $(SIMULATOR_DIR)/../..
+ROOT_DIR      ?= $(SIMULATOR_DIR)/..
 BUILD_DIR     ?= build
 
 # CC defaults to 'cc' (gcc) in Make, but this code requires clang.

@@ -269,7 +269,7 @@ fn validate_prerequisites(scheduler: &str, trace_mode: TraceMode) -> Result<(), 
 ///
 /// Search order:
 /// 1. `SCX_SCHED_BIN` environment variable (explicit override)
-/// 2. Repo-relative paths from CWD (`../../target/{release,debug}/scx_<name>`)
+/// 2. Repo-relative paths from CWD (`../target/{release,debug}/scx_<name>`)
 /// 3. CARGO_MANIFEST_DIR-relative paths (when run via `cargo run`)
 /// 4. System PATH / well-known locations
 fn find_scheduler_binary(scheduler: &str) -> Result<PathBuf, String> {
@@ -286,9 +286,9 @@ fn find_scheduler_binary(scheduler: &str) -> Result<PathBuf, String> {
         ));
     }
 
-    // 2. Repo-relative from CWD (scxsim is typically run from rust/scx_simulator/)
-    // The scx repo root is ../../ relative to that, so target/ is at ../../target/
-    let cwd_candidates = ["../../target/release", "../../target/debug"];
+    // 2. Repo-relative from CWD (scxsim is typically run from scx-sim/)
+    // The repo root is ../ relative to that, so target/ is at ../target/
+    let cwd_candidates = ["../target/release", "../target/debug"];
     for dir in cwd_candidates {
         let path = PathBuf::from(dir).join(&bin_name);
         if path.exists() {
@@ -296,13 +296,12 @@ fn find_scheduler_binary(scheduler: &str) -> Result<PathBuf, String> {
         }
     }
 
-    // 3. CARGO_MANIFEST_DIR-relative (crates/scx_simulator -> scx_simulator -> rust -> repo_root)
+    // 3. CARGO_MANIFEST_DIR-relative (crates/scx_simulator -> scx-sim -> repo_root)
     if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
         let manifest_path = PathBuf::from(&manifest_dir);
-        // Navigate: crates/scx_simulator -> crates -> scx_simulator -> rust -> repo_root
+        // Navigate: crates/scx_simulator -> crates -> scx-sim -> repo_root
         if let Some(repo_root) = manifest_path
             .parent()
-            .and_then(|p| p.parent())
             .and_then(|p| p.parent())
             .and_then(|p| p.parent())
         {
@@ -347,7 +346,7 @@ fn find_scheduler_binary(scheduler: &str) -> Result<PathBuf, String> {
 
     Err(format!(
         "scheduler binary {bin_name} not found. Build it with:\n\
-         cd ../../  # repo root\n\
+         cd ../  # repo root\n\
          cargo build --bin {bin_name} --release\n\n\
          Or set SCX_SCHED_BIN environment variable to the path of the scheduler binary."
     ))

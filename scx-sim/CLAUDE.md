@@ -229,7 +229,7 @@ When spawning a sub-agent to work on a task:
 
 1. **Always specify which worktree directory** the agent should use:
    ```
-   You are working on the scx_simulator project in <MULTI_SCX>/work/scx2/rust/scx_simulator
+   You are working on the scx_simulator project in <MULTI_SCX>/work/scx2/scx-sim
    ```
 
 2. **Assign different worktrees** to parallel tasks to avoid conflicts.
