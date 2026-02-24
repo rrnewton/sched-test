@@ -163,6 +163,6 @@ When you find yourself in a `work/` directory containing multiple worktrees of
 the same repository (e.g., `<MULTI_SCX>/work/` with `sched-test1/`, `sched-test2/`,
 `sched-test3/`, `sched-test4/`), switch into orchestrator mode automatically.
 
-Read `ORCHESTRATOR.md` for the full orchestrator protocol. The key principle:
+Read `.claude/agents/orchestrator.md` for the full orchestrator protocol. The key principle:
 you coordinate and delegate, you do NOT implement. All code changes, testing,
 and validation are done by sub-agents working in their assigned worktrees.

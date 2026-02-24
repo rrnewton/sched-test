@@ -29,7 +29,7 @@ You may use these tools ONLY as described:
 
 | Tool    | Allowed Use                                                  |
 |---------|--------------------------------------------------------------|
-| **Read**  | Read CLAUDE.md, ORCHESTRATOR.md, issue files, git logs     |
+| **Read**  | Read CLAUDE.md, orchestrator.md, issue files, git logs     |
 | **Write** | Write issue files via `mb`, update tracking docs           |
 | **Glob**  | Find files only when needed for delegation instructions    |
 | **Bash**  | ONLY for `mb` (issue tracking) and `git` (worktree/merge)  |
@@ -77,10 +77,10 @@ Directory Structure
 
 ```
 <MULTI_SCX>/work/
-├── sched-test1/    # Primary clone — on simulator.v3 (or main real branch)
-├── sched-test2/    # Worktree — on work2 (local work branch)
-├── sched-test3/    # Worktree — on work3 (local work branch)
-└── sched-test4/    # Worktree — on work4 (local work branch)
+├── sched-test1/    # Worktree #1 (primary checkout) — integration branch
+├── sched-test2/    # Worktree #2 — on work/2 (local work branch)
+├── sched-test3/    # Worktree #3 — on work/3 (local work branch)
+└── sched-test4/    # Worktree #4 — on work/4 (local work branch)
 ```
 
 All worktrees share a **single `.git` object store** (in the primary clone).
@@ -89,30 +89,49 @@ in any worktree updates all of them.
 
 **Branch constraint:** Git worktrees require each to be on a different branch.
 The real branches (e.g., `simulator.v3`, `simulator-frida`) are the ones that
-get pushed to remote. The `work*` branches are lightweight local branches for
+get pushed to remote. The `work/*` branches are lightweight local branches for
 parallel agent work.
+
+Integration Branch Principle
+----------------------------------------
+
+**Worktree #1 (primary checkout) is the integration branch.** It stays on the
+real branch (e.g., `simulator.v3`). Prefer dispatching work to worktrees #2-#4
+on `work/*` branches. Keep #1 free for:
+
+- Merging completed work branches (ff-only merge from `work/2`, `work/3`, `work/4`)
+- Issue tracking with `mb` (beads)
+- Pushing to remote
+- Serving as the orchestrator's own workspace for management tasks
+
+**Don't lock worktree #1 with a long-running agent.** If all agents are busy,
+worktree #1 should be the last one you assign work to. If you must use it, keep
+it short.
+
+**Work flows inward:** Sub-agents commit on `work/*` branches -> orchestrator
+merges into the real branch on worktree #1 -> orchestrator pushes.
 
 Work Branches
 ----------------------------------------
 
-**`work*` branches are LOCAL ONLY and TRANSIENT.** Never push them to remote.
+**`work/*` branches are LOCAL ONLY and TRANSIENT.** Never push them to remote.
 They exist solely to satisfy the worktree one-branch-per-directory constraint.
 
-When work on a `work*` branch is ready, merge it back to the target branch
+When work on a `work/*` branch is ready, merge it back to the target branch
 using a **fast-forward only merge**:
 
 ```bash
 # From sched-test1 (on simulator.v3):
-git merge --ff-only work4
+git merge --ff-only work/4
 ```
 
 If fast-forward is not possible, rebase the work branch first:
 
 ```bash
-# From sched-test4 (on work4):
+# From sched-test4 (on work/4):
 git rebase simulator.v3
 # Then from sched-test1:
-git merge --ff-only work4
+git merge --ff-only work/4
 ```
 
 Common Worktree Commands
@@ -124,12 +143,33 @@ git worktree list
 
 # Switching a worktree to a different real branch:
 cd <MULTI_SCX>/work/sched-test3
-git checkout -b work3-new simulator-frida   # new local branch off target
-git branch -D work3                          # delete old
+git checkout -b work/3-new simulator-frida   # new local branch off target
+git branch -D work/3                          # delete old
 
 # Adding a new worktree:
-git worktree add ../sched-test5 -b work5 simulator.v3
+git worktree add ../sched-test5 -b work/5 simulator.v3
 ```
+
+Orchestrator's Git Role
+========================================
+
+The orchestrator performs git operations that span BETWEEN worktrees — operations
+that bridge multiple checkouts. Each sub-agent "holds the lock" on its worktree
+while running.
+
+**The orchestrator DOES:**
+
+- `git merge --ff-only work/N` — on worktree #1, pulling in completed work
+- `git push origin <branch>` — pushing the real branch
+- `git reset --hard <branch>` — resetting work branches after merge
+- `git rebase <target>` — only to prepare a work branch for ff-only merge,
+  and only if the sub-agent is not available to do it
+
+**The orchestrator does NOT:**
+
+- Resolve merge conflicts (delegate to the sub-agent with context)
+- Run `git add`, `git commit` on source code changes
+- Edit files to fix conflicts
 
 Spawning Sub-Agents
 ========================================
@@ -171,7 +211,7 @@ Before starting:
 When done:
 - Run: ./validate.sh (must pass)
 - Commit with message referencing sim-XXXXX
-- Do NOT push — leave the commit on work3
+- Do NOT push — leave the commit on work/3
 ```
 
 After Sub-Agent Completion
@@ -185,7 +225,7 @@ When a sub-agent completes its work, follow this checklist:
 2. **Merge work branches back:**
    ```bash
    # From sched-test1 (on the real branch, e.g. simulator.v3):
-   git merge --ff-only work3
+   git merge --ff-only work/3
    ```
 
 3. **Push the real branch:**
@@ -195,7 +235,7 @@ When a sub-agent completes its work, follow this checklist:
 
 4. **Reset the work branch** so it is ready for the next task:
    ```bash
-   # From sched-test3 (on work3):
+   # From sched-test3 (on work/3):
    git reset --hard simulator.v3
    ```
 
@@ -221,8 +261,9 @@ conflicts, and undermine the delegation model.
 | Writing or editing code yourself    | You are a coordinator, not an implementer    |
 | Running tests or `validate.sh`      | Delegate all execution to sub-agents         |
 | Pasting full agent output           | Wastes context; summarize in 1-3 sentences   |
+| Resolving merge conflicts yourself  | The sub-agent with full context should resolve conflicts; orchestrator only conducts git operations that span between worktrees |
 | Losing track of running agents      | Maintain a mental map of agent-to-worktree   |
-| Pushing `work*` branches to remote  | Work branches are local-only and transient   |
+| Pushing `work/*` branches to remote | Work branches are local-only and transient   |
 | Assigning two agents to one worktree| Causes conflicts; one worktree per agent     |
 | Amending pushed commits             | Creates force-push situations; new commit    |
 | Skipping issue tracking             | You are the backstop; always track issues    |
@@ -230,11 +271,12 @@ conflicts, and undermine the delegation model.
 Parallel Development Philosophy
 ========================================
 
-1. **Commit and push early and often** to the real branches (not `work*`).
+1. **Commit and push early and often** to the real branches (not `work/*`).
    Do not let work accumulate locally — push as soon as validation passes.
 
 2. **Resolve conflicts early.** When multiple agents push to the same branch,
-   pull, rebase, resolve conflicts, and push promptly.
+   delegate conflict resolution to the sub-agent that has full context on the
+   changes, then pull, rebase, and push promptly.
 
 3. **Keep tests passing.** Every commit must pass `./validate.sh` locally.
    Check CI status and fix failures immediately.
