@@ -5,6 +5,7 @@
 #include <linux/bpf.h>
 
 #include "scx_test_map.h"
+#include "sim_rbc_guard.h"
 
 enum {
 	SCX_MAP_TYPE_NORMAL,
@@ -112,34 +113,32 @@ static struct scx_test_map *scx_test_map_lookup(const void *map_ptr, int cpu)
 
 void *scx_test_map_lookup_percpu_elem(void *map, const void *key, int cpu)
 {
+	RBC_GUARD_START;
 	struct scx_test_map *test_map = scx_test_map_lookup(map, cpu);
-	if (!test_map) {
-		return NULL;
-	}
+	if (!test_map)
+		RBC_GUARD_RETURN(NULL);
 
 	for (int i = 0; i < test_map->nr; i++) {
-		if (memcmp(SCX_MAP_KEY(test_map, i), key, test_map->key_size) == 0) {
-			return SCX_MAP_VALUE(test_map, i);
-		}
+		if (memcmp(SCX_MAP_KEY(test_map, i), key, test_map->key_size) == 0)
+			RBC_GUARD_RETURN(SCX_MAP_VALUE(test_map, i));
 	}
 
-	return NULL;
+	RBC_GUARD_RETURN(NULL);
 }
 
 void *scx_test_map_lookup_elem(void *map, const void *key)
 {
+	RBC_GUARD_START;
 	struct scx_test_map *test_map = scx_test_map_lookup(map, 0);
-	if (!test_map) {
-		return NULL;
-	}
+	if (!test_map)
+		RBC_GUARD_RETURN(NULL);
 
 	for (int i = 0; i < test_map->nr; i++) {
-		if (memcmp(SCX_MAP_KEY(test_map, i), key, test_map->key_size) == 0) {
-			return SCX_MAP_VALUE(test_map, i);
-		}
+		if (memcmp(SCX_MAP_KEY(test_map, i), key, test_map->key_size) == 0)
+			RBC_GUARD_RETURN(SCX_MAP_VALUE(test_map, i));
 	}
 
-	return NULL;
+	RBC_GUARD_RETURN(NULL);
 }
 
 static int map_update_elem(struct scx_test_map *test_map, const void *key,
@@ -189,15 +188,16 @@ static int map_update_elem(struct scx_test_map *test_map, const void *key,
 void *scx_test_task_storage_get(void *map, const void *key, void *value,
 				unsigned long flags)
 {
+	RBC_GUARD_START;
 	void *newvalue = NULL;
 	struct scx_test_map *test_map;
 
 	void *ret = scx_test_map_lookup_elem(map, key);
 	if (ret)
-		return ret;
+		RBC_GUARD_RETURN(ret);
 
 	if (!(flags & BPF_LOCAL_STORAGE_GET_F_CREATE))
-		return NULL;
+		RBC_GUARD_RETURN(NULL);
 
 	test_map = scx_test_map_lookup(map, 0);
 
@@ -218,32 +218,28 @@ void *scx_test_task_storage_get(void *map, const void *key, void *value,
 	if (newvalue)
 		free(newvalue);
 
-	return scx_test_map_lookup_elem(map, key);
+	RBC_GUARD_RETURN(scx_test_map_lookup_elem(map, key));
 }
 
 
 int scx_test_map_update_elem(void *map, const void *key, const void *value,
 			     unsigned long flags)
 {
+	RBC_GUARD_START;
 	struct scx_test_map *test_map = scx_test_map_lookup(map, 0);
-
-	if (!test_map) {
-		return -1;
-	}
-
-	return map_update_elem(test_map, key, value, flags);
+	if (!test_map)
+		RBC_GUARD_RETURN(-1);
+	RBC_GUARD_RETURN(map_update_elem(test_map, key, value, flags));
 }
 
 int scx_test_map_update_percpu_elem(void *map, const void *key, const void *value,
 				    int cpu, unsigned long flags)
 {
+	RBC_GUARD_START;
 	struct scx_test_map *test_map = scx_test_map_lookup(map, cpu);
-
-	if (!test_map) {
-		return -1;
-	}
-
-	return map_update_elem(test_map, key, value, flags);
+	if (!test_map)
+		RBC_GUARD_RETURN(-1);
+	RBC_GUARD_RETURN(map_update_elem(test_map, key, value, flags));
 }
 
 void scx_test_map_register(struct scx_test_map *map, void *map_ptr)
