@@ -853,6 +853,9 @@ impl<S: Scheduler> Simulator<S> {
         }
 
         // Resolve e9patch function pointers if e9patch mode is active.
+        // The shared RBC page must already be mmap'd (done by the caller
+        // before loading the .so, since e9-instrumented Jcc instructions
+        // access the fixed address during DT_INIT).
         if state
             .preemptive
             .as_ref()

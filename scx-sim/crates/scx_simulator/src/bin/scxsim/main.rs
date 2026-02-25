@@ -619,6 +619,11 @@ fn run_determinism_check(args: &RunArgs, scenario: Scenario) -> Result<(), Strin
     let _lock = SIM_LOCK.lock().unwrap();
     let use_e9 = args.preemptive && args.preempt_mode == PreemptModeArg::E9patch;
 
+    // Map the shared RBC state page BEFORE loading the _e9.so.
+    if use_e9 {
+        scx_simulator::preempt::mmap_shared_rbc();
+    }
+
     // Run 1: collect checkpoints
     enable_determinism_mode();
     let sched1 = load_scheduler(&args.scheduler, args.cpus, use_e9)?;
@@ -721,6 +726,13 @@ fn print_determinism_failure(
 
 fn run_simulation(args: &RunArgs, scenario: Scenario) -> Result<(), String> {
     let use_e9 = args.preemptive && args.preempt_mode == PreemptModeArg::E9patch;
+
+    // Map the shared RBC state page BEFORE loading the _e9.so — the e9-
+    // instrumented .so accesses this address during DT_INIT.
+    if use_e9 {
+        scx_simulator::preempt::mmap_shared_rbc();
+    }
+
     let sched = load_scheduler(&args.scheduler, args.cpus, use_e9)?;
     let _lock = SIM_LOCK.lock().unwrap();
 
