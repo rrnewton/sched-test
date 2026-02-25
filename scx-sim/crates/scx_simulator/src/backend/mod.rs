@@ -15,6 +15,7 @@
 //! to provide alternative synchronization strategies.
 
 pub mod e9patch;
+pub mod native;
 pub mod pmu;
 pub mod replay;
 
@@ -330,7 +331,7 @@ pub(crate) fn run_preemptive_dispatch<S, B>(
 ///
 /// Separated from [`run_preemptive_dispatch`] so that future backends can
 /// supply a different orchestrator while reusing the same worker lifecycle.
-fn run_dispatch_with_orchestrator<S, B, O>(
+pub(crate) fn run_dispatch_with_orchestrator<S, B, O>(
     dispatch_cpus: &[CpuId],
     state_send: &SendPtr<SimulatorState>,
     sched_send: &SendPtr<S>,
@@ -432,7 +433,7 @@ pub(crate) fn run_preemptive_batch<S, B>(
 /// Separated from [`run_preemptive_batch`] so that future backends can
 /// supply a different orchestrator while reusing the same worker lifecycle.
 #[allow(clippy::too_many_arguments)]
-fn run_batch_with_orchestrator<S, B, O>(
+pub(crate) fn run_batch_with_orchestrator<S, B, O>(
     per_cpu: &HashMap<CpuId, Vec<crate::engine::Event>>,
     cpu_ids: &[CpuId],
     sim_send: &SendPtr<Simulator<S>>,

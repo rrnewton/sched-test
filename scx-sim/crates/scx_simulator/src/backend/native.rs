@@ -1,0 +1,128 @@
+//! Native concurrent backend — no PMU, no token ring.
+//!
+//! Provides [`NullBackend`] (a [`PreemptionBackend`] with no instrumentation)
+//! and [`NativeOrchestrator`] (a [`ThreadOrchestrator`] that lets all workers
+//! run freely in parallel). Together they implement the `--native-concurrent`
+//! dispatch path where threads run with true OS-level concurrency and no
+//! serialisation.
+
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+use std::sync::Barrier;
+
+use tracing::{debug, info};
+
+use super::{PreemptionBackend, StructopDelta, ThreadOrchestrator};
+use crate::interleave::WorkerId;
+use crate::preempt::{self, PreemptRing};
+
+// ---------------------------------------------------------------------------
+// NullBackend — PreemptionBackend with no instrumentation
+// ---------------------------------------------------------------------------
+
+/// A preemption backend that installs no PMU timer, no signal handler, and
+/// produces no preemption events. Used with `--native-concurrent` so that
+/// the generic `run_dispatch_with_orchestrator` / `run_batch_with_orchestrator`
+/// drivers can be reused without any hardware instrumentation.
+pub(crate) struct NullBackend;
+
+/// Per-worker context for NullBackend — intentionally empty.
+pub(crate) struct NullWorkerCtx;
+
+impl PreemptionBackend for NullBackend {
+    type WorkerCtx = NullWorkerCtx;
+
+    fn worker_setup(&self, ring: &PreemptRing, worker_id: WorkerId) -> NullWorkerCtx {
+        // Install preempt TLS (needed for structop accounting counters that
+        // kfuncs read via the TLS), but with no PMU timer fd and no
+        // measurement counter fd.
+        preempt::install(ring, worker_id, -1, -1, 0, 0);
+        debug!(
+            worker = worker_id.0,
+            "native-concurrent: worker setup (null backend)"
+        );
+        NullWorkerCtx
+    }
+
+    fn build_target(
+        &self,
+        _ctx: &NullWorkerCtx,
+        _ring: &PreemptRing,
+    ) -> Option<super::PreemptTarget> {
+        // No preemption target — workers run uninterrupted.
+        None
+    }
+
+    fn arm(&self, _ctx: &mut NullWorkerCtx, _target: super::PreemptTarget) {
+        unreachable!("NullBackend::arm() should never be called (build_target returns None)");
+    }
+
+    fn disarm(&self, _ctx: &mut NullWorkerCtx) -> StructopDelta {
+        StructopDelta::default()
+    }
+
+    fn worker_teardown(&self, _ctx: NullWorkerCtx) {
+        preempt::uninstall();
+    }
+
+    fn log_completion(&self, _ring: &PreemptRing) {
+        info!("native-concurrent dispatch: complete (null backend, no preemption)");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NativeOrchestrator — ThreadOrchestrator with no serialisation
+// ---------------------------------------------------------------------------
+
+/// A thread orchestrator that lets all workers run freely in parallel.
+///
+/// Phase 1: no clock-window throttling — all workers start simultaneously
+/// (via a barrier) and finish independently. An atomic counter tracks
+/// completions so `wait_all_done` can detect when every worker has finished.
+pub(crate) struct NativeOrchestrator {
+    /// Barrier that workers wait on before starting work.
+    barrier: Barrier,
+    /// Number of workers that have called `finish`.
+    finished: AtomicUsize,
+    /// Total number of workers.
+    total: usize,
+}
+
+impl NativeOrchestrator {
+    pub fn new(num_workers: usize) -> Self {
+        // +1 for the orchestrator thread itself (which calls `start`).
+        NativeOrchestrator {
+            barrier: Barrier::new(num_workers + 1),
+            finished: AtomicUsize::new(0),
+            total: num_workers,
+        }
+    }
+}
+
+impl ThreadOrchestrator for NativeOrchestrator {
+    fn start(&self) {
+        // Release all workers by participating in the barrier.
+        self.barrier.wait();
+    }
+
+    fn wait_all_done(&self) {
+        // Spin-wait until all workers have called `finish`.
+        while self.finished.load(Relaxed) < self.total {
+            std::hint::spin_loop();
+        }
+    }
+
+    fn wait_for_token(&self, _worker_id: WorkerId) {
+        // All workers wait on the barrier together — once released, they
+        // run concurrently with no further synchronisation.
+        self.barrier.wait();
+    }
+
+    fn yield_token(&self, _worker_id: WorkerId) -> bool {
+        // No token to yield — all workers run freely.
+        false
+    }
+
+    fn finish(&self, _worker_id: WorkerId) {
+        self.finished.fetch_add(1, Relaxed);
+    }
+}
