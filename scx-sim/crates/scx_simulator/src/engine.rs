@@ -14,7 +14,7 @@ use tracing::{debug, info, trace, warn};
 use crate::backend::e9patch::E9PatchBackend;
 use crate::backend::pmu::PmuBackend;
 use crate::backend::replay::ReplayBackend;
-use crate::backend::{PreemptionBackend, SendPtr};
+use crate::backend::{PreemptionBackend, SendPtr, StructopDelta};
 use crate::cgroup::{clear_cgroup_registry, install_cgroup_registry, CgroupId, CgroupRegistry};
 use crate::cpu::{IrqContext, LastStopReason, SimCpu};
 use crate::dsq::DsqManager;
@@ -3083,22 +3083,12 @@ impl<S: Scheduler> Simulator<S> {
                     }
 
                     // Drain per-worker interleave count into structop accumulator.
-                    unsafe {
-                        let idx = cpu.0 as usize;
-                        if idx < (*sp).structop_accum.len() {
-                            (&mut (*sp).structop_accum)[idx].interleave_count +=
-                                crate::preempt::structop_info().interleave_count;
-                        }
-                    }
-
-                    // Clear ops_context before releasing the token to avoid
-                    // a race: after finish(), the new token holder writes
-                    // ops_context = Dispatch and our exit_sim must not
-                    // clobber it.
-                    unsafe { (*sp).ops_context = OpsContext::None };
-                    crate::preempt::set_current_ops_context(OpsContext::None);
-                    ring_ref.finish(worker_id);
-                    kfuncs::exit_sim_no_clear_ops();
+                    let delta = StructopDelta {
+                        rbc_total: 0,
+                        interleave_count: crate::preempt::structop_info().interleave_count,
+                    };
+                    unsafe { crate::backend::drain_structop_accum(sp, cpu, &delta) };
+                    unsafe { crate::backend::clear_ops_and_finish(sp, ring_ref, worker_id) };
                     interleave::uninstall();
                 });
             }
@@ -3326,20 +3316,12 @@ impl<S: Scheduler> Simulator<S> {
                     }
 
                     // Drain per-worker interleave count into structop accumulator.
-                    unsafe {
-                        let idx = cpu.0 as usize;
-                        if idx < (*sp).structop_accum.len() {
-                            (&mut (*sp).structop_accum)[idx].interleave_count +=
-                                crate::preempt::structop_info().interleave_count;
-                        }
-                    }
-
-                    // Clear ops_context before releasing the token (same
-                    // race-prevention as the dispatch cooperative path).
-                    unsafe { (*sp).ops_context = OpsContext::None };
-                    crate::preempt::set_current_ops_context(OpsContext::None);
-                    ring_ref.finish(worker_id);
-                    kfuncs::exit_sim_no_clear_ops();
+                    let delta = StructopDelta {
+                        rbc_total: 0,
+                        interleave_count: crate::preempt::structop_info().interleave_count,
+                    };
+                    unsafe { crate::backend::drain_structop_accum(sp, cpu, &delta) };
+                    unsafe { crate::backend::clear_ops_and_finish(sp, ring_ref, worker_id) };
                     interleave::uninstall();
                 });
             }
