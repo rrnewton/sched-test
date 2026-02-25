@@ -25,6 +25,11 @@ struct task_struct;
 /* Declared in sim_task.c — gets PID from task pointer */
 extern int sim_task_get_pid(struct task_struct *p);
 
+/* RBC counter pause/resume — defined in Rust (kfuncs.rs), resolved via
+ * -rdynamic. Pauses the PMU counter so kfunc branches are not counted. */
+extern void sim_rbc_pause(void);
+extern void sim_rbc_resume(void);
+
 /*
  * Hash table for mapping task_struct* → allocated per-task context.
  *
@@ -89,9 +94,11 @@ static struct sdt_entry *sdt_find_slot(struct task_struct *p)
  */
 int scx_task_init(u64 data_size)
 {
+	sim_rbc_pause();
 	sdt_data_size = data_size;
 	__builtin_memset(sdt_table, 0, sizeof(sdt_table));
 	sdt_initialized = 1;
+	sim_rbc_resume();
 	return 0;
 }
 
@@ -106,16 +113,23 @@ void *scx_task_alloc(struct task_struct *p)
 	struct sdt_entry *entry;
 	void *data;
 
-	if (!sdt_initialized || !p)
+	sim_rbc_pause();
+
+	if (!sdt_initialized || !p) {
+		sim_rbc_resume();
 		return (void *)0;
+	}
 
 	data = sim_arena_calloc(sdt_data_size);
-	if (!data)
+	if (!data) {
+		sim_rbc_resume();
 		return (void *)0;
+	}
 
 	entry = sdt_find_slot(p);
 	if (!entry) {
 		sim_arena_free(data);
+		sim_rbc_resume();
 		return (void *)0;
 	}
 
@@ -125,6 +139,7 @@ void *scx_task_alloc(struct task_struct *p)
 
 	entry->key = p;
 	entry->data = data;
+	sim_rbc_resume();
 	return data;
 }
 
@@ -137,13 +152,20 @@ void *scx_task_data(struct task_struct *p)
 {
 	struct sdt_entry *entry;
 
-	if (!sdt_initialized || !p)
+	sim_rbc_pause();
+
+	if (!sdt_initialized || !p) {
+		sim_rbc_resume();
 		return (void *)0;
+	}
 
 	entry = sdt_find_slot(p);
-	if (!entry || entry->key != p)
+	if (!entry || entry->key != p) {
+		sim_rbc_resume();
 		return (void *)0;
+	}
 
+	sim_rbc_resume();
 	return entry->data;
 }
 
@@ -154,16 +176,23 @@ void scx_task_free(struct task_struct *p)
 {
 	struct sdt_entry *entry;
 
-	if (!sdt_initialized || !p)
+	sim_rbc_pause();
+
+	if (!sdt_initialized || !p) {
+		sim_rbc_resume();
 		return;
+	}
 
 	entry = sdt_find_slot(p);
-	if (!entry || entry->key != p)
+	if (!entry || entry->key != p) {
+		sim_rbc_resume();
 		return;
+	}
 
 	sim_arena_free(entry->data);
 	entry->key = (void *)0;
 	entry->data = (void *)0;
+	sim_rbc_resume();
 }
 
 /*
