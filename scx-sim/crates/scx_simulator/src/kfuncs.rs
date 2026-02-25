@@ -971,23 +971,17 @@ where
             // Track kfunc call count and cost for RBC accounting
             sim.rbc_kfunc_calls += 1;
             sim.rbc_kfunc_ns += cost_ns;
-            // Pause RBC counter — kfunc code is not scheduler code
-            if let Some(ref rbc) = sim.rbc_counter {
-                let _ = rbc.disable();
-            }
-            // Pause RBC measurement counter (preemptive mode)
-            crate::preempt::pause_measurement();
+            // Pause RBC counter — kfunc code is not scheduler code.
+            // Uses the re-entrant pause/resume so C kfuncs called from
+            // within this kfunc don't prematurely re-enable the counter.
+            sim_rbc_pause();
             // Pause preemption timer — prevent signals while &mut SimulatorState exists
             crate::preempt::pause_timer();
 
             let result = f(sim);
 
             // Resume RBC counter — returning to scheduler C code
-            if let Some(ref rbc) = sim.rbc_counter {
-                let _ = rbc.enable();
-            }
-            // Resume RBC measurement counter (preemptive mode)
-            crate::preempt::resume_measurement();
+            sim_rbc_resume();
             result
         };
         // &mut SimulatorState borrow ended — safe to yield.
@@ -1009,6 +1003,69 @@ where
 
         result
     })
+}
+
+// ---------------------------------------------------------------------------
+// C-callable RBC counter pause/resume for C kfunc stubs
+// ---------------------------------------------------------------------------
+
+// Nesting depth for RBC pause/resume. Only the outermost pause/resume
+// pair actually disables/enables the PMU counter. This allows C kfuncs
+// to call other C kfuncs (or Rust kfuncs via `with_sim`) without
+// prematurely re-enabling the counter.
+thread_local! {
+    static RBC_PAUSE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Pause the PMU RBC counter from C code.
+///
+/// Called by C kfunc stubs (scx_task_alloc, bpf_cpumask_create, etc.) that
+/// are semantically kfuncs but implemented as plain C. Re-entrant: nested
+/// calls increment a depth counter; only the outermost pause disables
+/// the PMU.
+#[no_mangle]
+pub extern "C" fn sim_rbc_pause() {
+    let depth = RBC_PAUSE_DEPTH.with(|d| {
+        let cur = d.get();
+        d.set(cur + 1);
+        cur
+    });
+    if depth == 0 {
+        SIM_STATE.with(|cell| {
+            if let Some(ptr) = cell.get() {
+                let sim = unsafe { &*ptr };
+                if let Some(ref rbc) = sim.rbc_counter {
+                    let _ = rbc.disable();
+                }
+                crate::preempt::pause_measurement();
+            }
+        });
+    }
+}
+
+/// Resume the PMU RBC counter from C code.
+///
+/// Counterpart to `sim_rbc_pause()`. Only the outermost resume
+/// re-enables the PMU.
+#[no_mangle]
+pub extern "C" fn sim_rbc_resume() {
+    let depth = RBC_PAUSE_DEPTH.with(|d| {
+        let cur = d.get();
+        debug_assert!(cur > 0, "sim_rbc_resume without matching sim_rbc_pause");
+        d.set(cur - 1);
+        cur - 1
+    });
+    if depth == 0 {
+        SIM_STATE.with(|cell| {
+            if let Some(ptr) = cell.get() {
+                let sim = unsafe { &*ptr };
+                if let Some(ref rbc) = sim.rbc_counter {
+                    let _ = rbc.enable();
+                }
+                crate::preempt::resume_measurement();
+            }
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------
