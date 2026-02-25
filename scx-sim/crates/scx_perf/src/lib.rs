@@ -182,7 +182,10 @@ impl PmuConfig {
 
 /// Open a perf_event_open counting fd for the given type/config pair.
 ///
-/// Returns the raw fd. The counter starts disabled, excludes kernel and hypervisor.
+/// Returns the raw fd. The counter starts disabled, pinned, excludes kernel
+/// and hypervisor. The `pinned` flag requests an exclusive hardware counter;
+/// if none is available, `perf_event_open` succeeds but reads return 0
+/// (callers must validate via a test read).
 fn open_counting_fd(type_: u32, config: u64) -> Result<RawFd, PerfError> {
     let mut attr = perf::bindings::perf_event_attr {
         type_,
@@ -193,6 +196,7 @@ fn open_counting_fd(type_: u32, config: u64) -> Result<RawFd, PerfError> {
     attr.set_disabled(1);
     attr.set_exclude_kernel(1);
     attr.set_exclude_hv(1);
+    attr.set_pinned(1);
 
     // pid=0 (current thread), cpu=-1 (any CPU)
     let fd = unsafe { perf::perf_event_open(&mut attr, 0, -1, -1, 0) };
@@ -230,8 +234,9 @@ fn open_sampling_fd(type_: u32, config: u64, sample_period: u64) -> Result<RawFd
 
 /// A PMU counter for retired conditional branches.
 ///
-/// Wraps a `perf_event_open` file descriptor. The counter is pinned to the
-/// current thread and CPU-independent (it follows the thread).
+/// Wraps a `perf_event_open` file descriptor. The counter is created with
+/// `pinned=1` for an exclusive hardware counter (no multiplexing) and is
+/// CPU-independent (it follows the thread).
 pub struct RbcCounter {
     fd: RawFd,
 }
@@ -732,8 +737,13 @@ impl Drop for HwBreakpoint {
 
 /// Try to create an RBC counter, returning `None` with a warning if unavailable.
 ///
-/// This is the recommended entry point: it handles CPU detection failure and
-/// perf_event_open permission errors gracefully.
+/// This is the recommended entry point: it handles CPU detection failure,
+/// perf_event_open permission errors, and PMU contention gracefully.
+///
+/// Because the counter is created with `pinned=1`, `perf_event_open` will
+/// succeed even when no physical PMU counter is available, but reads will
+/// return 0. This function validates the counter by running a short
+/// branch-generating loop and checking for a non-zero read.
 pub fn try_create_rbc_counter() -> Option<RbcCounter> {
     let config = match PmuConfig::detect() {
         Some(c) => c,
@@ -742,13 +752,52 @@ pub fn try_create_rbc_counter() -> Option<RbcCounter> {
             return None;
         }
     };
-    match RbcCounter::new(&config) {
-        Ok(counter) => Some(counter),
+    let counter = match RbcCounter::new(&config) {
+        Ok(c) => c,
         Err(e) => {
             tracing::warn!("RBC counter unavailable: {e}");
-            None
+            return None;
+        }
+    };
+
+    // Validate: the counter must actually count branches.
+    // With pinned=1, perf_event_open succeeds but reads return 0
+    // if no physical PMU counter is available.
+    if !validate_rbc_counter(&counter) {
+        return None;
+    }
+
+    Some(counter)
+}
+
+/// Run a short branch-generating loop and verify the counter reads non-zero.
+///
+/// Returns `true` if the counter is working, `false` (with a warning) if
+/// the PMU hardware counter is not available (pinned counter reads zero).
+fn validate_rbc_counter(counter: &RbcCounter) -> bool {
+    let _ = counter.reset();
+    let _ = counter.enable();
+    // Generate known conditional branches.
+    let mut sum = 0u64;
+    for i in 0..1000u64 {
+        if i % 2 == 0 {
+            sum += i;
         }
     }
+    std::hint::black_box(sum);
+    let _ = counter.disable();
+    let count = counter.read().unwrap_or(0);
+    if count == 0 {
+        tracing::warn!(
+            "RBC counter created but reads zero (PMU not available). \
+             Falling back to no-RBC overhead model."
+        );
+        return false;
+    }
+    tracing::info!(validated_count = count, "RBC counter validated");
+    // Reset so the caller gets a clean counter.
+    let _ = counter.reset();
+    true
 }
 
 /// Try to create an RBC timer, returning `None` with a warning if unavailable.
