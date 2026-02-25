@@ -463,6 +463,7 @@ fn charge_sched_time(state: &mut SimulatorState, cpu: CpuId, ops: &str) {
             let kfunc_ns = state.rbc_kfunc_ns;
             let total_ns = rbc_ns + kfunc_ns;
             state.cpus[cpu.0 as usize].local_clock += total_ns;
+            kfuncs::clock_window_check(cpu, state.cpus[cpu.0 as usize].local_clock);
             trace!(
                 ops,
                 rbc = count,
@@ -489,6 +490,7 @@ fn charge_sched_time(state: &mut SimulatorState, cpu: CpuId, ops: &str) {
         let kfunc_ns = state.rbc_kfunc_ns;
         let total_ns = kfunc_ns.max(MIN_CALLBACK_COST_NS);
         state.cpus[cpu.0 as usize].local_clock += total_ns;
+        kfuncs::clock_window_check(cpu, state.cpus[cpu.0 as usize].local_clock);
         trace!(
             ops,
             kfuncs = state.rbc_kfunc_calls,
@@ -2502,6 +2504,7 @@ impl<S: Scheduler> Simulator<S> {
         // Apply CSW overhead directly to local_clock (see #NOTE TIMING_MODEL)
         let overhead = state.csw_overhead(stop_reason);
         state.cpus[cpu.0 as usize].local_clock += overhead;
+        kfuncs::clock_window_check(cpu, state.cpus[cpu.0 as usize].local_clock);
 
         // Set slice to reflect consumed time (used by stopping() for vtime)
         let remaining_slice = original_slice.saturating_sub(time_consumed);
@@ -3513,6 +3516,7 @@ impl<S: Scheduler> Simulator<S> {
         // Apply CSW overhead (see #NOTE TIMING_MODEL)
         let overhead = state.csw_overhead(LastStopReason::Involuntary);
         state.cpus[cpu_idx].local_clock += overhead;
+        kfuncs::clock_window_check(cpu, state.cpus[cpu_idx].local_clock);
 
         // Set remaining slice on raw task (used by stopping() for vtime)
         unsafe { crate::ffi::sim_task_set_slice(raw, remaining_slice) };

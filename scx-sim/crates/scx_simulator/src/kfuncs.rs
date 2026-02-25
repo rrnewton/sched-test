@@ -416,6 +416,7 @@ impl SimulatorState {
     pub fn advance_cpu_clock(&mut self, cpu: CpuId) {
         let idx = cpu.0 as usize;
         self.cpus[idx].local_clock = self.cpus[idx].local_clock.max(self.clock);
+        clock_window_check(cpu, self.cpus[idx].local_clock);
     }
 
     /// Sample approximately-normal noise using Irwin-Hall (sum of 4 uniforms).
@@ -789,6 +790,16 @@ pub fn set_sim_cpu_width(nr_cpus: u32) {
         ctx.cpu_width = width;
         c.set(ctx);
     });
+}
+
+/// Hook for clock-window throttling in native concurrent mode.
+///
+/// Called whenever a CPU's `local_clock` advances. In Phase 2, this
+/// will check the window constraint and spin/yield if the calling CPU
+/// has raced too far ahead of the slowest CPU.
+#[inline(always)]
+pub fn clock_window_check(_cpu: CpuId, _local_clock: TimeNs) {
+    // Phase 2: enforce window constraint via NativeOrchestrator
 }
 
 /// Access the simulator state from within a kfunc.
