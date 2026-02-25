@@ -1,10 +1,18 @@
-//! Preemption backend trait and generic interleaving drivers.
+//! Preemption backend trait, thread orchestration, and generic interleaving
+//! drivers.
 //!
 //! Provides a trait-based abstraction for different preemption backends
-//! (PMU timer, hardware breakpoint replay, Frida Stalker). Each backend
+//! (PMU timer, hardware breakpoint replay, e9patch). Each backend
 //! implements [`PreemptionBackend`] to define how workers are instrumented;
 //! the generic [`run_preemptive_dispatch`] and [`run_preemptive_batch`]
 //! drivers handle the common worker lifecycle.
+//!
+//! Thread synchronization is decoupled from preemption instrumentation via
+//! the [`ThreadOrchestrator`] trait, which captures the wait/yield/finish
+//! protocol. Both [`PreemptRing`] (futex-based) and
+//! [`TokenRing`](crate::interleave::TokenRing) (Mutex/Condvar-based)
+//! implement this trait, enabling future backends (e.g. native concurrency)
+//! to provide alternative synchronization strategies.
 
 pub mod e9patch;
 pub mod pmu;
@@ -20,6 +28,83 @@ use crate::interleave::WorkerId;
 use crate::kfuncs::{self, OpsContext, SimulatorState};
 use crate::preempt::PreemptRing;
 use crate::types::CpuId;
+
+// ---------------------------------------------------------------------------
+// ThreadOrchestrator — synchronization strategy abstraction
+// ---------------------------------------------------------------------------
+
+/// Trait capturing the thread synchronization protocol for concurrent
+/// worker execution.
+///
+/// Decouples the wait/yield/finish protocol from preemption instrumentation.
+/// Both [`PreemptRing`] (futex-based, signal-safe) and
+/// [`TokenRing`](crate::interleave::TokenRing) (Mutex/Condvar-based)
+/// implement this trait. Future backends (e.g. native concurrency with no
+/// serialization) can provide alternative implementations.
+///
+/// # Protocol
+///
+/// **Orchestrator side:**
+/// 1. [`start`](ThreadOrchestrator::start) — signal all workers to begin
+/// 2. [`wait_all_done`](ThreadOrchestrator::wait_all_done) — block until
+///    all workers have called `finish`
+///
+/// **Worker side:**
+/// 1. [`wait_for_token`](ThreadOrchestrator::wait_for_token) — block until
+///    allowed to execute
+/// 2. (worker body runs)
+/// 3. [`finish`](ThreadOrchestrator::finish) — signal completion, wake next
+///
+/// Workers may also call [`yield_token`](ThreadOrchestrator::yield_token)
+/// at cooperative yield points to release and re-acquire the execution token.
+pub(crate) trait ThreadOrchestrator: Sync {
+    /// Orchestrator: select the first worker and wake it.
+    fn start(&self);
+
+    /// Orchestrator: block until all workers have finished.
+    fn wait_all_done(&self);
+
+    /// Worker: block until this worker is selected to execute.
+    fn wait_for_token(&self, worker_id: WorkerId);
+
+    /// Worker: release token, select next worker via PRNG, block until
+    /// re-selected.
+    ///
+    /// Returns `true` if a different worker was selected (actual context
+    /// switch), `false` if the same worker was re-selected (no-op yield).
+    ///
+    /// Currently called through concrete types (`PreemptRing::yield_token`,
+    /// `TokenRing::yield_token`) rather than through the trait, but is part
+    /// of the orchestrator protocol surface for future backends.
+    #[allow(dead_code)]
+    fn yield_token(&self, worker_id: WorkerId) -> bool;
+
+    /// Worker: mark as finished and wake the next worker (or signal
+    /// all-done to the orchestrator).
+    fn finish(&self, worker_id: WorkerId);
+}
+
+impl ThreadOrchestrator for PreemptRing {
+    fn start(&self) {
+        PreemptRing::start(self);
+    }
+
+    fn wait_all_done(&self) {
+        PreemptRing::wait_all_done(self);
+    }
+
+    fn wait_for_token(&self, worker_id: WorkerId) {
+        PreemptRing::wait_for_token(self, worker_id);
+    }
+
+    fn yield_token(&self, worker_id: WorkerId) -> bool {
+        PreemptRing::yield_token(self, worker_id)
+    }
+
+    fn finish(&self, worker_id: WorkerId) {
+        PreemptRing::finish(self, worker_id);
+    }
+}
 
 /// Wrapper to send raw pointers across thread boundaries.
 ///
@@ -179,12 +264,54 @@ fn build_and_arm<B: PreemptionBackend>(backend: &B, ctx: &mut B::WorkerCtx, ring
     }
 }
 
+/// Drain per-worker structop deltas into the accumulator.
+///
+/// # Safety
+/// Caller must hold the execution token (single-writer access to `sp`).
+pub(crate) unsafe fn drain_structop_accum(
+    sp: *mut SimulatorState,
+    cpu: CpuId,
+    delta: &StructopDelta,
+) {
+    let idx = cpu.0 as usize;
+    if idx < (*sp).structop_accum.len() {
+        let accum = &mut (&mut (*sp).structop_accum)[idx];
+        accum.rbc_total += delta.rbc_total;
+        accum.interleave_count += delta.interleave_count;
+    }
+}
+
+/// Clear ops_context and release the token via the orchestrator.
+///
+/// Must be called AFTER disabling instrumentation (so pending signals
+/// still see the true callback context) and BEFORE releasing the token
+/// (so the new token holder's ops_context isn't clobbered by our
+/// exit_sim).
+///
+/// # Safety
+/// Caller must hold the execution token (single-writer access to `sp`).
+pub(crate) unsafe fn clear_ops_and_finish<O: ThreadOrchestrator>(
+    sp: *mut SimulatorState,
+    orchestrator: &O,
+    worker_id: WorkerId,
+) {
+    (*sp).ops_context = OpsContext::None;
+    crate::preempt::set_current_ops_context(OpsContext::None);
+    orchestrator.finish(worker_id);
+    kfuncs::exit_sim_no_clear_ops();
+}
+
 /// Run concurrent dispatch using a [`PreemptionBackend`].
 ///
 /// Spawns one worker per CPU, each executing `dispatch_worker_body` inside
-/// the PreemptRing token-passing protocol with backend-specific
-/// instrumentation. The common lifecycle (structop drain, ops_context clear,
-/// token protocol) is handled here.
+/// the token-passing protocol with backend-specific instrumentation. The
+/// common lifecycle (structop drain, ops_context clear, synchronization
+/// protocol) is handled here.
+///
+/// Thread synchronization (wait/finish/start/wait_all_done) is routed
+/// through the [`ThreadOrchestrator`] trait. For preemptive backends the
+/// orchestrator is the `PreemptRing` itself; the `PreemptRing` is still
+/// needed for PRNG/recording/timeslice functionality.
 pub(crate) fn run_preemptive_dispatch<S, B>(
     dispatch_cpus: &[CpuId],
     state_send: &SendPtr<SimulatorState>,
@@ -196,10 +323,30 @@ pub(crate) fn run_preemptive_dispatch<S, B>(
     B: PreemptionBackend,
 {
     let ring = PreemptRing::new(dispatch_cpus.len(), seed);
+    run_dispatch_with_orchestrator(dispatch_cpus, state_send, sched_send, &ring, &ring, backend);
+}
+
+/// Inner dispatch driver parameterised over [`ThreadOrchestrator`].
+///
+/// Separated from [`run_preemptive_dispatch`] so that future backends can
+/// supply a different orchestrator while reusing the same worker lifecycle.
+fn run_dispatch_with_orchestrator<S, B, O>(
+    dispatch_cpus: &[CpuId],
+    state_send: &SendPtr<SimulatorState>,
+    sched_send: &SendPtr<S>,
+    ring: &PreemptRing,
+    orchestrator: &O,
+    backend: &B,
+) where
+    S: Scheduler,
+    B: PreemptionBackend,
+    O: ThreadOrchestrator,
+{
     backend.global_setup();
 
     std::thread::scope(|s| {
-        let ring_ref = &ring;
+        let ring_ref = ring;
+        let orch_ref = orchestrator;
         let state_ref = state_send;
         let sched_ref = sched_send;
 
@@ -211,7 +358,7 @@ pub(crate) fn run_preemptive_dispatch<S, B>(
                 let schp = sched_ref.0 as *const S;
 
                 let mut ctx = backend.worker_setup(ring_ref, worker_id);
-                ring_ref.wait_for_token(worker_id);
+                orch_ref.wait_for_token(worker_id);
 
                 // Enter sim AFTER acquiring the token to avoid racing on
                 // SimulatorState.current_cpu with other workers.
@@ -225,35 +372,18 @@ pub(crate) fn run_preemptive_dispatch<S, B>(
                 }
 
                 let delta = backend.disarm(&mut ctx);
-
-                // Drain per-worker structop deltas into the accumulator.
-                unsafe {
-                    let idx = cpu.0 as usize;
-                    if idx < (*sp).structop_accum.len() {
-                        let accum = &mut (&mut (*sp).structop_accum)[idx];
-                        accum.rbc_total += delta.rbc_total;
-                        accum.interleave_count += delta.interleave_count;
-                    }
-                }
-
-                // Clear ops_context AFTER disabling instrumentation (so
-                // pending signals still see the true callback context)
-                // and BEFORE releasing the token (so the new token
-                // holder's ops_context isn't clobbered by our exit_sim).
-                unsafe { (*sp).ops_context = OpsContext::None };
-                crate::preempt::set_current_ops_context(OpsContext::None);
-                ring_ref.finish(worker_id);
-                kfuncs::exit_sim_no_clear_ops();
+                unsafe { drain_structop_accum(sp, cpu, &delta) };
+                unsafe { clear_ops_and_finish(sp, orch_ref, worker_id) };
 
                 backend.worker_teardown(ctx);
             });
         }
 
-        ring.start();
-        ring.wait_all_done();
+        orchestrator.start();
+        orchestrator.wait_all_done();
     });
 
-    backend.log_completion(&ring);
+    backend.log_completion(ring);
     backend.global_teardown();
 }
 
@@ -280,10 +410,52 @@ pub(crate) fn run_preemptive_batch<S, B>(
     B: PreemptionBackend,
 {
     let ring = PreemptRing::new(cpu_ids.len(), seed);
+    run_batch_with_orchestrator(
+        per_cpu,
+        cpu_ids,
+        sim_send,
+        state_send,
+        tasks_send,
+        events_send,
+        cgroup_send,
+        &ring,
+        &ring,
+        watchdog_timeout,
+        duration_ns,
+        max_cgroups,
+        backend,
+    );
+}
+
+/// Inner batch driver parameterised over [`ThreadOrchestrator`].
+///
+/// Separated from [`run_preemptive_batch`] so that future backends can
+/// supply a different orchestrator while reusing the same worker lifecycle.
+#[allow(clippy::too_many_arguments)]
+fn run_batch_with_orchestrator<S, B, O>(
+    per_cpu: &HashMap<CpuId, Vec<crate::engine::Event>>,
+    cpu_ids: &[CpuId],
+    sim_send: &SendPtr<Simulator<S>>,
+    state_send: &SendPtr<SimulatorState>,
+    tasks_send: &SendPtr<HashMap<crate::types::Pid, crate::task::SimTask>>,
+    events_send: &SendPtr<EventQueue>,
+    cgroup_send: &SendPtr<crate::cgroup::CgroupRegistry>,
+    ring: &PreemptRing,
+    orchestrator: &O,
+    watchdog_timeout: Option<crate::types::TimeNs>,
+    duration_ns: crate::types::TimeNs,
+    max_cgroups: u32,
+    backend: &B,
+) where
+    S: Scheduler,
+    B: PreemptionBackend,
+    O: ThreadOrchestrator,
+{
     backend.global_setup();
 
     std::thread::scope(|s| {
-        let ring_ref = &ring;
+        let ring_ref = ring;
+        let orch_ref = orchestrator;
         let sim_ref = sim_send;
         let state_ref = state_send;
         let tasks_ref = tasks_send;
@@ -299,7 +471,7 @@ pub(crate) fn run_preemptive_batch<S, B>(
                 let sp = state_ref.0;
 
                 let mut ctx = backend.worker_setup(ring_ref, worker_id);
-                ring_ref.wait_for_token(worker_id);
+                orch_ref.wait_for_token(worker_id);
 
                 unsafe { kfuncs::enter_sim(&mut *sp, cpu) };
 
@@ -320,29 +492,17 @@ pub(crate) fn run_preemptive_batch<S, B>(
                 }
 
                 let delta = backend.disarm(&mut ctx);
-
-                unsafe {
-                    let idx = cpu.0 as usize;
-                    if idx < (*sp).structop_accum.len() {
-                        let accum = &mut (&mut (*sp).structop_accum)[idx];
-                        accum.rbc_total += delta.rbc_total;
-                        accum.interleave_count += delta.interleave_count;
-                    }
-                }
-
-                unsafe { (*sp).ops_context = OpsContext::None };
-                crate::preempt::set_current_ops_context(OpsContext::None);
-                ring_ref.finish(worker_id);
-                kfuncs::exit_sim_no_clear_ops();
+                unsafe { drain_structop_accum(sp, cpu, &delta) };
+                unsafe { clear_ops_and_finish(sp, orch_ref, worker_id) };
 
                 backend.worker_teardown(ctx);
             });
         }
 
-        ring.start();
-        ring.wait_all_done();
+        orchestrator.start();
+        orchestrator.wait_all_done();
     });
 
-    backend.log_completion(&ring);
+    backend.log_completion(ring);
     backend.global_teardown();
 }
