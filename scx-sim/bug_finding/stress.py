@@ -10,6 +10,8 @@ Usage:
     python3 stress.py                  # Run for 10 minutes (default)
     python3 stress.py --duration 30    # Run for 30 minutes
     python3 stress.py --jobs 8         # Use 8 parallel workers
+    python3 stress.py --determinism    # Enable determinism checking
+    python3 stress.py --e9patch        # Only test e9patch mode
 """
 
 import argparse
@@ -38,12 +40,24 @@ OUTPUT_DIR = Path(__file__).parent / "output"
 
 SCHEDULERS = ["simple", "lavd", "cosmos", "tickless", "mitosis"]
 CPU_COUNTS = [1, 2, 4, 8]
-INTERLEAVE_MODES = ["off", "cooperative", "preemptive"]
+INTERLEAVE_MODES = ["off", "cooperative", "preemptive", "e9patch"]
 
 
 def get_available_workloads() -> list[Path]:
     """Return sorted list of available workload files."""
     return sorted(WORKLOADS_DIR.glob("*.json"))
+
+
+def e9_schedulers_available() -> bool:
+    """Check if _e9.so scheduler variants exist (built via `make e9`)."""
+    # Look for at least one _e9.so in the scheduler build dir.
+    sched_dirs = list(
+        PROJECT_ROOT.glob("target/release/build/scx_simulator-*/out/schedulers")
+    )
+    if not sched_dirs:
+        return False
+    return any(sched_dirs[0].glob("*_e9.so"))
+
 
 # Defaults for stall detection
 DEFAULT_WATCHDOG_TIMEOUT = "2s"
@@ -51,6 +65,9 @@ DEFAULT_SIM_DURATION = "4s"
 
 # Process timeout (wall-clock) — generous to avoid false positives
 PROCESS_TIMEOUT_SEC = 120
+
+# Number of repeat runs for e9patch determinism checking
+E9_DETERMINISM_REPEATS = 3
 
 # Runtime config (set from CLI args in main)
 WATCHDOG_TIMEOUT = DEFAULT_WATCHDOG_TIMEOUT
@@ -96,7 +113,7 @@ class TestConfig:
     workload: Path
     cpus: int
     seed: int
-    interleave_mode: str  # "off", "cooperative", "preemptive"
+    interleave_mode: str  # "off", "cooperative", "preemptive", "e9patch"
     iteration: int
 
     @property
@@ -149,19 +166,7 @@ class Finding:
         return "\n".join(lines)
 
     def repro_command(self) -> str:
-        cmd = [
-            str(SCXSIM),
-            str(self.config.workload),
-            "-s", self.config.scheduler,
-            "-c", str(self.config.cpus),
-            "--seed", str(self.config.seed),
-            "--watchdog-timeout", WATCHDOG_TIMEOUT,
-            "--end-time", SIM_DURATION,
-        ]
-        if self.config.interleave_mode == "cooperative":
-            cmd.append("--interleave")
-        elif self.config.interleave_mode == "preemptive":
-            cmd.append("--preemptive")
+        cmd = build_base_cmd(self.config)
         if self.error_type == "determinism":
             cmd.append("--determinism-check")
         return " ".join(cmd)
@@ -176,6 +181,7 @@ def build_base_cmd(config: TestConfig) -> list[str]:
     """Build the base scxsim command for a configuration."""
     cmd = [
         str(SCXSIM),
+        "run",
         str(config.workload),
         "-s", config.scheduler,
         "-c", str(config.cpus),
@@ -187,6 +193,8 @@ def build_base_cmd(config: TestConfig) -> list[str]:
         cmd.append("--interleave")
     elif config.interleave_mode == "preemptive":
         cmd.append("--preemptive")
+    elif config.interleave_mode == "e9patch":
+        cmd.extend(["--preemptive", "--preempt-mode", "e9patch"])
     return cmd
 
 
@@ -283,11 +291,163 @@ def run_determinism_preemptive(config: TestConfig) -> Optional[Finding]:
             os.unlink(tmpfile.name)
 
 
+def normalize_stdout(stdout: str) -> str:
+    """Remove nondeterministic fields from stdout for comparison.
+
+    The structop summary's `rbc` column measures PMU overhead (real CPU
+    cycles), which varies between runs. Strip that column so only
+    deterministic fields (structops, kfuncs, interlv) remain.
+    """
+    lines = []
+    in_structop_table = False
+    rbc_col_idx = None
+
+    for line in stdout.splitlines():
+        stripped = line.strip()
+
+        # Detect the structop header line to find the rbc column index
+        if "structops" in stripped and "kfuncs" in stripped:
+            in_structop_table = True
+            parts = stripped.split()
+            try:
+                rbc_col_idx = parts.index("rbc")
+            except ValueError:
+                rbc_col_idx = None
+            if rbc_col_idx is not None:
+                del parts[rbc_col_idx]
+            lines.append("  ".join(parts))
+            continue
+
+        # Inside the structop table: strip the rbc column from data lines
+        if in_structop_table and rbc_col_idx is not None:
+            parts = stripped.split()
+            if len(parts) > rbc_col_idx:
+                del parts[rbc_col_idx]
+                lines.append("  ".join(parts))
+                continue
+            elif not stripped:
+                # Empty line ends the table
+                in_structop_table = False
+                rbc_col_idx = None
+
+        lines.append(line)
+
+    return "\n".join(lines)
+
+
+def compare_outputs(stdout1: str, stdout2: str, run_a: int, run_b: int) -> str:
+    """Compare two stdout strings line-by-line and return diff description.
+
+    Returns empty string if identical, otherwise a summary of first divergence.
+    Normalizes stdout to remove nondeterministic PMU overhead columns.
+    """
+    norm1 = normalize_stdout(stdout1).strip().splitlines()
+    norm2 = normalize_stdout(stdout2).strip().splitlines()
+    for i, (l1, l2) in enumerate(zip(norm1, norm2)):
+        if l1 != l2:
+            return (
+                f"stdout diverges at line {i + 1} (run {run_a} vs {run_b}):\n"
+                f"  run {run_a}: {l1!r}\n"
+                f"  run {run_b}: {l2!r}"
+            )
+    if len(norm1) != len(norm2):
+        return (
+            f"stdout line count differs (run {run_a} vs {run_b}): "
+            f"{len(norm1)} vs {len(norm2)}"
+        )
+    return ""
+
+
+def run_determinism_e9patch(config: TestConfig) -> Optional[Finding]:
+    """Run the same e9patch config N times and compare stdout for determinism.
+
+    e9patch is fully deterministic (no PMU skid), so identical seeds must
+    produce identical output. This is a stronger check than --determinism-check
+    because it also compares the final stdout summary (not just checkpoints).
+    """
+    start = time.monotonic()
+    results = []
+    env = os.environ.copy()
+    env["RUST_LOG"] = "warn"
+
+    try:
+        for i in range(E9_DETERMINISM_REPEATS):
+            cmd = build_base_cmd(config)
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=PROCESS_TIMEOUT_SEC,
+                env=env,
+            )
+            if result.returncode != 0:
+                elapsed = time.monotonic() - start
+                error_type = classify_error(result.returncode, result.stderr)
+                return Finding(
+                    config=config,
+                    error_type=f"e9_run{i + 1}_{error_type}",
+                    exit_code=result.returncode,
+                    stderr=result.stderr.strip(),
+                    stdout=result.stdout.strip(),
+                    wall_time_sec=elapsed,
+                )
+            results.append(result)
+
+        elapsed = time.monotonic() - start
+
+        # Compare all runs against the first
+        for i in range(1, len(results)):
+            diff = compare_outputs(
+                results[0].stdout, results[i].stdout, 1, i + 1
+            )
+            if diff:
+                combined_stderr = (
+                    f"e9patch determinism failure: {diff}\n\n"
+                    f"--- run 1 stderr ---\n{results[0].stderr.strip()}\n\n"
+                    f"--- run {i + 1} stderr ---\n{results[i].stderr.strip()}"
+                )
+                return Finding(
+                    config=config,
+                    error_type="determinism",
+                    exit_code=1,
+                    stderr=combined_stderr,
+                    stdout=results[0].stdout.strip(),
+                    wall_time_sec=elapsed,
+                )
+
+        # All runs identical
+        return None
+
+    except subprocess.TimeoutExpired:
+        elapsed = time.monotonic() - start
+        return Finding(
+            config=config,
+            error_type="timeout",
+            exit_code=-1,
+            stderr=f"process timed out after {PROCESS_TIMEOUT_SEC}s",
+            stdout="",
+            wall_time_sec=elapsed,
+        )
+    except Exception as e:
+        elapsed = time.monotonic() - start
+        return Finding(
+            config=config,
+            error_type="other",
+            exit_code=-1,
+            stderr=str(e),
+            stdout="",
+            wall_time_sec=elapsed,
+        )
+
+
 def run_one(config: TestConfig) -> Optional[Finding]:
     """Run a single simulation and return a Finding if it fails."""
-    # In determinism mode with preemptive configs, use record+replay.
-    if DETERMINISM_MODE and config.interleave_mode == "preemptive":
-        return run_determinism_preemptive(config)
+    # In determinism mode, use specialized handlers per interleave mode.
+    if DETERMINISM_MODE:
+        if config.interleave_mode == "preemptive":
+            return run_determinism_preemptive(config)
+        elif config.interleave_mode == "e9patch":
+            return run_determinism_e9patch(config)
 
     cmd = build_base_cmd(config)
 
@@ -342,15 +502,24 @@ def run_one(config: TestConfig) -> Optional[Finding]:
 
 
 def generate_configs(
-    rng: random.Random, schedulers: list[str], workloads: list[Path]
+    rng: random.Random,
+    schedulers: list[str],
+    workloads: list[Path],
+    modes: list[str],
 ) -> TestConfig:
     """Generate a random test configuration."""
+    mode = rng.choice(modes)
+    cpus = rng.choice(CPU_COUNTS)
+    # e9patch with 1 CPU has no concurrent dispatch and thus no preemption,
+    # so bias toward 2+ CPUs for e9patch mode.
+    if mode == "e9patch" and cpus == 1:
+        cpus = rng.choice([2, 4, 8])
     return TestConfig(
         scheduler=rng.choice(schedulers),
         workload=rng.choice(workloads),
-        cpus=rng.choice(CPU_COUNTS),
+        cpus=cpus,
         seed=rng.randint(0, 2**32 - 1),
-        interleave_mode=rng.choice(INTERLEAVE_MODES),
+        interleave_mode=mode,
         iteration=0,
     )
 
@@ -423,6 +592,16 @@ def main():
         action="store_true",
         help="Enable strict determinism checking: run each seed twice and verify identical behavior",
     )
+    parser.add_argument(
+        "--e9patch",
+        action="store_true",
+        help="Only test e9patch interleave mode (requires _e9.so variants)",
+    )
+    parser.add_argument(
+        "--no-e9patch",
+        action="store_true",
+        help="Exclude e9patch interleave mode",
+    )
     args = parser.parse_args()
 
     # Handle --list-workloads early (before other setup)
@@ -475,6 +654,24 @@ def main():
               file=sys.stderr)
         sys.exit(1)
 
+    # Determine which interleave modes to test
+    has_e9 = e9_schedulers_available()
+    if args.e9patch:
+        if not has_e9:
+            print(
+                "error: --e9patch requires _e9.so variants. "
+                "Build with: make -C schedulers e9",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        modes = ["e9patch"]
+    elif args.no_e9patch:
+        modes = [m for m in INTERLEAVE_MODES if m != "e9patch"]
+    elif has_e9:
+        modes = INTERLEAVE_MODES
+    else:
+        modes = [m for m in INTERLEAVE_MODES if m != "e9patch"]
+
     master_seed = args.seed if args.seed is not None else random.randint(0, 2**32 - 1)
     rng = random.Random(master_seed)
     deadline = time.monotonic() + args.duration * 60
@@ -486,7 +683,10 @@ def main():
     print(f"Mode: {mode_str}")
     print(f"Schedulers: {', '.join(schedulers)}")
     print(f"Workloads: {', '.join(wl.stem for wl in workloads)}")
+    print(f"Interleave modes: {', '.join(modes)}")
     print(f"Watchdog: {WATCHDOG_TIMEOUT}, sim duration: {SIM_DURATION}")
+    if "e9patch" in modes:
+        print(f"e9patch determinism repeats: {E9_DETERMINISM_REPEATS}")
     print(f"Output: {OUTPUT_DIR}")
     print(f"Log: {log_path}")
     print()
@@ -500,6 +700,7 @@ def main():
     log.info(f"Mode: {mode_str}")
     log.info(f"Schedulers: {', '.join(schedulers)}")
     log.info(f"Workloads: {', '.join(wl.stem for wl in workloads)}")
+    log.info(f"Interleave modes: {', '.join(modes)}")
     log.info(f"Watchdog timeout: {WATCHDOG_TIMEOUT}")
     log.info(f"Sim duration: {SIM_DURATION}")
 
@@ -518,7 +719,7 @@ def main():
             while time.monotonic() < deadline or pending:
                 # Submit new work while under deadline
                 while len(pending) < batch_size and time.monotonic() < deadline:
-                    config = generate_configs(rng, schedulers, workloads)
+                    config = generate_configs(rng, schedulers, workloads, modes)
                     config.iteration = iteration
                     iteration += 1
                     future = pool.submit(run_one, config)
