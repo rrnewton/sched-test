@@ -215,7 +215,7 @@ struct RunArgs {
     /// Controls the simulated-time window within which concurrent dispatch
     /// threads are allowed to execute. Requires --native-concurrent.
     /// Default: 10_000_000 (10 ms).
-    #[arg(long, default_value_t = 10_000_000, requires = "native_concurrent")]
+    #[arg(long, default_value_t = 10_000_000, requires = "native_concurrent", hide_default_value = true)]
     window_ns: u64,
 
     /// List available schedulers and exit.
