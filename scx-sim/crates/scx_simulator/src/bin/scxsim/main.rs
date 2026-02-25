@@ -8,9 +8,9 @@ use scx_simulator::scenario::{parse_duration_ns, parse_seed};
 use scx_simulator::{
     compare_checkpoints, compute_so_hash, discover_schedulers, drain_determinism_checkpoints,
     drain_preemption_records, enable_determinism_mode, enable_preemption_collection, load_rtapp,
-    scheduler_so_base, scheduler_so_path, DynamicScheduler, Phase, PmuEvent, PreemptMode,
-    PreemptionTrace, PreemptiveConfig, RepeatMode, Scenario, SimFormat, Simulator, TaskBehavior,
-    TraceMetadata, TraceStats, SIM_LOCK,
+    scheduler_so_base, scheduler_so_path, DynamicScheduler, NativeConcurrentConfig, Phase,
+    PmuEvent, PreemptMode, PreemptionTrace, PreemptiveConfig, RepeatMode, Scenario, SimFormat,
+    Simulator, TaskBehavior, TraceMetadata, TraceStats, SIM_LOCK,
 };
 
 mod real_run;
@@ -201,6 +201,22 @@ struct RunArgs {
     #[arg(long, value_enum, default_value_t = PreemptModeArg::Pmu, requires = "preemptive")]
     preempt_mode: PreemptModeArg,
 
+    /// Enable native concurrent dispatch via OS threads with clock-window
+    /// synchronisation.
+    ///
+    /// Runs dispatch callbacks for multiple CPUs on real OS threads,
+    /// synchronised by a shared clock window rather than token passing.
+    /// Implies --interleave.
+    #[arg(long)]
+    native_concurrent: bool,
+
+    /// Clock window size in nanoseconds for native concurrent mode.
+    ///
+    /// Controls the simulated-time window within which concurrent dispatch
+    /// threads are allowed to execute. Default: 10_000_000 (10 ms).
+    #[arg(long, default_value_t = 10_000_000, requires = "native_concurrent")]
+    window_ns: u64,
+
     /// List available schedulers and exit.
     #[arg(long)]
     list_schedulers: bool,
@@ -342,6 +358,12 @@ fn run(args: &RunArgs) -> Result<(), String> {
             cooperative_only: false,
             break_on: args.break_on.to_pmu_event(),
             preempt_mode: args.preempt_mode.to_preempt_mode(),
+        });
+        scenario.interleave = true;
+    }
+    if args.native_concurrent {
+        scenario.native_concurrent = Some(NativeConcurrentConfig {
+            window_ns: args.window_ns,
         });
         scenario.interleave = true;
     }
