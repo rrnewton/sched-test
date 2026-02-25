@@ -423,7 +423,11 @@ fn set_ops_context(state: &mut SimulatorState, ctx: OpsContext) {
 fn start_rbc(state: &mut SimulatorState) {
     state.rbc_kfunc_calls = 0;
     state.rbc_kfunc_ns = 0;
-    if let Some(ref rbc) = state.rbc_counter {
+    if state.e9_fns.is_some() {
+        // e9patch mode: snapshot the deterministic software counter.
+        // The counter decrements on each Jcc, so `snapshot - current = branches`.
+        state.rbc_e9_snapshot = unsafe { (*crate::preempt::e9_shared_rbc()).counter };
+    } else if let Some(ref rbc) = state.rbc_counter {
         let _ = rbc.reset();
         let _ = rbc.enable();
     }
@@ -441,10 +445,14 @@ fn update_sum_exec(raw: *mut c_void, base: TimeNs, elapsed: TimeNs) {
 
 /// Disable the RBC counter, read the count, and charge scheduler overhead to `cpu`.
 ///
-/// When the RBC counter is available, overhead = RBC-derived time + kfunc cost.
-/// When the RBC counter is unavailable (VM, concurrent batch, etc.), the
-/// accumulated kfunc cost from `with_sim()` calls serves as a fallback timing
-/// model so that `local_clock` still advances on every callback.
+/// Three modes:
+/// 1. **e9patch** (`e9_fns.is_some()`): Uses the deterministic software counter.
+///    The e9 trampoline decrements a counter at every Jcc in the instrumented
+///    `.so`. `start_rbc()` snapshots the counter; here we compute the difference.
+///    Fully deterministic — no PMU hardware involved.
+/// 2. **PMU** (`rbc_counter.is_some()`): Uses the hardware PMU counter.
+///    Nondeterministic due to PMU skid and real CPU scheduling.
+/// 3. **Fallback** (neither): Uses accumulated kfunc cost with a minimum floor.
 fn charge_sched_time(state: &mut SimulatorState, cpu: CpuId, ops: &str) {
     let idx = cpu.0 as usize;
 
@@ -455,7 +463,31 @@ fn charge_sched_time(state: &mut SimulatorState, cpu: CpuId, ops: &str) {
         state.structop_accum[idx].kfunc_count += state.rbc_kfunc_calls as u64;
     }
 
-    if let Some(ref rbc) = state.rbc_counter {
+    if state.e9_fns.is_some() {
+        // e9patch mode: deterministic software branch count.
+        let current = unsafe { (*crate::preempt::e9_shared_rbc()).counter };
+        // Counter decrements, so snapshot - current = branches executed.
+        // Clamp to 0 in case the counter was re-armed between start and now.
+        let count = (state.rbc_e9_snapshot - current).max(0) as u64;
+        if let Some(ns_per_rbc) = state.sched_overhead_rbc_ns {
+            let rbc_ns = count * ns_per_rbc;
+            let kfunc_ns = state.rbc_kfunc_ns;
+            let total_ns = rbc_ns + kfunc_ns;
+            state.cpus[cpu.0 as usize].local_clock += total_ns;
+            trace!(
+                ops,
+                rbc = count,
+                kfuncs = state.rbc_kfunc_calls,
+                kfunc_ns,
+                total_ns,
+                "sched overhead"
+            );
+            // Accumulate RBC into structop summary.
+            if idx < state.structop_accum.len() {
+                state.structop_accum[idx].rbc_total += count;
+            }
+        }
+    } else if let Some(ref rbc) = state.rbc_counter {
         let _ = rbc.disable();
         let count = rbc.read().unwrap_or(0);
         if let Some(ns_per_rbc) = state.sched_overhead_rbc_ns {
@@ -776,17 +808,29 @@ impl<S: Scheduler> Simulator<S> {
 
         // Build simulator state (shared with kfuncs via thread-local)
         //
-        // The RBC counter is created with pid=0 (current thread) and measures
-        // retired conditional branches on the main engine thread. In interleave/
-        // preemptive mode, concurrent batches run scheduler callbacks on worker
-        // threads where this counter is invisible — those paths use per-thread
-        // `measure_counter` instances instead. Sequential callbacks (global
-        // events, single-CPU batches) still run on the main thread and benefit
-        // from this counter. `process_batch_concurrent` temporarily takes the
-        // counter out of state during concurrent processing to prevent worker
-        // threads from accessing a main-thread-only PMU fd.
+        // In e9patch mode, the e9 software counter provides a deterministic
+        // branch count — skip creating the nondeterministic PMU counter.
+        // The e9 trampoline counts every Jcc in the instrumented `.so`,
+        // which is exactly the set of branches the PMU counter measures.
+        let is_e9 = scenario
+            .preemptive
+            .as_ref()
+            .is_some_and(|cfg| cfg.preempt_mode == PreemptMode::E9patch);
         let rbc_ns = scenario.sched_overhead_rbc_ns.filter(|&ns| ns > 0);
-        let rbc_counter = if rbc_ns.is_some() {
+        let rbc_counter = if is_e9 {
+            // e9patch mode: use deterministic software counter instead of PMU.
+            None
+        } else if rbc_ns.is_some() {
+            // PMU mode: the RBC counter is created with pid=0 (current thread)
+            // and measures retired conditional branches on the main engine
+            // thread. In interleave/preemptive mode, concurrent batches run
+            // scheduler callbacks on worker threads where this counter is
+            // invisible — those paths use per-thread `measure_counter`
+            // instances instead. Sequential callbacks (global events,
+            // single-CPU batches) still run on the main thread and benefit
+            // from this counter. `process_batch_concurrent` temporarily takes
+            // the counter out of state during concurrent processing to prevent
+            // worker threads from accessing a main-thread-only PMU fd.
             perf::try_create_rbc_counter()
         } else {
             None
@@ -817,6 +861,7 @@ impl<S: Scheduler> Simulator<S> {
             sched_overhead_rbc_ns: rbc_ns,
             rbc_kfunc_calls: 0,
             rbc_kfunc_ns: 0,
+            rbc_e9_snapshot: 0,
             bpf_error: None,
             interleave: scenario.interleave,
             preemptive: scenario.preemptive.clone(),
@@ -1112,22 +1157,31 @@ impl<S: Scheduler> Simulator<S> {
 
         // Log interleaving mode
         if let Some(ref cfg) = state.preemptive {
-            if !cfg.cooperative_only && scenario.replay_trace.is_none() {
-                warn!(
+            if cfg.preempt_mode == PreemptMode::E9patch {
+                info!(
                     timeslice_min = cfg.timeslice_min,
                     timeslice_max = cfg.timeslice_max,
                     break_on = %cfg.break_on,
-                    "preemptive mode: PMU preemption is NONDETERMINISTIC \
-                     (use --record-preemptions / --replay-preemptions for deterministic replay)"
+                    "preemptive interleaving enabled (e9patch software RBC, deterministic)"
+                );
+            } else {
+                if !cfg.cooperative_only && scenario.replay_trace.is_none() {
+                    warn!(
+                        timeslice_min = cfg.timeslice_min,
+                        timeslice_max = cfg.timeslice_max,
+                        break_on = %cfg.break_on,
+                        "preemptive mode: PMU preemption is NONDETERMINISTIC \
+                         (use --record-preemptions / --replay-preemptions for deterministic replay)"
+                    );
+                }
+                info!(
+                    timeslice_min = cfg.timeslice_min,
+                    timeslice_max = cfg.timeslice_max,
+                    cooperative_only = cfg.cooperative_only,
+                    break_on = %cfg.break_on,
+                    "preemptive interleaving enabled (PMU {} timer)", cfg.break_on
                 );
             }
-            info!(
-                timeslice_min = cfg.timeslice_min,
-                timeslice_max = cfg.timeslice_max,
-                cooperative_only = cfg.cooperative_only,
-                break_on = %cfg.break_on,
-                "preemptive interleaving enabled (PMU {} timer)", cfg.break_on
-            );
         } else if state.interleave {
             info!("cooperative interleaving enabled (kfunc boundaries only)");
         }
