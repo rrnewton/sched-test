@@ -1109,6 +1109,11 @@ impl ScenarioBuilder {
             self.nr_cpus,
             self.smt_threads_per_core
         );
+        assert!(
+            !(self.native_concurrent.is_some() && self.preemptive.is_some()),
+            "--native-concurrent and --preemptive are mutually exclusive: \
+             native concurrent mode runs workers freely without PMU or token ring"
+        );
         Scenario {
             nr_cpus: self.nr_cpus,
             smt_threads_per_core: self.smt_threads_per_core,
