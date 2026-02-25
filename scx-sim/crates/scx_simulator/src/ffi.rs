@@ -458,10 +458,17 @@ impl DynamicScheduler {
     /// Optional ops (`runnable`, `init_task`) become `None` if missing.
     pub fn load(path: &str, prefix: &str, nr_cpus: u32) -> Self {
         // SAFETY: The .so is built by our build system from known-safe C source.
-        // We use RTLD_NOW for eager binding and the default RTLD_LOCAL for
-        // symbol isolation.
-        let lib = unsafe { libloading::Library::new(path) }
-            .unwrap_or_else(|e| panic!("failed to load {path}: {e}"));
+        // Use RTLD_NOW for eager binding so all PLT entries are resolved at
+        // load time. Without this, lazy PLT resolution during simulation adds
+        // nondeterministic dynamic-linker branches to the PMU RBC counter.
+        let lib: libloading::Library = unsafe {
+            libloading::os::unix::Library::open(
+                Some(path),
+                libloading::os::unix::RTLD_NOW | libloading::os::unix::RTLD_LOCAL,
+            )
+        }
+        .unwrap_or_else(|e| panic!("failed to load {path}: {e}"))
+        .into();
 
         // Probe for {prefix}_setup — call it if present
         unsafe {
