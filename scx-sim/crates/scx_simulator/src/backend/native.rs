@@ -13,7 +13,7 @@ use tracing::{debug, info};
 
 use super::{PreemptionBackend, StructopDelta, ThreadOrchestrator};
 use crate::interleave::WorkerId;
-use crate::preempt::{self, PreemptRing};
+use crate::preempt::PreemptRing;
 
 // ---------------------------------------------------------------------------
 // NullBackend — PreemptionBackend with no instrumentation
@@ -31,11 +31,16 @@ pub(crate) struct NullWorkerCtx;
 impl PreemptionBackend for NullBackend {
     type WorkerCtx = NullWorkerCtx;
 
-    fn worker_setup(&self, ring: &PreemptRing, worker_id: WorkerId) -> NullWorkerCtx {
-        // Install preempt TLS (needed for structop accounting counters that
-        // kfuncs read via the TLS), but with no PMU timer fd and no
-        // measurement counter fd.
-        preempt::install(ring, worker_id, -1, -1, 0, 0);
+    fn worker_setup(&self, _ring: &PreemptRing, worker_id: WorkerId) -> NullWorkerCtx {
+        // Do NOT install preempt TLS here. Workers in native-concurrent mode
+        // run freely with no preemptive yield points. Installing PREEMPT_CTX
+        // would cause maybe_yield_preemptive() to call PreemptRing::yield_token(),
+        // but the NativeOrchestrator is the orchestrator (not PreemptRing), so
+        // the worker would deadlock waiting for a token that never comes.
+        //
+        // All preempt TLS consumers (maybe_yield_preemptive, pause_timer,
+        // resume_timer, pause_measurement, resume_measurement) gracefully
+        // no-op when PREEMPT_CTX is None.
         debug!(
             worker = worker_id.0,
             "native-concurrent: worker setup (null backend)"
@@ -61,7 +66,7 @@ impl PreemptionBackend for NullBackend {
     }
 
     fn worker_teardown(&self, _ctx: NullWorkerCtx) {
-        preempt::uninstall();
+        // No preempt TLS to uninstall — we never installed it.
     }
 
     fn log_completion(&self, _ring: &PreemptRing) {
