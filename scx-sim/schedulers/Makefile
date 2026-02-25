@@ -27,7 +27,8 @@ endif
 # For standalone use: try pkg-config, then fall back to Cargo build cache.
 BPF_INCLUDE   ?= $(or \
     $(shell pkg-config --cflags-only-I libbpf 2>/dev/null | sed 's/^-I//'),\
-    $(firstword $(wildcard $(ROOT_DIR)/target/debug/build/libbpf-sys-*/out/include)))
+    $(firstword $(wildcard $(SIMULATOR_DIR)/target/debug/build/libbpf-sys-*/out/include) \
+                $(wildcard $(SIMULATOR_DIR)/target/release/build/libbpf-sys-*/out/include)))
 
 # --- Auto-discover schedulers ---
 SCHEDS := $(patsubst %/wrapper.c,%,$(wildcard */wrapper.c))
@@ -84,12 +85,12 @@ E9PATCH ?= $(or $(wildcard $(SIMULATOR_DIR)/third_party/e9patch/e9patch),$(shell
 .PHONY: all clean e9 $(SCHEDS)
 
 ifeq ($(BPF_INCLUDE),)
-all $(SO_TARGETS):
+all:
 	$(error BPF_INCLUDE is empty — install libbpf-devel or run 'cargo build' first to populate target/debug/build/libbpf-sys-*/out/include)
-else
+endif
+
 all: $(SO_TARGETS)
 	@echo "Built $(words $(SO_TARGETS)) scheduler(s): $(SCHEDS)"
-endif
 
 # Individual scheduler targets (e.g., make simple)
 $(foreach s,$(SCHEDS),$(eval $(s): $(BUILD_DIR)/libscx_$(s).so))
@@ -199,7 +200,7 @@ $(E9_TRAMPOLINE_BIN): $(E9_TRAMPOLINE_SRC) | $(BUILD_DIR)
 		exit 1; \
 	fi
 	cp $(E9_TRAMPOLINE_SRC) $(SIMULATOR_DIR)/third_party/e9patch/e9_rbc_trampoline.c
-	cd $(SIMULATOR_DIR)/third_party/e9patch && $(E9COMPILE) e9_rbc_trampoline.c
+	cd $(SIMULATOR_DIR)/third_party/e9patch && ./e9compile.sh e9_rbc_trampoline.c
 	mv $(SIMULATOR_DIR)/third_party/e9patch/e9_rbc_trampoline $(E9_TRAMPOLINE_BIN)
 	rm -f $(SIMULATOR_DIR)/third_party/e9patch/e9_rbc_trampoline.c \
 	      $(SIMULATOR_DIR)/third_party/e9patch/e9_rbc_trampoline.o
