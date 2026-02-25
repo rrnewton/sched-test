@@ -210,10 +210,11 @@ struct RunArgs {
     #[arg(long)]
     native_concurrent: bool,
 
-    /// Clock window size in nanoseconds for native concurrent mode.
+    /// Clock window size in nanoseconds (only with --native-concurrent).
     ///
     /// Controls the simulated-time window within which concurrent dispatch
-    /// threads are allowed to execute. Default: 10_000_000 (10 ms).
+    /// threads are allowed to execute. Requires --native-concurrent.
+    /// Default: 10_000_000 (10 ms).
     #[arg(long, default_value_t = 10_000_000, requires = "native_concurrent")]
     window_ns: u64,
 
