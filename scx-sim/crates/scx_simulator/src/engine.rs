@@ -2961,7 +2961,21 @@ impl<S: Scheduler> Simulator<S> {
 
         let interleave_seed = state.next_prng();
 
-        if let Some(ref preemptive_cfg) = state.preemptive {
+        if state.native_concurrent.is_some() {
+            // Native concurrent: all workers run freely in parallel with
+            // no PMU, no signals, no token ring serialisation.
+            use crate::backend::native::{NativeOrchestrator, NullBackend};
+            let ring = crate::preempt::PreemptRing::new(dispatch_cpus.len(), interleave_seed);
+            let orchestrator = NativeOrchestrator::new(dispatch_cpus.len());
+            crate::backend::run_dispatch_with_orchestrator(
+                &dispatch_cpus,
+                &state_send,
+                &sched_send,
+                &ring,
+                &orchestrator,
+                &NullBackend,
+            );
+        } else if let Some(ref preemptive_cfg) = state.preemptive {
             if let Some(ref backend) = state.replay_backend {
                 assert!(backend.is_precise(), "replay requires a precise backend");
                 replay_dispatch_with_retry(
@@ -3175,7 +3189,28 @@ impl<S: Scheduler> Simulator<S> {
         let events_send = SendPtr(events as *mut EventQueue);
         let cgroup_send = SendPtr(cgroup_registry as *mut CgroupRegistry);
 
-        if let Some(ref preemptive_cfg) = state.preemptive.clone() {
+        if state.native_concurrent.is_some() {
+            // Native concurrent: all workers run freely in parallel with
+            // no PMU, no signals, no token ring serialisation.
+            use crate::backend::native::{NativeOrchestrator, NullBackend};
+            let ring = crate::preempt::PreemptRing::new(cpu_ids.len(), interleave_seed);
+            let orchestrator = NativeOrchestrator::new(cpu_ids.len());
+            crate::backend::run_batch_with_orchestrator(
+                &per_cpu,
+                &cpu_ids,
+                &sim_send,
+                &state_send,
+                &tasks_send,
+                &events_send,
+                &cgroup_send,
+                &ring,
+                &orchestrator,
+                watchdog_timeout,
+                duration_ns,
+                max_cgroups,
+                &NullBackend,
+            );
+        } else if let Some(ref preemptive_cfg) = state.preemptive.clone() {
             if let Some(ref backend) = state.replay_backend {
                 crate::backend::run_preemptive_batch(
                     &per_cpu,
