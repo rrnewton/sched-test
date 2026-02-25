@@ -76,8 +76,12 @@ fn main() {
     // Provides strong definitions of scx_task_alloc/data/free that override
     // the __weak stubs in overrides.c. Linked into the main binary for unit
     // tests and exported via -rdynamic for .so schedulers.
+    // Build the SDT (per-task data) stubs and deterministic arena allocator.
+    // sim_sdt_stubs.c and sim_arena.c are compiled together so they share
+    // the arena storage (sim_arena_buf/sim_arena_offset).
     let mut sim_sdt = cc::Build::new();
     sim_sdt.file(workspace_dir.join("csrc/sim_sdt_stubs.c"));
+    sim_sdt.file(workspace_dir.join("csrc/sim_arena.c"));
     configure_build(&mut sim_sdt);
     sim_sdt.compile("sim_sdt_stubs");
 
@@ -143,6 +147,10 @@ fn main() {
     // e9patch-instrumented .so files can resolve them via -rdynamic.
     println!("cargo:rustc-link-arg=-Wl,--undefined=e9_preempt_yield");
     println!("cargo:rustc-link-arg=-Wl,--undefined=E9_SHARED_RBC");
+    // Arena allocator symbols used by both sim_sdt_stubs (main binary) and
+    // sim_bpf_stubs (.so) — ensure they're exported via -rdynamic.
+    println!("cargo:rustc-link-arg=-Wl,--undefined=sim_arena_buf");
+    println!("cargo:rustc-link-arg=-Wl,--undefined=sim_arena_offset");
 
     // Link the clang profile runtime when coverage is enabled.
     // This provides __llvm_profile_* symbols for the instrumented .so files.
