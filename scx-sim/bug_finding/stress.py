@@ -291,69 +291,26 @@ def run_determinism_preemptive(config: TestConfig) -> Optional[Finding]:
             os.unlink(tmpfile.name)
 
 
-def normalize_stdout(stdout: str) -> str:
-    """Remove nondeterministic fields from stdout for comparison.
-
-    The structop summary's `rbc` column measures PMU overhead (real CPU
-    cycles), which varies between runs. Strip that column so only
-    deterministic fields (structops, kfuncs, interlv) remain.
-    """
-    lines = []
-    in_structop_table = False
-    rbc_col_idx = None
-
-    for line in stdout.splitlines():
-        stripped = line.strip()
-
-        # Detect the structop header line to find the rbc column index
-        if "structops" in stripped and "kfuncs" in stripped:
-            in_structop_table = True
-            parts = stripped.split()
-            try:
-                rbc_col_idx = parts.index("rbc")
-            except ValueError:
-                rbc_col_idx = None
-            if rbc_col_idx is not None:
-                del parts[rbc_col_idx]
-            lines.append("  ".join(parts))
-            continue
-
-        # Inside the structop table: strip the rbc column from data lines
-        if in_structop_table and rbc_col_idx is not None:
-            parts = stripped.split()
-            if len(parts) > rbc_col_idx:
-                del parts[rbc_col_idx]
-                lines.append("  ".join(parts))
-                continue
-            elif not stripped:
-                # Empty line ends the table
-                in_structop_table = False
-                rbc_col_idx = None
-
-        lines.append(line)
-
-    return "\n".join(lines)
-
-
 def compare_outputs(stdout1: str, stdout2: str, run_a: int, run_b: int) -> str:
     """Compare two stdout strings line-by-line and return diff description.
 
     Returns empty string if identical, otherwise a summary of first divergence.
-    Normalizes stdout to remove nondeterministic PMU overhead columns.
+    For e9patch mode, EVERYTHING in stdout should be deterministic — the rbc
+    column is the software-counted conditional branch count (no PMU overhead).
     """
-    norm1 = normalize_stdout(stdout1).strip().splitlines()
-    norm2 = normalize_stdout(stdout2).strip().splitlines()
-    for i, (l1, l2) in enumerate(zip(norm1, norm2)):
+    lines1 = stdout1.strip().splitlines()
+    lines2 = stdout2.strip().splitlines()
+    for i, (l1, l2) in enumerate(zip(lines1, lines2)):
         if l1 != l2:
             return (
                 f"stdout diverges at line {i + 1} (run {run_a} vs {run_b}):\n"
                 f"  run {run_a}: {l1!r}\n"
                 f"  run {run_b}: {l2!r}"
             )
-    if len(norm1) != len(norm2):
+    if len(lines1) != len(lines2):
         return (
             f"stdout line count differs (run {run_a} vs {run_b}): "
-            f"{len(norm1)} vs {len(norm2)}"
+            f"{len(lines1)} vs {len(lines2)}"
         )
     return ""
 
