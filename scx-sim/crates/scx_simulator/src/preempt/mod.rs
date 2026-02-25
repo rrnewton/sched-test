@@ -2570,39 +2570,98 @@ pub fn arm_replay_breakpoint_pub(bp_fd: RawFd, addr: u64) {
 // e9patch preemption — shared state and extern "C" entry point
 // ---------------------------------------------------------------------------
 
+/// Fixed virtual address for the shared RBC state page.
+///
+/// Both the Rust backend and the e9-injected trampoline use this hardcoded
+/// address — no RIP-relative addressing, no dlsym, no relocations. The Rust
+/// backend mmaps a page here before loading the `_e9.so`.
+///
+/// Chosen at `0x1_E900_0000` (≈8GB), below typical ASLR base (~0x5555..),
+/// above typical mmap base (~0x7fff..), in an obscure gap.
+pub const E9_SHARED_ADDR: usize = 0x1E9_000_000;
+
 /// Shared RBC state accessed by both the e9patch trampoline (C code injected
-/// into the .so by e9tool) and the Rust backend (`E9PatchBackend`).
+/// into the `.so` by e9tool) and the Rust backend (`E9PatchBackend`).
 ///
-/// The e9 trampoline resolves this struct via `dlsym(NULL, "E9_SHARED_RBC")`
-/// in its `init()` function. The Rust backend and the `.so`'s `e9_arm()` /
-/// `e9_disarm()` / `e9_worker_setup()` write to this struct. The trampoline's
-/// `rbc_trampoline()` reads `counter` and `armed` on the fast path.
+/// Mapped at [`E9_SHARED_ADDR`] via `mmap(MAP_FIXED)`. The trampoline reads
+/// `counter` and `armed` on the fast path (via hardcoded `movabs`).
+/// The `.so`'s `e9_arm()` / `e9_disarm()` write here.
 ///
-/// Global (not per-thread) because the PreemptRing token protocol guarantees
-/// only one worker is active at a time.
+/// Only `counter`, `armed`, and `yield_fn` are used by the trampoline.
+/// The `ring_ptr` and `worker_id` fields are NOT in this struct — they
+/// come from Rust thread-local storage (`PREEMPT_CTX`) inside
+/// `e9_preempt_yield`, because the global struct would be overwritten
+/// by other workers between yield and resume.
 #[repr(C)]
 pub struct E9SharedRbc {
     pub counter: i64,
     pub armed: i32,
-    pub worker_id: i32,
-    pub ring_ptr: *mut std::ffi::c_void,
+    pub _pad: i32,
+    pub yield_fn: *const std::ffi::c_void,
 }
 
 // SAFETY: single-writer access enforced by PreemptRing token passing.
 unsafe impl Send for E9SharedRbc {}
 unsafe impl Sync for E9SharedRbc {}
 
-/// Global shared RBC state, exported to C via `#[no_mangle]`.
+/// Get a raw pointer to the shared RBC state at the fixed address.
 ///
-/// The e9patch trampoline resolves this symbol via `dlsym` to share state
-/// with the Rust backend. The `.so`'s `e9_arm()` / `e9_disarm()` functions
-/// also access it via `extern` declarations.
+/// # Safety
+/// The caller must ensure `mmap_shared_rbc()` has been called first.
+pub unsafe fn e9_shared_rbc() -> *mut E9SharedRbc {
+    E9_SHARED_ADDR as *mut E9SharedRbc
+}
+
+/// Map the shared RBC state page at the fixed address.
+///
+/// Returns the pointer on success, or panics if the mmap fails.
+pub fn mmap_shared_rbc() -> *mut E9SharedRbc {
+    let addr = E9_SHARED_ADDR as *mut std::ffi::c_void;
+    let ptr = unsafe {
+        libc::mmap(
+            addr,
+            std::mem::size_of::<E9SharedRbc>(),
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED,
+            -1,
+            0,
+        )
+    };
+    assert!(
+        ptr != libc::MAP_FAILED,
+        "e9patch: mmap at {E9_SHARED_ADDR:#x} failed (address in use?)"
+    );
+    // Initialize to disarmed state.
+    let shared = ptr as *mut E9SharedRbc;
+    unsafe {
+        (*shared).counter = i64::MAX;
+        (*shared).armed = 0;
+        (*shared)._pad = 0;
+        (*shared).yield_fn = e9_preempt_yield as *const std::ffi::c_void;
+    }
+    shared
+}
+
+/// Unmap the shared RBC state page.
+pub fn munmap_shared_rbc() {
+    unsafe {
+        libc::munmap(
+            E9_SHARED_ADDR as *mut std::ffi::c_void,
+            std::mem::size_of::<E9SharedRbc>(),
+        );
+    }
+}
+
+// Keep E9_SHARED_RBC as a symbol for the .so's extern declarations to resolve.
+// The .so's e9_arm/e9_disarm/e9_worker_setup use this to write to the shared
+// state. But the actual memory is at the mmap'd fixed address — this static is
+// unused at runtime (the .so functions are updated to use the mmap'd address).
 #[no_mangle]
 pub static mut E9_SHARED_RBC: E9SharedRbc = E9SharedRbc {
     counter: i64::MAX,
     armed: 0,
-    worker_id: -1,
-    ring_ptr: std::ptr::null_mut(),
+    _pad: 0,
+    yield_fn: std::ptr::null(),
 };
 
 // Atomic counter of e9_preempt_yield calls (for debugging).
@@ -2623,13 +2682,21 @@ pub fn e9_yield_call_count() -> u64 {
 ///
 /// # Safety
 ///
-/// `ring` must be a valid pointer to a `PreemptRing`.
+/// Must be called from a thread with `PREEMPT_CTX` installed (i.e., a
+/// worker thread inside a preemptive dispatch).
 #[no_mangle]
-pub unsafe extern "C" fn e9_preempt_yield(ring: *const PreemptRing, worker_id: i32) -> u64 {
+pub unsafe extern "C" fn e9_preempt_yield() -> u64 {
     E9_YIELD_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-    let ring = unsafe { &*ring };
-    let wid = WorkerId(worker_id as usize);
+    // Get ring and worker_id from Rust TLS — NOT from the shared struct,
+    // because other workers may have overwritten the shared struct between
+    // our yield and our resume.
+    let pctx = match PREEMPT_CTX.with(|c| c.get()) {
+        Some(ctx) => ctx,
+        None => return u64::MAX,
+    };
+    let ring = unsafe { &*pctx.ring };
+    let wid = pctx.worker_id;
 
     // 1. Save SimulatorState context.
     let sim_ptr = match crate::kfuncs::sim_state_ptr() {
@@ -2685,12 +2752,7 @@ pub unsafe extern "C" fn e9_preempt_yield(ring: *const PreemptRing, worker_id: i
     }
 
     // 6. Roll new timeslice from PRNG and return it.
-    let pctx = PREEMPT_CTX.with(|c| c.get());
-    let (ts_min, ts_max) = match pctx {
-        Some(ctx) => (ctx.timeslice_min, ctx.timeslice_max),
-        None => (1, 1),
-    };
-    ring.roll_timeslice(ts_min, ts_max)
+    ring.roll_timeslice(pctx.timeslice_min, pctx.timeslice_max)
 }
 
 // ---------------------------------------------------------------------------
