@@ -168,103 +168,214 @@ pub struct DsqIterState {
 }
 
 /// The subset of simulator state that kfuncs need access to.
+///
+/// # Concurrency classification
+///
+/// Each field is classified for Phase 2 concurrent access:
+/// - **PER-CPU**: Only accessed by the worker owning that CPU (safe without locking).
+/// - **SHARED-READ**: Read by multiple workers but rarely mutated (RwLock candidate).
+/// - **SHARED-MUTABLE**: Read and written by multiple workers (Mutex candidate).
+/// - **PER-WORKER-TLS**: Should come from TLS in concurrent mode, not shared state.
 pub struct SimulatorState {
+    /// PER-CPU: Each worker accesses only `cpus[current_cpu]`. The Vec itself
+    /// is fixed-size after init (no reallocation), so disjoint per-CPU access
+    /// is safe. Cross-CPU reads (idle scan, kick) need SHARED-READ treatment.
     pub cpus: Vec<SimCpu>,
+    /// SHARED-MUTABLE: DSQs are global state — multiple workers insert/consume
+    /// concurrently. Requires Mutex or sharded locking in concurrent mode.
     pub dsqs: DsqManager,
+    /// PER-WORKER-TLS: In concurrent mode, use `current_cpu_from_tls()`
+    /// instead. This field is only safe under token-ring serialization.
+    /// `enter_sim()` writes it on the shared state, which races when
+    /// multiple workers call `enter_sim()` concurrently.
+    ///
+    /// Call sites reading `sim.current_cpu` inside kfuncs (Phase 2 migration):
+    /// - `scx_bpf_dsq_insert` (trace recording)
+    /// - `scx_bpf_dsq_insert_vtime` (trace recording)
+    /// - `scx_bpf_dsq_move_to_local` (local DSQ target)
+    /// - `scx_bpf_dsq_nr_queued` (LOCAL DSQ lookup)
+    /// - `scx_bpf_now` / `bpf_ktime_get_ns` (per-CPU clock)
+    /// - `bpf_get_smp_processor_id` / `sim_bpf_get_smp_processor_id`
+    /// - `sim_bpf_in_hardirq` / `sim_bpf_in_serving_softirq` / `sim_bpf_in_interrupt`
+    /// - `bpf_get_current_task_btf` (current task lookup)
+    /// - `scx_bpf_kick_cpu` (trace recording)
+    /// - `sim_scx_bpf_dsq_move` (LOCAL DSQ target)
+    /// - `resolve_pending_dispatch` (LOCAL_ON rejection trace)
     pub current_cpu: CpuId,
+    /// SHARED-MUTABLE: Trace is append-only but written by all workers.
+    /// Could use a per-CPU trace buffer with post-merge, or a Mutex.
     pub trace: Trace,
+    /// SHARED-READ: Global simulation clock (event queue time). Updated by
+    /// the engine between events, read by kfuncs. Workers read but do not
+    /// write during callback execution.
     pub clock: TimeNs,
+    /// SHARED-READ: Task pointer maps are populated at init and during
+    /// `enable`/task creation. Read by kfuncs for PID↔pointer translation.
+    /// Rarely mutated after setup (RwLock candidate).
+    ///
     /// Maps raw task_struct pointers to PIDs for reverse lookup.
     pub task_raw_to_pid: HashMap<usize, Pid>,
-    /// Maps PIDs to raw task_struct pointers (reverse of task_raw_to_pid).
+    /// SHARED-READ: Reverse of task_raw_to_pid. Same access pattern.
+    ///
+    /// Maps PIDs to raw task_struct pointers.
     pub task_pid_to_raw: HashMap<Pid, usize>,
+    /// SHARED-MUTABLE: PRNG state is mutated on every call to
+    /// `sim_bpf_get_prandom_u32`. Needs Mutex or per-worker PRNG.
+    ///
     /// Deterministic PRNG for reproducible simulation.
     pub rng: SmallRng,
+    /// PER-WORKER-TLS: Each worker sets this to the callback it is executing.
+    /// Already duplicated in per-thread TLS via `set_current_ops_context()`.
+    /// The shared field is used by the engine between callbacks.
+    ///
     /// Which ops callback we are currently inside.
     pub ops_context: OpsContext,
+    /// PER-CPU: Each worker records its own pending dispatch during
+    /// `select_cpu`/`enqueue`. Only the owning worker reads it back
+    /// in `resolve_pending_dispatch`.
+    ///
     /// Deferred dispatch recorded during `select_cpu` or `enqueue`.
     /// The engine resolves `SCX_DSQ_LOCAL` and executes after the callback.
     pub pending_dispatch: Option<PendingDispatch>,
+    /// PER-CPU: DSQ iterator state is per-callback, used only by the
+    /// worker that started the iteration.
+    ///
     /// Active DSQ iterator for `bpf_for_each(scx_dsq, ...)`.
     pub dsq_iter: Option<DsqIterState>,
+    /// PER-CPU: Kicks are accumulated by the current worker's callback
+    /// and processed after the callback returns on that worker's CPU.
+    ///
     /// CPUs kicked via `scx_bpf_kick_cpu` during a callback.
     /// The engine processes these after the callback returns.
     /// Uses BTreeMap for deterministic iteration order.
     pub kicked_cpus: BTreeMap<CpuId, KickFlags>,
+    /// SHARED-MUTABLE: Updated when any task starts running on any CPU,
+    /// read by `scx_bpf_task_cpu`. Needs Mutex or per-task atomic.
+    ///
     /// Per-task last CPU (set when a task starts running).
     /// Used by `scx_bpf_task_cpu` to return the correct value.
     pub task_last_cpu: HashMap<Pid, CpuId>,
+    /// SHARED-MUTABLE: Updated by enqueue/dispatch on any CPU, read by
+    /// dequeue gating. Needs Mutex or per-task atomic state.
+    ///
     /// Per-task SCX ops_state (mirrors kernel's `SCX_OPSS_*`).
     /// Tracks whether the task is `Queued` (in the BPF scheduler) or `None`
     /// (dispatched / not queued). Used to gate `ops.dequeue()`.
     /// Uses BTreeMap for deterministic iteration order.
     pub task_ops_state: BTreeMap<Pid, OpsTaskState>,
+    /// PER-CPU: Set by `scx_bpf_reenqueue_local` during `cpu_release`,
+    /// consumed by the engine on the same CPU after the callback.
+    ///
     /// Flag set by `scx_bpf_reenqueue_local` during `cpu_release`.
     /// The engine drains the local DSQ and re-enqueues tasks after the
     /// callback returns.
     pub reenqueue_local_requested: bool,
+    /// SHARED-MUTABLE: Timer can be set by any callback on any CPU.
+    /// The engine reads and clears it after each callback.
+    ///
     /// Pending BPF timer: fire at this time (set by `sim_timer_start`).
     pub pending_timer_ns: Option<TimeNs>,
-    /// Raw pointer to the waker task during a wake-induced `select_cpu` call.
+    /// PER-CPU: Set by the engine before calling `select_cpu` on the
+    /// waker's CPU, consumed by `bpf_get_current_task_btf` during that
+    /// same callback. Only the owning worker reads/writes it.
     ///
+    /// Raw pointer to the waker task during a wake-induced `select_cpu` call.
     /// In the kernel, `select_cpu` runs in the waker's context, so
     /// `bpf_get_current_task_btf()` returns the waker's task_struct.
     /// The engine sets this when processing a `Phase::Wake`-induced event.
     pub waker_task_raw: Option<usize>,
-    /// Raw pointer to a synthetic idle task_struct (PF_IDLE, mm=NULL).
+    /// SHARED-READ: Allocated once at startup, never mutated. All workers
+    /// can safely read the pointer.
     ///
+    /// Raw pointer to a synthetic idle task_struct (PF_IDLE, mm=NULL).
     /// In the real kernel, `bpf_get_current_task_btf()` never returns NULL —
     /// the idle task is always running when no real task is. The engine
     /// allocates this once at startup so kfuncs can return it as a fallback.
     pub idle_task_raw: *mut c_void,
+    /// SHARED-READ: Configuration set at init, never mutated during simulation.
+    ///
     /// Timing noise configuration (tick jitter).
     pub noise: NoiseConfig,
+    /// SHARED-READ: Configuration set at init, never mutated during simulation.
+    ///
     /// Context switch overhead configuration.
     pub overhead: OverheadConfig,
+    /// PER-CPU: Each worker has its own RBC counter fd. In concurrent mode
+    /// this would move to per-worker TLS.
+    ///
     /// RBC counter for measuring scheduler C code overhead (None = disabled).
     pub rbc_counter: Option<RbcCounter>,
+    /// SHARED-READ: Configuration set at init, never mutated during simulation.
+    ///
     /// Nanoseconds per retired conditional branch (None = disabled).
     pub sched_overhead_rbc_ns: Option<u64>,
+    /// PER-CPU: Accumulated per-callback, reset per measurement window.
+    /// Each worker tracks its own kfunc call count.
+    ///
     /// Number of kfunc calls during the current RBC measurement window.
     pub rbc_kfunc_calls: u32,
+    /// PER-CPU: Accumulated per-callback, reset per measurement window.
+    /// Each worker tracks its own kfunc nanosecond cost.
+    ///
     /// Accumulated kfunc nanosecond cost during the current RBC measurement window.
     pub rbc_kfunc_ns: u64,
-    /// BPF error message set by `scx_bpf_error()`.
+    /// SHARED-MUTABLE: Any kfunc on any CPU can set a BPF error. First-write
+    /// wins (subsequent errors are ignored). Needs Mutex or atomic Option.
     ///
+    /// BPF error message set by `scx_bpf_error()`.
     /// When set, the engine should stop the simulation and report
     /// `ExitKind::ErrorBpf`. Only the first error is recorded.
     pub bpf_error: Option<String>,
+    /// SHARED-READ: Configuration set at init, never mutated during simulation.
+    ///
     /// Enable concurrent callback interleaving at kfunc yield points.
     pub interleave: bool,
+    /// SHARED-READ: Configuration set at init, never mutated during simulation.
+    ///
     /// Preemptive interleaving configuration (None = disabled).
     pub preemptive: Option<PreemptiveConfig>,
-    /// Optional preemption trace for replay mode.
+    /// SHARED-READ: Loaded at init, read-only during simulation. Workers
+    /// read preemption targets but never mutate the trace.
     ///
+    /// Optional preemption trace for replay mode.
     /// When set, preemptive dispatch uses the recorded trace instead of
     /// random PMU timeslices, enabling exact reproduction of preemption
     /// points via hardware breakpoints.
     pub replay_trace: Option<crate::preempt::trace::PreemptionTrace>,
-    /// Persistent replay backend (created once, reused across dispatch rounds).
+    /// SHARED-MUTABLE: Per-worker cursors are advanced during dispatch.
+    /// In concurrent mode, each worker's cursor is independent, but the
+    /// backend itself is shared.
     ///
+    /// Persistent replay backend (created once, reused across dispatch rounds).
     /// The `ReplayBackend` holds per-worker `ReplayCursor`s that track
     /// which preemption target is next. Creating a fresh backend each
     /// round would reset cursors to index 0, causing targets from all
     /// rounds to be replayed from the beginning every time.
     pub(crate) replay_backend: Option<crate::backend::replay::ReplayBackend>,
+    /// SHARED-READ: Set once during `Simulator::run()`, read-only afterward.
+    ///
     /// Resolved e9patch C trampoline function pointers (from the loaded `.so`).
     /// Set during `Simulator::run()` when e9patch mode is active.
     pub(crate) e9_fns: Option<crate::backend::e9patch::E9PatchFns>,
+    /// PER-CPU: Indexed by CpuId.0 — each worker accesses only its own
+    /// accumulator. The Vec is fixed-size after init.
+    ///
     /// Per-CPU structop accumulators that persist across dispatch rounds.
     /// Indexed by CpuId.0. Seeded into worker thread-locals at the start
     /// of each dispatch round and drained back at the end.
     pub structop_accum: Vec<crate::preempt::StructopInfo>,
+    /// SHARED-MUTABLE: Read and written by the engine to coordinate
+    /// concurrent batch processing. Workers check this flag to decide
+    /// whether to defer kicks or suppress nested dispatch.
+    ///
     /// True while inside a concurrent batch (same-timestamp per-CPU events
     /// being processed in parallel). When set, `process_kicked_cpus` defers
     /// kicks (accumulates in `kicked_cpus` but does not process) and
     /// `dispatch_concurrent` is suppressed to prevent nesting.
     pub in_concurrent_batch: bool,
-    /// Native concurrency backend configuration (None = disabled).
+    /// SHARED-READ: Configuration set at init, never mutated during simulation.
     ///
+    /// Native concurrency backend configuration (None = disabled).
     /// When set, workers run truly concurrently with real locks and
     /// window-based clock throttling instead of token-ring serialization.
     pub native_concurrent: Option<NativeConcurrentConfig>,
@@ -758,6 +869,23 @@ pub fn sim_clock() -> TimeNs {
 /// Read the current CPU ID from the thread-local (if set).
 pub fn sim_cpu() -> Option<CpuId> {
     SIM_CONTEXT.with(|c| c.get().cpu)
+}
+
+/// Get the current CPU for this worker thread.
+///
+/// Reads from TLS (`SIM_CONTEXT`), which is safe for concurrent access.
+/// In token-ring mode, this returns the same value as `sim.current_cpu`.
+/// In native concurrent mode, this is the ONLY safe way to read the
+/// current CPU — `sim.current_cpu` is racy.
+///
+/// # Panics
+/// Panics if called outside of an `enter_sim`/`exit_sim` scope (no CPU set).
+pub fn current_cpu_from_tls() -> CpuId {
+    SIM_CONTEXT.with(|c| {
+        c.get()
+            .cpu
+            .expect("current_cpu_from_tls called outside of simulator context (no CPU set)")
+    })
 }
 
 /// Read the CPU ID zero-padding width from the thread-local.
