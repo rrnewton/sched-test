@@ -1806,6 +1806,12 @@ extern "C" fn preempt_handler(
     // 1. Disable PMU timer to prevent recursive signals.
     disable_timer(pctx.timer_fd);
 
+    // 1a. Pause measurement counter immediately — the signal handler's own
+    //     branches should not contribute to the scheduler overhead RBC count.
+    //     Without this, the nondeterministic timing of signal delivery adds
+    //     a variable number of handler branches to the RBC total.
+    disable_measurement(pctx.measure_fd);
+
     // 2. Capture preemption instrumentation BEFORE any other work.
     //    Extract RIP from ucontext and read current RBC count.
     let instruction_pointer = extract_rip_from_ucontext(ctx);
@@ -1863,8 +1869,8 @@ extern "C" fn preempt_handler(
         sinfo,
     );
 
-    // 5. Pause measurement counter before yielding (don't count parked time).
-    disable_measurement(pctx.measure_fd);
+    // 5. Measurement counter was already paused at the top of the handler
+    //    (step 1a), so we don't need to disable it again before yielding.
 
     // 6. Yield token (futex-based, signal-safe). Blocks until re-selected.
     ring.inc_signal_preempt(); // atomic, signal-safe
