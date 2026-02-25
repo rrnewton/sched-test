@@ -187,6 +187,28 @@ impl TokenRing {
     }
 }
 
+impl crate::backend::ThreadOrchestrator for TokenRing {
+    fn start(&self) {
+        TokenRing::start(self);
+    }
+
+    fn wait_all_done(&self) {
+        TokenRing::wait_all_done(self);
+    }
+
+    fn wait_for_token(&self, worker_id: WorkerId) {
+        TokenRing::wait_for_token(self, worker_id);
+    }
+
+    fn yield_token(&self, worker_id: WorkerId) -> bool {
+        TokenRing::yield_token(self, worker_id)
+    }
+
+    fn finish(&self, worker_id: WorkerId) {
+        TokenRing::finish(self, worker_id);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Thread-local yield-point plumbing
 // ---------------------------------------------------------------------------
