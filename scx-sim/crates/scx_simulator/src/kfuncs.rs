@@ -28,7 +28,7 @@ use crate::dsq::DsqManager;
 use crate::ffi;
 use crate::fmt::FmtN;
 use crate::perf::RbcCounter;
-use crate::scenario::{NoiseConfig, OverheadConfig, PreemptiveConfig};
+use crate::scenario::{NativeConcurrentConfig, NoiseConfig, OverheadConfig, PreemptiveConfig};
 use crate::task::OpsTaskState;
 use crate::trace::{DispatchRejectReason, DsqSampleTrigger, Trace, TraceKind};
 use crate::types::{CpuId, DsqId, KickFlags, Pid, TimeNs, Vtime};
@@ -263,6 +263,11 @@ pub struct SimulatorState {
     /// kicks (accumulates in `kicked_cpus` but does not process) and
     /// `dispatch_concurrent` is suppressed to prevent nesting.
     pub in_concurrent_batch: bool,
+    /// Native concurrency backend configuration (None = disabled).
+    ///
+    /// When set, workers run truly concurrently with real locks and
+    /// window-based clock throttling instead of token-ring serialization.
+    pub native_concurrent: Option<NativeConcurrentConfig>,
 }
 
 /// Kernel value of `SCX_TASK_QUEUED` from `enum scx_task_state`.
@@ -1765,6 +1770,7 @@ mod tests {
             e9_fns: None,
             structop_accum: vec![crate::preempt::StructopInfo::default(); nr_cpus as usize],
             in_concurrent_batch: false,
+            native_concurrent: None,
         }
     }
 
