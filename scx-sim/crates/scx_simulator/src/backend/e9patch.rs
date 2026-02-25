@@ -20,7 +20,7 @@
 
 use tracing::{debug, info};
 
-use crate::backend::{PreemptionBackend, StructopDelta};
+use crate::backend::{PreemptTarget, PreemptionBackend, RbcTarget, RelativeRbc, StructopDelta};
 use crate::interleave::WorkerId;
 use crate::preempt::{self, PreemptRing};
 
@@ -106,9 +106,22 @@ impl PreemptionBackend for E9PatchBackend {
         E9PatchWorkerCtx
     }
 
-    fn arm(&self, _ctx: &mut E9PatchWorkerCtx, ring: &PreemptRing) {
-        let ts = ring.roll_timeslice(self.timeslice_min, self.timeslice_max);
-        unsafe { (self.fns.arm)(ts) };
+    fn build_target(&self, _ctx: &E9PatchWorkerCtx, ring: &PreemptRing) -> Option<PreemptTarget> {
+        let timeslice = ring.roll_timeslice(self.timeslice_min, self.timeslice_max);
+        Some(PreemptTarget {
+            count_rbc: RbcTarget::Relative(RelativeRbc(timeslice)),
+            target_rip: None,
+        })
+    }
+
+    fn arm(&self, _ctx: &mut E9PatchWorkerCtx, target: PreemptTarget) {
+        let timeslice = match target.count_rbc {
+            RbcTarget::Relative(RelativeRbc(n)) => n,
+            RbcTarget::Absolute(_) => {
+                panic!("E9PatchBackend::arm() expects RbcTarget::Relative, got Absolute");
+            }
+        };
+        unsafe { (self.fns.arm)(timeslice) };
     }
 
     fn disarm(&self, _ctx: &mut E9PatchWorkerCtx) -> StructopDelta {

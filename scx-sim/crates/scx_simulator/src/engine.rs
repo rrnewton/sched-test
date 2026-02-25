@@ -826,6 +826,7 @@ impl<S: Scheduler> Simulator<S> {
                 scenario.nr_cpus as usize
             ],
             in_concurrent_batch: false,
+            native_concurrent: scenario.native_concurrent,
         };
 
         // Build the persistent ReplayBackend once if we have a replay trace.

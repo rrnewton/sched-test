@@ -81,8 +81,8 @@ pub use preempt::{
 pub use rtapp::load_rtapp;
 pub use scenario::{
     CgroupBandwidth, CgroupCpusetChangeEvent, CgroupCreateEvent, CgroupDef, CgroupDestroyEvent,
-    CgroupMigrateEvent, CpuPreemptEvent, HotplugEvent, IrqEvent, IrqType, NoiseConfig,
-    OverheadConfig, PreemptMode, PreemptiveConfig, Scenario,
+    CgroupMigrateEvent, CpuPreemptEvent, HotplugEvent, IrqEvent, IrqType, NativeConcurrentConfig,
+    NoiseConfig, OverheadConfig, PreemptMode, PreemptiveConfig, Scenario,
 };
 pub use stats::{CpuStats, DistributionStats, TaskStats, TraceComparison, TraceStats};
 pub use task::{nice_to_weight, sched_weight_to_cgroup, Phase, RepeatMode, TaskBehavior, TaskDef};

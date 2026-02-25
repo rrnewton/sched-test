@@ -199,6 +199,30 @@ pub enum PreemptMode {
     /// e9patch software RBC (deterministic, debugger-compatible, requires
     /// `_e9.so` variant of the scheduler).
     E9patch,
+    /// Native concurrency: workers run truly concurrently with real locks
+    /// and window-based clock throttling. No token ring.
+    NativeConcurrent,
+}
+
+/// Configuration for the native concurrency backend.
+///
+/// Worker threads run truly concurrently with window-based clock throttling
+/// instead of being serialized by a token ring. This enables external
+/// determinism/chaos tools (`hermit`, `rr`) for replay and fuzz-testing
+/// of cross-CPU scheduler interactions.
+#[derive(Debug, Clone, Copy)]
+pub struct NativeConcurrentConfig {
+    /// Maximum logical time (ns) any CPU can be ahead of the slowest.
+    /// Default: 10_000_000 (10ms).
+    pub window_ns: TimeNs,
+}
+
+impl Default for NativeConcurrentConfig {
+    fn default() -> Self {
+        NativeConcurrentConfig {
+            window_ns: 10_000_000,
+        }
+    }
 }
 
 /// Configuration for preemptive interleaving via PMU timer signals.
@@ -521,6 +545,11 @@ pub struct Scenario {
     pub max_cgroups: u32,
     /// IRQ events to inject during the simulation.
     pub irq_events: Vec<IrqEvent>,
+    /// Native concurrency backend configuration.
+    ///
+    /// When `Some`, workers run truly concurrently with real locks and
+    /// window-based clock throttling. Implies `interleave = true`.
+    pub native_concurrent: Option<NativeConcurrentConfig>,
 }
 
 /// Builder for constructing scenarios.
@@ -550,6 +579,7 @@ pub struct ScenarioBuilder {
     no_pmu_signal: bool,
     max_cgroups: u32,
     irq_events: Vec<IrqEvent>,
+    native_concurrent: Option<NativeConcurrentConfig>,
 }
 
 impl Scenario {
@@ -580,6 +610,7 @@ impl Scenario {
             no_pmu_signal: false,
             max_cgroups: DEFAULT_MAX_CGROUPS,
             irq_events: Vec::new(),
+            native_concurrent: None,
         }
     }
 }
@@ -958,6 +989,17 @@ impl ScenarioBuilder {
         self
     }
 
+    /// Enable native concurrency backend with the given configuration.
+    ///
+    /// Implies `interleave(true)`. Workers run truly concurrently with
+    /// real locks and window-based clock throttling instead of being
+    /// serialized by a token ring.
+    pub fn native_concurrent(mut self, config: NativeConcurrentConfig) -> Self {
+        self.native_concurrent = Some(config);
+        self.interleave = true;
+        self
+    }
+
     /// Set a preemption trace for replay mode.
     ///
     /// When set, preemptive dispatch uses the recorded trace instead of
@@ -1092,6 +1134,7 @@ impl ScenarioBuilder {
             no_pmu_signal: self.no_pmu_signal,
             max_cgroups: self.max_cgroups,
             irq_events: self.irq_events,
+            native_concurrent: self.native_concurrent,
         }
     }
 }
