@@ -33,21 +33,20 @@ struct bpf_cpumask {
 	unsigned long bits[128];
 };
 
-/* Forward declarations for libc functions */
-extern void *calloc(unsigned long nmemb, unsigned long size);
-extern void free(void *ptr);
-extern void *memset(void *s, int c, unsigned long n);
+/* Deterministic bump allocator — replaces glibc calloc/free to avoid
+ * nondeterministic PMU branch counts from glibc's heap management. */
+#include "sim_arena.h"
 
 /* --- cpumask helpers --- */
 
 struct bpf_cpumask *bpf_cpumask_create(void)
 {
-	return (struct bpf_cpumask *)calloc(1, sizeof(struct bpf_cpumask));
+	return (struct bpf_cpumask *)sim_arena_calloc(sizeof(struct bpf_cpumask));
 }
 
 void bpf_cpumask_release(struct bpf_cpumask *cpumask)
 {
-	free(cpumask);
+	sim_arena_free(cpumask);
 }
 
 void bpf_cpumask_set_cpu(u32 cpu, struct bpf_cpumask *cpumask)
@@ -64,12 +63,12 @@ void bpf_cpumask_clear_cpu(u32 cpu, struct bpf_cpumask *cpumask)
 
 void bpf_cpumask_clear(struct bpf_cpumask *cpumask)
 {
-	memset(cpumask, 0, sizeof(struct bpf_cpumask));
+	__builtin_memset(cpumask, 0, sizeof(struct bpf_cpumask));
 }
 
 void bpf_cpumask_setall(struct bpf_cpumask *cpumask)
 {
-	memset(cpumask, 0xff, sizeof(struct bpf_cpumask));
+	__builtin_memset(cpumask, 0xff, sizeof(struct bpf_cpumask));
 }
 
 bool bpf_cpumask_test_cpu(u32 cpu, const struct cpumask *cpumask)

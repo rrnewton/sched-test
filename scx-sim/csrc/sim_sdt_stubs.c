@@ -12,11 +12,9 @@
  * conflicts. It only needs opaque pointers and basic types.
  */
 
-/* Forward-declare libc functions to avoid header conflicts with vmlinux.h */
-extern void *calloc(unsigned long nmemb, unsigned long size);
-extern void *malloc(unsigned long size);
-extern void free(void *ptr);
-extern void *memset(void *s, int c, unsigned long n);
+/* Deterministic bump allocator — replaces glibc calloc/free to avoid
+ * nondeterministic PMU branch counts from glibc's heap management. */
+#include "sim_arena.h"
 
 /* Use kern_types.h for basic types (u32, u64, etc.) */
 #include "kern_types.h"
@@ -92,7 +90,7 @@ static struct sdt_entry *sdt_find_slot(struct task_struct *p)
 int scx_task_init(u64 data_size)
 {
 	sdt_data_size = data_size;
-	memset(sdt_table, 0, sizeof(sdt_table));
+	__builtin_memset(sdt_table, 0, sizeof(sdt_table));
 	sdt_initialized = 1;
 	return 0;
 }
@@ -111,19 +109,19 @@ void *scx_task_alloc(struct task_struct *p)
 	if (!sdt_initialized || !p)
 		return (void *)0;
 
-	data = calloc(1, sdt_data_size);
+	data = sim_arena_calloc(sdt_data_size);
 	if (!data)
 		return (void *)0;
 
 	entry = sdt_find_slot(p);
 	if (!entry) {
-		free(data);
+		sim_arena_free(data);
 		return (void *)0;
 	}
 
 	/* If slot already occupied by this key, free old data */
 	if (entry->key == p && entry->data)
-		free(entry->data);
+		sim_arena_free(entry->data);
 
 	entry->key = p;
 	entry->data = data;
@@ -163,7 +161,7 @@ void scx_task_free(struct task_struct *p)
 	if (!entry || entry->key != p)
 		return;
 
-	free(entry->data);
+	sim_arena_free(entry->data);
 	entry->key = (void *)0;
 	entry->data = (void *)0;
 }
@@ -198,7 +196,10 @@ void sim_sdt_reset(void)
 	/* Clear the hash table to the same state as after scx_task_init().
 	 * memset is deterministic (same instruction count regardless of
 	 * current table contents), unlike iterating and checking each slot. */
-	memset(sdt_table, 0, sizeof(sdt_table));
+	__builtin_memset(sdt_table, 0, sizeof(sdt_table));
+	/* Reset the arena so the next run's allocations get the same
+	 * addresses as the first run (deterministic bump pointer). */
+	sim_arena_reset();
 	/* Note: sdt_initialized and sdt_data_size are NOT reset here.
 	 * They are set during scheduler load (scx_task_init) and must
 	 * persist across simulation runs with the same scheduler. */
