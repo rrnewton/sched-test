@@ -304,6 +304,9 @@ pub struct SimulatorState {
     /// this would move to per-worker TLS.
     ///
     /// RBC counter for measuring scheduler C code overhead (None = disabled).
+    ///
+    /// In e9patch mode this is `None` — the e9 software counter provides a
+    /// deterministic branch count instead of the nondeterministic PMU.
     pub rbc_counter: Option<RbcCounter>,
     /// SHARED-READ: Configuration set at init, never mutated during simulation.
     ///
@@ -319,6 +322,13 @@ pub struct SimulatorState {
     ///
     /// Accumulated kfunc nanosecond cost during the current RBC measurement window.
     pub rbc_kfunc_ns: u64,
+    /// Snapshot of the e9 software counter at `start_rbc()` time.
+    ///
+    /// When e9patch mode is active, `start_rbc()` saves the current value of
+    /// `E9SharedRbc.counter` here. `charge_sched_time()` then computes the
+    /// number of Jcc instructions executed as `snapshot - current_counter`.
+    /// This gives a deterministic branch count (unlike the PMU hardware counter).
+    pub rbc_e9_snapshot: i64,
     /// SHARED-MUTABLE: Any kfunc on any CPU can set a BPF error. First-write
     /// wins (subsequent errors are ignored). Needs Mutex or atomic Option.
     ///
@@ -1901,6 +1911,7 @@ mod tests {
             sched_overhead_rbc_ns: None,
             rbc_kfunc_calls: 0,
             rbc_kfunc_ns: 0,
+            rbc_e9_snapshot: 0,
             bpf_error: None,
             interleave: false,
             preemptive: None,
