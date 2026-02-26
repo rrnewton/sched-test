@@ -23,13 +23,39 @@ use crate::fmt::FmtN;
 use crate::kfuncs::{self, OpsContext, SimulatorState};
 use crate::monitor::{Monitor, ProbeContext, ProbePoint};
 use crate::perf;
-use crate::preempt::{is_determinism_mode_enabled, record_checkpoint, CheckpointEvent};
+use crate::preempt::{
+    is_determinism_mode_enabled, record_checkpoint, scheduler_so_path, CheckpointEvent,
+};
 use crate::scenario::{
     CgroupCpusetChangeEvent, CgroupCreateEvent, CgroupDestroyEvent, IrqType, PreemptMode, Scenario,
 };
 use crate::task::{OpsTaskState, Phase, SimTask, TaskState};
 use crate::trace::{DsqSampleTrigger, Trace, TraceKind};
 use crate::types::{CpuId, DsqId, KickFlags, Pid, TimeNs};
+
+/// Pause execution so a debugger can attach before scheduler code runs.
+///
+/// Prints the PID and loaded scheduler `.so` path to stderr, then raises
+/// `SIGSTOP`. The user can attach with `lldb -p <PID>` and type `continue`
+/// in the debugger to resume into `ops.init()`.
+fn wait_for_debugger() {
+    let pid = std::process::id();
+    let so_path = scheduler_so_path().unwrap_or_else(|| "<unknown>".to_string());
+    eprintln!();
+    eprintln!("=== --wait-debugger ===");
+    eprintln!("PID:           {pid}");
+    eprintln!("Scheduler .so: {so_path}");
+    eprintln!();
+    eprintln!("Attach with:   lldb -p {pid}");
+    eprintln!("Then type 'continue' in lldb to resume.");
+    eprintln!();
+    eprintln!("Sending SIGSTOP to self...");
+    // SAFETY: raise(SIGSTOP) is a well-defined POSIX operation.
+    unsafe {
+        libc::raise(libc::SIGSTOP);
+    }
+    eprintln!("Resumed from debugger, continuing to ops.init()...");
+}
 
 /// Check for BPF errors after a scheduler callback.
 ///
@@ -939,6 +965,12 @@ impl<S: Scheduler> Simulator<S> {
             cgroup_registry.create(&cg_def.name, parent_cgid, cg_def.cpuset.clone());
         }
         unsafe { install_cgroup_registry(&mut cgroup_registry) };
+
+        // If --wait-debugger was requested, pause so the user can attach a
+        // debugger while scheduler symbols are loaded but before init() runs.
+        if scenario.wait_debugger {
+            wait_for_debugger();
+        }
 
         // Initialize scheduler
         unsafe {
