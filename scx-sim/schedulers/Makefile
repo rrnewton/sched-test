@@ -35,7 +35,7 @@ SCHEDS := $(patsubst %/wrapper.c,%,$(wildcard */wrapper.c))
 SO_TARGETS := $(foreach s,$(SCHEDS),$(BUILD_DIR)/libscx_$(s).so)
 
 # --- Common flags ---
-CFLAGS_BASE := -fPIC -DSCX_BPF_UNITTEST \
+CFLAGS_BASE := -fPIC -DSCX_BPF_UNITTEST -g \
                -Wno-unused-parameter -Wno-unknown-attributes
 
 # --- Coverage support (opt-in via SCX_SIM_COVERAGE=1) ---
