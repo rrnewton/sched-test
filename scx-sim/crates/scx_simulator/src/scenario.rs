@@ -550,6 +550,13 @@ pub struct Scenario {
     /// When `Some`, workers run truly concurrently with real locks and
     /// window-based clock throttling. Implies `interleave = true`.
     pub native_concurrent: Option<NativeConcurrentConfig>,
+    /// Pause before `ops.init()` so a debugger can attach.
+    ///
+    /// When true, the engine prints the PID and scheduler `.so` path to
+    /// stderr and raises `SIGSTOP`, allowing the user to attach `lldb`
+    /// (or another debugger) and inspect scheduler symbols before
+    /// execution begins.
+    pub wait_debugger: bool,
 }
 
 /// Builder for constructing scenarios.
@@ -580,6 +587,7 @@ pub struct ScenarioBuilder {
     max_cgroups: u32,
     irq_events: Vec<IrqEvent>,
     native_concurrent: Option<NativeConcurrentConfig>,
+    wait_debugger: bool,
 }
 
 impl Scenario {
@@ -611,6 +619,7 @@ impl Scenario {
             max_cgroups: DEFAULT_MAX_CGROUPS,
             irq_events: Vec::new(),
             native_concurrent: None,
+            wait_debugger: false,
         }
     }
 }
@@ -1000,6 +1009,16 @@ impl ScenarioBuilder {
         self
     }
 
+    /// Pause before `ops.init()` so a debugger can attach.
+    ///
+    /// When enabled, the engine prints the PID and scheduler `.so` path
+    /// to stderr and raises `SIGSTOP`, giving the user time to attach a
+    /// debugger (e.g. `lldb -p <PID>`) and inspect scheduler symbols.
+    pub fn wait_debugger(mut self, enabled: bool) -> Self {
+        self.wait_debugger = enabled;
+        self
+    }
+
     /// Set a preemption trace for replay mode.
     ///
     /// When set, preemptive dispatch uses the recorded trace instead of
@@ -1140,6 +1159,7 @@ impl ScenarioBuilder {
             max_cgroups: self.max_cgroups,
             irq_events: self.irq_events,
             native_concurrent: self.native_concurrent,
+            wait_debugger: self.wait_debugger,
         }
     }
 }

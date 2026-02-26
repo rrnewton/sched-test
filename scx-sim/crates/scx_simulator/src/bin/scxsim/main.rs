@@ -279,6 +279,14 @@ struct RunArgs {
     /// durations, inter-arrival times, and per-CPU tick intervals.
     #[arg(long)]
     verbose_summary: bool,
+
+    /// Pause before ops.init() so a debugger can attach.
+    ///
+    /// After the scheduler .so is loaded (symbols visible to the debugger)
+    /// but before any scheduler code executes, the process stops via
+    /// SIGSTOP. Attach with `lldb -p <PID>` and type `continue` to resume.
+    #[arg(long)]
+    wait_debugger: bool,
 }
 
 /// Arguments for the `replay` subcommand.
@@ -306,6 +314,14 @@ struct ReplayArgs {
     /// and checks the RBC count to find the right dynamic instance.
     #[arg(long)]
     no_pmu_signal: bool,
+
+    /// Pause before ops.init() so a debugger can attach.
+    ///
+    /// After the scheduler .so is loaded (symbols visible to the debugger)
+    /// but before any scheduler code executes, the process stops via
+    /// SIGSTOP. Attach with `lldb -p <PID>` and type `continue` to resume.
+    #[arg(long)]
+    wait_debugger: bool,
 }
 
 fn main() {
@@ -386,6 +402,9 @@ fn run(args: &RunArgs) -> Result<(), String> {
     if let Some(ref timeout) = args.watchdog_timeout {
         scenario.watchdog_timeout_ns =
             Some(parse_duration_ns(timeout).map_err(|e| format!("--watchdog-timeout: {e}"))?);
+    }
+    if args.wait_debugger {
+        scenario.wait_debugger = true;
     }
 
     // Validate --wprof and --bpf-trace require --real-run vm
@@ -580,6 +599,9 @@ fn replay_simulation(args: &ReplayArgs) -> Result<(), String> {
     let mut scenario = builder.build();
     scenario.replay_trace = Some(trace);
     scenario.no_pmu_signal = args.no_pmu_signal;
+    if args.wait_debugger {
+        scenario.wait_debugger = true;
+    }
 
     // Enable preemption recording if --record-preemptions is set.
     if args.record_preemptions.is_some() {
