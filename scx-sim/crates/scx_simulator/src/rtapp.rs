@@ -499,6 +499,7 @@ pub fn load_rtapp(json_str: &str, nr_cpus: u32) -> Result<Scenario, RtAppError> 
         max_cgroups: crate::cgroup::DEFAULT_MAX_CGROUPS,
         irq_events: Vec::new(),
         native_concurrent: None,
+        wait_debugger: false,
     })
 }
 
