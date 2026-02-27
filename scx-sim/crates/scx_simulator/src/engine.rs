@@ -33,36 +33,123 @@ use crate::task::{OpsTaskState, Phase, SimTask, TaskState};
 use crate::trace::{DsqSampleTrigger, Trace, TraceKind};
 use crate::types::{CpuId, DsqId, KickFlags, Pid, TimeNs};
 
+/// Source file suffixes whose functions should be skippable via step-avoid-regexp.
+const HELPER_SOURCE_SUFFIXES: &[&str] = &["wrapper.c", "util.bpf.c"];
+
+/// Discover helper function names from a scheduler `.so` using `nm -l`.
+///
+/// Runs `nm -l <so_path>` and filters for text symbols (`T`/`t`) whose source
+/// file path ends with one of [`HELPER_SOURCE_SUFFIXES`]. Skips symbols
+/// starting with `_` or `.` (compiler-generated internals). Returns a sorted,
+/// deduplicated list of function names. Returns an empty vec on any failure.
+fn discover_helper_functions(so_path: &str) -> Vec<String> {
+    let output = match std::process::Command::new("nm")
+        .args(["-l", so_path])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut names: Vec<String> = stdout.lines().filter_map(parse_nm_helper_symbol).collect();
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
+/// Parse a single `nm -l` output line, returning the function name if it
+/// is a text symbol from a helper source file.
+///
+/// Expected format: `<addr> <type> <name>\t<source_path>:<line>`
+fn parse_nm_helper_symbol(line: &str) -> Option<String> {
+    // Split on tab to separate symbol info from source path.
+    let (sym_part, source_part) = line.split_once('\t')?;
+    // Source path must end with one of our helper suffixes (before `:line`).
+    let source_file = source_part.split_once(':').map_or(source_part, |(f, _)| f);
+    if !HELPER_SOURCE_SUFFIXES
+        .iter()
+        .any(|suffix| source_file.ends_with(suffix))
+    {
+        return None;
+    }
+    // Parse the symbol part: "<addr> <type> <name>"
+    let mut fields = sym_part.split_whitespace();
+    let _addr = fields.next()?;
+    let sym_type = fields.next()?;
+    let name = fields.next()?;
+    // Only text (function) symbols.
+    if sym_type != "T" && sym_type != "t" {
+        return None;
+    }
+    // Skip internal/compiler-generated symbols.
+    if name.starts_with('_') || name.starts_with('.') {
+        return None;
+    }
+    Some(name.to_owned())
+}
+
+/// Build lldb `command alias` definitions for skipping/unskipping helper functions.
+///
+/// Returns `None` if `names` is empty, otherwise returns a multi-line string
+/// with alias definitions that the user can invoke as `skip-helpers` and
+/// `unskip-helpers` in the lldb session.
+fn build_helper_aliases(names: &[String]) -> Option<String> {
+    if names.is_empty() {
+        return None;
+    }
+    let alternation = names.join("|");
+    Some(format!(
+        "\
+command alias skip-helpers settings set target.process.thread.step-avoid-regexp \"^({alternation})\"
+command alias unskip-helpers settings clear target.process.thread.step-avoid-regexp",
+    ))
+}
+
 /// Write an lldb breakpoint script alongside the scheduler `.so`.
 ///
 /// Given a `.so` path like `/path/to/libscx_simple.so`, writes the script
 /// to `/path/to/libscx_simple.lldb`. The script contains `breakpoint set`
-/// commands for each ops callback symbol plus a `process handle` directive
-/// to suppress the SIGTRAP marker signal. Returns the script path.
-fn write_lldb_script(info: &crate::ffi::DebuggerInfo) -> String {
+/// commands for each ops callback symbol, plus optional `command alias`
+/// definitions for `skip-helpers`/`unskip-helpers`. Returns
+/// `(script_path, has_helpers)`.
+fn write_lldb_script(info: &crate::ffi::DebuggerInfo) -> (String, bool) {
     let so = std::path::Path::new(&info.so_path);
     let lldb_path = so.with_extension("lldb");
     let mut script = String::new();
     script.push_str("# Auto-generated lldb breakpoint script for scheduler ops\n");
     script.push_str(&format!("# Scheduler: {}\n\n", info.prefix));
-    // Suppress the SIGTRAP marker raised after debugger attach detection.
-    // -s false: don't stop on SIGTRAP (so no extra stop for the user)
-    // -n false: don't notify about it
-    // -p false: don't pass it to the process (avoids default SIGTRAP kill)
-    // This lets the user do a single `continue` from the attach point to
-    // hit the first ops breakpoint (breakpoints use debug traps, not
-    // the SIGTRAP Unix signal, so they are unaffected).
-    script.push_str("process handle SIGTRAP -s false -n false -p false\n\n");
+    // Make `step` stay in scheduler C code by skipping the simulator binary.
+    // All scheduler code lives in libscx_*.so; everything we want to skip
+    // (kfunc stubs, RBC instrumentation, Rust engine code) lives in scxsim.
+    if let Ok(exe) = std::env::current_exe() {
+        script.push_str(&format!(
+            "settings set target.process.thread.step-avoid-libraries \"{}\"\n\n",
+            exe.display()
+        ));
+    }
     for sym in &info.ops_symbol_names {
         script.push_str(&format!("breakpoint set --name {sym}\n"));
     }
+
+    // Discover helper functions from wrapper.c / util.bpf.c and emit command
+    // alias definitions for skip-helpers / unskip-helpers.
+    let helpers = discover_helper_functions(&info.so_path);
+    let aliases = build_helper_aliases(&helpers);
+    if let Some(ref cmds) = aliases {
+        script.push_str(
+            "\n# Custom commands for skipping utility helpers (util.bpf.c, wrapper.c):\n",
+        );
+        script.push_str(cmds);
+        script.push('\n');
+    }
+
     if let Err(e) = std::fs::write(&lldb_path, &script) {
         eprintln!(
             "warning: could not write lldb script to {}: {e}",
             lldb_path.display()
         );
     }
-    lldb_path.to_string_lossy().into_owned()
+    (lldb_path.to_string_lossy().into_owned(), aliases.is_some())
 }
 
 /// Spin-wait until a debugger (ptrace tracer) attaches to this process.
@@ -90,22 +177,27 @@ fn wait_for_debugger_attach() {
 ///
 /// Writes an lldb breakpoint script alongside the scheduler `.so`, prints
 /// the PID and a copy-pasteable `lldb` attach command, then spin-waits
-/// for a debugger to attach. Once attached, raises `SIGTRAP` which the
-/// lldb script is configured to suppress (so the user only needs a single
-/// `continue` from the attach point to hit the first breakpoint).
+/// for a debugger to attach. Once attached, execution proceeds directly
+/// to `ops.init()`. The user types a single `continue` from the lldb
+/// attach stop to hit the first ops breakpoint.
 fn wait_for_debugger<S: Scheduler>(scheduler: &S) {
     let pid = std::process::id();
     let info = scheduler.debugger_info();
 
-    let (so_display, script_display, bp_count) = match &info {
+    let (so_display, script_display, bp_count, has_helpers) = match &info {
         Some(dbg) => {
-            let script_path = write_lldb_script(dbg);
+            let (script_path, has_helpers) = write_lldb_script(dbg);
             let count = dbg.ops_symbol_names.len();
-            (dbg.so_path.as_str().to_owned(), Some(script_path), count)
+            (
+                dbg.so_path.as_str().to_owned(),
+                Some(script_path),
+                count,
+                has_helpers,
+            )
         }
         None => {
             let fallback = scheduler_so_path().unwrap_or_else(|| "<unknown>".to_string());
-            (fallback, None, 0)
+            (fallback, None, 0, false)
         }
     };
 
@@ -120,22 +212,20 @@ fn wait_for_debugger<S: Scheduler>(scheduler: &S) {
     eprintln!("Waiting for debugger to attach...");
     eprintln!();
     match &script_display {
-        Some(script) => eprintln!("  lldb -p {pid} -s {script}"),
+        Some(script) => eprintln!("  lldb -p {pid} -o \"command source {script}\""),
         None => eprintln!("  lldb -p {pid}"),
+    }
+    if has_helpers {
+        eprintln!();
+        eprintln!("Custom lldb commands available:");
+        eprintln!("  skip-helpers    \u{2014} skip util.bpf.c/wrapper.c when stepping");
+        eprintln!("  unskip-helpers  \u{2014} stop skipping helpers");
     }
     eprintln!();
 
     wait_for_debugger_attach();
 
-    // SAFETY: raise(SIGTRAP) is a well-defined POSIX operation. The lldb
-    // script configures `process handle SIGTRAP -s false` so this signal
-    // is suppressed by the debugger and does not cause an extra stop.
-    // This serves as a marker that the debugger is attached and the
-    // process is about to enter ops.init().
-    unsafe {
-        libc::raise(libc::SIGTRAP);
-    }
-    eprintln!("Debugger attached, continuing to ops.init()...");
+    eprintln!("Debugger attached, resuming...");
 }
 
 /// Check for BPF errors after a scheduler callback.
@@ -4493,4 +4583,90 @@ fn replay_dispatch_with_retry<S: Scheduler>(
          This should not happen in breakpoint-only mode — \
          please report this as a bug."
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_nm_text_symbol_from_helper_source() {
+        let line = "0000000000000900 t get_cpu_ctx\t/some/path/util.bpf.c:71";
+        assert_eq!(parse_nm_helper_symbol(line), Some("get_cpu_ctx".to_owned()));
+    }
+
+    #[test]
+    fn parse_nm_global_text_symbol_from_wrapper() {
+        let line = "000000000001efc0 T bpf_cgroup_from_id\t/some/path/wrapper.c:385";
+        assert_eq!(
+            parse_nm_helper_symbol(line),
+            Some("bpf_cgroup_from_id".to_owned())
+        );
+    }
+
+    #[test]
+    fn parse_nm_skips_non_text_symbols() {
+        // Data symbol (V) from util.bpf.c — should be ignored.
+        let line = "000000000001f000 V cpu_ctx_stor\t/some/path/util.bpf.c:62";
+        assert_eq!(parse_nm_helper_symbol(line), None);
+    }
+
+    #[test]
+    fn parse_nm_skips_underscore_prefix() {
+        let line = "0000000000000900 T _internal_func\t/some/path/wrapper.c:10";
+        assert_eq!(parse_nm_helper_symbol(line), None);
+    }
+
+    #[test]
+    fn parse_nm_skips_dot_prefix() {
+        let line = "0000000000000900 t .hidden_func\t/some/path/util.bpf.c:5";
+        assert_eq!(parse_nm_helper_symbol(line), None);
+    }
+
+    #[test]
+    fn parse_nm_skips_non_helper_source() {
+        let line = "0000000000000490 T simple_dispatch\t/some/path/scx_simple.bpf.c:98";
+        assert_eq!(parse_nm_helper_symbol(line), None);
+    }
+
+    #[test]
+    fn parse_nm_skips_lines_without_tab() {
+        let line = "                 U calloc";
+        assert_eq!(parse_nm_helper_symbol(line), None);
+    }
+
+    #[test]
+    fn parse_nm_source_without_line_number() {
+        // Some nm outputs omit the line number.
+        let line = "0000000000000900 t helper_fn\t/some/path/wrapper.c";
+        assert_eq!(parse_nm_helper_symbol(line), Some("helper_fn".to_owned()));
+    }
+
+    #[test]
+    fn build_helper_aliases_empty_names() {
+        assert_eq!(build_helper_aliases(&[]), None);
+    }
+
+    #[test]
+    fn build_helper_aliases_single_name() {
+        let names = vec!["get_cpu_ctx".to_owned()];
+        let aliases = build_helper_aliases(&names).unwrap();
+        assert!(aliases.contains("command alias skip-helpers"));
+        assert!(aliases.contains("command alias unskip-helpers"));
+        assert!(aliases.contains("\"^(get_cpu_ctx)\""));
+        assert!(aliases.contains("settings clear target.process.thread.step-avoid-regexp"));
+    }
+
+    #[test]
+    fn build_helper_aliases_multiple_names() {
+        let names = vec![
+            "calc_avg".to_owned(),
+            "get_cpu_ctx".to_owned(),
+            "stat_inc".to_owned(),
+        ];
+        let aliases = build_helper_aliases(&names).unwrap();
+        assert!(aliases.contains("command alias skip-helpers"));
+        assert!(aliases.contains("\"^(calc_avg|get_cpu_ctx|stat_inc)\""));
+        assert!(aliases.contains("command alias unskip-helpers"));
+    }
 }
