@@ -284,7 +284,8 @@ struct RunArgs {
     ///
     /// After the scheduler .so is loaded, writes an lldb breakpoint script
     /// next to the .so, prints a copy-pasteable lldb command, and spin-waits
-    /// for a debugger. Raises SIGTRAP on attach (single `continue` needed).
+    /// for a debugger. A single `continue` from the attach stop hits the
+    /// first ops breakpoint.
     #[arg(long)]
     wait_debugger: bool,
 }
@@ -319,7 +320,8 @@ struct ReplayArgs {
     ///
     /// After the scheduler .so is loaded, writes an lldb breakpoint script
     /// next to the .so, prints a copy-pasteable lldb command, and spin-waits
-    /// for a debugger. Raises SIGTRAP on attach (single `continue` needed).
+    /// for a debugger. A single `continue` from the attach stop hits the
+    /// first ops breakpoint.
     #[arg(long)]
     wait_debugger: bool,
 }
