@@ -605,8 +605,9 @@ pub struct Scenario {
     ///
     /// When true, the engine writes an lldb breakpoint script next to the
     /// scheduler `.so`, prints the PID and a copy-pasteable `lldb` command,
-    /// then spin-waits for a debugger to attach. Once attached, raises
-    /// `SIGTRAP` so the debugger stops cleanly (single `continue` needed).
+    /// then spin-waits for a debugger to attach. After the debugger
+    /// attaches and the user types `continue`, execution proceeds to
+    /// `ops.init()` and hits the first breakpoint.
     pub wait_debugger: bool,
 }
 
@@ -1064,7 +1065,8 @@ impl ScenarioBuilder {
     ///
     /// When enabled, the engine writes an lldb breakpoint script next to
     /// the scheduler `.so`, prints the PID and a copy-pasteable `lldb`
-    /// command, then spin-waits for a debugger. Raises `SIGTRAP` on attach.
+    /// command, then spin-waits for a debugger. A single `continue` from
+    /// the attach stop hits the first ops breakpoint.
     pub fn wait_debugger(mut self, enabled: bool) -> Self {
         self.wait_debugger = enabled;
         self
