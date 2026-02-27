@@ -62,7 +62,9 @@ pub use cgroup::{
     DEFAULT_MAX_CGROUPS,
 };
 pub use engine::{ExitKind, SimulationResult, Simulator};
-pub use ffi::{discover_schedulers, DynamicScheduler, LavdPowerMode, Scheduler, SchedulerInfo};
+pub use ffi::{
+    discover_schedulers, DebuggerInfo, DynamicScheduler, LavdPowerMode, Scheduler, SchedulerInfo,
+};
 pub use fmt::{FmtN, FmtTs, SimFormat};
 pub use kfuncs::sim_clock;
 pub use monitor::{Monitor, ProbeContext, ProbePoint};

@@ -603,10 +603,10 @@ pub struct Scenario {
     pub native_concurrent: Option<NativeConcurrentConfig>,
     /// Pause before `ops.init()` so a debugger can attach.
     ///
-    /// When true, the engine prints the PID and scheduler `.so` path to
-    /// stderr and raises `SIGSTOP`, allowing the user to attach `lldb`
-    /// (or another debugger) and inspect scheduler symbols before
-    /// execution begins.
+    /// When true, the engine writes an lldb breakpoint script next to the
+    /// scheduler `.so`, prints the PID and a copy-pasteable `lldb` command,
+    /// then spin-waits for a debugger to attach. Once attached, raises
+    /// `SIGTRAP` so the debugger stops cleanly (single `continue` needed).
     pub wait_debugger: bool,
 }
 
@@ -1062,9 +1062,9 @@ impl ScenarioBuilder {
 
     /// Pause before `ops.init()` so a debugger can attach.
     ///
-    /// When enabled, the engine prints the PID and scheduler `.so` path
-    /// to stderr and raises `SIGSTOP`, giving the user time to attach a
-    /// debugger (e.g. `lldb -p <PID>`) and inspect scheduler symbols.
+    /// When enabled, the engine writes an lldb breakpoint script next to
+    /// the scheduler `.so`, prints the PID and a copy-pasteable `lldb`
+    /// command, then spin-waits for a debugger. Raises `SIGTRAP` on attach.
     pub fn wait_debugger(mut self, enabled: bool) -> Self {
         self.wait_debugger = enabled;
         self

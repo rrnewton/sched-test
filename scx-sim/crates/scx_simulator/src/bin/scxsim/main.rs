@@ -282,9 +282,9 @@ struct RunArgs {
 
     /// Pause before ops.init() so a debugger can attach.
     ///
-    /// After the scheduler .so is loaded (symbols visible to the debugger)
-    /// but before any scheduler code executes, the process stops via
-    /// SIGSTOP. Attach with `lldb -p <PID>` and type `continue` to resume.
+    /// After the scheduler .so is loaded, writes an lldb breakpoint script
+    /// next to the .so, prints a copy-pasteable lldb command, and spin-waits
+    /// for a debugger. Raises SIGTRAP on attach (single `continue` needed).
     #[arg(long)]
     wait_debugger: bool,
 }
@@ -317,9 +317,9 @@ struct ReplayArgs {
 
     /// Pause before ops.init() so a debugger can attach.
     ///
-    /// After the scheduler .so is loaded (symbols visible to the debugger)
-    /// but before any scheduler code executes, the process stops via
-    /// SIGSTOP. Attach with `lldb -p <PID>` and type `continue` to resume.
+    /// After the scheduler .so is loaded, writes an lldb breakpoint script
+    /// next to the .so, prints a copy-pasteable lldb command, and spin-waits
+    /// for a debugger. Raises SIGTRAP on attach (single `continue` needed).
     #[arg(long)]
     wait_debugger: bool,
 }
