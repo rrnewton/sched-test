@@ -33,28 +33,109 @@ use crate::task::{OpsTaskState, Phase, SimTask, TaskState};
 use crate::trace::{DsqSampleTrigger, Trace, TraceKind};
 use crate::types::{CpuId, DsqId, KickFlags, Pid, TimeNs};
 
+/// Write an lldb breakpoint script alongside the scheduler `.so`.
+///
+/// Given a `.so` path like `/path/to/libscx_simple.so`, writes the script
+/// to `/path/to/libscx_simple.lldb`. The script contains `breakpoint set`
+/// commands for each ops callback symbol plus a `process handle` directive
+/// to suppress the SIGTRAP marker signal. Returns the script path.
+fn write_lldb_script(info: &crate::ffi::DebuggerInfo) -> String {
+    let so = std::path::Path::new(&info.so_path);
+    let lldb_path = so.with_extension("lldb");
+    let mut script = String::new();
+    script.push_str("# Auto-generated lldb breakpoint script for scheduler ops\n");
+    script.push_str(&format!("# Scheduler: {}\n\n", info.prefix));
+    // Suppress the SIGTRAP marker raised after debugger attach detection.
+    // -s false: don't stop on SIGTRAP (so no extra stop for the user)
+    // -n false: don't notify about it
+    // -p false: don't pass it to the process (avoids default SIGTRAP kill)
+    // This lets the user do a single `continue` from the attach point to
+    // hit the first ops breakpoint (breakpoints use debug traps, not
+    // the SIGTRAP Unix signal, so they are unaffected).
+    script.push_str("process handle SIGTRAP -s false -n false -p false\n\n");
+    for sym in &info.ops_symbol_names {
+        script.push_str(&format!("breakpoint set --name {sym}\n"));
+    }
+    if let Err(e) = std::fs::write(&lldb_path, &script) {
+        eprintln!(
+            "warning: could not write lldb script to {}: {e}",
+            lldb_path.display()
+        );
+    }
+    lldb_path.to_string_lossy().into_owned()
+}
+
+/// Spin-wait until a debugger (ptrace tracer) attaches to this process.
+///
+/// Reads `/proc/self/status` and checks `TracerPid`. Returns once
+/// `TracerPid` is non-zero, polling every 100ms.
+fn wait_for_debugger_attach() {
+    loop {
+        if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+            for line in status.lines() {
+                if let Some(pid_str) = line.strip_prefix("TracerPid:\t") {
+                    if let Ok(pid) = pid_str.trim().parse::<u32>() {
+                        if pid != 0 {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
 /// Pause execution so a debugger can attach before scheduler code runs.
 ///
-/// Prints the PID and loaded scheduler `.so` path to stderr, then raises
-/// `SIGSTOP`. The user can attach with `lldb -p <PID>` and type `continue`
-/// in the debugger to resume into `ops.init()`.
-fn wait_for_debugger() {
+/// Writes an lldb breakpoint script alongside the scheduler `.so`, prints
+/// the PID and a copy-pasteable `lldb` attach command, then spin-waits
+/// for a debugger to attach. Once attached, raises `SIGTRAP` which the
+/// lldb script is configured to suppress (so the user only needs a single
+/// `continue` from the attach point to hit the first breakpoint).
+fn wait_for_debugger<S: Scheduler>(scheduler: &S) {
     let pid = std::process::id();
-    let so_path = scheduler_so_path().unwrap_or_else(|| "<unknown>".to_string());
+    let info = scheduler.debugger_info();
+
+    let (so_display, script_display, bp_count) = match &info {
+        Some(dbg) => {
+            let script_path = write_lldb_script(dbg);
+            let count = dbg.ops_symbol_names.len();
+            (dbg.so_path.as_str().to_owned(), Some(script_path), count)
+        }
+        None => {
+            let fallback = scheduler_so_path().unwrap_or_else(|| "<unknown>".to_string());
+            (fallback, None, 0)
+        }
+    };
+
     eprintln!();
     eprintln!("=== --wait-debugger ===");
-    eprintln!("PID:           {pid}");
-    eprintln!("Scheduler .so: {so_path}");
-    eprintln!();
-    eprintln!("Attach with:   lldb -p {pid}");
-    eprintln!("Then type 'continue' in lldb to resume.");
-    eprintln!();
-    eprintln!("Sending SIGSTOP to self...");
-    // SAFETY: raise(SIGSTOP) is a well-defined POSIX operation.
-    unsafe {
-        libc::raise(libc::SIGSTOP);
+    eprintln!("PID: {pid}");
+    eprintln!("Scheduler .so: {so_display}");
+    if let Some(ref script) = script_display {
+        eprintln!("Breakpoints: {bp_count} ops callbacks in {script}");
     }
-    eprintln!("Resumed from debugger, continuing to ops.init()...");
+    eprintln!();
+    eprintln!("Waiting for debugger to attach...");
+    eprintln!();
+    match &script_display {
+        Some(script) => eprintln!("  lldb -p {pid} -s {script}"),
+        None => eprintln!("  lldb -p {pid}"),
+    }
+    eprintln!();
+
+    wait_for_debugger_attach();
+
+    // SAFETY: raise(SIGTRAP) is a well-defined POSIX operation. The lldb
+    // script configures `process handle SIGTRAP -s false` so this signal
+    // is suppressed by the debugger and does not cause an extra stop.
+    // This serves as a marker that the debugger is attached and the
+    // process is about to enter ops.init().
+    unsafe {
+        libc::raise(libc::SIGTRAP);
+    }
+    eprintln!("Debugger attached, continuing to ops.init()...");
 }
 
 /// Check for BPF errors after a scheduler callback.
@@ -1102,7 +1183,7 @@ impl<S: Scheduler> Simulator<S> {
         // If --wait-debugger was requested, pause so the user can attach a
         // debugger while scheduler symbols are loaded but before init() runs.
         if scenario.wait_debugger {
-            wait_for_debugger();
+            wait_for_debugger(&self.scheduler);
         }
 
         // Initialize scheduler

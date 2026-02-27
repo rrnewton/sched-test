@@ -285,6 +285,29 @@ pub trait Scheduler {
     fn resolve_e9_fns(&self) -> Option<crate::backend::e9patch::E9PatchFns> {
         None
     }
+
+    /// Return debugger metadata for `--wait-debugger` support.
+    ///
+    /// The default implementation returns `None` (no debugger info available).
+    /// `DynamicScheduler` overrides this with the actual `.so` path, symbol
+    /// prefix, and list of defined ops symbol names.
+    fn debugger_info(&self) -> Option<DebuggerInfo> {
+        None
+    }
+}
+
+/// Debugger metadata for a loaded scheduler, used by `--wait-debugger`.
+///
+/// Contains the information needed to generate an lldb breakpoint script:
+/// the `.so` file path, the symbol prefix (e.g. "simple"), and the list
+/// of ops callback symbol names present in the loaded scheduler.
+pub struct DebuggerInfo {
+    /// Absolute path to the loaded `.so` file.
+    pub so_path: String,
+    /// Symbol prefix (e.g. "simple" for `simple_init`, `simple_enqueue`).
+    pub prefix: String,
+    /// Symbol names for all defined ops callbacks (e.g. `["simple_init", ...]`).
+    pub ops_symbol_names: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -434,6 +457,10 @@ pub struct DynamicScheduler {
     /// Keep the library alive so function pointers remain valid.
     _lib: libloading::Library,
     ops: SchedOps,
+    /// Symbol prefix (e.g. "simple") used to form ops symbol names.
+    prefix: String,
+    /// Absolute path to the loaded `.so` file.
+    so_path: String,
 }
 
 impl DynamicScheduler {
@@ -480,7 +507,12 @@ impl DynamicScheduler {
         }
 
         let ops = unsafe { Self::load_ops(&lib, prefix) };
-        Self { _lib: lib, ops }
+        Self {
+            _lib: lib,
+            ops,
+            prefix: prefix.to_owned(),
+            so_path: path.to_owned(),
+        }
     }
 
     /// Load the scx_simple scheduler.
@@ -789,6 +821,56 @@ impl DynamicScheduler {
                 .map(|p| std::mem::transmute::<*const (), CpuOfflineFn>(p)),
         }
     }
+
+    /// Return the list of defined ops callback names (without prefix).
+    ///
+    /// Mandatory ops are always included. Optional ops are included only
+    /// when the scheduler `.so` exported the corresponding symbol.
+    /// This is only called once during `--wait-debugger` setup.
+    fn defined_ops_names(&self) -> Vec<&'static str> {
+        // Mandatory ops — always present
+        let mut names = vec![
+            "init",
+            "select_cpu",
+            "enqueue",
+            "dispatch",
+            "running",
+            "stopping",
+        ];
+        // Optional ops — include only when present in the loaded .so
+        let optional: [(&str, bool); 21] = [
+            ("enable", self.ops.enable.is_some()),
+            ("runnable", self.ops.runnable.is_some()),
+            ("init_task", self.ops.init_task.is_some()),
+            ("cpu_release", self.ops.cpu_release.is_some()),
+            ("exit", self.ops.exit.is_some()),
+            ("fire_timer", self.ops.fire_timer.is_some()),
+            ("quiescent", self.ops.quiescent.is_some()),
+            ("dequeue", self.ops.dequeue.is_some()),
+            ("tick", self.ops.tick.is_some()),
+            ("set_cpumask", self.ops.set_cpumask.is_some()),
+            ("dump", self.ops.dump.is_some()),
+            ("dump_task", self.ops.dump_task.is_some()),
+            ("update_idle", self.ops.update_idle.is_some()),
+            ("exit_task", self.ops.exit_task.is_some()),
+            ("cgroup_init", self.ops.cgroup_init.is_some()),
+            ("cgroup_exit", self.ops.cgroup_exit.is_some()),
+            ("cgroup_move", self.ops.cgroup_move.is_some()),
+            (
+                "cgroup_set_bandwidth",
+                self.ops.cgroup_set_bandwidth.is_some(),
+            ),
+            ("cpu_acquire", self.ops.cpu_acquire.is_some()),
+            ("cpu_online", self.ops.cpu_online.is_some()),
+            ("cpu_offline", self.ops.cpu_offline.is_some()),
+        ];
+        for (name, present) in &optional {
+            if *present {
+                names.push(name);
+            }
+        }
+        names
+    }
 }
 
 impl Scheduler for DynamicScheduler {
@@ -969,5 +1051,19 @@ impl Scheduler for DynamicScheduler {
 
     fn resolve_e9_fns(&self) -> Option<crate::backend::e9patch::E9PatchFns> {
         unsafe { crate::backend::e9patch::E9PatchFns::resolve(&self._lib) }
+    }
+
+    fn debugger_info(&self) -> Option<DebuggerInfo> {
+        let prefix = &self.prefix;
+        let ops_symbol_names = self
+            .defined_ops_names()
+            .into_iter()
+            .map(|name| format!("{prefix}_{name}"))
+            .collect();
+        Some(DebuggerInfo {
+            so_path: self.so_path.clone(),
+            prefix: prefix.clone(),
+            ops_symbol_names,
+        })
     }
 }
