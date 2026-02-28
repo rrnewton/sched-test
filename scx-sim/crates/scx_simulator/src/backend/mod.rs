@@ -58,6 +58,13 @@ use crate::types::CpuId;
 ///
 /// Workers may also call [`yield_token`](ThreadOrchestrator::yield_token)
 /// at cooperative yield points to release and re-acquire the execution token.
+///
+/// The [`yield_to_engine`](ThreadOrchestrator::yield_to_engine) method is
+/// the simulator-in-the-loop variant of `yield_token`: instead of picking
+/// the next worker directly (PRNG), it returns control to the simulator
+/// engine, which updates CPU clocks, inspects the event queue, and decides
+/// what to run next. In Phase 1 (sim-a730ac) the default implementation
+/// delegates to `yield_token` for backward compatibility.
 pub(crate) trait ThreadOrchestrator: Sync {
     /// Orchestrator: select the first worker and wake it.
     fn start(&self);
@@ -79,6 +86,21 @@ pub(crate) trait ThreadOrchestrator: Sync {
     /// of the orchestrator protocol surface for future backends.
     #[allow(dead_code)]
     fn yield_token(&self, worker_id: WorkerId) -> bool;
+
+    /// Worker: yield to the simulator engine for a scheduling decision.
+    ///
+    /// Unlike [`yield_token`](ThreadOrchestrator::yield_token) (which picks
+    /// the next worker via PRNG), this returns control to the engine thread.
+    /// The engine inspects state (CPU clocks, event queue) and decides which
+    /// worker to resume.
+    ///
+    /// Default implementation delegates to `yield_token` for backward
+    /// compatibility. Later phases (sim-a730ac Phases 2-3) override this
+    /// with simulator-in-the-loop logic.
+    #[allow(dead_code)] // Phase 1 surface; callers come in Phases 2-3
+    fn yield_to_engine(&self, worker_id: WorkerId) -> bool {
+        self.yield_token(worker_id)
+    }
 
     /// Worker: mark as finished and wake the next worker (or signal
     /// all-done to the orchestrator).
