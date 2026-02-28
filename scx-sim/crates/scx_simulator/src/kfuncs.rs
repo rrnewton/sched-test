@@ -167,6 +167,18 @@ pub struct DsqIterState {
     pub pos: usize,
 }
 
+/// Events staged by kfuncs during a callback for deferred processing.
+///
+/// Kfuncs cannot push directly to the event queue (they only have
+/// `&mut SimulatorState`, not `&mut EventQueue`). Instead, they append
+/// to `SimulatorState::staged_events`, which the engine flushes to the
+/// event queue after each callback returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StagedEvent {
+    /// A kick to be delivered to a target CPU after IPI latency.
+    KickDelivered { cpu: CpuId, flags: KickFlags },
+}
+
 /// The subset of simulator state that kfuncs need access to.
 ///
 /// # Concurrency classification
@@ -249,6 +261,11 @@ pub struct SimulatorState {
     /// The engine processes these after the callback returns.
     /// Uses BTreeMap for deterministic iteration order.
     pub kicked_cpus: BTreeMap<CpuId, KickFlags>,
+    /// Events staged by kfuncs during a callback for deferred processing.
+    ///
+    /// The engine flushes these to the event queue after each callback
+    /// returns. This replaces direct kick processing for timed events.
+    pub staged_events: Vec<(TimeNs, StagedEvent)>,
     /// SHARED-MUTABLE: Updated when any task starts running on any CPU,
     /// read by `scx_bpf_task_cpu`. Needs Mutex or per-task atomic.
     ///
@@ -1952,6 +1969,7 @@ mod tests {
             pending_dispatch: None,
             dsq_iter: None,
             kicked_cpus: BTreeMap::new(),
+            staged_events: Vec::new(),
             reenqueue_local_requested: false,
             pending_timer_ns: None,
             waker_task_raw: None,
