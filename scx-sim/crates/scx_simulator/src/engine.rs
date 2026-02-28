@@ -258,7 +258,13 @@ enum EventKind {
     /// A task finishes its current Run phase on the given CPU.
     TaskPhaseComplete { cpu: CpuId },
     /// A BPF timer fires (e.g., deferred wakeup timer).
-    TimerFired,
+    ///
+    /// `cpu` is the CPU where `bpf_timer_start()` was called. In the kernel,
+    /// BPF timers fire in softirq context on the CPU that armed them (with
+    /// `BPF_F_TIMER_CPU_PIN`). Assigning a CPU makes this a per-CPU event
+    /// eligible for concurrent batch processing (matching kernel behavior
+    /// where timers on different CPUs fire independently).
+    TimerFired { cpu: CpuId },
     /// Periodic scheduler tick on a CPU.
     Tick { cpu: CpuId },
     /// A CPU goes offline (hotplug remove).
@@ -316,9 +322,9 @@ impl EventKind {
     /// Return the CPU this event is associated with, or `None` for global events.
     ///
     /// Per-CPU events (ticks, slice expiry, phase completion, hotplug, task
-    /// wakes, etc.) are eligible for concurrent batch processing when multiple
-    /// CPUs have events at the same timestamp. Global events (timer fired,
-    /// cgroup operations) are processed sequentially first.
+    /// wakes, timer fired, etc.) are eligible for concurrent batch processing
+    /// when multiple CPUs have events at the same timestamp. Global events
+    /// (cgroup operations) are processed sequentially first.
     fn cpu(&self) -> Option<CpuId> {
         match self {
             EventKind::Tick { cpu }
@@ -333,9 +339,9 @@ impl EventKind {
             | EventKind::TaskWake { cpu, .. }
             | EventKind::DsqConsume { cpu }
             | EventKind::StartRunning { cpu, .. }
-            | EventKind::KickDelivered { cpu, .. } => Some(*cpu),
-            EventKind::TimerFired
-            | EventKind::CgroupMigrate { .. }
+            | EventKind::KickDelivered { cpu, .. }
+            | EventKind::TimerFired { cpu } => Some(*cpu),
+            EventKind::CgroupMigrate { .. }
             | EventKind::CgroupCreate(_)
             | EventKind::CgroupDestroy(_)
             | EventKind::CgroupCpusetChange(_) => None,
@@ -943,6 +949,7 @@ impl<S: Scheduler> Simulator<S> {
             task_ops_state: BTreeMap::new(),
             reenqueue_local_requested: false,
             pending_timer_ns: None,
+            pending_timer_cpu: None,
             waker_task_raw: None,
             idle_task_raw,
             noise: scenario.noise.clone(),
@@ -1168,9 +1175,13 @@ impl<S: Scheduler> Simulator<S> {
         // Build event queue
         let mut events = EventQueue::new(scenario.seed, scenario.fixed_priority);
 
-        // Drain any pending timer from scheduler init (e.g., deferred wakeup timer)
+        // Drain any pending timer from scheduler init (e.g., deferred wakeup timer).
+        // The CPU is captured by `sim_timer_start` during the init callback.
         if let Some(fire_at) = state.pending_timer_ns.take() {
-            events.push(fire_at, EventKind::TimerFired);
+            let cpu = state.pending_timer_cpu.take().unwrap_or(CpuId(0));
+            events.push(fire_at, EventKind::TimerFired { cpu });
+        } else {
+            state.pending_timer_cpu.take();
         }
 
         // Schedule initial TaskWake events for all tasks
@@ -1528,12 +1539,10 @@ impl<S: Scheduler> Simulator<S> {
             | EventKind::TaskWake { cpu, .. }
             | EventKind::DsqConsume { cpu }
             | EventKind::StartRunning { cpu, .. }
-            | EventKind::KickDelivered { cpu, .. } => {
+            | EventKind::KickDelivered { cpu, .. }
+            | EventKind::TimerFired { cpu } => {
                 state.advance_cpu_clock(*cpu);
                 kfuncs::set_sim_clock(state.cpus[cpu.0 as usize].local_clock, Some(*cpu));
-            }
-            EventKind::TimerFired => {
-                kfuncs::set_sim_clock(state.clock, None);
             }
             EventKind::CgroupMigrate { .. }
             | EventKind::CgroupCreate(_)
@@ -1553,8 +1562,8 @@ impl<S: Scheduler> Simulator<S> {
             EventKind::TaskPhaseComplete { cpu } => {
                 self.handle_task_phase_complete(cpu, state, tasks, events, duration_ns, monitor);
             }
-            EventKind::TimerFired => {
-                self.handle_timer_fired(state, tasks, events, cgroup_registry, monitor);
+            EventKind::TimerFired { cpu } => {
+                self.handle_timer_fired(cpu, state, tasks, events, cgroup_registry, monitor);
             }
             EventKind::Tick { cpu } => {
                 if let Some(timeout) = watchdog_timeout {
@@ -1638,13 +1647,18 @@ impl<S: Scheduler> Simulator<S> {
         None
     }
 
-    /// Handle a BPF timer firing.
+    /// Handle a BPF timer firing on a specific CPU.
+    ///
+    /// In the kernel, BPF timer callbacks fire in softirq context on the
+    /// CPU that armed the timer (with `BPF_F_TIMER_CPU_PIN`). The `cpu`
+    /// parameter carries the CPU where `bpf_timer_start()` was called.
     ///
     /// Calls the scheduler's `fire_timer()` callback, which invokes the
     /// stored BPF timer callback (e.g., `wakeup_timerfn` in COSMOS).
     /// The callback may kick CPUs and re-arm the timer via `bpf_timer_start`.
     fn handle_timer_fired(
         &self,
+        cpu: CpuId,
         state: &mut SimulatorState,
         tasks: &mut HashMap<Pid, SimTask>,
         events: &mut EventQueue,
@@ -1652,10 +1666,8 @@ impl<S: Scheduler> Simulator<S> {
         monitor: &mut dyn Monitor,
     ) {
         unsafe {
-            // Timer fires on CPU 0 by convention. Advance its clock to the
-            // event queue time so scx_bpf_now() inside the callback returns
-            // a value consistent with (or later than) all CPU local clocks.
-            let cpu = CpuId(0);
+            // Advance the per-CPU clock so scx_bpf_now() inside the callback
+            // returns a value consistent with (or later than) all CPU local clocks.
             state.advance_cpu_clock(cpu);
             kfuncs::enter_sim(state, cpu);
             set_ops_context(state, OpsContext::FireTimer);
@@ -1665,13 +1677,19 @@ impl<S: Scheduler> Simulator<S> {
             cgroup_registry.prepare_css_iter_from_root();
             start_rbc(state);
             self.scheduler.fire_timer();
-            charge_sched_time(state, CpuId(0), "fire_timer");
+            charge_sched_time(state, cpu, "fire_timer");
             kfuncs::exit_sim();
         }
 
-        // Drain re-armed timer
+        // Drain re-armed timer. The CPU is captured by `sim_timer_start`
+        // inside the callback (which may differ from `cpu` if the callback
+        // re-arms the timer in a different CPU context, though typically it
+        // stays on the same CPU).
         if let Some(fire_at) = state.pending_timer_ns.take() {
-            events.push(fire_at, EventKind::TimerFired);
+            let timer_cpu = state.pending_timer_cpu.take().unwrap_or(cpu);
+            events.push(fire_at, EventKind::TimerFired { cpu: timer_cpu });
+        } else {
+            state.pending_timer_cpu.take();
         }
 
         // Process CPUs kicked by the timer callback
