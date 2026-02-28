@@ -292,6 +292,12 @@ pub struct SimulatorState {
     ///
     /// Pending BPF timer: fire at this time (set by `sim_timer_start`).
     pub pending_timer_ns: Option<TimeNs>,
+    /// SHARED-MUTABLE: The CPU where `bpf_timer_start` was called.
+    /// In the kernel, BPF timers fire in softirq on the CPU that armed
+    /// them (with `BPF_F_TIMER_CPU_PIN`). Set alongside `pending_timer_ns`
+    /// by `sim_timer_start`, drained by the engine when creating the
+    /// `TimerFired` event.
+    pub pending_timer_cpu: Option<CpuId>,
     /// PER-CPU: Set by the engine before calling `select_cpu` on the
     /// waker's CPU, consumed by `bpf_get_current_task_btf` during that
     /// same callback. Only the owning worker reads/writes it.
@@ -1931,13 +1937,23 @@ pub extern "C" fn scx_bpf_cpuperf_cap(_cpu: i32) -> u32 {
 /// Schedule a BPF timer to fire after `nsecs` nanoseconds.
 ///
 /// Called from C scheduler code when `bpf_timer_start(timer, nsecs, flags)`
-/// is invoked. The engine drains `pending_timer_ns` after each callback
-/// and inserts a `TimerFired` event into the event queue.
+/// is invoked. The engine drains `pending_timer_ns` and `pending_timer_cpu`
+/// after each callback and inserts a `TimerFired` event into the event queue.
+///
+/// In the kernel, BPF timers fire in softirq on the CPU that armed them
+/// (with `BPF_F_TIMER_CPU_PIN`). We capture `current_cpu` here so the
+/// `TimerFired` event is associated with the correct CPU.
 #[no_mangle]
 pub extern "C" fn sim_timer_start(nsecs: u64) {
     with_sim(kfunc_cost::TRIVIAL, |sim| {
         sim.pending_timer_ns = Some(sim.clock + nsecs);
-        debug!(nsecs, fire_at = sim.clock + nsecs, "timer_start");
+        sim.pending_timer_cpu = Some(sim.current_cpu);
+        debug!(
+            nsecs,
+            fire_at = sim.clock + nsecs,
+            cpu = sim.current_cpu.0,
+            "timer_start"
+        );
     });
 }
 
@@ -1972,6 +1988,7 @@ mod tests {
             staged_events: Vec::new(),
             reenqueue_local_requested: false,
             pending_timer_ns: None,
+            pending_timer_cpu: None,
             waker_task_raw: None,
             idle_task_raw: ptr::null_mut(),
             noise: NoiseConfig {
