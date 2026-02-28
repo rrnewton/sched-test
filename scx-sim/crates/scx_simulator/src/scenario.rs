@@ -306,6 +306,17 @@ pub struct OverheadConfig {
     pub csw_jitter: bool,
     /// Standard deviation for CSW overhead jitter (ns). Default: 100.
     pub csw_jitter_stddev_ns: TimeNs,
+    /// Nanosecond cost for global DSQ consume operation.
+    /// Models the cache-line transfer and dequeue overhead. Default: 100.
+    pub dsq_consume_ns: TimeNs,
+    /// Overhead for ops.running() callback dispatch.
+    /// Models the kernel context setup before calling the callback. Default: 50.
+    pub running_overhead_ns: TimeNs,
+    /// IPI delivery latency for scx_bpf_kick_cpu.
+    /// Models the inter-processor interrupt latency. Default: 200.
+    pub ipi_delivery_ns: TimeNs,
+    /// Overhead for ops.update_idle() callback dispatch. Default: 50.
+    pub update_idle_overhead_ns: TimeNs,
 }
 
 impl Default for OverheadConfig {
@@ -318,6 +329,10 @@ impl Default for OverheadConfig {
             involuntary_csw_ns: 1_000,
             csw_jitter: true,
             csw_jitter_stddev_ns: 100,
+            dsq_consume_ns: 100,
+            running_overhead_ns: 50,
+            ipi_delivery_ns: 200,
+            update_idle_overhead_ns: 50,
         }
     }
 }
@@ -341,6 +356,42 @@ impl OverheadConfig {
             _ => {}
         }
         config
+    }
+
+    /// Effective IPI delivery latency: 0 when overhead is disabled.
+    pub fn effective_ipi_delivery_ns(&self) -> TimeNs {
+        if self.enabled {
+            self.ipi_delivery_ns
+        } else {
+            0
+        }
+    }
+
+    /// Effective DSQ consume overhead: 0 when overhead is disabled.
+    pub fn effective_dsq_consume_ns(&self) -> TimeNs {
+        if self.enabled {
+            self.dsq_consume_ns
+        } else {
+            0
+        }
+    }
+
+    /// Effective running callback overhead: 0 when overhead is disabled.
+    pub fn effective_running_overhead_ns(&self) -> TimeNs {
+        if self.enabled {
+            self.running_overhead_ns
+        } else {
+            0
+        }
+    }
+
+    /// Effective update_idle callback overhead: 0 when overhead is disabled.
+    pub fn effective_update_idle_overhead_ns(&self) -> TimeNs {
+        if self.enabled {
+            self.update_idle_overhead_ns
+        } else {
+            0
+        }
     }
 }
 

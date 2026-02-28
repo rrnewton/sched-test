@@ -20,7 +20,7 @@ use crate::cpu::{IrqContext, LastStopReason, SimCpu};
 use crate::dsq::DsqManager;
 use crate::ffi::{self, Scheduler};
 use crate::fmt::FmtN;
-use crate::kfuncs::{self, OpsContext, SimulatorState};
+use crate::kfuncs::{self, OpsContext, SimulatorState, StagedEvent};
 use crate::monitor::{Monitor, ProbeContext, ProbePoint};
 use crate::perf;
 use crate::preempt::{
@@ -290,6 +290,26 @@ enum EventKind {
     },
     /// An interrupt handler completes on a CPU.
     IrqEnd { cpu: CpuId },
+    /// Per-CPU event: consume from global DSQ into local DSQ.
+    ///
+    /// Scheduled after ops.dispatch() returns with an empty local DSQ.
+    /// Consumes logical time (`dsq_consume_ns`), modeling the cache-line
+    /// transfer and dequeue overhead that is instantaneous in the
+    /// sequential post-processing path.
+    DsqConsume { cpu: CpuId },
+    /// Per-CPU event: run the picked task (ops.running + start execution).
+    ///
+    /// Scheduled after a task is picked from the local DSQ (either from
+    /// dispatch or from `DsqConsume`). Consumes logical time
+    /// (`running_overhead_ns`), modeling the kernel overhead of setting
+    /// up the task context and calling `ops.running()`.
+    StartRunning { cpu: CpuId, pid: Pid },
+    /// Per-CPU event: process a kick (IPI delivered to this CPU).
+    ///
+    /// Scheduled when `scx_bpf_kick_cpu(target, flags)` is called.
+    /// Consumes logical time (`ipi_delivery_ns`), modeling the
+    /// inter-processor interrupt latency between the source and target CPU.
+    KickDelivered { cpu: CpuId, flags: KickFlags },
 }
 
 impl EventKind {
@@ -310,7 +330,10 @@ impl EventKind {
             | EventKind::CpuAcquire { cpu }
             | EventKind::IrqStart { cpu, .. }
             | EventKind::IrqEnd { cpu }
-            | EventKind::TaskWake { cpu, .. } => Some(*cpu),
+            | EventKind::TaskWake { cpu, .. }
+            | EventKind::DsqConsume { cpu }
+            | EventKind::StartRunning { cpu, .. }
+            | EventKind::KickDelivered { cpu, .. } => Some(*cpu),
             EventKind::TimerFired
             | EventKind::CgroupMigrate { .. }
             | EventKind::CgroupCreate(_)
@@ -333,6 +356,34 @@ fn group_events_by_cpu(batch: Vec<Event>) -> (Vec<Event>, HashMap<CpuId, Vec<Eve
         }
     }
     (global, per_cpu)
+}
+
+/// Flush staged events from `SimulatorState` into the event queue.
+///
+/// After each callback returns, kfuncs may have staged events (e.g.,
+/// `KickDelivered`) in `state.staged_events`. This function drains
+/// them and pushes corresponding `EventKind` entries into the event queue.
+///
+/// Staged events are sorted by `(time, cpu)` before flushing to ensure
+/// deterministic insertion order regardless of the order kfuncs staged them.
+fn flush_staged_events(state: &mut SimulatorState, events: &mut EventQueue) {
+    if state.staged_events.is_empty() {
+        return;
+    }
+    let mut staged = std::mem::take(&mut state.staged_events);
+    // Sort by (time, cpu) for deterministic event queue insertion.
+    staged.sort_by_key(|(t, ev)| {
+        let cpu_ord = match ev {
+            StagedEvent::KickDelivered { cpu, .. } => cpu.0,
+        };
+        (*t, cpu_ord)
+    });
+    for (time, staged_event) in staged {
+        let kind = match staged_event {
+            StagedEvent::KickDelivered { cpu, flags } => EventKind::KickDelivered { cpu, flags },
+        };
+        events.push(time, kind);
+    }
 }
 
 /// The main simulator.
@@ -887,6 +938,7 @@ impl<S: Scheduler> Simulator<S> {
             pending_dispatch: None,
             dsq_iter: None,
             kicked_cpus: BTreeMap::new(),
+            staged_events: Vec::new(),
             task_last_cpu: HashMap::new(),
             task_ops_state: BTreeMap::new(),
             reenqueue_local_requested: false,
@@ -1473,7 +1525,10 @@ impl<S: Scheduler> Simulator<S> {
             | EventKind::CpuAcquire { cpu }
             | EventKind::IrqStart { cpu, .. }
             | EventKind::IrqEnd { cpu }
-            | EventKind::TaskWake { cpu, .. } => {
+            | EventKind::TaskWake { cpu, .. }
+            | EventKind::DsqConsume { cpu }
+            | EventKind::StartRunning { cpu, .. }
+            | EventKind::KickDelivered { cpu, .. } => {
                 state.advance_cpu_clock(*cpu);
                 kfuncs::set_sim_clock(state.cpus[cpu.0 as usize].local_clock, Some(*cpu));
             }
@@ -1569,6 +1624,15 @@ impl<S: Scheduler> Simulator<S> {
             }
             EventKind::IrqEnd { cpu } => {
                 self.handle_irq_end(cpu, state);
+            }
+            EventKind::DsqConsume { cpu } => {
+                self.handle_dsq_consume(cpu, state, tasks, events, monitor);
+            }
+            EventKind::StartRunning { cpu, pid } => {
+                self.handle_start_running_event(cpu, pid, state, tasks, events, monitor);
+            }
+            EventKind::KickDelivered { cpu, flags } => {
+                self.handle_kick_delivered(cpu, flags, state, tasks, events, monitor);
             }
         }
         None
@@ -3529,6 +3593,102 @@ impl<S: Scheduler> Simulator<S> {
             } else {
                 self.try_dispatch_and_run(kicked_cpu, state, tasks, events, monitor);
             }
+        }
+    }
+
+    /// Handle a `DsqConsume` event: consume from global DSQ into local DSQ.
+    ///
+    /// If the local DSQ is still empty, tries to move a task from the global
+    /// DSQ. If successful, schedules a `StartRunning` event for the consumed
+    /// task. If nothing is available, the CPU goes idle.
+    fn handle_dsq_consume(
+        &self,
+        cpu: CpuId,
+        state: &mut SimulatorState,
+        tasks: &mut HashMap<Pid, SimTask>,
+        events: &mut EventQueue,
+        monitor: &mut dyn Monitor,
+    ) {
+        let cpu_idx = cpu.0 as usize;
+
+        // If local DSQ already has tasks (e.g., another CPU dispatched here),
+        // skip the global DSQ consume and go straight to picking.
+        if state.cpus[cpu_idx].local_dsq.is_empty() {
+            let cpus_ptr = state.cpus.as_mut_ptr();
+            let sim_cpu = unsafe { &mut *cpus_ptr.add(cpu_idx) };
+            let consumed = state.dsqs.move_to_local(DsqId::GLOBAL, sim_cpu);
+            if consumed {
+                state.trace.record(
+                    state.cpus[cpu_idx].local_clock,
+                    cpu,
+                    TraceKind::DsqMoveToLocal {
+                        dsq_id: DsqId::GLOBAL,
+                        success: true,
+                    },
+                );
+            }
+        }
+
+        if let Some(pid) = state.cpus[cpu_idx].local_dsq.pop_front() {
+            state.trace.record(
+                state.cpus[cpu_idx].local_clock,
+                cpu,
+                TraceKind::PickTask { pid },
+            );
+            self.start_running(cpu, pid, state, tasks, events, monitor);
+        } else {
+            // CPU is idle
+            unsafe { ffi::scx_test_set_idle_cpumask(cpu.0 as i32) };
+            state.update_smt_mask_idle(cpu);
+            let local_t = state.cpus[cpu_idx].local_clock;
+            kfuncs::set_sim_clock(local_t, Some(cpu));
+            state.trace.record(local_t, cpu, TraceKind::CpuIdle);
+            info!(cpu = cpu.0, "IDLE (dsq_consume)");
+        }
+    }
+
+    /// Handle a `StartRunning` event: start a specific task on a CPU.
+    ///
+    /// Delegates to the existing `start_running` method. If the task has
+    /// become invalid (exited, or CPU is no longer idle), safely skips.
+    fn handle_start_running_event(
+        &self,
+        cpu: CpuId,
+        pid: Pid,
+        state: &mut SimulatorState,
+        tasks: &mut HashMap<Pid, SimTask>,
+        events: &mut EventQueue,
+        monitor: &mut dyn Monitor,
+    ) {
+        // If CPU already has a task running (e.g., a kick caused preemption
+        // and dispatch before this event), skip.
+        if state.cpus[cpu.0 as usize].current_task.is_some() {
+            return;
+        }
+        self.start_running(cpu, pid, state, tasks, events, monitor);
+    }
+
+    /// Handle a `KickDelivered` event: process a delivered IPI on the target CPU.
+    ///
+    /// Matches the logic from the former `process_kicked_cpus` but for a
+    /// single CPU+flags pair delivered as a timed event.
+    fn handle_kick_delivered(
+        &self,
+        cpu: CpuId,
+        flags: KickFlags,
+        state: &mut SimulatorState,
+        tasks: &mut HashMap<Pid, SimTask>,
+        events: &mut EventQueue,
+        monitor: &mut dyn Monitor,
+    ) {
+        if flags.contains(KickFlags::PREEMPT) && state.cpus[cpu.0 as usize].current_task.is_some() {
+            self.preempt_current(cpu, state, tasks, events, monitor);
+        } else if flags.contains(KickFlags::IDLE) {
+            if state.cpus[cpu.0 as usize].current_task.is_none() {
+                self.try_dispatch_and_run(cpu, state, tasks, events, monitor);
+            }
+        } else {
+            self.try_dispatch_and_run(cpu, state, tasks, events, monitor);
         }
     }
 

@@ -171,6 +171,7 @@ fn test_csw_overhead_consumed() {
             involuntary_csw_ns: 500_000, // 500μs per involuntary CSW
             csw_jitter: false,
             csw_jitter_stddev_ns: 0,
+            ..Default::default()
         })
         .task(make_tasks()[0].clone())
         .task(make_tasks()[1].clone())
