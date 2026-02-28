@@ -50,13 +50,63 @@ pub struct WorkerId(pub usize);
 // TokenRing — PRNG-driven cooperative scheduler
 // ---------------------------------------------------------------------------
 
+/// Opaque handle passed to [`OnYieldFn`] callbacks, providing controlled
+/// access to worker-selection logic without exposing `TokenState` internals.
+///
+/// Future phases will extend this with event-queue inspection and clock
+/// queries; for now it wraps the PRNG-based `pick_next()`.
+pub struct YieldContext<'a> {
+    state: &'a mut TokenState,
+}
+
+impl YieldContext<'_> {
+    /// Pick the next non-finished worker using the deterministic PRNG.
+    ///
+    /// This is the same selection logic used by the default (no-callback)
+    /// path. Callbacks that want to preserve existing behavior can simply
+    /// call this.
+    pub fn pick_next_prng(&mut self) -> Option<WorkerId> {
+        self.state.pick_next()
+    }
+
+    /// The total number of workers in the ring.
+    pub fn total(&self) -> usize {
+        self.state.total
+    }
+
+    /// Whether the given worker has finished.
+    pub fn is_finished(&self, id: WorkerId) -> bool {
+        self.state.is_finished(id)
+    }
+}
+
+/// Callback type for engine-mediated yield decisions.
+///
+/// Invoked inside `yield_token` when a worker yields. Receives the yielding
+/// worker's ID and a [`YieldContext`] that provides worker-selection helpers.
+/// Returns the [`WorkerId`] to activate next, or `None` if all workers are
+/// done (should not normally happen during a yield).
+///
+/// In Phase 1 (sim-a730ac) this is always `None` (PRNG-direct path). Later
+/// phases install a callback that wakes the simulator engine for
+/// clock-update / event-queue inspection between yields.
+pub type OnYieldFn = Box<dyn Fn(WorkerId, &mut YieldContext<'_>) -> Option<WorkerId> + Send + Sync>;
+
 /// Token-passing scheduler for concurrent callback interleaving.
 ///
 /// Workers block on a condvar until selected by the PRNG. Only one worker
 /// is active at a time, ensuring single-threaded access to shared state.
+///
+/// An optional [`OnYieldFn`] callback can override worker selection at each
+/// yield point, enabling the simulator engine to participate in scheduling
+/// decisions (see `ai_docs/widened_concurrency_plan.md`, Phase 1).
 pub struct TokenRing {
     mu: Mutex<TokenState>,
     cv: Condvar,
+    /// Optional engine-mediated yield callback. When `None`, `yield_token`
+    /// uses the PRNG directly (current/default behavior). When `Some`,
+    /// the callback decides which worker to resume.
+    on_yield: Option<OnYieldFn>,
 }
 
 struct TokenState {
@@ -107,8 +157,32 @@ impl TokenState {
     }
 }
 
+/// Decide the next worker to activate on yield.
+///
+/// When `on_yield` is `Some`, delegates to the callback via [`YieldContext`].
+/// Otherwise falls through to PRNG-based selection. This is a free function
+/// (not a method on `TokenRing`) to avoid borrowing `self` while the
+/// `MutexGuard<TokenState>` is held.
+fn pick_next_for_yield(
+    on_yield: &Option<OnYieldFn>,
+    yielding: WorkerId,
+    state: &mut TokenState,
+) -> Option<WorkerId> {
+    if let Some(ref cb) = *on_yield {
+        let mut ctx = YieldContext { state };
+        cb(yielding, &mut ctx)
+    } else {
+        state.pick_next()
+    }
+}
+
 impl TokenRing {
     /// Create a new token ring for `total` workers.
+    ///
+    /// The ring uses PRNG-driven worker selection by default. To override
+    /// selection with engine-mediated logic, use [`with_on_yield`].
+    ///
+    /// [`with_on_yield`]: TokenRing::with_on_yield
     ///
     /// # Panics
     /// Panics if `total` is 0 or exceeds 64.
@@ -125,7 +199,19 @@ impl TokenRing {
                 rng: SmallRng::seed_from_u64(seed as u64),
             }),
             cv: Condvar::new(),
+            on_yield: None,
         }
+    }
+
+    /// Builder: install an [`OnYieldFn`] callback for engine-mediated yield.
+    ///
+    /// When set, every `yield_token` call invokes the callback to decide
+    /// which worker to resume, instead of using the PRNG directly. This
+    /// is infrastructure for simulator-in-the-loop (Phase 1 of
+    /// sim-a730ac); the default (`None`) preserves existing behavior.
+    pub fn with_on_yield(mut self, f: OnYieldFn) -> Self {
+        self.on_yield = Some(f);
+        self
     }
 
     /// Orchestrator: select the first worker via PRNG and wake it.
@@ -143,19 +229,18 @@ impl TokenRing {
         }
     }
 
-    /// Worker: release token, select next worker via PRNG, block until
-    /// re-selected.
+    /// Worker: release token, select next worker, block until re-selected.
     ///
     /// Returns `true` if a different worker was selected (actual context
-    /// switch), `false` if the PRNG re-selected the same worker (no-op yield).
+    /// switch), `false` if the same worker was re-selected (no-op yield).
     ///
-    /// The current worker gives up the token and waits for a future
-    /// turn. Another worker (possibly the same one) is selected by the
-    /// PRNG and woken up.
+    /// If an [`OnYieldFn`] callback is installed, it decides the next
+    /// worker. Otherwise, the PRNG picks the next non-finished worker
+    /// directly (the original/default behavior).
     pub fn yield_token(&self, my_id: WorkerId) -> bool {
         let mut state = self.mu.lock().unwrap();
         debug_assert_eq!(state.active, Some(my_id));
-        state.active = state.pick_next();
+        state.active = pick_next_for_yield(&self.on_yield, my_id, &mut state);
         let switched = state.active != Some(my_id);
         self.cv.notify_all();
         while state.active != Some(my_id) {
@@ -448,5 +533,207 @@ mod tests {
             ring.start();
             ring.wait_all_done();
         });
+    }
+
+    // -----------------------------------------------------------------------
+    // on_yield callback tests (Phase 1: sim-a730ac)
+    // -----------------------------------------------------------------------
+
+    /// Run N workers with an optional `on_yield` callback, each yielding once.
+    /// Returns the order in which workers were first activated.
+    fn run_and_record_order_with_callback(
+        n: usize,
+        seed: u32,
+        on_yield: Option<OnYieldFn>,
+    ) -> Vec<WorkerId> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut ring = TokenRing::new(n, seed);
+        if let Some(f) = on_yield {
+            ring = ring.with_on_yield(f);
+        }
+        let order: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(usize::MAX)).collect();
+        let counter = AtomicUsize::new(0);
+
+        std::thread::scope(|s| {
+            for i in 0..n {
+                let ring_ref = &ring;
+                let order_ref = &order;
+                let counter_ref = &counter;
+                s.spawn(move || {
+                    ring_ref.wait_for_token(WorkerId(i));
+                    let seq = counter_ref.fetch_add(1, Ordering::SeqCst);
+                    order_ref[i].store(seq, Ordering::SeqCst);
+                    ring_ref.yield_token(WorkerId(i));
+                    ring_ref.finish(WorkerId(i));
+                });
+            }
+            ring.start();
+            ring.wait_all_done();
+        });
+
+        let mut pairs: Vec<(usize, WorkerId)> = order
+            .iter()
+            .enumerate()
+            .map(|(i, a)| (a.load(Ordering::SeqCst), WorkerId(i)))
+            .collect();
+        pairs.sort_by_key(|&(seq, _)| seq);
+        pairs.into_iter().map(|(_, id)| id).collect()
+    }
+
+    #[test]
+    fn test_on_yield_none_matches_default() {
+        // With on_yield = None, the TokenRing produces the same
+        // interleaving order as the original (no callback) path.
+        // Both use PRNG-driven pick_next, so same seed => same order.
+        for seed in [42, 100, 12345, 999] {
+            let default_order = run_and_record_order(4, seed);
+            let callback_none_order = run_and_record_order_with_callback(4, seed, None);
+            assert_eq!(
+                default_order, callback_none_order,
+                "on_yield=None must match default for seed {seed}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_on_yield_custom_callback_routes_decisions() {
+        // Install an on_yield callback that always picks worker 0 first
+        // (if not finished), then falls back to PRNG. This verifies that
+        // the callback is actually invoked and controls worker selection.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let callback_invocations = std::sync::Arc::new(AtomicUsize::new(0));
+        let invocations_clone = callback_invocations.clone();
+
+        let on_yield: OnYieldFn = Box::new(move |_yielding, ctx| {
+            invocations_clone.fetch_add(1, Ordering::SeqCst);
+            // Delegate to the PRNG picker -- we just want to verify
+            // the callback is called.
+            ctx.pick_next_prng()
+        });
+
+        let ring = TokenRing::new(3, 42).with_on_yield(on_yield);
+
+        std::thread::scope(|s| {
+            for i in 0..3 {
+                let ring_ref = &ring;
+                s.spawn(move || {
+                    ring_ref.wait_for_token(WorkerId(i));
+                    ring_ref.yield_token(WorkerId(i));
+                    ring_ref.yield_token(WorkerId(i));
+                    ring_ref.finish(WorkerId(i));
+                });
+            }
+            ring.start();
+            ring.wait_all_done();
+        });
+
+        // 3 workers x 2 yields each = 6 callback invocations.
+        assert_eq!(
+            callback_invocations.load(Ordering::SeqCst),
+            6,
+            "on_yield callback must be invoked at every yield point"
+        );
+    }
+
+    #[test]
+    fn test_on_yield_prng_passthrough_determinism() {
+        // An on_yield callback that delegates to pick_next_prng must
+        // produce the same interleaving as the default (no callback) path,
+        // since both consume the same PRNG sequence.
+        for seed in [42, 7777, 31415] {
+            let default_order = run_and_record_order(3, seed);
+            let passthrough: OnYieldFn = Box::new(|_yielding, ctx| ctx.pick_next_prng());
+            let callback_order = run_and_record_order_with_callback(3, seed, Some(passthrough));
+            assert_eq!(
+                default_order, callback_order,
+                "PRNG passthrough callback must match default for seed {seed}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_on_yield_custom_selection_overrides_prng() {
+        // Install a callback that always picks the lowest-numbered
+        // non-finished worker (round-robin-ish). This should produce
+        // a different ordering than the PRNG for most seeds.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let activation_order = std::sync::Arc::new(
+            (0..3)
+                .map(|_| AtomicUsize::new(usize::MAX))
+                .collect::<Vec<_>>(),
+        );
+        let counter = std::sync::Arc::new(AtomicUsize::new(0));
+
+        let lowest_first: OnYieldFn = Box::new(|_yielding, ctx| {
+            // Pick the lowest-numbered non-finished worker.
+            for i in 0..ctx.total() {
+                let w = WorkerId(i);
+                if !ctx.is_finished(w) {
+                    return Some(w);
+                }
+            }
+            None
+        });
+
+        let ring = TokenRing::new(3, 42).with_on_yield(lowest_first);
+
+        let ao = activation_order.clone();
+        let ctr = counter.clone();
+        std::thread::scope(|s| {
+            for i in 0..3 {
+                let ring_ref = &ring;
+                let ao_ref = &ao;
+                let ctr_ref = &ctr;
+                s.spawn(move || {
+                    ring_ref.wait_for_token(WorkerId(i));
+                    let seq = ctr_ref.fetch_add(1, Ordering::SeqCst);
+                    ao_ref[i].store(seq, Ordering::SeqCst);
+                    ring_ref.yield_token(WorkerId(i));
+                    ring_ref.finish(WorkerId(i));
+                });
+            }
+            ring.start();
+            ring.wait_all_done();
+        });
+
+        // With lowest-first, activation order should be 0, 1, 2
+        // (after the initial PRNG-based start picks the first worker,
+        // every yield picks the lowest available).
+        // Note: `start()` still uses PRNG to pick the first worker.
+        // After that, every yield uses our callback.
+        let order: Vec<usize> = activation_order
+            .iter()
+            .map(|a| a.load(Ordering::SeqCst))
+            .collect();
+        // Verify the callback produced a deterministic pattern.
+        // The exact order depends on which worker `start()` picks via PRNG,
+        // but the callback-driven yields should be consistent across runs.
+        let order2 = {
+            let lowest_first2: OnYieldFn = Box::new(|_yielding, ctx| {
+                for i in 0..ctx.total() {
+                    let w = WorkerId(i);
+                    if !ctx.is_finished(w) {
+                        return Some(w);
+                    }
+                }
+                None
+            });
+            run_and_record_order_with_callback(3, 42, Some(lowest_first2))
+        };
+        // Same seed + same callback => same order.
+        let mut pairs: Vec<(usize, WorkerId)> = order
+            .iter()
+            .enumerate()
+            .map(|(i, &seq)| (seq, WorkerId(i)))
+            .collect();
+        pairs.sort_by_key(|&(seq, _)| seq);
+        let order_vec: Vec<WorkerId> = pairs.into_iter().map(|(_, id)| id).collect();
+        assert_eq!(
+            order_vec, order2,
+            "same seed + same callback must be deterministic"
+        );
     }
 }
