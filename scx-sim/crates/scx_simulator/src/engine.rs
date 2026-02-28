@@ -240,7 +240,19 @@ enum EventKind {
     /// A task becomes runnable (wakes up).
     /// `waker` identifies the task that triggered the wake (if any),
     /// enabling wake-affine scheduling (e.g., COSMOS mm_affinity).
-    TaskWake { pid: Pid, waker: Option<WakerInfo> },
+    ///
+    /// `cpu` is the CPU where the wakeup originates: the waker's CPU when a
+    /// waker is present, or the task's `prev_cpu` otherwise. In the kernel,
+    /// `try_to_wake_up()` always runs on a specific CPU (the waker's CPU),
+    /// and `ops.select_cpu()` sees that CPU via `bpf_get_smp_processor_id()`.
+    /// Assigning a CPU makes this a per-CPU event eligible for concurrent
+    /// batch processing (matching kernel behavior where wakeups on different
+    /// CPUs proceed in parallel).
+    TaskWake {
+        pid: Pid,
+        waker: Option<WakerInfo>,
+        cpu: CpuId,
+    },
     /// A task's time slice expires on the given CPU.
     SliceExpired { cpu: CpuId },
     /// A task finishes its current Run phase on the given CPU.
@@ -283,9 +295,9 @@ enum EventKind {
 impl EventKind {
     /// Return the CPU this event is associated with, or `None` for global events.
     ///
-    /// Per-CPU events (ticks, slice expiry, phase completion, hotplug, etc.)
-    /// are eligible for concurrent batch processing when multiple CPUs have
-    /// events at the same timestamp. Global events (task wakes, timer fired,
+    /// Per-CPU events (ticks, slice expiry, phase completion, hotplug, task
+    /// wakes, etc.) are eligible for concurrent batch processing when multiple
+    /// CPUs have events at the same timestamp. Global events (timer fired,
     /// cgroup operations) are processed sequentially first.
     fn cpu(&self) -> Option<CpuId> {
         match self {
@@ -297,9 +309,9 @@ impl EventKind {
             | EventKind::CpuRelease { cpu }
             | EventKind::CpuAcquire { cpu }
             | EventKind::IrqStart { cpu, .. }
-            | EventKind::IrqEnd { cpu } => Some(*cpu),
-            EventKind::TaskWake { .. }
-            | EventKind::TimerFired
+            | EventKind::IrqEnd { cpu }
+            | EventKind::TaskWake { cpu, .. } => Some(*cpu),
+            EventKind::TimerFired
             | EventKind::CgroupMigrate { .. }
             | EventKind::CgroupCreate(_)
             | EventKind::CgroupDestroy(_)
@@ -1111,11 +1123,14 @@ impl<S: Scheduler> Simulator<S> {
 
         // Schedule initial TaskWake events for all tasks
         for def in &scenario.tasks {
+            // Initial wakes have no waker; use CpuId(0) matching the task's
+            // initial prev_cpu (set in SimTask::new).
             events.push(
                 def.start_time_ns,
                 EventKind::TaskWake {
                     pid: def.pid,
                     waker: None,
+                    cpu: CpuId(0),
                 },
             );
         }
@@ -1457,11 +1472,12 @@ impl<S: Scheduler> Simulator<S> {
             | EventKind::CpuRelease { cpu }
             | EventKind::CpuAcquire { cpu }
             | EventKind::IrqStart { cpu, .. }
-            | EventKind::IrqEnd { cpu } => {
+            | EventKind::IrqEnd { cpu }
+            | EventKind::TaskWake { cpu, .. } => {
                 state.advance_cpu_clock(*cpu);
                 kfuncs::set_sim_clock(state.cpus[cpu.0 as usize].local_clock, Some(*cpu));
             }
-            EventKind::TaskWake { .. } | EventKind::TimerFired => {
+            EventKind::TimerFired => {
                 kfuncs::set_sim_clock(state.clock, None);
             }
             EventKind::CgroupMigrate { .. }
@@ -1473,7 +1489,7 @@ impl<S: Scheduler> Simulator<S> {
         }
 
         match event.kind {
-            EventKind::TaskWake { pid, waker } => {
+            EventKind::TaskWake { pid, waker, .. } => {
                 self.handle_task_wake(pid, waker, state, tasks, events, monitor);
             }
             EventKind::SliceExpired { cpu } => {
@@ -2686,10 +2702,17 @@ impl<S: Scheduler> Simulator<S> {
                         .record(local_t, cpu, TraceKind::TaskSlept { pid });
                     info!(task = task.name.as_str(), pid = pid.0, "SLEEPING");
 
-                    // Schedule wake event
+                    // Schedule wake event on the CPU the task last ran on
                     let wake_time = local_t.saturating_add(sleep_ns);
                     if wake_time <= duration_ns {
-                        events.push(wake_time, EventKind::TaskWake { pid, waker: None });
+                        events.push(
+                            wake_time,
+                            EventKind::TaskWake {
+                                pid,
+                                waker: None,
+                                cpu: task.prev_cpu,
+                            },
+                        );
                     }
                 }
                 Some(Phase::Run(_)) => {
@@ -2733,6 +2756,7 @@ impl<S: Scheduler> Simulator<S> {
                         EventKind::TaskWake {
                             pid: target_pid,
                             waker: Some(WakerInfo { pid, cpu }),
+                            cpu,
                         },
                     );
 
@@ -2755,6 +2779,7 @@ impl<S: Scheduler> Simulator<S> {
                                         EventKind::TaskWake {
                                             pid: next_target,
                                             waker: Some(WakerInfo { pid, cpu }),
+                                            cpu,
                                         },
                                     );
                                     if !task.advance_phase() {
@@ -2811,7 +2836,11 @@ impl<S: Scheduler> Simulator<S> {
                                     if wake_time <= duration_ns {
                                         events.push(
                                             wake_time,
-                                            EventKind::TaskWake { pid, waker: None },
+                                            EventKind::TaskWake {
+                                                pid,
+                                                waker: None,
+                                                cpu: task.prev_cpu,
+                                            },
                                         );
                                     }
                                     break;
@@ -3832,6 +3861,7 @@ impl<S: Scheduler> Simulator<S> {
                         EventKind::TaskWake {
                             pid: target,
                             waker: None,
+                            cpu: task.prev_cpu,
                         },
                     );
                     if !task.advance_phase() {
