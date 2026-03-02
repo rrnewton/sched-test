@@ -402,9 +402,23 @@ pub struct SimulatorState {
     /// whether to defer kicks or suppress nested dispatch.
     ///
     /// True while inside a concurrent batch (same-timestamp per-CPU events
-    /// being processed in parallel). When set, `process_kicked_cpus` defers
-    /// kicks (accumulates in `kicked_cpus` but does not process) and
-    /// `dispatch_concurrent` is suppressed to prevent nesting.
+    /// being processed in parallel). Guards two invariants:
+    ///
+    /// 1. **Kick deferral**: `process_kicked_cpus` returns immediately when
+    ///    set, so kicks accumulate in `kicked_cpus` during the batch and are
+    ///    processed only after all workers complete. Without this, a worker
+    ///    thread would drain+process the shared `kicked_cpus` map mid-batch,
+    ///    racing with other workers that are still accumulating kicks.
+    ///
+    /// 2. **Nested dispatch suppression**: `handle_task_wake` skips
+    ///    `dispatch_concurrent` when set, preventing nested concurrent thread
+    ///    spawning (which would deadlock the token ring or corrupt state).
+    ///
+    /// This flag can be removed once `scx_bpf_kick_cpu` stages
+    /// `KickDelivered` timed events (via `staged_events` + `flush_staged_events`)
+    /// instead of writing to the `kicked_cpus` BTreeMap, and
+    /// `process_kicked_cpus` is deleted. See `widened_concurrency_plan.md`
+    /// Phase 2 and Phase 4 for the removal plan.
     pub in_concurrent_batch: bool,
     /// SHARED-READ: Configuration set at init, never mutated during simulation.
     ///

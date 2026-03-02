@@ -2572,6 +2572,13 @@ impl<S: Scheduler> Simulator<S> {
                     .map(|c| c.id)
                     .collect();
 
+                // Guard: suppress nested dispatch_concurrent when already
+                // inside a concurrent batch (process_batch_concurrent).
+                // Worker threads reach here via process_event -> handle_task_wake.
+                // Spawning nested concurrent threads would deadlock the token
+                // ring and corrupt shared state. Removable once the engine uses
+                // dynamic window batching (Phase 3) that eliminates re-entrant
+                // concurrent dispatch entirely.
                 if (state.interleave || state.preemptive.is_some())
                     && !state.in_concurrent_batch
                     && idle_cpus.len() >= 2
@@ -3537,13 +3544,20 @@ impl<S: Scheduler> Simulator<S> {
     /// (e.g., tick on CPU 0 racing with dispatch on CPU 1).
     ///
     /// During the concurrent phase:
-    /// - `in_concurrent_batch` is set, suppressing `process_kicked_cpus`
-    ///   and `dispatch_concurrent` to prevent nesting
+    /// - `in_concurrent_batch` is set, which:
+    ///   (a) prevents `process_kicked_cpus` from draining+processing the
+    ///   shared `kicked_cpus` map mid-batch (workers are still writing it),
+    ///   (b) prevents `handle_task_wake` from calling `dispatch_concurrent`,
+    ///   which would nest concurrent thread spawning and deadlock.
     /// - Kicked CPUs accumulate in `state.kicked_cpus`
     ///
     /// After all workers complete:
     /// - `in_concurrent_batch` is cleared
-    /// - Deferred kicked CPUs are processed
+    /// - Deferred kicked CPUs are processed via `process_kicked_cpus`
+    ///
+    /// This flag can be removed once kicks become timed events and
+    /// `process_kicked_cpus` is deleted (see `widened_concurrency_plan.md`
+    /// Phase 2 + Phase 4).
     #[allow(clippy::too_many_arguments)]
     fn process_batch_concurrent(
         &self,
@@ -3804,9 +3818,13 @@ impl<S: Scheduler> Simulator<S> {
         events: &mut EventQueue,
         monitor: &mut dyn Monitor,
     ) {
-        // During concurrent batch processing, kicks accumulate in
-        // state.kicked_cpus but are not processed until the batch
-        // completes (post-batch phase on the engine thread).
+        // Guard: during concurrent batch processing, worker threads reach
+        // this function via process_event -> handle_task_wake/handle_tick.
+        // Draining kicked_cpus here would race with other workers still
+        // accumulating kicks, and the resulting dispatch calls would corrupt
+        // state. Kicks are deferred until the post-batch phase on the engine
+        // thread (see process_batch_concurrent, after in_concurrent_batch is
+        // cleared). Removable once kicks become timed events (Phase 2).
         if state.in_concurrent_batch {
             return;
         }
