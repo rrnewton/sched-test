@@ -198,16 +198,6 @@ impl EventQueue {
         self.heap.push(Reverse(Event { time_ns, seq, kind }));
     }
 
-    /// Pop the next event (earliest timestamp, then lowest tiebreaker).
-    fn pop(&mut self) -> Option<Event> {
-        self.heap.pop().map(|Reverse(e)| e)
-    }
-
-    /// Peek at the next event without removing it.
-    fn peek(&self) -> Option<&Event> {
-        self.heap.peek().map(|Reverse(e)| e)
-    }
-
     /// Peek at the next event's timestamp without removing it.
     fn peek_time(&self) -> Option<TimeNs> {
         self.heap.peek().map(|Reverse(e)| e.time_ns)
@@ -329,7 +319,15 @@ enum EventKind {
         cpu: CpuId,
     },
     /// A cgroup is created at runtime.
-    CgroupCreate(CgroupCreateEvent),
+    ///
+    /// `cpu` is the CPU where the creation is initiated. In the kernel,
+    /// `cgroup_mkdir()` runs in process context on the CPU of the task
+    /// creating the cgroup. Assigning a CPU makes this a per-CPU event
+    /// eligible for concurrent batch processing.
+    CgroupCreate {
+        event: CgroupCreateEvent,
+        cpu: CpuId,
+    },
     /// A cgroup is destroyed at runtime.
     CgroupDestroy(CgroupDestroyEvent),
     /// A cgroup's cpuset is changed at runtime.
@@ -388,10 +386,9 @@ impl EventKind {
             | EventKind::StartRunning { cpu, .. }
             | EventKind::KickDelivered { cpu, .. }
             | EventKind::TimerFired { cpu }
-            | EventKind::CgroupMigrate { cpu, .. } => Some(*cpu),
-            EventKind::CgroupCreate(_)
-            | EventKind::CgroupDestroy(_)
-            | EventKind::CgroupCpusetChange(_) => None,
+            | EventKind::CgroupMigrate { cpu, .. }
+            | EventKind::CgroupCreate { cpu, .. } => Some(*cpu),
+            EventKind::CgroupDestroy(_) | EventKind::CgroupCpusetChange(_) => None,
         }
     }
 }
@@ -1284,7 +1281,13 @@ impl<S: Scheduler> Simulator<S> {
 
         // Seed cgroup lifecycle events
         for ce in &scenario.cgroup_create_events {
-            events.push(ce.at_ns, EventKind::CgroupCreate(ce.clone()));
+            events.push(
+                ce.at_ns,
+                EventKind::CgroupCreate {
+                    event: ce.clone(),
+                    cpu: CpuId(0),
+                },
+            );
         }
         for de in &scenario.cgroup_destroy_events {
             events.push(de.at_ns, EventKind::CgroupDestroy(de.clone()));
@@ -1546,13 +1549,12 @@ impl<S: Scheduler> Simulator<S> {
             | EventKind::StartRunning { cpu, .. }
             | EventKind::KickDelivered { cpu, .. }
             | EventKind::TimerFired { cpu }
-            | EventKind::CgroupMigrate { cpu, .. } => {
+            | EventKind::CgroupMigrate { cpu, .. }
+            | EventKind::CgroupCreate { cpu, .. } => {
                 state.advance_cpu_clock(*cpu);
                 kfuncs::set_sim_clock(state.cpus[cpu.0 as usize].local_clock, Some(*cpu));
             }
-            EventKind::CgroupCreate(_)
-            | EventKind::CgroupDestroy(_)
-            | EventKind::CgroupCpusetChange(_) => {
+            EventKind::CgroupDestroy(_) | EventKind::CgroupCpusetChange(_) => {
                 kfuncs::set_sim_clock(state.clock, None);
             }
         }
@@ -1607,7 +1609,7 @@ impl<S: Scheduler> Simulator<S> {
                     monitor,
                 );
             }
-            EventKind::CgroupCreate(event) => {
+            EventKind::CgroupCreate { event, .. } => {
                 if let Some(err) =
                     self.handle_cgroup_create(&event, state, cgroup_registry, max_cgroups)
                 {
