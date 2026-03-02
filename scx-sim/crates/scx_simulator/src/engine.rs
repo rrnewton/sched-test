@@ -236,6 +236,7 @@ struct WakerInfo {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 enum EventKind {
     /// A task becomes runnable (wakes up).
     /// `waker` identifies the task that triggered the wake (if any),
@@ -276,10 +277,16 @@ enum EventKind {
     /// sched_ext regains a CPU from higher-priority class (cpu_acquire).
     CpuAcquire { cpu: CpuId },
     /// A task is migrated between cgroups at runtime.
+    ///
+    /// `cpu` is the CPU where the migration is initiated. In the kernel,
+    /// `cgroup_migrate()` runs in process context on the CPU of the task
+    /// writing to `cgroup.procs`. Assigning a CPU makes this a per-CPU
+    /// event eligible for concurrent batch processing.
     CgroupMigrate {
         pid: Pid,
         from_cgroup: String,
         to_cgroup: String,
+        cpu: CpuId,
     },
     /// A cgroup is created at runtime.
     CgroupCreate(CgroupCreateEvent),
@@ -340,9 +347,9 @@ impl EventKind {
             | EventKind::DsqConsume { cpu }
             | EventKind::StartRunning { cpu, .. }
             | EventKind::KickDelivered { cpu, .. }
-            | EventKind::TimerFired { cpu } => Some(*cpu),
-            EventKind::CgroupMigrate { .. }
-            | EventKind::CgroupCreate(_)
+            | EventKind::TimerFired { cpu }
+            | EventKind::CgroupMigrate { cpu, .. } => Some(*cpu),
+            EventKind::CgroupCreate(_)
             | EventKind::CgroupDestroy(_)
             | EventKind::CgroupCpusetChange(_) => None,
         }
@@ -372,6 +379,7 @@ fn group_events_by_cpu(batch: Vec<Event>) -> (Vec<Event>, HashMap<CpuId, Vec<Eve
 ///
 /// Staged events are sorted by `(time, cpu)` before flushing to ensure
 /// deterministic insertion order regardless of the order kfuncs staged them.
+#[allow(dead_code)]
 fn flush_staged_events(state: &mut SimulatorState, events: &mut EventQueue) {
     if state.staged_events.is_empty() {
         return;
@@ -1229,6 +1237,7 @@ impl<S: Scheduler> Simulator<S> {
                     pid: me.pid,
                     from_cgroup: me.from_cgroup.clone(),
                     to_cgroup: me.to_cgroup.clone(),
+                    cpu: CpuId(0),
                 },
             );
         }
@@ -1540,12 +1549,12 @@ impl<S: Scheduler> Simulator<S> {
             | EventKind::DsqConsume { cpu }
             | EventKind::StartRunning { cpu, .. }
             | EventKind::KickDelivered { cpu, .. }
-            | EventKind::TimerFired { cpu } => {
+            | EventKind::TimerFired { cpu }
+            | EventKind::CgroupMigrate { cpu, .. } => {
                 state.advance_cpu_clock(*cpu);
                 kfuncs::set_sim_clock(state.cpus[cpu.0 as usize].local_clock, Some(*cpu));
             }
-            EventKind::CgroupMigrate { .. }
-            | EventKind::CgroupCreate(_)
+            EventKind::CgroupCreate(_)
             | EventKind::CgroupDestroy(_)
             | EventKind::CgroupCpusetChange(_) => {
                 kfuncs::set_sim_clock(state.clock, None);
@@ -1589,6 +1598,7 @@ impl<S: Scheduler> Simulator<S> {
                 pid,
                 from_cgroup,
                 to_cgroup,
+                ..
             } => {
                 self.handle_cgroup_migrate(
                     pid,
