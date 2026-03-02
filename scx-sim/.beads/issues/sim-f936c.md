@@ -1,10 +1,11 @@
 ---
 title: Eliminate special-case 'global event' treatment for structops
-status: open
+status: closed
 priority: 1
 issue_type: epic
 created_at: 2026-02-24T10:31:31.935670615+00:00
-updated_at: 2026-02-24T10:31:31.935670615+00:00
+updated_at: 2026-03-02T20:06:22.060580711+00:00
+closed_at: 2026-03-02T20:06:22.060580630+00:00
 ---
 
 # Description
