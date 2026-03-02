@@ -4,7 +4,7 @@
 //! clock, CPU/task state, and drives the scheduler through its ops callbacks.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap, HashMap};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::ffi::c_void;
 
 use rand::rngs::SmallRng;
@@ -199,9 +199,13 @@ impl EventQueue {
     }
 
     /// Pop the next event (earliest timestamp, then lowest tiebreaker).
-    #[allow(dead_code)]
     fn pop(&mut self) -> Option<Event> {
         self.heap.pop().map(|Reverse(e)| e)
+    }
+
+    /// Peek at the next event without removing it.
+    fn peek(&self) -> Option<&Event> {
+        self.heap.peek().map(|Reverse(e)| e)
     }
 
     /// Peek at the next event's timestamp without removing it.
@@ -222,6 +226,42 @@ impl EventQueue {
         }
         batch
     }
+
+    /// Pop per-CPU events whose timestamps fall within the dynamic
+    /// concurrency window `[0, deadline]`, but only for CPUs not already
+    /// in `active_cpus`. Global events (no CPU) are left in the queue.
+    ///
+    /// Returns the newly-discovered events, sorted by (time, seq).
+    fn drain_concurrent_window(
+        &mut self,
+        deadline: TimeNs,
+        active_cpus: &std::collections::HashSet<CpuId>,
+    ) -> Vec<Event> {
+        let mut discovered = Vec::new();
+        // We need to pop and re-push events we don't want. Collect
+        // candidates in one pass.
+        let mut reinsert = Vec::new();
+        while let Some(Reverse(e)) = self.heap.peek() {
+            if e.time_ns > deadline {
+                break;
+            }
+            let event = self.heap.pop().unwrap().0;
+            match event.kind.cpu() {
+                Some(cpu) if !active_cpus.contains(&cpu) => {
+                    discovered.push(event);
+                }
+                _ => {
+                    // Global event or CPU already active: put back.
+                    reinsert.push(event);
+                }
+            }
+        }
+        // Re-insert events we didn't take.
+        for event in reinsert {
+            self.heap.push(Reverse(event));
+        }
+        discovered
+    }
 }
 
 /// Context about the task that triggered a wakeup.
@@ -236,7 +276,7 @@ struct WakerInfo {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
+#[allow(dead_code)] // Phase 2 variants used when Phase 3 dynamic window is active
 enum EventKind {
     /// A task becomes runnable (wakes up).
     /// `waker` identifies the task that triggered the wake (if any),
@@ -379,7 +419,7 @@ fn group_events_by_cpu(batch: Vec<Event>) -> (Vec<Event>, HashMap<CpuId, Vec<Eve
 ///
 /// Staged events are sorted by `(time, cpu)` before flushing to ensure
 /// deterministic insertion order regardless of the order kfuncs staged them.
-#[allow(dead_code)]
+#[allow(dead_code)] // Phase 2 infrastructure; callers added in Phase 3
 fn flush_staged_events(state: &mut SimulatorState, events: &mut EventQueue) {
     if state.staged_events.is_empty() {
         return;
@@ -1305,12 +1345,16 @@ impl<S: Scheduler> Simulator<S> {
             info!("cooperative interleaving enabled (kfunc boundaries only)");
         }
 
-        // Main event loop: process events in same-timestamp batches.
+        // Main event loop: process events with dynamic concurrency windows.
         //
-        // When interleaving is enabled, events at the same timestamp
-        // targeting different CPUs are processed concurrently through
-        // token-passing. This models real kernel behavior where scheduler
-        // callbacks on different CPUs race with each other.
+        // When interleaving is enabled, the event loop uses dynamic
+        // concurrency windows instead of static same-timestamp batching.
+        // After processing a batch of same-timestamp events concurrently,
+        // the loop checks whether CPU clocks advanced past any pending
+        // events. If so, those events are pulled into a new concurrent
+        // batch, modeling the kernel's overlapping execution on different
+        // CPUs. The window grows organically based on structop execution
+        // cost.
         //
         // When interleaving is disabled, all events are processed
         // sequentially in their original priority order (by seq
@@ -1323,77 +1367,29 @@ impl<S: Scheduler> Simulator<S> {
             }
             state.clock = t;
 
-            let batch = events.drain_at(t);
-
             if interleave_enabled {
-                // Partition into global (sequential) and per-CPU (concurrent).
-                let (global, per_cpu) = group_events_by_cpu(batch);
-
-                // 1. Global events: always processed sequentially first
-                for event in global {
-                    if let Some(err) = self.process_event(
-                        event,
-                        &mut state,
-                        &mut tasks,
-                        &mut events,
-                        watchdog_timeout,
-                        scenario.duration_ns,
-                        &mut cgroup_registry,
-                        max_cgroups,
-                        monitor,
-                    ) {
-                        exit_kind = err;
-                        break 'event_loop;
-                    }
-                    if let Some(err) = check_bpf_error(&mut state, ignore_bpf_errors) {
-                        exit_kind = err;
-                        break 'event_loop;
-                    }
-                }
-
-                // 2. Per-CPU events: concurrent if 2+ CPUs
-                if per_cpu.len() >= 2 {
-                    self.process_batch_concurrent(
-                        per_cpu,
-                        &mut state,
-                        &mut tasks,
-                        &mut events,
-                        watchdog_timeout,
-                        scenario.duration_ns,
-                        &mut cgroup_registry,
-                        max_cgroups,
-                        monitor,
-                    );
-                } else {
-                    // Single CPU or empty: sequential.
-                    // Sort for deterministic order (HashMap iteration is non-deterministic).
-                    let mut events_flat: Vec<Event> = per_cpu.into_values().flatten().collect();
-                    events_flat.sort();
-                    for event in events_flat {
-                        if let Some(err) = self.process_event(
-                            event,
-                            &mut state,
-                            &mut tasks,
-                            &mut events,
-                            watchdog_timeout,
-                            scenario.duration_ns,
-                            &mut cgroup_registry,
-                            max_cgroups,
-                            monitor,
-                        ) {
-                            exit_kind = err;
-                            break 'event_loop;
-                        }
-                        if let Some(err) = check_bpf_error(&mut state, ignore_bpf_errors) {
-                            exit_kind = err;
-                            break 'event_loop;
-                        }
-                    }
+                // Dynamic concurrency window: start with same-timestamp
+                // events, then expand as CPU clocks advance.
+                if let Some(err) = self.process_dynamic_window(
+                    t,
+                    &mut state,
+                    &mut tasks,
+                    &mut events,
+                    watchdog_timeout,
+                    scenario.duration_ns,
+                    &mut cgroup_registry,
+                    max_cgroups,
+                    ignore_bpf_errors,
+                    monitor,
+                ) {
+                    exit_kind = err;
+                    break 'event_loop;
                 }
             } else {
                 // No interleaving: process all events sequentially in
                 // original priority order (preserves backward-compatible
                 // determinism).
+                let batch = events.drain_at(t);
                 for event in batch {
                     if let Some(err) = self.process_event(
                         event,
@@ -3320,6 +3316,184 @@ impl<S: Scheduler> Simulator<S> {
             ring.start();
             ring.wait_all_done();
         });
+    }
+
+    /// Process events using the dynamic concurrency window.
+    ///
+    /// Starts with all events at timestamp `t`, partitions them into global
+    /// (sequential) and per-CPU (concurrent), processes each group, then
+    /// checks whether CPU clock advancement exposed new events that should
+    /// be processed concurrently. Repeats until no more events fall within
+    /// the expanded window.
+    ///
+    /// The window grows organically: as structops execute, `charge_sched_time`
+    /// advances CPU local clocks. Events on other CPUs whose timestamps fall
+    /// within `[t, max_local_clock]` are pulled into successive concurrent
+    /// batches, modeling the kernel's overlapping execution on different CPUs.
+    ///
+    /// Returns `Some(ExitKind)` on error, `None` on success.
+    #[allow(clippy::too_many_arguments)]
+    fn process_dynamic_window(
+        &self,
+        t: TimeNs,
+        state: &mut SimulatorState,
+        tasks: &mut HashMap<Pid, SimTask>,
+        events: &mut EventQueue,
+        watchdog_timeout: Option<TimeNs>,
+        duration_ns: TimeNs,
+        cgroup_registry: &mut CgroupRegistry,
+        max_cgroups: u32,
+        ignore_bpf_errors: bool,
+        monitor: &mut dyn Monitor,
+    ) -> Option<ExitKind> {
+        // Start with all events at the initial timestamp.
+        let batch = events.drain_at(t);
+
+        // Partition into global (sequential) and per-CPU (concurrent).
+        let (global, mut per_cpu) = group_events_by_cpu(batch);
+
+        // 1. Global events: always processed sequentially first.
+        if let Some(err) = self.process_events_sequential(
+            global,
+            state,
+            tasks,
+            events,
+            watchdog_timeout,
+            duration_ns,
+            cgroup_registry,
+            max_cgroups,
+            ignore_bpf_errors,
+            monitor,
+        ) {
+            return Some(err);
+        }
+
+        // 2. Per-CPU events: concurrent if 2+ CPUs, with dynamic window
+        //    expansion after each batch.
+        loop {
+            if per_cpu.len() >= 2 {
+                self.process_batch_concurrent(
+                    per_cpu,
+                    state,
+                    tasks,
+                    events,
+                    watchdog_timeout,
+                    duration_ns,
+                    cgroup_registry,
+                    max_cgroups,
+                    monitor,
+                );
+            } else if !per_cpu.is_empty() {
+                // Single CPU: sequential processing.
+                let mut events_flat: Vec<Event> = per_cpu.into_values().flatten().collect();
+                events_flat.sort();
+                if let Some(err) = self.process_events_sequential(
+                    events_flat,
+                    state,
+                    tasks,
+                    events,
+                    watchdog_timeout,
+                    duration_ns,
+                    cgroup_registry,
+                    max_cgroups,
+                    ignore_bpf_errors,
+                    monitor,
+                ) {
+                    return Some(err);
+                }
+            }
+
+            // Dynamic window expansion: check if CPU clocks advanced
+            // past any pending events on uninvolved CPUs.
+            let max_clock = state.cpus.iter().map(|c| c.local_clock).max().unwrap_or(t);
+
+            if max_clock <= t {
+                // No clock advancement beyond the initial timestamp.
+                break;
+            }
+
+            // Don't pull events past the simulation duration.
+            let deadline = max_clock.min(duration_ns);
+
+            // Collect events within the expanded window.
+            let active_cpus: HashSet<CpuId> = HashSet::new();
+            let newly_discovered = events.drain_concurrent_window(deadline, &active_cpus);
+
+            if newly_discovered.is_empty() {
+                break;
+            }
+
+            trace!(
+                discovered = newly_discovered.len(),
+                max_clock,
+                "dynamic window: discovered concurrent events"
+            );
+
+            // Partition newly discovered events.
+            let (new_global, new_per_cpu) = group_events_by_cpu(newly_discovered);
+
+            // Process any global events sequentially first.
+            if let Some(err) = self.process_events_sequential(
+                new_global,
+                state,
+                tasks,
+                events,
+                watchdog_timeout,
+                duration_ns,
+                cgroup_registry,
+                max_cgroups,
+                ignore_bpf_errors,
+                monitor,
+            ) {
+                return Some(err);
+            }
+
+            // Continue the loop with the new per-CPU events.
+            per_cpu = new_per_cpu;
+            if per_cpu.is_empty() {
+                break;
+            }
+        }
+
+        None
+    }
+
+    /// Process a list of events sequentially, checking for errors after each.
+    ///
+    /// Returns `Some(ExitKind)` on the first error, `None` if all succeed.
+    #[allow(clippy::too_many_arguments)]
+    fn process_events_sequential(
+        &self,
+        events_list: Vec<Event>,
+        state: &mut SimulatorState,
+        tasks: &mut HashMap<Pid, SimTask>,
+        events: &mut EventQueue,
+        watchdog_timeout: Option<TimeNs>,
+        duration_ns: TimeNs,
+        cgroup_registry: &mut CgroupRegistry,
+        max_cgroups: u32,
+        ignore_bpf_errors: bool,
+        monitor: &mut dyn Monitor,
+    ) -> Option<ExitKind> {
+        for event in events_list {
+            if let Some(err) = self.process_event(
+                event,
+                state,
+                tasks,
+                events,
+                watchdog_timeout,
+                duration_ns,
+                cgroup_registry,
+                max_cgroups,
+                monitor,
+            ) {
+                return Some(err);
+            }
+            if let Some(err) = check_bpf_error(state, ignore_bpf_errors) {
+                return Some(err);
+            }
+        }
+        None
     }
 
     /// Process per-CPU events at the same timestamp concurrently.
