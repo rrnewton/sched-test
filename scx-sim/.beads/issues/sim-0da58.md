@@ -1,12 +1,13 @@
 ---
 title: 'CgroupMigrate: model per-task rq->lock and correct dequeue flags'
-status: open
+status: closed
 priority: 2
 issue_type: task
 depends_on:
   sim-f936c: parent-child
 created_at: 2026-02-24T10:32:08.332295135+00:00
-updated_at: 2026-02-24T10:32:08.332295135+00:00
+updated_at: 2026-03-02T20:06:22.052849313+00:00
+closed_at: 2026-03-02T20:06:22.052849172+00:00
 ---
 
 # Description

@@ -1,12 +1,13 @@
 ---
 title: 'CgroupCreate: keep as global bookkeeping, verify CPU context'
-status: open
+status: closed
 priority: 3
 issue_type: task
 depends_on:
   sim-f936c: parent-child
 created_at: 2026-02-24T10:32:08.336242237+00:00
-updated_at: 2026-02-24T10:32:08.336242237+00:00
+updated_at: 2026-03-02T20:06:22.055065771+00:00
+closed_at: 2026-03-02T20:06:22.055065700+00:00
 ---
 
 # Description

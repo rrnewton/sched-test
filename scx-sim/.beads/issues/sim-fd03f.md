@@ -1,12 +1,13 @@
 ---
 title: 'TaskWake: model per-CPU execution and migrate off global path'
-status: open
+status: closed
 priority: 1
 issue_type: task
 depends_on:
   sim-f936c: parent-child
 created_at: 2026-02-24T10:32:08.324797271+00:00
-updated_at: 2026-02-24T10:32:08.324797271+00:00
+updated_at: 2026-03-02T20:06:22.048741448+00:00
+closed_at: 2026-03-02T20:06:22.048741348+00:00
 ---
 
 # Description
