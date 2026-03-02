@@ -339,7 +339,15 @@ enum EventKind {
         cpu: CpuId,
     },
     /// A cgroup's cpuset is changed at runtime.
-    CgroupCpusetChange(CgroupCpusetChangeEvent),
+    ///
+    /// `cpu` is the CPU where the change is initiated. In the kernel,
+    /// writing to `cpuset.cpus` runs in process context on the CPU of the
+    /// writing task. Assigning a CPU makes this a per-CPU event eligible
+    /// for concurrent batch processing.
+    CgroupCpusetChange {
+        event: CgroupCpusetChangeEvent,
+        cpu: CpuId,
+    },
     /// An interrupt starts on a CPU (hardirq or softirq).
     IrqStart {
         cpu: CpuId,
@@ -396,8 +404,8 @@ impl EventKind {
             | EventKind::TimerFired { cpu }
             | EventKind::CgroupMigrate { cpu, .. }
             | EventKind::CgroupCreate { cpu, .. }
-            | EventKind::CgroupDestroy { cpu, .. } => Some(*cpu),
-            EventKind::CgroupCpusetChange(_) => None,
+            | EventKind::CgroupDestroy { cpu, .. }
+            | EventKind::CgroupCpusetChange { cpu, .. } => Some(*cpu),
         }
     }
 }
@@ -1308,7 +1316,13 @@ impl<S: Scheduler> Simulator<S> {
             );
         }
         for cse in &scenario.cgroup_cpuset_change_events {
-            events.push(cse.at_ns, EventKind::CgroupCpusetChange(cse.clone()));
+            events.push(
+                cse.at_ns,
+                EventKind::CgroupCpusetChange {
+                    event: cse.clone(),
+                    cpu: CpuId(0),
+                },
+            );
         }
 
         // Seed IRQ events from the scenario
@@ -1570,8 +1584,9 @@ impl<S: Scheduler> Simulator<S> {
                 state.advance_cpu_clock(*cpu);
                 kfuncs::set_sim_clock(state.cpus[cpu.0 as usize].local_clock, Some(*cpu));
             }
-            EventKind::CgroupCpusetChange(_) => {
-                kfuncs::set_sim_clock(state.clock, None);
+            EventKind::CgroupCpusetChange { cpu, .. } => {
+                state.advance_cpu_clock(*cpu);
+                kfuncs::set_sim_clock(state.cpus[cpu.0 as usize].local_clock, Some(*cpu));
             }
         }
 
@@ -1635,7 +1650,7 @@ impl<S: Scheduler> Simulator<S> {
             EventKind::CgroupDestroy { event, .. } => {
                 self.handle_cgroup_destroy(&event, state, cgroup_registry);
             }
-            EventKind::CgroupCpusetChange(event) => {
+            EventKind::CgroupCpusetChange { event, .. } => {
                 self.handle_cgroup_cpuset_change(&event, state, cgroup_registry);
             }
             EventKind::IrqStart {
