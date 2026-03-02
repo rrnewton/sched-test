@@ -329,7 +329,15 @@ enum EventKind {
         cpu: CpuId,
     },
     /// A cgroup is destroyed at runtime.
-    CgroupDestroy(CgroupDestroyEvent),
+    ///
+    /// `cpu` is the CPU where the destruction is initiated. In the kernel,
+    /// `cgroup_rmdir()` runs in process context on the CPU of the task
+    /// removing the cgroup. Assigning a CPU makes this a per-CPU event
+    /// eligible for concurrent batch processing.
+    CgroupDestroy {
+        event: CgroupDestroyEvent,
+        cpu: CpuId,
+    },
     /// A cgroup's cpuset is changed at runtime.
     CgroupCpusetChange(CgroupCpusetChangeEvent),
     /// An interrupt starts on a CPU (hardirq or softirq).
@@ -387,8 +395,9 @@ impl EventKind {
             | EventKind::KickDelivered { cpu, .. }
             | EventKind::TimerFired { cpu }
             | EventKind::CgroupMigrate { cpu, .. }
-            | EventKind::CgroupCreate { cpu, .. } => Some(*cpu),
-            EventKind::CgroupDestroy(_) | EventKind::CgroupCpusetChange(_) => None,
+            | EventKind::CgroupCreate { cpu, .. }
+            | EventKind::CgroupDestroy { cpu, .. } => Some(*cpu),
+            EventKind::CgroupCpusetChange(_) => None,
         }
     }
 }
@@ -1290,7 +1299,13 @@ impl<S: Scheduler> Simulator<S> {
             );
         }
         for de in &scenario.cgroup_destroy_events {
-            events.push(de.at_ns, EventKind::CgroupDestroy(de.clone()));
+            events.push(
+                de.at_ns,
+                EventKind::CgroupDestroy {
+                    event: de.clone(),
+                    cpu: CpuId(0),
+                },
+            );
         }
         for cse in &scenario.cgroup_cpuset_change_events {
             events.push(cse.at_ns, EventKind::CgroupCpusetChange(cse.clone()));
@@ -1550,11 +1565,12 @@ impl<S: Scheduler> Simulator<S> {
             | EventKind::KickDelivered { cpu, .. }
             | EventKind::TimerFired { cpu }
             | EventKind::CgroupMigrate { cpu, .. }
-            | EventKind::CgroupCreate { cpu, .. } => {
+            | EventKind::CgroupCreate { cpu, .. }
+            | EventKind::CgroupDestroy { cpu, .. } => {
                 state.advance_cpu_clock(*cpu);
                 kfuncs::set_sim_clock(state.cpus[cpu.0 as usize].local_clock, Some(*cpu));
             }
-            EventKind::CgroupDestroy(_) | EventKind::CgroupCpusetChange(_) => {
+            EventKind::CgroupCpusetChange(_) => {
                 kfuncs::set_sim_clock(state.clock, None);
             }
         }
@@ -1616,7 +1632,7 @@ impl<S: Scheduler> Simulator<S> {
                     return Some(err);
                 }
             }
-            EventKind::CgroupDestroy(event) => {
+            EventKind::CgroupDestroy { event, .. } => {
                 self.handle_cgroup_destroy(&event, state, cgroup_registry);
             }
             EventKind::CgroupCpusetChange(event) => {
