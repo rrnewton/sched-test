@@ -1559,7 +1559,8 @@ impl<S: Scheduler> Simulator<S> {
         // When interleaving is disabled, all events are processed
         // sequentially in their original priority order (by seq
         // tiebreaker), preserving backward-compatible determinism.
-        let interleave_enabled = state.interleave || state.preemptive.is_some();
+        let interleave_enabled =
+            state.interleave || state.preemptive.is_some() || state.native_concurrent.is_some();
 
         'event_loop: while let Some(t) = events.peek_time() {
             if t > scenario.duration_ns {
@@ -1867,10 +1868,10 @@ impl<S: Scheduler> Simulator<S> {
         &self,
         cpu: CpuId,
         state: &mut SimulatorState,
-        tasks: &mut HashMap<Pid, SimTask>,
+        _tasks: &mut HashMap<Pid, SimTask>,
         events: &mut EventQueue,
         cgroup_registry: &CgroupRegistry,
-        monitor: &mut dyn Monitor,
+        _monitor: &mut dyn Monitor,
     ) {
         unsafe {
             // Advance the per-CPU clock so scx_bpf_now() inside the callback
@@ -2213,7 +2214,7 @@ impl<S: Scheduler> Simulator<S> {
         tasks: &mut HashMap<Pid, SimTask>,
         events: &mut EventQueue,
         cgroup_registry: &CgroupRegistry,
-        monitor: &mut dyn Monitor,
+        _monitor: &mut dyn Monitor,
     ) {
         let task = match tasks.get(&pid) {
             Some(t) => t,
@@ -2752,7 +2753,11 @@ impl<S: Scheduler> Simulator<S> {
                 // ring and corrupt shared state. Removable once the engine uses
                 // dynamic window batching (Phase 3) that eliminates re-entrant
                 // concurrent dispatch entirely.
-                if (state.interleave || state.preemptive.is_some()) && idle_cpus.len() >= 2 {
+                if (state.interleave
+                    || state.preemptive.is_some()
+                    || state.native_concurrent.is_some())
+                    && idle_cpus.len() >= 2
+                {
                     self.dispatch_concurrent(&idle_cpus, state, tasks, events, monitor);
                 } else {
                     for cpu in idle_cpus {
