@@ -136,7 +136,10 @@ process handle SIGFPE -s false -n false -p true\n\n"
                 "\
 # The simulator emulates BPF div-by-zero semantics via a SIGFPE handler.\n\
 # Let the handler work without GDB intercepting the signal.\n\
-handle SIGFPE nostop noprint pass\n\n"
+handle SIGFPE nostop noprint pass\n\
+\n\
+# Enable pending breakpoints for symbols not yet loaded (e.g., .so not dlopen'd).\n\
+set breakpoint pending on\n\n"
             }
         }
     }
