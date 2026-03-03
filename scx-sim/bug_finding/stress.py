@@ -167,7 +167,15 @@ class Finding:
 
     def repro_command(self) -> str:
         cmd = build_base_cmd(self.config)
-        if self.error_type == "determinism":
+        if self.error_type.startswith("record_"):
+            # Phase 1 failed during preemptive determinism
+            cmd.append("--record-preemptions /tmp/repro.preempt")
+        elif self.error_type.startswith("replay_"):
+            # Phase 2 failed during preemptive determinism (record+replay)
+            record_cmd = " ".join(cmd + ["--record-preemptions /tmp/repro.preempt"])
+            replay_cmd = f"{SCXSIM} replay /tmp/repro.preempt"
+            return f"{record_cmd} && {replay_cmd}"
+        elif self.error_type == "determinism":
             cmd.append("--determinism-check")
         return " ".join(cmd)
 
@@ -245,8 +253,10 @@ def run_determinism_preemptive(config: TestConfig) -> Optional[Finding]:
                 wall_time_sec=elapsed,
             )
 
-        # Run 2: replay preemption points (deterministic hw breakpoint)
-        cmd2 = build_base_cmd(config) + ["--replay-preemptions", tmpfile.name]
+        # Run 2: replay preemption points (deterministic hw breakpoint).
+        # Replay is a separate subcommand; the trace file embeds all
+        # scenario parameters (cpus, seed, duration, scheduler .so path).
+        cmd2 = [str(SCXSIM), "replay", tmpfile.name]
         result2 = subprocess.run(
             cmd2, capture_output=True, text=True, timeout=PROCESS_TIMEOUT_SEC
         )
