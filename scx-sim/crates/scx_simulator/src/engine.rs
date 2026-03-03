@@ -1903,9 +1903,6 @@ impl<S: Scheduler> Simulator<S> {
 
         // Flush staged events (e.g. KickDelivered) from the timer callback
         flush_staged_events(state, events);
-
-        // Process CPUs kicked by the timer callback
-        self.process_kicked_cpus(None, state, tasks, events, monitor);
     }
 
     /// Handle a periodic scheduler tick on a CPU.
@@ -2006,9 +2003,6 @@ impl<S: Scheduler> Simulator<S> {
 
         // Flush remaining staged events (kicks to other CPUs)
         flush_staged_events(state, events);
-
-        // Process other kicked CPUs
-        self.process_kicked_cpus(Some(cpu), state, tasks, events, monitor);
 
         if should_preempt && state.cpus[cpu.0 as usize].current_task.is_some() {
             self.preempt_current(cpu, state, tasks, events, monitor);
@@ -2273,9 +2267,6 @@ impl<S: Scheduler> Simulator<S> {
 
         // Flush staged events from cgroup_move or re-enqueue callbacks
         flush_staged_events(state, events);
-
-        // Process CPUs kicked by cgroup_move or re-enqueue callbacks
-        self.process_kicked_cpus(None, state, tasks, events, monitor);
     }
 
     /// Dequeue a task before cgroup migration (sched_change_begin).
@@ -3185,9 +3176,6 @@ impl<S: Scheduler> Simulator<S> {
         // Flush staged events from enqueue callbacks
         flush_staged_events(state, events);
 
-        // Process CPUs kicked during enqueue (e.g. SCX_DSQ_LOCAL_ON | cpu)
-        self.process_kicked_cpus(Some(cpu), state, tasks, events, monitor);
-
         // Dispatch next task on this CPU
         self.try_dispatch_and_run(cpu, state, tasks, events, monitor);
     }
@@ -3226,7 +3214,6 @@ impl<S: Scheduler> Simulator<S> {
             unsafe {
                 kfuncs::enter_sim(state, cpu);
                 set_ops_context(state, OpsContext::Dispatch);
-                state.kicked_cpus.clear();
                 debug!("enter:structop dispatch");
                 start_rbc(state);
                 self.scheduler.dispatch(cpu.0 as i32, prev_raw);
@@ -3260,11 +3247,6 @@ impl<S: Scheduler> Simulator<S> {
 
             // Flush staged events from dispatch callback
             flush_staged_events(state, events);
-
-            // Process CPUs kicked during dispatch().
-            // The scheduler may have dispatched tasks to other CPUs'
-            // local DSQs via scx_bpf_dsq_move(SCX_DSQ_LOCAL_ON | cpu).
-            self.process_kicked_cpus(Some(cpu), state, tasks, events, monitor);
         }
 
         // Kernel fallback: if local DSQ is still empty after dispatch(),
@@ -3378,10 +3360,6 @@ impl<S: Scheduler> Simulator<S> {
             return;
         }
 
-        // Clear kicked_cpus before the concurrent block — each worker's
-        // kfunc calls will accumulate new kicks into this shared map.
-        state.kicked_cpus.clear();
-
         // Phase 1: concurrent dispatch via scoped threads.
         //
         // SAFETY: token passing ensures only one thread accesses state/
@@ -3488,9 +3466,6 @@ impl<S: Scheduler> Simulator<S> {
 
         // Flush staged events from the concurrent dispatches.
         flush_staged_events(state, events);
-
-        // Process all kicked CPUs accumulated during the concurrent dispatches.
-        self.process_kicked_cpus(None, state, tasks, events, monitor);
     }
 
     /// Phase 1 cooperative: run dispatch via `TokenRing` (Mutex/Condvar).
