@@ -1779,14 +1779,16 @@ pub extern "C" fn bpf_task_from_pid(pid: i32) -> *mut c_void {
 }
 
 // ---------------------------------------------------------------------------
-// scx_bpf_kick_cpu — record kicked CPUs for the engine
+// scx_bpf_kick_cpu — stage a KickDelivered event for the engine
 // ---------------------------------------------------------------------------
 
 /// Kick a CPU (send scheduling IPI).
 ///
-/// Records the CPU and flags in the kicked map. The engine processes kicked
-/// CPUs after the current scheduler callback returns, triggering dispatch
-/// on those CPUs. Flags are OR'd so multiple kicks accumulate.
+/// Stages a `KickDelivered` event in `staged_events`. The engine flushes
+/// these into the event queue after the current callback returns, delivering
+/// the kick at `local_clock + ipi_delivery_ns`. Multiple kicks to the same
+/// CPU accumulate as separate staged events; the engine merges flags when
+/// processing them.
 #[no_mangle]
 pub extern "C" fn scx_bpf_kick_cpu(cpu: i32, flags: u64) {
     crate::preempt::set_current_kfunc("kick_cpu");
@@ -1795,14 +1797,18 @@ pub extern "C" fn scx_bpf_kick_cpu(cpu: i32, flags: u64) {
         let cpu_id = CpuId(cpu as u32);
         if (cpu_id.0 as usize) < sim.cpus.len() {
             let new_flags = KickFlags::from_raw(flags);
-            sim.kicked_cpus
-                .entry(cpu_id)
-                .and_modify(|existing| existing.insert(new_flags))
-                .or_insert(new_flags);
-            debug!(cpu, flags, "kick_cpu");
-
             let current = sim.current_cpu;
             let local_t = sim.cpus[current.0 as usize].local_clock;
+            let delivery_t = local_t + sim.overhead.effective_ipi_delivery_ns();
+            sim.staged_events.push((
+                delivery_t,
+                StagedEvent::KickDelivered {
+                    cpu: cpu_id,
+                    flags: new_flags,
+                },
+            ));
+            debug!(cpu, flags, "kick_cpu");
+
             sim.trace
                 .record(local_t, current, TraceKind::KickCpu { target_cpu: cpu_id });
         }
@@ -2773,16 +2779,22 @@ mod tests {
         unsafe { enter_sim(&mut state, cpu) };
         scx_bpf_kick_cpu(1, 0);
         scx_bpf_kick_cpu(3, 2); // SCX_KICK_PREEMPT
-        scx_bpf_kick_cpu(1, 2); // OR flags: 0 | 2 = PREEMPT
+        scx_bpf_kick_cpu(1, 2); // Second kick to same CPU
         exit_sim();
 
-        assert_eq!(state.kicked_cpus.len(), 2);
-        assert!(state.kicked_cpus.contains_key(&CpuId(1)));
-        assert!(state.kicked_cpus.contains_key(&CpuId(3)));
-        // CPU 1 was kicked with 0 then 2, should have PREEMPT
-        assert!(state.kicked_cpus[&CpuId(1)].contains(KickFlags::PREEMPT));
-        // CPU 3 was kicked with PREEMPT
-        assert!(state.kicked_cpus[&CpuId(3)].contains(KickFlags::PREEMPT));
+        // Kicks are now staged events, not in kicked_cpus
+        assert_eq!(state.staged_events.len(), 3);
+        // All staged events target the correct CPUs with correct flags
+        let events: Vec<_> = state
+            .staged_events
+            .iter()
+            .map(|(_, ev)| match ev {
+                StagedEvent::KickDelivered { cpu, flags } => (*cpu, *flags),
+            })
+            .collect();
+        assert_eq!(events[0], (CpuId(1), KickFlags::from_raw(0)));
+        assert_eq!(events[1], (CpuId(3), KickFlags::PREEMPT));
+        assert_eq!(events[2], (CpuId(1), KickFlags::PREEMPT));
     }
 
     #[test]
@@ -2795,7 +2807,7 @@ mod tests {
         scx_bpf_kick_cpu(99, 0);
         exit_sim();
 
-        assert!(state.kicked_cpus.is_empty());
+        assert!(state.staged_events.is_empty());
     }
 
     // -----------------------------------------------------------------------
