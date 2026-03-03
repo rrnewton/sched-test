@@ -604,7 +604,6 @@ fn group_events_by_cpu(batch: Vec<Event>) -> (Vec<Event>, HashMap<CpuId, Vec<Eve
 ///
 /// Staged events are sorted by `(time, cpu)` before flushing to ensure
 /// deterministic insertion order regardless of the order kfuncs staged them.
-#[allow(dead_code)] // Phase 2 infrastructure; callers added in Phase 3
 fn flush_staged_events(state: &mut SimulatorState, events: &mut EventQueue) {
     if state.staged_events.is_empty() {
         return;
