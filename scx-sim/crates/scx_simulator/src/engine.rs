@@ -1901,6 +1901,9 @@ impl<S: Scheduler> Simulator<S> {
             state.pending_timer_cpu.take();
         }
 
+        // Flush staged events (e.g. KickDelivered) from the timer callback
+        flush_staged_events(state, events);
+
         // Process CPUs kicked by the timer callback
         self.process_kicked_cpus(None, state, tasks, events, monitor);
     }
@@ -1984,17 +1987,25 @@ impl<S: Scheduler> Simulator<S> {
             kfuncs::exit_sim();
         }
 
-        // Check for self-preemption
-        let self_kick_preempt = state
-            .kicked_cpus
-            .get(&cpu)
-            .is_some_and(|flags| flags.contains(KickFlags::PREEMPT));
+        // Check for self-preemption: look in staged_events for a
+        // KickDelivered targeting this CPU with PREEMPT.
+        let self_kick_preempt = state.staged_events.iter().any(|(_, ev)| match ev {
+            StagedEvent::KickDelivered { cpu: c, flags } => {
+                *c == cpu && flags.contains(KickFlags::PREEMPT)
+            }
+        });
         let post_tick_slice = unsafe { ffi::sim_task_get_slice(raw) };
         let slice_zeroed = pre_tick_slice > 0 && post_tick_slice == 0;
         let should_preempt = self_kick_preempt || slice_zeroed;
 
-        // Remove self from kicked set before processing others
-        state.kicked_cpus.remove(&cpu);
+        // Remove self-kicks from staged events before flushing others.
+        // Self-kicks are handled inline via should_preempt above.
+        state.staged_events.retain(
+            |(_, ev)| !matches!(ev, StagedEvent::KickDelivered { cpu: c, .. } if *c == cpu),
+        );
+
+        // Flush remaining staged events (kicks to other CPUs)
+        flush_staged_events(state, events);
 
         // Process other kicked CPUs
         self.process_kicked_cpus(Some(cpu), state, tasks, events, monitor);
@@ -2259,6 +2270,9 @@ impl<S: Scheduler> Simulator<S> {
         if was_queued {
             self.cgroup_migrate_enqueue(pid, raw, cpu, state);
         }
+
+        // Flush staged events from cgroup_move or re-enqueue callbacks
+        flush_staged_events(state, events);
 
         // Process CPUs kicked by cgroup_move or re-enqueue callbacks
         self.process_kicked_cpus(None, state, tasks, events, monitor);
@@ -3168,6 +3182,9 @@ impl<S: Scheduler> Simulator<S> {
             }
         }
 
+        // Flush staged events from enqueue callbacks
+        flush_staged_events(state, events);
+
         // Process CPUs kicked during enqueue (e.g. SCX_DSQ_LOCAL_ON | cpu)
         self.process_kicked_cpus(Some(cpu), state, tasks, events, monitor);
 
@@ -3240,6 +3257,9 @@ impl<S: Scheduler> Simulator<S> {
                     });
                 }
             }
+
+            // Flush staged events from dispatch callback
+            flush_staged_events(state, events);
 
             // Process CPUs kicked during dispatch().
             // The scheduler may have dispatched tasks to other CPUs'
@@ -3465,6 +3485,9 @@ impl<S: Scheduler> Simulator<S> {
             // notification — not safe during concurrent post-processing).
             self.post_dispatch_run(cpu, false, state, tasks, events, monitor);
         }
+
+        // Flush staged events from the concurrent dispatches.
+        flush_staged_events(state, events);
 
         // Process all kicked CPUs accumulated during the concurrent dispatches.
         self.process_kicked_cpus(None, state, tasks, events, monitor);
@@ -3888,6 +3911,9 @@ impl<S: Scheduler> Simulator<S> {
         state.rbc_counter = main_rbc_counter;
         state.in_concurrent_batch = false;
 
+        // Flush staged events from the concurrent batch.
+        flush_staged_events(state, events);
+
         // Process deferred kicked CPUs from the concurrent batch.
         self.process_kicked_cpus(None, state, tasks, events, monitor);
     }
@@ -4262,7 +4288,8 @@ impl<S: Scheduler> Simulator<S> {
         // Caller-specific traces after enqueue
         post_enqueue(state, cpu, pid);
 
-        // Process kicked CPUs + dispatch next task
+        // Flush staged events + process kicked CPUs + dispatch next task
+        flush_staged_events(state, events);
         self.process_kicked_cpus(Some(cpu), state, tasks, events, monitor);
         self.try_dispatch_and_run(cpu, state, tasks, events, monitor);
     }
