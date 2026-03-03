@@ -113,7 +113,7 @@ tmux kill-session -t debug 2>/dev/null
 The tmux approach works identically with rr replay sessions:
 
 ```bash
-~/bin/rr record -- ./target/release/scxsim run <workload> --scheduler <name>
+rr record -- ./target/release/scxsim run <workload> --scheduler <name>
 GDB_SCRIPT=$(find target/release/build -name "libscx_<name>.gdb" | head -1)
 tmux new-session -d -s rr-debug "rr replay -d /usr/bin/gdb -- -x $GDB_SCRIPT"
 # Then same send-keys/capture-pane pattern
@@ -269,12 +269,12 @@ contains extensions that crash GDB 9.1 when attaching to this binary).
 
 ```bash
 # 1. Record
-~/bin/rr record -- ./target/release/scxsim run \
+rr record -- ./target/release/scxsim run \
     crates/scx_simulator/workloads/simple_wake.json \
     --scheduler simple --seed 42
 
 # 2. Replay with batch commands
-~/bin/rr replay -d /usr/bin/gdb -- -batch \
+rr replay -d /usr/bin/gdb -- -batch \
     -ex "set breakpoint pending on" \
     -ex "break simple_enqueue" \
     -ex "continue" \
@@ -287,7 +287,7 @@ contains extensions that crash GDB 9.1 when attaching to this binary).
 ### 4.4 rr Batch Mode with Reverse Debugging
 
 ```bash
-~/bin/rr replay -d /usr/bin/gdb -- -batch \
+rr replay -d /usr/bin/gdb -- -batch \
     -ex "set breakpoint pending on" \
     -ex "break simple_enqueue" \
     -ex "continue" \
@@ -360,7 +360,7 @@ when reverse execution is needed, use rr.
 ### 6.1 Recording
 
 ```bash
-~/bin/rr record -- ./target/release/scxsim run \
+rr record -- ./target/release/scxsim run \
     crates/scx_simulator/workloads/simple_wake.json \
     --scheduler simple --seed 42
 ```
@@ -372,7 +372,7 @@ The recording is stored in `~/.local/share/rr/scxsim-N/` (N increments).
 rr supports GDB's Machine Interface, which produces structured output:
 
 ```bash
-~/bin/rr replay -d /usr/bin/gdb -- -i=mi -batch \
+rr replay -d /usr/bin/gdb -- -i=mi -batch \
     -ex "break ffi.rs:972" \
     -ex "continue" \
     -ex "bt 5" \
@@ -387,7 +387,7 @@ agents that want to extract structured data from debugger output.
 GDB Python can be used inline via `-ex "python ..."` commands:
 
 ```bash
-~/bin/rr replay -d /usr/bin/gdb -- -batch \
+rr replay -d /usr/bin/gdb -- -batch \
     -ex "break ffi.rs:972" \
     -ex "continue" \
     -ex "python
@@ -408,7 +408,7 @@ interactive).
 For simulator-side breakpoints (Rust code), use `file:line` syntax:
 
 ```bash
-~/bin/rr replay -d /usr/bin/gdb -- -batch \
+rr replay -d /usr/bin/gdb -- -batch \
     -ex "break ffi.rs:972" \
     -ex "continue" \
     -ex "bt 5" \
@@ -421,7 +421,7 @@ For simulator-side breakpoints (Rust code), use `file:line` syntax:
 The `info functions <regex>` command helps discover Rust function names:
 
 ```bash
-~/bin/rr replay -d /usr/bin/gdb -- -batch \
+rr replay -d /usr/bin/gdb -- -batch \
     -ex "info functions tick" \
     -ex "quit"
 ```
