@@ -273,6 +273,26 @@ fn wait_for_debugger_attach() {
     }
 }
 
+/// Search the current directory and up to 3 parent directories for a
+/// `*.code-workspace` file, returning the first match found.
+fn find_workspace_file() -> Option<std::path::PathBuf> {
+    let mut dir = std::env::current_dir().ok()?;
+    for _ in 0..4 {
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("code-workspace") {
+                    return Some(path);
+                }
+            }
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    None
+}
+
 /// Pause execution so a debugger can attach before scheduler code runs.
 ///
 /// Writes debugger breakpoint scripts (`.lldb` and `.gdb`) alongside the
@@ -330,6 +350,14 @@ fn wait_for_debugger<S: Scheduler>(scheduler: &S) {
         eprintln!("Custom debugger commands available:");
         eprintln!("  skip-helpers    \u{2014} skip util.bpf.c/wrapper.c when stepping");
         eprintln!("  unskip-helpers  \u{2014} stop skipping helpers");
+    }
+    eprintln!();
+    eprintln!("Attach with VSCode:");
+    if let Some(ws) = find_workspace_file() {
+        eprintln!("  1. Open workspace: code {}", ws.display());
+        eprintln!("  2. Run & Debug (Ctrl+Shift+D) \u{2192} \"Attach\" \u{2192} enter PID {pid}");
+    } else {
+        eprintln!("  Run & Debug (Ctrl+Shift+D) \u{2192} \"Attach\" \u{2192} enter PID {pid}");
     }
     eprintln!();
 
