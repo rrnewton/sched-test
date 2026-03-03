@@ -836,6 +836,9 @@ thread_local! {
     /// Per-callback identity context saved/restored across yield points.
     /// Async-signal-safe: Cell<Copy> read/write.
     static CALLBACK_CTX: std::cell::Cell<Option<CallbackContext>> = const { std::cell::Cell::new(None) };
+    /// Engine-level SimArc stored so that `enter_sim` can install `SIM_ARC`
+    /// for cgroup callbacks and concurrent worker threads.
+    static ENGINE_SIM_ARC: RefCell<Option<SimArc>> = const { RefCell::new(None) };
 }
 
 /// Install a SimArc into the current thread's thread-local.
@@ -879,6 +882,32 @@ pub fn get_callback_ctx() -> Option<CallbackContext> {
     CALLBACK_CTX.with(|c| c.get())
 }
 
+/// Set the engine-level SimArc for this thread.
+///
+/// Called once by the engine at simulation start. `enter_sim` will
+/// automatically install this Arc into `SIM_ARC`, bridging the old
+/// raw-pointer path with the new Arc path for cgroup callbacks and
+/// concurrent worker threads.
+pub fn set_engine_sim_arc(arc: &SimArc) {
+    ENGINE_SIM_ARC.with(|c| {
+        *c.borrow_mut() = Some(Arc::clone(arc));
+    });
+}
+
+/// Clear the engine-level SimArc from this thread.
+///
+/// Called by the engine when simulation ends.
+pub fn clear_engine_sim_arc() {
+    ENGINE_SIM_ARC.with(|c| {
+        *c.borrow_mut() = None;
+    });
+}
+
+/// Get a clone of the engine-level SimArc (for worker threads).
+pub fn get_engine_sim_arc() -> Option<SimArc> {
+    ENGINE_SIM_ARC.with(|c| c.borrow().clone())
+}
+
 /// Install a simulator state pointer for the duration of ops callbacks.
 ///
 /// Sets `state.current_cpu` and syncs `SIM_CONTEXT` so the trace formatter
@@ -893,6 +922,13 @@ pub unsafe fn enter_sim(state: &mut SimulatorState, cpu: CpuId) {
     state.current_cpu = cpu;
     set_sim_clock(state.cpus[cpu.0 as usize].local_clock, Some(cpu));
     SIM_STATE.with(|cell| cell.set(Some(state as *mut SimulatorState)));
+    // Also install SIM_ARC from ENGINE_SIM_ARC so cgroup callbacks
+    // and concurrent workers can access the full SimState.
+    ENGINE_SIM_ARC.with(|c| {
+        if let Some(ref arc) = *c.borrow() {
+            install_sim_arc(arc);
+        }
+    });
 }
 
 /// Remove the simulator state pointer after ops callbacks complete.
@@ -941,6 +977,7 @@ pub fn exit_sim() {
 pub fn exit_sim_no_clear_ops() {
     crate::preempt::pause_timer();
     SIM_STATE.with(|cell| cell.set(None));
+    clear_sim_arc();
 }
 
 /// Get the raw SimulatorState pointer from the thread-local.
