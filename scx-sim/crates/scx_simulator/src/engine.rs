@@ -88,68 +88,139 @@ fn parse_nm_helper_symbol(line: &str) -> Option<String> {
     Some(name.to_owned())
 }
 
-/// Build lldb `command alias` definitions for skipping/unskipping helper functions.
-///
-/// Returns `None` if `names` is empty, otherwise returns a multi-line string
-/// with alias definitions that the user can invoke as `skip-helpers` and
-/// `unskip-helpers` in the lldb session.
-fn build_helper_aliases(names: &[String]) -> Option<String> {
-    if names.is_empty() {
-        return None;
-    }
-    let alternation = names.join("|");
-    Some(format!(
-        "\
-command alias skip-helpers settings set target.process.thread.step-avoid-regexp \"^({alternation})\"
-command alias unskip-helpers settings clear target.process.thread.step-avoid-regexp",
-    ))
+/// Which debugger flavour to generate a script for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DebuggerFlavor {
+    Lldb,
+    Gdb,
 }
 
-/// Write an lldb breakpoint script alongside the scheduler `.so`.
-///
-/// Given a `.so` path like `/path/to/libscx_simple.so`, writes the script
-/// to `/path/to/libscx_simple.lldb`. The script contains `breakpoint set`
-/// commands for each ops callback symbol, plus optional `command alias`
-/// definitions for `skip-helpers`/`unskip-helpers`. Returns
-/// `(script_path, has_helpers)`.
-fn write_lldb_script(info: &crate::ffi::DebuggerInfo) -> (String, bool) {
-    let so = std::path::Path::new(&info.so_path);
-    let lldb_path = so.with_extension("lldb");
-    let mut script = String::new();
-    script.push_str("# Auto-generated lldb breakpoint script for scheduler ops\n");
-    script.push_str(&format!("# Scheduler: {}\n\n", info.prefix));
-    // Make `step` stay in scheduler C code by skipping the simulator binary.
-    // All scheduler code lives in libscx_*.so; everything we want to skip
-    // (kfunc stubs, RBC instrumentation, Rust engine code) lives in scxsim.
-    if let Ok(exe) = std::env::current_exe() {
-        script.push_str(&format!(
-            "settings set target.process.thread.step-avoid-libraries \"{}\"\n\n",
-            exe.display()
-        ));
-    }
-    for sym in &info.ops_symbol_names {
-        script.push_str(&format!("breakpoint set --name {sym}\n"));
+impl DebuggerFlavor {
+    fn extension(self) -> &'static str {
+        match self {
+            Self::Lldb => "lldb",
+            Self::Gdb => "gdb",
+        }
     }
 
-    // Discover helper functions from wrapper.c / util.bpf.c and emit command
-    // alias definitions for skip-helpers / unskip-helpers.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Lldb => "lldb",
+            Self::Gdb => "gdb",
+        }
+    }
+
+    /// Emit a single breakpoint command.
+    fn fmt_breakpoint(self, sym: &str) -> String {
+        match self {
+            Self::Lldb => format!("breakpoint set --name {sym}\n"),
+            Self::Gdb => format!("break {sym}\n"),
+        }
+    }
+
+    /// Emit commands that make `step` skip the simulator binary so the
+    /// user stays inside the scheduler `.so` code.
+    fn fmt_skip_simulator(self) -> String {
+        match self {
+            Self::Lldb => {
+                if let Ok(exe) = std::env::current_exe() {
+                    format!(
+                        "settings set target.process.thread.step-avoid-libraries \"{}\"\n\n",
+                        exe.display()
+                    )
+                } else {
+                    String::new()
+                }
+            }
+            Self::Gdb => {
+                // GDB has no direct step-avoid-libraries equivalent.
+                // Skip all Rust-mangled functions (the simulator is Rust),
+                // plus C stub prefixes used by the simulator's kfunc layer.
+                "\
+skip -rfu \"^_ZN\"\n\
+skip -rfu \"^scx_bpf_\"\n\
+skip -rfu \"^scx_test_\"\n\
+skip -rfu \"^sim_\"\n\n"
+                    .to_owned()
+            }
+        }
+    }
+
+    /// Build custom commands for skipping/unskipping helper functions.
+    ///
+    /// Returns `None` if `names` is empty, otherwise returns a multi-line
+    /// string the user can invoke as `skip-helpers` / `unskip-helpers`.
+    fn build_helper_commands(self, names: &[String]) -> Option<String> {
+        if names.is_empty() {
+            return None;
+        }
+        let alternation = names.join("|");
+        Some(match self {
+            Self::Lldb => format!(
+                "\
+command alias skip-helpers settings set target.process.thread.step-avoid-regexp \"^({alternation})\"
+command alias unskip-helpers settings clear target.process.thread.step-avoid-regexp",
+            ),
+            Self::Gdb => format!(
+                "\
+define skip-helpers
+  skip -rfu \"^({alternation})\"
+end
+define unskip-helpers
+  # List current skips so you can selectively delete helper skips
+  info skip
+end",
+            ),
+        })
+    }
+}
+
+/// Write a debugger breakpoint script alongside the scheduler `.so`.
+///
+/// Given a `.so` path like `/path/to/libscx_simple.so` and a
+/// [`DebuggerFlavor`], writes the script to the matching extension
+/// (e.g. `.lldb` or `.gdb`). Returns `(script_path, has_helpers)`.
+fn write_debugger_script(
+    info: &crate::ffi::DebuggerInfo,
+    flavor: DebuggerFlavor,
+) -> (String, bool) {
+    let so = std::path::Path::new(&info.so_path);
+    let script_path = so.with_extension(flavor.extension());
+    let mut script = String::new();
+
+    script.push_str(&format!(
+        "# Auto-generated {} breakpoint script for scheduler ops\n",
+        flavor.name()
+    ));
+    script.push_str(&format!("# Scheduler: {}\n\n", info.prefix));
+
+    // Make `step` stay in scheduler C code by skipping the simulator binary.
+    script.push_str(&flavor.fmt_skip_simulator());
+
+    // Breakpoints on all loaded scheduler ops callbacks.
+    for sym in &info.ops_symbol_names {
+        script.push_str(&flavor.fmt_breakpoint(sym));
+    }
+
+    // Helper skip/unskip commands.
     let helpers = discover_helper_functions(&info.so_path);
-    let aliases = build_helper_aliases(&helpers);
-    if let Some(ref cmds) = aliases {
+    let cmds = flavor.build_helper_commands(&helpers);
+    if let Some(ref c) = cmds {
         script.push_str(
             "\n# Custom commands for skipping utility helpers (util.bpf.c, wrapper.c):\n",
         );
-        script.push_str(cmds);
+        script.push_str(c);
         script.push('\n');
     }
 
-    if let Err(e) = std::fs::write(&lldb_path, &script) {
+    if let Err(e) = std::fs::write(&script_path, &script) {
         eprintln!(
-            "warning: could not write lldb script to {}: {e}",
-            lldb_path.display()
+            "warning: could not write {} script to {}: {e}",
+            flavor.name(),
+            script_path.display()
         );
     }
-    (lldb_path.to_string_lossy().into_owned(), aliases.is_some())
+    (script_path.to_string_lossy().into_owned(), cmds.is_some())
 }
 
 /// Spin-wait until a debugger (ptrace tracer) attaches to this process.
@@ -175,29 +246,32 @@ fn wait_for_debugger_attach() {
 
 /// Pause execution so a debugger can attach before scheduler code runs.
 ///
-/// Writes an lldb breakpoint script alongside the scheduler `.so`, prints
-/// the PID and a copy-pasteable `lldb` attach command, then spin-waits
-/// for a debugger to attach. Once attached, execution proceeds directly
-/// to `ops.init()`. The user types a single `continue` from the lldb
-/// attach stop to hit the first ops breakpoint.
+/// Writes debugger breakpoint scripts (`.lldb` and `.gdb`) alongside the
+/// scheduler `.so`, prints the PID and copy-pasteable attach commands for
+/// both debuggers, then spin-waits for a debugger to attach. Once
+/// attached, execution proceeds directly to `ops.init()`. The user types
+/// a single `continue` from the debugger's attach stop to hit the first
+/// ops breakpoint.
 fn wait_for_debugger<S: Scheduler>(scheduler: &S) {
     let pid = std::process::id();
     let info = scheduler.debugger_info();
 
-    let (so_display, script_display, bp_count, has_helpers) = match &info {
+    let (so_display, lldb_script, gdb_script, bp_count, has_helpers) = match &info {
         Some(dbg) => {
-            let (script_path, has_helpers) = write_lldb_script(dbg);
+            let (lldb_path, lldb_helpers) = write_debugger_script(dbg, DebuggerFlavor::Lldb);
+            let (gdb_path, gdb_helpers) = write_debugger_script(dbg, DebuggerFlavor::Gdb);
             let count = dbg.ops_symbol_names.len();
             (
                 dbg.so_path.as_str().to_owned(),
-                Some(script_path),
+                Some(lldb_path),
+                Some(gdb_path),
                 count,
-                has_helpers,
+                lldb_helpers || gdb_helpers,
             )
         }
         None => {
             let fallback = scheduler_so_path().unwrap_or_else(|| "<unknown>".to_string());
-            (fallback, None, 0, false)
+            (fallback, None, None, 0, false)
         }
     };
 
@@ -205,19 +279,26 @@ fn wait_for_debugger<S: Scheduler>(scheduler: &S) {
     eprintln!("=== --wait-debugger ===");
     eprintln!("PID: {pid}");
     eprintln!("Scheduler .so: {so_display}");
-    if let Some(ref script) = script_display {
-        eprintln!("Breakpoints: {bp_count} ops callbacks in {script}");
+    if bp_count > 0 {
+        eprintln!("Breakpoints: {bp_count} ops callbacks");
     }
     eprintln!();
     eprintln!("Waiting for debugger to attach...");
     eprintln!();
-    match &script_display {
+    eprintln!("Attach with lldb:");
+    match &lldb_script {
         Some(script) => eprintln!("  lldb -p {pid} -o \"command source {script}\""),
         None => eprintln!("  lldb -p {pid}"),
     }
+    eprintln!();
+    eprintln!("Attach with gdb:");
+    match &gdb_script {
+        Some(script) => eprintln!("  gdb -p {pid} -x {script}"),
+        None => eprintln!("  gdb -p {pid}"),
+    }
     if has_helpers {
         eprintln!();
-        eprintln!("Custom lldb commands available:");
+        eprintln!("Custom debugger commands available:");
         eprintln!("  skip-helpers    \u{2014} skip util.bpf.c/wrapper.c when stepping");
         eprintln!("  unskip-helpers  \u{2014} stop skipping helpers");
     }
@@ -4577,30 +4658,95 @@ mod tests {
     }
 
     #[test]
-    fn build_helper_aliases_empty_names() {
-        assert_eq!(build_helper_aliases(&[]), None);
+    fn lldb_helper_commands_empty_names() {
+        assert_eq!(DebuggerFlavor::Lldb.build_helper_commands(&[]), None);
     }
 
     #[test]
-    fn build_helper_aliases_single_name() {
+    fn gdb_helper_commands_empty_names() {
+        assert_eq!(DebuggerFlavor::Gdb.build_helper_commands(&[]), None);
+    }
+
+    #[test]
+    fn lldb_helper_commands_single_name() {
         let names = vec!["get_cpu_ctx".to_owned()];
-        let aliases = build_helper_aliases(&names).unwrap();
-        assert!(aliases.contains("command alias skip-helpers"));
-        assert!(aliases.contains("command alias unskip-helpers"));
-        assert!(aliases.contains("\"^(get_cpu_ctx)\""));
-        assert!(aliases.contains("settings clear target.process.thread.step-avoid-regexp"));
+        let cmds = DebuggerFlavor::Lldb.build_helper_commands(&names).unwrap();
+        assert!(cmds.contains("command alias skip-helpers"));
+        assert!(cmds.contains("command alias unskip-helpers"));
+        assert!(cmds.contains("\"^(get_cpu_ctx)\""));
+        assert!(cmds.contains("settings clear target.process.thread.step-avoid-regexp"));
     }
 
     #[test]
-    fn build_helper_aliases_multiple_names() {
+    fn lldb_helper_commands_multiple_names() {
         let names = vec![
             "calc_avg".to_owned(),
             "get_cpu_ctx".to_owned(),
             "stat_inc".to_owned(),
         ];
-        let aliases = build_helper_aliases(&names).unwrap();
-        assert!(aliases.contains("command alias skip-helpers"));
-        assert!(aliases.contains("\"^(calc_avg|get_cpu_ctx|stat_inc)\""));
-        assert!(aliases.contains("command alias unskip-helpers"));
+        let cmds = DebuggerFlavor::Lldb.build_helper_commands(&names).unwrap();
+        assert!(cmds.contains("command alias skip-helpers"));
+        assert!(cmds.contains("\"^(calc_avg|get_cpu_ctx|stat_inc)\""));
+        assert!(cmds.contains("command alias unskip-helpers"));
+    }
+
+    #[test]
+    fn gdb_helper_commands_single_name() {
+        let names = vec!["get_cpu_ctx".to_owned()];
+        let cmds = DebuggerFlavor::Gdb.build_helper_commands(&names).unwrap();
+        assert!(cmds.contains("define skip-helpers"));
+        assert!(cmds.contains("skip -rfu \"^(get_cpu_ctx)\""));
+        assert!(cmds.contains("define unskip-helpers"));
+        assert!(cmds.contains("info skip"));
+    }
+
+    #[test]
+    fn gdb_helper_commands_multiple_names() {
+        let names = vec![
+            "calc_avg".to_owned(),
+            "get_cpu_ctx".to_owned(),
+            "stat_inc".to_owned(),
+        ];
+        let cmds = DebuggerFlavor::Gdb.build_helper_commands(&names).unwrap();
+        assert!(cmds.contains("define skip-helpers"));
+        assert!(cmds.contains("skip -rfu \"^(calc_avg|get_cpu_ctx|stat_inc)\""));
+        assert!(cmds.contains("define unskip-helpers"));
+    }
+
+    #[test]
+    fn lldb_fmt_breakpoint() {
+        assert_eq!(
+            DebuggerFlavor::Lldb.fmt_breakpoint("simple_init"),
+            "breakpoint set --name simple_init\n"
+        );
+    }
+
+    #[test]
+    fn gdb_fmt_breakpoint() {
+        assert_eq!(
+            DebuggerFlavor::Gdb.fmt_breakpoint("simple_init"),
+            "break simple_init\n"
+        );
+    }
+
+    #[test]
+    fn gdb_skip_simulator_contains_rust_mangled_skip() {
+        let skip = DebuggerFlavor::Gdb.fmt_skip_simulator();
+        assert!(skip.contains("skip -rfu \"^_ZN\""));
+        assert!(skip.contains("skip -rfu \"^scx_bpf_\""));
+        assert!(skip.contains("skip -rfu \"^scx_test_\""));
+        assert!(skip.contains("skip -rfu \"^sim_\""));
+    }
+
+    #[test]
+    fn lldb_skip_simulator_uses_step_avoid_libraries() {
+        let skip = DebuggerFlavor::Lldb.fmt_skip_simulator();
+        assert!(skip.contains("settings set target.process.thread.step-avoid-libraries"));
+    }
+
+    #[test]
+    fn debugger_flavor_extensions() {
+        assert_eq!(DebuggerFlavor::Lldb.extension(), "lldb");
+        assert_eq!(DebuggerFlavor::Gdb.extension(), "gdb");
     }
 }
