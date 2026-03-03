@@ -12,3 +12,7 @@ csrc/e9_rbc_trampoline
 !.claude/
 !.claude/agents/
 !.claude/agents/**
+
+# Allow VSCode debug configuration to be tracked
+!.vscode/
+!.vscode/launch.json

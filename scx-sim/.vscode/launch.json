@@ -1,0 +1,22 @@
+{
+      "version": "0.2.0",
+      "configurations": [
+          {
+              "name": "Attach to scxsim",
+              "type": "fb-lldb",
+              "request": "attach",
+              "pid": "${command:pickProcess}",
+              "processName": "scxsim",
+              "initCommands": [
+                  "settings set target.process.thread.step-avoid-regexp \"^(scx_bpf_|bpf_|_ZN)\"",
+                  "process handle SIGFPE -s false -n false -p true"
+              ],
+              "postRunCommands": [
+                  "breakpoint set --name simple_init",
+                  "breakpoint set --name simple_select_cpu",
+                  "breakpoint set --name simple_enqueue",
+                  "breakpoint set --name simple_dispatch"
+              ]
+          }
+      ]
+  }
