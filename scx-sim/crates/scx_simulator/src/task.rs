@@ -141,6 +141,21 @@ pub struct TaskDef {
     pub migration_disabled: u16,
 }
 
+impl TaskDef {
+    /// Initial CPU for this task, matching kernel semantics.
+    ///
+    /// In the kernel, a new task's `cpu` field is set to the CPU where it was
+    /// forked, which is always within its cpumask. We model this by returning
+    /// the first allowed CPU when a cpumask is specified, or `CpuId(0)` when
+    /// the task is unrestricted.
+    pub fn initial_cpu(&self) -> CpuId {
+        self.allowed_cpus
+            .as_ref()
+            .and_then(|cpus| cpus.first().copied())
+            .unwrap_or(CpuId(0))
+    }
+}
+
 /// A simulated task at runtime.
 pub struct SimTask {
     /// Raw pointer to the heap-allocated C task_struct.
@@ -217,6 +232,10 @@ impl SimTask {
             _ => 0,
         };
 
+        // In the kernel, a new task's cpu field is set to the CPU where
+        // it was forked, which is always within its cpumask.
+        let initial_cpu = def.initial_cpu();
+
         SimTask {
             raw,
             pid: def.pid,
@@ -227,7 +246,7 @@ impl SimTask {
             run_remaining_ns,
             state: TaskState::Sleeping,
             enabled: false,
-            prev_cpu: CpuId(0),
+            prev_cpu: initial_cpu,
             runnable_at_ns: None,
             sum_exec_base: 0,
         }

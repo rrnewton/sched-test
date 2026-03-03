@@ -1416,14 +1416,14 @@ impl<S: Scheduler> Simulator<S> {
 
         // Schedule initial TaskWake events for all tasks
         for def in &scenario.tasks {
-            // Initial wakes have no waker; use CpuId(0) matching the task's
-            // initial prev_cpu (set in SimTask::new).
+            // Initial wakes have no waker; use the task's initial prev_cpu
+            // (first allowed CPU from cpumask, or CpuId(0) if unrestricted).
             events.push(
                 def.start_time_ns,
                 EventKind::TaskWake {
                     pid: def.pid,
                     waker: None,
-                    cpu: CpuId(0),
+                    cpu: def.initial_cpu(),
                 },
             );
         }
