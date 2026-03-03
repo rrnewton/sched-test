@@ -1175,7 +1175,6 @@ impl<S: Scheduler> Simulator<S> {
             ops_context: OpsContext::None,
             pending_dispatch: None,
             dsq_iter: None,
-            kicked_cpus: BTreeMap::new(),
             staged_events: Vec::new(),
             task_last_cpu: HashMap::new(),
             task_ops_state: BTreeMap::new(),
@@ -1201,7 +1200,6 @@ impl<S: Scheduler> Simulator<S> {
                 crate::preempt::StructopInfo::default();
                 scenario.nr_cpus as usize
             ],
-            in_concurrent_batch: false,
             native_concurrent: scenario.native_concurrent,
         };
 
@@ -2754,10 +2752,7 @@ impl<S: Scheduler> Simulator<S> {
                 // ring and corrupt shared state. Removable once the engine uses
                 // dynamic window batching (Phase 3) that eliminates re-entrant
                 // concurrent dispatch entirely.
-                if (state.interleave || state.preemptive.is_some())
-                    && !state.in_concurrent_batch
-                    && idle_cpus.len() >= 2
-                {
+                if (state.interleave || state.preemptive.is_some()) && idle_cpus.len() >= 2 {
                     self.dispatch_concurrent(&idle_cpus, state, tasks, events, monitor);
                 } else {
                     for cpu in idle_cpus {
@@ -3711,21 +3706,9 @@ impl<S: Scheduler> Simulator<S> {
     /// where scheduler callbacks on different CPUs race with each other
     /// (e.g., tick on CPU 0 racing with dispatch on CPU 1).
     ///
-    /// During the concurrent phase:
-    /// - `in_concurrent_batch` is set, which:
-    ///   (a) prevents `process_kicked_cpus` from draining+processing the
-    ///   shared `kicked_cpus` map mid-batch (workers are still writing it),
-    ///   (b) prevents `handle_task_wake` from calling `dispatch_concurrent`,
-    ///   which would nest concurrent thread spawning and deadlock.
-    /// - Kicked CPUs accumulate in `state.kicked_cpus`
-    ///
-    /// After all workers complete:
-    /// - `in_concurrent_batch` is cleared
-    /// - Deferred kicked CPUs are processed via `process_kicked_cpus`
-    ///
-    /// This flag can be removed once kicks become timed events and
-    /// `process_kicked_cpus` is deleted (see `widened_concurrency_plan.md`
-    /// Phase 2 + Phase 4).
+    /// During the concurrent phase, kicked CPUs are staged as
+    /// `KickDelivered` events via `staged_events` and flushed into the
+    /// event queue after all workers complete.
     #[allow(clippy::too_many_arguments)]
     fn process_batch_concurrent(
         &self,
@@ -3762,9 +3745,6 @@ impl<S: Scheduler> Simulator<S> {
             }
             return;
         }
-
-        state.in_concurrent_batch = true;
-        state.kicked_cpus.clear();
 
         // Temporarily remove the main-thread RBC counter so worker threads
         // (which access state via raw pointers) don't touch a PMU fd bound
@@ -3884,13 +3864,9 @@ impl<S: Scheduler> Simulator<S> {
         }
 
         state.rbc_counter = main_rbc_counter;
-        state.in_concurrent_batch = false;
 
         // Flush staged events from the concurrent batch.
         flush_staged_events(state, events);
-
-        // Process deferred kicked CPUs from the concurrent batch.
-        self.process_kicked_cpus(None, state, tasks, events, monitor);
     }
 
     /// Cooperative batch-concurrent processing via `TokenRing`.
@@ -3971,53 +3947,6 @@ impl<S: Scheduler> Simulator<S> {
             workers = cpu_ids.len(),
             "batch-concurrent cooperative: complete"
         );
-    }
-
-    /// Process CPUs kicked via `scx_bpf_kick_cpu` during a callback.
-    ///
-    /// Drains the kicked_cpus map and handles each entry based on its flags:
-    /// - `PREEMPT` + task running → `preempt_current(cpu)`
-    /// - `IDLE` → only dispatch if CPU is idle
-    /// - Plain kick → `try_dispatch_and_run(cpu)`
-    ///
-    /// `exclude_cpu` is skipped (caller handles it separately, e.g. tick's own CPU).
-    fn process_kicked_cpus(
-        &self,
-        exclude_cpu: Option<CpuId>,
-        state: &mut SimulatorState,
-        tasks: &mut HashMap<Pid, SimTask>,
-        events: &mut EventQueue,
-        monitor: &mut dyn Monitor,
-    ) {
-        // Guard: during concurrent batch processing, worker threads reach
-        // this function via process_event -> handle_task_wake/handle_tick.
-        // Draining kicked_cpus here would race with other workers still
-        // accumulating kicks, and the resulting dispatch calls would corrupt
-        // state. Kicks are deferred until the post-batch phase on the engine
-        // thread (see process_batch_concurrent, after in_concurrent_batch is
-        // cleared). Removable once kicks become timed events (Phase 2).
-        if state.in_concurrent_batch {
-            return;
-        }
-        // BTreeMap iterates in sorted key order, ensuring deterministic processing.
-        // Use std::mem::take to drain all entries (BTreeMap::drain requires a range).
-        let kicked = std::mem::take(&mut state.kicked_cpus);
-        for (kicked_cpu, flags) in kicked {
-            if Some(kicked_cpu) == exclude_cpu {
-                continue;
-            }
-            if flags.contains(KickFlags::PREEMPT)
-                && state.cpus[kicked_cpu.0 as usize].current_task.is_some()
-            {
-                self.preempt_current(kicked_cpu, state, tasks, events, monitor);
-            } else if flags.contains(KickFlags::IDLE) {
-                if state.cpus[kicked_cpu.0 as usize].current_task.is_none() {
-                    self.try_dispatch_and_run(kicked_cpu, state, tasks, events, monitor);
-                }
-            } else {
-                self.try_dispatch_and_run(kicked_cpu, state, tasks, events, monitor);
-            }
-        }
     }
 
     /// Handle a `DsqConsume` event: consume from global DSQ into local DSQ.
@@ -4263,9 +4192,8 @@ impl<S: Scheduler> Simulator<S> {
         // Caller-specific traces after enqueue
         post_enqueue(state, cpu, pid);
 
-        // Flush staged events + process kicked CPUs + dispatch next task
+        // Flush staged events + dispatch next task
         flush_staged_events(state, events);
-        self.process_kicked_cpus(Some(cpu), state, tasks, events, monitor);
         self.try_dispatch_and_run(cpu, state, tasks, events, monitor);
     }
 

@@ -254,13 +254,6 @@ pub struct SimulatorState {
     ///
     /// Active DSQ iterator for `bpf_for_each(scx_dsq, ...)`.
     pub dsq_iter: Option<DsqIterState>,
-    /// PER-CPU: Kicks are accumulated by the current worker's callback
-    /// and processed after the callback returns on that worker's CPU.
-    ///
-    /// CPUs kicked via `scx_bpf_kick_cpu` during a callback.
-    /// The engine processes these after the callback returns.
-    /// Uses BTreeMap for deterministic iteration order.
-    pub kicked_cpus: BTreeMap<CpuId, KickFlags>,
     /// Events staged by kfuncs during a callback for deferred processing.
     ///
     /// The engine flushes these to the event queue after each callback
@@ -397,29 +390,6 @@ pub struct SimulatorState {
     /// Indexed by CpuId.0. Seeded into worker thread-locals at the start
     /// of each dispatch round and drained back at the end.
     pub structop_accum: Vec<crate::preempt::StructopInfo>,
-    /// SHARED-MUTABLE: Read and written by the engine to coordinate
-    /// concurrent batch processing. Workers check this flag to decide
-    /// whether to defer kicks or suppress nested dispatch.
-    ///
-    /// True while inside a concurrent batch (same-timestamp per-CPU events
-    /// being processed in parallel). Guards two invariants:
-    ///
-    /// 1. **Kick deferral**: `process_kicked_cpus` returns immediately when
-    ///    set, so kicks accumulate in `kicked_cpus` during the batch and are
-    ///    processed only after all workers complete. Without this, a worker
-    ///    thread would drain+process the shared `kicked_cpus` map mid-batch,
-    ///    racing with other workers that are still accumulating kicks.
-    ///
-    /// 2. **Nested dispatch suppression**: `handle_task_wake` skips
-    ///    `dispatch_concurrent` when set, preventing nested concurrent thread
-    ///    spawning (which would deadlock the token ring or corrupt state).
-    ///
-    /// This flag can be removed once `scx_bpf_kick_cpu` stages
-    /// `KickDelivered` timed events (via `staged_events` + `flush_staged_events`)
-    /// instead of writing to the `kicked_cpus` BTreeMap, and
-    /// `process_kicked_cpus` is deleted. See `widened_concurrency_plan.md`
-    /// Phase 2 and Phase 4 for the removal plan.
-    pub in_concurrent_batch: bool,
     /// SHARED-READ: Configuration set at init, never mutated during simulation.
     ///
     /// Native concurrency backend configuration (None = disabled).
@@ -790,13 +760,6 @@ impl SimulatorState {
         for (pid, state) in &self.task_ops_state {
             hash = fnv1a_combine(hash, fnv1a_hash_u64(pid.0 as u64));
             hash = fnv1a_combine(hash, fnv1a_hash_u64(*state as u64));
-        }
-
-        // Hash kicked_cpus (BTreeMap iterates in sorted key order)
-        hash = fnv1a_combine(hash, fnv1a_hash_u64(self.kicked_cpus.len() as u64));
-        for (cpu, flags) in &self.kicked_cpus {
-            hash = fnv1a_combine(hash, fnv1a_hash_u64(cpu.0 as u64));
-            hash = fnv1a_combine(hash, fnv1a_hash_u64(flags.raw()));
         }
 
         hash
@@ -2004,7 +1967,6 @@ mod tests {
             ops_context: OpsContext::None,
             pending_dispatch: None,
             dsq_iter: None,
-            kicked_cpus: BTreeMap::new(),
             staged_events: Vec::new(),
             reenqueue_local_requested: false,
             pending_timer_ns: None,
@@ -2031,7 +1993,6 @@ mod tests {
             replay_backend: None,
             e9_fns: None,
             structop_accum: vec![crate::preempt::StructopInfo::default(); nr_cpus as usize],
-            in_concurrent_batch: false,
             native_concurrent: None,
         }
     }
