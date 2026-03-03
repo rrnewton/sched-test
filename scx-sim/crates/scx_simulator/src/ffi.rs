@@ -298,9 +298,10 @@ pub trait Scheduler {
 
 /// Debugger metadata for a loaded scheduler, used by `--wait-debugger`.
 ///
-/// Contains the information needed to generate an lldb breakpoint script:
-/// the `.so` file path, the symbol prefix (e.g. "simple"), and the list
-/// of ops callback symbol names present in the loaded scheduler.
+/// Contains the information needed to generate debugger breakpoint scripts
+/// (`.lldb` and `.gdb`): the `.so` file path, the symbol prefix (e.g.
+/// "simple"), and the list of ops callback symbol names present in the
+/// loaded scheduler.
 pub struct DebuggerInfo {
     /// Absolute path to the loaded `.so` file.
     pub so_path: String,
