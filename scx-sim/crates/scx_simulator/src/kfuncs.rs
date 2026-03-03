@@ -15,21 +15,25 @@
 // would be meaningless.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
 use std::ptr;
+use std::sync::{Arc, Mutex};
 
 use rand::rngs::SmallRng;
 use rand::RngCore;
 use tracing::debug;
 
+use crate::cgroup::CgroupRegistry;
 use crate::cpu::{LastStopReason, SimCpu};
 use crate::dsq::DsqManager;
+use crate::engine::EventQueue;
 use crate::ffi;
 use crate::fmt::FmtN;
 use crate::perf::RbcCounter;
 use crate::scenario::{NativeConcurrentConfig, NoiseConfig, OverheadConfig, PreemptiveConfig};
-use crate::task::OpsTaskState;
+use crate::task::{OpsTaskState, SimTask};
 use crate::trace::{DispatchRejectReason, DsqSampleTrigger, Trace, TraceKind};
 use crate::types::{CpuId, DsqId, KickFlags, Pid, TimeNs, Vtime};
 
@@ -396,6 +400,38 @@ pub struct SimulatorState {
     /// When set, workers run truly concurrently with real locks and
     /// window-based clock throttling instead of token-ring serialization.
     pub native_concurrent: Option<NativeConcurrentConfig>,
+}
+
+/// Bundle of all shared simulator state, protected by a single Mutex.
+///
+/// The engine creates this at simulation start and wraps it in `Arc<Mutex<_>>`.
+/// Kfuncs acquire the lock via the `SIM_ARC` thread-local. The engine releases
+/// the lock before calling into C scheduler code, and kfuncs reacquire it
+/// through the thread-local Arc.
+pub struct SimState {
+    /// Core scheduler state (CPUs, DSQs, trace, etc.).
+    pub sim: SimulatorState,
+    /// All simulated tasks, keyed by PID.
+    pub tasks: HashMap<Pid, SimTask>,
+    /// The event priority queue.
+    pub events: EventQueue,
+    /// The cgroup hierarchy.
+    pub cgroup_registry: CgroupRegistry,
+}
+
+/// Shared-ownership handle to the mutex-protected simulation state.
+pub type SimArc = Arc<Mutex<SimState>>;
+
+/// Per-callback identity context that the signal handler needs to
+/// save/restore without locking the Mutex.
+///
+/// Stored in a `Cell<Option<CallbackContext>>` thread-local so it is
+/// async-signal-safe (plain Copy read/write).
+#[derive(Clone, Copy)]
+pub struct CallbackContext {
+    pub current_cpu: CpuId,
+    pub ops_context: OpsContext,
+    pub waker_task_raw: Option<usize>,
 }
 
 /// Kernel value of `SCX_TASK_QUEUED` from `enum scx_task_state`.
@@ -794,6 +830,53 @@ impl SimContext {
 thread_local! {
     static SIM_STATE: std::cell::Cell<Option<*mut SimulatorState>> = const { std::cell::Cell::new(None) };
     static SIM_CONTEXT: std::cell::Cell<SimContext> = const { std::cell::Cell::new(SimContext::new()) };
+    /// Arc-based thread-local for kfuncs to access the shared SimState.
+    /// Replaces the raw pointer `SIM_STATE` in the new architecture.
+    static SIM_ARC: RefCell<Option<SimArc>> = const { RefCell::new(None) };
+    /// Per-callback identity context saved/restored across yield points.
+    /// Async-signal-safe: Cell<Copy> read/write.
+    static CALLBACK_CTX: std::cell::Cell<Option<CallbackContext>> = const { std::cell::Cell::new(None) };
+}
+
+/// Install a SimArc into the current thread's thread-local.
+///
+/// Called by the engine before entering scheduler C code so that kfuncs
+/// (which reacquire the lock) can find the Arc.
+pub fn install_sim_arc(arc: &SimArc) {
+    SIM_ARC.with(|c| {
+        *c.borrow_mut() = Some(Arc::clone(arc));
+    });
+}
+
+/// Clear the SimArc from the current thread's thread-local.
+///
+/// Called by the engine after scheduler C code returns.
+pub fn clear_sim_arc() {
+    SIM_ARC.with(|c| {
+        *c.borrow_mut() = None;
+    });
+}
+
+/// Clone the SimArc from the thread-local (for passing to sub-modules).
+///
+/// Returns `None` if not inside a simulator context.
+pub fn clone_sim_arc() -> Option<SimArc> {
+    SIM_ARC.with(|c| c.borrow().clone())
+}
+
+/// Install per-callback identity context into the thread-local.
+pub fn install_callback_ctx(ctx: CallbackContext) {
+    CALLBACK_CTX.with(|c| c.set(Some(ctx)));
+}
+
+/// Clear per-callback identity context.
+pub fn clear_callback_ctx() {
+    CALLBACK_CTX.with(|c| c.set(None));
+}
+
+/// Read per-callback identity context (async-signal-safe).
+pub fn get_callback_ctx() -> Option<CallbackContext> {
+    CALLBACK_CTX.with(|c| c.get())
 }
 
 /// Install a simulator state pointer for the duration of ops callbacks.
