@@ -118,6 +118,29 @@ impl DebuggerFlavor {
         }
     }
 
+    /// Emit signal-handling commands so the debugger does not intercept
+    /// signals the simulator uses internally.
+    ///
+    /// The simulator installs a SIGFPE handler to emulate BPF's
+    /// "division by zero returns zero" semantics.  Without these
+    /// commands the debugger would stop on every such SIGFPE.
+    fn fmt_signal_handling(self) -> &'static str {
+        match self {
+            Self::Lldb => {
+                "\
+# The simulator emulates BPF div-by-zero semantics via a SIGFPE handler.\n\
+# Let the handler work without the debugger intercepting the signal.\n\
+process handle SIGFPE -s false -n false -p true\n\n"
+            }
+            Self::Gdb => {
+                "\
+# The simulator emulates BPF div-by-zero semantics via a SIGFPE handler.\n\
+# Let the handler work without GDB intercepting the signal.\n\
+handle SIGFPE nostop noprint pass\n\n"
+            }
+        }
+    }
+
     /// Emit commands that make `step` skip the simulator binary so the
     /// user stays inside the scheduler `.so` code.
     fn fmt_skip_simulator(self) -> String {
@@ -193,6 +216,9 @@ fn write_debugger_script(
         flavor.name()
     ));
     script.push_str(&format!("# Scheduler: {}\n\n", info.prefix));
+
+    // Tell the debugger not to intercept signals the simulator handles.
+    script.push_str(flavor.fmt_signal_handling());
 
     // Make `step` stay in scheduler C code by skipping the simulator binary.
     script.push_str(&flavor.fmt_skip_simulator());
@@ -4748,5 +4774,17 @@ mod tests {
     fn debugger_flavor_extensions() {
         assert_eq!(DebuggerFlavor::Lldb.extension(), "lldb");
         assert_eq!(DebuggerFlavor::Gdb.extension(), "gdb");
+    }
+
+    #[test]
+    fn gdb_signal_handling_contains_sigfpe() {
+        let cmds = DebuggerFlavor::Gdb.fmt_signal_handling();
+        assert!(cmds.contains("handle SIGFPE nostop noprint pass"));
+    }
+
+    #[test]
+    fn lldb_signal_handling_contains_sigfpe() {
+        let cmds = DebuggerFlavor::Lldb.fmt_signal_handling();
+        assert!(cmds.contains("process handle SIGFPE -s false -n false -p true"));
     }
 }
