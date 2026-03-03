@@ -1,10 +1,11 @@
 ---
 title: Native concurrency backend for external determinism tools
-status: in_progress
+status: closed
 priority: 0
 issue_type: feature
 created_at: 2026-02-25T18:18:30.570337895+00:00
-updated_at: 2026-02-25T18:18:37.709678880+00:00
+updated_at: 2026-03-03T19:03:48.989844421+00:00
+closed_at: 2026-03-03T19:03:48.989844341+00:00
 ---
 
 # Description
