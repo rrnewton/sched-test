@@ -80,15 +80,15 @@ const SCX_DSP_MAX_LOOPS: u32 = 32;
 
 /// A simulation event, ordered by timestamp then tiebreaker.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Event {
-    time_ns: TimeNs,
+pub(crate) struct Event {
+    pub(crate) time_ns: TimeNs,
     /// Tiebreaker for events at the same time (lower = higher priority).
     /// In fixed-priority mode, this is a monotonic counter (insertion order).
     /// In randomized mode, this combines a PRNG-derived priority with a
     /// monotonic counter to explore different orderings while remaining
     /// deterministic for a given seed.
-    seq: u64,
-    kind: EventKind,
+    pub(crate) seq: u64,
+    pub(crate) kind: EventKind,
 }
 
 impl Ord for Event {
@@ -115,18 +115,18 @@ impl PartialOrd for Event {
 ///
 /// The event PRNG is separate from `SimulatorState::rng` so that
 /// adding/removing events does not perturb the scheduler's PRNG sequence.
-struct EventQueue {
-    heap: BinaryHeap<Reverse<Event>>,
+pub struct EventQueue {
+    pub(crate) heap: BinaryHeap<Reverse<Event>>,
     /// Monotonic counter for unique event identity / fixed-priority ordering.
-    seq: u64,
+    pub(crate) seq: u64,
     /// Separate PRNG for randomized tiebreaking (independent of simulator PRNG).
-    event_rng: SmallRng,
+    pub(crate) event_rng: SmallRng,
     /// When true, use insertion-order tiebreaking (monotonic seq).
-    fixed_priority: bool,
+    pub(crate) fixed_priority: bool,
 }
 
 impl EventQueue {
-    fn new(seed: u32, fixed_priority: bool) -> Self {
+    pub(crate) fn new(seed: u32, fixed_priority: bool) -> Self {
         // Derive event PRNG seed from scenario seed but offset it so it's
         // independent of the main simulation PRNG.
         let event_seed = (seed as u64)
@@ -141,7 +141,7 @@ impl EventQueue {
     }
 
     /// Compute the `seq` tiebreaker for a new event.
-    fn next_seq(&mut self) -> u64 {
+    pub(crate) fn next_seq(&mut self) -> u64 {
         let s = self.seq;
         self.seq += 1;
         if self.fixed_priority {
@@ -155,26 +155,26 @@ impl EventQueue {
     }
 
     /// Push a new event, automatically assigning a tiebreaker.
-    fn push(&mut self, time_ns: TimeNs, kind: EventKind) {
+    pub(crate) fn push(&mut self, time_ns: TimeNs, kind: EventKind) {
         let seq = self.next_seq();
         self.heap.push(Reverse(Event { time_ns, seq, kind }));
     }
 
     /// Pop the next event (earliest timestamp, then lowest tiebreaker).
     #[allow(dead_code)]
-    fn pop(&mut self) -> Option<Event> {
+    pub(crate) fn pop(&mut self) -> Option<Event> {
         self.heap.pop().map(|Reverse(e)| e)
     }
 
     /// Peek at the next event's timestamp without removing it.
-    fn peek_time(&self) -> Option<TimeNs> {
+    pub(crate) fn peek_time(&self) -> Option<TimeNs> {
         self.heap.peek().map(|Reverse(e)| e.time_ns)
     }
 
     /// Pop all events at exactly timestamp `t`.
     ///
     /// Returns events in priority order (lowest `seq` first).
-    fn drain_at(&mut self, t: TimeNs) -> Vec<Event> {
+    pub(crate) fn drain_at(&mut self, t: TimeNs) -> Vec<Event> {
         let mut batch = Vec::new();
         while let Some(Reverse(e)) = self.heap.peek() {
             if e.time_ns != t {
@@ -192,13 +192,13 @@ impl EventQueue {
 /// `bpf_get_current_task_btf()` and `bpf_get_smp_processor_id()` return
 /// the waker's state. The engine uses this to set up the same context.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct WakerInfo {
-    pid: Pid,
-    cpu: CpuId,
+pub(crate) struct WakerInfo {
+    pub(crate) pid: Pid,
+    pub(crate) cpu: CpuId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum EventKind {
+pub(crate) enum EventKind {
     /// A task becomes runnable (wakes up).
     /// `waker` identifies the task that triggered the wake (if any),
     /// enabling wake-affine scheduling (e.g., COSMOS mm_affinity).
