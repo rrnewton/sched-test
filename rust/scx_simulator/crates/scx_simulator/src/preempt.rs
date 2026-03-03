@@ -43,7 +43,6 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering:
 use std::sync::Mutex;
 
 use crate::interleave::WorkerId;
-use crate::kfuncs::SimulatorState;
 use crate::types::CpuId;
 
 // ---------------------------------------------------------------------------
@@ -915,38 +914,26 @@ pub fn maybe_yield_preemptive() {
     // a preemptive signal from firing while we're in Rust/yield code.
     disable_timer(ctx.timer_fd);
 
-    // Save per-callback context from SimulatorState.
-    let sim_ptr: *mut SimulatorState = crate::kfuncs::sim_state_ptr()
+    // Save per-callback context from the CALLBACK_CTX thread-local.
+    let saved = crate::kfuncs::get_callback_ctx()
         .expect("maybe_yield_preemptive called outside simulator context");
-
-    let (saved_cpu, saved_ops_ctx, saved_waker) = unsafe {
-        (
-            (*sim_ptr).current_cpu,
-            (*sim_ptr).ops_context,
-            (*sim_ptr).waker_task_raw,
-        )
-    };
 
     // Release token and block until re-selected (futex-based).
     ring.inc_cooperative_yield();
     tracing::debug!(
         worker = ctx.worker_id.0,
-        cpu = saved_cpu.0,
+        cpu = saved.current_cpu.0,
         "preempt: cooperative yield (kfunc boundary)"
     );
     ring.yield_token(ctx.worker_id);
 
-    // Resumed — restore our context to SimulatorState.
+    // Resumed — restore our context.
     tracing::debug!(
         worker = ctx.worker_id.0,
-        cpu = saved_cpu.0,
+        cpu = saved.current_cpu.0,
         "preempt: resumed after cooperative yield"
     );
-    unsafe {
-        (*sim_ptr).current_cpu = saved_cpu;
-        (*sim_ptr).ops_context = saved_ops_ctx;
-        (*sim_ptr).waker_task_raw = saved_waker;
-    }
+    crate::kfuncs::install_callback_ctx(saved);
 
     // Timer stays disabled — with_sim() will re-arm via resume_timer().
 }
@@ -1061,7 +1048,8 @@ fn read_rbc_count(timer_fd: RawFd) -> u64 {
 /// Signal handler for preemptive interleaving.
 ///
 /// Called on SIGSTKFLT delivery (PMU counter overflow). All operations
-/// here are async-signal-safe.
+/// here are async-signal-safe. Uses CALLBACK_CTX (Cell<Copy>) instead
+/// of raw pointers to save/restore per-callback context.
 extern "C" fn preempt_handler(
     _signo: libc::c_int,
     _info: *mut libc::siginfo_t,
@@ -1083,33 +1071,21 @@ extern "C" fn preempt_handler(
     let instruction_pointer = extract_rip_from_ucontext(ctx);
     let rbc_count = read_rbc_count(pctx.timer_fd);
 
-    // 3. Save SimulatorState context to locals (on the signal stack frame).
-    let sim_ptr = match crate::kfuncs::sim_state_ptr() {
-        Some(p) => p,
+    // 3. Read per-callback context from CALLBACK_CTX (async-signal-safe).
+    let saved = match crate::kfuncs::get_callback_ctx() {
+        Some(c) => c,
         None => return,
     };
 
-    let (saved_cpu, saved_ops_ctx, saved_waker) = unsafe {
-        (
-            (*sim_ptr).current_cpu,
-            (*sim_ptr).ops_context,
-            (*sim_ptr).waker_task_raw,
-        )
-    };
-
     // 4. Record the preemption point for determinism verification.
-    ring.record_preemption(rbc_count, instruction_pointer, saved_cpu);
+    ring.record_preemption(rbc_count, instruction_pointer, saved.current_cpu);
 
     // 5. Yield token (futex-based, signal-safe). Blocks until re-selected.
     ring.inc_signal_preempt(); // atomic, signal-safe
     ring.yield_token(pctx.worker_id);
 
-    // 6. Resumed — restore SimulatorState context.
-    unsafe {
-        (*sim_ptr).current_cpu = saved_cpu;
-        (*sim_ptr).ops_context = saved_ops_ctx;
-        (*sim_ptr).waker_task_raw = saved_waker;
-    }
+    // 6. Resumed — restore context.
+    crate::kfuncs::install_callback_ctx(saved);
 
     // 7. Re-arm PMU timer with a fresh timeslice.
     rearm_timer(ring, &pctx);

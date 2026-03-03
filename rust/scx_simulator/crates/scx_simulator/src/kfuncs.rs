@@ -695,6 +695,13 @@ pub unsafe fn enter_sim(state: &mut SimulatorState, cpu: CpuId) {
     state.current_cpu = cpu;
     set_sim_clock(state.cpus[cpu.0 as usize].local_clock, Some(cpu));
     SIM_STATE.with(|cell| cell.set(Some(state as *mut SimulatorState)));
+    // Install CALLBACK_CTX so interleave/preempt yield functions can
+    // save/restore per-callback identity without raw pointer access.
+    install_callback_ctx(CallbackContext {
+        current_cpu: state.current_cpu,
+        ops_context: state.ops_context,
+        waker_task_raw: state.waker_task_raw,
+    });
     // Also install SIM_ARC from ENGINE_SIM_ARC so cgroup callbacks
     // and concurrent workers can access the full SimState.
     ENGINE_SIM_ARC.with(|c| {
@@ -706,6 +713,21 @@ pub unsafe fn enter_sim(state: &mut SimulatorState, cpu: CpuId) {
 
 /// Remove the simulator state pointer after ops callbacks complete.
 pub fn exit_sim() {
+    // Restore per-callback context from CALLBACK_CTX back to SimulatorState.
+    // The yield functions may have updated CALLBACK_CTX, so we need to
+    // sync it back to the raw pointer state.
+    if let Some(ctx) = get_callback_ctx() {
+        if let Some(ptr) = SIM_STATE.with(|cell| cell.get()) {
+            // SAFETY: ptr was installed by enter_sim and is still valid.
+            unsafe {
+                let sim = &mut *ptr;
+                sim.current_cpu = ctx.current_cpu;
+                sim.ops_context = ctx.ops_context;
+                sim.waker_task_raw = ctx.waker_task_raw;
+            }
+        }
+    }
+    clear_callback_ctx();
     SIM_STATE.with(|cell| cell.set(None));
     clear_sim_arc();
 }
