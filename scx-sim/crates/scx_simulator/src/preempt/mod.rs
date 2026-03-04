@@ -1731,10 +1731,16 @@ pub fn install_signal_handler() {
     assert_eq!(ret, 0, "failed to install SIGSTKFLT handler");
 }
 
-/// Remove the SIGSTKFLT signal handler, restoring default behavior.
+/// Disable the SIGSTKFLT signal handler after a preemptive interleave.
+///
+/// Sets the handler to `SIG_IGN` rather than `SIG_DFL` to avoid a race
+/// condition: a PMU timer may have already queued a SIGSTKFLT that has
+/// not yet been delivered. Under `SIG_DFL`, SIGSTKFLT terminates the
+/// process. Under `SIG_IGN`, the stray signal is harmlessly discarded.
+/// (See sim-c3fd09.)
 pub fn uninstall_signal_handler() {
     let sa = libc::sigaction {
-        sa_sigaction: libc::SIG_DFL,
+        sa_sigaction: libc::SIG_IGN,
         sa_mask: unsafe { std::mem::zeroed() },
         sa_flags: 0,
         sa_restorer: None,
@@ -2138,8 +2144,20 @@ pub fn install_replay_signal_handlers() {
     assert_eq!(ret, 0, "failed to install replay breakpoint handler");
 }
 
-/// Remove the replay signal handlers, restoring default behavior.
+/// Disable the replay signal handlers after a replay interleave.
+///
+/// Sets SIGSTKFLT to `SIG_IGN` (not `SIG_DFL`) to avoid a race where a
+/// pending PMU signal arrives after teardown and kills the process.
+/// SIGTRAP is restored to `SIG_DFL` since hardware breakpoints are
+/// explicitly disarmed before teardown and SIGTRAP's default (core dump)
+/// is the expected behavior for unexpected traps. (See sim-c3fd09.)
 pub fn uninstall_replay_signal_handlers() {
+    let sa_ignore = libc::sigaction {
+        sa_sigaction: libc::SIG_IGN,
+        sa_mask: unsafe { std::mem::zeroed() },
+        sa_flags: 0,
+        sa_restorer: None,
+    };
     let sa_default = libc::sigaction {
         sa_sigaction: libc::SIG_DFL,
         sa_mask: unsafe { std::mem::zeroed() },
@@ -2147,7 +2165,7 @@ pub fn uninstall_replay_signal_handlers() {
         sa_restorer: None,
     };
     unsafe {
-        libc::sigaction(PREEMPT_SIGNAL, &sa_default, std::ptr::null_mut());
+        libc::sigaction(PREEMPT_SIGNAL, &sa_ignore, std::ptr::null_mut());
         libc::sigaction(REPLAY_BP_SIGNAL, &sa_default, std::ptr::null_mut());
     }
 }
