@@ -5,7 +5,10 @@
 # merges profile data, and generates reports.
 #
 # Usage:
-#   ./coverage.sh [--html] [--lcov] [--keep-profraw] [--all]
+#   ./coverage.sh [--html] [--lcov] [--keep-profraw] [--all] [--no-record]
+#
+# The --no-record flag skips appending coverage data to data/coverage.csv.
+# By default, each run appends per-file and per-scheduler totals to the CSV.
 #
 # Environment:
 #   SCX_SIM_COVERAGE=1 is set automatically by this script.
@@ -15,25 +18,30 @@ cd "$(dirname "$0")"
 SCRIPT_DIR="$(pwd)"
 PROJ_ROOT="$(cd .. && pwd)"
 COVERAGE_OUT="$SCRIPT_DIR/coverage-out"
+CSV_FILE="$SCRIPT_DIR/data/coverage.csv"
+CSV_HEADER="timestamp,gitdepth,commit,scheduler,category,file,lines,covered,missed,coverage_pct"
 
 # --- Parse flags ---
 FLAG_HTML=0
 FLAG_LCOV=0
 FLAG_KEEP_PROFRAW=0
 FLAG_ALL=0
+FLAG_NO_RECORD=0
 for arg in "$@"; do
     case "$arg" in
         --html)         FLAG_HTML=1 ;;
         --lcov)         FLAG_LCOV=1 ;;
         --keep-profraw) FLAG_KEEP_PROFRAW=1 ;;
         --all)          FLAG_ALL=1 ;;
+        --no-record)    FLAG_NO_RECORD=1 ;;
         -h|--help)
-            echo "Usage: $0 [--html] [--lcov] [--keep-profraw] [--all]"
+            echo "Usage: $0 [--html] [--lcov] [--keep-profraw] [--all] [--no-record]"
             echo ""
             echo "  --html          Generate HTML coverage report"
             echo "  --lcov          Generate LCOV coverage report"
             echo "  --keep-profraw  Keep raw .profraw files after merging"
             echo "  --all           Show all instrumented files (default: scheduler sources only)"
+            echo "  --no-record     Skip appending results to data/coverage.csv"
             exit 0
             ;;
         *) echo "Unknown flag: $arg"; exit 1 ;;
@@ -222,6 +230,18 @@ for wrapper in "$SCRIPT_DIR"/schedulers/*/wrapper.c; do
     SCHEDULERS+=("$(basename "$sched_dir")")
 done
 
+# --- Helper: build exclusion filters for a single scheduler ---
+# Outputs filter flags that exclude every OTHER scheduler's source files.
+build_sched_exclusion_filters() {
+    local sched="$1"
+    for other in "${SCHEDULERS[@]}"; do
+        if [[ "$other" != "$sched" ]]; then
+            echo "-ignore-filename-regex=schedulers/${other}/"
+            echo "-ignore-filename-regex=scheds/rust/scx_${other}/"
+        fi
+    done
+}
+
 # --- Per-scheduler coverage tables ---
 # For each scheduler, show a separate table by excluding all OTHER
 # schedulers' source directories.
@@ -230,14 +250,10 @@ generate_scheduler_report() {
     shift
     local extra_filters=("$@")
 
-    # Exclude every other scheduler's files from schedulers/ and scheds/rust/
     local sched_filters=()
-    for other in "${SCHEDULERS[@]}"; do
-        if [[ "$other" != "$sched" ]]; then
-            sched_filters+=("-ignore-filename-regex=schedulers/${other}/")
-            sched_filters+=("-ignore-filename-regex=scheds/rust/scx_${other}/")
-        fi
-    done
+    while IFS= read -r f; do
+        sched_filters+=("$f")
+    done < <(build_sched_exclusion_filters "$sched")
 
     echo ""
     echo "=== Coverage: $sched ==="
@@ -246,6 +262,58 @@ generate_scheduler_report() {
         "${extra_filters[@]}" \
         "${sched_filters[@]}" \
         -show-region-summary=false
+}
+
+# --- CSV recording ---
+# Appends per-file and total rows for a scheduler to the CSV file.
+# Uses llvm-cov export (JSON) for reliable machine-readable parsing.
+record_scheduler_csv() {
+    local sched="$1"
+    local timestamp="$2"
+    local gitdepth="$3"
+    local commit="$4"
+    shift 4
+    local extra_filters=("$@")
+
+    local sched_filters=()
+    while IFS= read -r f; do
+        sched_filters+=("$f")
+    done < <(build_sched_exclusion_filters "$sched")
+
+    # Export JSON summary for this scheduler
+    local json
+    json=$(llvm-cov export "${OBJECT_FLAGS[@]}" \
+        -instr-profile="$COVERAGE_OUT/merged.profdata" \
+        "${extra_filters[@]}" \
+        "${sched_filters[@]}" \
+        --summary-only \
+        --skip-functions \
+        --skip-branches 2>/dev/null)
+
+    # Parse per-file rows and total from the JSON using jq.
+    # The JSON structure: { data: [{ files: [{ filename, summary: { lines: { count, covered, ... } } }], totals: { lines: { count, covered, ... } } }] }
+    # Strip PROJ_ROOT prefix from filenames to keep paths relative (avoids
+    # committing machine-specific absolute paths).
+    echo "$json" | jq -r --arg ts "$timestamp" --arg gd "$gitdepth" \
+        --arg cm "$commit" --arg sc "$sched" --arg root "$PROJ_ROOT/" '
+        .data[0] as $d |
+        # Per-file rows
+        ($d.files[] |
+            (.filename | if startswith($root) then .[$root | length:] else . end) as $fn |
+            .summary.lines as $l |
+            ($l.count - $l.covered) as $missed |
+            (if $l.count > 0 then ($l.covered * 100.0 / $l.count) else 0 end) as $pct |
+            [$ts, $gd, $cm, $sc, "per_file", $fn, ($l.count|tostring), ($l.covered|tostring), ($missed|tostring), ($pct * 10 | round / 10 | tostring)]
+            | join(",")
+        ),
+        # Total row
+        ($d.totals.lines as $l |
+            ($l.count - $l.covered) as $missed |
+            (if $l.count > 0 then ($l.covered * 100.0 / $l.count) else 0 end) as $pct |
+            [$ts, $gd, $cm, $sc, "total", "", ($l.count|tostring), ($l.covered|tostring), ($missed|tostring), ($pct * 10 | round / 10 | tostring)]
+            | join(",")
+        )
+    ' >> "$CSV_FILE"
 }
 
 for sched in "${SCHEDULERS[@]}"; do
@@ -259,6 +327,28 @@ llvm-cov report "${OBJECT_FLAGS[@]}" \
     -instr-profile="$COVERAGE_OUT/merged.profdata" \
     "${SOURCE_FILTER[@]}" \
     -show-region-summary=false
+
+# --- Record CSV ---
+if [[ $FLAG_NO_RECORD -eq 0 ]]; then
+    echo ""
+    echo "=== Recording coverage to CSV ==="
+    mkdir -p "$(dirname "$CSV_FILE")"
+
+    # Write header if the file doesn't exist or is empty
+    if [[ ! -s "$CSV_FILE" ]]; then
+        echo "$CSV_HEADER" > "$CSV_FILE"
+    fi
+
+    # Collect git metadata once
+    CSV_TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    CSV_GITDEPTH=$(git rev-list --count HEAD)
+    CSV_COMMIT=$(git rev-parse --short HEAD)
+
+    for sched in "${SCHEDULERS[@]}"; do
+        record_scheduler_csv "$sched" "$CSV_TIMESTAMP" "$CSV_GITDEPTH" "$CSV_COMMIT" "${SOURCE_FILTER[@]}"
+    done
+    echo "  Appended coverage data to $CSV_FILE"
+fi
 
 # --- Cleanup ---
 if [[ $FLAG_KEEP_PROFRAW -eq 0 ]]; then
