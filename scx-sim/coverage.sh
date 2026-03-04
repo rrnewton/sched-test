@@ -111,7 +111,9 @@ echo "  Found $(wc -l < "$COVERAGE_OUT/test-binaries.txt") test binary/binaries"
 # --- Run tests ---
 echo ""
 echo "=== Running tests to generate coverage data ==="
-cargo test --all 2>&1 | tee "$COVERAGE_OUT/test-output.txt"
+# Run tests sequentially to avoid PMU timer signal leaks between tests
+# (see sim-c3fd09: SIGSTKFLT crash during preemptive interleaving).
+cargo test --all -- --test-threads=1 2>&1 | tee "$COVERAGE_OUT/test-output.txt"
 
 # --- Merge profraw files ---
 echo ""
