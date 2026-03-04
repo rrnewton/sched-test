@@ -44,7 +44,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering:
 use std::sync::Mutex;
 
 use crate::interleave::WorkerId;
-use crate::kfuncs::{OpsContext, SimulatorState};
+use crate::kfuncs::OpsContext;
 use crate::types::CpuId;
 
 pub mod trace;
@@ -1541,17 +1541,11 @@ fn cooperative_yield_impl(phase: KfuncYieldPhase) {
     // a preemptive signal from firing while we're in Rust/yield code.
     disable_timer(ctx.timer_fd);
 
-    // Save per-callback context from SimulatorState.
-    let sim_ptr: *mut SimulatorState = crate::kfuncs::sim_state_ptr()
+    // Save per-callback context from CALLBACK_CTX thread-local.
+    let saved = crate::kfuncs::get_callback_ctx()
         .expect("cooperative_yield_impl called outside simulator context");
 
-    let (saved_cpu, saved_ops_ctx, saved_waker) = unsafe {
-        (
-            (*sim_ptr).current_cpu,
-            (*sim_ptr).ops_context,
-            (*sim_ptr).waker_task_raw,
-        )
-    };
+    let saved_ops_ctx = saved.ops_context;
 
     // Detect structop boundary transitions.
     let in_ops = saved_ops_ctx != crate::kfuncs::OpsContext::None;
@@ -1586,7 +1580,7 @@ fn cooperative_yield_impl(phase: KfuncYieldPhase) {
         inc_interleave();
     }
 
-    // Resumed — restore our context to SimulatorState.
+    // Resumed — restore our context.
     tracing::debug!(
         "preempt: resumed ({phase}), ops={ops} kfunc={kfn} structop#{0}:{1}",
         sinfo.cpu_count,
@@ -1594,11 +1588,7 @@ fn cooperative_yield_impl(phase: KfuncYieldPhase) {
     );
     // Resume measurement counter now that we're running again.
     enable_measurement(ctx.measure_fd);
-    unsafe {
-        (*sim_ptr).current_cpu = saved_cpu;
-        (*sim_ptr).ops_context = saved_ops_ctx;
-        (*sim_ptr).waker_task_raw = saved_waker;
-    }
+    crate::kfuncs::install_callback_ctx(saved);
 
     // Timer management depends on the phase:
     // - Pre: stays disabled — with_sim() will re-arm via resume_timer().
@@ -1817,9 +1807,9 @@ extern "C" fn preempt_handler(
     let instruction_pointer = extract_rip_from_ucontext(ctx);
     let rbc_count = read_rbc_count(pctx.timer_fd);
 
-    // 3. Save SimulatorState context to locals (on the signal stack frame).
-    let sim_ptr = match crate::kfuncs::sim_state_ptr() {
-        Some(p) => p,
+    // 3. Read per-callback context from CALLBACK_CTX (async-signal-safe).
+    let saved = match crate::kfuncs::get_callback_ctx() {
+        Some(c) => c,
         None => return,
     };
 
@@ -1830,8 +1820,6 @@ extern "C" fn preempt_handler(
     // copy was set by set_ops_context() when the engine entered
     // this callback, so it reflects this worker's true context.
     let saved_ops_ctx = current_ops_context();
-
-    let (saved_cpu, saved_waker) = unsafe { ((*sim_ptr).current_cpu, (*sim_ptr).waker_task_raw) };
 
     // 4. Track structop RBC and emit trace (signal-safe stderr write).
     record_rbc_preemption(rbc_count);
@@ -1864,7 +1852,7 @@ extern "C" fn preempt_handler(
     ring.record_preemption(
         rbc_count,
         instruction_pointer,
-        saved_cpu,
+        saved.current_cpu,
         pctx.worker_id,
         sinfo,
     );
@@ -1878,12 +1866,8 @@ extern "C" fn preempt_handler(
         inc_interleave(); // TLS, safe (signal masked during handler)
     }
 
-    // 7. Resumed — restore SimulatorState context.
-    unsafe {
-        (*sim_ptr).current_cpu = saved_cpu;
-        (*sim_ptr).ops_context = saved_ops_ctx;
-        (*sim_ptr).waker_task_raw = saved_waker;
-    }
+    // 7. Resumed — restore context.
+    crate::kfuncs::install_callback_ctx(saved);
 
     // 8. Resume measurement counter now that we're running again.
     enable_measurement(pctx.measure_fd);
@@ -2458,18 +2442,13 @@ extern "C" fn replay_bp_handler(
         }
     }
 
-    // 3. Save SimulatorState context.
-    let sim_ptr = match crate::kfuncs::sim_state_ptr() {
-        Some(p) => p,
+    // 3. Read per-callback context from CALLBACK_CTX (async-signal-safe).
+    let saved = match crate::kfuncs::get_callback_ctx() {
+        Some(c) => c,
         None => return,
     };
-    let (saved_cpu, saved_ops_ctx, saved_waker) = unsafe {
-        (
-            (*sim_ptr).current_cpu,
-            (*sim_ptr).ops_context,
-            (*sim_ptr).waker_task_raw,
-        )
-    };
+    let saved_cpu = saved.current_cpu;
+    let saved_ops_ctx = saved.ops_context;
 
     // 4. Track structop RBC.
     record_rbc_preemption(target.rbc_count);
@@ -2493,12 +2472,8 @@ extern "C" fn replay_bp_handler(
     ring.inc_signal_preempt();
     ring.yield_token(rctx.worker_id);
 
-    // 6. Resumed — restore SimulatorState context.
-    unsafe {
-        (*sim_ptr).current_cpu = saved_cpu;
-        (*sim_ptr).ops_context = saved_ops_ctx;
-        (*sim_ptr).waker_task_raw = saved_waker;
-    }
+    // 6. Resumed — restore context.
+    crate::kfuncs::install_callback_ctx(saved);
 
     // 7. Advance cursor and arm timer/breakpoint for next target.
     let counter_now = read_rbc_count(rctx.timer_fd);
@@ -2704,22 +2679,14 @@ pub unsafe extern "C" fn e9_preempt_yield() -> u64 {
     let ring = unsafe { &*pctx.ring };
     let wid = pctx.worker_id;
 
-    // 1. Save SimulatorState context.
-    let sim_ptr = match crate::kfuncs::sim_state_ptr() {
-        Some(p) => p,
+    // 1. Read per-callback context from CALLBACK_CTX.
+    let saved = match crate::kfuncs::get_callback_ctx() {
         None => {
             // Not inside a simulator context — return a large timeslice to
             // avoid spinning. This shouldn't happen in practice.
             return u64::MAX;
         }
-    };
-
-    let (saved_cpu, saved_ops_ctx, saved_waker) = unsafe {
-        (
-            (*sim_ptr).current_cpu,
-            (*sim_ptr).ops_context,
-            (*sim_ptr).waker_task_raw,
-        )
+        Some(c) => c,
     };
 
     // 2. Track structop and record preemption point.
@@ -2729,7 +2696,7 @@ pub unsafe extern "C" fn e9_preempt_yield() -> u64 {
     // so we record 0 for rbc_count (no hardware RBC measurement).
     record_rbc_preemption(0);
     let sinfo = structop_info();
-    ring.record_preemption(0, 0, saved_cpu, wid, sinfo);
+    ring.record_preemption(0, 0, saved.current_cpu, wid, sinfo);
 
     // 3. Trace log (safe — not in a signal handler).
     tracing::debug!(
@@ -2750,12 +2717,8 @@ pub unsafe extern "C" fn e9_preempt_yield() -> u64 {
         inc_interleave();
     }
 
-    // 5. Restore SimulatorState context.
-    unsafe {
-        (*sim_ptr).current_cpu = saved_cpu;
-        (*sim_ptr).ops_context = saved_ops_ctx;
-        (*sim_ptr).waker_task_raw = saved_waker;
-    }
+    // 5. Restore context.
+    crate::kfuncs::install_callback_ctx(saved);
 
     // 6. Roll new timeslice from PRNG and return it.
     ring.roll_timeslice(pctx.timeslice_min, pctx.timeslice_max)
