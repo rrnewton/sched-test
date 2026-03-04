@@ -1689,13 +1689,23 @@ impl<S: Scheduler> Simulator<S> {
             info!("cooperative interleaving enabled (kfunc boundaries only)");
         }
 
+        // Bundle all shared state into SimState. From this point forward,
+        // all access goes through `s.sim`, `s.tasks`, `s.events`,
+        // `s.cgroup_registry`.
+        let mut s = SimState {
+            sim: state,
+            tasks,
+            events,
+            cgroup_registry,
+        };
+
         // Main event loop: process events with dynamic concurrency windows.
         //
         // When interleaving is enabled, the event loop uses dynamic
         // concurrency windows instead of static same-timestamp batching.
         // After processing a batch of same-timestamp events concurrently,
         // the loop checks whether CPU clocks advanced past any pending
-        // events. If so, those events are pulled into a new concurrent
+        // s.events. If so, those events are pulled into a new concurrent
         // batch, modeling the kernel's overlapping execution on different
         // CPUs. The window grows organically based on structop execution
         // cost.
@@ -1704,25 +1714,25 @@ impl<S: Scheduler> Simulator<S> {
         // sequentially in their original priority order (by seq
         // tiebreaker), preserving backward-compatible determinism.
         let interleave_enabled =
-            state.interleave || state.preemptive.is_some() || state.native_concurrent.is_some();
+            s.sim.interleave || s.sim.preemptive.is_some() || s.sim.native_concurrent.is_some();
 
-        'event_loop: while let Some(t) = events.peek_time() {
+        'event_loop: while let Some(t) = s.events.peek_time() {
             if t > scenario.duration_ns {
                 break;
             }
-            state.clock = t;
+            s.sim.clock = t;
 
             if interleave_enabled {
                 // Dynamic concurrency window: start with same-timestamp
                 // events, then expand as CPU clocks advance.
                 if let Some(err) = self.process_dynamic_window(
                     t,
-                    &mut state,
-                    &mut tasks,
-                    &mut events,
+                    &mut s.sim,
+                    &mut s.tasks,
+                    &mut s.events,
                     watchdog_timeout,
                     scenario.duration_ns,
-                    &mut cgroup_registry,
+                    &mut s.cgroup_registry,
                     max_cgroups,
                     ignore_bpf_errors,
                     monitor,
@@ -1734,23 +1744,23 @@ impl<S: Scheduler> Simulator<S> {
                 // No interleaving: process all events sequentially in
                 // original priority order (preserves backward-compatible
                 // determinism).
-                let batch = events.drain_at(t);
+                let batch = s.events.drain_at(t);
                 for event in batch {
                     if let Some(err) = self.process_event(
                         event,
-                        &mut state,
-                        &mut tasks,
-                        &mut events,
+                        &mut s.sim,
+                        &mut s.tasks,
+                        &mut s.events,
                         watchdog_timeout,
                         scenario.duration_ns,
-                        &mut cgroup_registry,
+                        &mut s.cgroup_registry,
                         max_cgroups,
                         monitor,
                     ) {
                         exit_kind = err;
                         break 'event_loop;
                     }
-                    if let Some(err) = check_bpf_error(&mut state, ignore_bpf_errors) {
+                    if let Some(err) = check_bpf_error(&mut s.sim, ignore_bpf_errors) {
                         exit_kind = err;
                         break 'event_loop;
                     }
@@ -1762,9 +1772,9 @@ impl<S: Scheduler> Simulator<S> {
         // so that total_runtime() can close its open interval. We use
         // duration_ns as the end time because the simulation conceptually
         // ends at the configured boundary regardless of per-CPU clock drift.
-        for cpu_idx in 0..state.cpus.len() {
-            if let Some(pid) = state.cpus[cpu_idx].current_task {
-                state.trace.record(
+        for cpu_idx in 0..s.sim.cpus.len() {
+            if let Some(pid) = s.sim.cpus[cpu_idx].current_task {
+                s.sim.trace.record(
                     scenario.duration_ns,
                     CpuId(cpu_idx as u32),
                     TraceKind::SimulationEnd { pid },
@@ -1776,52 +1786,52 @@ impl<S: Scheduler> Simulator<S> {
         // IMPORTANT: Sort PIDs for deterministic order. HashMap iteration
         // is non-deterministic, and scheduler callbacks (dump_task, exit_task)
         // charge RBC costs that accumulate on the CPU clock.
-        let mut shutdown_pids: Vec<Pid> = tasks.keys().copied().collect();
+        let mut shutdown_pids: Vec<Pid> = s.tasks.keys().copied().collect();
         shutdown_pids.sort_by_key(|p| p.0);
         unsafe {
-            let cpu = state.current_cpu;
-            kfuncs::enter_sim(&mut state, cpu);
-            start_rbc(&mut state);
+            let cpu = s.sim.current_cpu;
+            kfuncs::enter_sim(&mut s.sim, cpu);
+            start_rbc(&mut s.sim);
             self.scheduler.dump(std::ptr::null_mut());
-            charge_sched_time(&mut state, CpuId(0), "dump");
+            charge_sched_time(&mut s.sim, CpuId(0), "dump");
 
             for &pid in &shutdown_pids {
-                let task = &tasks[&pid];
-                start_rbc(&mut state);
+                let task = &s.tasks[&pid];
+                start_rbc(&mut s.sim);
                 self.scheduler.dump_task(std::ptr::null_mut(), task.raw());
-                charge_sched_time(&mut state, CpuId(0), "dump_task");
+                charge_sched_time(&mut s.sim, CpuId(0), "dump_task");
             }
             kfuncs::exit_sim();
         }
 
         // Call exit_task for each task (mirrors kernel scheduler unload)
         unsafe {
-            let cpu = state.current_cpu;
-            kfuncs::enter_sim(&mut state, cpu);
+            let cpu = s.sim.current_cpu;
+            kfuncs::enter_sim(&mut s.sim, cpu);
             for &pid in &shutdown_pids {
-                let task = &tasks[&pid];
+                let task = &s.tasks[&pid];
                 debug!(pid = pid.0, "enter:structop exit_task");
-                start_rbc(&mut state);
+                start_rbc(&mut s.sim);
                 self.scheduler.exit_task(task.raw());
-                charge_sched_time(&mut state, CpuId(0), "exit_task");
+                charge_sched_time(&mut s.sim, CpuId(0), "exit_task");
             }
             kfuncs::exit_sim();
         }
 
         // Call cgroup_exit for each cgroup (reverse order: children before root)
         unsafe {
-            let cpu = state.current_cpu;
-            kfuncs::enter_sim(&mut state, cpu);
-            let cgids: Vec<CgroupId> = cgroup_registry
+            let cpu = s.sim.current_cpu;
+            kfuncs::enter_sim(&mut s.sim, cpu);
+            let cgids: Vec<CgroupId> = s.cgroup_registry
                 .all_cgids_preorder()
                 .into_iter()
                 .rev()
                 .collect();
             for cgid in cgids {
-                if let Some(raw) = cgroup_registry.get_raw(cgid) {
-                    start_rbc(&mut state);
+                if let Some(raw) = s.cgroup_registry.get_raw(cgid) {
+                    start_rbc(&mut s.sim);
                     self.scheduler.cgroup_exit(raw);
-                    charge_sched_time(&mut state, CpuId(0), "cgroup_exit");
+                    charge_sched_time(&mut s.sim, CpuId(0), "cgroup_exit");
                 }
             }
             kfuncs::exit_sim();
@@ -1829,11 +1839,11 @@ impl<S: Scheduler> Simulator<S> {
 
         // Call scheduler exit
         unsafe {
-            let cpu = state.current_cpu;
-            kfuncs::enter_sim(&mut state, cpu);
-            start_rbc(&mut state);
+            let cpu = s.sim.current_cpu;
+            kfuncs::enter_sim(&mut s.sim, cpu);
+            start_rbc(&mut s.sim);
             self.scheduler.exit();
-            charge_sched_time(&mut state, CpuId(0), "exit");
+            charge_sched_time(&mut s.sim, CpuId(0), "exit");
             kfuncs::exit_sim();
         }
 
@@ -1844,16 +1854,16 @@ impl<S: Scheduler> Simulator<S> {
         unsafe { ffi::sim_task_free(idle_task_raw) };
 
         // Set the exit kind on the trace
-        state.trace.set_exit_kind(exit_kind);
+        s.sim.trace.set_exit_kind(exit_kind);
 
         // Print end-of-simulation summary.
-        print_simulation_summary(&state.trace, &tasks, state.clock);
+        print_simulation_summary(&s.sim.trace, &s.tasks, s.sim.clock);
 
         // Print structop summary (per-CPU ops callbacks, RBC, kfuncs).
-        crate::preempt::print_structop_summary(&state.structop_accum);
+        crate::preempt::print_structop_summary(&s.sim.structop_accum);
 
         SimulationResult {
-            trace: state.trace,
+            trace: s.sim.trace,
             tasks,
         }
     }
