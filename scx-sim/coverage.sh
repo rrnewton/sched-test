@@ -213,9 +213,46 @@ if [[ $FLAG_LCOV -eq 1 ]]; then
     echo "  LCOV report: $COVERAGE_OUT/coverage.lcov"
 fi
 
-# Summary (always shown)
+# --- Discover schedulers (same convention as schedulers/Makefile) ---
+SCHEDULERS=()
+for wrapper in "$SCRIPT_DIR"/schedulers/*/wrapper.c; do
+    sched_dir=$(dirname "$wrapper")
+    SCHEDULERS+=("$(basename "$sched_dir")")
+done
+
+# --- Per-scheduler coverage tables ---
+# For each scheduler, show a separate table by excluding all OTHER
+# schedulers' source directories.
+generate_scheduler_report() {
+    local sched="$1"
+    shift
+    local extra_filters=("$@")
+
+    # Exclude every other scheduler's files from schedulers/ and scheds/rust/
+    local sched_filters=()
+    for other in "${SCHEDULERS[@]}"; do
+        if [[ "$other" != "$sched" ]]; then
+            sched_filters+=("-ignore-filename-regex=schedulers/${other}/")
+            sched_filters+=("-ignore-filename-regex=scheds/rust/scx_${other}/")
+        fi
+    done
+
+    echo ""
+    echo "=== Coverage: $sched ==="
+    llvm-cov report "${OBJECT_FLAGS[@]}" \
+        -instr-profile="$COVERAGE_OUT/merged.profdata" \
+        "${extra_filters[@]}" \
+        "${sched_filters[@]}" \
+        -show-region-summary=false
+}
+
+for sched in "${SCHEDULERS[@]}"; do
+    generate_scheduler_report "$sched" "${SOURCE_FILTER[@]}"
+done
+
+# Overall summary (always shown)
 echo ""
-echo "=== Coverage Summary ==="
+echo "=== Coverage Summary (all schedulers) ==="
 llvm-cov report "${OBJECT_FLAGS[@]}" \
     -instr-profile="$COVERAGE_OUT/merged.profdata" \
     "${SOURCE_FILTER[@]}" \
