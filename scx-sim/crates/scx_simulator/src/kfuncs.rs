@@ -922,6 +922,13 @@ pub unsafe fn enter_sim(state: &mut SimulatorState, cpu: CpuId) {
     state.current_cpu = cpu;
     set_sim_clock(state.cpus[cpu.0 as usize].local_clock, Some(cpu));
     SIM_STATE.with(|cell| cell.set(Some(state as *mut SimulatorState)));
+    // Install CALLBACK_CTX so interleave/preempt yield functions can
+    // save/restore per-callback identity without raw pointer access.
+    install_callback_ctx(CallbackContext {
+        current_cpu: state.current_cpu,
+        ops_context: state.ops_context,
+        waker_task_raw: state.waker_task_raw,
+    });
     // Also install SIM_ARC from ENGINE_SIM_ARC so cgroup callbacks
     // and concurrent workers can access the full SimState.
     ENGINE_SIM_ARC.with(|c| {
@@ -948,6 +955,19 @@ pub unsafe fn enter_sim(state: &mut SimulatorState, cpu: CpuId) {
 /// hold the token after `finish()`. Use [`exit_sim_no_clear_ops`] in
 /// those cases and clear `ops_context` manually before `finish()`.
 pub fn exit_sim() {
+    // Restore per-callback context from CALLBACK_CTX back to SimulatorState.
+    // The yield functions may have saved/restored CALLBACK_CTX across token
+    // passes, so we need to sync it back before clearing.
+    if let Some(ctx) = get_callback_ctx() {
+        if let Some(ptr) = SIM_STATE.with(|cell| cell.get()) {
+            unsafe {
+                (*ptr).current_cpu = ctx.current_cpu;
+                (*ptr).ops_context = ctx.ops_context;
+                (*ptr).waker_task_raw = ctx.waker_task_raw;
+            }
+        }
+    }
+    clear_callback_ctx();
     crate::preempt::pause_timer();
     SIM_STATE.with(|cell| {
         if let Some(ptr) = cell.get() {
@@ -963,6 +983,7 @@ pub fn exit_sim() {
     // Also clear per-thread TLS so structop boundary detection and the
     // signal handler see None between callbacks.
     crate::preempt::set_current_ops_context(OpsContext::None);
+    clear_sim_arc();
 }
 
 /// Like [`exit_sim`] but does **not** clear `ops_context`.
@@ -975,6 +996,17 @@ pub fn exit_sim() {
 /// causing the PMU signal handler to record `ops=none` instead of the
 /// true callback context.
 pub fn exit_sim_no_clear_ops() {
+    // Sync CALLBACK_CTX back (same as exit_sim but without clearing ops_context).
+    if let Some(ctx) = get_callback_ctx() {
+        if let Some(ptr) = SIM_STATE.with(|cell| cell.get()) {
+            unsafe {
+                (*ptr).current_cpu = ctx.current_cpu;
+                (*ptr).ops_context = ctx.ops_context;
+                (*ptr).waker_task_raw = ctx.waker_task_raw;
+            }
+        }
+    }
+    clear_callback_ctx();
     crate::preempt::pause_timer();
     SIM_STATE.with(|cell| cell.set(None));
     clear_sim_arc();

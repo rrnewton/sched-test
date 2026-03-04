@@ -39,9 +39,6 @@ use std::sync::{Condvar, Mutex};
 use rand::rngs::SmallRng;
 use rand::{RngCore, SeedableRng};
 
-use crate::kfuncs::{OpsContext, SimulatorState};
-use crate::types::CpuId;
-
 /// Worker identity within a concurrent group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct WorkerId(pub usize);
@@ -354,33 +351,18 @@ pub fn maybe_yield() {
 
     let ring = unsafe { &*ctx.ring };
 
-    // Read SimulatorState pointer from the kfuncs thread-local.
-    let sim_ptr: *mut SimulatorState =
-        crate::kfuncs::sim_state_ptr().expect("maybe_yield called outside of simulator context");
-
-    // Save per-callback context from SimulatorState.
-    // SAFETY: we hold the token, so exclusive access is guaranteed.
-    let saved_cpu: CpuId;
-    let saved_ops_ctx: OpsContext;
-    let saved_waker: Option<usize>;
-    unsafe {
-        saved_cpu = (*sim_ptr).current_cpu;
-        saved_ops_ctx = (*sim_ptr).ops_context;
-        saved_waker = (*sim_ptr).waker_task_raw;
-    }
+    // Save per-callback context from the CALLBACK_CTX thread-local.
+    // This is async-signal-safe (Cell<Copy> read).
+    let saved =
+        crate::kfuncs::get_callback_ctx().expect("maybe_yield called outside simulator context");
 
     // Release token and block until re-selected.
     if ring.yield_token(ctx.worker_id) {
         crate::preempt::inc_interleave();
     }
 
-    // Resumed — restore our context to SimulatorState.
-    // SAFETY: we hold the token again.
-    unsafe {
-        (*sim_ptr).current_cpu = saved_cpu;
-        (*sim_ptr).ops_context = saved_ops_ctx;
-        (*sim_ptr).waker_task_raw = saved_waker;
-    }
+    // Resumed — restore our context.
+    crate::kfuncs::install_callback_ctx(saved);
 }
 
 // ---------------------------------------------------------------------------
