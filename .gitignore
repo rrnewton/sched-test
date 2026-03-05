@@ -12,7 +12,13 @@ tags
 selftest
 selftest_noasan
 CLAUDE.md
+# Ignore all .claude directories in subdirectories
 **/.claude
+
+# But track the top-level .claude/skills/ for Claude Code skills
+!/.claude/
+/.claude/*
+!/.claude/skills/
 **/*.ll
 **/*.s
 **/*.tmp
