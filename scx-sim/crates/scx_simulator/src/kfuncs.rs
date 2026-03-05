@@ -408,7 +408,7 @@ pub struct SimulatorState {
 /// Kfuncs acquire the lock via the `SIM_ARC` thread-local. The engine releases
 /// the lock before calling into C scheduler code, and kfuncs reacquire it
 /// through the thread-local Arc.
-pub struct SimState {
+pub(crate) struct SimState {
     /// Core scheduler state (CPUs, DSQs, trace, etc.).
     pub sim: SimulatorState,
     /// All simulated tasks, keyed by PID.
@@ -420,7 +420,7 @@ pub struct SimState {
 }
 
 /// Shared-ownership handle to the mutex-protected simulation state.
-pub type SimArc = Arc<Mutex<SimState>>;
+pub(crate) type SimArc = Arc<Mutex<SimState>>;
 
 /// Per-callback identity context that the signal handler needs to
 /// save/restore without locking the Mutex.
@@ -845,7 +845,7 @@ thread_local! {
 ///
 /// Called by the engine before entering scheduler C code so that kfuncs
 /// (which reacquire the lock) can find the Arc.
-pub fn install_sim_arc(arc: &SimArc) {
+pub(crate) fn install_sim_arc(arc: &SimArc) {
     SIM_ARC.with(|c| {
         *c.borrow_mut() = Some(Arc::clone(arc));
     });
@@ -854,7 +854,7 @@ pub fn install_sim_arc(arc: &SimArc) {
 /// Clear the SimArc from the current thread's thread-local.
 ///
 /// Called by the engine after scheduler C code returns.
-pub fn clear_sim_arc() {
+pub(crate) fn clear_sim_arc() {
     SIM_ARC.with(|c| {
         *c.borrow_mut() = None;
     });
@@ -863,7 +863,8 @@ pub fn clear_sim_arc() {
 /// Clone the SimArc from the thread-local (for passing to sub-modules).
 ///
 /// Returns `None` if not inside a simulator context.
-pub fn clone_sim_arc() -> Option<SimArc> {
+#[allow(dead_code)]
+pub(crate) fn clone_sim_arc() -> Option<SimArc> {
     SIM_ARC.with(|c| c.borrow().clone())
 }
 
@@ -888,7 +889,8 @@ pub fn get_callback_ctx() -> Option<CallbackContext> {
 /// automatically install this Arc into `SIM_ARC`, bridging the old
 /// raw-pointer path with the new Arc path for cgroup callbacks and
 /// concurrent worker threads.
-pub fn set_engine_sim_arc(arc: &SimArc) {
+#[allow(dead_code)]
+pub(crate) fn set_engine_sim_arc(arc: &SimArc) {
     ENGINE_SIM_ARC.with(|c| {
         *c.borrow_mut() = Some(Arc::clone(arc));
     });
@@ -897,14 +899,16 @@ pub fn set_engine_sim_arc(arc: &SimArc) {
 /// Clear the engine-level SimArc from this thread.
 ///
 /// Called by the engine when simulation ends.
-pub fn clear_engine_sim_arc() {
+#[allow(dead_code)]
+pub(crate) fn clear_engine_sim_arc() {
     ENGINE_SIM_ARC.with(|c| {
         *c.borrow_mut() = None;
     });
 }
 
 /// Get a clone of the engine-level SimArc (for worker threads).
-pub fn get_engine_sim_arc() -> Option<SimArc> {
+#[allow(dead_code)]
+pub(crate) fn get_engine_sim_arc() -> Option<SimArc> {
     ENGINE_SIM_ARC.with(|c| c.borrow().clone())
 }
 
