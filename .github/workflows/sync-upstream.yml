@@ -1,0 +1,199 @@
+name: Sync Upstream SCX
+
+on:
+  schedule:
+    - cron: '0 4 * * *'  # Nightly at 4 AM UTC
+  workflow_dispatch:      # Manual trigger
+    inputs:
+      force_sync:
+        description: 'Force sync even if no new upstream commits'
+        required: false
+        default: 'false'
+        type: boolean
+      source_branch:
+        description: 'Source branch to base the sync on (overrides default)'
+        required: false
+        default: ''
+        type: string
+
+# Default source branch for the sync. Change this when the simulator
+# lands on main (or use the workflow_dispatch input to override).
+env:
+  DEFAULT_SOURCE_BRANCH: simulator.v3
+  SUCCESS_BRANCH: simulator-next
+
+jobs:
+  sync-upstream:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Determine source branch
+        id: config
+        run: |
+          if [ -n "${{ inputs.source_branch }}" ]; then
+            echo "source_branch=${{ inputs.source_branch }}" >> $GITHUB_OUTPUT
+          else
+            echo "source_branch=${{ env.DEFAULT_SOURCE_BRANCH }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.config.outputs.source_branch }}
+          submodules: true
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check for upstream changes
+        id: check
+        run: |
+          cd scx
+          CURRENT=$(git rev-parse HEAD)
+          git fetch origin main
+          LATEST=$(git rev-parse origin/main)
+
+          echo "current_commit=$CURRENT" >> $GITHUB_OUTPUT
+          echo "latest_commit=$LATEST" >> $GITHUB_OUTPUT
+          echo "current_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+          echo "latest_short=$(git rev-parse --short origin/main)" >> $GITHUB_OUTPUT
+
+          if [ "$CURRENT" != "$LATEST" ] || [ "${{ inputs.force_sync }}" == "true" ]; then
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            COMMIT_COUNT=$(git rev-list --count HEAD..origin/main)
+            echo "commit_count=$COMMIT_COUNT" >> $GITHUB_OUTPUT
+            echo "::notice::$COMMIT_COUNT new upstream commits: $CURRENT..$LATEST"
+          else
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "::notice::No new upstream commits"
+          fi
+
+      - name: Exit if no changes
+        if: steps.check.outputs.has_changes != 'true'
+        run: echo "No upstream changes to sync. Exiting."
+
+      - name: Setup sync branch
+        if: steps.check.outputs.has_changes == 'true'
+        run: |
+          DATE=$(date +%Y%m%d)
+          WORK_BRANCH="sync-upstream-${DATE}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b $WORK_BRANCH
+
+          # Update submodule to latest upstream main
+          cd scx
+          git checkout origin/main
+          cd ..
+          git add scx
+          git commit -m "$(cat <<EOF
+          Update scx submodule to upstream ${{ steps.check.outputs.latest_short }}
+
+          Previous: ${{ steps.check.outputs.current_commit }}
+          New:      ${{ steps.check.outputs.latest_commit }}
+          Commits:  ${{ steps.check.outputs.commit_count }}
+          EOF
+          )"
+
+          echo "WORK_BRANCH=$WORK_BRANCH" >> $GITHUB_ENV
+          echo "SYNC_DATE=$DATE" >> $GITHUB_ENV
+
+      - name: Install system dependencies
+        if: steps.check.outputs.has_changes == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libelf-dev
+
+      - name: Install Rust toolchain
+        if: steps.check.outputs.has_changes == 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-nextest
+        if: steps.check.outputs.has_changes == 'true'
+        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+
+      - name: Cache Cargo artifacts
+        if: steps.check.outputs.has_changes == 'true'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            scx-sim/target/
+          key: ${{ runner.os }}-sync-upstream-${{ hashFiles('scx-sim/Cargo.lock') }}
+
+      - name: Run Claude to sync upstream
+        if: steps.check.outputs.has_changes == 'true'
+        id: claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            Execute the /sync-upstream skill.
+
+            Context:
+            - Previous scx submodule commit: ${{ steps.check.outputs.current_commit }}
+            - New scx submodule commit: ${{ steps.check.outputs.latest_commit }}
+            - Upstream commits: ${{ steps.check.outputs.commit_count }}
+            - Working branch: ${{ env.WORK_BRANCH }}
+            - Source branch: ${{ steps.config.outputs.source_branch }}
+
+            The scx submodule has already been updated to the new commit.
+            Your job is to fix any compilation or test failures in the simulator
+            wrappers caused by the upstream changes.
+
+            Follow the skill instructions completely: analyze changes, fix builds,
+            run validate.sh, and report your final status.
+          max_turns: 100
+          timeout_minutes: 60
+
+      - name: Push and handle result
+        if: steps.check.outputs.has_changes == 'true'
+        run: |
+          # Check if the last commit message indicates success
+          LAST_MSG=$(git log -1 --pretty=%B)
+
+          if echo "$LAST_MSG" | grep -qi "Status: SUCCESS"; then
+            echo "::notice::Sync successful! Updating ${{ env.SUCCESS_BRANCH }}"
+
+            # Push work branch for reference
+            git push origin $WORK_BRANCH
+
+            # Update the success branch
+            git branch -f ${{ env.SUCCESS_BRANCH }} HEAD
+            git push origin ${{ env.SUCCESS_BRANCH }} --force
+
+            # Clean up work branch
+            git push origin --delete $WORK_BRANCH || true
+          else
+            echo "::warning::Sync incomplete or failed."
+
+            # Ensure WHY_THIS_BRANCH_IS_BROKEN.md exists for failed syncs
+            if [ ! -f WHY_THIS_BRANCH_IS_BROKEN.md ]; then
+              cat > WHY_THIS_BRANCH_IS_BROKEN.md <<BROKENEOF
+            # Why This Branch Is Broken
+
+            **Date**: $(date +%Y-%m-%d)
+            **Upstream commit**: ${{ steps.check.outputs.latest_commit }}
+            **Previous commit**: ${{ steps.check.outputs.current_commit }}
+
+            ## Status
+
+            The automated sync process did not report SUCCESS.
+            Check the GitHub Actions log for details.
+
+            See the commit history on this branch for any partial fixes applied.
+            BROKENEOF
+              git add WHY_THIS_BRANCH_IS_BROKEN.md
+              git commit -m "Add WHY_THIS_BRANCH_IS_BROKEN.md for failed sync" || true
+            fi
+
+            # Push the dated failure branch
+            FAIL_BRANCH="sync-failed-${SYNC_DATE}"
+            git branch -M $WORK_BRANCH $FAIL_BRANCH
+            git push origin $FAIL_BRANCH
+            echo "::warning::Failed sync branch pushed as $FAIL_BRANCH"
+          fi

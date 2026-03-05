@@ -157,8 +157,11 @@ extern void sim_timer_start(unsigned long long nsecs);
 #undef bpf_rcu_read_unlock
 #define bpf_rcu_read_unlock() ((void)0)
 
-/* Include cleanup.bpf.h to let it define its RAII framework first */
-#include "cleanup.bpf.h"
+/* Include cleanup.bpf.h to let it define its RAII framework first.
+ * Upstream moved cleanup.bpf.h from scx_mitosis/src/bpf/ to
+ * scheds/include/lib/. Use angle-bracket include to find it via
+ * -I$(ROOT_DIR)/scheds/include. */
+#include <lib/cleanup.bpf.h>
 
 /* Now override the RAII macros with neutralized versions */
 
