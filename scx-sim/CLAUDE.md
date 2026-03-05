@@ -91,6 +91,35 @@ File issues for bugs, TODOs, and feature work rather than leaving stale TODO
 comments in code. Reference issue IDs (e.g. sim-1) in commit messages when
 closing issues.
 
+Performance Benchmarks
+========================================
+
+Throughput benchmarks measure speedup factor (simulated time / wall-clock time).
+They are NOT part of `validate.sh`.
+
+### Running benchmarks
+
+    make benchmark                           # Full suite, current results
+    ./scripts/run_benchmark.sh               # Full suite, records to history CSV
+
+### Post-commit: benchmark tracking
+
+Run `./scripts/periodically_run_benchmarks.sh` after committing. This runs the
+full benchmark suite if >= 5 commits have elapsed since the last recorded
+benchmark. If it modifies `data/benchmarks/<CPU>/perf_history.csv`, make a
+follow-up commit with the updated CSV.
+
+Only runs meaningfully on the primary benchmark target machine (identified by
+CPU model name in the CSV directory structure).
+
+### Dependencies
+
+Set up the Python venv (one-time, requires network via with-proxy):
+
+    python3 -m venv .venv && with-proxy .venv/bin/pip install plotly pandas
+
+The benchmark scripts auto-detect `.venv/bin/python3` if available.
+
 Dependencies and Missing Software
 ========================================
 

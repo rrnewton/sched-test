@@ -23,3 +23,12 @@ coverage-out/
 # Allow coverage CSV history to be tracked
 !data/
 !data/coverage.csv
+
+# Benchmark HTML dashboards and logs (generated, not tracked)
+data/benchmarks/*/*.html
+data/benchmarks/*/benchmark_log_*.log
+benchmark_results.html
+benchmark_results.csv
+
+# Python venv (created locally, not tracked)
+.venv/
