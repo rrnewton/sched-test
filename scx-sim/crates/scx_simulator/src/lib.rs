@@ -57,10 +57,7 @@ pub mod workloads;
 pub use bpf_trace::{
     BpfEventKind, BpfTrace, BpfTraceEvent, TraceComparisonResult, TraceDifferences,
 };
-pub use cgroup::{
-    clear_cgroup_registry, install_cgroup_registry, CgroupId, CgroupInfo, CgroupRegistry,
-    DEFAULT_MAX_CGROUPS,
-};
+pub use cgroup::{CgroupId, CgroupInfo, CgroupRegistry, DEFAULT_MAX_CGROUPS};
 pub use engine::{ExitKind, SimulationResult, Simulator};
 pub use ffi::{
     discover_schedulers, DebuggerInfo, DynamicScheduler, LavdPowerMode, Scheduler, SchedulerInfo,

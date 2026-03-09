@@ -15,7 +15,7 @@ use crate::backend::e9patch::E9PatchBackend;
 use crate::backend::pmu::PmuBackend;
 use crate::backend::replay::ReplayBackend;
 use crate::backend::{PreemptionBackend, SendPtr, StructopDelta};
-use crate::cgroup::{clear_cgroup_registry, install_cgroup_registry, CgroupId, CgroupRegistry};
+use crate::cgroup::{CgroupId, CgroupRegistry};
 use crate::cpu::{IrqContext, LastStopReason, SimCpu};
 use crate::dsq::DsqManager;
 use crate::ffi::{self, Scheduler};
@@ -1402,7 +1402,23 @@ impl<S: Scheduler> Simulator<S> {
             };
             cgroup_registry.create(&cg_def.name, parent_cgid, cg_def.cpuset.clone());
         }
-        unsafe { install_cgroup_registry(&mut cgroup_registry) };
+
+        // Build event queue (created early so it can be bundled into SimState)
+        let events = EventQueue::new(scenario.seed, scenario.fixed_priority);
+
+        // Bundle all shared state into SimState. From this point forward,
+        // all access goes through `s.sim`, `s.tasks`, `s.events`,
+        // `s.cgroup_registry`.
+        let mut s = SimState {
+            sim: state,
+            tasks,
+            events,
+            cgroup_registry,
+        };
+        // Mark that SIM_STATE will point to a bundled SimState (not a standalone
+        // SimulatorState). This allows cgroup callbacks to safely cast the
+        // SimulatorState pointer back to &SimState for cgroup_registry access.
+        kfuncs::set_sim_state_bundled(true);
 
         // If --wait-debugger was requested, pause so the user can attach a
         // debugger while scheduler symbols are loaded but before init() runs.
@@ -1412,13 +1428,13 @@ impl<S: Scheduler> Simulator<S> {
 
         // Initialize scheduler
         unsafe {
-            let cpu = state.current_cpu;
-            kfuncs::enter_sim(&mut state, cpu);
+            let cpu = s.sim.current_cpu;
+            kfuncs::enter_sim(&mut s.sim, cpu);
             // Populate CSS iterator so bpf_for_each(css, ...) works in init.
-            cgroup_registry.prepare_css_iter_from_root();
-            start_rbc(&mut state);
+            s.cgroup_registry.prepare_css_iter_from_root();
+            start_rbc(&mut s.sim);
             let rc = self.scheduler.init();
-            charge_sched_time(&mut state, CpuId(0), "init");
+            charge_sched_time(&mut s.sim, CpuId(0), "init");
             kfuncs::exit_sim();
             assert!(rc == 0, "scheduler init failed with rc={rc}");
         }
@@ -1427,16 +1443,16 @@ impl<S: Scheduler> Simulator<S> {
         // In the kernel, cgroup_init is called for all existing cgroups when
         // the scheduler is loaded.
         unsafe {
-            let cpu = state.current_cpu;
-            kfuncs::enter_sim(&mut state, cpu);
+            let cpu = s.sim.current_cpu;
+            kfuncs::enter_sim(&mut s.sim, cpu);
             // Refresh CSS iterator so cgroup_init callbacks can use
             // bpf_for_each(css, ...) if needed.
-            cgroup_registry.prepare_css_iter_from_root();
-            for cgid in cgroup_registry.all_cgids_preorder() {
-                if let Some(raw) = cgroup_registry.get_raw(cgid) {
-                    start_rbc(&mut state);
+            s.cgroup_registry.prepare_css_iter_from_root();
+            for cgid in s.cgroup_registry.all_cgids_preorder() {
+                if let Some(raw) = s.cgroup_registry.get_raw(cgid) {
+                    start_rbc(&mut s.sim);
                     let rc = self.scheduler.cgroup_init(raw, std::ptr::null_mut());
-                    charge_sched_time(&mut state, CpuId(0), "cgroup_init");
+                    charge_sched_time(&mut s.sim, CpuId(0), "cgroup_init");
                     assert!(rc == 0, "cgroup_init failed for cgid={} rc={rc}", cgid.0);
                 }
             }
@@ -1446,20 +1462,20 @@ impl<S: Scheduler> Simulator<S> {
         // Call cgroup_set_bandwidth for cgroups that have bandwidth configured.
         // In the kernel, this is called when writing to cpu.max.
         unsafe {
-            let cpu = state.current_cpu;
-            kfuncs::enter_sim(&mut state, cpu);
+            let cpu = s.sim.current_cpu;
+            kfuncs::enter_sim(&mut s.sim, cpu);
             for cg_def in &scenario.cgroups {
                 if let Some(ref bw) = cg_def.bandwidth {
-                    if let Some(cgrp_info) = cgroup_registry.get_by_name(&cg_def.name) {
+                    if let Some(cgrp_info) = s.cgroup_registry.get_by_name(&cg_def.name) {
                         let raw = cgrp_info.raw();
-                        start_rbc(&mut state);
+                        start_rbc(&mut s.sim);
                         self.scheduler.cgroup_set_bandwidth(
                             raw,
                             bw.period_us,
                             bw.quota_us,
                             bw.burst_us,
                         );
-                        charge_sched_time(&mut state, CpuId(0), "cgroup_set_bandwidth");
+                        charge_sched_time(&mut s.sim, CpuId(0), "cgroup_set_bandwidth");
                     }
                 }
             }
@@ -1471,13 +1487,14 @@ impl<S: Scheduler> Simulator<S> {
         let mut task_cgroup_map: HashMap<Pid, *mut c_void> = HashMap::new();
         for def in &scenario.tasks {
             if let Some(ref cg_name) = def.cgroup_name {
-                let cgrp_raw = cgroup_registry
+                let cgrp_raw = s
+                    .cgroup_registry
                     .get_by_name(cg_name)
                     .unwrap_or_else(|| {
                         panic!("cgroup '{cg_name}' not found for task {:?}", def.pid)
                     })
                     .raw();
-                unsafe { ffi::sim_task_set_cgroup(tasks[&def.pid].raw(), cgrp_raw) };
+                unsafe { ffi::sim_task_set_cgroup(s.tasks[&def.pid].raw(), cgrp_raw) };
                 task_cgroup_map.insert(def.pid, cgrp_raw);
             }
         }
@@ -1491,34 +1508,34 @@ impl<S: Scheduler> Simulator<S> {
         // iteration is non-deterministic, and schedulers like LAVD have
         // state that depends on which tasks are already registered (via
         // bpf_task_from_pid parent lookups).
-        let mut sorted_pids: Vec<Pid> = tasks.keys().copied().collect();
+        let mut sorted_pids: Vec<Pid> = s.tasks.keys().copied().collect();
         sorted_pids.sort_by_key(|p| p.0);
         unsafe {
-            let cpu = state.current_cpu;
-            kfuncs::enter_sim(&mut state, cpu);
+            let cpu = s.sim.current_cpu;
+            kfuncs::enter_sim(&mut s.sim, cpu);
             for pid in sorted_pids {
-                let task = &tasks[&pid];
+                let task = &s.tasks[&pid];
                 // Resolve cgroup map BEFORE start_rbc — HashMap::get() has
                 // non-deterministic branch count due to random hash seeds.
                 let cgrp_raw = task_cgroup_map.get(&task.pid).copied();
-                start_rbc(&mut state);
+                start_rbc(&mut s.sim);
                 let rc = if let Some(cgrp_raw) = cgrp_raw {
                     self.scheduler.init_task_in_cgroup(task.raw(), cgrp_raw)
                 } else {
                     self.scheduler.init_task(task.raw())
                 };
-                charge_sched_time(&mut state, CpuId(0), "init_task");
+                charge_sched_time(&mut s.sim, CpuId(0), "init_task");
                 assert!(rc == 0, "init_task failed for pid={} rc={rc}", task.pid.0);
 
                 // Register task in task_pid_to_raw AFTER init_task completes.
                 // This allows other tasks' init_task to find this task as a parent.
-                state.task_pid_to_raw.insert(task.pid, task.raw() as usize);
+                s.sim.task_pid_to_raw.insert(task.pid, task.raw() as usize);
 
                 // Notify scheduler of initial cpumask (mirrors kernel enumeration)
                 let cpus_ptr = ffi::sim_task_get_cpus_ptr(task.raw());
-                start_rbc(&mut state);
+                start_rbc(&mut s.sim);
                 self.scheduler.set_cpumask(task.raw(), cpus_ptr);
-                charge_sched_time(&mut state, CpuId(0), "set_cpumask");
+                charge_sched_time(&mut s.sim, CpuId(0), "set_cpumask");
             }
             kfuncs::exit_sim();
         }
@@ -1529,33 +1546,30 @@ impl<S: Scheduler> Simulator<S> {
         // idle_start_clk == 0 as a sentinel for "not idle".
         for cpu_id in 0..nr_cpus {
             let cpu = CpuId(cpu_id);
-            state.cpus[cpu.0 as usize].local_clock = 1;
+            s.sim.cpus[cpu.0 as usize].local_clock = 1;
             unsafe {
-                kfuncs::enter_sim(&mut state, cpu);
-                set_ops_context(&mut state, OpsContext::UpdateIdle);
+                kfuncs::enter_sim(&mut s.sim, cpu);
+                set_ops_context(&mut s.sim, OpsContext::UpdateIdle);
                 self.scheduler.update_idle(cpu.0 as i32, true);
                 kfuncs::exit_sim();
             }
-            state.cpus[cpu.0 as usize].local_clock = 0;
+            s.sim.cpus[cpu.0 as usize].local_clock = 0;
         }
-
-        // Build event queue
-        let mut events = EventQueue::new(scenario.seed, scenario.fixed_priority);
 
         // Drain any pending timer from scheduler init (e.g., deferred wakeup timer).
         // The CPU is captured by `sim_timer_start` during the init callback.
-        if let Some(fire_at) = state.pending_timer_ns.take() {
-            let cpu = state.pending_timer_cpu.take().unwrap_or(CpuId(0));
-            events.push(fire_at, EventKind::TimerFired { cpu });
+        if let Some(fire_at) = s.sim.pending_timer_ns.take() {
+            let cpu = s.sim.pending_timer_cpu.take().unwrap_or(CpuId(0));
+            s.events.push(fire_at, EventKind::TimerFired { cpu });
         } else {
-            state.pending_timer_cpu.take();
+            s.sim.pending_timer_cpu.take();
         }
 
         // Schedule initial TaskWake events for all tasks
         for def in &scenario.tasks {
             // Initial wakes have no waker; use the task's initial prev_cpu
             // (first allowed CPU from cpumask, or CpuId(0) if unrestricted).
-            events.push(
+            s.events.push(
                 def.start_time_ns,
                 EventKind::TaskWake {
                     pid: def.pid,
@@ -1569,7 +1583,8 @@ impl<S: Scheduler> Simulator<S> {
         // chain: tick fires → handle_tick → schedule next tick. This matches
         // the kernel's periodic timer interrupt (HZ=250 → 4ms).
         for cpu_id in 0..nr_cpus {
-            events.push(TICK_INTERVAL_NS, EventKind::Tick { cpu: CpuId(cpu_id) });
+            s.events
+                .push(TICK_INTERVAL_NS, EventKind::Tick { cpu: CpuId(cpu_id) });
         }
 
         // Seed CPU hotplug events from the scenario
@@ -1579,18 +1594,20 @@ impl<S: Scheduler> Simulator<S> {
             } else {
                 EventKind::CpuOffline { cpu: hp.cpu }
             };
-            events.push(hp.time_ns, kind);
+            s.events.push(hp.time_ns, kind);
         }
 
         // Seed CPU preemption events (higher-priority scheduler class)
         for pe in &scenario.cpu_preempt_events {
-            events.push(pe.release_at_ns, EventKind::CpuRelease { cpu: pe.cpu });
-            events.push(pe.acquire_at_ns, EventKind::CpuAcquire { cpu: pe.cpu });
+            s.events
+                .push(pe.release_at_ns, EventKind::CpuRelease { cpu: pe.cpu });
+            s.events
+                .push(pe.acquire_at_ns, EventKind::CpuAcquire { cpu: pe.cpu });
         }
 
         // Seed cgroup migration events
         for me in &scenario.cgroup_migrate_events {
-            events.push(
+            s.events.push(
                 me.at_ns,
                 EventKind::CgroupMigrate {
                     pid: me.pid,
@@ -1603,7 +1620,7 @@ impl<S: Scheduler> Simulator<S> {
 
         // Seed cgroup lifecycle events
         for ce in &scenario.cgroup_create_events {
-            events.push(
+            s.events.push(
                 ce.at_ns,
                 EventKind::CgroupCreate {
                     event: ce.clone(),
@@ -1612,7 +1629,7 @@ impl<S: Scheduler> Simulator<S> {
             );
         }
         for de in &scenario.cgroup_destroy_events {
-            events.push(
+            s.events.push(
                 de.at_ns,
                 EventKind::CgroupDestroy {
                     event: de.clone(),
@@ -1621,7 +1638,7 @@ impl<S: Scheduler> Simulator<S> {
             );
         }
         for cse in &scenario.cgroup_cpuset_change_events {
-            events.push(
+            s.events.push(
                 cse.at_ns,
                 EventKind::CgroupCpusetChange {
                     event: cse.clone(),
@@ -1632,7 +1649,7 @@ impl<S: Scheduler> Simulator<S> {
 
         // Seed IRQ events from the scenario
         for irq in &scenario.irq_events {
-            events.push(
+            s.events.push(
                 irq.at_ns,
                 EventKind::IrqStart {
                     cpu: irq.cpu,
@@ -1652,7 +1669,7 @@ impl<S: Scheduler> Simulator<S> {
         let ignore_bpf_errors = scenario.ignore_bpf_errors;
 
         // Log interleaving mode
-        if let Some(ref cfg) = state.preemptive {
+        if let Some(ref cfg) = s.sim.preemptive {
             if cfg.preempt_mode == PreemptMode::E9patch {
                 info!(
                     timeslice_min = cfg.timeslice_min,
@@ -1678,19 +1695,9 @@ impl<S: Scheduler> Simulator<S> {
                     "preemptive interleaving enabled (PMU {} timer)", cfg.break_on
                 );
             }
-        } else if state.interleave {
+        } else if s.sim.interleave {
             info!("cooperative interleaving enabled (kfunc boundaries only)");
         }
-
-        // Bundle all shared state into SimState. From this point forward,
-        // all access goes through `s.sim`, `s.tasks`, `s.events`,
-        // `s.cgroup_registry`.
-        let mut s = SimState {
-            sim: state,
-            tasks,
-            events,
-            cgroup_registry,
-        };
 
         // Main event loop: process events with dynamic concurrency windows.
         //
@@ -1835,8 +1842,7 @@ impl<S: Scheduler> Simulator<S> {
             kfuncs::exit_sim();
         }
 
-        // Clean up cgroup registry
-        clear_cgroup_registry();
+        // (Cgroup registry is now part of SimState, no separate cleanup needed.)
 
         // Free the synthetic idle task
         unsafe { ffi::sim_task_free(idle_task_raw) };
@@ -1849,6 +1855,9 @@ impl<S: Scheduler> Simulator<S> {
 
         // Print structop summary (per-CPU ops callbacks, RBC, kfuncs).
         crate::preempt::print_structop_summary(&s.sim.structop_accum);
+
+        // Clear the bundled flag (SimState is about to be destructured).
+        kfuncs::set_sim_state_bundled(false);
 
         SimulationResult {
             trace: s.sim.trace,
