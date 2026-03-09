@@ -4,9 +4,9 @@ status: open
 priority: 1
 issue_type: task
 created_at: 2026-03-09T18:28:04.468392808+00:00
-updated_at: 2026-03-09T18:28:04.468392808+00:00
+updated_at: 2026-03-09T18:44:18.405588861+00:00
 ---
 
 # Description
 
-Move all shared simulator state behind a single Arc<Mutex<SimState>>. Eliminates SendPtr, raw pointer thread-locals, and CGROUP_REGISTRY AtomicPtr.
+Move all shared simulator state behind a single Arc<Mutex<SimState>>. Eliminates SendPtr, raw pointer thread-locals, and CGROUP_REGISTRY AtomicPtr. Phases 1a/1b/3a/2a/2b complete and ported to safety-refactor-v2. All 150+ tests pass.
