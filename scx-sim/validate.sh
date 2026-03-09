@@ -5,6 +5,10 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
+# Track skipped checks so we can warn at the end.
+SKIPPED=()
+record_skip() { SKIPPED+=("$1"); }
+
 echo "=== Running cargo fmt --check ==="
 cargo fmt --all -- --check
 
@@ -33,10 +37,12 @@ if [ -n "$E9TOOL" ] && [ -x "$E9TOOL" ]; then
         make -C schedulers BUILD_DIR="$PWD/$SCHED_DIR" e9
     else
         echo "  (skipped: scheduler build directory not found)"
+        record_skip "e9-instrumented scheduler build (scheduler build directory not found)"
     fi
 else
     echo ""
     echo "=== Skipping e9-instrumented schedulers (e9tool not found) ==="
+    record_skip "e9-instrumented schedulers (e9tool not found; run: make install-e9patch)"
 fi
 
 echo ""
@@ -60,6 +66,7 @@ echo "  stress.py minimal run (~3s) ..."
 E9_FLAG=""
 if ! compgen -G "target/*/build/scx_simulator-*/out/schedulers/*_e9.so" > /dev/null 2>&1; then
     E9_FLAG="--no-e9patch"
+    record_skip "stress.py e9patch mode (no _e9.so files built; run: make install-e9patch && make -C schedulers e9)"
 fi
 rc=0
 python3 bug_finding/stress.py \
@@ -73,3 +80,13 @@ echo "  stress.py smoke tests passed (exit code: $rc)"
 
 echo ""
 echo "=== All checks passed ==="
+
+if [ ${#SKIPPED[@]} -gt 0 ]; then
+    echo ""
+    echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    echo "!!! WARNING: The following checks were SKIPPED:"
+    for skip in "${SKIPPED[@]}"; do
+        echo "!!!   - $skip"
+    done
+    echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+fi
