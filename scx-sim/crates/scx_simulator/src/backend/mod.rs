@@ -23,10 +23,10 @@ use std::collections::HashMap;
 
 use tracing::debug;
 
-use crate::engine::{batch_worker_body, dispatch_worker_body, EventQueue, Simulator};
+use crate::engine::{batch_worker_body, dispatch_worker_body, Simulator};
 use crate::ffi::Scheduler;
 use crate::interleave::WorkerId;
-use crate::kfuncs::{self, OpsContext, SimulatorState};
+use crate::kfuncs::{self, OpsContext, SimState, SimulatorState};
 use crate::preempt::PreemptRing;
 use crate::types::CpuId;
 
@@ -420,9 +420,6 @@ pub(crate) fn run_preemptive_batch<S, B>(
     cpu_ids: &[CpuId],
     sim_send: &SendPtr<Simulator<S>>,
     state_send: &SendPtr<SimulatorState>,
-    tasks_send: &SendPtr<HashMap<crate::types::Pid, crate::task::SimTask>>,
-    events_send: &SendPtr<EventQueue>,
-    cgroup_send: &SendPtr<crate::cgroup::CgroupRegistry>,
     seed: u32,
     watchdog_timeout: Option<crate::types::TimeNs>,
     duration_ns: crate::types::TimeNs,
@@ -438,9 +435,6 @@ pub(crate) fn run_preemptive_batch<S, B>(
         cpu_ids,
         sim_send,
         state_send,
-        tasks_send,
-        events_send,
-        cgroup_send,
         &ring,
         &ring,
         watchdog_timeout,
@@ -454,15 +448,15 @@ pub(crate) fn run_preemptive_batch<S, B>(
 ///
 /// Separated from [`run_preemptive_batch`] so that future backends can
 /// supply a different orchestrator while reusing the same worker lifecycle.
+///
+/// `state_send` points to the `sim` field of a `SimState`. Workers recover
+/// the containing `SimState` via pointer cast (the `sim` field is first).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_batch_with_orchestrator<S, B, O>(
     per_cpu: &HashMap<CpuId, Vec<crate::engine::Event>>,
     cpu_ids: &[CpuId],
     sim_send: &SendPtr<Simulator<S>>,
     state_send: &SendPtr<SimulatorState>,
-    tasks_send: &SendPtr<HashMap<crate::types::Pid, crate::task::SimTask>>,
-    events_send: &SendPtr<EventQueue>,
-    cgroup_send: &SendPtr<crate::cgroup::CgroupRegistry>,
     ring: &PreemptRing,
     orchestrator: &O,
     watchdog_timeout: Option<crate::types::TimeNs>,
@@ -481,9 +475,6 @@ pub(crate) fn run_batch_with_orchestrator<S, B, O>(
         let orch_ref = orchestrator;
         let sim_ref = sim_send;
         let state_ref = state_send;
-        let tasks_ref = tasks_send;
-        let events_ref = events_send;
-        let cgroup_ref = cgroup_send;
 
         for (i, &cpu) in cpu_ids.iter().enumerate() {
             let worker_id = WorkerId(i);
@@ -501,12 +492,12 @@ pub(crate) fn run_batch_with_orchestrator<S, B, O>(
                 build_and_arm(backend, &mut ctx, ring_ref);
 
                 unsafe {
+                    // Recover the containing SimState from the SimulatorState
+                    // pointer (sim is the first field of SimState).
+                    let sim_state = &mut *(sp as *mut SimState);
                     batch_worker_body(
                         simp,
-                        sp,
-                        tasks_ref.0,
-                        events_ref.0,
-                        cgroup_ref.0,
+                        sim_state,
                         cpu_events,
                         watchdog_timeout,
                         duration_ns,

@@ -1066,29 +1066,16 @@ pub(crate) unsafe fn dispatch_worker_body<S: Scheduler>(
 ///
 /// # Safety
 ///
-/// All pointer arguments must point to valid, exclusively-accessible data.
+/// `sim_state` must point to valid, exclusively-accessible data.
 /// Must be called inside an `enter_sim` / `exit_sim` scope.
-#[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn batch_worker_body<S: Scheduler>(
     simp: *const Simulator<S>,
-    sp: *mut SimulatorState,
-    _tasks: *mut HashMap<Pid, SimTask>,
-    _events: *mut EventQueue,
-    _cgroups: *mut CgroupRegistry,
+    sim_state: &mut SimState,
     cpu_events: Vec<Event>,
     watchdog_timeout: Option<TimeNs>,
     duration_ns: TimeNs,
     max_cgroups: u32,
 ) {
-    // Recover the containing SimState from the SimulatorState pointer.
-    // SAFETY: `sp` points to the `sim` field of a SimState, which is the
-    // first field. The other pointer args (_tasks, _events, _cgroups)
-    // point to subsequent fields of the same SimState. Token passing
-    // ensures exclusive access. We cast directly rather than using
-    // ptr::read (which would bitwise-copy owned heap data and cause
-    // double-free).
-    let sim_state = &mut *(sp as *mut SimState);
-
     for event in cpu_events {
         (*simp).process_event(
             event,
@@ -3790,9 +3777,6 @@ impl<S: Scheduler> Simulator<S> {
         // that are effectively single-threaded under the token.
         let sim_send = SendPtr(self as *const Simulator<S> as *mut Simulator<S>);
         let state_send = SendPtr(&mut s.sim as *mut SimulatorState);
-        let tasks_send = SendPtr(&mut s.tasks as *mut HashMap<Pid, SimTask>);
-        let events_send = SendPtr(&mut s.events as *mut EventQueue);
-        let cgroup_send = SendPtr(&mut s.cgroup_registry as *mut CgroupRegistry);
 
         if s.sim.native_concurrent.is_some() {
             // Native concurrent: all workers run freely in parallel with
@@ -3805,9 +3789,6 @@ impl<S: Scheduler> Simulator<S> {
                 &cpu_ids,
                 &sim_send,
                 &state_send,
-                &tasks_send,
-                &events_send,
-                &cgroup_send,
                 &ring,
                 &orchestrator,
                 watchdog_timeout,
@@ -3822,9 +3803,6 @@ impl<S: Scheduler> Simulator<S> {
                     &cpu_ids,
                     &sim_send,
                     &state_send,
-                    &tasks_send,
-                    &events_send,
-                    &cgroup_send,
                     interleave_seed,
                     watchdog_timeout,
                     duration_ns,
@@ -3842,9 +3820,6 @@ impl<S: Scheduler> Simulator<S> {
                     &cpu_ids,
                     &sim_send,
                     &state_send,
-                    &tasks_send,
-                    &events_send,
-                    &cgroup_send,
                     interleave_seed,
                     watchdog_timeout,
                     duration_ns,
@@ -3863,9 +3838,6 @@ impl<S: Scheduler> Simulator<S> {
                     &cpu_ids,
                     &sim_send,
                     &state_send,
-                    &tasks_send,
-                    &events_send,
-                    &cgroup_send,
                     interleave_seed,
                     watchdog_timeout,
                     duration_ns,
@@ -3879,9 +3851,6 @@ impl<S: Scheduler> Simulator<S> {
                 &cpu_ids,
                 &sim_send,
                 &state_send,
-                &tasks_send,
-                &events_send,
-                &cgroup_send,
                 interleave_seed,
                 watchdog_timeout,
                 duration_ns,
@@ -3902,9 +3871,6 @@ impl<S: Scheduler> Simulator<S> {
         cpu_ids: &[CpuId],
         sim_send: &SendPtr<Simulator<S>>,
         state_send: &SendPtr<SimulatorState>,
-        tasks_send: &SendPtr<HashMap<Pid, SimTask>>,
-        events_send: &SendPtr<EventQueue>,
-        cgroup_send: &SendPtr<CgroupRegistry>,
         seed: u32,
         watchdog_timeout: Option<TimeNs>,
         duration_ns: TimeNs,
@@ -3918,9 +3884,6 @@ impl<S: Scheduler> Simulator<S> {
             let ring_ref = &ring;
             let sim_ref = sim_send;
             let state_ref = state_send;
-            let tasks_ref = tasks_send;
-            let events_ref = events_send;
-            let cgroup_ref = cgroup_send;
             let per_cpu_ref = &per_cpu;
 
             for (i, &cpu) in cpu_ids.iter().enumerate() {
@@ -3941,12 +3904,10 @@ impl<S: Scheduler> Simulator<S> {
                     // Process all events for this CPU sequentially.
                     // Yields happen at kfunc boundaries within handlers.
                     unsafe {
+                        let sim_state = &mut *(sp as *mut SimState);
                         batch_worker_body(
                             simp,
-                            sp,
-                            tasks_ref.0,
-                            events_ref.0,
-                            cgroup_ref.0,
+                            sim_state,
                             cpu_events,
                             watchdog_timeout,
                             duration_ns,
