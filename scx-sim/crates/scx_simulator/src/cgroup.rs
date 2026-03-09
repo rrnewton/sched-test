@@ -369,27 +369,38 @@ impl Drop for CgroupRegistry {
 // ---------------------------------------------------------------------------
 
 use std::ptr;
-use std::sync::atomic::{AtomicPtr, Ordering};
 
-/// Global pointer to the active cgroup registry.
-///
-/// Set by the engine before simulation starts; cleared afterwards.
-/// C code calls `sim_cgroup_lookup_by_id` and `sim_cgroup_lookup_ancestor`
-/// which read this pointer.
-static CGROUP_REGISTRY: AtomicPtr<CgroupRegistry> = AtomicPtr::new(ptr::null_mut());
+use crate::kfuncs::SimState;
 
-/// Install a cgroup registry as the active registry for C callbacks.
+/// Access the cgroup registry through the SIM_STATE thread-local.
 ///
-/// # Safety
-/// The registry must outlive any C callbacks that may access it.
-/// Only one simulation can be active at a time (SIM_LOCK).
-pub unsafe fn install_cgroup_registry(registry: &mut CgroupRegistry) {
-    CGROUP_REGISTRY.store(registry as *mut CgroupRegistry, Ordering::SeqCst);
+/// During a scheduler callback, `enter_sim` installs a pointer to
+/// `SimulatorState` (which is the `sim` field of `SimState`). Since
+/// `sim` is the first field, we can recover `&SimState` and access
+/// `cgroup_registry` without a separate global pointer.
+///
+/// Returns `None` if not inside an `enter_sim`/`exit_sim` scope or
+/// if the SIM_STATE pointer is not part of a bundled SimState.
+fn with_cgroup_registry<R>(f: impl FnOnce(&CgroupRegistry) -> R) -> Option<R> {
+    if !crate::kfuncs::sim_state_is_bundled() {
+        return None;
+    }
+    let sim_ptr = crate::kfuncs::sim_state_ptr()?;
+    // SAFETY: sim_ptr points to SimulatorState which is the first field of
+    // SimState. The sim_state_is_bundled flag confirms this pointer actually
+    // comes from a SimState, not a standalone SimulatorState.
+    let sim_state = unsafe { &*(sim_ptr as *mut SimState) };
+    Some(f(&sim_state.cgroup_registry))
 }
 
-/// Clear the active cgroup registry.
-pub fn clear_cgroup_registry() {
-    CGROUP_REGISTRY.store(ptr::null_mut(), Ordering::SeqCst);
+/// Mutable version of with_cgroup_registry.
+fn with_cgroup_registry_mut<R>(f: impl FnOnce(&mut CgroupRegistry) -> R) -> Option<R> {
+    if !crate::kfuncs::sim_state_is_bundled() {
+        return None;
+    }
+    let sim_ptr = crate::kfuncs::sim_state_ptr()?;
+    let sim_state = unsafe { &mut *(sim_ptr as *mut SimState) };
+    Some(f(&mut sim_state.cgroup_registry))
 }
 
 /// Look up a cgroup by ID (called from C).
@@ -397,16 +408,13 @@ pub fn clear_cgroup_registry() {
 /// Returns the raw cgroup pointer, or null if not found.
 #[no_mangle]
 pub extern "C" fn sim_cgroup_lookup_by_id(cgid: u64) -> *mut c_void {
-    let registry = CGROUP_REGISTRY.load(Ordering::SeqCst);
-    if registry.is_null() {
-        // No registry installed - fall back to root
-        return unsafe { sim_get_root_cgroup() };
-    }
-    let registry = unsafe { &*registry };
-    registry
-        .get(CgroupId(cgid))
-        .map(|info| info.raw)
-        .unwrap_or_else(ptr::null_mut)
+    with_cgroup_registry(|registry| {
+        registry
+            .get(CgroupId(cgid))
+            .map(|info| info.raw)
+            .unwrap_or_else(ptr::null_mut)
+    })
+    .unwrap_or_else(|| unsafe { sim_get_root_cgroup() })
 }
 
 /// Look up a cgroup's ancestor at a given level (called from C).
@@ -414,30 +422,27 @@ pub extern "C" fn sim_cgroup_lookup_by_id(cgid: u64) -> *mut c_void {
 /// Returns the ancestor's raw cgroup pointer, or null if invalid.
 #[no_mangle]
 pub extern "C" fn sim_cgroup_lookup_ancestor(cgrp: *mut c_void, level: u32) -> *mut c_void {
-    let registry = CGROUP_REGISTRY.load(Ordering::SeqCst);
-    if registry.is_null() || cgrp.is_null() {
-        // No registry - fall back to root for level 0
+    if cgrp.is_null() {
         if level == 0 {
             return unsafe { sim_get_root_cgroup() };
         }
         return ptr::null_mut();
     }
-    let registry = unsafe { &*registry };
-
-    // Find the cgroup by its raw pointer
-    let cgid = registry
-        .cgroups
-        .values()
-        .find(|info| info.raw == cgrp)
-        .map(|info| info.cgid);
-
-    match cgid {
-        Some(id) => registry
-            .ancestor(id, level)
-            .map(|info| info.raw)
-            .unwrap_or_else(ptr::null_mut),
-        None => ptr::null_mut(),
-    }
+    with_cgroup_registry(|registry| {
+        let cgid = registry
+            .cgroups
+            .values()
+            .find(|info| info.raw == cgrp)
+            .map(|info| info.cgid);
+        match cgid {
+            Some(id) => registry
+                .ancestor(id, level)
+                .map(|info| info.raw)
+                .unwrap_or_else(ptr::null_mut),
+            None => ptr::null_mut(),
+        }
+    })
+    .unwrap_or_else(ptr::null_mut)
 }
 
 // ---------------------------------------------------------------------------
@@ -448,38 +453,24 @@ pub extern "C" fn sim_cgroup_lookup_ancestor(cgrp: *mut c_void, level: u32) -> *
 ///
 /// Returns 0 on success, -12 (ENOMEM) if the maximum cgroup limit has been
 /// reached. This simulates BPF hash map insertion failures.
-///
-/// # Safety
-/// Must be called while a cgroup registry is installed.
 #[no_mangle]
 pub extern "C" fn sim_cgroup_registry_allocate() -> i32 {
-    let registry = CGROUP_REGISTRY.load(Ordering::SeqCst);
-    if registry.is_null() {
-        // No registry installed - always succeed
-        return 0;
-    }
-    let registry = unsafe { &mut *registry };
-    match registry.try_allocate_bpf_entry() {
+    with_cgroup_registry_mut(|registry| match registry.try_allocate_bpf_entry() {
         Ok(()) => 0,
         Err(e) => e,
-    }
+    })
+    .unwrap_or(0)
 }
 
 /// Free a BPF map entry for a cgroup (called from C).
 ///
 /// Decrements the allocated entry count. Safe to call even if no entry
 /// was allocated.
-///
-/// # Safety
-/// Must be called while a cgroup registry is installed.
 #[no_mangle]
 pub extern "C" fn sim_cgroup_registry_free() {
-    let registry = CGROUP_REGISTRY.load(Ordering::SeqCst);
-    if registry.is_null() {
-        return;
-    }
-    let registry = unsafe { &mut *registry };
-    registry.free_bpf_entry();
+    with_cgroup_registry_mut(|registry| {
+        registry.free_bpf_entry();
+    });
 }
 
 /// Get the current number of allocated BPF entries (called from C).
@@ -487,12 +478,7 @@ pub extern "C" fn sim_cgroup_registry_free() {
 /// Returns 0 if no registry is installed.
 #[no_mangle]
 pub extern "C" fn sim_cgroup_registry_allocated_count() -> u32 {
-    let registry = CGROUP_REGISTRY.load(Ordering::SeqCst);
-    if registry.is_null() {
-        return 0;
-    }
-    let registry = unsafe { &*registry };
-    registry.allocated_bpf_entries()
+    with_cgroup_registry(|registry| registry.allocated_bpf_entries()).unwrap_or(0)
 }
 
 /// Get the maximum cgroup limit (called from C).
@@ -500,12 +486,7 @@ pub extern "C" fn sim_cgroup_registry_allocated_count() -> u32 {
 /// Returns 0 if no registry is installed.
 #[no_mangle]
 pub extern "C" fn sim_cgroup_registry_max() -> u32 {
-    let registry = CGROUP_REGISTRY.load(Ordering::SeqCst);
-    if registry.is_null() {
-        return 0;
-    }
-    let registry = unsafe { &*registry };
-    registry.max_cgroups()
+    with_cgroup_registry(|registry| registry.max_cgroups()).unwrap_or(0)
 }
 
 /// Set the maximum cgroup limit (called from C).
@@ -514,12 +495,9 @@ pub extern "C" fn sim_cgroup_registry_max() -> u32 {
 /// No-op if no registry is installed.
 #[no_mangle]
 pub extern "C" fn sim_cgroup_registry_set_max(max: u32) {
-    let registry = CGROUP_REGISTRY.load(Ordering::SeqCst);
-    if registry.is_null() {
-        return;
-    }
-    let registry = unsafe { &mut *registry };
-    registry.set_max_cgroups(max);
+    with_cgroup_registry_mut(|registry| {
+        registry.set_max_cgroups(max);
+    });
 }
 
 // FFI declarations for CSS iterator
