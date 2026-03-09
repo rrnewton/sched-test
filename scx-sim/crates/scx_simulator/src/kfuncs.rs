@@ -839,6 +839,9 @@ thread_local! {
     /// Engine-level SimArc stored so that `enter_sim` can install `SIM_ARC`
     /// for cgroup callbacks and concurrent worker threads.
     static ENGINE_SIM_ARC: RefCell<Option<SimArc>> = const { RefCell::new(None) };
+    /// True when SIM_STATE points to a SimulatorState that is the `sim` field
+    /// of a SimState (i.e., safe to cast to *mut SimState for cgroup access).
+    static SIM_STATE_IS_BUNDLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Install a SimArc into the current thread's thread-local.
@@ -910,6 +913,19 @@ pub(crate) fn clear_engine_sim_arc() {
 #[allow(dead_code)]
 pub(crate) fn get_engine_sim_arc() -> Option<SimArc> {
     ENGINE_SIM_ARC.with(|c| c.borrow().clone())
+}
+
+/// Check if the current SIM_STATE pointer is inside a SimState bundle.
+///
+/// Returns true when the engine has bundled state into SimState and it's
+/// safe to cast `sim_state_ptr()` to `*mut SimState` for field access.
+pub(crate) fn sim_state_is_bundled() -> bool {
+    SIM_STATE_IS_BUNDLED.with(|c| c.get())
+}
+
+/// Mark that the current thread's SIM_STATE points to a bundled SimState.
+pub(crate) fn set_sim_state_bundled(bundled: bool) {
+    SIM_STATE_IS_BUNDLED.with(|c| c.set(bundled));
 }
 
 /// Install a simulator state pointer for the duration of ops callbacks.
