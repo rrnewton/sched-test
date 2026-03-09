@@ -241,3 +241,10 @@ $(BUILD_DIR):
 
 # Include generated dependency files for incremental rebuilds
 -include $(wildcard $(BUILD_DIR)/*.d)
+
+# Catch-all: stale .d files may reference headers that have moved or been
+# deleted (e.g. after upstream sync). Without this rule, Make errors out with
+# "No rule to make target". The catch-all silently ignores the stale dep;
+# the next real compilation regenerates the .d file with correct paths.
+%.h:
+	@:
