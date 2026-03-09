@@ -20,6 +20,25 @@ echo ""
 echo "=== Running doc-tests ==="
 cargo test --workspace --doc
 
+# --- Build e9-instrumented schedulers if e9patch is available ---
+# The cargo commands above have already built the base .so files.
+# If e9tool is installed, build _e9.so variants so the stress.py smoke
+# test exercises e9patch mode automatically.
+E9TOOL="${E9TOOL:-$(ls third_party/e9patch/e9tool 2>/dev/null || which e9tool 2>/dev/null || true)}"
+if [ -n "$E9TOOL" ] && [ -x "$E9TOOL" ]; then
+    echo ""
+    echo "=== Building e9-instrumented schedulers ==="
+    SCHED_DIR=$(ls -d target/debug/build/scx_simulator-*/out/schedulers 2>/dev/null | head -1)
+    if [ -n "$SCHED_DIR" ]; then
+        make -C schedulers BUILD_DIR="$PWD/$SCHED_DIR" e9
+    else
+        echo "  (skipped: scheduler build directory not found)"
+    fi
+else
+    echo ""
+    echo "=== Skipping e9-instrumented schedulers (e9tool not found) ==="
+fi
+
 echo ""
 echo "=== Running stress.py smoke tests ==="
 # Smoke tests to catch CLI bitrot in stress.py (sim-e0791).
@@ -32,13 +51,19 @@ echo "  stress.py --list-workloads ..."
 python3 bug_finding/stress.py --list-workloads > /dev/null
 
 echo "  stress.py minimal run (~3s) ..."
-# A minimal run: 0.05 min (~3s), 1 worker, 1 scheduler, no e9patch.
+# A minimal run: 0.05 min (~3s), 1 worker, 1 scheduler.
+# stress.py auto-detects e9patch (_e9.so files); pass --no-e9patch only if
+# they are absent to avoid a noisy warning.
 # Exit code 0 = no bugs found, 1 = bugs found; both mean stress.py itself
 # ran correctly. Only exit code >= 2 indicates a stress.py failure (e.g.
 # bad CLI flags, Python exception).
+E9_FLAG=""
+if ! compgen -G "target/*/build/scx_simulator-*/out/schedulers/*_e9.so" > /dev/null 2>&1; then
+    E9_FLAG="--no-e9patch"
+fi
 rc=0
 python3 bug_finding/stress.py \
-    --duration 0.05 --jobs 1 --schedulers simple --no-e9patch \
+    --duration 0.05 --jobs 1 --schedulers simple $E9_FLAG \
     2>/dev/null || rc=$?
 if [ "$rc" -ge 2 ]; then
     echo "FAIL: stress.py exited with code $rc (expected 0 or 1)"
