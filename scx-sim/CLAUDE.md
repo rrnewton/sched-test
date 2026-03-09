@@ -135,6 +135,7 @@ Common tools already available:
 - **rt-app**: `~/bin/rt-app` (built from `~/playground/rt-app`)
 - **bpftrace**: system-installed
 - **mb** (minibeads): local issue tracker
+- **e9patch**: `make install-e9patch` (requires network; use `with-proxy make install-e9patch` on Meta machines). After install: `make -C schedulers e9` to build instrumented scheduler libraries.
 
 Every TODO in source code MUST reference an issue: `TODO(sim-XXXXX)`. Do not
 leave TODOs without a tracking issue — file one first, then add the TODO.
