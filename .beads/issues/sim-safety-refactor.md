@@ -1,13 +1,12 @@
 ---
 title: 'Safety refactor: Arc<Mutex<SimState>> + fold all shared state'
-status: closed
+status: open
 priority: 1
 issue_type: task
 created_at: 2026-03-09T18:28:04.468392808+00:00
-updated_at: 2026-03-10T12:22:11.021861520+00:00
-closed_at: 2026-03-10T12:22:11.021861430+00:00
+updated_at: 2026-03-09T18:44:18.405588861+00:00
 ---
 
 # Description
 
-Complete. Eliminated CGROUP_REGISTRY AtomicPtr, 3 of 4 SendPtrs, raw pointer context save/restore in signal handler and yield paths. 31 handler methods converted to SimState. Phase 3c (Arc<Mutex<>>) deferred as marginal benefit over current architecture.
+Move all shared simulator state behind a single Arc<Mutex<SimState>>. Eliminates SendPtr, raw pointer thread-locals, and CGROUP_REGISTRY AtomicPtr. Phases 1a/1b/3a/2a/2b complete and ported to safety-refactor-v2. All 150+ tests pass.

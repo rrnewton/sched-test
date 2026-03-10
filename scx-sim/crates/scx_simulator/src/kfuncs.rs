@@ -15,9 +15,11 @@
 // would be meaningless.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
 use std::ptr;
+use std::sync::{Arc, Mutex};
 
 use rand::rngs::SmallRng;
 use rand::RngCore;
@@ -400,14 +402,12 @@ pub struct SimulatorState {
     pub native_concurrent: Option<NativeConcurrentConfig>,
 }
 
-/// Bundle of all shared simulator state.
+/// Bundle of all shared simulator state, protected by a single Mutex.
 ///
-/// The engine creates this at simulation start, co-locating the four
-/// shared state components. Handler methods take `&mut SimState` and
-/// access fields through `s.sim`, `s.tasks`, `s.events`,
-/// `s.cgroup_registry`. The `sim` field is first, allowing concurrent
-/// dispatch workers to recover the containing `SimState` from a raw
-/// `*mut SimulatorState` pointer via pointer cast.
+/// The engine creates this at simulation start and wraps it in `Arc<Mutex<_>>`.
+/// Kfuncs acquire the lock via the `SIM_ARC` thread-local. The engine releases
+/// the lock before calling into C scheduler code, and kfuncs reacquire it
+/// through the thread-local Arc.
 pub(crate) struct SimState {
     /// Core scheduler state (CPUs, DSQs, trace, etc.).
     pub sim: SimulatorState,
@@ -418,6 +418,9 @@ pub(crate) struct SimState {
     /// The cgroup hierarchy.
     pub cgroup_registry: CgroupRegistry,
 }
+
+/// Shared-ownership handle to the mutex-protected simulation state.
+pub(crate) type SimArc = Arc<Mutex<SimState>>;
 
 /// Per-callback identity context that the signal handler needs to
 /// save/restore without locking the Mutex.
@@ -827,12 +830,45 @@ impl SimContext {
 thread_local! {
     static SIM_STATE: std::cell::Cell<Option<*mut SimulatorState>> = const { std::cell::Cell::new(None) };
     static SIM_CONTEXT: std::cell::Cell<SimContext> = const { std::cell::Cell::new(SimContext::new()) };
+    /// Arc-based thread-local for kfuncs to access the shared SimState.
+    /// Replaces the raw pointer `SIM_STATE` in the new architecture.
+    static SIM_ARC: RefCell<Option<SimArc>> = const { RefCell::new(None) };
     /// Per-callback identity context saved/restored across yield points.
     /// Async-signal-safe: Cell<Copy> read/write.
     static CALLBACK_CTX: std::cell::Cell<Option<CallbackContext>> = const { std::cell::Cell::new(None) };
+    /// Engine-level SimArc stored so that `enter_sim` can install `SIM_ARC`
+    /// for cgroup callbacks and concurrent worker threads.
+    static ENGINE_SIM_ARC: RefCell<Option<SimArc>> = const { RefCell::new(None) };
     /// True when SIM_STATE points to a SimulatorState that is the `sim` field
     /// of a SimState (i.e., safe to cast to *mut SimState for cgroup access).
     static SIM_STATE_IS_BUNDLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Install a SimArc into the current thread's thread-local.
+///
+/// Called by the engine before entering scheduler C code so that kfuncs
+/// (which reacquire the lock) can find the Arc.
+pub(crate) fn install_sim_arc(arc: &SimArc) {
+    SIM_ARC.with(|c| {
+        *c.borrow_mut() = Some(Arc::clone(arc));
+    });
+}
+
+/// Clear the SimArc from the current thread's thread-local.
+///
+/// Called by the engine after scheduler C code returns.
+pub(crate) fn clear_sim_arc() {
+    SIM_ARC.with(|c| {
+        *c.borrow_mut() = None;
+    });
+}
+
+/// Clone the SimArc from the thread-local (for passing to sub-modules).
+///
+/// Returns `None` if not inside a simulator context.
+#[allow(dead_code)]
+pub(crate) fn clone_sim_arc() -> Option<SimArc> {
+    SIM_ARC.with(|c| c.borrow().clone())
 }
 
 /// Install per-callback identity context into the thread-local.
@@ -848,6 +884,35 @@ pub fn clear_callback_ctx() {
 /// Read per-callback identity context (async-signal-safe).
 pub fn get_callback_ctx() -> Option<CallbackContext> {
     CALLBACK_CTX.with(|c| c.get())
+}
+
+/// Set the engine-level SimArc for this thread.
+///
+/// Called once by the engine at simulation start. `enter_sim` will
+/// automatically install this Arc into `SIM_ARC`, bridging the old
+/// raw-pointer path with the new Arc path for cgroup callbacks and
+/// concurrent worker threads.
+#[allow(dead_code)]
+pub(crate) fn set_engine_sim_arc(arc: &SimArc) {
+    ENGINE_SIM_ARC.with(|c| {
+        *c.borrow_mut() = Some(Arc::clone(arc));
+    });
+}
+
+/// Clear the engine-level SimArc from this thread.
+///
+/// Called by the engine when simulation ends.
+#[allow(dead_code)]
+pub(crate) fn clear_engine_sim_arc() {
+    ENGINE_SIM_ARC.with(|c| {
+        *c.borrow_mut() = None;
+    });
+}
+
+/// Get a clone of the engine-level SimArc (for worker threads).
+#[allow(dead_code)]
+pub(crate) fn get_engine_sim_arc() -> Option<SimArc> {
+    ENGINE_SIM_ARC.with(|c| c.borrow().clone())
 }
 
 /// Check if the current SIM_STATE pointer is inside a SimState bundle.
@@ -883,6 +948,13 @@ pub unsafe fn enter_sim(state: &mut SimulatorState, cpu: CpuId) {
         current_cpu: state.current_cpu,
         ops_context: state.ops_context,
         waker_task_raw: state.waker_task_raw,
+    });
+    // Also install SIM_ARC from ENGINE_SIM_ARC so cgroup callbacks
+    // and concurrent workers can access the full SimState.
+    ENGINE_SIM_ARC.with(|c| {
+        if let Some(ref arc) = *c.borrow() {
+            install_sim_arc(arc);
+        }
     });
 }
 
@@ -931,6 +1003,7 @@ pub fn exit_sim() {
     // Also clear per-thread TLS so structop boundary detection and the
     // signal handler see None between callbacks.
     crate::preempt::set_current_ops_context(OpsContext::None);
+    clear_sim_arc();
 }
 
 /// Like [`exit_sim`] but does **not** clear `ops_context`.
@@ -956,6 +1029,7 @@ pub fn exit_sim_no_clear_ops() {
     clear_callback_ctx();
     crate::preempt::pause_timer();
     SIM_STATE.with(|cell| cell.set(None));
+    clear_sim_arc();
 }
 
 /// Get the raw SimulatorState pointer from the thread-local.
