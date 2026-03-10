@@ -1,65 +1,65 @@
-# Safety Refactor: Arc<Mutex<SimState>> + Fold All Shared State
+# Safety Refactor: Fold All Shared State into SimState
 
 **Issue**: sim-safety-refactor
+**Status**: Complete
 
-## Goal
+## Summary
 
-Move all shared simulator state behind a single `Arc<Mutex<SimState>>`.
-The engine releases the lock before calling into C scheduler code;
-kfuncs and cgroup callbacks reacquire it through a thread-local Arc.
-This eliminates `SendPtr`, the raw pointer thread-local, and the
-`CGROUP_REGISTRY` AtomicPtr.
+The simulator previously used `unsafe` raw pointer patterns to share
+`SimulatorState`, `CgroupRegistry`, `HashMap<Pid, SimTask>`, and `EventQueue`
+across threads and between the engine and kfuncs. This refactor:
 
-## Phases
+1. **Bundles all 4 components** into a single `SimState` struct
+2. **Eliminates raw pointer context save/restore** in yield paths
+   (signal handler, cooperative yield, preemptive yield) using
+   `CallbackContext` (a `Cell<Copy>` thread-local)
+3. **Eliminates `CGROUP_REGISTRY: AtomicPtr`** — cgroup callbacks
+   access the registry through the `SimState` bundle
+4. **Eliminates 3 of 4 `SendPtr`** instances for shared state in
+   concurrent dispatch
+5. **Converts 31 handler methods** from taking 4 separate params
+   to `s: &mut SimState`
 
-### Phase 1a: Infrastructure types ✅
-- `SimState` struct bundling SimulatorState + tasks + events + cgroup_registry
-- `SimArc = Arc<Mutex<SimState>>` type alias
-- `CallbackContext` Copy struct for signal-safe context save/restore
-- `SIM_ARC` and `CALLBACK_CTX` thread-locals with accessors
-- `EventQueue`, `Event`, `EventKind` made `pub(crate)`
+## Completed Phases
 
-### Phase 1b: ENGINE_SIM_ARC bridge ✅
-- `ENGINE_SIM_ARC` thread-local + set/clear/get functions
-- `enter_sim` installs `SIM_ARC` + `CALLBACK_CTX`
-- `exit_sim` syncs `CALLBACK_CTX` back and clears both
+| Phase | Description | Commit |
+|-------|-------------|--------|
+| 1a | SimState, CallbackContext, thread-local infrastructure | `829db50` |
+| 1b | ENGINE_SIM_ARC bridge (enter_sim/exit_sim install CALLBACK_CTX) | `ba63189` |
+| 3a | CallbackContext conversion (interleave/preempt yield paths) | `13f1ccd` |
+| 2a | SimState bundling in run_internal | `7cc3280` |
+| 2b | Handler signature conversion (31 methods) | `41be970` |
+| 2c | Concurrent dispatch SendPtr consolidation | `d439456` |
+| 3b | Eliminate CGROUP_REGISTRY AtomicPtr | `8b0b980` |
+| 4  | Cleanup: remove unused Arc/Mutex infrastructure | (this commit) |
 
-### Phase 3a: CallbackContext conversion ✅
-- `interleave::maybe_yield` uses get/install_callback_ctx
-- `preempt::cooperative_yield_impl` same
-- `preempt::preempt_handler` (signal handler) same — fully async-signal-safe
-- `preempt::replay_bp_handler` same
-- `preempt::e9_yield_call` same
-- **Eliminates all unsafe raw pointer dereference sites in yield paths**
+## Remaining unsafe (inherent, not architectural)
 
-### Phase 2a: SimState bundling in run_internal ✅
-- `run_internal` bundles state+tasks+events+cgroup_registry into SimState
-- All access in run_internal body through s.sim, s.tasks, s.events, s.cgroup_registry
+The following `unsafe` remains and is inherent to the simulator's design:
 
-### Phase 2b: Handler signature conversion ✅
-- 31 handler methods converted from 4 separate params to `s: &mut SimState`
-- `batch_worker_body` reconstructs SimState from raw pointers via ManuallyDrop
-- `advance_to_run_phase` takes separate sim/events params (borrow split)
-- Concurrent dispatch worker methods retain SendPtr-based signatures
+- **FFI calls to C scheduler code** — `self.scheduler.XXX()` calls
+- **FFI calls to C helper functions** — `ffi::sim_task_*`, `ffi::scx_test_*`
+- **`SendPtr<SimulatorState>`** — for concurrent dispatch workers.
+  Token-passing serializes access; the raw pointer crosses thread boundaries.
+- **`SendPtr<Simulator<S>>` / `SendPtr<S>`** — scheduler pointers for FFI
+- **`*const TokenRing` / `*const PreemptRing`** in thread-locals —
+  ring pointer lifetime vs `'static` thread-local conflict
+- **`SIM_STATE: Cell<*mut SimulatorState>`** — raw pointer thread-local
+  for kfuncs. Token-passing serializes access.
+- **`sp as *mut SimState`** cast in batch_worker_body — relies on `sim`
+  being the first field of SimState
+- **Signal handler** (`libc::sigaction`, `libc::ioctl`, `libc::syscall`)
+- **`CgroupInfo`**'s raw C pointer — inherent to C interop
 
-### Phase 2c: Concurrent dispatch SendPtr consolidation ⬜
-- Replace 4 separate SendPtr (state/tasks/events/cgroup) with SendPtr<SimState>
-- Update dispatch_concurrent_cooperative, dispatch_concurrent_preemptive
-- Update process_batch_concurrent_cooperative, process_batch_concurrent_preemptive
-- Update dispatch_native_concurrent and backend module
+## Deferred: Arc<Mutex<>> wrapping (Phase 3c)
 
-### Phase 3b: Eliminate CGROUP_REGISTRY AtomicPtr ⬜
-- Convert 7 cgroup extern C functions to use clone_sim_arc()
-- Remove CGROUP_REGISTRY static, install_cgroup_registry, clear_cgroup_registry
+The original plan included wrapping SimState in `Arc<Mutex<SimState>>`
+so the engine releases the lock before C calls and kfuncs reacquire it.
+This was deferred because:
 
-### Phase 3c: Wrap SimState in Arc<Mutex<>> ⬜
-- Engine creates SimArc, locks for work, drops lock before C calls
-- sim_callback! macro for lock-release-call-reacquire pattern
-- Workers receive Arc::clone instead of SendPtr
-
-### Phase 4: Cleanup ⬜
-- Remove SendPtr struct (or reduce to scheduler pointer only)
-- Remove enter_sim/exit_sim/sim_state_ptr (replace with SimArc path)
-- Convert with_sim from SIM_STATE raw pointer to SIM_ARC
-- Update lib.rs re-exports
-- Audit remaining unsafe
+1. The engine holds `&mut SimState` for its entire run and must drop it
+   before every C call — requiring restructuring the entire control flow
+2. The safety benefits are marginal over the current state (token-passing
+   already serializes access; the remaining raw pointers are documented)
+3. The `std::sync::Mutex` deadlock-on-same-thread property (the original
+   motivation) can be tested without the full wrapping
