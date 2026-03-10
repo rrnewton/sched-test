@@ -372,35 +372,41 @@ use std::ptr;
 
 use crate::kfuncs::SimState;
 
-/// Access the cgroup registry through the SIM_STATE thread-local.
+/// Access the cgroup registry through the simulator state.
 ///
-/// During a scheduler callback, `enter_sim` installs a pointer to
-/// `SimulatorState` (which is the `sim` field of `SimState`). Since
-/// `sim` is the first field, we can recover `&SimState` and access
-/// `cgroup_registry` without a separate global pointer.
+/// Uses two paths:
+/// 1. **Raw pointer path**: If SIM_STATE is installed and points to a bundled
+///    SimState (sim_state_is_bundled), recovers the SimState and accesses
+///    cgroup_registry. This is the fast path when the engine holds the lock.
+/// 2. **Arc<Mutex<>> path**: If SIM_ARC is installed (sim_callback! dropped the
+///    guard), locks the mutex to access cgroup_registry.
 ///
-/// Returns `None` if not inside an `enter_sim`/`exit_sim` scope or
-/// if the SIM_STATE pointer is not part of a bundled SimState.
+/// Returns `None` if neither path is available.
 fn with_cgroup_registry<R>(f: impl FnOnce(&CgroupRegistry) -> R) -> Option<R> {
-    if !crate::kfuncs::sim_state_is_bundled() {
-        return None;
+    // Try raw pointer path first (engine holds the guard)
+    if crate::kfuncs::sim_state_is_bundled() {
+        if let Some(sim_ptr) = crate::kfuncs::sim_state_ptr() {
+            let sim_state = unsafe { &*(sim_ptr as *mut SimState) };
+            return Some(f(&sim_state.cgroup_registry));
+        }
     }
-    let sim_ptr = crate::kfuncs::sim_state_ptr()?;
-    // SAFETY: sim_ptr points to SimulatorState which is the first field of
-    // SimState. The sim_state_is_bundled flag confirms this pointer actually
-    // comes from a SimState, not a standalone SimulatorState.
-    let sim_state = unsafe { &*(sim_ptr as *mut SimState) };
-    Some(f(&sim_state.cgroup_registry))
+    // Arc path (sim_callback! context)
+    let arc = crate::kfuncs::clone_sim_arc()?;
+    let guard = arc.lock().unwrap();
+    Some(f(&guard.cgroup_registry))
 }
 
 /// Mutable version of with_cgroup_registry.
 fn with_cgroup_registry_mut<R>(f: impl FnOnce(&mut CgroupRegistry) -> R) -> Option<R> {
-    if !crate::kfuncs::sim_state_is_bundled() {
-        return None;
+    if crate::kfuncs::sim_state_is_bundled() {
+        if let Some(sim_ptr) = crate::kfuncs::sim_state_ptr() {
+            let sim_state = unsafe { &mut *(sim_ptr as *mut SimState) };
+            return Some(f(&mut sim_state.cgroup_registry));
+        }
     }
-    let sim_ptr = crate::kfuncs::sim_state_ptr()?;
-    let sim_state = unsafe { &mut *(sim_ptr as *mut SimState) };
-    Some(f(&mut sim_state.cgroup_registry))
+    let arc = crate::kfuncs::clone_sim_arc()?;
+    let mut guard = arc.lock().unwrap();
+    Some(f(&mut guard.cgroup_registry))
 }
 
 /// Look up a cgroup by ID (called from C).

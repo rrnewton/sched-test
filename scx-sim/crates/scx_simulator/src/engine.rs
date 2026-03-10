@@ -6,6 +6,7 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::ffi::c_void;
+use std::sync::{Arc, Mutex};
 
 use rand::rngs::SmallRng;
 use rand::{RngCore, SeedableRng};
@@ -20,7 +21,7 @@ use crate::cpu::{IrqContext, LastStopReason, SimCpu};
 use crate::dsq::DsqManager;
 use crate::ffi::{self, Scheduler};
 use crate::fmt::FmtN;
-use crate::kfuncs::{self, OpsContext, SimState, SimulatorState, StagedEvent};
+use crate::kfuncs::{self, OpsContext, SimArc, SimState, SimulatorState, StagedEvent};
 use crate::monitor::{Monitor, ProbeContext, ProbePoint};
 use crate::perf;
 use crate::preempt::{
@@ -1088,6 +1089,44 @@ pub(crate) unsafe fn batch_worker_body<S: Scheduler>(
     }
 }
 
+/// Drop the MutexGuard, install SIM_ARC, call C code, then reacquire.
+///
+/// Usage:
+/// ```ignore
+/// sim_callback!(guard, sim_arc, cpu, {
+///     self.scheduler.init();
+/// });
+/// // guard is now relocked
+/// ```
+macro_rules! sim_callback {
+    ($guard:ident, $arc:expr, $cpu:expr, $call:block) => {{
+        {
+            let __cpu = $cpu;
+            let __sim = &mut $guard.sim;
+            __sim.current_cpu = __cpu;
+            kfuncs::set_sim_clock(__sim.cpus[__cpu.0 as usize].local_clock, Some(__cpu));
+            kfuncs::install_callback_ctx(kfuncs::CallbackContext {
+                current_cpu: __cpu,
+                ops_context: __sim.ops_context,
+                waker_task_raw: __sim.waker_task_raw,
+            });
+        }
+        drop($guard);
+        kfuncs::install_sim_arc(&$arc);
+        unsafe { $call }
+        kfuncs::clear_sim_arc();
+        // Sync CALLBACK_CTX back
+        $guard = $arc.lock().unwrap();
+        if let Some(__ctx) = kfuncs::get_callback_ctx() {
+            $guard.sim.current_cpu = __ctx.current_cpu;
+            $guard.sim.ops_context = __ctx.ops_context;
+            $guard.sim.waker_task_raw = __ctx.waker_task_raw;
+        }
+        kfuncs::clear_callback_ctx();
+        crate::preempt::pause_timer();
+    }};
+}
+
 impl<S: Scheduler> Simulator<S> {
     pub fn new(scheduler: S) -> Self {
         Simulator { scheduler }
@@ -1407,18 +1446,21 @@ impl<S: Scheduler> Simulator<S> {
         let events = EventQueue::new(scenario.seed, scenario.fixed_priority);
 
         // Bundle all shared state into SimState. From this point forward,
-        // all access goes through `s.sim`, `s.tasks`, `s.events`,
-        // `s.cgroup_registry`.
-        let mut s = SimState {
+        // all access goes through the Arc<Mutex<SimState>>.
+        let sim_arc: SimArc = Arc::new(Mutex::new(SimState {
             sim: state,
             tasks,
             events,
             cgroup_registry,
-        };
-        // Mark that SIM_STATE will point to a bundled SimState (not a standalone
-        // SimulatorState). This allows cgroup callbacks to safely cast the
-        // SimulatorState pointer back to &SimState for cgroup_registry access.
+        }));
+        // Install the Arc in ENGINE_SIM_ARC so enter_sim can propagate it
+        // to SIM_ARC for kfuncs and cgroup callbacks.
+        kfuncs::set_engine_sim_arc(&sim_arc);
+        // Mark that SIM_STATE will point to a bundled SimState.
         kfuncs::set_sim_state_bundled(true);
+        // Alias for code that still uses `s.sim`, `s.tasks` etc.
+        // The engine locks the Arc for its own work and drops before C calls.
+        let mut s = sim_arc.lock().unwrap();
 
         // If --wait-debugger was requested, pause so the user can attach a
         // debugger while scheduler symbols are loaded but before init() runs.
@@ -1427,15 +1469,17 @@ impl<S: Scheduler> Simulator<S> {
         }
 
         // Initialize scheduler
-        unsafe {
+        {
             let cpu = s.sim.current_cpu;
-            kfuncs::enter_sim(&mut s.sim, cpu);
             // Populate CSS iterator so bpf_for_each(css, ...) works in init.
-            s.cgroup_registry.prepare_css_iter_from_root();
+            unsafe { s.cgroup_registry.prepare_css_iter_from_root() };
             start_rbc(&mut s.sim);
-            let rc = self.scheduler.init();
+            #[allow(unused_assignments)]
+            let mut rc = 0i32;
+            sim_callback!(s, sim_arc, cpu, {
+                rc = self.scheduler.init();
+            });
             charge_sched_time(&mut s.sim, CpuId(0), "init");
-            kfuncs::exit_sim();
             assert!(rc == 0, "scheduler init failed with rc={rc}");
         }
 
@@ -1514,28 +1558,29 @@ impl<S: Scheduler> Simulator<S> {
             let cpu = s.sim.current_cpu;
             kfuncs::enter_sim(&mut s.sim, cpu);
             for pid in sorted_pids {
-                let task = &s.tasks[&pid];
+                let ss = &mut *s; // explicit deref for split borrow
+                let task = &ss.tasks[&pid];
                 // Resolve cgroup map BEFORE start_rbc — HashMap::get() has
                 // non-deterministic branch count due to random hash seeds.
                 let cgrp_raw = task_cgroup_map.get(&task.pid).copied();
-                start_rbc(&mut s.sim);
+                start_rbc(&mut ss.sim);
                 let rc = if let Some(cgrp_raw) = cgrp_raw {
                     self.scheduler.init_task_in_cgroup(task.raw(), cgrp_raw)
                 } else {
                     self.scheduler.init_task(task.raw())
                 };
-                charge_sched_time(&mut s.sim, CpuId(0), "init_task");
+                charge_sched_time(&mut ss.sim, CpuId(0), "init_task");
                 assert!(rc == 0, "init_task failed for pid={} rc={rc}", task.pid.0);
 
                 // Register task in task_pid_to_raw AFTER init_task completes.
                 // This allows other tasks' init_task to find this task as a parent.
-                s.sim.task_pid_to_raw.insert(task.pid, task.raw() as usize);
+                ss.sim.task_pid_to_raw.insert(task.pid, task.raw() as usize);
 
                 // Notify scheduler of initial cpumask (mirrors kernel enumeration)
                 let cpus_ptr = ffi::sim_task_get_cpus_ptr(task.raw());
-                start_rbc(&mut s.sim);
+                start_rbc(&mut ss.sim);
                 self.scheduler.set_cpumask(task.raw(), cpus_ptr);
-                charge_sched_time(&mut s.sim, CpuId(0), "set_cpumask");
+                charge_sched_time(&mut ss.sim, CpuId(0), "set_cpumask");
             }
             kfuncs::exit_sim();
         }
@@ -1790,10 +1835,11 @@ impl<S: Scheduler> Simulator<S> {
             charge_sched_time(&mut s.sim, CpuId(0), "dump");
 
             for &pid in &shutdown_pids {
-                let task = &s.tasks[&pid];
-                start_rbc(&mut s.sim);
+                let ss = &mut *s;
+                let task = &ss.tasks[&pid];
+                start_rbc(&mut ss.sim);
                 self.scheduler.dump_task(std::ptr::null_mut(), task.raw());
-                charge_sched_time(&mut s.sim, CpuId(0), "dump_task");
+                charge_sched_time(&mut ss.sim, CpuId(0), "dump_task");
             }
             kfuncs::exit_sim();
         }
@@ -1803,11 +1849,12 @@ impl<S: Scheduler> Simulator<S> {
             let cpu = s.sim.current_cpu;
             kfuncs::enter_sim(&mut s.sim, cpu);
             for &pid in &shutdown_pids {
-                let task = &s.tasks[&pid];
+                let ss = &mut *s;
+                let task = &ss.tasks[&pid];
                 debug!(pid = pid.0, "enter:structop exit_task");
-                start_rbc(&mut s.sim);
+                start_rbc(&mut ss.sim);
                 self.scheduler.exit_task(task.raw());
-                charge_sched_time(&mut s.sim, CpuId(0), "exit_task");
+                charge_sched_time(&mut ss.sim, CpuId(0), "exit_task");
             }
             kfuncs::exit_sim();
         }
@@ -1856,12 +1903,23 @@ impl<S: Scheduler> Simulator<S> {
         // Print structop summary (per-CPU ops callbacks, RBC, kfuncs).
         crate::preempt::print_structop_summary(&s.sim.structop_accum);
 
-        // Clear the bundled flag (SimState is about to be destructured).
+        // Clear the bundled flag and ENGINE_SIM_ARC.
         kfuncs::set_sim_state_bundled(false);
+        kfuncs::clear_engine_sim_arc();
+
+        // Drop the MutexGuard and extract the SimState from the Arc.
+        drop(s);
+        let sim_state = match Arc::try_unwrap(sim_arc) {
+            Ok(mutex) => match mutex.into_inner() {
+                Ok(state) => state,
+                Err(poison) => poison.into_inner(),
+            },
+            Err(_) => panic!("Arc<Mutex<SimState>> still has multiple owners at end of simulation"),
+        };
 
         SimulationResult {
-            trace: s.sim.trace,
-            tasks: s.tasks,
+            trace: sim_state.sim.trace,
+            tasks: sim_state.tasks,
         }
     }
 

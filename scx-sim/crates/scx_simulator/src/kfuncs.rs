@@ -419,6 +419,12 @@ pub(crate) struct SimState {
     pub cgroup_registry: CgroupRegistry,
 }
 
+// SAFETY: SimState contains raw pointers (idle_task_raw in SimulatorState,
+// raw C pointers in CgroupInfo/SimTask) but these are only accessed while
+// the Mutex is held. The Arc<Mutex<>> ensures exclusive access.
+unsafe impl Send for SimState {}
+unsafe impl Sync for SimState {}
+
 /// Shared-ownership handle to the mutex-protected simulation state.
 pub(crate) type SimArc = Arc<Mutex<SimState>>;
 
@@ -919,6 +925,7 @@ pub(crate) fn get_engine_sim_arc() -> Option<SimArc> {
 ///
 /// Returns true when the engine has bundled state into SimState and it's
 /// safe to cast `sim_state_ptr()` to `*mut SimState` for field access.
+#[allow(dead_code)]
 pub(crate) fn sim_state_is_bundled() -> bool {
     SIM_STATE_IS_BUNDLED.with(|c| c.get())
 }
@@ -926,6 +933,49 @@ pub(crate) fn sim_state_is_bundled() -> bool {
 /// Mark that the current thread's SIM_STATE points to a bundled SimState.
 pub(crate) fn set_sim_state_bundled(bundled: bool) {
     SIM_STATE_IS_BUNDLED.with(|c| c.set(bundled));
+}
+
+/// Prepare for a C scheduler callback by installing the SimArc in the
+/// thread-local so kfuncs and cgroup callbacks can lock it.
+///
+/// Called by the engine AFTER dropping its MutexGuard and BEFORE calling
+/// into C scheduler code. Sets the SIM_ARC thread-local, CALLBACK_CTX,
+/// and SIM_CONTEXT for trace formatting.
+///
+/// Also installs the raw SIM_STATE pointer for backward compatibility
+/// with code that still uses `sim_state_ptr()`.
+#[allow(dead_code)]
+pub(crate) fn prepare_callback(arc: &SimArc, cpu: CpuId) {
+    // Lock briefly to read the state we need for context setup
+    {
+        let guard = arc.lock().unwrap();
+        set_sim_clock(guard.sim.cpus[cpu.0 as usize].local_clock, Some(cpu));
+        install_callback_ctx(CallbackContext {
+            current_cpu: cpu,
+            ops_context: guard.sim.ops_context,
+            waker_task_raw: guard.sim.waker_task_raw,
+        });
+    }
+    install_sim_arc(arc);
+}
+
+/// Finish a C scheduler callback by syncing CALLBACK_CTX back to
+/// SimState and clearing the SIM_ARC thread-local.
+///
+/// Called by the engine AFTER the C call returns and BEFORE relocking
+/// the mutex.
+#[allow(dead_code)]
+pub(crate) fn finish_callback(arc: &SimArc) {
+    // Sync CALLBACK_CTX back to SimState
+    if let Some(ctx) = get_callback_ctx() {
+        let mut guard = arc.lock().unwrap();
+        guard.sim.current_cpu = ctx.current_cpu;
+        guard.sim.ops_context = ctx.ops_context;
+        guard.sim.waker_task_raw = ctx.waker_task_raw;
+    }
+    clear_callback_ctx();
+    crate::preempt::pause_timer();
+    clear_sim_arc();
 }
 
 /// Install a simulator state pointer for the duration of ops callbacks.
@@ -949,13 +999,10 @@ pub unsafe fn enter_sim(state: &mut SimulatorState, cpu: CpuId) {
         ops_context: state.ops_context,
         waker_task_raw: state.waker_task_raw,
     });
-    // Also install SIM_ARC from ENGINE_SIM_ARC so cgroup callbacks
-    // and concurrent workers can access the full SimState.
-    ENGINE_SIM_ARC.with(|c| {
-        if let Some(ref arc) = *c.borrow() {
-            install_sim_arc(arc);
-        }
-    });
+    // NOTE: We do NOT install SIM_ARC here. The engine holds the MutexGuard,
+    // so kfuncs must use the SIM_STATE raw pointer path (with_sim checks
+    // SIM_STATE first). SIM_ARC is only installed by sim_callback! which
+    // drops the guard before the C call.
 }
 
 /// Remove the simulator state pointer after ops callbacks complete.
@@ -1114,67 +1161,58 @@ pub fn clock_window_check(_cpu: CpuId, _local_clock: TimeNs) {
 
 /// Access the simulator state from within a kfunc.
 ///
-/// Pauses the RBC counter during kfunc execution (kfunc code is not
-/// scheduler C code and should not contribute to overhead measurement)
-/// and resumes it on return. Adds `cost_ns` to the accumulated kfunc
-/// cost for the current measurement window.
-///
-/// After resuming timers, performs a post-kfunc cooperative yield to
-/// give other workers a chance to run between consecutive kfuncs.
-/// This doubles interleaving coverage compared to pre-kfunc-only yields.
+/// Uses two access paths:
+/// 1. **Raw pointer path**: If `SIM_STATE` is set (via `enter_sim`), uses the
+///    raw pointer directly. This is the fast path — the engine installs the
+///    raw pointer AND holds the MutexGuard, so we must not try to lock.
+/// 2. **Arc<Mutex<>> path**: If `SIM_STATE` is not set but `SIM_ARC` is
+///    installed (via `sim_callback!` which drops the guard first), locks
+///    the mutex.
 ///
 /// # Panics
-/// Panics if called outside of an `enter_sim`/`exit_sim` scope.
+/// Panics if neither SIM_STATE nor SIM_ARC is installed.
 fn with_sim<F, R>(cost_ns: u64, f: F) -> R
 where
     F: FnOnce(&mut SimulatorState) -> R,
 {
-    SIM_STATE.with(|cell| {
-        let ptr = cell
-            .get()
-            .expect("kfunc called outside of simulator context");
-
-        // SAFETY: We hold a valid pointer installed by enter_sim, and
-        // the simulation is single-threaded (token-serialized).
-        // We scope the &mut borrow tightly to avoid aliasing during
-        // the post-kfunc yield.
+    // Try raw pointer path first (engine holds the guard AND installs SIM_STATE)
+    let raw_ptr = SIM_STATE.with(|cell| cell.get());
+    if let Some(ptr) = raw_ptr {
         let result = {
             let sim = unsafe { &mut *ptr };
-            // Track kfunc call count and cost for RBC accounting
             sim.rbc_kfunc_calls += 1;
             sim.rbc_kfunc_ns += cost_ns;
-            // Pause RBC counter — kfunc code is not scheduler code.
-            // Uses the re-entrant pause/resume so C kfuncs called from
-            // within this kfunc don't prematurely re-enable the counter.
             sim_rbc_pause();
-            // Pause preemption timer — prevent signals while &mut SimulatorState exists
             crate::preempt::pause_timer();
-
             let result = f(sim);
-
-            // Resume RBC counter — returning to scheduler C code
             sim_rbc_resume();
             result
         };
-        // &mut SimulatorState borrow ended — safe to yield.
-
-        // Resume preemption timer — returning to scheduler C code
         crate::preempt::resume_timer();
-
-        // Post-kfunc cooperative yield — give other workers a chance
-        // to run after this kfunc completes. This catches concurrency
-        // bugs that manifest when another worker interleaves between
-        // consecutive kfuncs. The yield disables the timer, yields,
-        // and re-arms on resume.
         crate::preempt::maybe_yield_preemptive_post();
-
-        // Clear kfunc name now that the kfunc is complete. PMU preemptions
-        // fire between kfuncs (while C scheduler code runs), so the name
-        // must be empty to avoid stale names in preemption records.
         crate::preempt::set_current_kfunc("");
+        return result;
+    }
 
+    // Arc path (sim_callback! drops the guard and installs SIM_ARC)
+    let arc = SIM_ARC
+        .with(|c| c.borrow().clone())
+        .expect("kfunc called outside of simulator context");
+    let result = {
+        let mut guard = arc.lock().unwrap();
+        let sim = &mut guard.sim;
+        sim.rbc_kfunc_calls += 1;
+        sim.rbc_kfunc_ns += cost_ns;
+        sim_rbc_pause();
+        crate::preempt::pause_timer();
+        let result = f(sim);
+        sim_rbc_resume();
         result
-    })
+    };
+    crate::preempt::resume_timer();
+    crate::preempt::maybe_yield_preemptive_post();
+    crate::preempt::set_current_kfunc("");
+    result
 }
 
 // ---------------------------------------------------------------------------
