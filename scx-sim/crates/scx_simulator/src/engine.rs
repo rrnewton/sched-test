@@ -1486,44 +1486,54 @@ impl<S: Scheduler> Simulator<S> {
         // Call cgroup_init for each cgroup (root first, then children in order).
         // In the kernel, cgroup_init is called for all existing cgroups when
         // the scheduler is loaded.
-        unsafe {
+        {
             let cpu = s.sim.current_cpu;
-            kfuncs::enter_sim(&mut s.sim, cpu);
             // Refresh CSS iterator so cgroup_init callbacks can use
             // bpf_for_each(css, ...) if needed.
-            s.cgroup_registry.prepare_css_iter_from_root();
-            for cgid in s.cgroup_registry.all_cgids_preorder() {
-                if let Some(raw) = s.cgroup_registry.get_raw(cgid) {
-                    start_rbc(&mut s.sim);
-                    let rc = self.scheduler.cgroup_init(raw, std::ptr::null_mut());
-                    charge_sched_time(&mut s.sim, CpuId(0), "cgroup_init");
-                    assert!(rc == 0, "cgroup_init failed for cgid={} rc={rc}", cgid.0);
-                }
+            unsafe { s.cgroup_registry.prepare_css_iter_from_root() };
+            // Snapshot cgids and raw pointers before dropping guard for C calls.
+            let cg_init_list: Vec<(CgroupId, *mut c_void)> = s
+                .cgroup_registry
+                .all_cgids_preorder()
+                .into_iter()
+                .filter_map(|cgid| s.cgroup_registry.get_raw(cgid).map(|raw| (cgid, raw)))
+                .collect();
+            for (cgid, raw) in cg_init_list {
+                start_rbc(&mut s.sim);
+                #[allow(unused_assignments)]
+                let mut rc = 0i32;
+                sim_callback!(s, sim_arc, cpu, {
+                    rc = self.scheduler.cgroup_init(raw, std::ptr::null_mut());
+                });
+                charge_sched_time(&mut s.sim, CpuId(0), "cgroup_init");
+                assert!(rc == 0, "cgroup_init failed for cgid={} rc={rc}", cgid.0);
             }
-            kfuncs::exit_sim();
         }
 
         // Call cgroup_set_bandwidth for cgroups that have bandwidth configured.
         // In the kernel, this is called when writing to cpu.max.
-        unsafe {
+        {
             let cpu = s.sim.current_cpu;
-            kfuncs::enter_sim(&mut s.sim, cpu);
-            for cg_def in &scenario.cgroups {
-                if let Some(ref bw) = cg_def.bandwidth {
-                    if let Some(cgrp_info) = s.cgroup_registry.get_by_name(&cg_def.name) {
-                        let raw = cgrp_info.raw();
-                        start_rbc(&mut s.sim);
-                        self.scheduler.cgroup_set_bandwidth(
-                            raw,
-                            bw.period_us,
-                            bw.quota_us,
-                            bw.burst_us,
-                        );
-                        charge_sched_time(&mut s.sim, CpuId(0), "cgroup_set_bandwidth");
-                    }
-                }
+            // Snapshot bandwidth configs before dropping guard.
+            let bw_configs: Vec<_> = scenario
+                .cgroups
+                .iter()
+                .filter_map(|cg_def| {
+                    cg_def.bandwidth.as_ref().and_then(|bw| {
+                        s.cgroup_registry
+                            .get_by_name(&cg_def.name)
+                            .map(|info| (info.raw(), bw.period_us, bw.quota_us, bw.burst_us))
+                    })
+                })
+                .collect();
+            for (raw, period_us, quota_us, burst_us) in bw_configs {
+                start_rbc(&mut s.sim);
+                sim_callback!(s, sim_arc, cpu, {
+                    self.scheduler
+                        .cgroup_set_bandwidth(raw, period_us, quota_us, burst_us);
+                });
+                charge_sched_time(&mut s.sim, CpuId(0), "cgroup_set_bandwidth");
             }
-            kfuncs::exit_sim();
         }
 
         // Pre-assign tasks to cgroups before init_task.
@@ -1554,35 +1564,36 @@ impl<S: Scheduler> Simulator<S> {
         // bpf_task_from_pid parent lookups).
         let mut sorted_pids: Vec<Pid> = s.tasks.keys().copied().collect();
         sorted_pids.sort_by_key(|p| p.0);
-        unsafe {
+        {
             let cpu = s.sim.current_cpu;
-            kfuncs::enter_sim(&mut s.sim, cpu);
             for pid in sorted_pids {
-                let ss = &mut *s; // explicit deref for split borrow
-                let task = &ss.tasks[&pid];
-                // Resolve cgroup map BEFORE start_rbc — HashMap::get() has
-                // non-deterministic branch count due to random hash seeds.
-                let cgrp_raw = task_cgroup_map.get(&task.pid).copied();
-                start_rbc(&mut ss.sim);
-                let rc = if let Some(cgrp_raw) = cgrp_raw {
-                    self.scheduler.init_task_in_cgroup(task.raw(), cgrp_raw)
-                } else {
-                    self.scheduler.init_task(task.raw())
-                };
-                charge_sched_time(&mut ss.sim, CpuId(0), "init_task");
-                assert!(rc == 0, "init_task failed for pid={} rc={rc}", task.pid.0);
+                let task_raw = s.tasks[&pid].raw();
+                let task_pid = s.tasks[&pid].pid;
+                let cgrp_raw = task_cgroup_map.get(&task_pid).copied();
+                start_rbc(&mut s.sim);
+                #[allow(unused_assignments)]
+                let mut rc = 0i32;
+                sim_callback!(s, sim_arc, cpu, {
+                    rc = if let Some(cgrp_raw) = cgrp_raw {
+                        self.scheduler.init_task_in_cgroup(task_raw, cgrp_raw)
+                    } else {
+                        self.scheduler.init_task(task_raw)
+                    };
+                });
+                charge_sched_time(&mut s.sim, CpuId(0), "init_task");
+                assert!(rc == 0, "init_task failed for pid={} rc={rc}", task_pid.0);
 
                 // Register task in task_pid_to_raw AFTER init_task completes.
-                // This allows other tasks' init_task to find this task as a parent.
-                ss.sim.task_pid_to_raw.insert(task.pid, task.raw() as usize);
+                s.sim.task_pid_to_raw.insert(task_pid, task_raw as usize);
 
                 // Notify scheduler of initial cpumask (mirrors kernel enumeration)
-                let cpus_ptr = ffi::sim_task_get_cpus_ptr(task.raw());
-                start_rbc(&mut ss.sim);
-                self.scheduler.set_cpumask(task.raw(), cpus_ptr);
-                charge_sched_time(&mut ss.sim, CpuId(0), "set_cpumask");
+                let cpus_ptr = unsafe { ffi::sim_task_get_cpus_ptr(task_raw) };
+                start_rbc(&mut s.sim);
+                sim_callback!(s, sim_arc, cpu, {
+                    self.scheduler.set_cpumask(task_raw, cpus_ptr);
+                });
+                charge_sched_time(&mut s.sim, CpuId(0), "set_cpumask");
             }
-            kfuncs::exit_sim();
         }
 
         // All CPUs start idle — notify the scheduler so it can begin
@@ -1592,12 +1603,10 @@ impl<S: Scheduler> Simulator<S> {
         for cpu_id in 0..nr_cpus {
             let cpu = CpuId(cpu_id);
             s.sim.cpus[cpu.0 as usize].local_clock = 1;
-            unsafe {
-                kfuncs::enter_sim(&mut s.sim, cpu);
-                set_ops_context(&mut s.sim, OpsContext::UpdateIdle);
+            set_ops_context(&mut s.sim, OpsContext::UpdateIdle);
+            sim_callback!(s, sim_arc, cpu, {
                 self.scheduler.update_idle(cpu.0 as i32, true);
-                kfuncs::exit_sim();
-            }
+            });
             s.sim.cpus[cpu.0 as usize].local_clock = 0;
         }
 
@@ -1827,66 +1836,74 @@ impl<S: Scheduler> Simulator<S> {
         // charge RBC costs that accumulate on the CPU clock.
         let mut shutdown_pids: Vec<Pid> = s.tasks.keys().copied().collect();
         shutdown_pids.sort_by_key(|p| p.0);
-        unsafe {
+        {
             let cpu = s.sim.current_cpu;
-            kfuncs::enter_sim(&mut s.sim, cpu);
             start_rbc(&mut s.sim);
-            self.scheduler.dump(std::ptr::null_mut());
+            sim_callback!(s, sim_arc, cpu, {
+                self.scheduler.dump(std::ptr::null_mut());
+            });
             charge_sched_time(&mut s.sim, CpuId(0), "dump");
 
-            for &pid in &shutdown_pids {
-                let ss = &mut *s;
-                let task = &ss.tasks[&pid];
-                start_rbc(&mut ss.sim);
-                self.scheduler.dump_task(std::ptr::null_mut(), task.raw());
-                charge_sched_time(&mut ss.sim, CpuId(0), "dump_task");
+            // Snapshot task raw pointers for dump_task/exit_task.
+            let task_raws: Vec<(Pid, *mut c_void)> = shutdown_pids
+                .iter()
+                .map(|&pid| (pid, s.tasks[&pid].raw()))
+                .collect();
+
+            for &(pid, raw) in &task_raws {
+                start_rbc(&mut s.sim);
+                sim_callback!(s, sim_arc, cpu, {
+                    self.scheduler.dump_task(std::ptr::null_mut(), raw);
+                });
+                charge_sched_time(&mut s.sim, CpuId(0), "dump_task");
+                let _ = pid; // used for deterministic ordering
             }
-            kfuncs::exit_sim();
         }
 
         // Call exit_task for each task (mirrors kernel scheduler unload)
-        unsafe {
+        {
             let cpu = s.sim.current_cpu;
-            kfuncs::enter_sim(&mut s.sim, cpu);
-            for &pid in &shutdown_pids {
-                let ss = &mut *s;
-                let task = &ss.tasks[&pid];
+            let task_raws: Vec<(Pid, *mut c_void)> = shutdown_pids
+                .iter()
+                .map(|&pid| (pid, s.tasks[&pid].raw()))
+                .collect();
+            for &(pid, raw) in &task_raws {
                 debug!(pid = pid.0, "enter:structop exit_task");
-                start_rbc(&mut ss.sim);
-                self.scheduler.exit_task(task.raw());
-                charge_sched_time(&mut ss.sim, CpuId(0), "exit_task");
+                start_rbc(&mut s.sim);
+                sim_callback!(s, sim_arc, cpu, {
+                    self.scheduler.exit_task(raw);
+                });
+                charge_sched_time(&mut s.sim, CpuId(0), "exit_task");
             }
-            kfuncs::exit_sim();
         }
 
         // Call cgroup_exit for each cgroup (reverse order: children before root)
-        unsafe {
+        {
             let cpu = s.sim.current_cpu;
-            kfuncs::enter_sim(&mut s.sim, cpu);
-            let cgids: Vec<CgroupId> = s
+            let cg_exit_list: Vec<(*mut c_void,)> = s
                 .cgroup_registry
                 .all_cgids_preorder()
                 .into_iter()
                 .rev()
+                .filter_map(|cgid| s.cgroup_registry.get_raw(cgid).map(|raw| (raw,)))
                 .collect();
-            for cgid in cgids {
-                if let Some(raw) = s.cgroup_registry.get_raw(cgid) {
-                    start_rbc(&mut s.sim);
+            for (raw,) in cg_exit_list {
+                start_rbc(&mut s.sim);
+                sim_callback!(s, sim_arc, cpu, {
                     self.scheduler.cgroup_exit(raw);
-                    charge_sched_time(&mut s.sim, CpuId(0), "cgroup_exit");
-                }
+                });
+                charge_sched_time(&mut s.sim, CpuId(0), "cgroup_exit");
             }
-            kfuncs::exit_sim();
         }
 
         // Call scheduler exit
-        unsafe {
+        {
             let cpu = s.sim.current_cpu;
-            kfuncs::enter_sim(&mut s.sim, cpu);
             start_rbc(&mut s.sim);
-            self.scheduler.exit();
+            sim_callback!(s, sim_arc, cpu, {
+                self.scheduler.exit();
+            });
             charge_sched_time(&mut s.sim, CpuId(0), "exit");
-            kfuncs::exit_sim();
         }
 
         // (Cgroup registry is now part of SimState, no separate cleanup needed.)
