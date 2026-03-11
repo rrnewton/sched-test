@@ -1071,7 +1071,7 @@ pub(crate) unsafe fn dispatch_worker_body<S: Scheduler>(
 /// Must be called inside an `enter_sim` / `exit_sim` scope.
 pub(crate) unsafe fn batch_worker_body<S: Scheduler>(
     simp: *const Simulator<S>,
-    sim_state: &mut SimState,
+    sim_arc: &SimArc,
     cpu_events: Vec<Event>,
     watchdog_timeout: Option<TimeNs>,
     duration_ns: TimeNs,
@@ -1080,7 +1080,7 @@ pub(crate) unsafe fn batch_worker_body<S: Scheduler>(
     for event in cpu_events {
         (*simp).process_event(
             event,
-            sim_state,
+            sim_arc,
             watchdog_timeout,
             duration_ns,
             max_cgroups,
@@ -1091,31 +1091,36 @@ pub(crate) unsafe fn batch_worker_body<S: Scheduler>(
 
 /// Drop the MutexGuard, install SIM_ARC, call C code, then reacquire.
 ///
+/// Takes `$s` (the `&mut SimState` deref of `$guard`) and shadows it to
+/// end the borrow before dropping the guard. After relocking, rebinds `$s`.
+///
 /// Usage:
 /// ```ignore
-/// sim_callback!(guard, sim_arc, cpu, {
+/// let mut guard = sim_arc.lock().unwrap();
+/// let s = &mut *guard;
+/// s.sim.current_cpu = cpu;
+/// sim_callback!(s, guard, sim_arc, cpu, {
 ///     self.scheduler.init();
 /// });
-/// // guard is now relocked
+/// // s and guard are now rebound (relocked)
 /// ```
 macro_rules! sim_callback {
-    ($guard:ident, $arc:expr, $cpu:expr, $call:block) => {{
-        {
-            let __cpu = $cpu;
-            let __sim = &mut $guard.sim;
-            __sim.current_cpu = __cpu;
-            kfuncs::set_sim_clock(__sim.cpus[__cpu.0 as usize].local_clock, Some(__cpu));
-            kfuncs::install_callback_ctx(kfuncs::CallbackContext {
-                current_cpu: __cpu,
-                ops_context: __sim.ops_context,
-                waker_task_raw: __sim.waker_task_raw,
-            });
-        }
+    ($s:ident, $guard:ident, $arc:expr, $cpu:expr, $call:block) => {
+        // Read context through $s (the caller's &mut *guard deref).
+        // NLL ends $s's borrow on $guard after the last use (install_callback_ctx).
+        let __cpu = $cpu;
+        $s.sim.current_cpu = __cpu;
+        kfuncs::set_sim_clock($s.sim.cpus[__cpu.0 as usize].local_clock, Some(__cpu));
+        kfuncs::install_callback_ctx(kfuncs::CallbackContext {
+            current_cpu: __cpu,
+            ops_context: $s.sim.ops_context,
+            waker_task_raw: $s.sim.waker_task_raw,
+        });
+        // $s is no longer used. NLL ends its borrow on $guard.
         drop($guard);
         kfuncs::install_sim_arc(&$arc);
         unsafe { $call }
         kfuncs::clear_sim_arc();
-        // Sync CALLBACK_CTX back
         $guard = $arc.lock().unwrap();
         if let Some(__ctx) = kfuncs::get_callback_ctx() {
             $guard.sim.current_cpu = __ctx.current_cpu;
@@ -1124,7 +1129,8 @@ macro_rules! sim_callback {
         }
         kfuncs::clear_callback_ctx();
         crate::preempt::pause_timer();
-    }};
+        // Caller must rebind: let $s = &mut *$guard;
+    };
 }
 
 impl<S: Scheduler> Simulator<S> {
@@ -1458,8 +1464,7 @@ impl<S: Scheduler> Simulator<S> {
         kfuncs::set_engine_sim_arc(&sim_arc);
         // Mark that SIM_STATE will point to a bundled SimState.
         kfuncs::set_sim_state_bundled(true);
-        // Alias for code that still uses `s.sim`, `s.tasks` etc.
-        // The engine locks the Arc for its own work and drops before C calls.
+        // Lock the Arc for engine work. Dropped before C calls via sim_callback!.
         let mut s = sim_arc.lock().unwrap();
 
         // If --wait-debugger was requested, pause so the user can attach a
@@ -1476,7 +1481,7 @@ impl<S: Scheduler> Simulator<S> {
             start_rbc(&mut s.sim);
             #[allow(unused_assignments)]
             let mut rc = 0i32;
-            sim_callback!(s, sim_arc, cpu, {
+            sim_callback!(s, s, sim_arc, cpu, {
                 rc = self.scheduler.init();
             });
             charge_sched_time(&mut s.sim, CpuId(0), "init");
@@ -1502,7 +1507,7 @@ impl<S: Scheduler> Simulator<S> {
                 start_rbc(&mut s.sim);
                 #[allow(unused_assignments)]
                 let mut rc = 0i32;
-                sim_callback!(s, sim_arc, cpu, {
+                sim_callback!(s, s, sim_arc, cpu, {
                     rc = self.scheduler.cgroup_init(raw, std::ptr::null_mut());
                 });
                 charge_sched_time(&mut s.sim, CpuId(0), "cgroup_init");
@@ -1528,7 +1533,7 @@ impl<S: Scheduler> Simulator<S> {
                 .collect();
             for (raw, period_us, quota_us, burst_us) in bw_configs {
                 start_rbc(&mut s.sim);
-                sim_callback!(s, sim_arc, cpu, {
+                sim_callback!(s, s, sim_arc, cpu, {
                     self.scheduler
                         .cgroup_set_bandwidth(raw, period_us, quota_us, burst_us);
                 });
@@ -1573,7 +1578,7 @@ impl<S: Scheduler> Simulator<S> {
                 start_rbc(&mut s.sim);
                 #[allow(unused_assignments)]
                 let mut rc = 0i32;
-                sim_callback!(s, sim_arc, cpu, {
+                sim_callback!(s, s, sim_arc, cpu, {
                     rc = if let Some(cgrp_raw) = cgrp_raw {
                         self.scheduler.init_task_in_cgroup(task_raw, cgrp_raw)
                     } else {
@@ -1589,7 +1594,7 @@ impl<S: Scheduler> Simulator<S> {
                 // Notify scheduler of initial cpumask (mirrors kernel enumeration)
                 let cpus_ptr = unsafe { ffi::sim_task_get_cpus_ptr(task_raw) };
                 start_rbc(&mut s.sim);
-                sim_callback!(s, sim_arc, cpu, {
+                sim_callback!(s, s, sim_arc, cpu, {
                     self.scheduler.set_cpumask(task_raw, cpus_ptr);
                 });
                 charge_sched_time(&mut s.sim, CpuId(0), "set_cpumask");
@@ -1604,7 +1609,7 @@ impl<S: Scheduler> Simulator<S> {
             let cpu = CpuId(cpu_id);
             s.sim.cpus[cpu.0 as usize].local_clock = 1;
             set_ops_context(&mut s.sim, OpsContext::UpdateIdle);
-            sim_callback!(s, sim_arc, cpu, {
+            sim_callback!(s, s, sim_arc, cpu, {
                 self.scheduler.update_idle(cpu.0 as i32, true);
             });
             s.sim.cpus[cpu.0 as usize].local_clock = 0;
@@ -1779,9 +1784,10 @@ impl<S: Scheduler> Simulator<S> {
             if interleave_enabled {
                 // Dynamic concurrency window: start with same-timestamp
                 // events, then expand as CPU clocks advance.
+                drop(s);
                 if let Some(err) = self.process_dynamic_window(
                     t,
-                    &mut s,
+                    &sim_arc,
                     watchdog_timeout,
                     scenario.duration_ns,
                     max_cgroups,
@@ -1791,15 +1797,17 @@ impl<S: Scheduler> Simulator<S> {
                     exit_kind = err;
                     break 'event_loop;
                 }
+                s = sim_arc.lock().unwrap();
             } else {
                 // No interleaving: process all events sequentially in
                 // original priority order (preserves backward-compatible
                 // determinism).
                 let batch = s.events.drain_at(t);
                 for event in batch {
+                    drop(s);
                     if let Some(err) = self.process_event(
                         event,
-                        &mut s,
+                        &sim_arc,
                         watchdog_timeout,
                         scenario.duration_ns,
                         max_cgroups,
@@ -1808,6 +1816,7 @@ impl<S: Scheduler> Simulator<S> {
                         exit_kind = err;
                         break 'event_loop;
                     }
+                    s = sim_arc.lock().unwrap();
                     if let Some(err) = check_bpf_error(&mut s.sim, ignore_bpf_errors) {
                         exit_kind = err;
                         break 'event_loop;
@@ -1817,9 +1826,8 @@ impl<S: Scheduler> Simulator<S> {
         }
 
         // Flush running tasks: emit SimulationEnd for any task still on-CPU
-        // so that total_runtime() can close its open interval. We use
-        // duration_ns as the end time because the simulation conceptually
-        // ends at the configured boundary regardless of per-CPU clock drift.
+        // Relock the guard after event loop (may have been dropped during processing).
+        s = sim_arc.lock().unwrap();
         for cpu_idx in 0..s.sim.cpus.len() {
             if let Some(pid) = s.sim.cpus[cpu_idx].current_task {
                 s.sim.trace.record(
@@ -1839,7 +1847,7 @@ impl<S: Scheduler> Simulator<S> {
         {
             let cpu = s.sim.current_cpu;
             start_rbc(&mut s.sim);
-            sim_callback!(s, sim_arc, cpu, {
+            sim_callback!(s, s, sim_arc, cpu, {
                 self.scheduler.dump(std::ptr::null_mut());
             });
             charge_sched_time(&mut s.sim, CpuId(0), "dump");
@@ -1852,7 +1860,7 @@ impl<S: Scheduler> Simulator<S> {
 
             for &(pid, raw) in &task_raws {
                 start_rbc(&mut s.sim);
-                sim_callback!(s, sim_arc, cpu, {
+                sim_callback!(s, s, sim_arc, cpu, {
                     self.scheduler.dump_task(std::ptr::null_mut(), raw);
                 });
                 charge_sched_time(&mut s.sim, CpuId(0), "dump_task");
@@ -1870,7 +1878,7 @@ impl<S: Scheduler> Simulator<S> {
             for &(pid, raw) in &task_raws {
                 debug!(pid = pid.0, "enter:structop exit_task");
                 start_rbc(&mut s.sim);
-                sim_callback!(s, sim_arc, cpu, {
+                sim_callback!(s, s, sim_arc, cpu, {
                     self.scheduler.exit_task(raw);
                 });
                 charge_sched_time(&mut s.sim, CpuId(0), "exit_task");
@@ -1889,7 +1897,7 @@ impl<S: Scheduler> Simulator<S> {
                 .collect();
             for (raw,) in cg_exit_list {
                 start_rbc(&mut s.sim);
-                sim_callback!(s, sim_arc, cpu, {
+                sim_callback!(s, s, sim_arc, cpu, {
                     self.scheduler.cgroup_exit(raw);
                 });
                 charge_sched_time(&mut s.sim, CpuId(0), "cgroup_exit");
@@ -1900,7 +1908,7 @@ impl<S: Scheduler> Simulator<S> {
         {
             let cpu = s.sim.current_cpu;
             start_rbc(&mut s.sim);
-            sim_callback!(s, sim_arc, cpu, {
+            sim_callback!(s, s, sim_arc, cpu, {
                 self.scheduler.exit();
             });
             charge_sched_time(&mut s.sim, CpuId(0), "exit");
@@ -1948,12 +1956,14 @@ impl<S: Scheduler> Simulator<S> {
     fn process_event(
         &self,
         event: Event,
-        s: &mut SimState,
+        sim_arc: &SimArc,
         watchdog_timeout: Option<TimeNs>,
         duration_ns: TimeNs,
         max_cgroups: u32,
         monitor: &mut dyn Monitor,
     ) -> Option<ExitKind> {
+        let mut guard = sim_arc.lock().unwrap();
+        let s = &mut *guard;
         // Advance per-CPU clock for CPU-specific events
         match &event.kind {
             EventKind::SliceExpired { cpu }
@@ -1984,16 +1994,24 @@ impl<S: Scheduler> Simulator<S> {
 
         match event.kind {
             EventKind::TaskWake { pid, waker, .. } => {
-                self.handle_task_wake(pid, waker, s, monitor);
+                drop(guard);
+                self.handle_task_wake(pid, waker, sim_arc, monitor);
+                guard = sim_arc.lock().unwrap();
             }
             EventKind::SliceExpired { cpu } => {
-                self.handle_slice_expired(cpu, s, monitor);
+                drop(guard);
+                self.handle_slice_expired(cpu, sim_arc, monitor);
+                guard = sim_arc.lock().unwrap();
             }
             EventKind::TaskPhaseComplete { cpu } => {
-                self.handle_task_phase_complete(cpu, s, duration_ns, monitor);
+                drop(guard);
+                self.handle_task_phase_complete(cpu, sim_arc, duration_ns, monitor);
+                guard = sim_arc.lock().unwrap();
             }
             EventKind::TimerFired { cpu } => {
-                self.handle_timer_fired(cpu, s, monitor);
+                drop(guard);
+                self.handle_timer_fired(cpu, sim_arc, monitor);
+                guard = sim_arc.lock().unwrap();
             }
             EventKind::Tick { cpu } => {
                 if let Some(timeout) = watchdog_timeout {
@@ -2002,19 +2020,29 @@ impl<S: Scheduler> Simulator<S> {
                         return Some(stall_error);
                     }
                 }
-                self.handle_tick(cpu, s, monitor);
+                drop(guard);
+                self.handle_tick(cpu, sim_arc, monitor);
+                guard = sim_arc.lock().unwrap();
             }
             EventKind::CpuOffline { cpu } => {
-                self.handle_cpu_offline(cpu, s, monitor);
+                drop(guard);
+                self.handle_cpu_offline(cpu, sim_arc, monitor);
+                guard = sim_arc.lock().unwrap();
             }
             EventKind::CpuOnline { cpu } => {
-                self.handle_cpu_online(cpu, s, monitor);
+                drop(guard);
+                self.handle_cpu_online(cpu, sim_arc, monitor);
+                guard = sim_arc.lock().unwrap();
             }
             EventKind::CpuRelease { cpu } => {
-                self.handle_cpu_release(cpu, s, monitor);
+                drop(guard);
+                self.handle_cpu_release(cpu, sim_arc, monitor);
+                guard = sim_arc.lock().unwrap();
             }
             EventKind::CpuAcquire { cpu } => {
-                self.handle_cpu_acquire(cpu, s, monitor);
+                drop(guard);
+                self.handle_cpu_acquire(cpu, sim_arc, monitor);
+                guard = sim_arc.lock().unwrap();
             }
             EventKind::CgroupMigrate {
                 pid,
@@ -2022,18 +2050,26 @@ impl<S: Scheduler> Simulator<S> {
                 to_cgroup,
                 ..
             } => {
-                self.handle_cgroup_migrate(pid, &from_cgroup, &to_cgroup, s, monitor);
+                drop(guard);
+                self.handle_cgroup_migrate(pid, &from_cgroup, &to_cgroup, sim_arc, monitor);
+                guard = sim_arc.lock().unwrap();
             }
             EventKind::CgroupCreate { event, .. } => {
-                if let Some(err) = self.handle_cgroup_create(&event, s, max_cgroups) {
+                drop(guard);
+                if let Some(err) = self.handle_cgroup_create(&event, sim_arc, max_cgroups) {
                     return Some(err);
                 }
+                guard = sim_arc.lock().unwrap();
             }
             EventKind::CgroupDestroy { event, .. } => {
-                self.handle_cgroup_destroy(&event, s);
+                drop(guard);
+                self.handle_cgroup_destroy(&event, sim_arc);
+                guard = sim_arc.lock().unwrap();
             }
             EventKind::CgroupCpusetChange { event, .. } => {
-                self.handle_cgroup_cpuset_change(&event, s);
+                drop(guard);
+                self.handle_cgroup_cpuset_change(&event, sim_arc);
+                guard = sim_arc.lock().unwrap();
             }
             EventKind::IrqStart {
                 cpu,
@@ -2041,21 +2077,32 @@ impl<S: Scheduler> Simulator<S> {
                 duration_ns,
                 wake_pids,
             } => {
-                self.handle_irq_start(cpu, irq_type, duration_ns, &wake_pids, s, monitor);
+                drop(guard);
+                self.handle_irq_start(cpu, irq_type, duration_ns, &wake_pids, sim_arc, monitor);
+                guard = sim_arc.lock().unwrap();
             }
             EventKind::IrqEnd { cpu } => {
-                self.handle_irq_end(cpu, s);
+                drop(guard);
+                self.handle_irq_end(cpu, sim_arc);
+                guard = sim_arc.lock().unwrap();
             }
             EventKind::DsqConsume { cpu } => {
-                self.handle_dsq_consume(cpu, s, monitor);
+                drop(guard);
+                self.handle_dsq_consume(cpu, sim_arc, monitor);
+                guard = sim_arc.lock().unwrap();
             }
             EventKind::StartRunning { cpu, pid } => {
-                self.handle_start_running_event(cpu, pid, s, monitor);
+                drop(guard);
+                self.handle_start_running_event(cpu, pid, sim_arc, monitor);
+                guard = sim_arc.lock().unwrap();
             }
             EventKind::KickDelivered { cpu, flags } => {
-                self.handle_kick_delivered(cpu, flags, s, monitor);
+                drop(guard);
+                self.handle_kick_delivered(cpu, flags, sim_arc, monitor);
+                guard = sim_arc.lock().unwrap();
             }
         }
+        let s = &mut *guard;
         None
     }
 
@@ -2068,22 +2115,23 @@ impl<S: Scheduler> Simulator<S> {
     /// Calls the scheduler's `fire_timer()` callback, which invokes the
     /// stored BPF timer callback (e.g., `wakeup_timerfn` in COSMOS).
     /// The callback may kick CPUs and re-arm the timer via `bpf_timer_start`.
-    fn handle_timer_fired(&self, cpu: CpuId, s: &mut SimState, _monitor: &mut dyn Monitor) {
-        unsafe {
-            // Advance the per-CPU clock so scx_bpf_now() inside the callback
-            // returns a value consistent with (or later than) all CPU local clocks.
-            s.sim.advance_cpu_clock(cpu);
-            kfuncs::enter_sim(&mut s.sim, cpu);
-            set_ops_context(&mut s.sim, OpsContext::FireTimer);
-            // Populate the CSS iterator so bpf_for_each(css, ...) inside the
-            // timer callback can discover all cgroups (e.g. mitosis
-            // update_timer_cb configures cells from the cgroup tree).
-            s.cgroup_registry.prepare_css_iter_from_root();
-            start_rbc(&mut s.sim);
+    fn handle_timer_fired(&self, cpu: CpuId, sim_arc: &SimArc, _monitor: &mut dyn Monitor) {
+        let mut guard = sim_arc.lock().unwrap();
+        let s = &mut *guard;
+        // Advance the per-CPU clock so scx_bpf_now() inside the callback
+        // returns a value consistent with (or later than) all CPU local clocks.
+        s.sim.advance_cpu_clock(cpu);
+        set_ops_context(&mut s.sim, OpsContext::FireTimer);
+        // Populate the CSS iterator so bpf_for_each(css, ...) inside the
+        // timer callback can discover all cgroups (e.g. mitosis
+        // update_timer_cb configures cells from the cgroup tree).
+        unsafe { s.cgroup_registry.prepare_css_iter_from_root() };
+        start_rbc(&mut s.sim);
+        sim_callback!(s, guard, sim_arc, cpu, {
             self.scheduler.fire_timer();
-            charge_sched_time(&mut s.sim, cpu, "fire_timer");
-            kfuncs::exit_sim();
-        }
+        });
+        let s = &mut *guard;
+        charge_sched_time(&mut s.sim, cpu, "fire_timer");
 
         // Drain re-armed timer. The CPU is captured by `sim_timer_start`
         // inside the callback (which may differ from `cpu` if the callback
@@ -2098,7 +2146,7 @@ impl<S: Scheduler> Simulator<S> {
         }
 
         // Flush staged events (e.g. KickDelivered) from the timer callback
-        flush_staged_events(&mut s.sim, &mut s.events);
+        { let s = &mut *guard; flush_staged_events(&mut s.sim, &mut s.events); }
     }
 
     /// Handle a periodic scheduler tick on a CPU.
@@ -2111,7 +2159,9 @@ impl<S: Scheduler> Simulator<S> {
     /// via two patterns:
     /// 1. Scheduler called `scx_bpf_kick_cpu(cpu, SCX_KICK_PREEMPT)` on self
     /// 2. Scheduler zeroed `p->scx.slice` (slice changed to 0 during tick)
-    fn handle_tick(&self, cpu: CpuId, s: &mut SimState, monitor: &mut dyn Monitor) {
+    fn handle_tick(&self, cpu: CpuId, sim_arc: &SimArc, monitor: &mut dyn Monitor) {
+        let mut guard = sim_arc.lock().unwrap();
+        let s = &mut *guard;
         // Don't schedule further ticks on offline CPUs
         if !s.sim.cpus[cpu.0 as usize].is_online {
             return;
@@ -2134,15 +2184,17 @@ impl<S: Scheduler> Simulator<S> {
         };
 
         // Record tick in trace
+        let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
         s.sim.trace.record(
-            s.sim.cpus[cpu.0 as usize].local_clock,
+            __local_t,
             cpu,
             TraceKind::Tick { pid },
         );
 
         // Sample all non-builtin DSQ lengths at tick time
+        let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
         s.sim.trace.sample_dsq_lengths(
-            s.sim.cpus[cpu.0 as usize].local_clock,
+            __local_t,
             &s.sim.dsqs,
             DsqSampleTrigger::Tick,
             None, // Sample all DSQs
@@ -2162,16 +2214,15 @@ impl<S: Scheduler> Simulator<S> {
             update_sum_exec(raw, task.sum_exec_base, elapsed);
         }
 
-        unsafe {
-            kfuncs::enter_sim(&mut s.sim, cpu);
-            set_ops_context(&mut s.sim, OpsContext::Tick);
-            debug!(pid = pid.0, "enter:structop tick");
-            start_rbc(&mut s.sim);
+        set_ops_context(&mut s.sim, OpsContext::Tick);
+        debug!(pid = pid.0, "enter:structop tick");
+        start_rbc(&mut s.sim);
+        sim_callback!(s, guard, sim_arc, cpu, {
             self.scheduler.tick(raw);
-            charge_sched_time(&mut s.sim, cpu, "tick");
-            maybe_record_checkpoint(&s.sim, CheckpointEvent::Tick, cpu);
-            kfuncs::exit_sim();
-        }
+        });
+        let s = &mut *guard;
+        charge_sched_time(&mut s.sim, cpu, "tick");
+        maybe_record_checkpoint(&s.sim, CheckpointEvent::Tick, cpu);
 
         // Check for self-preemption: look in staged_events for a
         // KickDelivered targeting this CPU with PREEMPT.
@@ -2194,7 +2245,9 @@ impl<S: Scheduler> Simulator<S> {
         flush_staged_events(&mut s.sim, &mut s.events);
 
         if should_preempt && s.sim.cpus[cpu.0 as usize].current_task.is_some() {
-            self.preempt_current(cpu, s, monitor);
+            drop(guard);
+            self.preempt_current(cpu, sim_arc, monitor);
+            guard = sim_arc.lock().unwrap();
         }
     }
 
@@ -2203,7 +2256,9 @@ impl<S: Scheduler> Simulator<S> {
     /// Preempts any running task, drains the local DSQ, calls
     /// `ops.cpu_offline`, and marks the CPU offline so ticks and
     /// dispatch stop targeting it.
-    fn handle_cpu_offline(&self, cpu: CpuId, s: &mut SimState, monitor: &mut dyn Monitor) {
+    fn handle_cpu_offline(&self, cpu: CpuId, sim_arc: &SimArc, monitor: &mut dyn Monitor) {
+        let mut guard = sim_arc.lock().unwrap();
+        let s = &mut *guard;
         if !s.sim.cpus[cpu.0 as usize].is_online {
             return; // Already offline
         }
@@ -2211,35 +2266,39 @@ impl<S: Scheduler> Simulator<S> {
         info!(cpu = cpu.0, "CPU OFFLINE");
 
         // Preempt running task (if any) — it will be re-enqueued
-        if s.sim.cpus[cpu.0 as usize].current_task.is_some() {
-            self.preempt_current(cpu, s, monitor);
+        let needs_preempt = s.sim.cpus[cpu.0 as usize].current_task.is_some();
+        if needs_preempt {
+            drop(guard);
+            self.preempt_current(cpu, sim_arc, monitor);
+            guard = sim_arc.lock().unwrap();
         }
+        let s = &mut *guard;
 
         // Drain local DSQ: re-enqueue each task so the scheduler places it
         // elsewhere. In the kernel, migrate_disabled tasks would stay, but
         // we don't model that.
         let local_pids: Vec<Pid> = s.sim.cpus[cpu.0 as usize].local_dsq.drain(..).collect();
         for pid in local_pids {
+            let s = &mut *guard;
             if let Some(task) = s.tasks.get(&pid) {
                 let raw = task.raw();
-                unsafe {
-                    kfuncs::enter_sim(&mut s.sim, cpu);
-                    self.call_enqueue(cpu, raw, 0, &mut s.sim);
-                    kfuncs::exit_sim();
-                }
+                sim_callback!(s, guard, sim_arc, cpu, {
+                    self.scheduler.enqueue(raw, 0);
+                });
+                let s = &mut *guard;
             }
         }
 
         // Notify the scheduler
-        unsafe {
-            kfuncs::enter_sim(&mut s.sim, cpu);
-            set_ops_context(&mut s.sim, OpsContext::CpuOffline);
-            debug!(cpu = cpu.0, "enter:structop cpu_offline");
-            start_rbc(&mut s.sim);
+        let s = &mut *guard;
+        set_ops_context(&mut s.sim, OpsContext::CpuOffline);
+        debug!(cpu = cpu.0, "enter:structop cpu_offline");
+        start_rbc(&mut s.sim);
+        sim_callback!(s, guard, sim_arc, cpu, {
             self.scheduler.cpu_offline(cpu.0 as i32);
-            charge_sched_time(&mut s.sim, cpu, "cpu_offline");
-            kfuncs::exit_sim();
-        }
+        });
+        let s = &mut *guard;
+        charge_sched_time(&mut s.sim, cpu, "cpu_offline");
 
         s.sim.cpus[cpu.0 as usize].is_online = false;
     }
@@ -2248,7 +2307,9 @@ impl<S: Scheduler> Simulator<S> {
     ///
     /// Marks the CPU online, calls `ops.cpu_online`, notifies idle state,
     /// restarts ticks, and tries to dispatch work to the CPU.
-    fn handle_cpu_online(&self, cpu: CpuId, s: &mut SimState, monitor: &mut dyn Monitor) {
+    fn handle_cpu_online(&self, cpu: CpuId, sim_arc: &SimArc, monitor: &mut dyn Monitor) {
+        let mut guard = sim_arc.lock().unwrap();
+        let s = &mut *guard;
         if s.sim.cpus[cpu.0 as usize].is_online {
             return; // Already online
         }
@@ -2257,40 +2318,42 @@ impl<S: Scheduler> Simulator<S> {
         s.sim.cpus[cpu.0 as usize].is_online = true;
 
         // Notify the scheduler
-        unsafe {
-            kfuncs::enter_sim(&mut s.sim, cpu);
-            set_ops_context(&mut s.sim, OpsContext::CpuOnline);
-            debug!(cpu = cpu.0, "enter:structop cpu_online");
-            start_rbc(&mut s.sim);
+        set_ops_context(&mut s.sim, OpsContext::CpuOnline);
+        debug!(cpu = cpu.0, "enter:structop cpu_online");
+        start_rbc(&mut s.sim);
+        sim_callback!(s, guard, sim_arc, cpu, {
             self.scheduler.cpu_online(cpu.0 as i32);
-            charge_sched_time(&mut s.sim, cpu, "cpu_online");
-            kfuncs::exit_sim();
-        }
+        });
+        let s = &mut *guard;
+        charge_sched_time(&mut s.sim, cpu, "cpu_online");
 
         // CPU starts idle after coming online
         unsafe { ffi::scx_test_set_idle_cpumask(cpu.0 as i32) };
-        unsafe {
-            kfuncs::enter_sim(&mut s.sim, cpu);
-            set_ops_context(&mut s.sim, OpsContext::UpdateIdle);
-            start_rbc(&mut s.sim);
+        set_ops_context(&mut s.sim, OpsContext::UpdateIdle);
+        start_rbc(&mut s.sim);
+        sim_callback!(s, guard, sim_arc, cpu, {
             self.scheduler.update_idle(cpu.0 as i32, true);
-            charge_sched_time(&mut s.sim, cpu, "update_idle");
-            kfuncs::exit_sim();
-        }
+        });
+        let s = &mut *guard;
+        charge_sched_time(&mut s.sim, cpu, "update_idle");
 
         // Restart tick chain for this CPU
         let next_tick = s.sim.cpus[cpu.0 as usize].local_clock + TICK_INTERVAL_NS;
         s.events.push(next_tick, EventKind::Tick { cpu });
 
         // Try to dispatch work to the newly online CPU
-        self.try_dispatch_and_run(cpu, s, monitor);
+        drop(guard);
+        self.try_dispatch_and_run(cpu, sim_arc, monitor);
+        guard = sim_arc.lock().unwrap();
     }
 
     /// Handle a higher-priority scheduler class taking a CPU (cpu_release).
     ///
     /// Preempts any running SCX task, calls `ops.cpu_release`, and stops
     /// ticks on the CPU until `cpu_acquire` fires.
-    fn handle_cpu_release(&self, cpu: CpuId, s: &mut SimState, monitor: &mut dyn Monitor) {
+    fn handle_cpu_release(&self, cpu: CpuId, sim_arc: &SimArc, monitor: &mut dyn Monitor) {
+        let mut guard = sim_arc.lock().unwrap();
+        let s = &mut *guard;
         if !s.sim.cpus[cpu.0 as usize].is_online {
             return;
         }
@@ -2298,19 +2361,24 @@ impl<S: Scheduler> Simulator<S> {
         info!(cpu = cpu.0, "CPU RELEASE (higher-priority class)");
 
         // Preempt running task (if any)
-        if s.sim.cpus[cpu.0 as usize].current_task.is_some() {
-            self.preempt_current(cpu, s, monitor);
+        let __has_task = s.sim.cpus[cpu.0 as usize].current_task.is_some();
+
+        if __has_task {
+            drop(guard);
+            self.preempt_current(cpu, sim_arc, monitor);
+            guard = sim_arc.lock().unwrap();
         }
 
+        let s = &mut *guard;
+
         // Call cpu_release
-        unsafe {
-            kfuncs::enter_sim(&mut s.sim, cpu);
-            start_rbc(&mut s.sim);
+        start_rbc(&mut s.sim);
+        sim_callback!(s, guard, sim_arc, cpu, {
             self.scheduler
                 .cpu_release(cpu.0 as i32, std::ptr::null_mut());
-            charge_sched_time(&mut s.sim, cpu, "cpu_release");
-            kfuncs::exit_sim();
-        }
+        });
+        let s = &mut *guard;
+        charge_sched_time(&mut s.sim, cpu, "cpu_release");
 
         // Mark CPU as temporarily unavailable (reuse is_online)
         s.sim.cpus[cpu.0 as usize].is_online = false;
@@ -2319,7 +2387,9 @@ impl<S: Scheduler> Simulator<S> {
     /// Handle sched_ext regaining a CPU from a higher-priority class (cpu_acquire).
     ///
     /// Calls `ops.cpu_acquire`, marks the CPU available, and tries to dispatch.
-    fn handle_cpu_acquire(&self, cpu: CpuId, s: &mut SimState, monitor: &mut dyn Monitor) {
+    fn handle_cpu_acquire(&self, cpu: CpuId, sim_arc: &SimArc, monitor: &mut dyn Monitor) {
+        let mut guard = sim_arc.lock().unwrap();
+        let s = &mut *guard;
         info!(
             cpu = cpu.0,
             "CPU ACQUIRE (regained from higher-priority class)"
@@ -2328,32 +2398,32 @@ impl<S: Scheduler> Simulator<S> {
         s.sim.cpus[cpu.0 as usize].is_online = true;
 
         // Call cpu_acquire
-        unsafe {
-            kfuncs::enter_sim(&mut s.sim, cpu);
-            start_rbc(&mut s.sim);
+        start_rbc(&mut s.sim);
+        sim_callback!(s, guard, sim_arc, cpu, {
             self.scheduler
                 .cpu_acquire(cpu.0 as i32, std::ptr::null_mut());
-            charge_sched_time(&mut s.sim, cpu, "cpu_acquire");
-            kfuncs::exit_sim();
-        }
+        });
+        let s = &mut *guard;
+        charge_sched_time(&mut s.sim, cpu, "cpu_acquire");
 
         // CPU starts idle after being reacquired
         unsafe { ffi::scx_test_set_idle_cpumask(cpu.0 as i32) };
-        unsafe {
-            kfuncs::enter_sim(&mut s.sim, cpu);
-            set_ops_context(&mut s.sim, OpsContext::UpdateIdle);
-            start_rbc(&mut s.sim);
+        set_ops_context(&mut s.sim, OpsContext::UpdateIdle);
+        start_rbc(&mut s.sim);
+        sim_callback!(s, guard, sim_arc, cpu, {
             self.scheduler.update_idle(cpu.0 as i32, true);
-            charge_sched_time(&mut s.sim, cpu, "update_idle");
-            kfuncs::exit_sim();
-        }
+        });
+        let s = &mut *guard;
+        charge_sched_time(&mut s.sim, cpu, "update_idle");
 
         // Restart tick chain
         let next_tick = s.sim.cpus[cpu.0 as usize].local_clock + TICK_INTERVAL_NS;
         s.events.push(next_tick, EventKind::Tick { cpu });
 
         // Try to dispatch work
-        self.try_dispatch_and_run(cpu, s, monitor);
+        drop(guard);
+        self.try_dispatch_and_run(cpu, sim_arc, monitor);
+        guard = sim_arc.lock().unwrap();
     }
 
     /// Handle a cgroup migration: move a task between cgroups.
@@ -2372,9 +2442,11 @@ impl<S: Scheduler> Simulator<S> {
         pid: Pid,
         from_name: &str,
         to_name: &str,
-        s: &mut SimState,
+        sim_arc: &SimArc,
         _monitor: &mut dyn Monitor,
     ) {
+        let mut guard = sim_arc.lock().unwrap();
+        let s = &mut *guard;
         let task = match s.tasks.get(&pid) {
             Some(t) => t,
             None => return,
@@ -2404,8 +2476,11 @@ impl<S: Scheduler> Simulator<S> {
 
         // --- sched_change_begin: dequeue if queued ---
         if was_queued {
-            self.cgroup_migrate_dequeue(pid, raw, cpu, s);
+            drop(guard);
+            self.cgroup_migrate_dequeue(pid, raw, cpu, sim_arc);
+            guard = sim_arc.lock().unwrap();
         }
+        let s = &mut *guard;
 
         // Update the task's cgroup in C-side
         unsafe {
@@ -2413,21 +2488,23 @@ impl<S: Scheduler> Simulator<S> {
         }
 
         // Call cgroup_move
-        unsafe {
-            kfuncs::enter_sim(&mut s.sim, cpu);
-            start_rbc(&mut s.sim);
+        start_rbc(&mut s.sim);
+        sim_callback!(s, guard, sim_arc, cpu, {
             self.scheduler.cgroup_move(raw, from_raw, to_raw);
-            charge_sched_time(&mut s.sim, cpu, "cgroup_move");
-            kfuncs::exit_sim();
-        }
+        });
+        let s = &mut *guard;
+        charge_sched_time(&mut s.sim, cpu, "cgroup_move");
 
         // --- sched_change_end: re-enqueue if was queued ---
         if was_queued {
-            self.cgroup_migrate_enqueue(pid, raw, cpu, s);
+            drop(guard);
+            self.cgroup_migrate_enqueue(pid, raw, cpu, sim_arc);
+            guard = sim_arc.lock().unwrap();
         }
+        let s = &mut *guard;
 
         // Flush staged events from cgroup_move or re-enqueue callbacks
-        flush_staged_events(&mut s.sim, &mut s.events);
+        { let s = &mut *guard; { let s = &mut *guard; flush_staged_events(&mut s.sim, &mut s.events); } };
     }
 
     /// Dequeue a task before cgroup migration (sched_change_begin).
@@ -2435,7 +2512,9 @@ impl<S: Scheduler> Simulator<S> {
     /// Removes the task from its current DSQ (global, per-cell, or local)
     /// and calls `ops.dequeue` if the task is still in the BPF scheduler's
     /// queue (OpsTaskState::Queued).
-    fn cgroup_migrate_dequeue(&self, pid: Pid, raw: *mut c_void, cpu: CpuId, s: &mut SimState) {
+    fn cgroup_migrate_dequeue(&self, pid: Pid, raw: *mut c_void, cpu: CpuId, sim_arc: &SimArc) {
+        let mut guard = sim_arc.lock().unwrap();
+        let s = &mut *guard;
         // Remove from global/per-cell DSQs
         s.sim.dsqs.remove_pid_from_all(pid);
 
@@ -2450,16 +2529,15 @@ impl<S: Scheduler> Simulator<S> {
         // If still in BPF scheduler queue, call ops.dequeue (flags=0, not sleep)
         let ops_state = s.sim.task_ops_state.get(&pid).copied().unwrap_or_default();
         if ops_state == OpsTaskState::Queued {
-            unsafe {
-                kfuncs::enter_sim(&mut s.sim, cpu);
-                set_ops_context(&mut s.sim, OpsContext::Dequeue);
-                debug!(pid = pid.0, "dequeue (cgroup_migrate)");
-                start_rbc(&mut s.sim);
+            set_ops_context(&mut s.sim, OpsContext::Dequeue);
+            debug!(pid = pid.0, "dequeue (cgroup_migrate)");
+            start_rbc(&mut s.sim);
+            s.sim.set_task_ops_state(pid, OpsTaskState::None);
+            sim_callback!(s, guard, sim_arc, cpu, {
                 self.scheduler.dequeue(raw, 0);
-                charge_sched_time(&mut s.sim, cpu, "dequeue");
-                s.sim.set_task_ops_state(pid, OpsTaskState::None);
-                kfuncs::exit_sim();
-            }
+            });
+            let s = &mut *guard;
+            charge_sched_time(&mut s.sim, cpu, "dequeue");
         }
     }
 
@@ -2467,19 +2545,20 @@ impl<S: Scheduler> Simulator<S> {
     ///
     /// Calls `ops.enqueue` so the BPF scheduler dispatches the task to
     /// the correct DSQ based on its updated cgroup/cell metadata.
-    fn cgroup_migrate_enqueue(&self, pid: Pid, raw: *mut c_void, cpu: CpuId, s: &mut SimState) {
-        unsafe {
-            kfuncs::enter_sim(&mut s.sim, cpu);
-            set_ops_context(&mut s.sim, OpsContext::Enqueue);
-            s.sim.set_task_ops_state(pid, OpsTaskState::Queued);
-            debug!(pid = pid.0, "enqueue (cgroup_migrate)");
-            start_rbc(&mut s.sim);
+    fn cgroup_migrate_enqueue(&self, pid: Pid, raw: *mut c_void, cpu: CpuId, sim_arc: &SimArc) {
+        let mut guard = sim_arc.lock().unwrap();
+        let s = &mut *guard;
+        set_ops_context(&mut s.sim, OpsContext::Enqueue);
+        s.sim.set_task_ops_state(pid, OpsTaskState::Queued);
+        debug!(pid = pid.0, "enqueue (cgroup_migrate)");
+        start_rbc(&mut s.sim);
+        sim_callback!(s, guard, sim_arc, cpu, {
             self.scheduler.enqueue(raw, 0);
-            charge_sched_time(&mut s.sim, cpu, "enqueue");
-            maybe_record_checkpoint(&s.sim, CheckpointEvent::Enqueue, cpu);
-            s.sim.resolve_pending_dispatch(cpu);
-            kfuncs::exit_sim();
-        }
+        });
+        let s = &mut *guard;
+        charge_sched_time(&mut s.sim, cpu, "enqueue");
+        maybe_record_checkpoint(&s.sim, CheckpointEvent::Enqueue, cpu);
+        s.sim.resolve_pending_dispatch(cpu);
     }
 
     /// Handle runtime cgroup creation.
@@ -2490,9 +2569,11 @@ impl<S: Scheduler> Simulator<S> {
     fn handle_cgroup_create(
         &self,
         event: &CgroupCreateEvent,
-        s: &mut SimState,
+        sim_arc: &SimArc,
         max_cgroups: u32,
     ) -> Option<ExitKind> {
+        let mut guard = sim_arc.lock().unwrap();
+        let s = &mut *guard;
         // Check resource limit before creating
         let current_count = s.cgroup_registry.len() as u32;
         if current_count >= max_cgroups {
@@ -2532,11 +2613,12 @@ impl<S: Scheduler> Simulator<S> {
 
         // Call cgroup_init (refresh CSS iterator so the callback can use
         // bpf_for_each(css, ...) with the newly created cgroup included).
+        // TODO(sim_arc): convert this enter_sim/exit_sim block to sim_callback!
         unsafe {
             let cpu = s.sim.current_cpu;
             let raw = s.cgroup_registry.get_raw(cgid).unwrap();
             kfuncs::enter_sim(&mut s.sim, cpu);
-            s.cgroup_registry.prepare_css_iter_from_root();
+            unsafe { s.cgroup_registry.prepare_css_iter_from_root() };
             start_rbc(&mut s.sim);
             let rc = self.scheduler.cgroup_init(raw, std::ptr::null_mut());
             charge_sched_time(&mut s.sim, cpu, "cgroup_init");
@@ -2563,7 +2645,9 @@ impl<S: Scheduler> Simulator<S> {
     /// Handle runtime cgroup destruction.
     ///
     /// Calls `cgroup_exit` and removes the cgroup from the registry.
-    fn handle_cgroup_destroy(&self, event: &CgroupDestroyEvent, s: &mut SimState) {
+    fn handle_cgroup_destroy(&self, event: &CgroupDestroyEvent, sim_arc: &SimArc) {
+        let mut guard = sim_arc.lock().unwrap();
+        let s = &mut *guard;
         let raw = match s.cgroup_registry.destroy_by_name(&event.name) {
             Some(r) => r,
             None => {
@@ -2579,17 +2663,15 @@ impl<S: Scheduler> Simulator<S> {
         );
 
         // Call cgroup_exit
-        unsafe {
-            let cpu = s.sim.current_cpu;
-            kfuncs::enter_sim(&mut s.sim, cpu);
-            start_rbc(&mut s.sim);
+        let cpu = s.sim.current_cpu;
+        start_rbc(&mut s.sim);
+        sim_callback!(s, guard, sim_arc, cpu, {
             self.scheduler.cgroup_exit(raw);
-            charge_sched_time(&mut s.sim, cpu, "cgroup_exit");
-            kfuncs::exit_sim();
-
-            // Free the C-side cgroup struct
-            s.cgroup_registry.free_raw(raw);
-        }
+        });
+        let s = &mut *guard;
+        charge_sched_time(&mut s.sim, cpu, "cgroup_exit");
+        // Free the C-side cgroup struct
+        unsafe { s.cgroup_registry.free_raw(raw) };
     }
 
     /// Handle a runtime cgroup cpuset change.
@@ -2597,7 +2679,9 @@ impl<S: Scheduler> Simulator<S> {
     /// Updates the cgroup's cpuset in the registry and C-side struct,
     /// then calls `cgroup_init` to notify the scheduler of the change
     /// (mirroring what the kernel does when cpuset.cpus is modified).
-    fn handle_cgroup_cpuset_change(&self, event: &CgroupCpusetChangeEvent, s: &mut SimState) {
+    fn handle_cgroup_cpuset_change(&self, event: &CgroupCpusetChangeEvent, sim_arc: &SimArc) {
+        let mut guard = sim_arc.lock().unwrap();
+        let s = &mut *guard;
         if !s
             .cgroup_registry
             .update_cpuset(&event.cgroup_name, event.new_cpuset.clone())
@@ -2618,15 +2702,14 @@ impl<S: Scheduler> Simulator<S> {
         // Call cgroup_init to notify the scheduler of the cpuset change
         if let Some(cgrp_info) = s.cgroup_registry.get_by_name(&event.cgroup_name) {
             let raw = cgrp_info.raw();
-            unsafe {
-                let cpu = s.sim.current_cpu;
-                kfuncs::enter_sim(&mut s.sim, cpu);
-                s.cgroup_registry.prepare_css_iter_from_root();
-                start_rbc(&mut s.sim);
+            let cpu = s.sim.current_cpu;
+            unsafe { s.cgroup_registry.prepare_css_iter_from_root() };
+            start_rbc(&mut s.sim);
+            sim_callback!(s, guard, sim_arc, cpu, {
                 self.scheduler.cgroup_init(raw, std::ptr::null_mut());
-                charge_sched_time(&mut s.sim, cpu, "cgroup_init");
-                kfuncs::exit_sim();
-            }
+            });
+            let s = &mut *guard;
+            charge_sched_time(&mut s.sim, cpu, "cgroup_init");
         }
     }
 
@@ -2642,9 +2725,11 @@ impl<S: Scheduler> Simulator<S> {
         irq_type: IrqType,
         duration_ns: TimeNs,
         wake_pids: &[Pid],
-        s: &mut SimState,
+        sim_arc: &SimArc,
         monitor: &mut dyn Monitor,
     ) {
+        let mut guard = sim_arc.lock().unwrap();
+        let s = &mut *guard;
         let irq_context = match irq_type {
             IrqType::HardIrq => IrqContext::HardIrq,
             IrqType::SoftIrq => IrqContext::ServingSoftIrq,
@@ -2664,8 +2749,9 @@ impl<S: Scheduler> Simulator<S> {
             "IRQ START ({irq_label})"
         );
 
+        let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
         s.sim.trace.record(
-            s.sim.cpus[cpu.0 as usize].local_clock,
+            __local_t,
             cpu,
             TraceKind::IrqStart { cpu, irq_type },
         );
@@ -2681,8 +2767,11 @@ impl<S: Scheduler> Simulator<S> {
         // called inside an IRQ handler runs synchronously with the
         // interrupt context still active.
         for &pid in wake_pids {
-            self.handle_task_wake(pid, None, s, monitor);
+            drop(guard);
+            self.handle_task_wake(pid, None, sim_arc, monitor);
+            guard = sim_arc.lock().unwrap();
         }
+        let s = &mut *guard;
 
         // Schedule IrqEnd
         let end_time = s.sim.cpus[cpu.0 as usize].local_clock + duration_ns;
@@ -2690,11 +2779,14 @@ impl<S: Scheduler> Simulator<S> {
     }
 
     /// Handle an interrupt completing on a CPU.
-    fn handle_irq_end(&self, cpu: CpuId, s: &mut SimState) {
+    fn handle_irq_end(&self, cpu: CpuId, sim_arc: &SimArc) {
+        let mut guard = sim_arc.lock().unwrap();
+        let s = &mut *guard;
         s.sim.cpus[cpu.0 as usize].irq_context = IrqContext::None;
 
+        let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
         s.sim.trace.record(
-            s.sim.cpus[cpu.0 as usize].local_clock,
+            __local_t,
             cpu,
             TraceKind::IrqEnd { cpu },
         );
@@ -2711,10 +2803,13 @@ impl<S: Scheduler> Simulator<S> {
         &self,
         pid: Pid,
         waker: Option<WakerInfo>,
-        s: &mut SimState,
+        sim_arc: &SimArc,
         monitor: &mut dyn Monitor,
     ) {
+        let mut guard = sim_arc.lock().unwrap();
+        let s = &mut *guard;
         {
+            let s = &mut *guard;
             let task = match s.tasks.get_mut(&pid) {
                 Some(t) => t,
                 None => return,
@@ -2739,9 +2834,14 @@ impl<S: Scheduler> Simulator<S> {
 
         // Make sure the current phase is a Run phase
         // (skip over Wake phases, handle Sleep->Run transitions)
-        let task = s.tasks.get_mut(&pid).unwrap();
-        self.advance_to_run_phase(task, &mut s.sim, &mut s.events);
+        {
+            let s = &mut *guard;
+            let task = s.tasks.get_mut(&pid).unwrap();
+            self.advance_to_run_phase(task, &mut s.sim, &mut s.events);
+        }
 
+        let s = &mut *guard;
+        let task = s.tasks.get(&pid).unwrap();
         if task.state == TaskState::Exited {
             // Task completed all its phases; record the completion event.
             let wake_cpu = waker.as_ref().map_or(task.prev_cpu, |w| w.cpu);
@@ -2784,22 +2884,22 @@ impl<S: Scheduler> Simulator<S> {
         } else {
             SCX_ENQ_WAKEUP
         };
-        unsafe {
-            kfuncs::enter_sim(&mut s.sim, wake_cpu);
-            set_ops_context(&mut s.sim, OpsContext::Runnable);
-            s.sim.waker_task_raw = waker_raw;
-            debug!(pid = pid.0, "enter:structop runnable");
-            start_rbc(&mut s.sim);
+        set_ops_context(&mut s.sim, OpsContext::Runnable);
+        s.sim.waker_task_raw = waker_raw;
+        debug!(pid = pid.0, "enter:structop runnable");
+        start_rbc(&mut s.sim);
+        sim_callback!(s, guard, sim_arc, wake_cpu, {
             self.scheduler.runnable(raw, enq_flags);
-            charge_sched_time(&mut s.sim, wake_cpu, "runnable");
-            kfuncs::exit_sim();
-        }
+        });
+        let s = &mut *guard;
+        charge_sched_time(&mut s.sim, wake_cpu, "runnable");
 
         // Call select_cpu
         // Set ops_state to Queued before select_cpu — kernel sets QUEUED in
         // do_enqueue_task before either select_cpu or enqueue.
         s.sim.set_task_ops_state(pid, OpsTaskState::Queued);
 
+        // TODO(sim_arc): convert this enter_sim/exit_sim block to sim_callback!
         unsafe {
             kfuncs::enter_sim(&mut s.sim, wake_cpu);
             s.sim.pending_dispatch = None;
@@ -2864,12 +2964,14 @@ impl<S: Scheduler> Simulator<S> {
                 s.sim.current_cpu = dd_cpu;
                 kfuncs::set_sim_clock(s.sim.cpus[dd_cpu.0 as usize].local_clock, Some(dd_cpu));
                 debug!(pid = pid.0, target_cpu = dd_cpu.0, "direct dispatch");
-                self.try_dispatch_and_run(dd_cpu, s, monitor);
+                drop(guard);
+                self.try_dispatch_and_run(dd_cpu, sim_arc, monitor);
+                guard = sim_arc.lock().unwrap();
             } else {
                 // Task was not directly dispatched; call enqueue
                 kfuncs::enter_sim(&mut s.sim, selected_cpu);
                 debug!(pid = pid.0, enq_flags, "enter:structop enqueue");
-                self.call_enqueue(selected_cpu, raw, enq_flags, &mut s.sim);
+                self.scheduler.enqueue(raw, enq_flags);
                 kfuncs::exit_sim();
 
                 s.sim.trace.record(
@@ -2902,10 +3004,14 @@ impl<S: Scheduler> Simulator<S> {
                     || s.sim.native_concurrent.is_some())
                     && idle_cpus.len() >= 2
                 {
-                    self.dispatch_concurrent(&idle_cpus, s, monitor);
+                    drop(guard);
+                    self.dispatch_concurrent(&idle_cpus, sim_arc, monitor);
+                    guard = sim_arc.lock().unwrap();
                 } else {
                     for cpu in idle_cpus {
-                        self.try_dispatch_and_run(cpu, s, monitor);
+                        drop(guard);
+                        self.try_dispatch_and_run(cpu, sim_arc, monitor);
+                        guard = sim_arc.lock().unwrap();
                     }
                 }
             }
@@ -2913,7 +3019,9 @@ impl<S: Scheduler> Simulator<S> {
     }
 
     /// Handle a task's time slice expiring.
-    fn handle_slice_expired(&self, cpu: CpuId, s: &mut SimState, monitor: &mut dyn Monitor) {
+    fn handle_slice_expired(&self, cpu: CpuId, sim_arc: &SimArc, monitor: &mut dyn Monitor) {
+        let mut guard = sim_arc.lock().unwrap();
+        let s = &mut *guard;
         // If IRQ time was stolen, re-schedule the event later.
         let stolen = s.sim.cpus[cpu.0 as usize].irq_stolen_ns;
         if stolen > 0 {
@@ -2959,7 +3067,7 @@ impl<S: Scheduler> Simulator<S> {
             raw,
             slice,
             0, // remaining_slice = 0: full slice consumed
-            s,
+            sim_arc,
             monitor,
             |st, cp, p| {
                 // Trace records between stopping and enqueue
@@ -2996,10 +3104,12 @@ impl<S: Scheduler> Simulator<S> {
     fn handle_task_phase_complete(
         &self,
         cpu: CpuId,
-        s: &mut SimState,
+        sim_arc: &SimArc,
         duration_ns: TimeNs,
         monitor: &mut dyn Monitor,
     ) {
+        let mut guard = sim_arc.lock().unwrap();
+        let s = &mut *guard;
         // If IRQ time was stolen, re-schedule the event later.
         let stolen = s.sim.cpus[cpu.0 as usize].irq_stolen_ns;
         if stolen > 0 {
@@ -3021,6 +3131,7 @@ impl<S: Scheduler> Simulator<S> {
         };
 
         let raw = task.raw();
+        let task_name = task.name.clone(); // Clone for use after sim_callback!
 
         // Save the time consumed before advance_phase resets run_remaining_ns
         let time_consumed = task.run_remaining_ns;
@@ -3056,16 +3167,15 @@ impl<S: Scheduler> Simulator<S> {
             update_sum_exec(raw, task.sum_exec_base, time_consumed);
         }
 
-        unsafe {
-            kfuncs::enter_sim(&mut s.sim, cpu);
-            set_ops_context(&mut s.sim, OpsContext::Stopping);
-            debug!(pid = pid.0, still_runnable, "enter:structop stopping");
-            start_rbc(&mut s.sim);
+        set_ops_context(&mut s.sim, OpsContext::Stopping);
+        debug!(pid = pid.0, still_runnable, "enter:structop stopping");
+        start_rbc(&mut s.sim);
+        sim_callback!(s, guard, sim_arc, cpu, {
             self.scheduler.stopping(raw, still_runnable);
-            charge_sched_time(&mut s.sim, cpu, "stopping");
-            maybe_record_checkpoint(&s.sim, CheckpointEvent::Stopping, cpu);
-            kfuncs::exit_sim();
-        }
+        });
+        let s = &mut *guard;
+        charge_sched_time(&mut s.sim, cpu, "stopping");
+        maybe_record_checkpoint(&s.sim, CheckpointEvent::Stopping, cpu);
 
         // Monitor: Stopping probe
         monitor.sample(&ProbeContext {
@@ -3076,10 +3186,12 @@ impl<S: Scheduler> Simulator<S> {
             task_raw: raw,
             trace: &s.sim.trace,
         });
+        let s = &mut *guard;
 
         if !still_runnable {
             // Kernel clears SCX_TASK_QUEUED when a task goes to sleep.
             s.sim.clear_task_queued(pid);
+            // TODO(sim_arc): convert this enter_sim/exit_sim block to sim_callback!
             unsafe {
                 kfuncs::enter_sim(&mut s.sim, cpu);
                 let ops_state = s.sim.task_ops_state.get(&pid).copied().unwrap_or_default();
@@ -3110,8 +3222,9 @@ impl<S: Scheduler> Simulator<S> {
             });
         }
 
+        let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
         s.sim.trace.record(
-            s.sim.cpus[cpu.0 as usize].local_clock,
+            __local_t,
             cpu,
             TraceKind::PutPrevTask {
                 pid,
@@ -3123,12 +3236,13 @@ impl<S: Scheduler> Simulator<S> {
             // Task has completed all phases
             let task = s.tasks.get_mut(&pid).unwrap();
             task.state = TaskState::Exited;
-            s.sim.trace.record(
-                s.sim.cpus[cpu.0 as usize].local_clock,
+            let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
+        s.sim.trace.record(
+            __local_t,
                 cpu,
                 TraceKind::TaskCompleted { pid },
             );
-            info!(task = task.name.as_str(), pid = pid.0, "COMPLETED");
+            info!(task = task_name.as_str(), pid = pid.0, "COMPLETED");
         } else {
             match next_phase {
                 Some(Phase::Sleep(sleep_ns)) => {
@@ -3138,7 +3252,7 @@ impl<S: Scheduler> Simulator<S> {
                     s.sim
                         .trace
                         .record(local_t, cpu, TraceKind::TaskSlept { pid });
-                    info!(task = task.name.as_str(), pid = pid.0, "SLEEPING");
+                    info!(task = task_name.as_str(), pid = pid.0, "SLEEPING");
 
                     // Schedule wake event on the CPU the task last ran on
                     let wake_time = local_t.saturating_add(sleep_ns);
@@ -3160,30 +3274,31 @@ impl<S: Scheduler> Simulator<S> {
 
                     // Re-enqueue (part of put_prev_task for runnable tasks)
                     let raw = task.raw();
-                    unsafe {
-                        kfuncs::enter_sim(&mut s.sim, cpu);
-                        // Set ops state BEFORE start_rbc — set_task_ops_state
-                        // does a HashMap::get() which has non-deterministic
-                        // branch count due to random hash seeds.
-                        s.sim.set_task_ops_state(pid, OpsTaskState::Queued);
-                        debug!(pid = pid.0, "enqueue (yield re-enqueue)");
-                        self.call_enqueue(cpu, raw, 0, &mut s.sim);
-                        kfuncs::exit_sim();
-                    }
+                    // Set ops state BEFORE start_rbc — set_task_ops_state
+                    // does a HashMap::get() which has non-deterministic
+                    // branch count due to random hash seeds.
+                    s.sim.set_task_ops_state(pid, OpsTaskState::Queued);
+                    debug!(pid = pid.0, "enqueue (yield re-enqueue)");
+                    sim_callback!(s, guard, sim_arc, cpu, {
+                        self.scheduler.enqueue(raw, 0);
+                    });
+                    let s = &mut *guard;
 
-                    s.sim.trace.record(
-                        s.sim.cpus[cpu.0 as usize].local_clock,
+                    let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
+        s.sim.trace.record(
+            __local_t,
                         cpu,
                         TraceKind::EnqueueTask { pid, enq_flags: 0 },
                     );
 
                     // High-level event: task is now fully off-CPU and re-enqueued
-                    s.sim.trace.record(
-                        s.sim.cpus[cpu.0 as usize].local_clock,
+                    let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
+        s.sim.trace.record(
+            __local_t,
                         cpu,
                         TraceKind::TaskYielded { pid },
                     );
-                    info!(task = task.name.as_str(), pid = pid.0, "YIELDED");
+                    info!(task = task_name.as_str(), pid = pid.0, "YIELDED");
                 }
                 Some(Phase::Wake(target_pid)) => {
                     let local_t = s.sim.cpus[cpu.0 as usize].local_clock;
@@ -3234,26 +3349,27 @@ impl<S: Scheduler> Simulator<S> {
                                     // Still runnable — re-enqueue (same as yield)
                                     task.state = TaskState::Runnable;
                                     let raw = task.raw();
-                                    unsafe {
-                                        kfuncs::enter_sim(&mut s.sim, cpu);
-                                        // Set ops state BEFORE start_rbc — HashMap::get()
-                                        // in set_scx_flag has non-deterministic branch count.
-                                        s.sim.set_task_ops_state(pid, OpsTaskState::Queued);
-                                        self.call_enqueue(cpu, raw, 0, &mut s.sim);
-                                        kfuncs::exit_sim();
-                                    }
-                                    s.sim.trace.record(
-                                        s.sim.cpus[cpu.0 as usize].local_clock,
+                                    // Set ops state BEFORE start_rbc — HashMap::get()
+                                    // in set_scx_flag has non-deterministic branch count.
+                                    s.sim.set_task_ops_state(pid, OpsTaskState::Queued);
+                                    sim_callback!(s, guard, sim_arc, cpu, {
+                                        self.scheduler.enqueue(raw, 0);
+                                    });
+                                    let s = &mut *guard;
+                                    let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
+        s.sim.trace.record(
+            __local_t,
                                         cpu,
                                         TraceKind::EnqueueTask { pid, enq_flags: 0 },
                                     );
-                                    s.sim.trace.record(
-                                        s.sim.cpus[cpu.0 as usize].local_clock,
+                                    let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
+        s.sim.trace.record(
+            __local_t,
                                         cpu,
                                         TraceKind::TaskYielded { pid },
                                     );
                                     info!(
-                                        task = task.name.as_str(),
+                                        task = task_name.as_str(),
                                         pid = pid.0,
                                         "YIELDED (after wake)"
                                     );
@@ -3266,7 +3382,7 @@ impl<S: Scheduler> Simulator<S> {
                                         .trace
                                         .record(local_t, cpu, TraceKind::TaskSlept { pid });
                                     info!(
-                                        task = task.name.as_str(),
+                                        task = task_name.as_str(),
                                         pid = pid.0,
                                         "SLEEPING (after wake)"
                                     );
@@ -3299,8 +3415,9 @@ impl<S: Scheduler> Simulator<S> {
                 None => {
                     let task = s.tasks.get_mut(&pid).unwrap();
                     task.state = TaskState::Exited;
-                    s.sim.trace.record(
-                        s.sim.cpus[cpu.0 as usize].local_clock,
+                    let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
+        s.sim.trace.record(
+            __local_t,
                         cpu,
                         TraceKind::TaskCompleted { pid },
                     );
@@ -3309,14 +3426,18 @@ impl<S: Scheduler> Simulator<S> {
         }
 
         // Flush staged events from enqueue callbacks
-        flush_staged_events(&mut s.sim, &mut s.events);
+        { let s = &mut *guard; { let s = &mut *guard; flush_staged_events(&mut s.sim, &mut s.events); } };
 
         // Dispatch next task on this CPU
-        self.try_dispatch_and_run(cpu, s, monitor);
+        drop(guard);
+        self.try_dispatch_and_run(cpu, sim_arc, monitor);
+        guard = sim_arc.lock().unwrap();
     }
 
     /// Try to dispatch and run a task on the given CPU.
-    fn try_dispatch_and_run(&self, cpu: CpuId, s: &mut SimState, monitor: &mut dyn Monitor) {
+    fn try_dispatch_and_run(&self, cpu: CpuId, sim_arc: &SimArc, monitor: &mut dyn Monitor) {
+        let mut guard = sim_arc.lock().unwrap();
+        let s = &mut *guard;
         // If CPU is already running something, nothing to do
         if s.sim.cpus[cpu.0 as usize].current_task.is_some() {
             return;
@@ -3339,22 +3460,22 @@ impl<S: Scheduler> Simulator<S> {
                 .map_or(std::ptr::null_mut(), |raw| raw as *mut c_void);
 
             // Call scheduler dispatch to try to fill the local DSQ
-            unsafe {
-                kfuncs::enter_sim(&mut s.sim, cpu);
-                set_ops_context(&mut s.sim, OpsContext::Dispatch);
-                debug!("enter:structop dispatch");
-                start_rbc(&mut s.sim);
+            set_ops_context(&mut s.sim, OpsContext::Dispatch);
+            debug!("enter:structop dispatch");
+            start_rbc(&mut s.sim);
+            sim_callback!(s, guard, sim_arc, cpu, {
                 self.scheduler.dispatch(cpu.0 as i32, prev_raw);
-                charge_sched_time(&mut s.sim, cpu, "dispatch");
-                maybe_record_checkpoint(&s.sim, CheckpointEvent::Dispatch, cpu);
-                // Flush any deferred dispatch from dispatch() callback
-                // (SCX_DSQ_LOCAL resolves to the dispatching CPU)
-                s.sim.resolve_pending_dispatch(cpu);
-                kfuncs::exit_sim();
-            }
+            });
+            let s = &mut *guard;
+            charge_sched_time(&mut s.sim, cpu, "dispatch");
+            maybe_record_checkpoint(&s.sim, CheckpointEvent::Dispatch, cpu);
+            // Flush any deferred dispatch from dispatch() callback
+            // (SCX_DSQ_LOCAL resolves to the dispatching CPU)
+            s.sim.resolve_pending_dispatch(cpu);
 
-            s.sim.trace.record(
-                s.sim.cpus[cpu.0 as usize].local_clock,
+            let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
+        s.sim.trace.record(
+            __local_t,
                 cpu,
                 TraceKind::Balance { prev_pid },
             );
@@ -3374,14 +3495,16 @@ impl<S: Scheduler> Simulator<S> {
             }
 
             // Flush staged events from dispatch callback
-            flush_staged_events(&mut s.sim, &mut s.events);
+            { let s = &mut *guard; flush_staged_events(&mut s.sim, &mut s.events); }
         }
 
         // Kernel fallback: if local DSQ is still empty after dispatch(),
         // automatically consume from the global DSQ (SCX_DSQ_GLOBAL).
         // This matches pick_next_task_scx() which tries the global DSQ
         // before going idle.
-        self.post_dispatch_run(cpu, true, s, monitor);
+        drop(guard);
+        self.post_dispatch_run(cpu, true, sim_arc, monitor);
+        guard = sim_arc.lock().unwrap();
     }
 
     /// Post-dispatch: try global DSQ fallback, then start running or go idle.
@@ -3394,9 +3517,11 @@ impl<S: Scheduler> Simulator<S> {
         &self,
         cpu: CpuId,
         notify_idle: bool,
-        s: &mut SimState,
+        sim_arc: &SimArc,
         monitor: &mut dyn Monitor,
     ) {
+        let mut guard = sim_arc.lock().unwrap();
+        let s = &mut *guard;
         // Global DSQ fallback
         if s.sim.cpus[cpu.0 as usize].local_dsq.is_empty() {
             let cpu_idx = cpu.0 as usize;
@@ -3404,8 +3529,9 @@ impl<S: Scheduler> Simulator<S> {
             let sim_cpu = unsafe { &mut *cpus_ptr.add(cpu_idx) };
             let consumed = s.sim.dsqs.move_to_local(DsqId::GLOBAL, sim_cpu);
             if consumed {
-                s.sim.trace.record(
-                    s.sim.cpus[cpu_idx].local_clock,
+                let __local_t = s.sim.cpus[cpu_idx].local_clock;
+        s.sim.trace.record(
+            __local_t,
                     cpu,
                     TraceKind::DsqMoveToLocal {
                         dsq_id: DsqId::GLOBAL,
@@ -3417,12 +3543,15 @@ impl<S: Scheduler> Simulator<S> {
 
         // Try to pull a task from the local DSQ
         if let Some(pid) = s.sim.cpus[cpu.0 as usize].local_dsq.pop_front() {
-            s.sim.trace.record(
-                s.sim.cpus[cpu.0 as usize].local_clock,
+            let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
+        s.sim.trace.record(
+            __local_t,
                 cpu,
                 TraceKind::PickTask { pid },
             );
-            self.start_running(cpu, pid, s, monitor);
+            drop(guard);
+            self.start_running(cpu, pid, sim_arc, monitor);
+            guard = sim_arc.lock().unwrap();
         } else {
             // CPU is idle — update the C idle cpumask so
             // scx_bpf_test_and_clear_cpu_idle works correctly
@@ -3434,17 +3563,17 @@ impl<S: Scheduler> Simulator<S> {
 
             if notify_idle {
                 // Notify scheduler that CPU is entering idle (ops.update_idle)
-                unsafe {
-                    kfuncs::enter_sim(&mut s.sim, cpu);
-                    set_ops_context(&mut s.sim, OpsContext::UpdateIdle);
-                    debug!("enter:structop update_idle(idle=true)");
-                    start_rbc(&mut s.sim);
+                set_ops_context(&mut s.sim, OpsContext::UpdateIdle);
+                debug!("enter:structop update_idle(idle=true)");
+                start_rbc(&mut s.sim);
+                sim_callback!(s, guard, sim_arc, cpu, {
                     self.scheduler.update_idle(cpu.0 as i32, true);
-                    charge_sched_time(&mut s.sim, cpu, "update_idle");
-                    kfuncs::exit_sim();
-                }
+                });
+                let s = &mut *guard;
+                charge_sched_time(&mut s.sim, cpu, "update_idle");
             }
 
+            let s = &mut *guard;
             s.sim.trace.record(local_t, cpu, TraceKind::CpuIdle);
             info!(cpu = cpu.0, "IDLE");
         }
@@ -3460,7 +3589,9 @@ impl<S: Scheduler> Simulator<S> {
     ///
     /// Phase 2 (sequential): global DSQ fallback, start_running, and
     /// kicked-CPU processing happen on the engine thread.
-    fn dispatch_concurrent(&self, cpus: &[CpuId], s: &mut SimState, monitor: &mut dyn Monitor) {
+    fn dispatch_concurrent(&self, cpus: &[CpuId], sim_arc: &SimArc, monitor: &mut dyn Monitor) {
+        let mut guard = sim_arc.lock().unwrap();
+        let s = &mut *guard;
         // Filter to CPUs that actually need dispatch (idle + empty local DSQ).
         let dispatch_cpus: Vec<CpuId> = cpus
             .iter()
@@ -3474,8 +3605,11 @@ impl<S: Scheduler> Simulator<S> {
         // Fall back to sequential for 0–1 CPUs (no interleaving benefit).
         if dispatch_cpus.len() < 2 {
             for &cpu in cpus {
-                self.try_dispatch_and_run(cpu, s, monitor);
+                drop(guard);
+                self.try_dispatch_and_run(cpu, sim_arc, monitor);
+                guard = sim_arc.lock().unwrap();
             }
+            let s = &mut *guard;
             return;
         }
 
@@ -3522,7 +3656,7 @@ impl<S: Scheduler> Simulator<S> {
                 let backend = E9PatchBackend {
                     timeslice_min: preemptive_cfg.timeslice_min,
                     timeslice_max: preemptive_cfg.timeslice_max,
-                    fns: s.sim.e9_fns.expect("e9_fns must be resolved"),
+                    fns: e9_fns.expect("e9_fns must be resolved"),
                 };
                 crate::backend::run_preemptive_dispatch(
                     &dispatch_cpus,
@@ -3557,9 +3691,11 @@ impl<S: Scheduler> Simulator<S> {
 
         // Phase 2: sequential post-processing on the engine thread.
         for &cpu in &dispatch_cpus {
+            let s = &mut *guard;
             let prev_pid = s.sim.cpus[cpu.0 as usize].prev_task;
-            s.sim.trace.record(
-                s.sim.cpus[cpu.0 as usize].local_clock,
+            let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
+        s.sim.trace.record(
+            __local_t,
                 cpu,
                 TraceKind::Balance { prev_pid },
             );
@@ -3580,11 +3716,14 @@ impl<S: Scheduler> Simulator<S> {
 
             // Global DSQ fallback + start running or idle (without update_idle
             // notification — not safe during concurrent post-processing).
-            self.post_dispatch_run(cpu, false, s, monitor);
+            drop(guard);
+            self.post_dispatch_run(cpu, false, sim_arc, monitor);
+            guard = sim_arc.lock().unwrap();
         }
+        let s = &mut *guard;
 
         // Flush staged events from the concurrent dispatches.
-        flush_staged_events(&mut s.sim, &mut s.events);
+        { let s = &mut *guard; flush_staged_events(&mut s.sim, &mut s.events); }
     }
 
     /// Phase 1 cooperative: run dispatch via `TokenRing` (Mutex/Condvar).
@@ -3663,13 +3802,15 @@ impl<S: Scheduler> Simulator<S> {
     fn process_dynamic_window(
         &self,
         t: TimeNs,
-        s: &mut SimState,
+        sim_arc: &SimArc,
         watchdog_timeout: Option<TimeNs>,
         duration_ns: TimeNs,
         max_cgroups: u32,
         ignore_bpf_errors: bool,
         monitor: &mut dyn Monitor,
     ) -> Option<ExitKind> {
+        let mut guard = sim_arc.lock().unwrap();
+        let s = &mut *guard;
         // Start with all events at the initial timestamp.
         let batch = s.events.drain_at(t);
 
@@ -3677,9 +3818,10 @@ impl<S: Scheduler> Simulator<S> {
         let (global, mut per_cpu) = group_events_by_cpu(batch);
 
         // 1. Global events: always processed sequentially first.
+        drop(guard);
         if let Some(err) = self.process_events_sequential(
             global,
-            s,
+            sim_arc,
             watchdog_timeout,
             duration_ns,
             max_cgroups,
@@ -3688,26 +3830,31 @@ impl<S: Scheduler> Simulator<S> {
         ) {
             return Some(err);
         }
+        guard = sim_arc.lock().unwrap();
+        let s = &mut *guard;
 
         // 2. Per-CPU events: concurrent if 2+ CPUs, with dynamic window
         //    expansion after each batch.
         loop {
             if per_cpu.len() >= 2 {
+                drop(guard);
                 self.process_batch_concurrent(
                     per_cpu,
-                    s,
+                    sim_arc,
                     watchdog_timeout,
                     duration_ns,
                     max_cgroups,
                     monitor,
                 );
+                guard = sim_arc.lock().unwrap();
             } else if !per_cpu.is_empty() {
                 // Single CPU: sequential processing.
                 let mut events_flat: Vec<Event> = per_cpu.into_values().flatten().collect();
                 events_flat.sort();
+                drop(guard);
                 if let Some(err) = self.process_events_sequential(
                     events_flat,
-                    s,
+                    sim_arc,
                     watchdog_timeout,
                     duration_ns,
                     max_cgroups,
@@ -3716,7 +3863,9 @@ impl<S: Scheduler> Simulator<S> {
                 ) {
                     return Some(err);
                 }
+                guard = sim_arc.lock().unwrap();
             }
+            let s = &mut *guard;
 
             // Dynamic window expansion: check if CPU clocks advanced
             // past any pending events on uninvolved CPUs.
@@ -3748,9 +3897,10 @@ impl<S: Scheduler> Simulator<S> {
             let (new_global, new_per_cpu) = group_events_by_cpu(newly_discovered);
 
             // Process any global events sequentially first.
+            drop(guard);
             if let Some(err) = self.process_events_sequential(
                 new_global,
-                s,
+                sim_arc,
                 watchdog_timeout,
                 duration_ns,
                 max_cgroups,
@@ -3759,6 +3909,8 @@ impl<S: Scheduler> Simulator<S> {
             ) {
                 return Some(err);
             }
+            guard = sim_arc.lock().unwrap();
+            let s = &mut *guard;
 
             // Continue the loop with the new per-CPU events.
             per_cpu = new_per_cpu;
@@ -3777,17 +3929,20 @@ impl<S: Scheduler> Simulator<S> {
     fn process_events_sequential(
         &self,
         events_list: Vec<Event>,
-        s: &mut SimState,
+        sim_arc: &SimArc,
         watchdog_timeout: Option<TimeNs>,
         duration_ns: TimeNs,
         max_cgroups: u32,
         ignore_bpf_errors: bool,
         monitor: &mut dyn Monitor,
     ) -> Option<ExitKind> {
+        let mut guard = sim_arc.lock().unwrap();
+        let s = &mut *guard;
         for event in events_list {
+            drop(guard);
             if let Some(err) = self.process_event(
                 event,
-                s,
+                sim_arc,
                 watchdog_timeout,
                 duration_ns,
                 max_cgroups,
@@ -3795,6 +3950,8 @@ impl<S: Scheduler> Simulator<S> {
             ) {
                 return Some(err);
             }
+            guard = sim_arc.lock().unwrap();
+            let s = &mut *guard;
             if let Some(err) = check_bpf_error(&mut s.sim, ignore_bpf_errors) {
                 return Some(err);
             }
@@ -3816,12 +3973,14 @@ impl<S: Scheduler> Simulator<S> {
     fn process_batch_concurrent(
         &self,
         per_cpu: HashMap<CpuId, Vec<Event>>,
-        s: &mut SimState,
+        sim_arc: &SimArc,
         watchdog_timeout: Option<TimeNs>,
         duration_ns: TimeNs,
         max_cgroups: u32,
         monitor: &mut dyn Monitor,
     ) {
+        let mut guard = sim_arc.lock().unwrap();
+        let s = &mut *guard;
         let mut cpu_ids: Vec<CpuId> = per_cpu.keys().copied().collect();
         cpu_ids.sort(); // deterministic worker-to-CPU assignment
         let nr_workers = cpu_ids.len();
@@ -3831,15 +3990,18 @@ impl<S: Scheduler> Simulator<S> {
             let mut flat: Vec<Event> = per_cpu.into_values().flatten().collect();
             flat.sort();
             for event in flat {
+                drop(guard);
                 self.process_event(
                     event,
-                    s,
+                    sim_arc,
                     watchdog_timeout,
                     duration_ns,
                     max_cgroups,
                     monitor,
                 );
+                guard = sim_arc.lock().unwrap();
             }
+            let s = &mut *guard;
             return;
         }
 
@@ -3862,7 +4024,15 @@ impl<S: Scheduler> Simulator<S> {
         let sim_send = SendPtr(self as *const Simulator<S> as *mut Simulator<S>);
         let state_send = SendPtr(&mut s.sim as *mut SimulatorState);
 
-        if s.sim.native_concurrent.is_some() {
+        // Save conditions before dropping guard (workers lock sim_arc internally)
+        let is_native = s.sim.native_concurrent.is_some();
+        let preemptive_cfg = s.sim.preemptive.clone();
+        let replay_backend_present = s.sim.replay_backend.is_some();
+        let e9_fns = s.sim.e9_fns;
+        drop(s);
+        drop(guard);
+
+        if is_native {
             // Native concurrent: all workers run freely in parallel with
             // no PMU, no signals, no token ring serialisation.
             use crate::backend::native::{NativeOrchestrator, NullBackend};
@@ -3873,6 +4043,7 @@ impl<S: Scheduler> Simulator<S> {
                 &cpu_ids,
                 &sim_send,
                 &state_send,
+                sim_arc,
                 &ring,
                 &orchestrator,
                 watchdog_timeout,
@@ -3880,13 +4051,16 @@ impl<S: Scheduler> Simulator<S> {
                 max_cgroups,
                 &NullBackend,
             );
-        } else if let Some(ref preemptive_cfg) = s.sim.preemptive.clone() {
-            if let Some(ref backend) = s.sim.replay_backend {
+        } else if let Some(ref preemptive_cfg) = preemptive_cfg {
+            if replay_backend_present {
+                let guard_temp = sim_arc.lock().unwrap();
+                let backend = guard_temp.sim.replay_backend.as_ref().unwrap();
                 crate::backend::run_preemptive_batch(
                     &per_cpu,
                     &cpu_ids,
                     &sim_send,
                     &state_send,
+                    sim_arc,
                     interleave_seed,
                     watchdog_timeout,
                     duration_ns,
@@ -3897,13 +4071,14 @@ impl<S: Scheduler> Simulator<S> {
                 let backend = E9PatchBackend {
                     timeslice_min: preemptive_cfg.timeslice_min,
                     timeslice_max: preemptive_cfg.timeslice_max,
-                    fns: s.sim.e9_fns.expect("e9_fns must be resolved"),
+                    fns: e9_fns.expect("e9_fns must be resolved"),
                 };
                 crate::backend::run_preemptive_batch(
                     &per_cpu,
                     &cpu_ids,
                     &sim_send,
                     &state_send,
+                    sim_arc,
                     interleave_seed,
                     watchdog_timeout,
                     duration_ns,
@@ -3922,6 +4097,7 @@ impl<S: Scheduler> Simulator<S> {
                     &cpu_ids,
                     &sim_send,
                     &state_send,
+                    sim_arc,
                     interleave_seed,
                     watchdog_timeout,
                     duration_ns,
@@ -3935,6 +4111,7 @@ impl<S: Scheduler> Simulator<S> {
                 &cpu_ids,
                 &sim_send,
                 &state_send,
+                sim_arc,
                 interleave_seed,
                 watchdog_timeout,
                 duration_ns,
@@ -3942,6 +4119,9 @@ impl<S: Scheduler> Simulator<S> {
             );
         }
 
+        // Relock after concurrent block
+        guard = sim_arc.lock().unwrap();
+        let s = &mut *guard;
         s.sim.rbc_counter = main_rbc_counter;
 
         // Flush staged events from the concurrent batch.
@@ -3955,6 +4135,7 @@ impl<S: Scheduler> Simulator<S> {
         cpu_ids: &[CpuId],
         sim_send: &SendPtr<Simulator<S>>,
         state_send: &SendPtr<SimulatorState>,
+        sim_arc: &SimArc,
         seed: u32,
         watchdog_timeout: Option<TimeNs>,
         duration_ns: TimeNs,
@@ -3968,6 +4149,7 @@ impl<S: Scheduler> Simulator<S> {
             let ring_ref = &ring;
             let sim_ref = sim_send;
             let state_ref = state_send;
+            let arc_ref = sim_arc;
             let per_cpu_ref = &per_cpu;
 
             for (i, &cpu) in cpu_ids.iter().enumerate() {
@@ -3988,10 +4170,9 @@ impl<S: Scheduler> Simulator<S> {
                     // Process all events for this CPU sequentially.
                     // Yields happen at kfunc boundaries within handlers.
                     unsafe {
-                        let sim_state = &mut *(sp as *mut SimState);
                         batch_worker_body(
                             simp,
-                            sim_state,
+                            arc_ref,
                             cpu_events,
                             watchdog_timeout,
                             duration_ns,
@@ -4025,7 +4206,9 @@ impl<S: Scheduler> Simulator<S> {
     /// If the local DSQ is still empty, tries to move a task from the global
     /// DSQ. If successful, schedules a `StartRunning` event for the consumed
     /// task. If nothing is available, the CPU goes idle.
-    fn handle_dsq_consume(&self, cpu: CpuId, s: &mut SimState, monitor: &mut dyn Monitor) {
+    fn handle_dsq_consume(&self, cpu: CpuId, sim_arc: &SimArc, monitor: &mut dyn Monitor) {
+        let mut guard = sim_arc.lock().unwrap();
+        let s = &mut *guard;
         let cpu_idx = cpu.0 as usize;
 
         // If local DSQ already has tasks (e.g., another CPU dispatched here),
@@ -4035,8 +4218,9 @@ impl<S: Scheduler> Simulator<S> {
             let sim_cpu = unsafe { &mut *cpus_ptr.add(cpu_idx) };
             let consumed = s.sim.dsqs.move_to_local(DsqId::GLOBAL, sim_cpu);
             if consumed {
-                s.sim.trace.record(
-                    s.sim.cpus[cpu_idx].local_clock,
+                let __local_t = s.sim.cpus[cpu_idx].local_clock;
+        s.sim.trace.record(
+            __local_t,
                     cpu,
                     TraceKind::DsqMoveToLocal {
                         dsq_id: DsqId::GLOBAL,
@@ -4047,12 +4231,15 @@ impl<S: Scheduler> Simulator<S> {
         }
 
         if let Some(pid) = s.sim.cpus[cpu_idx].local_dsq.pop_front() {
-            s.sim.trace.record(
-                s.sim.cpus[cpu_idx].local_clock,
+            let __local_t = s.sim.cpus[cpu_idx].local_clock;
+        s.sim.trace.record(
+            __local_t,
                 cpu,
                 TraceKind::PickTask { pid },
             );
-            self.start_running(cpu, pid, s, monitor);
+            drop(guard);
+            self.start_running(cpu, pid, sim_arc, monitor);
+            guard = sim_arc.lock().unwrap();
         } else {
             // CPU is idle
             unsafe { ffi::scx_test_set_idle_cpumask(cpu.0 as i32) };
@@ -4072,15 +4259,19 @@ impl<S: Scheduler> Simulator<S> {
         &self,
         cpu: CpuId,
         pid: Pid,
-        s: &mut SimState,
+        sim_arc: &SimArc,
         monitor: &mut dyn Monitor,
     ) {
+        let mut guard = sim_arc.lock().unwrap();
+        let s = &mut *guard;
         // If CPU already has a task running (e.g., a kick caused preemption
         // and dispatch before this event), skip.
         if s.sim.cpus[cpu.0 as usize].current_task.is_some() {
             return;
         }
-        self.start_running(cpu, pid, s, monitor);
+        drop(guard);
+        self.start_running(cpu, pid, sim_arc, monitor);
+        guard = sim_arc.lock().unwrap();
     }
 
     /// Handle a `KickDelivered` event: process a delivered IPI on the target CPU.
@@ -4091,17 +4282,26 @@ impl<S: Scheduler> Simulator<S> {
         &self,
         cpu: CpuId,
         flags: KickFlags,
-        s: &mut SimState,
+        sim_arc: &SimArc,
         monitor: &mut dyn Monitor,
     ) {
+        let mut guard = sim_arc.lock().unwrap();
+        let s = &mut *guard;
         if flags.contains(KickFlags::PREEMPT) && s.sim.cpus[cpu.0 as usize].current_task.is_some() {
-            self.preempt_current(cpu, s, monitor);
+            drop(guard);
+            self.preempt_current(cpu, sim_arc, monitor);
+            guard = sim_arc.lock().unwrap();
         } else if flags.contains(KickFlags::IDLE) {
-            if s.sim.cpus[cpu.0 as usize].current_task.is_none() {
-                self.try_dispatch_and_run(cpu, s, monitor);
+            let is_idle = s.sim.cpus[cpu.0 as usize].current_task.is_none();
+            if is_idle {
+                drop(guard);
+                self.try_dispatch_and_run(cpu, sim_arc, monitor);
+                guard = sim_arc.lock().unwrap();
             }
         } else {
-            self.try_dispatch_and_run(cpu, s, monitor);
+            drop(guard);
+            self.try_dispatch_and_run(cpu, sim_arc, monitor);
+            guard = sim_arc.lock().unwrap();
         }
     }
 
@@ -4110,17 +4310,15 @@ impl<S: Scheduler> Simulator<S> {
     /// Computes how much of the slice was consumed, deducts it from
     /// `run_remaining_ns`, calls `stopping()` + `enqueue()`, then
     /// dispatches the next task via `try_dispatch_and_run()`.
-    fn preempt_current(&self, cpu: CpuId, s: &mut SimState, monitor: &mut dyn Monitor) {
+    fn preempt_current(&self, cpu: CpuId, sim_arc: &SimArc, monitor: &mut dyn Monitor) {
+        let mut guard = sim_arc.lock().unwrap();
+        let s = &mut *guard;
         let pid = match s.sim.cpus[cpu.0 as usize].current_task {
             Some(pid) => pid,
             None => return,
         };
 
-        let task = match s.tasks.get_mut(&pid) {
-            Some(t) => t,
-            None => return,
-        };
-
+        // Read CPU state BEFORE borrowing tasks (split borrow through MutexGuard)
         let local_clock = s.sim.cpus[cpu.0 as usize].local_clock;
         let started_at = s.sim.cpus[cpu.0 as usize]
             .task_started_at
@@ -4128,10 +4326,14 @@ impl<S: Scheduler> Simulator<S> {
         let original_slice = s.sim.cpus[cpu.0 as usize].task_original_slice.unwrap_or(0);
         let consumed = local_clock.saturating_sub(started_at);
 
+        let task = match s.tasks.get_mut(&pid) {
+            Some(t) => t,
+            None => return,
+        };
+
         task.run_remaining_ns = task.run_remaining_ns.saturating_sub(consumed);
 
-        s.sim
-            .trace
+        s.sim.trace
             .record(local_clock, cpu, TraceKind::TaskPreempted { pid });
 
         let task_name = task.name.as_str();
@@ -4148,17 +4350,19 @@ impl<S: Scheduler> Simulator<S> {
         // Set remaining slice on raw task (used by stopping() for vtime accounting)
         let remaining_slice = original_slice.saturating_sub(consumed);
 
+        drop(guard);
         self.stop_and_reenqueue(
             cpu,
             pid,
             raw,
             consumed,
             remaining_slice,
-            s,
+            sim_arc,
             monitor,
             |_, _, _| {}, // no extra traces before enqueue
             |_, _, _| {}, // no extra traces after enqueue
         );
+        guard = sim_arc.lock().unwrap();
     }
 
     /// Stop a running task, re-enqueue it, and dispatch the next task.
@@ -4177,11 +4381,13 @@ impl<S: Scheduler> Simulator<S> {
         raw: *mut c_void,
         consumed: TimeNs,
         remaining_slice: TimeNs,
-        s: &mut SimState,
+        sim_arc: &SimArc,
         monitor: &mut dyn Monitor,
         pre_enqueue: impl FnOnce(&mut SimulatorState, CpuId, Pid),
         post_enqueue: impl FnOnce(&mut SimulatorState, CpuId, Pid),
     ) {
+        let mut guard = sim_arc.lock().unwrap();
+        let s = &mut *guard;
         let cpu_idx = cpu.0 as usize;
 
         // Clear CPU state
@@ -4205,16 +4411,15 @@ impl<S: Scheduler> Simulator<S> {
         }
 
         // stopping()
-        unsafe {
-            kfuncs::enter_sim(&mut s.sim, cpu);
-            set_ops_context(&mut s.sim, OpsContext::Stopping);
-            debug!(pid = pid.0, runnable = true, "enter:structop stopping");
-            start_rbc(&mut s.sim);
+        set_ops_context(&mut s.sim, OpsContext::Stopping);
+        debug!(pid = pid.0, runnable = true, "enter:structop stopping");
+        start_rbc(&mut s.sim);
+        sim_callback!(s, guard, sim_arc, cpu, {
             self.scheduler.stopping(raw, true);
-            charge_sched_time(&mut s.sim, cpu, "stopping");
-            maybe_record_checkpoint(&s.sim, CheckpointEvent::Stopping, cpu);
-            kfuncs::exit_sim();
-        }
+        });
+        let s = &mut *guard;
+        charge_sched_time(&mut s.sim, cpu, "stopping");
+        maybe_record_checkpoint(&s.sim, CheckpointEvent::Stopping, cpu);
 
         // Monitor: Stopping probe
         monitor.sample(&ProbeContext {
@@ -4230,24 +4435,27 @@ impl<S: Scheduler> Simulator<S> {
         pre_enqueue(&mut s.sim, cpu, pid);
 
         // Re-enqueue
-        unsafe {
-            kfuncs::enter_sim(&mut s.sim, cpu);
-            s.sim.set_task_ops_state(pid, OpsTaskState::Queued);
-            debug!(pid = pid.0, "enqueue (re-enqueue)");
-            self.call_enqueue(cpu, raw, 0, &mut s.sim);
-            kfuncs::exit_sim();
-        }
+        s.sim.set_task_ops_state(pid, OpsTaskState::Queued);
+        debug!(pid = pid.0, "enqueue (re-enqueue)");
+        sim_callback!(s, guard, sim_arc, cpu, {
+            self.scheduler.enqueue(raw, 0);
+        });
+        let s = &mut *guard;
 
         // Caller-specific traces after enqueue
         post_enqueue(&mut s.sim, cpu, pid);
 
         // Flush staged events + dispatch next task
-        flush_staged_events(&mut s.sim, &mut s.events);
-        self.try_dispatch_and_run(cpu, s, monitor);
+        { let s = &mut *guard; { let s = &mut *guard; flush_staged_events(&mut s.sim, &mut s.events); } };
+        drop(guard);
+        self.try_dispatch_and_run(cpu, sim_arc, monitor);
+        guard = sim_arc.lock().unwrap();
     }
 
     /// Start running a task on a CPU.
-    fn start_running(&self, cpu: CpuId, pid: Pid, s: &mut SimState, monitor: &mut dyn Monitor) {
+    fn start_running(&self, cpu: CpuId, pid: Pid, sim_arc: &SimArc, monitor: &mut dyn Monitor) {
+        let mut guard = sim_arc.lock().unwrap();
+        let s = &mut *guard;
         let task = match s.tasks.get_mut(&pid) {
             Some(t) => t,
             None => return,
@@ -4255,7 +4463,10 @@ impl<S: Scheduler> Simulator<S> {
 
         // Skip exited tasks that are still lingering in DSQs
         if matches!(task.state, TaskState::Exited) {
-            self.try_dispatch_and_run(cpu, s, monitor);
+            drop(guard);
+            self.try_dispatch_and_run(cpu, sim_arc, monitor);
+            guard = sim_arc.lock().unwrap();
+            let s = &mut *guard;
             return;
         }
 
@@ -4276,52 +4487,49 @@ impl<S: Scheduler> Simulator<S> {
         // CPU is now busy — core is no longer fully idle
         s.sim.update_smt_mask_busy(cpu);
 
+        // Save task data before potential sim_callback! (which drops guard)
+        let raw = task.raw();
+        task.sum_exec_base = unsafe { ffi::sim_task_get_sum_exec_runtime(raw) };
+        let task_enabled = task.enabled;
+        if !task_enabled {
+            task.enabled = true;
+        }
+        // NLL: task is no longer used after this point.
+
         // Notify scheduler that CPU is exiting idle (ops.update_idle)
         if was_idle {
-            unsafe {
-                kfuncs::enter_sim(&mut s.sim, cpu);
-                set_ops_context(&mut s.sim, OpsContext::UpdateIdle);
-                debug!("enter:structop update_idle(idle=false)");
-                start_rbc(&mut s.sim);
+            set_ops_context(&mut s.sim, OpsContext::UpdateIdle);
+            debug!("enter:structop update_idle(idle=false)");
+            start_rbc(&mut s.sim);
+            sim_callback!(s, guard, sim_arc, cpu, {
                 self.scheduler.update_idle(cpu.0 as i32, false);
-                charge_sched_time(&mut s.sim, cpu, "update_idle");
-                kfuncs::exit_sim();
-            }
+            });
+            let s = &mut *guard;
+            charge_sched_time(&mut s.sim, cpu, "update_idle");
         }
-
-        let raw = task.raw();
-
-        // Save sum_exec_runtime base for this run period. LAVD's
-        // running() captures last_sum_exec_clk = task_exec_time(p),
-        // so sum_exec_runtime must be correct at this point (it is,
-        // from the last stopping() update or 0 for the first run).
-        task.sum_exec_base = unsafe { ffi::sim_task_get_sum_exec_runtime(raw) };
-
-        // Call enable on first schedule
-        if !task.enabled {
-            task.enabled = true;
-            unsafe {
-                kfuncs::enter_sim(&mut s.sim, cpu);
-                set_ops_context(&mut s.sim, OpsContext::Enable);
-                debug!(pid = pid.0, "enter:structop enable");
-                start_rbc(&mut s.sim);
+        let s = &mut *guard;
+        if !task_enabled {
+            set_ops_context(&mut s.sim, OpsContext::Enable);
+            debug!(pid = pid.0, "enter:structop enable");
+            start_rbc(&mut s.sim);
+            sim_callback!(s, guard, sim_arc, cpu, {
                 self.scheduler.enable(raw);
-                charge_sched_time(&mut s.sim, cpu, "enable");
-                kfuncs::exit_sim();
-            }
+            });
+            let s = &mut *guard;
+            charge_sched_time(&mut s.sim, cpu, "enable");
         }
 
         // Call running
-        unsafe {
-            kfuncs::enter_sim(&mut s.sim, cpu);
-            set_ops_context(&mut s.sim, OpsContext::Running);
-            debug!(pid = pid.0, "enter:structop running");
-            start_rbc(&mut s.sim);
+        let s = &mut *guard;
+        set_ops_context(&mut s.sim, OpsContext::Running);
+        debug!(pid = pid.0, "enter:structop running");
+        start_rbc(&mut s.sim);
+        sim_callback!(s, guard, sim_arc, cpu, {
             self.scheduler.running(raw);
-            charge_sched_time(&mut s.sim, cpu, "running");
-            maybe_record_checkpoint(&s.sim, CheckpointEvent::Running, cpu);
-            kfuncs::exit_sim();
-        }
+        });
+        let s = &mut *guard;
+        charge_sched_time(&mut s.sim, cpu, "running");
+        maybe_record_checkpoint(&s.sim, CheckpointEvent::Running, cpu);
 
         // Monitor: Running probe
         monitor.sample(&ProbeContext {
@@ -4333,8 +4541,9 @@ impl<S: Scheduler> Simulator<S> {
             trace: &s.sim.trace,
         });
 
+        let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
         s.sim.trace.record(
-            s.sim.cpus[cpu.0 as usize].local_clock,
+            __local_t,
             cpu,
             TraceKind::SetNextTask { pid },
         );
