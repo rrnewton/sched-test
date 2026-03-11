@@ -26,7 +26,7 @@ use tracing::debug;
 use crate::engine::{batch_worker_body, dispatch_worker_body, Simulator};
 use crate::ffi::Scheduler;
 use crate::interleave::WorkerId;
-use crate::kfuncs::{self, OpsContext, SimState, SimulatorState};
+use crate::kfuncs::{self, OpsContext, SimArc, SimState, SimulatorState};
 use crate::preempt::PreemptRing;
 use crate::types::CpuId;
 
@@ -420,6 +420,7 @@ pub(crate) fn run_preemptive_batch<S, B>(
     cpu_ids: &[CpuId],
     sim_send: &SendPtr<Simulator<S>>,
     state_send: &SendPtr<SimulatorState>,
+    sim_arc: &SimArc,
     seed: u32,
     watchdog_timeout: Option<crate::types::TimeNs>,
     duration_ns: crate::types::TimeNs,
@@ -435,6 +436,7 @@ pub(crate) fn run_preemptive_batch<S, B>(
         cpu_ids,
         sim_send,
         state_send,
+        sim_arc,
         &ring,
         &ring,
         watchdog_timeout,
@@ -457,6 +459,7 @@ pub(crate) fn run_batch_with_orchestrator<S, B, O>(
     cpu_ids: &[CpuId],
     sim_send: &SendPtr<Simulator<S>>,
     state_send: &SendPtr<SimulatorState>,
+    sim_arc: &SimArc,
     ring: &PreemptRing,
     orchestrator: &O,
     watchdog_timeout: Option<crate::types::TimeNs>,
@@ -475,6 +478,7 @@ pub(crate) fn run_batch_with_orchestrator<S, B, O>(
         let orch_ref = orchestrator;
         let sim_ref = sim_send;
         let state_ref = state_send;
+        let arc_ref = sim_arc;
 
         for (i, &cpu) in cpu_ids.iter().enumerate() {
             let worker_id = WorkerId(i);
@@ -492,12 +496,9 @@ pub(crate) fn run_batch_with_orchestrator<S, B, O>(
                 build_and_arm(backend, &mut ctx, ring_ref);
 
                 unsafe {
-                    // Recover the containing SimState from the SimulatorState
-                    // pointer (sim is the first field of SimState).
-                    let sim_state = &mut *(sp as *mut SimState);
                     batch_worker_body(
                         simp,
-                        sim_state,
+                        arc_ref,
                         cpu_events,
                         watchdog_timeout,
                         duration_ns,
