@@ -1,10 +1,11 @@
 ---
 title: 'Safety refactor: Arc<Mutex<SimState>> + fold all shared state'
-status: open
+status: closed
 priority: 1
 issue_type: task
 created_at: 2026-03-09T18:28:04.468392808+00:00
-updated_at: 2026-03-09T18:44:18.405588861+00:00
+updated_at: 2026-03-11T14:20:45.903665991+00:00
+closed_at: 2026-03-11T14:20:45.903665841+00:00
 ---
 
 # Description
