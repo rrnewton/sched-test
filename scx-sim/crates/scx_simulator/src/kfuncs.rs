@@ -937,24 +937,16 @@ pub(crate) fn set_sim_state_bundled(bundled: bool) {
 
 /// Prepare for a C scheduler callback by installing the SimArc in the
 /// thread-local so kfuncs and cgroup callbacks can lock it.
-///
-/// Called by the engine AFTER dropping its MutexGuard and BEFORE calling
-/// into C scheduler code. Sets the SIM_ARC thread-local, CALLBACK_CTX,
-/// and SIM_CONTEXT for trace formatting.
-///
-/// Also installs the raw SIM_STATE pointer for backward compatibility
-/// with code that still uses `sim_state_ptr()`.
-/// Finish a C scheduler callback by syncing CALLBACK_CTX back to
-/// SimState and clearing the SIM_ARC thread-local.
-///
-/// Called by the engine AFTER the C call returns and BEFORE relocking
-/// the mutex.
 /// Install a simulator state pointer for the duration of ops callbacks.
 ///
 /// Sets `state.current_cpu` and syncs `SIM_CONTEXT` so the trace formatter
-/// shows the correct CPU in the timestamp suffix. Every callback scope must
-/// declare which CPU it runs on; use `state.current_cpu` for scopes where the
-/// CPU doesn't change (init, exit, fire_timer).
+/// shows the correct CPU in the timestamp suffix. Also installs
+/// `CALLBACK_CTX` so yield functions can save/restore identity without
+/// raw pointer access.
+///
+/// The `SIM_STATE` raw pointer allows `with_sim()` to access state
+/// without locking — the caller holds the MutexGuard, guaranteeing
+/// exclusive access.
 ///
 /// # Safety
 /// The caller must ensure `state` remains valid and unaliased for the
