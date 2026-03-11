@@ -419,6 +419,38 @@ pub(crate) struct SimState {
     pub cgroup_registry: CgroupRegistry,
 }
 
+/// Split-borrowed references to all SimState fields.
+///
+/// `MutexGuard<SimState>::DerefMut` returns a single `&mut SimState`,
+/// preventing the borrow checker from splitting borrows of distinct
+/// fields. Use `guard.fields()` to get independently-borrowable
+/// references:
+///
+/// ```ignore
+/// let f = guard.fields();
+/// start_rbc(&mut f.sim);          // borrows f.sim
+/// f.tasks.get_mut(&pid);          // borrows f.tasks — no conflict
+/// f.sim.trace.record(...);        // borrows f.sim — fine
+/// ```
+pub(crate) struct SimFields<'a> {
+    pub sim: &'a mut SimulatorState,
+    pub tasks: &'a mut HashMap<Pid, SimTask>,
+    pub events: &'a mut EventQueue,
+    pub cgroup_registry: &'a mut CgroupRegistry,
+}
+
+impl SimState {
+    /// Get split-borrowable references to all fields.
+    pub(crate) fn fields(&mut self) -> SimFields<'_> {
+        SimFields {
+            sim: &mut self.sim,
+            tasks: &mut self.tasks,
+            events: &mut self.events,
+            cgroup_registry: &mut self.cgroup_registry,
+        }
+    }
+}
+
 // SAFETY: SimState contains raw pointers (idle_task_raw in SimulatorState,
 // raw C pointers in CgroupInfo/SimTask) but these are only accessed while
 // the Mutex is held. The Arc<Mutex<>> ensures exclusive access.
@@ -1133,16 +1165,17 @@ pub fn clock_window_check(_cpu: CpuId, _local_clock: TimeNs) {
 ///    the mutex.
 ///
 /// # Panics
-/// Panics if neither SIM_STATE nor SIM_ARC is installed.
+/// Panics if neither SIM_ARC nor SIM_STATE is installed.
 fn with_sim<F, R>(cost_ns: u64, f: F) -> R
 where
     F: FnOnce(&mut SimulatorState) -> R,
 {
-    // Try raw pointer path first (engine holds the guard AND installs SIM_STATE)
-    let raw_ptr = SIM_STATE.with(|cell| cell.get());
-    if let Some(ptr) = raw_ptr {
+    // Primary path: lock the Arc (production — engine installs SIM_ARC)
+    let maybe_arc = SIM_ARC.with(|c| c.borrow().clone());
+    if let Some(arc) = maybe_arc {
         let result = {
-            let sim = unsafe { &mut *ptr };
+            let mut guard = arc.lock().unwrap();
+            let sim = &mut guard.sim;
             sim.rbc_kfunc_calls += 1;
             sim.rbc_kfunc_ns += cost_ns;
             sim_rbc_pause();
@@ -1157,25 +1190,26 @@ where
         return result;
     }
 
-    // Arc path (sim_callback! drops the guard and installs SIM_ARC)
-    let arc = SIM_ARC
-        .with(|c| c.borrow().clone())
-        .expect("kfunc called outside of simulator context");
-    let result = {
-        let mut guard = arc.lock().unwrap();
-        let sim = &mut guard.sim;
-        sim.rbc_kfunc_calls += 1;
-        sim.rbc_kfunc_ns += cost_ns;
-        sim_rbc_pause();
-        crate::preempt::pause_timer();
-        let result = f(sim);
-        sim_rbc_resume();
+    // Fallback: raw pointer (unit tests via enter_sim)
+    SIM_STATE.with(|cell| {
+        let ptr = cell
+            .get()
+            .expect("kfunc called outside of simulator context");
+        let result = {
+            let sim = unsafe { &mut *ptr };
+            sim.rbc_kfunc_calls += 1;
+            sim.rbc_kfunc_ns += cost_ns;
+            sim_rbc_pause();
+            crate::preempt::pause_timer();
+            let result = f(sim);
+            sim_rbc_resume();
+            result
+        };
+        crate::preempt::resume_timer();
+        crate::preempt::maybe_yield_preemptive_post();
+        crate::preempt::set_current_kfunc("");
         result
-    };
-    crate::preempt::resume_timer();
-    crate::preempt::maybe_yield_preemptive_post();
-    crate::preempt::set_current_kfunc("");
-    result
+    })
 }
 
 // ---------------------------------------------------------------------------
