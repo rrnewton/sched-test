@@ -944,40 +944,11 @@ pub(crate) fn set_sim_state_bundled(bundled: bool) {
 ///
 /// Also installs the raw SIM_STATE pointer for backward compatibility
 /// with code that still uses `sim_state_ptr()`.
-#[allow(dead_code)]
-pub(crate) fn prepare_callback(arc: &SimArc, cpu: CpuId) {
-    // Lock briefly to read the state we need for context setup
-    {
-        let guard = arc.lock().unwrap();
-        set_sim_clock(guard.sim.cpus[cpu.0 as usize].local_clock, Some(cpu));
-        install_callback_ctx(CallbackContext {
-            current_cpu: cpu,
-            ops_context: guard.sim.ops_context,
-            waker_task_raw: guard.sim.waker_task_raw,
-        });
-    }
-    install_sim_arc(arc);
-}
-
 /// Finish a C scheduler callback by syncing CALLBACK_CTX back to
 /// SimState and clearing the SIM_ARC thread-local.
 ///
 /// Called by the engine AFTER the C call returns and BEFORE relocking
 /// the mutex.
-#[allow(dead_code)]
-pub(crate) fn finish_callback(arc: &SimArc) {
-    // Sync CALLBACK_CTX back to SimState
-    if let Some(ctx) = get_callback_ctx() {
-        let mut guard = arc.lock().unwrap();
-        guard.sim.current_cpu = ctx.current_cpu;
-        guard.sim.ops_context = ctx.ops_context;
-        guard.sim.waker_task_raw = ctx.waker_task_raw;
-    }
-    clear_callback_ctx();
-    crate::preempt::pause_timer();
-    clear_sim_arc();
-}
-
 /// Install a simulator state pointer for the duration of ops callbacks.
 ///
 /// Sets `state.current_cpu` and syncs `SIM_CONTEXT` so the trace formatter
