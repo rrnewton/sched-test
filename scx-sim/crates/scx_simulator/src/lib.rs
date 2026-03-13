@@ -31,6 +31,7 @@
 
 // === Modules that mix safe/unsafe (remain at crate root for now) ===
 pub mod cgroup;
+pub mod cgroup_wrapper;
 pub mod engine;
 pub mod scheduler_wrapper;
 pub mod task;
@@ -70,6 +71,7 @@ pub use unsafe_impl::probes;
 
 // Re-export the main public types for convenience.
 pub use cgroup::{CgroupId, CgroupInfo, CgroupRegistry, DEFAULT_MAX_CGROUPS};
+pub use cgroup_wrapper::{free_cgroup_raw, CgroupPtr, CssIterGuard, SimCgroupHandle};
 pub use engine::{ExitKind, SimulationResult, Simulator};
 pub use ffi::{
     discover_schedulers, DebuggerInfo, DynamicScheduler, LavdPowerMode, Scheduler, SchedulerInfo,
