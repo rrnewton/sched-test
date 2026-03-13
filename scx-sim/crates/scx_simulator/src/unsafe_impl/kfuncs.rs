@@ -1222,20 +1222,49 @@ fn rbc_resume_inner(sim: &SimulatorState) {
 }
 
 /// Pause the PMU RBC counter from C code.
+///
+/// Uses `try_lock()` instead of `lock()` to avoid deadlocking when called
+/// from within `with_sim()`. The `with_sim()` function already holds the
+/// mutex and calls `rbc_pause_inner()` directly, so when `try_lock()` fails
+/// it means the depth counter was already incremented and the RBC counter
+/// already disabled by the lock holder. In that case, we only bump the
+/// depth counter to maintain correct nesting.
 #[no_mangle]
 pub extern "C" fn sim_rbc_pause() {
     if let Some(arc) = SIM_ARC.with(|c| c.borrow().clone()) {
-        let guard = arc.lock().unwrap();
-        rbc_pause_inner(&guard.sim);
+        match arc.try_lock() {
+            Ok(guard) => rbc_pause_inner(&guard.sim),
+            Err(_) => {
+                // Lock already held by with_sim() on this thread.
+                // with_sim() already called rbc_pause_inner(), so just
+                // bump the depth counter for correct nesting.
+                RBC_PAUSE_DEPTH.with(|d| d.set(d.get() + 1));
+            }
+        }
     }
 }
 
 /// Resume the PMU RBC counter from C code.
+///
+/// Mirror of [`sim_rbc_pause`]: uses `try_lock()` to avoid re-entrant
+/// deadlock. When the lock is already held (inside `with_sim()`), we only
+/// decrement the depth counter since `rbc_resume_inner()` will be called
+/// by `with_sim()` when it finishes.
 #[no_mangle]
 pub extern "C" fn sim_rbc_resume() {
     if let Some(arc) = SIM_ARC.with(|c| c.borrow().clone()) {
-        let guard = arc.lock().unwrap();
-        rbc_resume_inner(&guard.sim);
+        match arc.try_lock() {
+            Ok(guard) => rbc_resume_inner(&guard.sim),
+            Err(_) => {
+                // Lock already held by with_sim() on this thread.
+                // Just decrement the depth counter.
+                RBC_PAUSE_DEPTH.with(|d| {
+                    let cur = d.get();
+                    debug_assert!(cur > 0, "sim_rbc_resume without matching sim_rbc_pause");
+                    d.set(cur - 1);
+                });
+            }
+        }
     }
 }
 
@@ -2536,7 +2565,11 @@ mod tests {
         let p = register_task(&mut arc.lock().unwrap().sim, Pid(1));
 
         // Task was last running on CPU 8
-        arc.lock().unwrap().sim.task_last_cpu.insert(Pid(1), CpuId(8));
+        arc.lock()
+            .unwrap()
+            .sim
+            .task_last_cpu
+            .insert(Pid(1), CpuId(8));
 
         // Task has migration_disabled > 0 (like a kworker in BPF code)
         // In production, migration_disabled > 1 means pre-existing disable
@@ -2608,7 +2641,11 @@ mod tests {
         let p = register_task(&mut arc.lock().unwrap().sim, Pid(1));
 
         // Task was last running on CPU 8
-        arc.lock().unwrap().sim.task_last_cpu.insert(Pid(1), CpuId(8));
+        arc.lock()
+            .unwrap()
+            .sim
+            .task_last_cpu
+            .insert(Pid(1), CpuId(8));
 
         // Task has migration_disabled > 0
         unsafe {
@@ -2648,7 +2685,11 @@ mod tests {
         let p = register_task(&mut arc.lock().unwrap().sim, Pid(1));
 
         // Task was last running on CPU 8
-        arc.lock().unwrap().sim.task_last_cpu.insert(Pid(1), CpuId(8));
+        arc.lock()
+            .unwrap()
+            .sim
+            .task_last_cpu
+            .insert(Pid(1), CpuId(8));
 
         // Task has migration_disabled = 0 (migration enabled)
         unsafe {
