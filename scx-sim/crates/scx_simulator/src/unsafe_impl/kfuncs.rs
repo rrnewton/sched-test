@@ -1,24 +1,24 @@
 //! Kfunc implementations for the simulator.
 //!
 //! These are `#[no_mangle] extern "C"` functions that the compiled scheduler
-//! C code calls. They access the simulator state via a thread-local pointer.
+//! C code calls. They access the simulator state via `Arc<Mutex<SimState>>`.
 //!
 //! The pattern is:
-//! 1. Before calling any scheduler ops, the simulator installs a pointer
-//!    to its state via `enter_sim()`.
-//! 2. When the scheduler calls a kfunc, the kfunc accesses the simulator
-//!    state via `with_sim()`.
-//! 3. After the ops call returns, the simulator calls `exit_sim()`.
+//! 1. Before calling any scheduler ops, the simulator installs a `SimArc`
+//!    in the thread-local `SIM_ARC` (via `install_sim_arc` or `enter_sim`).
+//! 2. When the scheduler calls a kfunc, the kfunc locks the mutex via
+//!    `with_sim()`.
+//! 3. After the ops call returns, the simulator calls `exit_sim()` or
+//!    `clear_sim_arc()`.
 //!
 //! # Safety
 //!
 //! Every public function in this module is `#[no_mangle] extern "C"` and
 //! receives raw `*mut c_void` / `*const c_void` pointers from C scheduler
-//! code. The thread-local `SIM_STATE` cell stores a raw pointer to
-//! [`SimulatorState`]; `enter_sim` / `exit_sim` manage its lifetime.
-//! Soundness relies on the caller (the simulation engine) guaranteeing that
-//! `enter_sim` is always paired with `exit_sim` and that no kfunc is called
-//! outside that window.
+//! code. The thread-local `SIM_ARC` holds an `Arc<Mutex<SimState>>`;
+//! `enter_sim` / `exit_sim` manage its installation. Soundness relies on
+//! the caller (the simulation engine) guaranteeing that `SIM_ARC` is
+//! installed before any kfunc is called and cleared after.
 
 // These are extern "C" FFI entry points called from C code — the C caller
 // is responsible for passing valid pointers, so marking them `unsafe` in Rust
@@ -494,11 +494,7 @@ impl SimulatorState {
     /// needs `&mut SimCpu` while we also hold `&mut DsqManager`.
     ///
     /// Returns true if a task was consumed.
-    pub fn consume_dsq_to_local(
-        &mut self,
-        dsq_id: crate::types::DsqId,
-        cpu: crate::types::CpuId,
-    ) -> bool {
+    pub fn consume_dsq_to_local(&mut self, dsq_id: crate::types::DsqId, cpu: crate::types::CpuId) -> bool {
         let cpu_idx = cpu.0 as usize;
         // SAFETY: cpu_idx is within bounds (validated by the engine).
         // The split borrow is sound because cpus_ptr[cpu_idx] and dsqs
@@ -529,9 +525,6 @@ impl SimulatorState {
     /// and when the task is picked to run.
     pub fn clear_task_queued(&mut self, pid: Pid) {
         if let Some(&raw) = self.task_pid_to_raw.get(&pid) {
-            // SAFETY: `raw` is a valid task_struct pointer obtained from
-            // `task_pid_to_raw`, which stores pointers allocated by
-            // `sim_task_alloc` during task creation.
             unsafe {
                 let flags = crate::ffi::sim_task_get_scx_flags(raw as *mut c_void);
                 if flags & SCX_TASK_QUEUED != 0 {
@@ -546,7 +539,6 @@ impl SimulatorState {
 
     fn set_scx_flag(&self, pid: Pid, flag: u32) {
         if let Some(&raw) = self.task_pid_to_raw.get(&pid) {
-            // SAFETY: `raw` is a valid task_struct pointer from `task_pid_to_raw`.
             unsafe {
                 let flags = crate::ffi::sim_task_get_scx_flags(raw as *mut c_void);
                 if flags & flag == 0 {
@@ -901,10 +893,8 @@ impl SimContext {
 }
 
 thread_local! {
-    static SIM_STATE: std::cell::Cell<Option<*mut SimulatorState>> = const { std::cell::Cell::new(None) };
     static SIM_CONTEXT: std::cell::Cell<SimContext> = const { std::cell::Cell::new(SimContext::new()) };
     /// Arc-based thread-local for kfuncs to access the shared SimState.
-    /// Replaces the raw pointer `SIM_STATE` in the new architecture.
     static SIM_ARC: RefCell<Option<SimArc>> = const { RefCell::new(None) };
     /// Per-callback identity context saved/restored across yield points.
     /// Async-signal-safe: Cell<Copy> read/write.
@@ -912,9 +902,6 @@ thread_local! {
     /// Engine-level SimArc stored so that `enter_sim` can install `SIM_ARC`
     /// for cgroup callbacks and concurrent worker threads.
     static ENGINE_SIM_ARC: RefCell<Option<SimArc>> = const { RefCell::new(None) };
-    /// True when SIM_STATE points to a SimulatorState that is the `sim` field
-    /// of a SimState (i.e., safe to cast to *mut SimState for cgroup access).
-    static SIM_STATE_IS_BUNDLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Install a SimArc into the current thread's thread-local.
@@ -988,32 +975,18 @@ pub(crate) fn get_engine_sim_arc() -> Option<SimArc> {
     ENGINE_SIM_ARC.with(|c| c.borrow().clone())
 }
 
-/// Check if the current SIM_STATE pointer is inside a SimState bundle.
-///
-/// Returns true when the engine has bundled state into SimState and it's
-/// safe to cast `sim_state_ptr()` to `*mut SimState` for field access.
-#[allow(dead_code)]
-pub(crate) fn sim_state_is_bundled() -> bool {
-    SIM_STATE_IS_BUNDLED.with(|c| c.get())
-}
-
-/// Mark that the current thread's SIM_STATE points to a bundled SimState.
-pub(crate) fn set_sim_state_bundled(bundled: bool) {
-    SIM_STATE_IS_BUNDLED.with(|c| c.set(bundled));
-}
-
 /// Prepare for a C scheduler callback by installing the SimArc in the
 /// thread-local so kfuncs and cgroup callbacks can lock it.
-/// Install a simulator state pointer for the duration of ops callbacks.
+/// Prepare for a C scheduler callback by installing the SimArc in the
+/// thread-local so kfuncs and cgroup callbacks can lock it.
 ///
 /// Sets `state.current_cpu` and syncs `SIM_CONTEXT` so the trace formatter
 /// shows the correct CPU in the timestamp suffix. Also installs
 /// `CALLBACK_CTX` so yield functions can save/restore identity without
 /// raw pointer access.
 ///
-/// The `SIM_STATE` raw pointer allows `with_sim()` to access state
-/// without locking — the caller holds the MutexGuard, guaranteeing
-/// exclusive access.
+/// Installs `SIM_ARC` from `ENGINE_SIM_ARC` so that `with_sim()` and
+/// cgroup callbacks can lock the mutex to access state.
 ///
 /// # Safety
 /// The caller must ensure `state` remains valid and unaliased for the
@@ -1021,18 +994,16 @@ pub(crate) fn set_sim_state_bundled(bundled: bool) {
 pub unsafe fn enter_sim(state: &mut SimulatorState, cpu: CpuId) {
     state.current_cpu = cpu;
     set_sim_clock(state.cpus[cpu.0 as usize].local_clock, Some(cpu));
-    SIM_STATE.with(|cell| cell.set(Some(state as *mut SimulatorState)));
-    // Install CALLBACK_CTX so interleave/preempt yield functions can
-    // save/restore per-callback identity without raw pointer access.
     install_callback_ctx(CallbackContext {
         current_cpu: state.current_cpu,
         ops_context: state.ops_context,
         waker_task_raw: state.waker_task_raw,
     });
-    // NOTE: We do NOT install SIM_ARC here. The engine holds the MutexGuard,
-    // so kfuncs must use the SIM_STATE raw pointer path (with_sim checks
-    // SIM_STATE first). SIM_ARC is only installed by sim_callback! which
-    // drops the guard before the C call.
+    // Install SIM_ARC from ENGINE_SIM_ARC so kfuncs and cgroup callbacks
+    // can lock the mutex.
+    if let Some(arc) = get_engine_sim_arc() {
+        install_sim_arc(&arc);
+    }
 }
 
 /// Remove the simulator state pointer after ops callbacks complete.
@@ -1056,30 +1027,19 @@ pub fn exit_sim() {
     // The yield functions may have saved/restored CALLBACK_CTX across token
     // passes, so we need to sync it back before clearing.
     if let Some(ctx) = get_callback_ctx() {
-        if let Some(ptr) = SIM_STATE.with(|cell| cell.get()) {
-            // SAFETY: `ptr` was installed by `enter_sim` and is valid.
-            // The caller holds the token; exclusive access is ensured.
-            unsafe {
-                (*ptr).current_cpu = ctx.current_cpu;
-                (*ptr).ops_context = ctx.ops_context;
-                (*ptr).waker_task_raw = ctx.waker_task_raw;
-            }
+        if let Some(arc) = clone_sim_arc() {
+            let mut guard = arc.lock().unwrap();
+            guard.sim.current_cpu = ctx.current_cpu;
+            guard.sim.ops_context = ctx.ops_context;
+            guard.sim.waker_task_raw = ctx.waker_task_raw;
         }
     }
     clear_callback_ctx();
     crate::preempt::pause_timer();
-    SIM_STATE.with(|cell| {
-        if let Some(ptr) = cell.get() {
-            // Clear ops_context AFTER pausing the timer, so any pending
-            // PMU signal (from the last kfunc's rearm) still sees the
-            // correct callback context rather than None.
-            // SAFETY: `ptr` is valid; exclusive access by token.
-            unsafe {
-                (*ptr).ops_context = OpsContext::None;
-            }
-        }
-        cell.set(None);
-    });
+    if let Some(arc) = clone_sim_arc() {
+        let mut guard = arc.lock().unwrap();
+        guard.sim.ops_context = OpsContext::None;
+    }
     // Also clear per-thread TLS so structop boundary detection and the
     // signal handler see None between callbacks.
     crate::preempt::set_current_ops_context(OpsContext::None);
@@ -1098,28 +1058,16 @@ pub fn exit_sim() {
 pub fn exit_sim_no_clear_ops() {
     // Sync CALLBACK_CTX back (same as exit_sim but without clearing ops_context).
     if let Some(ctx) = get_callback_ctx() {
-        if let Some(ptr) = SIM_STATE.with(|cell| cell.get()) {
-            // SAFETY: `ptr` was installed by `enter_sim` and is valid.
-            // The caller holds the token; exclusive access is ensured.
-            unsafe {
-                (*ptr).current_cpu = ctx.current_cpu;
-                (*ptr).ops_context = ctx.ops_context;
-                (*ptr).waker_task_raw = ctx.waker_task_raw;
-            }
+        if let Some(arc) = clone_sim_arc() {
+            let mut guard = arc.lock().unwrap();
+            guard.sim.current_cpu = ctx.current_cpu;
+            guard.sim.ops_context = ctx.ops_context;
+            guard.sim.waker_task_raw = ctx.waker_task_raw;
         }
     }
     clear_callback_ctx();
     crate::preempt::pause_timer();
-    SIM_STATE.with(|cell| cell.set(None));
     clear_sim_arc();
-}
-
-/// Get the raw SimulatorState pointer from the thread-local.
-///
-/// Returns `None` if not inside an `enter_sim`/`exit_sim` scope.
-/// Used by the interleave module to save/restore per-callback context.
-pub fn sim_state_ptr() -> Option<*mut SimulatorState> {
-    SIM_STATE.with(|cell| cell.get())
 }
 
 /// Read the current CPU's local clock from the thread-local.
@@ -1196,63 +1144,32 @@ pub fn clock_window_check(_cpu: CpuId, _local_clock: TimeNs) {
 
 /// Access the simulator state from within a kfunc.
 ///
-/// Uses two access paths:
-/// 1. **Raw pointer path**: If `SIM_STATE` is set (via `enter_sim`), uses the
-///    raw pointer directly. This is the fast path — the engine installs the
-///    raw pointer AND holds the MutexGuard, so we must not try to lock.
-/// 2. **Arc<Mutex<>> path**: If `SIM_STATE` is not set but `SIM_ARC` is
-///    installed (via `sim_callback!` which drops the guard first), locks
-///    the mutex.
+/// Locks `SIM_ARC` to get exclusive access to `SimulatorState`.
 ///
 /// # Panics
-/// Panics if neither SIM_ARC nor SIM_STATE is installed.
+/// Panics if `SIM_ARC` is not installed.
 fn with_sim<F, R>(cost_ns: u64, f: F) -> R
 where
     F: FnOnce(&mut SimulatorState) -> R,
 {
-    // Primary path: lock the Arc (production — engine installs SIM_ARC)
-    let maybe_arc = SIM_ARC.with(|c| c.borrow().clone());
-    if let Some(arc) = maybe_arc {
-        let result = {
-            let mut guard = arc.lock().unwrap();
-            let sim = &mut guard.sim;
-            sim.rbc_kfunc_calls += 1;
-            sim.rbc_kfunc_ns += cost_ns;
-            sim_rbc_pause();
-            crate::preempt::pause_timer();
-            let result = f(sim);
-            sim_rbc_resume();
-            result
-        };
-        crate::preempt::resume_timer();
-        crate::preempt::maybe_yield_preemptive_post();
-        crate::preempt::set_current_kfunc("");
-        return result;
-    }
-
-    // Fallback: raw pointer (unit tests via enter_sim)
-    SIM_STATE.with(|cell| {
-        let ptr = cell
-            .get()
-            .expect("kfunc called outside of simulator context");
-        let result = {
-            // SAFETY: `ptr` was installed by `enter_sim` and is valid until
-            // `exit_sim`. The caller holds the execution token, ensuring
-            // exclusive access to the pointed-to SimulatorState.
-            let sim = unsafe { &mut *ptr };
-            sim.rbc_kfunc_calls += 1;
-            sim.rbc_kfunc_ns += cost_ns;
-            sim_rbc_pause();
-            crate::preempt::pause_timer();
-            let result = f(sim);
-            sim_rbc_resume();
-            result
-        };
-        crate::preempt::resume_timer();
-        crate::preempt::maybe_yield_preemptive_post();
-        crate::preempt::set_current_kfunc("");
+    let arc = SIM_ARC
+        .with(|c| c.borrow().clone())
+        .expect("kfunc called outside of simulator context (SIM_ARC not installed)");
+    let result = {
+        let mut guard = arc.lock().unwrap();
+        let sim = &mut guard.sim;
+        sim.rbc_kfunc_calls += 1;
+        sim.rbc_kfunc_ns += cost_ns;
+        rbc_pause_inner(sim);
+        crate::preempt::pause_timer();
+        let result = f(sim);
+        rbc_resume_inner(sim);
         result
-    })
+    };
+    crate::preempt::resume_timer();
+    crate::preempt::maybe_yield_preemptive_post();
+    crate::preempt::set_current_kfunc("");
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -1267,54 +1184,52 @@ thread_local! {
     static RBC_PAUSE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
-/// Pause the PMU RBC counter from C code.
-///
-/// Called by C kfunc stubs (scx_task_alloc, bpf_cpumask_create, etc.) that
-/// are semantically kfuncs but implemented as plain C. Re-entrant: nested
-/// calls increment a depth counter; only the outermost pause disables
-/// the PMU.
-#[no_mangle]
-pub extern "C" fn sim_rbc_pause() {
+/// Inner RBC pause logic. Called with `&SimulatorState` already available.
+fn rbc_pause_inner(sim: &SimulatorState) {
     let depth = RBC_PAUSE_DEPTH.with(|d| {
         let cur = d.get();
         d.set(cur + 1);
         cur
     });
     if depth == 0 {
-        SIM_STATE.with(|cell| {
-            if let Some(ptr) = cell.get() {
-                let sim = unsafe { &*ptr };
-                if let Some(ref rbc) = sim.rbc_counter {
-                    let _ = rbc.disable();
-                }
-                crate::preempt::pause_measurement();
-            }
-        });
+        if let Some(ref rbc) = sim.rbc_counter {
+            let _ = rbc.disable();
+        }
+        crate::preempt::pause_measurement();
     }
 }
 
-/// Resume the PMU RBC counter from C code.
-///
-/// Counterpart to `sim_rbc_pause()`. Only the outermost resume
-/// re-enables the PMU.
-#[no_mangle]
-pub extern "C" fn sim_rbc_resume() {
+/// Inner RBC resume logic. Called with `&SimulatorState` already available.
+fn rbc_resume_inner(sim: &SimulatorState) {
     let depth = RBC_PAUSE_DEPTH.with(|d| {
         let cur = d.get();
-        debug_assert!(cur > 0, "sim_rbc_resume without matching sim_rbc_pause");
+        debug_assert!(cur > 0, "rbc_resume_inner without matching rbc_pause_inner");
         d.set(cur - 1);
         cur - 1
     });
     if depth == 0 {
-        SIM_STATE.with(|cell| {
-            if let Some(ptr) = cell.get() {
-                let sim = unsafe { &*ptr };
-                if let Some(ref rbc) = sim.rbc_counter {
-                    let _ = rbc.enable();
-                }
-                crate::preempt::resume_measurement();
-            }
-        });
+        if let Some(ref rbc) = sim.rbc_counter {
+            let _ = rbc.enable();
+        }
+        crate::preempt::resume_measurement();
+    }
+}
+
+/// Pause the PMU RBC counter from C code.
+#[no_mangle]
+pub extern "C" fn sim_rbc_pause() {
+    if let Some(arc) = SIM_ARC.with(|c| c.borrow().clone()) {
+        let guard = arc.lock().unwrap();
+        rbc_pause_inner(&guard.sim);
+    }
+}
+
+/// Resume the PMU RBC counter from C code.
+#[no_mangle]
+pub extern "C" fn sim_rbc_resume() {
+    if let Some(arc) = SIM_ARC.with(|c| c.borrow().clone()) {
+        let guard = arc.lock().unwrap();
+        rbc_resume_inner(&guard.sim);
     }
 }
 
@@ -1351,18 +1266,14 @@ pub extern "C" fn scx_bpf_select_cpu_dfl(
     crate::preempt::set_current_kfunc("select_cpu_dfl");
     crate::interleave::maybe_yield();
     with_sim(kfunc_cost::COMPLEX, |sim| {
-        // SAFETY: `p` is a valid task_struct pointer from the scheduler.
         let cpus_ptr = unsafe { ffi::sim_task_get_cpus_ptr(p) };
         let allowed = |cpu: u32| -> bool {
-            // SAFETY: `cpus_ptr` is either null (allow all) or a valid
-            // cpumask pointer from the C task_struct.
             cpus_ptr.is_null() || unsafe { ffi::bpf_cpumask_test_cpu(cpu, cpus_ptr) }
         };
 
         let prev = CpuId(prev_cpu as u32);
         // Prefer prev_cpu if it's idle and allowed
         if (prev.0 as usize) < sim.cpus.len() && sim.cpu_is_idle(prev) && allowed(prev.0) {
-            // SAFETY: `is_idle` is a valid pointer provided by the caller.
             unsafe { *is_idle = true };
             debug!(
                 prev_cpu,
@@ -1379,7 +1290,6 @@ pub extern "C" fn scx_bpf_select_cpu_dfl(
             .find(|c| c.is_idle() && c.local_dsq.is_empty() && allowed(c.id.0))
         {
             let cpu_id = cpu.id;
-            // SAFETY: `is_idle` is a valid pointer provided by the caller.
             unsafe { *is_idle = true };
             debug!(
                 prev_cpu,
@@ -1389,7 +1299,6 @@ pub extern "C" fn scx_bpf_select_cpu_dfl(
             );
             return cpu_id.0 as i32;
         }
-        // SAFETY: `is_idle` is a valid pointer provided by the caller.
         unsafe { *is_idle = false };
         // Fall back to prev_cpu if allowed, otherwise first allowed CPU
         let fallback = if allowed(prev.0) {
@@ -1489,7 +1398,6 @@ pub extern "C" fn scx_bpf_dsq_insert(p: *mut c_void, dsq_id: u64, slice: u64, en
     crate::interleave::maybe_yield();
     with_sim(kfunc_cost::MODERATE, |sim| {
         let pid = sim.task_pid_from_raw(p);
-        // SAFETY: `p` is a valid task_struct pointer from the scheduler.
         unsafe { ffi::sim_task_set_slice(p, slice) };
         debug!(pid = pid.0, dsq_id, slice = %FmtN(slice), "enter:kfunc dsq_insert");
 
@@ -1573,9 +1481,6 @@ pub extern "C" fn scx_bpf_dsq_move_to_local(dsq_id: u64) -> bool {
         let cpu_idx = sim.current_cpu.0 as usize;
         // Need to split borrow: extract cpu mutably, pass dsqs mutably
         let cpus_ptr = sim.cpus.as_mut_ptr();
-        // SAFETY: `cpu_idx` is within bounds (validated by the engine).
-        // The split borrow is sound because `cpus_ptr[cpu_idx]` and
-        // `sim.dsqs` are disjoint fields of SimulatorState.
         let cpu = unsafe { &mut *cpus_ptr.add(cpu_idx) };
         let result = sim.dsqs.move_to_local(DsqId(dsq_id), cpu);
         debug!(dsq_id, result, "enter:kfunc dsq_move_to_local");
@@ -1722,9 +1627,6 @@ pub extern "C" fn scx_bpf_error_bstr(fmt: *const i8, _data: *const u64, _data_sz
     let msg = if fmt.is_null() {
         "scheduler error (null fmt)".to_string()
     } else {
-        // SAFETY: `fmt` is non-null. `CStr::from_ptr` reads until the
-        // null terminator. The pointer comes from C scheduler code which
-        // passes a string literal.
         let cstr = unsafe { std::ffi::CStr::from_ptr(fmt) };
         cstr.to_string_lossy().into_owned()
     };
@@ -2061,13 +1963,11 @@ pub extern "C" fn scx_bpf_task_cgroup(p: *mut c_void, _subsys_id: i32) -> *mut c
         return ptr::null_mut();
     }
     // Get the task's cgroup from the C-side task_struct
-    // SAFETY: `p` is a non-null, valid task_struct pointer (checked above).
     let cgrp = unsafe { ffi::sim_task_get_cgroup(p) };
     if !cgrp.is_null() {
         return cgrp;
     }
     // Fallback: return root cgroup (task not assigned to any cgroup)
-    // SAFETY: `sim_get_root_cgroup` returns the statically allocated root.
     unsafe { ffi::sim_get_root_cgroup() }
 }
 
@@ -2208,8 +2108,10 @@ pub extern "C" fn sim_timer_start(nsecs: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cgroup::CgroupRegistry;
     use crate::cpu::SimCpu;
     use crate::dsq::DsqManager;
+    use crate::engine::EventQueue;
     use crate::scenario::{NoiseConfig, OverheadConfig};
     use crate::trace::Trace;
     use crate::types::{CpuId, DsqId, KickFlags, Pid};
@@ -2262,6 +2164,32 @@ mod tests {
         }
     }
 
+    /// Wrap a `SimulatorState` in `Arc<Mutex<SimState>>` for unit tests.
+    fn test_sim_arc(state: SimulatorState) -> SimArc {
+        let nr_cpus = state.cpus.len() as u32;
+        Arc::new(Mutex::new(SimState {
+            sim: state,
+            tasks: HashMap::new(),
+            events: EventQueue::new(0, false),
+            cgroup_registry: CgroupRegistry::new(nr_cpus, 100),
+        }))
+    }
+
+    /// Install `SIM_ARC` and set up `SIM_CONTEXT` for a test kfunc call.
+    fn enter_test_sim(arc: &SimArc, cpu: CpuId) {
+        {
+            let mut guard = arc.lock().unwrap();
+            guard.sim.current_cpu = cpu;
+            set_sim_clock(guard.sim.cpus[cpu.0 as usize].local_clock, Some(cpu));
+        }
+        install_sim_arc(arc);
+    }
+
+    /// Clear `SIM_ARC` after test kfunc calls complete.
+    fn exit_test_sim() {
+        clear_sim_arc();
+    }
+
     /// Allocate a C task_struct and register it in the state's pointer maps.
     ///
     /// Returns the raw pointer. Caller must call `ffi::sim_task_free` when done.
@@ -2282,16 +2210,16 @@ mod tests {
         }
     }
 
-    /// Run a closure with SimulatorState installed in the thread-local.
+    /// Run a closure with SimulatorState installed via the SIM_ARC path.
     #[allow(dead_code)]
-    fn with_state<F, R>(state: &mut SimulatorState, f: F) -> R
+    fn with_state<F, R>(arc: &SimArc, f: F) -> R
     where
-        F: FnOnce(&mut SimulatorState) -> R,
+        F: FnOnce() -> R,
     {
-        let cpu = state.current_cpu;
-        unsafe { enter_sim(state, cpu) };
-        let result = f(state);
-        exit_sim();
+        let cpu = arc.lock().unwrap().sim.current_cpu;
+        enter_test_sim(arc, cpu);
+        let result = f();
+        exit_test_sim();
         result
     }
 
@@ -2304,14 +2232,16 @@ mod tests {
         let _lock = SIM_LOCK.lock().unwrap();
         let mut state = test_state(1);
 
-        let cpu = state.current_cpu;
-        unsafe { enter_sim(&mut state, cpu) };
+        let arc = test_sim_arc(state);
+
+        let cpu = arc.lock().unwrap().sim.current_cpu;
+        enter_test_sim(&arc, cpu);
         assert_eq!(scx_bpf_create_dsq(42, -1), 0);
         // Creating the same DSQ again should fail
         assert_eq!(scx_bpf_create_dsq(42, -1), -1);
-        exit_sim();
+        exit_test_sim();
 
-        assert_eq!(state.dsqs.nr_queued(DsqId(42)), 0);
+        assert_eq!(arc.lock().unwrap().sim.dsqs.nr_queued(DsqId(42)), 0);
     }
 
     #[test]
@@ -2320,10 +2250,12 @@ mod tests {
         let mut state = test_state(1);
         state.dsqs.create(DsqId(100));
 
-        let cpu = state.current_cpu;
-        unsafe { enter_sim(&mut state, cpu) };
+        let arc = test_sim_arc(state);
+
+        let cpu = arc.lock().unwrap().sim.current_cpu;
+        enter_test_sim(&arc, cpu);
         assert_eq!(scx_bpf_dsq_nr_queued(100), 0);
-        exit_sim();
+        exit_test_sim();
     }
 
     #[test]
@@ -2334,10 +2266,12 @@ mod tests {
         state.dsqs.insert_fifo(DsqId(100), Pid(1));
         state.dsqs.insert_fifo(DsqId(100), Pid(2));
 
-        let cpu = state.current_cpu;
-        unsafe { enter_sim(&mut state, cpu) };
+        let arc = test_sim_arc(state);
+
+        let cpu = arc.lock().unwrap().sim.current_cpu;
+        enter_test_sim(&arc, cpu);
         assert_eq!(scx_bpf_dsq_nr_queued(100), 2);
-        exit_sim();
+        exit_test_sim();
     }
 
     // -----------------------------------------------------------------------
@@ -2348,23 +2282,27 @@ mod tests {
     fn test_dsq_insert_deferred() {
         let _lock = SIM_LOCK.lock().unwrap();
         let mut state = test_state(1);
-        let p = register_task(&mut state, Pid(1));
+        let arc = test_sim_arc(state);
 
-        let cpu = state.current_cpu;
-        unsafe { enter_sim(&mut state, cpu) };
+        let p = register_task(&mut arc.lock().unwrap().sim, Pid(1));
+
+        let cpu = arc.lock().unwrap().sim.current_cpu;
+        enter_test_sim(&arc, cpu);
         scx_bpf_dsq_insert(p, DsqId::GLOBAL.0, 5_000_000, 0);
-        exit_sim();
+        exit_test_sim();
 
         // Insert is deferred, not immediate
-        assert!(state.pending_dispatch.is_some());
-        let pd = state.pending_dispatch.as_ref().unwrap();
+        let guard = arc.lock().unwrap();
+        assert!(guard.sim.pending_dispatch.is_some());
+        let pd = guard.sim.pending_dispatch.as_ref().unwrap();
         assert_eq!(pd.pid, Pid(1));
         assert_eq!(pd.dsq_id, DsqId::GLOBAL);
         assert!(pd.vtime.is_none());
         // DSQ should still be empty until resolved
-        assert_eq!(state.dsqs.nr_queued(DsqId::GLOBAL), 0);
+        assert_eq!(guard.sim.dsqs.nr_queued(DsqId::GLOBAL), 0);
+        drop(guard);
 
-        free_task(&mut state, Pid(1));
+        free_task(&mut arc.lock().unwrap().sim, Pid(1));
     }
 
     #[test]
@@ -2372,58 +2310,70 @@ mod tests {
         let _lock = SIM_LOCK.lock().unwrap();
         let mut state = test_state(1);
         state.dsqs.create(DsqId(50));
-        let p = register_task(&mut state, Pid(3));
+        let arc = test_sim_arc(state);
 
-        let cpu = state.current_cpu;
-        unsafe { enter_sim(&mut state, cpu) };
+        let p = register_task(&mut arc.lock().unwrap().sim, Pid(3));
+
+        let cpu = arc.lock().unwrap().sim.current_cpu;
+        enter_test_sim(&arc, cpu);
         scx_bpf_dsq_insert_vtime(p, 50, 5_000_000, 1000, 0);
-        exit_sim();
+        exit_test_sim();
 
-        let pd = state.pending_dispatch.as_ref().unwrap();
+        let guard = arc.lock().unwrap();
+        let pd = guard.sim.pending_dispatch.as_ref().unwrap();
         assert_eq!(pd.pid, Pid(3));
         assert_eq!(pd.dsq_id, DsqId(50));
         assert_eq!(pd.vtime, Some(Vtime(1000)));
 
-        free_task(&mut state, Pid(3));
+        drop(guard);
+        free_task(&mut arc.lock().unwrap().sim, Pid(3));
     }
 
     #[test]
     fn test_resolve_pending_dispatch_global() {
         let _lock = SIM_LOCK.lock().unwrap();
         let mut state = test_state(2);
-        let p = register_task(&mut state, Pid(1));
+        let arc = test_sim_arc(state);
 
-        let cpu = state.current_cpu;
-        unsafe { enter_sim(&mut state, cpu) };
+        let p = register_task(&mut arc.lock().unwrap().sim, Pid(1));
+
+        let cpu = arc.lock().unwrap().sim.current_cpu;
+        enter_test_sim(&arc, cpu);
         scx_bpf_dsq_insert(p, DsqId::GLOBAL.0, 5_000_000, 0);
-        exit_sim();
+        exit_test_sim();
 
-        let result = state.resolve_pending_dispatch(CpuId(0));
+        let mut guard = arc.lock().unwrap();
+        let result = guard.sim.resolve_pending_dispatch(CpuId(0));
         // Global DSQ dispatch returns None (not a local dispatch)
         assert!(result.is_none());
-        assert_eq!(state.dsqs.nr_queued(DsqId::GLOBAL), 1);
+        assert_eq!(guard.sim.dsqs.nr_queued(DsqId::GLOBAL), 1);
 
-        free_task(&mut state, Pid(1));
+        drop(guard);
+        free_task(&mut arc.lock().unwrap().sim, Pid(1));
     }
 
     #[test]
     fn test_resolve_pending_dispatch_local() {
         let _lock = SIM_LOCK.lock().unwrap();
         let mut state = test_state(2);
-        let p = register_task(&mut state, Pid(1));
+        let arc = test_sim_arc(state);
 
-        let cpu = state.current_cpu;
-        unsafe { enter_sim(&mut state, cpu) };
+        let p = register_task(&mut arc.lock().unwrap().sim, Pid(1));
+
+        let cpu = arc.lock().unwrap().sim.current_cpu;
+        enter_test_sim(&arc, cpu);
         scx_bpf_dsq_insert(p, DsqId::LOCAL.0, 5_000_000, 0);
-        exit_sim();
+        exit_test_sim();
 
-        let result = state.resolve_pending_dispatch(CpuId(1));
+        let mut guard = arc.lock().unwrap();
+        let result = guard.sim.resolve_pending_dispatch(CpuId(1));
         // Local dispatch resolves to the specified CPU
         assert_eq!(result, Some(CpuId(1)));
-        assert_eq!(state.cpus[1].local_dsq.len(), 1);
-        assert_eq!(state.cpus[1].local_dsq[0], Pid(1));
+        assert_eq!(guard.sim.cpus[1].local_dsq.len(), 1);
+        assert_eq!(guard.sim.cpus[1].local_dsq[0], Pid(1));
 
-        free_task(&mut state, Pid(1));
+        drop(guard);
+        free_task(&mut arc.lock().unwrap().sim, Pid(1));
     }
 
     /// Test that SCX_DSQ_LOCAL_ON dispatch to valid CPU succeeds.
@@ -2431,25 +2381,29 @@ mod tests {
     fn test_resolve_pending_dispatch_local_on_valid() {
         let _lock = SIM_LOCK.lock().unwrap();
         let mut state = test_state(4);
-        let p = register_task(&mut state, Pid(1));
+        let arc = test_sim_arc(state);
+
+        let p = register_task(&mut arc.lock().unwrap().sim, Pid(1));
 
         // Create LOCAL_ON DSQ for CPU 2
         let local_on_dsq = DsqId::LOCAL_ON_MASK | 2;
 
-        let cpu = state.current_cpu;
-        unsafe { enter_sim(&mut state, cpu) };
+        let cpu = arc.lock().unwrap().sim.current_cpu;
+        enter_test_sim(&arc, cpu);
         scx_bpf_dsq_insert(p, local_on_dsq, 5_000_000, 0);
-        exit_sim();
+        exit_test_sim();
 
         // Task has no cpumask restriction (cpus_ptr is null), so all CPUs allowed
-        let result = state.resolve_pending_dispatch(CpuId(0));
+        let mut guard = arc.lock().unwrap();
+        let result = guard.sim.resolve_pending_dispatch(CpuId(0));
         // LOCAL_ON dispatch resolves to the specified target CPU
         assert_eq!(result, Some(CpuId(2)));
-        assert_eq!(state.cpus[2].local_dsq.len(), 1);
-        assert_eq!(state.cpus[2].local_dsq[0], Pid(1));
-        assert!(state.bpf_error.is_none());
+        assert_eq!(guard.sim.cpus[2].local_dsq.len(), 1);
+        assert_eq!(guard.sim.cpus[2].local_dsq[0], Pid(1));
+        assert!(guard.sim.bpf_error.is_none());
 
-        free_task(&mut state, Pid(1));
+        drop(guard);
+        free_task(&mut arc.lock().unwrap().sim, Pid(1));
     }
 
     /// Test that SCX_DSQ_LOCAL_ON dispatch to a CPU outside cpumask fails.
@@ -2457,7 +2411,9 @@ mod tests {
     fn test_resolve_pending_dispatch_local_on_cpumask_violation() {
         let _lock = SIM_LOCK.lock().unwrap();
         let mut state = test_state(4);
-        let p = register_task(&mut state, Pid(1));
+        let arc = test_sim_arc(state);
+
+        let p = register_task(&mut arc.lock().unwrap().sim, Pid(1));
 
         // Set up cpumask: task can only run on CPUs 0 and 1
         unsafe {
@@ -2469,20 +2425,21 @@ mod tests {
         // Try to dispatch to CPU 3 (not in cpumask)
         let local_on_dsq = DsqId::LOCAL_ON_MASK | 3;
 
-        let cpu = state.current_cpu;
-        unsafe { enter_sim(&mut state, cpu) };
+        let cpu = arc.lock().unwrap().sim.current_cpu;
+        enter_test_sim(&arc, cpu);
         scx_bpf_dsq_insert(p, local_on_dsq, 5_000_000, 0);
-        exit_sim();
+        exit_test_sim();
 
-        let result = state.resolve_pending_dispatch(CpuId(0));
+        let mut guard = arc.lock().unwrap();
+        let result = guard.sim.resolve_pending_dispatch(CpuId(0));
 
         // Dispatch should be rejected
         assert_eq!(result, None);
         // CPU 3's local DSQ should be empty
-        assert!(state.cpus[3].local_dsq.is_empty());
+        assert!(guard.sim.cpus[3].local_dsq.is_empty());
         // BPF error should be set
-        assert!(state.bpf_error.is_some());
-        let error_msg = state.bpf_error.as_ref().unwrap();
+        assert!(guard.sim.bpf_error.is_some());
+        let error_msg = guard.sim.bpf_error.as_ref().unwrap();
         assert!(
             error_msg.contains("SCX_DSQ_LOCAL_ON"),
             "error should mention SCX_DSQ_LOCAL_ON: {}",
@@ -2495,7 +2452,7 @@ mod tests {
         );
 
         // Verify trace event was recorded
-        let events = state.trace.events();
+        let events = guard.sim.trace.events();
         let dispatch_reject = events.iter().find(|e| {
             matches!(
                 e.kind,
@@ -2511,7 +2468,8 @@ mod tests {
             "DispatchRejected trace event should be recorded"
         );
 
-        free_task(&mut state, Pid(1));
+        drop(guard);
+        free_task(&mut arc.lock().unwrap().sim, Pid(1));
     }
 
     /// Test that SCX_DSQ_LOCAL_ON dispatch to a CPU in cpumask succeeds.
@@ -2519,7 +2477,9 @@ mod tests {
     fn test_resolve_pending_dispatch_local_on_cpumask_valid() {
         let _lock = SIM_LOCK.lock().unwrap();
         let mut state = test_state(4);
-        let p = register_task(&mut state, Pid(1));
+        let arc = test_sim_arc(state);
+
+        let p = register_task(&mut arc.lock().unwrap().sim, Pid(1));
 
         // Set up cpumask: task can only run on CPUs 0 and 2
         unsafe {
@@ -2531,20 +2491,22 @@ mod tests {
         // Dispatch to CPU 2 (in cpumask)
         let local_on_dsq = DsqId::LOCAL_ON_MASK | 2;
 
-        let cpu = state.current_cpu;
-        unsafe { enter_sim(&mut state, cpu) };
+        let cpu = arc.lock().unwrap().sim.current_cpu;
+        enter_test_sim(&arc, cpu);
         scx_bpf_dsq_insert(p, local_on_dsq, 5_000_000, 0);
-        exit_sim();
+        exit_test_sim();
 
-        let result = state.resolve_pending_dispatch(CpuId(0));
+        let mut guard = arc.lock().unwrap();
+        let result = guard.sim.resolve_pending_dispatch(CpuId(0));
 
         // Dispatch should succeed
         assert_eq!(result, Some(CpuId(2)));
-        assert_eq!(state.cpus[2].local_dsq.len(), 1);
-        assert_eq!(state.cpus[2].local_dsq[0], Pid(1));
-        assert!(state.bpf_error.is_none());
+        assert_eq!(guard.sim.cpus[2].local_dsq.len(), 1);
+        assert_eq!(guard.sim.cpus[2].local_dsq[0], Pid(1));
+        assert!(guard.sim.bpf_error.is_none());
 
-        free_task(&mut state, Pid(1));
+        drop(guard);
+        free_task(&mut arc.lock().unwrap().sim, Pid(1));
     }
 
     /// Test SCX_DSQ_LOCAL_ON dispatch to different CPU for migration-disabled task fails.
@@ -2563,10 +2525,12 @@ mod tests {
     fn test_resolve_pending_dispatch_local_on_migration_disabled_violation() {
         let _lock = SIM_LOCK.lock().unwrap();
         let mut state = test_state(32);
-        let p = register_task(&mut state, Pid(1));
+        let arc = test_sim_arc(state);
+
+        let p = register_task(&mut arc.lock().unwrap().sim, Pid(1));
 
         // Task was last running on CPU 8
-        state.task_last_cpu.insert(Pid(1), CpuId(8));
+        arc.lock().unwrap().sim.task_last_cpu.insert(Pid(1), CpuId(8));
 
         // Task has migration_disabled > 0 (like a kworker in BPF code)
         // In production, migration_disabled > 1 means pre-existing disable
@@ -2578,20 +2542,21 @@ mod tests {
         // Try to dispatch to CPU 31 (different from last CPU 8)
         let local_on_dsq = DsqId::LOCAL_ON_MASK | 31;
 
-        let cpu = state.current_cpu;
-        unsafe { enter_sim(&mut state, cpu) };
+        let cpu = arc.lock().unwrap().sim.current_cpu;
+        enter_test_sim(&arc, cpu);
         scx_bpf_dsq_insert(p, local_on_dsq, 5_000_000, 0);
-        exit_sim();
+        exit_test_sim();
 
-        let result = state.resolve_pending_dispatch(CpuId(0));
+        let mut guard = arc.lock().unwrap();
+        let result = guard.sim.resolve_pending_dispatch(CpuId(0));
 
         // Dispatch should be rejected
         assert_eq!(result, None);
         // CPU 31's local DSQ should be empty
-        assert!(state.cpus[31].local_dsq.is_empty());
+        assert!(guard.sim.cpus[31].local_dsq.is_empty());
         // BPF error should be set
-        assert!(state.bpf_error.is_some());
-        let error_msg = state.bpf_error.as_ref().unwrap();
+        assert!(guard.sim.bpf_error.is_some());
+        let error_msg = guard.sim.bpf_error.as_ref().unwrap();
         assert!(
             error_msg.contains("SCX_DSQ_LOCAL_ON"),
             "error should mention SCX_DSQ_LOCAL_ON: {}",
@@ -2604,7 +2569,7 @@ mod tests {
         );
 
         // Verify trace event was recorded with correct reason
-        let events = state.trace.events();
+        let events = guard.sim.trace.events();
         let dispatch_reject = events.iter().find(|e| {
             matches!(
                 e.kind,
@@ -2620,7 +2585,8 @@ mod tests {
             "DispatchRejected with MigrationDisabled reason should be recorded"
         );
 
-        free_task(&mut state, Pid(1));
+        drop(guard);
+        free_task(&mut arc.lock().unwrap().sim, Pid(1));
     }
 
     /// Test SCX_DSQ_LOCAL_ON dispatch to same CPU for migration-disabled task succeeds.
@@ -2631,10 +2597,12 @@ mod tests {
     fn test_resolve_pending_dispatch_local_on_migration_disabled_same_cpu_ok() {
         let _lock = SIM_LOCK.lock().unwrap();
         let mut state = test_state(16);
-        let p = register_task(&mut state, Pid(1));
+        let arc = test_sim_arc(state);
+
+        let p = register_task(&mut arc.lock().unwrap().sim, Pid(1));
 
         // Task was last running on CPU 8
-        state.task_last_cpu.insert(Pid(1), CpuId(8));
+        arc.lock().unwrap().sim.task_last_cpu.insert(Pid(1), CpuId(8));
 
         // Task has migration_disabled > 0
         unsafe {
@@ -2644,20 +2612,22 @@ mod tests {
         // Dispatch to CPU 8 (same as last CPU) - should succeed
         let local_on_dsq = DsqId::LOCAL_ON_MASK | 8;
 
-        let cpu = state.current_cpu;
-        unsafe { enter_sim(&mut state, cpu) };
+        let cpu = arc.lock().unwrap().sim.current_cpu;
+        enter_test_sim(&arc, cpu);
         scx_bpf_dsq_insert(p, local_on_dsq, 5_000_000, 0);
-        exit_sim();
+        exit_test_sim();
 
-        let result = state.resolve_pending_dispatch(CpuId(0));
+        let mut guard = arc.lock().unwrap();
+        let result = guard.sim.resolve_pending_dispatch(CpuId(0));
 
         // Dispatch should succeed
         assert_eq!(result, Some(CpuId(8)));
-        assert_eq!(state.cpus[8].local_dsq.len(), 1);
-        assert_eq!(state.cpus[8].local_dsq[0], Pid(1));
-        assert!(state.bpf_error.is_none());
+        assert_eq!(guard.sim.cpus[8].local_dsq.len(), 1);
+        assert_eq!(guard.sim.cpus[8].local_dsq[0], Pid(1));
+        assert!(guard.sim.bpf_error.is_none());
 
-        free_task(&mut state, Pid(1));
+        drop(guard);
+        free_task(&mut arc.lock().unwrap().sim, Pid(1));
     }
 
     /// Test that migration_disabled=0 tasks can move to different CPUs.
@@ -2667,10 +2637,12 @@ mod tests {
     fn test_resolve_pending_dispatch_local_on_migration_enabled_can_move() {
         let _lock = SIM_LOCK.lock().unwrap();
         let mut state = test_state(16);
-        let p = register_task(&mut state, Pid(1));
+        let arc = test_sim_arc(state);
+
+        let p = register_task(&mut arc.lock().unwrap().sim, Pid(1));
 
         // Task was last running on CPU 8
-        state.task_last_cpu.insert(Pid(1), CpuId(8));
+        arc.lock().unwrap().sim.task_last_cpu.insert(Pid(1), CpuId(8));
 
         // Task has migration_disabled = 0 (migration enabled)
         unsafe {
@@ -2680,20 +2652,22 @@ mod tests {
         // Dispatch to CPU 12 (different from last CPU 8) - should succeed
         let local_on_dsq = DsqId::LOCAL_ON_MASK | 12;
 
-        let cpu = state.current_cpu;
-        unsafe { enter_sim(&mut state, cpu) };
+        let cpu = arc.lock().unwrap().sim.current_cpu;
+        enter_test_sim(&arc, cpu);
         scx_bpf_dsq_insert(p, local_on_dsq, 5_000_000, 0);
-        exit_sim();
+        exit_test_sim();
 
-        let result = state.resolve_pending_dispatch(CpuId(0));
+        let mut guard = arc.lock().unwrap();
+        let result = guard.sim.resolve_pending_dispatch(CpuId(0));
 
         // Dispatch should succeed (migration is enabled)
         assert_eq!(result, Some(CpuId(12)));
-        assert_eq!(state.cpus[12].local_dsq.len(), 1);
-        assert_eq!(state.cpus[12].local_dsq[0], Pid(1));
-        assert!(state.bpf_error.is_none());
+        assert_eq!(guard.sim.cpus[12].local_dsq.len(), 1);
+        assert_eq!(guard.sim.cpus[12].local_dsq[0], Pid(1));
+        assert!(guard.sim.bpf_error.is_none());
 
-        free_task(&mut state, Pid(1));
+        drop(guard);
+        free_task(&mut arc.lock().unwrap().sim, Pid(1));
     }
 
     // -----------------------------------------------------------------------
@@ -2709,15 +2683,17 @@ mod tests {
         state.dsqs.insert_fifo(DsqId(77), Pid(11));
         state.current_cpu = CpuId(1);
 
-        let cpu = state.current_cpu;
-        unsafe { enter_sim(&mut state, cpu) };
+        let arc = test_sim_arc(state);
+
+        let cpu = arc.lock().unwrap().sim.current_cpu;
+        enter_test_sim(&arc, cpu);
         let moved = scx_bpf_dsq_move_to_local(77);
-        exit_sim();
+        exit_test_sim();
 
         assert!(moved);
-        assert_eq!(state.cpus[1].local_dsq.len(), 1);
-        assert_eq!(state.cpus[1].local_dsq[0], Pid(10));
-        assert_eq!(state.dsqs.nr_queued(DsqId(77)), 1);
+        assert_eq!(arc.lock().unwrap().sim.cpus[1].local_dsq.len(), 1);
+        assert_eq!(arc.lock().unwrap().sim.cpus[1].local_dsq[0], Pid(10));
+        assert_eq!(arc.lock().unwrap().sim.dsqs.nr_queued(DsqId(77)), 1);
     }
 
     #[test]
@@ -2726,13 +2702,15 @@ mod tests {
         let mut state = test_state(1);
         state.dsqs.create(DsqId(77));
 
-        let cpu = state.current_cpu;
-        unsafe { enter_sim(&mut state, cpu) };
+        let arc = test_sim_arc(state);
+
+        let cpu = arc.lock().unwrap().sim.current_cpu;
+        enter_test_sim(&arc, cpu);
         let moved = scx_bpf_dsq_move_to_local(77);
-        exit_sim();
+        exit_test_sim();
 
         assert!(!moved);
-        assert!(state.cpus[0].local_dsq.is_empty());
+        assert!(arc.lock().unwrap().sim.cpus[0].local_dsq.is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -2744,18 +2722,20 @@ mod tests {
         let _lock = SIM_LOCK.lock().unwrap();
         let mut state = test_state(4);
         // All CPUs idle, prev_cpu=2 should be returned
-        let p = register_task(&mut state, Pid(1));
+        let arc = test_sim_arc(state);
 
-        let cpu = state.current_cpu;
-        unsafe { enter_sim(&mut state, cpu) };
+        let p = register_task(&mut arc.lock().unwrap().sim, Pid(1));
+
+        let cpu = arc.lock().unwrap().sim.current_cpu;
+        enter_test_sim(&arc, cpu);
         let mut is_idle = false;
         let cpu = scx_bpf_select_cpu_dfl(p, 2, 0, &mut is_idle);
-        exit_sim();
+        exit_test_sim();
 
         assert_eq!(cpu, 2);
         assert!(is_idle);
 
-        free_task(&mut state, Pid(1));
+        free_task(&mut arc.lock().unwrap().sim, Pid(1));
     }
 
     #[test]
@@ -2764,18 +2744,20 @@ mod tests {
         let mut state = test_state(3);
         // Make prev_cpu busy, leave others idle
         state.cpus[1].current_task = Some(Pid(99));
-        let p = register_task(&mut state, Pid(1));
+        let arc = test_sim_arc(state);
 
-        let cpu = state.current_cpu;
-        unsafe { enter_sim(&mut state, cpu) };
+        let p = register_task(&mut arc.lock().unwrap().sim, Pid(1));
+
+        let cpu = arc.lock().unwrap().sim.current_cpu;
+        enter_test_sim(&arc, cpu);
         let mut is_idle = false;
         let cpu = scx_bpf_select_cpu_dfl(p, 1, 0, &mut is_idle);
-        exit_sim();
+        exit_test_sim();
 
         assert!(is_idle);
         assert_ne!(cpu, 1); // Should pick a different idle CPU
 
-        free_task(&mut state, Pid(1));
+        free_task(&mut arc.lock().unwrap().sim, Pid(1));
     }
 
     #[test]
@@ -2785,18 +2767,20 @@ mod tests {
         // All CPUs busy
         state.cpus[0].current_task = Some(Pid(10));
         state.cpus[1].current_task = Some(Pid(11));
-        let p = register_task(&mut state, Pid(1));
+        let arc = test_sim_arc(state);
 
-        let cpu = state.current_cpu;
-        unsafe { enter_sim(&mut state, cpu) };
+        let p = register_task(&mut arc.lock().unwrap().sim, Pid(1));
+
+        let cpu = arc.lock().unwrap().sim.current_cpu;
+        enter_test_sim(&arc, cpu);
         let mut is_idle = false;
         let cpu = scx_bpf_select_cpu_dfl(p, 0, 0, &mut is_idle);
-        exit_sim();
+        exit_test_sim();
 
         assert!(!is_idle);
         assert_eq!(cpu, 0); // Falls back to prev_cpu
 
-        free_task(&mut state, Pid(1));
+        free_task(&mut arc.lock().unwrap().sim, Pid(1));
     }
 
     // -----------------------------------------------------------------------
@@ -2810,10 +2794,12 @@ mod tests {
         state.current_cpu = CpuId(1);
         state.cpus[1].local_clock = 42_000_000;
 
-        let cpu = state.current_cpu;
-        unsafe { enter_sim(&mut state, cpu) };
+        let arc = test_sim_arc(state);
+
+        let cpu = arc.lock().unwrap().sim.current_cpu;
+        enter_test_sim(&arc, cpu);
         let now = scx_bpf_now();
-        exit_sim();
+        exit_test_sim();
 
         assert_eq!(now, 42_000_000);
     }
@@ -2824,10 +2810,12 @@ mod tests {
         let mut state = test_state(1);
         state.cpus[0].local_clock = 99_000;
 
-        let cpu = state.current_cpu;
-        unsafe { enter_sim(&mut state, cpu) };
+        let arc = test_sim_arc(state);
+
+        let cpu = arc.lock().unwrap().sim.current_cpu;
+        enter_test_sim(&arc, cpu);
         let t = bpf_ktime_get_ns();
-        exit_sim();
+        exit_test_sim();
 
         assert_eq!(t, 99_000);
     }
@@ -2842,11 +2830,13 @@ mod tests {
         let mut state = test_state(4);
         state.current_cpu = CpuId(3);
 
-        let cpu = state.current_cpu;
-        unsafe { enter_sim(&mut state, cpu) };
+        let arc = test_sim_arc(state);
+
+        let cpu = arc.lock().unwrap().sim.current_cpu;
+        enter_test_sim(&arc, cpu);
         assert_eq!(bpf_get_smp_processor_id(), 3);
         assert_eq!(sim_bpf_get_smp_processor_id(), 3);
-        exit_sim();
+        exit_test_sim();
     }
 
     #[test]
@@ -2854,10 +2844,12 @@ mod tests {
         let _lock = SIM_LOCK.lock().unwrap();
         let mut state = test_state(8);
 
-        let cpu = state.current_cpu;
-        unsafe { enter_sim(&mut state, cpu) };
+        let arc = test_sim_arc(state);
+
+        let cpu = arc.lock().unwrap().sim.current_cpu;
+        enter_test_sim(&arc, cpu);
         assert_eq!(scx_bpf_nr_cpu_ids(), 8);
-        exit_sim();
+        exit_test_sim();
     }
 
     // -----------------------------------------------------------------------
@@ -2870,19 +2862,25 @@ mod tests {
         let mut state = test_state(1);
         state.rng = SmallRng::seed_from_u64(12345);
 
-        let cpu = state.current_cpu;
-        unsafe { enter_sim(&mut state, cpu) };
+        let arc = test_sim_arc(state);
+
+        let cpu = arc.lock().unwrap().sim.current_cpu;
+        enter_test_sim(&arc, cpu);
         let a = sim_bpf_get_prandom_u32();
         let b = sim_bpf_get_prandom_u32();
-        exit_sim();
+        exit_test_sim();
 
         // Replay with same seed
-        state.rng = SmallRng::seed_from_u64(12345);
-        let cpu = state.current_cpu;
-        unsafe { enter_sim(&mut state, cpu) };
+        {
+            let mut guard = arc.lock().unwrap();
+            guard.sim.rng = SmallRng::seed_from_u64(12345);
+        }
+
+        let cpu = arc.lock().unwrap().sim.current_cpu;
+        enter_test_sim(&arc, cpu);
         let a2 = sim_bpf_get_prandom_u32();
         let b2 = sim_bpf_get_prandom_u32();
-        exit_sim();
+        exit_test_sim();
 
         assert_eq!(a, a2);
         assert_eq!(b, b2);
@@ -2897,18 +2895,20 @@ mod tests {
     fn test_bpf_task_from_pid() {
         let _lock = SIM_LOCK.lock().unwrap();
         let mut state = test_state(1);
-        let raw = register_task(&mut state, Pid(42));
+        let arc = test_sim_arc(state);
 
-        let cpu = state.current_cpu;
-        unsafe { enter_sim(&mut state, cpu) };
+        let raw = register_task(&mut arc.lock().unwrap().sim, Pid(42));
+
+        let cpu = arc.lock().unwrap().sim.current_cpu;
+        enter_test_sim(&arc, cpu);
         let found = bpf_task_from_pid(42);
         let not_found = bpf_task_from_pid(999);
-        exit_sim();
+        exit_test_sim();
 
         assert_eq!(found, raw);
         assert!(not_found.is_null());
 
-        free_task(&mut state, Pid(42));
+        free_task(&mut arc.lock().unwrap().sim, Pid(42));
     }
 
     #[test]
@@ -2939,18 +2939,20 @@ mod tests {
     fn test_get_current_task_btf() {
         let _lock = SIM_LOCK.lock().unwrap();
         let mut state = test_state(2);
-        let raw = register_task(&mut state, Pid(7));
-        state.cpus[0].current_task = Some(Pid(7));
-        state.current_cpu = CpuId(0);
+        let arc = test_sim_arc(state);
 
-        let cpu = state.current_cpu;
-        unsafe { enter_sim(&mut state, cpu) };
+        let raw = register_task(&mut arc.lock().unwrap().sim, Pid(7));
+        arc.lock().unwrap().sim.cpus[0].current_task = Some(Pid(7));
+        arc.lock().unwrap().sim.current_cpu = CpuId(0);
+
+        let cpu = arc.lock().unwrap().sim.current_cpu;
+        enter_test_sim(&arc, cpu);
         let current = bpf_get_current_task_btf();
-        exit_sim();
+        exit_test_sim();
 
         assert_eq!(current, raw);
 
-        free_task(&mut state, Pid(7));
+        free_task(&mut arc.lock().unwrap().sim, Pid(7));
     }
 
     #[test]
@@ -2959,10 +2961,12 @@ mod tests {
         let mut state = test_state(1);
         // No task running on CPU 0
 
-        let cpu = state.current_cpu;
-        unsafe { enter_sim(&mut state, cpu) };
+        let arc = test_sim_arc(state);
+
+        let cpu = arc.lock().unwrap().sim.current_cpu;
+        enter_test_sim(&arc, cpu);
         let current = bpf_get_current_task_btf();
-        exit_sim();
+        exit_test_sim();
 
         assert!(current.is_null());
     }
@@ -2975,21 +2979,23 @@ mod tests {
     fn test_cpu_curr() {
         let _lock = SIM_LOCK.lock().unwrap();
         let mut state = test_state(2);
-        let raw = register_task(&mut state, Pid(5));
-        state.cpus[1].current_task = Some(Pid(5));
+        let arc = test_sim_arc(state);
 
-        let cpu = state.current_cpu;
-        unsafe { enter_sim(&mut state, cpu) };
+        let raw = register_task(&mut arc.lock().unwrap().sim, Pid(5));
+        arc.lock().unwrap().sim.cpus[1].current_task = Some(Pid(5));
+
+        let cpu = arc.lock().unwrap().sim.current_cpu;
+        enter_test_sim(&arc, cpu);
         let p = scx_bpf_cpu_curr(1);
         let idle = scx_bpf_cpu_curr(0);
         let oob = scx_bpf_cpu_curr(99);
-        exit_sim();
+        exit_test_sim();
 
         assert_eq!(p, raw);
         assert!(idle.is_null());
         assert!(oob.is_null());
 
-        free_task(&mut state, Pid(5));
+        free_task(&mut arc.lock().unwrap().sim, Pid(5));
     }
 
     // -----------------------------------------------------------------------
@@ -3001,17 +3007,21 @@ mod tests {
         let _lock = SIM_LOCK.lock().unwrap();
         let mut state = test_state(4);
 
-        let cpu = state.current_cpu;
-        unsafe { enter_sim(&mut state, cpu) };
+        let arc = test_sim_arc(state);
+
+        let cpu = arc.lock().unwrap().sim.current_cpu;
+        enter_test_sim(&arc, cpu);
         scx_bpf_kick_cpu(1, 0);
         scx_bpf_kick_cpu(3, 2); // SCX_KICK_PREEMPT
         scx_bpf_kick_cpu(1, 2); // Second kick to same CPU
-        exit_sim();
+        exit_test_sim();
 
         // Kicks are now staged events, not in kicked_cpus
-        assert_eq!(state.staged_events.len(), 3);
+        let guard = arc.lock().unwrap();
+        assert_eq!(guard.sim.staged_events.len(), 3);
         // All staged events target the correct CPUs with correct flags
-        let events: Vec<_> = state
+        let events: Vec<_> = guard
+            .sim
             .staged_events
             .iter()
             .map(|(_, ev)| match ev {
@@ -3028,12 +3038,14 @@ mod tests {
         let _lock = SIM_LOCK.lock().unwrap();
         let mut state = test_state(2);
 
-        let cpu = state.current_cpu;
-        unsafe { enter_sim(&mut state, cpu) };
-        scx_bpf_kick_cpu(99, 0);
-        exit_sim();
+        let arc = test_sim_arc(state);
 
-        assert!(state.staged_events.is_empty());
+        let cpu = arc.lock().unwrap().sim.current_cpu;
+        enter_test_sim(&arc, cpu);
+        scx_bpf_kick_cpu(99, 0);
+        exit_test_sim();
+
+        assert!(arc.lock().unwrap().sim.staged_events.is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -3046,13 +3058,15 @@ mod tests {
         let mut state = test_state(1);
         state.dsqs.create(DsqId(200));
 
-        let cpu = state.current_cpu;
-        unsafe { enter_sim(&mut state, cpu) };
+        let arc = test_sim_arc(state);
+
+        let cpu = arc.lock().unwrap().sim.current_cpu;
+        enter_test_sim(&arc, cpu);
         let first = sim_dsq_iter_begin(200, 0);
-        exit_sim();
+        exit_test_sim();
 
         assert!(first.is_null());
-        assert!(state.dsq_iter.is_none());
+        assert!(arc.lock().unwrap().sim.dsq_iter.is_none());
     }
 
     #[test]
@@ -3064,12 +3078,14 @@ mod tests {
         state.dsqs.insert_fifo(DsqId(200), Pid(2));
         state.dsqs.insert_fifo(DsqId(200), Pid(3));
 
-        let raw1 = register_task(&mut state, Pid(1));
-        let raw2 = register_task(&mut state, Pid(2));
-        let raw3 = register_task(&mut state, Pid(3));
+        let arc = test_sim_arc(state);
 
-        let cpu = state.current_cpu;
-        unsafe { enter_sim(&mut state, cpu) };
+        let raw1 = register_task(&mut arc.lock().unwrap().sim, Pid(1));
+        let raw2 = register_task(&mut arc.lock().unwrap().sim, Pid(2));
+        let raw3 = register_task(&mut arc.lock().unwrap().sim, Pid(3));
+
+        let cpu = arc.lock().unwrap().sim.current_cpu;
+        enter_test_sim(&arc, cpu);
 
         let p1 = sim_dsq_iter_begin(200, 0);
         assert_eq!(p1, raw1);
@@ -3083,11 +3099,11 @@ mod tests {
         let end = sim_dsq_iter_next();
         assert!(end.is_null());
 
-        exit_sim();
+        exit_test_sim();
 
-        free_task(&mut state, Pid(1));
-        free_task(&mut state, Pid(2));
-        free_task(&mut state, Pid(3));
+        free_task(&mut arc.lock().unwrap().sim, Pid(1));
+        free_task(&mut arc.lock().unwrap().sim, Pid(2));
+        free_task(&mut arc.lock().unwrap().sim, Pid(3));
     }
 
     // -----------------------------------------------------------------------
@@ -3103,11 +3119,13 @@ mod tests {
         state.dsqs.insert_fifo(DsqId(300), Pid(1));
         state.dsqs.insert_fifo(DsqId(300), Pid(2));
 
-        let raw1 = register_task(&mut state, Pid(1));
-        let _raw2 = register_task(&mut state, Pid(2));
+        let arc = test_sim_arc(state);
 
-        let cpu = state.current_cpu;
-        unsafe { enter_sim(&mut state, cpu) };
+        let raw1 = register_task(&mut arc.lock().unwrap().sim, Pid(1));
+        let _raw2 = register_task(&mut arc.lock().unwrap().sim, Pid(2));
+
+        let cpu = arc.lock().unwrap().sim.current_cpu;
+        enter_test_sim(&arc, cpu);
 
         // Start iterating DSQ 300
         let p = sim_dsq_iter_begin(300, 0);
@@ -3117,13 +3135,13 @@ mod tests {
         let moved = sim_scx_bpf_dsq_move(raw1, 301, 0);
         assert!(moved);
 
-        exit_sim();
+        exit_test_sim();
 
-        assert_eq!(state.dsqs.nr_queued(DsqId(300)), 1); // pid 2 remains
-        assert_eq!(state.dsqs.nr_queued(DsqId(301)), 1); // pid 1 moved here
+        assert_eq!(arc.lock().unwrap().sim.dsqs.nr_queued(DsqId(300)), 1); // pid 2 remains
+        assert_eq!(arc.lock().unwrap().sim.dsqs.nr_queued(DsqId(301)), 1); // pid 1 moved here
 
-        free_task(&mut state, Pid(1));
-        free_task(&mut state, Pid(2));
+        free_task(&mut arc.lock().unwrap().sim, Pid(1));
+        free_task(&mut arc.lock().unwrap().sim, Pid(2));
     }
 
     // -----------------------------------------------------------------------
@@ -3134,18 +3152,20 @@ mod tests {
     fn test_task_running() {
         let _lock = SIM_LOCK.lock().unwrap();
         let mut state = test_state(2);
-        let raw_running = register_task(&mut state, Pid(1));
-        let raw_idle = register_task(&mut state, Pid(2));
-        state.cpus[0].current_task = Some(Pid(1));
+        let arc = test_sim_arc(state);
 
-        let cpu = state.current_cpu;
-        unsafe { enter_sim(&mut state, cpu) };
+        let raw_running = register_task(&mut arc.lock().unwrap().sim, Pid(1));
+        let raw_idle = register_task(&mut arc.lock().unwrap().sim, Pid(2));
+        arc.lock().unwrap().sim.cpus[0].current_task = Some(Pid(1));
+
+        let cpu = arc.lock().unwrap().sim.current_cpu;
+        enter_test_sim(&arc, cpu);
         assert!(scx_bpf_task_running(raw_running));
         assert!(!scx_bpf_task_running(raw_idle));
-        exit_sim();
+        exit_test_sim();
 
-        free_task(&mut state, Pid(1));
-        free_task(&mut state, Pid(2));
+        free_task(&mut arc.lock().unwrap().sim, Pid(1));
+        free_task(&mut arc.lock().unwrap().sim, Pid(2));
     }
 
     // -----------------------------------------------------------------------
@@ -3199,14 +3219,19 @@ mod tests {
         let _lock = SIM_LOCK.lock().unwrap();
         let mut state = test_state(1);
 
-        let cpu = state.current_cpu;
-        unsafe { enter_sim(&mut state, cpu) };
+        let arc = test_sim_arc(state);
+
+        let cpu = arc.lock().unwrap().sim.current_cpu;
+        enter_test_sim(&arc, cpu);
 
         // Null task pointer returns null
         assert!(scx_bpf_task_cgroup(ptr::null_mut(), 0).is_null());
 
-        // bpf_cgroup_from_id falls back to root cgroup when no registry is installed
-        assert!(!bpf_cgroup_from_id(123).is_null());
+        // bpf_cgroup_from_id with root cgroup ID returns non-null
+        assert!(!bpf_cgroup_from_id(1).is_null());
+
+        // Non-existent cgroup ID returns null
+        assert!(bpf_cgroup_from_id(999).is_null());
 
         // Null cgroup pointer returns null
         assert!(bpf_cgroup_ancestor(ptr::null_mut(), 0).is_null());
@@ -3221,7 +3246,7 @@ mod tests {
         );
         assert!(bpf_map_lookup_percpu_elem(ptr::null_mut(), ptr::null(), 0).is_null());
 
-        exit_sim();
+        exit_test_sim();
     }
 
     #[test]
@@ -3240,7 +3265,9 @@ mod tests {
     fn test_sdt_task_alloc_data_free() {
         let _lock = SIM_LOCK.lock().unwrap();
         let mut state = test_state(1);
-        let p = register_task(&mut state, Pid(100));
+        let arc = test_sim_arc(state);
+
+        let p = register_task(&mut arc.lock().unwrap().sim, Pid(100));
 
         // Initialize the allocator with 256 bytes per task
         let ret = unsafe { ffi::scx_task_init(256) };
@@ -3266,15 +3293,17 @@ mod tests {
         let data3 = unsafe { ffi::scx_task_data(p) };
         assert!(data3.is_null(), "scx_task_data must return null after free");
 
-        free_task(&mut state, Pid(100));
+        free_task(&mut arc.lock().unwrap().sim, Pid(100));
     }
 
     #[test]
     fn test_sdt_task_multiple_tasks() {
         let _lock = SIM_LOCK.lock().unwrap();
         let mut state = test_state(2);
-        let p1 = register_task(&mut state, Pid(10));
-        let p2 = register_task(&mut state, Pid(20));
+        let arc = test_sim_arc(state);
+
+        let p1 = register_task(&mut arc.lock().unwrap().sim, Pid(10));
+        let p2 = register_task(&mut arc.lock().unwrap().sim, Pid(20));
 
         let ret = unsafe { ffi::scx_task_init(64) };
         assert_eq!(ret, 0);
@@ -3295,15 +3324,17 @@ mod tests {
         assert_eq!(unsafe { ffi::scx_task_data(p2) }, d2);
 
         unsafe { ffi::scx_task_free(p2) };
-        free_task(&mut state, Pid(10));
-        free_task(&mut state, Pid(20));
+        free_task(&mut arc.lock().unwrap().sim, Pid(10));
+        free_task(&mut arc.lock().unwrap().sim, Pid(20));
     }
 
     #[test]
     fn test_sdt_task_data_null_before_alloc() {
         let _lock = SIM_LOCK.lock().unwrap();
         let mut state = test_state(1);
-        let p = register_task(&mut state, Pid(50));
+        let arc = test_sim_arc(state);
+
+        let p = register_task(&mut arc.lock().unwrap().sim, Pid(50));
 
         let ret = unsafe { ffi::scx_task_init(32) };
         assert_eq!(ret, 0);
@@ -3312,6 +3343,6 @@ mod tests {
         let data = unsafe { ffi::scx_task_data(p) };
         assert!(data.is_null(), "scx_task_data before alloc must be null");
 
-        free_task(&mut state, Pid(50));
+        free_task(&mut arc.lock().unwrap().sim, Pid(50));
     }
 }
