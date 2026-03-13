@@ -487,6 +487,23 @@ pub struct CallbackContext {
 pub const SCX_TASK_QUEUED: u32 = 1;
 
 impl SimulatorState {
+    /// Consume a task from a global DSQ into a CPU's local DSQ.
+    ///
+    /// Uses raw pointer arithmetic to split-borrow `cpus[cpu_idx]` and
+    /// `dsqs` simultaneously, which is necessary because `move_to_local`
+    /// needs `&mut SimCpu` while we also hold `&mut DsqManager`.
+    ///
+    /// Returns true if a task was consumed.
+    pub fn consume_dsq_to_local(&mut self, dsq_id: crate::types::DsqId, cpu: crate::types::CpuId) -> bool {
+        let cpu_idx = cpu.0 as usize;
+        // SAFETY: cpu_idx is within bounds (validated by the engine).
+        // The split borrow is sound because cpus_ptr[cpu_idx] and dsqs
+        // are disjoint fields of SimulatorState.
+        let cpus_ptr = self.cpus.as_mut_ptr();
+        let sim_cpu = unsafe { &mut *cpus_ptr.add(cpu_idx) };
+        self.dsqs.move_to_local(dsq_id, sim_cpu)
+    }
+
     /// Set the per-task ops_state and, when transitioning to Queued,
     /// also set `SCX_TASK_QUEUED` in `p->scx.flags`.
     ///
