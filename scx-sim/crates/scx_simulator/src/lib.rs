@@ -29,44 +29,44 @@
 //! trace.dump();
 //! ```
 
+// === Modules with unsafe code (remain at crate root) ===
 pub mod backend;
-pub mod bpf_trace;
 pub mod cgroup;
-pub mod cpu;
-pub mod det_hashmap;
-pub mod dsq;
 pub mod engine;
 pub mod ffi;
-pub mod fmt;
 pub mod interleave;
 pub mod kfuncs;
-pub mod monitor;
-pub mod perf;
-mod perfetto;
 pub mod preempt;
 pub mod probes;
-pub mod rtapp;
-pub mod scenario;
-pub mod stats;
 pub mod task;
-pub mod trace;
-pub mod types;
-pub mod workloads;
+
+// === Safe modules (zero unsafe) — grouped under safe/ ===
+pub mod safe;
+
+// Re-export safe modules at crate root so `crate::types`, `crate::dsq`, etc.
+// continue to resolve for all internal `use crate::xxx` paths.
+pub use safe::bpf_trace;
+pub use safe::cpu;
+pub use safe::det_hashmap;
+pub use safe::dsq;
+pub use safe::fmt;
+pub use safe::monitor;
+pub use safe::perf;
+pub(crate) use safe::perfetto;
+pub use safe::rtapp;
+pub use safe::scenario;
+pub use safe::stats;
+pub use safe::trace;
+pub use safe::types;
+pub use safe::workloads;
 
 // Re-export the main public types for convenience.
-pub use bpf_trace::{
-    BpfEventKind, BpfTrace, BpfTraceEvent, TraceComparisonResult, TraceDifferences,
-};
 pub use cgroup::{CgroupId, CgroupInfo, CgroupRegistry, DEFAULT_MAX_CGROUPS};
 pub use engine::{ExitKind, SimulationResult, Simulator};
 pub use ffi::{
     discover_schedulers, DebuggerInfo, DynamicScheduler, LavdPowerMode, Scheduler, SchedulerInfo,
 };
-pub use fmt::{FmtN, FmtTs, SimFormat};
 pub use kfuncs::sim_clock;
-pub use monitor::{Monitor, ProbeContext, ProbePoint};
-pub use perf::PmuEvent;
-pub use perf::RbcCounter;
 pub use preempt::trace::PreemptionTrace;
 pub use preempt::trace::TraceMetadata;
 pub use preempt::{
@@ -77,16 +77,25 @@ pub use preempt::{
     CheckpointEvent, DeterminismCheckpoint, DivergenceType, PreemptionRecord, StructopInfo,
     INSN_BYTES_LEN,
 };
-pub use rtapp::load_rtapp;
-pub use scenario::{
+pub use safe::bpf_trace::{
+    BpfEventKind, BpfTrace, BpfTraceEvent, TraceComparisonResult, TraceDifferences,
+};
+pub use safe::fmt::{FmtN, FmtTs, SimFormat};
+pub use safe::monitor::{Monitor, ProbeContext, ProbePoint};
+pub use safe::perf::PmuEvent;
+pub use safe::perf::RbcCounter;
+pub use safe::rtapp::load_rtapp;
+pub use safe::scenario::{
     CgroupBandwidth, CgroupCpusetChangeEvent, CgroupCreateEvent, CgroupDef, CgroupDestroyEvent,
     CgroupMigrateEvent, CpuPreemptEvent, HotplugEvent, IrqEvent, IrqType, NativeConcurrentConfig,
     NoiseConfig, OverheadConfig, PreemptMode, PreemptiveConfig, Scenario,
 };
-pub use stats::{CpuStats, DistributionStats, TaskStats, TraceComparison, TraceStats};
+pub use safe::stats::{CpuStats, DistributionStats, TaskStats, TraceComparison, TraceStats};
+pub use safe::trace::{
+    DsqLengthSample, DsqSampleTrigger, Trace, TraceEvent, TraceKind, TraceSummary,
+};
+pub use safe::types::{CpuId, DsqId, KickFlags, MmId, Pid, TimeNs, Vtime};
 pub use task::{nice_to_weight, sched_weight_to_cgroup, Phase, RepeatMode, TaskBehavior, TaskDef};
-pub use trace::{DsqLengthSample, DsqSampleTrigger, Trace, TraceEvent, TraceKind, TraceSummary};
-pub use types::{CpuId, DsqId, KickFlags, MmId, Pid, TimeNs, Vtime};
 
 use std::sync::Mutex;
 

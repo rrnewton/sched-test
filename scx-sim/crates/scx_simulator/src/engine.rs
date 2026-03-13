@@ -2156,7 +2156,10 @@ impl<S: Scheduler> Simulator<S> {
         }
 
         // Flush staged events (e.g. KickDelivered) from the timer callback
-        { let s = &mut *guard; flush_staged_events(&mut s.sim, &mut s.events); }
+        {
+            let s = &mut *guard;
+            flush_staged_events(&mut s.sim, &mut s.events);
+        }
     }
 
     /// Handle a periodic scheduler tick on a CPU.
@@ -2195,11 +2198,7 @@ impl<S: Scheduler> Simulator<S> {
 
         // Record tick in trace
         let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
-        s.sim.trace.record(
-            __local_t,
-            cpu,
-            TraceKind::Tick { pid },
-        );
+        s.sim.trace.record(__local_t, cpu, TraceKind::Tick { pid });
 
         // Sample all non-builtin DSQ lengths at tick time
         let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
@@ -2515,7 +2514,13 @@ impl<S: Scheduler> Simulator<S> {
         let s = &mut *guard;
 
         // Flush staged events from cgroup_move or re-enqueue callbacks
-        { let s = &mut *guard; { let s = &mut *guard; flush_staged_events(&mut s.sim, &mut s.events); } };
+        {
+            let s = &mut *guard;
+            {
+                let s = &mut *guard;
+                flush_staged_events(&mut s.sim, &mut s.events);
+            }
+        };
     }
 
     /// Dequeue a task before cgroup migration (sched_change_begin).
@@ -2760,11 +2765,9 @@ impl<S: Scheduler> Simulator<S> {
         );
 
         let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
-        s.sim.trace.record(
-            __local_t,
-            cpu,
-            TraceKind::IrqStart { cpu, irq_type },
-        );
+        s.sim
+            .trace
+            .record(__local_t, cpu, TraceKind::IrqStart { cpu, irq_type });
 
         // Accumulate stolen time if a task is running
         if s.sim.cpus[cpu.0 as usize].current_task.is_some() {
@@ -2795,11 +2798,9 @@ impl<S: Scheduler> Simulator<S> {
         s.sim.cpus[cpu.0 as usize].irq_context = IrqContext::None;
 
         let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
-        s.sim.trace.record(
-            __local_t,
-            cpu,
-            TraceKind::IrqEnd { cpu },
-        );
+        s.sim
+            .trace
+            .record(__local_t, cpu, TraceKind::IrqEnd { cpu });
 
         info!(cpu = cpu.0, "IRQ END");
     }
@@ -3246,11 +3247,9 @@ impl<S: Scheduler> Simulator<S> {
             let task = s.tasks.get_mut(&pid).unwrap();
             task.state = TaskState::Exited;
             let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
-        s.sim.trace.record(
-            __local_t,
-                cpu,
-                TraceKind::TaskCompleted { pid },
-            );
+            s.sim
+                .trace
+                .record(__local_t, cpu, TraceKind::TaskCompleted { pid });
             info!(task = task_name.as_str(), pid = pid.0, "COMPLETED");
         } else {
             match next_phase {
@@ -3295,19 +3294,17 @@ impl<S: Scheduler> Simulator<S> {
                     s.sim.resolve_pending_dispatch(cpu);
 
                     let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
-        s.sim.trace.record(
-            __local_t,
+                    s.sim.trace.record(
+                        __local_t,
                         cpu,
                         TraceKind::EnqueueTask { pid, enq_flags: 0 },
                     );
 
                     // High-level event: task is now fully off-CPU and re-enqueued
                     let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
-        s.sim.trace.record(
-            __local_t,
-                        cpu,
-                        TraceKind::TaskYielded { pid },
-                    );
+                    s.sim
+                        .trace
+                        .record(__local_t, cpu, TraceKind::TaskYielded { pid });
                     info!(task = task_name.as_str(), pid = pid.0, "YIELDED");
                 }
                 Some(Phase::Wake(target_pid)) => {
@@ -3368,14 +3365,14 @@ impl<S: Scheduler> Simulator<S> {
                                     let s = &mut *guard;
                                     s.sim.resolve_pending_dispatch(cpu);
                                     let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
-        s.sim.trace.record(
-            __local_t,
+                                    s.sim.trace.record(
+                                        __local_t,
                                         cpu,
                                         TraceKind::EnqueueTask { pid, enq_flags: 0 },
                                     );
                                     let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
-        s.sim.trace.record(
-            __local_t,
+                                    s.sim.trace.record(
+                                        __local_t,
                                         cpu,
                                         TraceKind::TaskYielded { pid },
                                     );
@@ -3427,17 +3424,21 @@ impl<S: Scheduler> Simulator<S> {
                     let task = s.tasks.get_mut(&pid).unwrap();
                     task.state = TaskState::Exited;
                     let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
-        s.sim.trace.record(
-            __local_t,
-                        cpu,
-                        TraceKind::TaskCompleted { pid },
-                    );
+                    s.sim
+                        .trace
+                        .record(__local_t, cpu, TraceKind::TaskCompleted { pid });
                 }
             }
         }
 
         // Flush staged events from enqueue callbacks
-        { let s = &mut *guard; { let s = &mut *guard; flush_staged_events(&mut s.sim, &mut s.events); } };
+        {
+            let s = &mut *guard;
+            {
+                let s = &mut *guard;
+                flush_staged_events(&mut s.sim, &mut s.events);
+            }
+        };
 
         // Dispatch next task on this CPU
         drop(guard);
@@ -3485,11 +3486,9 @@ impl<S: Scheduler> Simulator<S> {
             s.sim.resolve_pending_dispatch(cpu);
 
             let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
-        s.sim.trace.record(
-            __local_t,
-                cpu,
-                TraceKind::Balance { prev_pid },
-            );
+            s.sim
+                .trace
+                .record(__local_t, cpu, TraceKind::Balance { prev_pid });
 
             // Monitor: Dispatched probe (after ops.dispatch() completed)
             if let Some(ppid) = prev_pid {
@@ -3506,7 +3505,10 @@ impl<S: Scheduler> Simulator<S> {
             }
 
             // Flush staged events from dispatch callback
-            { let s = &mut *guard; flush_staged_events(&mut s.sim, &mut s.events); }
+            {
+                let s = &mut *guard;
+                flush_staged_events(&mut s.sim, &mut s.events);
+            }
         }
 
         // Kernel fallback: if local DSQ is still empty after dispatch(),
@@ -3541,8 +3543,8 @@ impl<S: Scheduler> Simulator<S> {
             let consumed = s.sim.dsqs.move_to_local(DsqId::GLOBAL, sim_cpu);
             if consumed {
                 let __local_t = s.sim.cpus[cpu_idx].local_clock;
-        s.sim.trace.record(
-            __local_t,
+                s.sim.trace.record(
+                    __local_t,
                     cpu,
                     TraceKind::DsqMoveToLocal {
                         dsq_id: DsqId::GLOBAL,
@@ -3555,11 +3557,9 @@ impl<S: Scheduler> Simulator<S> {
         // Try to pull a task from the local DSQ
         if let Some(pid) = s.sim.cpus[cpu.0 as usize].local_dsq.pop_front() {
             let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
-        s.sim.trace.record(
-            __local_t,
-                cpu,
-                TraceKind::PickTask { pid },
-            );
+            s.sim
+                .trace
+                .record(__local_t, cpu, TraceKind::PickTask { pid });
             drop(guard);
             self.start_running(cpu, pid, sim_arc, monitor);
             guard = sim_arc.lock().unwrap();
@@ -3705,11 +3705,9 @@ impl<S: Scheduler> Simulator<S> {
             let s = &mut *guard;
             let prev_pid = s.sim.cpus[cpu.0 as usize].prev_task;
             let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
-        s.sim.trace.record(
-            __local_t,
-                cpu,
-                TraceKind::Balance { prev_pid },
-            );
+            s.sim
+                .trace
+                .record(__local_t, cpu, TraceKind::Balance { prev_pid });
 
             // Monitor: Dispatched probe
             if let Some(ppid) = prev_pid {
@@ -3734,7 +3732,10 @@ impl<S: Scheduler> Simulator<S> {
         let s = &mut *guard;
 
         // Flush staged events from the concurrent dispatches.
-        { let s = &mut *guard; flush_staged_events(&mut s.sim, &mut s.events); }
+        {
+            let s = &mut *guard;
+            flush_staged_events(&mut s.sim, &mut s.events);
+        }
     }
 
     /// Phase 1 cooperative: run dispatch via `TokenRing` (Mutex/Condvar).
@@ -4227,8 +4228,8 @@ impl<S: Scheduler> Simulator<S> {
             let consumed = s.sim.dsqs.move_to_local(DsqId::GLOBAL, sim_cpu);
             if consumed {
                 let __local_t = s.sim.cpus[cpu_idx].local_clock;
-        s.sim.trace.record(
-            __local_t,
+                s.sim.trace.record(
+                    __local_t,
                     cpu,
                     TraceKind::DsqMoveToLocal {
                         dsq_id: DsqId::GLOBAL,
@@ -4240,11 +4241,9 @@ impl<S: Scheduler> Simulator<S> {
 
         if let Some(pid) = s.sim.cpus[cpu_idx].local_dsq.pop_front() {
             let __local_t = s.sim.cpus[cpu_idx].local_clock;
-        s.sim.trace.record(
-            __local_t,
-                cpu,
-                TraceKind::PickTask { pid },
-            );
+            s.sim
+                .trace
+                .record(__local_t, cpu, TraceKind::PickTask { pid });
             drop(guard);
             self.start_running(cpu, pid, sim_arc, monitor);
             guard = sim_arc.lock().unwrap();
@@ -4341,7 +4340,8 @@ impl<S: Scheduler> Simulator<S> {
 
         task.run_remaining_ns = task.run_remaining_ns.saturating_sub(consumed);
 
-        s.sim.trace
+        s.sim
+            .trace
             .record(local_clock, cpu, TraceKind::TaskPreempted { pid });
 
         let task_name = task.name.as_str();
@@ -4457,7 +4457,13 @@ impl<S: Scheduler> Simulator<S> {
         post_enqueue(&mut s.sim, cpu, pid);
 
         // Flush staged events + dispatch next task
-        { let s = &mut *guard; { let s = &mut *guard; flush_staged_events(&mut s.sim, &mut s.events); } };
+        {
+            let s = &mut *guard;
+            {
+                let s = &mut *guard;
+                flush_staged_events(&mut s.sim, &mut s.events);
+            }
+        };
         drop(guard);
         self.try_dispatch_and_run(cpu, sim_arc, monitor);
         guard = sim_arc.lock().unwrap();
@@ -4553,11 +4559,9 @@ impl<S: Scheduler> Simulator<S> {
         });
 
         let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
-        s.sim.trace.record(
-            __local_t,
-            cpu,
-            TraceKind::SetNextTask { pid },
-        );
+        s.sim
+            .trace
+            .record(__local_t, cpu, TraceKind::SetNextTask { pid });
 
         let local_t = s.sim.cpus[cpu.0 as usize].local_clock;
         kfuncs::set_sim_clock(local_t, Some(cpu));
