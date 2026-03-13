@@ -9,6 +9,16 @@
 //! 2. When the scheduler calls a kfunc, the kfunc accesses the simulator
 //!    state via `with_sim()`.
 //! 3. After the ops call returns, the simulator calls `exit_sim()`.
+//!
+//! # Safety
+//!
+//! Every public function in this module is `#[no_mangle] extern "C"` and
+//! receives raw `*mut c_void` / `*const c_void` pointers from C scheduler
+//! code. The thread-local `SIM_STATE` cell stores a raw pointer to
+//! [`SimulatorState`]; `enter_sim` / `exit_sim` manage its lifetime.
+//! Soundness relies on the caller (the simulation engine) guaranteeing that
+//! `enter_sim` is always paired with `exit_sim` and that no kfunc is called
+//! outside that window.
 
 // These are extern "C" FFI entry points called from C code — the C caller
 // is responsible for passing valid pointers, so marking them `unsafe` in Rust

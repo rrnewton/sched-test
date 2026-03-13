@@ -1,0 +1,26 @@
+//! Unsafe-heavy modules grouped by safety boundary.
+//!
+//! # Safety
+//!
+//! This module consolidates the crate's modules that contain significant
+//! `unsafe` code. Grouping them into a single subtree makes auditing,
+//! `#[deny(unsafe_op_in_unsafe_fn)]` enforcement, and future `unsafe`
+//! reduction work easier to scope.
+//!
+//! ## Contained modules
+//!
+//! | Module | Unsafe surface |
+//! |-------------|------------------------------------------------------|
+//! | `ffi` | `extern "C"` declarations, raw pointer manipulation, `dlopen`/`dlsym` calls |
+//! | `kfuncs` | `#[no_mangle] extern "C"` kfunc entry points, thread-local raw-pointer state |
+//! | `preempt` | Signal handlers, futex syscalls, atomics, inline assembly |
+//! | `backend` | PMU perf_event ioctls, hardware breakpoints, `/proc` mmap, e9patch binary patching |
+//! | `interleave`| `UnsafeCell`-based token ring, raw thread synchronization |
+//! | `probes` | `dlsym` function-pointer resolution, raw C function calls |
+
+pub mod backend;
+pub mod ffi;
+pub mod interleave;
+pub mod kfuncs;
+pub mod preempt;
+pub mod probes;
