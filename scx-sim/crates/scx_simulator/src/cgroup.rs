@@ -374,18 +374,22 @@ use std::ptr;
 
 /// Access the cgroup registry through the simulator state.
 ///
-/// Locks `SIM_ARC` to access the cgroup_registry within `SimState`.
-/// Returns `None` if `SIM_ARC` is not installed.
+/// Uses `try_lock()` to avoid deadlocking when called from within
+/// `with_sim()` (which already holds the mutex). Returns `None` if
+/// `SIM_ARC` is not installed or if the lock is already held.
 fn with_cgroup_registry<R>(f: impl FnOnce(&CgroupRegistry) -> R) -> Option<R> {
     let arc = crate::kfuncs::clone_sim_arc()?;
-    let guard = arc.lock().unwrap();
+    let guard = arc.try_lock().ok()?;
     Some(f(&guard.cgroup_registry))
 }
 
 /// Mutable version of with_cgroup_registry.
+///
+/// Uses `try_lock()` to avoid re-entrant deadlock (same rationale as
+/// [`with_cgroup_registry`]).
 fn with_cgroup_registry_mut<R>(f: impl FnOnce(&mut CgroupRegistry) -> R) -> Option<R> {
     let arc = crate::kfuncs::clone_sim_arc()?;
-    let mut guard = arc.lock().unwrap();
+    let mut guard = arc.try_lock().ok()?;
     Some(f(&mut guard.cgroup_registry))
 }
 
