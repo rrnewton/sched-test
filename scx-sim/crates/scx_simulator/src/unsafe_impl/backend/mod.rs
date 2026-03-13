@@ -34,10 +34,10 @@ use tracing::debug;
 
 use crate::engine::{batch_worker_body, dispatch_worker_body, Simulator};
 use crate::ffi::Scheduler;
-use crate::interleave::WorkerId;
-use crate::kfuncs::{self, OpsContext, SimArc, SimState, SimulatorState};
+use crate::interleave::{self, TokenRing, WorkerId};
+use crate::kfuncs::{self, OpsContext, SimArc, SimulatorState};
 use crate::preempt::PreemptRing;
-use crate::types::CpuId;
+use crate::types::{CpuId, TimeNs};
 
 // ---------------------------------------------------------------------------
 // ThreadOrchestrator — synchronization strategy abstraction
@@ -541,4 +541,145 @@ pub(crate) fn run_batch_with_orchestrator<S, B, O>(
 
     backend.log_completion(ring);
     backend.global_teardown();
+}
+
+// ---------------------------------------------------------------------------
+// Cooperative (non-preemptive) worker drivers
+// ---------------------------------------------------------------------------
+//
+// These mirror [`run_dispatch_with_orchestrator`] and
+// [`run_batch_with_orchestrator`] but without a [`PreemptionBackend`].
+// Workers yield exclusively at kfunc boundaries via
+// `interleave::maybe_yield()`.  All raw-pointer dereferences and unsafe
+// FFI calls are confined here so that `engine.rs` remains free of
+// `unsafe` blocks for the cooperative path.
+
+/// Cooperative concurrent dispatch via [`TokenRing`].
+///
+/// Each worker runs `dispatch_worker_body` for a single CPU, yielding at
+/// kfunc boundaries through the installed interleave hook. The per-worker
+/// lifecycle (enter_sim, body, drain structop, clear ops, finish) matches
+/// the preemptive drivers but without instrumentation setup/teardown.
+pub(crate) fn run_cooperative_dispatch<S: Scheduler>(
+    dispatch_cpus: &[CpuId],
+    state_send: &SendPtr<SimulatorState>,
+    sched_send: &SendPtr<S>,
+    seed: u32,
+) {
+    let ring = TokenRing::new(dispatch_cpus.len(), seed);
+
+    std::thread::scope(|s| {
+        let ring_ref = &ring;
+        let state_ref = state_send;
+        let sched_ref = sched_send;
+
+        for (i, &cpu) in dispatch_cpus.iter().enumerate() {
+            let worker_id = WorkerId(i);
+
+            s.spawn(move || {
+                let sp = state_ref.0;
+                let schp = sched_ref.0 as *const S;
+
+                interleave::install(ring_ref, worker_id);
+                ring_ref.wait_for_token(worker_id);
+
+                // SAFETY: `sp` points to a valid `SimulatorState` (owned
+                // by the engine, protected by the token-passing protocol).
+                // `schp` points to the valid `Scheduler` for the same
+                // duration. All workers run under `thread::scope` which
+                // guarantees the pointed-to data outlives the threads.
+                unsafe {
+                    kfuncs::enter_sim(&mut *sp, cpu);
+                    debug!(cpu = cpu.0, "enter:structop dispatch (concurrent)");
+                    dispatch_worker_body(sp, schp, cpu);
+                }
+
+                let delta = StructopDelta {
+                    rbc_total: 0,
+                    interleave_count: crate::preempt::structop_info().interleave_count,
+                };
+                // SAFETY: same pointer validity as above; token still held.
+                unsafe {
+                    drain_structop_accum(sp, cpu, &delta);
+                    clear_ops_and_finish(sp, ring_ref, worker_id);
+                }
+                interleave::uninstall();
+            });
+        }
+
+        ring.start();
+        ring.wait_all_done();
+    });
+}
+
+/// Cooperative concurrent batch event processing via [`TokenRing`].
+///
+/// Each worker processes all events for a single CPU sequentially via
+/// `batch_worker_body`. The lifecycle matches [`run_cooperative_dispatch`]
+/// but operates on per-CPU event batches rather than single dispatch calls.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_cooperative_batch<S: Scheduler>(
+    per_cpu: &HashMap<CpuId, Vec<crate::engine::Event>>,
+    cpu_ids: &[CpuId],
+    sim_send: &SendPtr<Simulator<S>>,
+    state_send: &SendPtr<SimulatorState>,
+    sim_arc: &SimArc,
+    seed: u32,
+    watchdog_timeout: Option<TimeNs>,
+    duration_ns: TimeNs,
+    max_cgroups: u32,
+) {
+    let ring = TokenRing::new(cpu_ids.len(), seed);
+
+    std::thread::scope(|s| {
+        let ring_ref = &ring;
+        let sim_ref = sim_send;
+        let state_ref = state_send;
+        let arc_ref = sim_arc;
+        let per_cpu_ref = &per_cpu;
+
+        for (i, &cpu) in cpu_ids.iter().enumerate() {
+            let worker_id = WorkerId(i);
+            let cpu_events = per_cpu_ref.get(&cpu).cloned().unwrap_or_default();
+
+            s.spawn(move || {
+                let simp = sim_ref.0 as *const Simulator<S>;
+                let sp = state_ref.0;
+
+                interleave::install(ring_ref, worker_id);
+                ring_ref.wait_for_token(worker_id);
+
+                // SAFETY: `sp` points to a valid `SimulatorState` and
+                // `simp` to the containing `Simulator`, both owned by
+                // the engine and protected by the token-passing protocol.
+                // `arc_ref` is a shared reference to the `SimArc` whose
+                // lifetime is bound by `thread::scope`.
+                unsafe {
+                    kfuncs::enter_sim(&mut *sp, cpu);
+                    batch_worker_body(
+                        simp,
+                        arc_ref,
+                        cpu_events,
+                        watchdog_timeout,
+                        duration_ns,
+                        max_cgroups,
+                    );
+                }
+
+                let delta = StructopDelta {
+                    rbc_total: 0,
+                    interleave_count: crate::preempt::structop_info().interleave_count,
+                };
+                // SAFETY: same pointer validity as above; token still held.
+                unsafe {
+                    drain_structop_accum(sp, cpu, &delta);
+                    clear_ops_and_finish(sp, ring_ref, worker_id);
+                }
+                interleave::uninstall();
+            });
+        }
+
+        ring.start();
+        ring.wait_all_done();
+    });
 }

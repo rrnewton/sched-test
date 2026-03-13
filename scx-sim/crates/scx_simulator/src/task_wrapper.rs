@@ -46,6 +46,21 @@ impl SimTaskHandle {
         Self { raw }
     }
 
+    /// Allocate a synthetic idle task (PF_IDLE = 0x2, mm = NULL).
+    ///
+    /// The kernel always has a task running — the idle task occupies each
+    /// CPU when no real task is scheduled. This handle owns the underlying
+    /// C `task_struct` and frees it on drop, eliminating the need for a
+    /// manual `unsafe { ffi::free_task_raw(...) }` call.
+    ///
+    /// # Panics
+    /// Panics if `sim_task_alloc` returns null.
+    pub fn new_idle() -> Self {
+        let handle = Self::new();
+        handle.set_flags(0x2); // PF_IDLE
+        handle
+    }
+
     /// Return the raw pointer for passing to FFI scheduler ops.
     ///
     /// The pointer is valid for the lifetime of this handle.

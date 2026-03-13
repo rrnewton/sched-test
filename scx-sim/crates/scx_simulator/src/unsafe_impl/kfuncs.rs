@@ -442,6 +442,7 @@ pub(crate) struct SimState {
 /// f.tasks.get_mut(&pid);          // borrows f.tasks — no conflict
 /// f.sim.trace.record(...);        // borrows f.sim — fine
 /// ```
+#[allow(dead_code)]
 pub(crate) struct SimFields<'a> {
     pub sim: &'a mut SimulatorState,
     pub tasks: &'a mut HashMap<Pid, SimTask>,
@@ -451,6 +452,7 @@ pub(crate) struct SimFields<'a> {
 
 impl SimState {
     /// Get split-borrowable references to all fields.
+    #[allow(dead_code)]
     pub(crate) fn fields(&mut self) -> SimFields<'_> {
         SimFields {
             sim: &mut self.sim,
@@ -494,7 +496,11 @@ impl SimulatorState {
     /// needs `&mut SimCpu` while we also hold `&mut DsqManager`.
     ///
     /// Returns true if a task was consumed.
-    pub fn consume_dsq_to_local(&mut self, dsq_id: crate::types::DsqId, cpu: crate::types::CpuId) -> bool {
+    pub fn consume_dsq_to_local(
+        &mut self,
+        dsq_id: crate::types::DsqId,
+        cpu: crate::types::CpuId,
+    ) -> bool {
         let cpu_idx = cpu.0 as usize;
         // SAFETY: cpu_idx is within bounds (validated by the engine).
         // The split borrow is sound because cpus_ptr[cpu_idx] and dsqs
