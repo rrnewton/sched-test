@@ -405,7 +405,7 @@ pub(crate) fn run_dispatch_with_orchestrator<S, B, O>(
                 // SAFETY: `sp` and `schp` are valid; token ensures exclusive access.
                 unsafe {
                     debug!(cpu = cpu.0, "enter:structop dispatch (preemptive)");
-                    dispatch_worker_body(sp, schp, cpu);
+                    dispatch_worker_body(&mut *sp, &*schp, cpu);
                 }
 
                 let delta = backend.disarm(&mut ctx);
@@ -516,7 +516,7 @@ pub(crate) fn run_batch_with_orchestrator<S, B, O>(
                 // exclusive access to shared state.
                 unsafe {
                     batch_worker_body(
-                        simp,
+                        &*simp,
                         arc_ref,
                         cpu_events,
                         watchdog_timeout,
@@ -591,7 +591,7 @@ pub(crate) fn run_cooperative_dispatch<S: Scheduler>(
                 unsafe {
                     kfuncs::enter_sim(&mut *sp, cpu);
                     debug!(cpu = cpu.0, "enter:structop dispatch (concurrent)");
-                    dispatch_worker_body(sp, schp, cpu);
+                    dispatch_worker_body(&mut *sp, &*schp, cpu);
                 }
 
                 let delta = StructopDelta {
@@ -657,7 +657,7 @@ pub(crate) fn run_cooperative_batch<S: Scheduler>(
                 unsafe {
                     kfuncs::enter_sim(&mut *sp, cpu);
                     batch_worker_body(
-                        simp,
+                        &*simp,
                         arc_ref,
                         cpu_events,
                         watchdog_timeout,
