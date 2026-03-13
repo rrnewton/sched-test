@@ -1041,7 +1041,7 @@ fn maybe_record_checkpoint(state: &SimulatorState, event: CheckpointEvent, cpu: 
 /// dispatch. Caller must have already entered sim and acquired the token.
 pub(crate) fn dispatch_worker_body<S: Scheduler>(
     sim: &mut SimulatorState,
-    scheduler: &S,
+    scheduler: &SchedulerWrapper<S>,
     cpu: CpuId,
 ) {
     sim.current_cpu = cpu;
@@ -1052,10 +1052,7 @@ pub(crate) fn dispatch_worker_body<S: Scheduler>(
         .and_then(|pid| sim.task_pid_to_raw.get(&pid).copied())
         .map_or(std::ptr::null_mut(), |raw| raw as *mut c_void);
 
-    // SAFETY: `scheduler` is a valid reference to a `Scheduler`. The
-    // `prev_raw` pointer is either null or a valid task_struct pointer from
-    // `task_pid_to_raw`. The FFI dispatch callback requires these invariants.
-    unsafe { scheduler.dispatch(cpu.0 as i32, prev_raw) };
+    scheduler.dispatch(cpu.0 as i32, OptionalPtr::new(prev_raw));
     sim.resolve_pending_dispatch(cpu);
 }
 
@@ -3611,8 +3608,8 @@ impl<S: Scheduler> Simulator<S> {
         // SAFETY: token passing ensures only one thread accesses state/
         // scheduler at a time. Raw pointers avoid Send/Sync bounds on
         // types that are effectively single-threaded under the token.
-        let state_send = SendPtr(&mut s.sim as *mut SimulatorState);
-        let sched_send = SendPtr(self.scheduler.inner() as *const S as *mut S);
+        let state_send = SendPtr::from_mut(&mut s.sim);
+        let sched_send = SendPtr::from_ref(&self.scheduler);
 
         // Advance each CPU's clock before spawning (pure per-CPU, no races).
         for &cpu in &dispatch_cpus {
@@ -3638,7 +3635,7 @@ impl<S: Scheduler> Simulator<S> {
         } else if let Some(ref preemptive_cfg) = s.sim.preemptive {
             if let Some(ref backend) = s.sim.replay_backend {
                 assert!(backend.is_precise(), "replay requires a precise backend");
-                replay_dispatch_with_retry(
+                crate::backend::replay_dispatch_with_retry(
                     &dispatch_cpus,
                     &state_send,
                     &sched_send,
@@ -3674,7 +3671,7 @@ impl<S: Scheduler> Simulator<S> {
                 );
             }
         } else {
-            self.dispatch_concurrent_cooperative(
+            crate::backend::run_cooperative_dispatch(
                 &dispatch_cpus,
                 &state_send,
                 &sched_send,
@@ -3718,20 +3715,6 @@ impl<S: Scheduler> Simulator<S> {
             let s = &mut *guard;
             flush_staged_events(&mut s.sim, &mut s.events);
         }
-    }
-
-    /// Phase 1 cooperative: run dispatch via `TokenRing` (Mutex/Condvar).
-    ///
-    /// Each worker yields at kfunc boundaries via `interleave::maybe_yield()`.
-    /// No mid-C-code preemption points.
-    fn dispatch_concurrent_cooperative(
-        &self,
-        dispatch_cpus: &[CpuId],
-        state_send: &SendPtr<SimulatorState>,
-        sched_send: &SendPtr<S>,
-        seed: u32,
-    ) {
-        crate::backend::run_cooperative_dispatch(dispatch_cpus, state_send, sched_send, seed);
     }
 
     /// Process events using the dynamic concurrency window.
@@ -3969,8 +3952,8 @@ impl<S: Scheduler> Simulator<S> {
         // SAFETY: token passing ensures only one thread accesses shared
         // state at a time. Raw pointers avoid Send/Sync bounds on types
         // that are effectively single-threaded under the token.
-        let sim_send = SendPtr(self as *const Simulator<S> as *mut Simulator<S>);
-        let state_send = SendPtr(&mut guard.sim as *mut SimulatorState);
+        let sim_send = SendPtr::from_ref(self);
+        let state_send = SendPtr::from_mut(&mut guard.sim);
 
         // Save conditions before dropping guard (workers lock sim_arc internally)
         let is_native = guard.sim.native_concurrent.is_some();
@@ -4053,8 +4036,8 @@ impl<S: Scheduler> Simulator<S> {
                 );
             }
         } else {
-            Self::process_batch_concurrent_cooperative(
-                per_cpu,
+            crate::backend::run_cooperative_batch(
+                &per_cpu,
                 &cpu_ids,
                 &sim_send,
                 &state_send,
@@ -4063,6 +4046,11 @@ impl<S: Scheduler> Simulator<S> {
                 watchdog_timeout,
                 duration_ns,
                 max_cgroups,
+            );
+
+            debug!(
+                workers = cpu_ids.len(),
+                "batch-concurrent cooperative: complete"
             );
         }
 
@@ -4073,37 +4061,6 @@ impl<S: Scheduler> Simulator<S> {
 
         // Flush staged events from the concurrent batch.
         flush_staged_events(&mut s.sim, &mut s.events);
-    }
-
-    /// Cooperative batch-concurrent processing via `TokenRing`.
-    #[allow(clippy::too_many_arguments)]
-    fn process_batch_concurrent_cooperative(
-        per_cpu: HashMap<CpuId, Vec<Event>>,
-        cpu_ids: &[CpuId],
-        sim_send: &SendPtr<Simulator<S>>,
-        state_send: &SendPtr<SimulatorState>,
-        sim_arc: &SimArc,
-        seed: u32,
-        watchdog_timeout: Option<TimeNs>,
-        duration_ns: TimeNs,
-        max_cgroups: u32,
-    ) {
-        crate::backend::run_cooperative_batch(
-            &per_cpu,
-            cpu_ids,
-            sim_send,
-            state_send,
-            sim_arc,
-            seed,
-            watchdog_timeout,
-            duration_ns,
-            max_cgroups,
-        );
-
-        debug!(
-            workers = cpu_ids.len(),
-            "batch-concurrent cooperative: complete"
-        );
     }
 
     /// Handle a `DsqConsume` event: consume from global DSQ into local DSQ.
@@ -4559,99 +4516,6 @@ impl<S: Scheduler> Simulator<S> {
             }
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// Replay dispatch with overshoot retry logic
-// ---------------------------------------------------------------------------
-
-/// Maximum number of PMU signal retry attempts before falling back to
-/// breakpoint-only mode.
-const REPLAY_PMU_MAX_RETRIES: u32 = 3;
-
-/// Maximum number of breakpoint-only retry attempts after PMU retries
-/// are exhausted.
-const REPLAY_BP_ONLY_MAX_RETRIES: u32 = 2;
-
-/// Run replay dispatch with automatic retry on PMU overshoot.
-///
-/// Uses a two-tier retry strategy:
-/// 1. Up to [`REPLAY_PMU_MAX_RETRIES`] attempts with the PMU signal approach
-/// 2. Up to [`REPLAY_BP_ONLY_MAX_RETRIES`] attempts with breakpoint-only mode
-///
-/// If all attempts fail, panics with a clear message.
-fn replay_dispatch_with_retry<S: Scheduler>(
-    dispatch_cpus: &[CpuId],
-    state_send: &SendPtr<SimulatorState>,
-    sched_send: &SendPtr<S>,
-    seed: u32,
-    backend: &ReplayBackend,
-) {
-    use crate::preempt::{reset_replay_state, REPLAY_OVERSHOT};
-    use std::sync::atomic::Ordering::SeqCst;
-
-    // If already in breakpoint-only mode, no retry needed for PMU overshoot.
-    if backend.no_pmu_signal() {
-        reset_replay_state();
-        crate::backend::run_preemptive_dispatch(
-            dispatch_cpus,
-            state_send,
-            sched_send,
-            seed,
-            backend,
-        );
-        return;
-    }
-
-    // Tier 1: PMU signal attempts.
-    for attempt in 1..=REPLAY_PMU_MAX_RETRIES {
-        reset_replay_state();
-        backend.reset_cursors();
-        crate::backend::run_preemptive_dispatch(
-            dispatch_cpus,
-            state_send,
-            sched_send,
-            seed,
-            backend,
-        );
-        if !REPLAY_OVERSHOT.load(SeqCst) {
-            return; // Success — no overshoot.
-        }
-        eprintln!(
-            "replay: PMU overshoot on attempt {attempt}/{REPLAY_PMU_MAX_RETRIES}, retrying..."
-        );
-    }
-
-    // Tier 2: breakpoint-only fallback.
-    eprintln!(
-        "replay: all {REPLAY_PMU_MAX_RETRIES} PMU attempts overshot, \
-         falling back to breakpoint-only mode"
-    );
-    let bp_backend = backend.with_bp_only();
-    for attempt in 1..=REPLAY_BP_ONLY_MAX_RETRIES {
-        reset_replay_state();
-        crate::backend::run_preemptive_dispatch(
-            dispatch_cpus,
-            state_send,
-            sched_send,
-            seed,
-            &bp_backend,
-        );
-        if !REPLAY_OVERSHOT.load(SeqCst) {
-            return; // Success.
-        }
-        eprintln!(
-            "replay: breakpoint-only overshoot on attempt \
-             {attempt}/{REPLAY_BP_ONLY_MAX_RETRIES}, retrying..."
-        );
-    }
-
-    let total = REPLAY_PMU_MAX_RETRIES + REPLAY_BP_ONLY_MAX_RETRIES;
-    panic!(
-        "replay: all {total} attempts failed due to overshoot. \
-         This should not happen in breakpoint-only mode — \
-         please report this as a bug."
-    );
 }
 
 #[cfg(test)]

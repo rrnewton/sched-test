@@ -37,6 +37,7 @@ use crate::ffi::Scheduler;
 use crate::interleave::{self, TokenRing, WorkerId};
 use crate::kfuncs::{self, OpsContext, SimArc, SimulatorState};
 use crate::preempt::PreemptRing;
+use crate::scheduler_wrapper::SchedulerWrapper;
 use crate::types::{CpuId, TimeNs};
 
 // ---------------------------------------------------------------------------
@@ -144,12 +145,33 @@ impl ThreadOrchestrator for PreemptRing {
 ///
 /// Callers must ensure only one thread accesses the pointed-to data at a time
 /// (enforced by PreemptRing / TokenRing token passing).
-pub(crate) struct SendPtr<T>(pub *mut T);
+pub(crate) struct SendPtr<T>(pub(super) *mut T);
 // SAFETY: SendPtr wraps a raw pointer for cross-thread transfer.
 // Callers must ensure only one thread accesses the pointed-to data at
 // a time, which is enforced by the PreemptRing / TokenRing protocol.
 unsafe impl<T> Send for SendPtr<T> {}
 unsafe impl<T> Sync for SendPtr<T> {}
+
+impl<T> SendPtr<T> {
+    /// Create a `SendPtr` from a mutable reference.
+    ///
+    /// The returned wrapper can be sent across thread boundaries. The caller
+    /// must ensure the referent outlives all worker threads (guaranteed by
+    /// `std::thread::scope`) and that only one thread accesses the data at
+    /// a time (enforced by token-ring or preempt-ring protocols).
+    pub(crate) fn from_mut(r: &mut T) -> Self {
+        Self(r as *mut T)
+    }
+
+    /// Create a `SendPtr` from a shared reference.
+    ///
+    /// Casts away `const` so the pointer can be stored uniformly, but the
+    /// pointed-to data must only be mutated when the caller holds the
+    /// execution token.
+    pub(crate) fn from_ref(r: &T) -> Self {
+        Self(r as *const T as *mut T)
+    }
+}
 
 /// Per-worker accounting delta merged into `structop_accum` after the worker
 /// body runs. Backends populate this in [`PreemptionBackend::disarm`].
@@ -350,7 +372,7 @@ pub(crate) unsafe fn clear_ops_and_finish<O: ThreadOrchestrator>(
 pub(crate) fn run_preemptive_dispatch<S, B>(
     dispatch_cpus: &[CpuId],
     state_send: &SendPtr<SimulatorState>,
-    sched_send: &SendPtr<S>,
+    sched_send: &SendPtr<SchedulerWrapper<S>>,
     seed: u32,
     backend: &B,
 ) where
@@ -368,7 +390,7 @@ pub(crate) fn run_preemptive_dispatch<S, B>(
 pub(crate) fn run_dispatch_with_orchestrator<S, B, O>(
     dispatch_cpus: &[CpuId],
     state_send: &SendPtr<SimulatorState>,
-    sched_send: &SendPtr<S>,
+    sched_send: &SendPtr<SchedulerWrapper<S>>,
     ring: &PreemptRing,
     orchestrator: &O,
     backend: &B,
@@ -390,7 +412,7 @@ pub(crate) fn run_dispatch_with_orchestrator<S, B, O>(
 
             s.spawn(move || {
                 let sp = state_ref.0;
-                let schp = sched_ref.0 as *const S;
+                let schp = sched_ref.0 as *const SchedulerWrapper<S>;
 
                 let mut ctx = backend.worker_setup(ring_ref, worker_id);
                 orch_ref.wait_for_token(worker_id);
@@ -563,7 +585,7 @@ pub(crate) fn run_batch_with_orchestrator<S, B, O>(
 pub(crate) fn run_cooperative_dispatch<S: Scheduler>(
     dispatch_cpus: &[CpuId],
     state_send: &SendPtr<SimulatorState>,
-    sched_send: &SendPtr<S>,
+    sched_send: &SendPtr<SchedulerWrapper<S>>,
     seed: u32,
 ) {
     let ring = TokenRing::new(dispatch_cpus.len(), seed);
@@ -578,14 +600,14 @@ pub(crate) fn run_cooperative_dispatch<S: Scheduler>(
 
             s.spawn(move || {
                 let sp = state_ref.0;
-                let schp = sched_ref.0 as *const S;
+                let schp = sched_ref.0 as *const SchedulerWrapper<S>;
 
                 interleave::install(ring_ref, worker_id);
                 ring_ref.wait_for_token(worker_id);
 
                 // SAFETY: `sp` points to a valid `SimulatorState` (owned
                 // by the engine, protected by the token-passing protocol).
-                // `schp` points to the valid `Scheduler` for the same
+                // `schp` points to the valid `SchedulerWrapper` for the same
                 // duration. All workers run under `thread::scope` which
                 // guarantees the pointed-to data outlives the threads.
                 unsafe {
@@ -682,4 +704,79 @@ pub(crate) fn run_cooperative_batch<S: Scheduler>(
         ring.start();
         ring.wait_all_done();
     });
+}
+
+// ---------------------------------------------------------------------------
+// Replay dispatch with overshoot retry logic
+// ---------------------------------------------------------------------------
+
+/// Maximum number of PMU signal retry attempts before falling back to
+/// breakpoint-only mode.
+const REPLAY_PMU_MAX_RETRIES: u32 = 3;
+
+/// Maximum number of breakpoint-only retry attempts after PMU retries
+/// are exhausted.
+const REPLAY_BP_ONLY_MAX_RETRIES: u32 = 2;
+
+/// Run replay dispatch with automatic retry on PMU overshoot.
+///
+/// Uses a two-tier retry strategy:
+/// 1. Up to [`REPLAY_PMU_MAX_RETRIES`] attempts with the PMU signal approach
+/// 2. Up to [`REPLAY_BP_ONLY_MAX_RETRIES`] attempts with breakpoint-only mode
+///
+/// If all attempts fail, panics with a clear message.
+pub(crate) fn replay_dispatch_with_retry<S: Scheduler>(
+    dispatch_cpus: &[CpuId],
+    state_send: &SendPtr<SimulatorState>,
+    sched_send: &SendPtr<SchedulerWrapper<S>>,
+    seed: u32,
+    backend: &replay::ReplayBackend,
+) {
+    use crate::preempt::{reset_replay_state, REPLAY_OVERSHOT};
+    use std::sync::atomic::Ordering::SeqCst;
+
+    // If already in breakpoint-only mode, no retry needed for PMU overshoot.
+    if backend.no_pmu_signal() {
+        reset_replay_state();
+        run_preemptive_dispatch(dispatch_cpus, state_send, sched_send, seed, backend);
+        return;
+    }
+
+    // Tier 1: PMU signal attempts.
+    for attempt in 1..=REPLAY_PMU_MAX_RETRIES {
+        reset_replay_state();
+        backend.reset_cursors();
+        run_preemptive_dispatch(dispatch_cpus, state_send, sched_send, seed, backend);
+        if !REPLAY_OVERSHOT.load(SeqCst) {
+            return; // Success — no overshoot.
+        }
+        eprintln!(
+            "replay: PMU overshoot on attempt {attempt}/{REPLAY_PMU_MAX_RETRIES}, retrying..."
+        );
+    }
+
+    // Tier 2: breakpoint-only fallback.
+    eprintln!(
+        "replay: all {REPLAY_PMU_MAX_RETRIES} PMU attempts overshot, \
+         falling back to breakpoint-only mode"
+    );
+    let bp_backend = backend.with_bp_only();
+    for attempt in 1..=REPLAY_BP_ONLY_MAX_RETRIES {
+        reset_replay_state();
+        run_preemptive_dispatch(dispatch_cpus, state_send, sched_send, seed, &bp_backend);
+        if !REPLAY_OVERSHOT.load(SeqCst) {
+            return; // Success.
+        }
+        eprintln!(
+            "replay: breakpoint-only overshoot on attempt \
+             {attempt}/{REPLAY_BP_ONLY_MAX_RETRIES}, retrying..."
+        );
+    }
+
+    let total = REPLAY_PMU_MAX_RETRIES + REPLAY_BP_ONLY_MAX_RETRIES;
+    panic!(
+        "replay: all {total} attempts failed due to overshoot. \
+         This should not happen in breakpoint-only mode — \
+         please report this as a bug."
+    );
 }
