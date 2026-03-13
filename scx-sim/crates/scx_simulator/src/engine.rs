@@ -1438,8 +1438,6 @@ impl<S: Scheduler> Simulator<S> {
         // Install the Arc in ENGINE_SIM_ARC so enter_sim can propagate it
         // to SIM_ARC for kfuncs and cgroup callbacks.
         kfuncs::set_engine_sim_arc(&sim_arc);
-        // Mark that SIM_STATE will point to a bundled SimState.
-        kfuncs::set_sim_state_bundled(true);
         // Lock the Arc for engine work. Dropped before C calls via sim_callback!.
         let mut s = sim_arc.lock().unwrap();
 
@@ -1924,8 +1922,7 @@ impl<S: Scheduler> Simulator<S> {
         // Print structop summary (per-CPU ops callbacks, RBC, kfuncs).
         crate::preempt::print_structop_summary(&s.sim.structop_accum);
 
-        // Clear the bundled flag and ENGINE_SIM_ARC.
-        kfuncs::set_sim_state_bundled(false);
+        // Clear ENGINE_SIM_ARC.
         kfuncs::clear_engine_sim_arc();
 
         // Drop the MutexGuard and extract the SimState from the Arc.
