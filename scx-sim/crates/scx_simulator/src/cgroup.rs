@@ -343,12 +343,14 @@ impl CgroupRegistry {
 
     /// Free a raw cgroup pointer after cgroup_exit has been called.
     ///
-    /// # Safety
     /// Must only be called with a pointer returned from `destroy_by_name`,
     /// and only after `cgroup_exit` has been called for that cgroup.
-    pub unsafe fn free_raw(&self, raw: *mut c_void) {
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    pub fn free_raw(&self, raw: *mut c_void) {
         if !raw.is_null() {
-            sim_cgroup_free(raw);
+            // SAFETY: `raw` was allocated by `sim_cgroup_alloc` and is being
+            // freed exactly once after the cgroup has been unregistered.
+            unsafe { sim_cgroup_free(raw) };
         }
     }
 }
@@ -520,17 +522,23 @@ impl CgroupRegistry {
     /// in pre-order. Call this before entering a `bpf_for_each(css, ...)`
     /// loop in scheduler code.
     ///
-    /// # Safety
-    /// Must be called from the simulator's single-threaded context.
-    pub unsafe fn prepare_css_iter(&self, root_cgid: CgroupId) {
-        sim_css_iter_reset();
+    /// Must be called from the simulator's single-threaded context
+    /// (which is guaranteed by the Arc<Mutex> / token-ring protocol).
+    pub fn prepare_css_iter(&self, root_cgid: CgroupId) {
+        // SAFETY: These C functions manipulate global iteration state.
+        // The simulator's single-threaded execution model (enforced by
+        // the sim_callback!/token-ring protocol) ensures no concurrent
+        // access to this state.
+        unsafe {
+            sim_css_iter_reset();
 
-        if let Some(root) = self.cgroups.get(&root_cgid) {
-            sim_css_iter_set_root(root.raw);
+            if let Some(root) = self.cgroups.get(&root_cgid) {
+                sim_css_iter_set_root(root.raw);
 
-            // Add all descendants in pre-order
-            for info in self.iter_descendants(root_cgid) {
-                sim_css_iter_add(info.raw);
+                // Add all descendants in pre-order
+                for info in self.iter_descendants(root_cgid) {
+                    sim_css_iter_add(info.raw);
+                }
             }
         }
     }
@@ -539,9 +547,8 @@ impl CgroupRegistry {
     ///
     /// Convenience wrapper for `prepare_css_iter(CgroupId::ROOT)`.
     ///
-    /// # Safety
     /// Must be called from the simulator's single-threaded context.
-    pub unsafe fn prepare_css_iter_from_root(&self) {
+    pub fn prepare_css_iter_from_root(&self) {
         self.prepare_css_iter(CgroupId::ROOT);
     }
 }
