@@ -32,7 +32,9 @@
 // === Modules that mix safe/unsafe (remain at crate root for now) ===
 pub mod cgroup;
 pub mod engine;
+pub mod scheduler_wrapper;
 pub mod task;
+pub mod task_wrapper;
 
 // === Safe modules (zero unsafe) — grouped under safe/ ===
 pub mod safe;
@@ -101,7 +103,9 @@ pub use safe::trace::{
     DsqLengthSample, DsqSampleTrigger, Trace, TraceEvent, TraceKind, TraceSummary,
 };
 pub use safe::types::{CpuId, DsqId, KickFlags, MmId, Pid, TimeNs, Vtime};
+pub use scheduler_wrapper::{OptionalPtr, SchedulerWrapper, TaskPtr};
 pub use task::{nice_to_weight, sched_weight_to_cgroup, Phase, RepeatMode, TaskBehavior, TaskDef};
+pub use task_wrapper::SimTaskHandle;
 
 use std::sync::Mutex;
 
