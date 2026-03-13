@@ -746,6 +746,8 @@ fn maybe_collect_global(record: PreemptionRecord) {
 ///
 /// Returns immediately (spurious wakeup) if the value has changed.
 fn futex_wait(futex: &AtomicU32, expected: u32) {
+    // SAFETY: `SYS_futex` with FUTEX_WAIT is async-signal-safe.
+    // `futex` is a valid pointer to an AtomicU32.
     unsafe {
         libc::syscall(
             libc::SYS_futex,
@@ -762,6 +764,8 @@ fn futex_wait(futex: &AtomicU32, expected: u32) {
 
 /// Wake up to `count` threads blocked on `futex`.
 fn futex_wake(futex: &AtomicU32, count: i32) {
+    // SAFETY: `SYS_futex` with FUTEX_WAKE is async-signal-safe.
+    // `futex` is a valid pointer to an AtomicU32.
     unsafe {
         libc::syscall(
             libc::SYS_futex,
@@ -1402,7 +1406,9 @@ struct PreemptCtx {
     replay_mode: bool,
 }
 
-// Raw pointer is Send — access serialized by token passing.
+// SAFETY: PreemptCtx holds a raw pointer to a PreemptRing that lives in
+// a `thread::scope` block on the main thread. Access is serialized by
+// the token-passing protocol.
 unsafe impl Send for PreemptCtx {}
 
 thread_local! {
@@ -1543,6 +1549,9 @@ fn cooperative_yield_impl(phase: KfuncYieldPhase) {
         None => return,
     };
 
+    // SAFETY: `ctx.ring` was set from a valid `&PreemptRing` reference in
+    // `install()`. The PreemptRing lives in a `thread::scope` block and
+    // outlives all worker threads.
     let ring = unsafe { &*ctx.ring };
 
     // Disable the PMU timer during the cooperative yield to prevent
@@ -1632,6 +1641,7 @@ pub fn pause_timer() {
 /// preemptive interleaving is not active on this thread.
 pub fn resume_timer() {
     if let Some(ctx) = PREEMPT_CTX.with(|c| c.get()) {
+        // SAFETY: `ctx.ring` is a valid pointer set during `install()`.
         let ring = unsafe { &*ctx.ring };
         rearm_timer(ring, &ctx);
     }
@@ -1696,6 +1706,8 @@ impl FmtWrite for StackWriter<'_> {
 /// Uses raw `libc::write(STDERR_FILENO, ...)` which is guaranteed
 /// async-signal-safe by POSIX.
 fn write_stderr(buf: &[u8]) {
+    // SAFETY: `libc::write` to STDERR_FILENO is async-signal-safe per POSIX.
+    // `buf.as_ptr()` is valid for `buf.len()` bytes.
     unsafe {
         libc::write(
             libc::STDERR_FILENO,
@@ -1719,12 +1731,14 @@ pub const PREEMPT_SIGNAL: libc::c_int = libc::SIGSTKFLT;
 pub fn install_signal_handler() {
     let sa = libc::sigaction {
         sa_sigaction: preempt_handler as *const () as libc::sighandler_t,
+        // SAFETY: `std::mem::zeroed()` is valid for `sigset_t` (all-zeros = empty set).
         sa_mask: unsafe { std::mem::zeroed() },
         // SA_SIGINFO so we get siginfo_t; SA_RESTART to not fail slow
         // syscalls (though we don't expect any during C scheduler code).
         sa_flags: libc::SA_SIGINFO | libc::SA_RESTART,
         sa_restorer: None,
     };
+    // SAFETY: `sa` is a valid sigaction struct. `sigaction` is async-signal-safe.
     let ret = unsafe { libc::sigaction(PREEMPT_SIGNAL, &sa, std::ptr::null_mut()) };
     assert_eq!(ret, 0, "failed to install SIGSTKFLT handler");
 }
@@ -1739,10 +1753,12 @@ pub fn install_signal_handler() {
 pub fn uninstall_signal_handler() {
     let sa = libc::sigaction {
         sa_sigaction: libc::SIG_IGN,
+        // SAFETY: `std::mem::zeroed()` is valid for `sigset_t`.
         sa_mask: unsafe { std::mem::zeroed() },
         sa_flags: 0,
         sa_restorer: None,
     };
+    // SAFETY: `sa` is a valid sigaction struct. Sets handler to SIG_IGN.
     unsafe {
         libc::sigaction(PREEMPT_SIGNAL, &sa, std::ptr::null_mut());
     }
@@ -1756,6 +1772,9 @@ fn extract_rip_from_ucontext(ctx: *mut libc::c_void) -> u64 {
     if ctx.is_null() {
         return 0;
     }
+    // SAFETY: `ctx` is a non-null ucontext_t pointer provided by the
+    // kernel's signal delivery mechanism. REG_RIP (index 16) is valid
+    // on x86-64 Linux.
     unsafe {
         let uc = ctx as *const libc::ucontext_t;
         // REG_RIP is index 16 on x86-64 Linux (from sys/ucontext.h).
@@ -1776,6 +1795,9 @@ fn read_rbc_count(timer_fd: RawFd) -> u64 {
         return 0;
     }
     let mut count: u64 = 0;
+    // SAFETY: `timer_fd` is a valid perf_event fd. `libc::read` is
+    // async-signal-safe. Reading 8 bytes from a perf_event fd returns
+    // the current counter value.
     let ret = unsafe {
         libc::read(
             timer_fd,
@@ -1805,6 +1827,8 @@ extern "C" fn preempt_handler(
         None => return, // Not in a preemptive interleave context.
     };
 
+    // SAFETY: `pctx.ring` is a valid pointer set during `install()`.
+    // The PreemptRing lives in a `thread::scope` block and outlives workers.
     let ring = unsafe { &*pctx.ring };
 
     // 1. Disable PMU timer to prevent recursive signals.
@@ -1906,6 +1930,8 @@ fn disable_timer(fd: RawFd) {
     if fd < 0 {
         return;
     }
+    // SAFETY: `fd` is a valid perf_event fd. PERF_IOC_DISABLE is a valid
+    // ioctl for perf_event fds. Async-signal-safe.
     unsafe {
         libc::ioctl(fd, scx_perf::PERF_IOC_DISABLE, 0 as libc::c_ulong);
     }
@@ -1916,6 +1942,7 @@ fn disable_measurement(fd: RawFd) {
     if fd < 0 {
         return;
     }
+    // SAFETY: `fd` is a valid perf_event fd. Async-signal-safe.
     unsafe {
         libc::ioctl(fd, scx_perf::PERF_IOC_DISABLE, 0 as libc::c_ulong);
     }
@@ -1926,6 +1953,7 @@ fn enable_measurement(fd: RawFd) {
     if fd < 0 {
         return;
     }
+    // SAFETY: `fd` is a valid perf_event fd. Async-signal-safe.
     unsafe {
         libc::ioctl(fd, scx_perf::PERF_IOC_ENABLE, 0 as libc::c_ulong);
     }
@@ -1965,8 +1993,9 @@ fn rearm_timer(ring: &PreemptRing, ctx: &PreemptCtx) {
     // Consume PRNG unconditionally for deterministic sequencing.
     let timeslice = ring.roll_timeslice(ctx.timeslice_min, ctx.timeslice_max);
     if ctx.replay_mode {
-        // Re-enable only — counter must run continuously for replay
+        // Re-enable only -- counter must run continuously for replay
         // handlers that compare against cumulative structop_rbc targets.
+        // SAFETY: `fd` is a valid perf_event fd.
         unsafe {
             libc::ioctl(fd, scx_perf::PERF_IOC_ENABLE, 0 as libc::c_ulong);
         }
@@ -1974,6 +2003,8 @@ fn rearm_timer(ring: &PreemptRing, ctx: &PreemptCtx) {
     }
     // Recording: reset + new period + enable.
     let mut period = timeslice;
+    // SAFETY: `fd` is a valid perf_event fd. These ioctls reset the
+    // counter, set a new overflow period, and enable counting.
     unsafe {
         libc::ioctl(fd, scx_perf::PERF_IOC_RESET, 0 as libc::c_ulong);
         libc::ioctl(fd, scx_perf::PERF_IOC_PERIOD, &mut period as *mut u64);
@@ -2077,7 +2108,9 @@ struct ReplayCtx {
     no_pmu_signal: bool,
 }
 
-// Raw pointers are Send — access serialized by token passing.
+// SAFETY: ReplayCtx holds raw pointers to PreemptRing and ReplayCursor
+// that live in a `thread::scope` block. Access is serialized by the
+// token-passing protocol.
 unsafe impl Send for ReplayCtx {}
 
 thread_local! {
@@ -2118,20 +2151,24 @@ pub fn install_replay_signal_handlers() {
     // PMU handler: fires when we're within MARGIN of the target.
     let sa_pmu = libc::sigaction {
         sa_sigaction: replay_pmu_handler as *const () as libc::sighandler_t,
+        // SAFETY: `std::mem::zeroed()` is valid for `sigset_t`.
         sa_mask: unsafe { std::mem::zeroed() },
         sa_flags: libc::SA_SIGINFO | libc::SA_RESTART,
         sa_restorer: None,
     };
+    // SAFETY: `sa_pmu` is a valid sigaction struct.
     let ret = unsafe { libc::sigaction(PREEMPT_SIGNAL, &sa_pmu, std::ptr::null_mut()) };
     assert_eq!(ret, 0, "failed to install replay PMU handler");
 
     // Breakpoint handler: fires when we hit the target instruction.
     let sa_bp = libc::sigaction {
         sa_sigaction: replay_bp_handler as *const () as libc::sighandler_t,
+        // SAFETY: `std::mem::zeroed()` is valid for `sigset_t`.
         sa_mask: unsafe { std::mem::zeroed() },
         sa_flags: libc::SA_SIGINFO | libc::SA_RESTART,
         sa_restorer: None,
     };
+    // SAFETY: `sa_bp` is a valid sigaction struct.
     let ret = unsafe { libc::sigaction(REPLAY_BP_SIGNAL, &sa_bp, std::ptr::null_mut()) };
     assert_eq!(ret, 0, "failed to install replay breakpoint handler");
 }
@@ -2146,16 +2183,21 @@ pub fn install_replay_signal_handlers() {
 pub fn uninstall_replay_signal_handlers() {
     let sa_ignore = libc::sigaction {
         sa_sigaction: libc::SIG_IGN,
+        // SAFETY: `std::mem::zeroed()` is valid for `sigset_t`.
         sa_mask: unsafe { std::mem::zeroed() },
         sa_flags: 0,
         sa_restorer: None,
     };
     let sa_default = libc::sigaction {
         sa_sigaction: libc::SIG_DFL,
+        // SAFETY: `std::mem::zeroed()` is valid for `sigset_t`.
         sa_mask: unsafe { std::mem::zeroed() },
         sa_flags: 0,
         sa_restorer: None,
     };
+    // SAFETY: Both sigaction structs are valid. SIG_IGN for PREEMPT_SIGNAL
+    // prevents stray PMU signals from killing the process. SIG_DFL for
+    // REPLAY_BP_SIGNAL restores default SIGTRAP behavior.
     unsafe {
         libc::sigaction(PREEMPT_SIGNAL, &sa_ignore, std::ptr::null_mut());
         libc::sigaction(REPLAY_BP_SIGNAL, &sa_default, std::ptr::null_mut());
@@ -2171,6 +2213,8 @@ fn arm_replay_timer(timer_fd: RawFd, target_rbc: u64) {
         return;
     }
     let mut period = target_rbc.saturating_sub(REPLAY_MARGIN).max(1);
+    // SAFETY: `timer_fd` is a valid perf_event fd. These ioctls reset the
+    // counter, set a new overflow period, and enable counting.
     unsafe {
         libc::ioctl(timer_fd, scx_perf::PERF_IOC_RESET, 0 as libc::c_ulong);
         libc::ioctl(timer_fd, scx_perf::PERF_IOC_PERIOD, &mut period as *mut u64);
@@ -2205,6 +2249,9 @@ fn arm_breakpoint(bp_fd: RawFd, addr: u64) {
     attr.set_exclude_hv(1);
     attr.set_pinned(1);
 
+    // SAFETY: `bp_fd` is a valid perf_event fd. PERF_IOC_MODIFY_ATTRIBUTES
+    // updates the breakpoint address. PERF_IOC_ENABLE starts monitoring.
+    // `attr` is a valid perf_event_attr struct on the stack.
     unsafe {
         libc::ioctl(
             bp_fd,
@@ -2272,6 +2319,7 @@ extern "C" fn replay_pmu_handler(
     }
 
     // 2. Look up the next target from the cursor.
+    // SAFETY: `rctx.cursor` is a valid pointer set during `install_replay()`.
     let cursor = unsafe { &*rctx.cursor };
     let target = match cursor.current_target() {
         Some(t) => t,
@@ -2306,6 +2354,7 @@ extern "C" fn replay_pmu_handler(
     // 5. Re-enable the PMU counter (without resetting) so that
     //    read_rbc_count() in the breakpoint handler returns the live
     //    cumulative value, not the frozen value from disable_timer().
+    // SAFETY: `rctx.timer_fd` is a valid perf_event fd.
     unsafe {
         libc::ioctl(rctx.timer_fd, scx_perf::PERF_IOC_ENABLE, 0 as libc::c_ulong);
     }
@@ -2335,6 +2384,7 @@ fn replay_validate_structop(target: &PreemptionRecord, sinfo: &StructopInfo) {
             sinfo.ops_context.short_name(),
         );
         write_stderr(w.as_bytes());
+        // SAFETY: `libc::abort()` is async-signal-safe per POSIX.
         unsafe { libc::abort() };
     }
 
@@ -2352,6 +2402,7 @@ fn replay_validate_structop(target: &PreemptionRecord, sinfo: &StructopInfo) {
             sinfo.global_count,
         );
         write_stderr(w.as_bytes());
+        // SAFETY: `libc::abort()` is async-signal-safe per POSIX.
         unsafe { libc::abort() };
     }
 
@@ -2407,6 +2458,7 @@ fn replay_validate_insn_bytes(target: &PreemptionRecord) {
         }
         let _ = writeln!(w, " -- .so version mismatch?");
         write_stderr(w.as_bytes());
+        // SAFETY: `libc::abort()` is async-signal-safe per POSIX.
         unsafe { libc::abort() };
     }
 }
@@ -2429,6 +2481,8 @@ extern "C" fn replay_bp_handler(
         None => return,
     };
 
+    // SAFETY: `rctx.cursor` and `rctx.ring` are valid pointers set during
+    // `install_replay()`. They live in a `thread::scope` block.
     let cursor = unsafe { &*rctx.cursor };
     let ring = unsafe { &*rctx.ring };
 
@@ -2527,6 +2581,8 @@ fn arm_replay_next_target(
         let absolute_target = target.structop_rbc.saturating_sub(REPLAY_MARGIN);
         let delta = absolute_target.saturating_sub(current_counter).max(1);
         let mut period = delta;
+        // SAFETY: `timer_fd` is a valid perf_event fd. These ioctls set
+        // the overflow period and enable counting.
         unsafe {
             libc::ioctl(timer_fd, scx_perf::PERF_IOC_PERIOD, &mut period as *mut u64);
             libc::ioctl(timer_fd, scx_perf::PERF_IOC_ENABLE, 0 as libc::c_ulong);
@@ -2544,10 +2600,12 @@ pub fn install_replay_bp_only_handlers() {
     // Breakpoint handler: fires on every execution of the target instruction.
     let sa_bp = libc::sigaction {
         sa_sigaction: replay_bp_handler as *const () as libc::sighandler_t,
+        // SAFETY: `std::mem::zeroed()` is valid for `sigset_t`.
         sa_mask: unsafe { std::mem::zeroed() },
         sa_flags: libc::SA_SIGINFO | libc::SA_RESTART,
         sa_restorer: None,
     };
+    // SAFETY: `sa_bp` is a valid sigaction struct.
     let ret = unsafe { libc::sigaction(REPLAY_BP_SIGNAL, &sa_bp, std::ptr::null_mut()) };
     assert_eq!(ret, 0, "failed to install replay breakpoint handler");
 }
@@ -2556,10 +2614,12 @@ pub fn install_replay_bp_only_handlers() {
 pub fn uninstall_replay_bp_only_handlers() {
     let sa_default = libc::sigaction {
         sa_sigaction: libc::SIG_DFL,
+        // SAFETY: `std::mem::zeroed()` is valid for `sigset_t`.
         sa_mask: unsafe { std::mem::zeroed() },
         sa_flags: 0,
         sa_restorer: None,
     };
+    // SAFETY: Restores SIGTRAP to default handler.
     unsafe {
         libc::sigaction(REPLAY_BP_SIGNAL, &sa_default, std::ptr::null_mut());
     }
@@ -2607,7 +2667,8 @@ pub struct E9SharedRbc {
     pub yield_fn: *const std::ffi::c_void,
 }
 
-// SAFETY: single-writer access enforced by PreemptRing token passing.
+// SAFETY: E9SharedRbc is a plain-old-data struct at a fixed mmap'd address.
+// Single-writer access is enforced by the PreemptRing token-passing protocol.
 unsafe impl Send for E9SharedRbc {}
 unsafe impl Sync for E9SharedRbc {}
 
@@ -2638,6 +2699,8 @@ pub fn e9_read_counter() -> i64 {
 /// Returns the pointer on success, or panics if the mmap fails.
 pub fn mmap_shared_rbc() -> *mut E9SharedRbc {
     let addr = E9_SHARED_ADDR as *mut std::ffi::c_void;
+    // SAFETY: `mmap` with MAP_FIXED at our chosen address. The address
+    // is in an obscure gap (0x1E9_000_000) below typical ASLR ranges.
     let ptr = unsafe {
         libc::mmap(
             addr,
@@ -2654,6 +2717,8 @@ pub fn mmap_shared_rbc() -> *mut E9SharedRbc {
     );
     // Initialize to disarmed state.
     let shared = ptr as *mut E9SharedRbc;
+    // SAFETY: `shared` points to the freshly mmap'd page (verified non-null
+    // above). Writing these fields initializes the struct to disarmed state.
     unsafe {
         (*shared).counter = i64::MAX;
         (*shared).armed = 0;
@@ -2665,6 +2730,8 @@ pub fn mmap_shared_rbc() -> *mut E9SharedRbc {
 
 /// Unmap the shared RBC state page.
 pub fn munmap_shared_rbc() {
+    // SAFETY: E9_SHARED_ADDR was mapped by `mmap_shared_rbc()`.
+    // Unmapped exactly once here during e9patch teardown.
     unsafe {
         libc::munmap(
             E9_SHARED_ADDR as *mut std::ffi::c_void,
@@ -2716,6 +2783,7 @@ pub unsafe extern "C" fn e9_preempt_yield() -> u64 {
         Some(ctx) => ctx,
         None => return u64::MAX,
     };
+    // SAFETY: `pctx.ring` is a valid pointer set during `install()`.
     let ring = unsafe { &*pctx.ring };
     let wid = pctx.worker_id;
 

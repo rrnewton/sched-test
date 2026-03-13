@@ -27,10 +27,10 @@ use crate::perf;
 use crate::preempt::{
     is_determinism_mode_enabled, record_checkpoint, scheduler_so_path, CheckpointEvent,
 };
-use crate::scheduler_wrapper::{OptionalPtr, SchedulerWrapper, TaskPtr};
 use crate::scenario::{
     CgroupCpusetChangeEvent, CgroupCreateEvent, CgroupDestroyEvent, IrqType, PreemptMode, Scenario,
 };
+use crate::scheduler_wrapper::{OptionalPtr, SchedulerWrapper, TaskPtr};
 use crate::task::{OpsTaskState, Phase, SimTask, TaskState};
 use crate::trace::{DsqSampleTrigger, Trace, TraceKind};
 use crate::types::{CpuId, DsqId, KickFlags, Pid, TimeNs};
@@ -1184,13 +1184,7 @@ impl<S: Scheduler> Simulator<S> {
     /// Note: callers that need `set_task_ops_state(pid, Queued)` must do
     /// so before calling this helper (most do, but cpu_offline drain doesn't).
     #[allow(dead_code)]
-    fn call_enqueue(
-        &self,
-        cpu: CpuId,
-        raw: *mut c_void,
-        flags: u64,
-        state: &mut SimulatorState,
-    ) {
+    fn call_enqueue(&self, cpu: CpuId, raw: *mut c_void, flags: u64, state: &mut SimulatorState) {
         set_ops_context(state, OpsContext::Enqueue);
         start_rbc(state);
         self.scheduler.enqueue(TaskPtr::new(raw), flags);
@@ -1490,7 +1484,9 @@ impl<S: Scheduler> Simulator<S> {
                 #[allow(unused_assignments)]
                 let mut rc = 0i32;
                 sim_callback!(s, s, sim_arc, cpu, {
-                    rc = self.scheduler.cgroup_init(TaskPtr::new(raw), OptionalPtr::null());
+                    rc = self
+                        .scheduler
+                        .cgroup_init(TaskPtr::new(raw), OptionalPtr::null());
                 });
                 charge_sched_time(&mut s.sim, CpuId(0), "cgroup_init");
                 assert!(rc == 0, "cgroup_init failed for cgid={} rc={rc}", cgid.0);
@@ -1516,8 +1512,12 @@ impl<S: Scheduler> Simulator<S> {
             for (raw, period_us, quota_us, burst_us) in bw_configs {
                 start_rbc(&mut s.sim);
                 sim_callback!(s, s, sim_arc, cpu, {
-                    self.scheduler
-                        .cgroup_set_bandwidth(TaskPtr::new(raw), period_us, quota_us, burst_us);
+                    self.scheduler.cgroup_set_bandwidth(
+                        TaskPtr::new(raw),
+                        period_us,
+                        quota_us,
+                        burst_us,
+                    );
                 });
                 charge_sched_time(&mut s.sim, CpuId(0), "cgroup_set_bandwidth");
             }
@@ -1562,7 +1562,8 @@ impl<S: Scheduler> Simulator<S> {
                 let mut rc = 0i32;
                 sim_callback!(s, s, sim_arc, cpu, {
                     rc = if let Some(cgrp_raw) = cgrp_raw {
-                        self.scheduler.init_task_in_cgroup(TaskPtr::new(task_raw), TaskPtr::new(cgrp_raw))
+                        self.scheduler
+                            .init_task_in_cgroup(TaskPtr::new(task_raw), TaskPtr::new(cgrp_raw))
                     } else {
                         self.scheduler.init_task(TaskPtr::new(task_raw))
                     };
@@ -1853,7 +1854,8 @@ impl<S: Scheduler> Simulator<S> {
             for &(pid, raw) in &task_raws {
                 start_rbc(&mut s.sim);
                 sim_callback!(s, s, sim_arc, cpu, {
-                    self.scheduler.dump_task(OptionalPtr::null(), TaskPtr::new(raw));
+                    self.scheduler
+                        .dump_task(OptionalPtr::null(), TaskPtr::new(raw));
                 });
                 charge_sched_time(&mut s.sim, CpuId(0), "dump_task");
                 let _ = pid; // used for deterministic ordering
@@ -2482,7 +2484,11 @@ impl<S: Scheduler> Simulator<S> {
         // Call cgroup_move
         start_rbc(&mut s.sim);
         sim_callback!(s, guard, sim_arc, cpu, {
-            self.scheduler.cgroup_move(TaskPtr::new(raw), TaskPtr::new(from_raw), TaskPtr::new(to_raw));
+            self.scheduler.cgroup_move(
+                TaskPtr::new(raw),
+                TaskPtr::new(from_raw),
+                TaskPtr::new(to_raw),
+            );
         });
         let s = &mut *guard;
         charge_sched_time(&mut s.sim, cpu, "cgroup_move");
@@ -2617,7 +2623,9 @@ impl<S: Scheduler> Simulator<S> {
         start_rbc(&mut s.sim);
         let rc;
         sim_callback!(s, guard, sim_arc, cpu, {
-            rc = self.scheduler.cgroup_init(TaskPtr::new(raw), OptionalPtr::null());
+            rc = self
+                .scheduler
+                .cgroup_init(TaskPtr::new(raw), OptionalPtr::null());
         });
         let s = &mut *guard;
         charge_sched_time(&mut s.sim, cpu, "cgroup_init");
@@ -2703,7 +2711,8 @@ impl<S: Scheduler> Simulator<S> {
             s.cgroup_registry.prepare_css_iter_from_root();
             start_rbc(&mut s.sim);
             sim_callback!(s, guard, sim_arc, cpu, {
-                self.scheduler.cgroup_init(TaskPtr::new(raw), OptionalPtr::null());
+                self.scheduler
+                    .cgroup_init(TaskPtr::new(raw), OptionalPtr::null());
             });
             let s = &mut *guard;
             charge_sched_time(&mut s.sim, cpu, "cgroup_init");
@@ -2898,7 +2907,9 @@ impl<S: Scheduler> Simulator<S> {
         start_rbc(&mut s.sim);
         let selected_cpu_raw;
         sim_callback!(s, guard, sim_arc, wake_cpu, {
-            selected_cpu_raw = self.scheduler.select_cpu(TaskPtr::new(raw), prev_cpu.0 as i32, enq_flags);
+            selected_cpu_raw =
+                self.scheduler
+                    .select_cpu(TaskPtr::new(raw), prev_cpu.0 as i32, enq_flags);
         });
         let s = &mut *guard;
 
@@ -3458,7 +3469,8 @@ impl<S: Scheduler> Simulator<S> {
             debug!("enter:structop dispatch");
             start_rbc(&mut s.sim);
             sim_callback!(s, guard, sim_arc, cpu, {
-                self.scheduler.dispatch(cpu.0 as i32, OptionalPtr::new(prev_raw));
+                self.scheduler
+                    .dispatch(cpu.0 as i32, OptionalPtr::new(prev_raw));
             });
             let s = &mut *guard;
             charge_sched_time(&mut s.sim, cpu, "dispatch");
@@ -3752,8 +3764,12 @@ impl<S: Scheduler> Simulator<S> {
 
                     // Enter sim AFTER acquiring the token to avoid racing on
                     // SimulatorState.current_cpu with other workers.
+                    // SAFETY: token passing ensures exclusive access to `sp`.
+                    // `sp` is valid for the lifetime of the scope.
                     unsafe { kfuncs::enter_sim(&mut *sp, cpu) };
 
+                    // SAFETY: `sp` and `schp` are valid pointers; exclusive
+                    // access is ensured by the token ring protocol.
                     unsafe {
                         debug!(cpu = cpu.0, "enter:structop dispatch (concurrent)");
                         dispatch_worker_body(sp, schp, cpu);
@@ -3764,7 +3780,9 @@ impl<S: Scheduler> Simulator<S> {
                         rbc_total: 0,
                         interleave_count: crate::preempt::structop_info().interleave_count,
                     };
+                    // SAFETY: token held; exclusive access to `sp`.
                     unsafe { crate::backend::drain_structop_accum(sp, cpu, &delta) };
+                    // SAFETY: token held; clears ops_context before releasing.
                     unsafe { crate::backend::clear_ops_and_finish(sp, ring_ref, worker_id) };
                     interleave::uninstall();
                 });
@@ -4153,10 +4171,13 @@ impl<S: Scheduler> Simulator<S> {
                     // Enter sim AFTER acquiring the token to avoid racing on
                     // SimulatorState.current_cpu with other workers.
                     let sp = state_ref.0;
+                    // SAFETY: token passing ensures exclusive access to `sp`.
                     unsafe { kfuncs::enter_sim(&mut *sp, cpu) };
 
                     // Process all events for this CPU sequentially.
                     // Yields happen at kfunc boundaries within handlers.
+                    // SAFETY: `simp` and `arc_ref` are valid; token ensures
+                    // exclusive access to shared state.
                     unsafe {
                         batch_worker_body(
                             simp,
@@ -4173,7 +4194,9 @@ impl<S: Scheduler> Simulator<S> {
                         rbc_total: 0,
                         interleave_count: crate::preempt::structop_info().interleave_count,
                     };
+                    // SAFETY: token held; exclusive access to `sp`.
                     unsafe { crate::backend::drain_structop_accum(sp, cpu, &delta) };
+                    // SAFETY: token held; clears ops_context before releasing.
                     unsafe { crate::backend::clear_ops_and_finish(sp, ring_ref, worker_id) };
                     interleave::uninstall();
                 });

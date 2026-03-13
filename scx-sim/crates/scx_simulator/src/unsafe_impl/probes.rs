@@ -56,6 +56,9 @@ impl LavdProbes {
     /// Panics if any required probe symbol is missing (indicates the
     /// scheduler was built without probe exports).
     pub fn new(sched: &DynamicScheduler) -> Self {
+        // SAFETY: Symbols are resolved from a loaded scheduler `.so` built
+        // by our build system. The function pointer types match the C
+        // signatures exported by the LAVD scheduler probe functions.
         unsafe {
             macro_rules! resolve {
                 ($name:expr, $ty:ty) => {
@@ -137,21 +140,26 @@ impl LavdProbes {
 
     /// Read `sys_stat.avg_lat_cri` (system average latency criticality).
     pub fn sys_avg_lat_cri(&self) -> u32 {
+        // SAFETY: `sys_avg_lat_cri_fn` is a valid function pointer resolved
+        // from the loaded scheduler `.so`. No pointer arguments.
         unsafe { (self.sys_avg_lat_cri_fn)() }
     }
 
     /// Read `sys_stat.thr_lat_cri` (latency criticality kick threshold).
     pub fn sys_thr_lat_cri(&self) -> u32 {
+        // SAFETY: Valid function pointer; no pointer arguments.
         unsafe { (self.sys_thr_lat_cri_fn)() }
     }
 
     /// Read `sys_stat.nr_sched` (total scheduling decisions).
     pub fn sys_nr_sched(&self) -> u64 {
+        // SAFETY: Valid function pointer; no pointer arguments.
         unsafe { (self.sys_nr_sched_fn)() }
     }
 
     /// Read `sys_stat.nr_lat_cri` (number of latency-critical scheduling decisions).
     pub fn sys_nr_lat_cri(&self) -> u64 {
+        // SAFETY: Valid function pointer; no pointer arguments.
         unsafe { (self.sys_nr_lat_cri_fn)() }
     }
 
@@ -159,16 +167,19 @@ impl LavdProbes {
 
     /// Read `sys_stat.slice_wall` (current target slice for the system).
     pub fn sys_slice_wall(&self) -> u64 {
+        // SAFETY: Valid function pointer; no pointer arguments.
         unsafe { (self.sys_slice_wall_fn)() }
     }
 
     /// Read `sys_stat.nr_queued_task` (number of queued tasks).
     pub fn sys_nr_queued_task(&self) -> u32 {
+        // SAFETY: Valid function pointer; no pointer arguments.
         unsafe { (self.sys_nr_queued_task_fn)() }
     }
 
     /// Check if `can_boost_slice()` returns true.
     pub fn can_boost_slice(&self) -> bool {
+        // SAFETY: Valid function pointer; no pointer arguments.
         unsafe { (self.can_boost_slice_fn)() != 0 }
     }
 

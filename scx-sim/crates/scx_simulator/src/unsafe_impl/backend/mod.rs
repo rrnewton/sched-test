@@ -145,6 +145,9 @@ impl ThreadOrchestrator for PreemptRing {
 /// Callers must ensure only one thread accesses the pointed-to data at a time
 /// (enforced by PreemptRing / TokenRing token passing).
 pub(crate) struct SendPtr<T>(pub *mut T);
+// SAFETY: SendPtr wraps a raw pointer for cross-thread transfer.
+// Callers must ensure only one thread accesses the pointed-to data at
+// a time, which is enforced by the PreemptRing / TokenRing protocol.
 unsafe impl<T> Send for SendPtr<T> {}
 unsafe impl<T> Sync for SendPtr<T> {}
 
@@ -394,17 +397,21 @@ pub(crate) fn run_dispatch_with_orchestrator<S, B, O>(
 
                 // Enter sim AFTER acquiring the token to avoid racing on
                 // SimulatorState.current_cpu with other workers.
+                // SAFETY: token passing ensures exclusive access to `sp`.
                 unsafe { kfuncs::enter_sim(&mut *sp, cpu) };
 
                 build_and_arm(backend, &mut ctx, ring_ref);
 
+                // SAFETY: `sp` and `schp` are valid; token ensures exclusive access.
                 unsafe {
                     debug!(cpu = cpu.0, "enter:structop dispatch (preemptive)");
                     dispatch_worker_body(sp, schp, cpu);
                 }
 
                 let delta = backend.disarm(&mut ctx);
+                // SAFETY: token held; exclusive access to `sp`.
                 unsafe { drain_structop_accum(sp, cpu, &delta) };
+                // SAFETY: token held; clears ops_context before releasing.
                 unsafe { clear_ops_and_finish(sp, orch_ref, worker_id) };
 
                 backend.worker_teardown(ctx);
@@ -500,10 +507,13 @@ pub(crate) fn run_batch_with_orchestrator<S, B, O>(
                 let mut ctx = backend.worker_setup(ring_ref, worker_id);
                 orch_ref.wait_for_token(worker_id);
 
+                // SAFETY: token passing ensures exclusive access to `sp`.
                 unsafe { kfuncs::enter_sim(&mut *sp, cpu) };
 
                 build_and_arm(backend, &mut ctx, ring_ref);
 
+                // SAFETY: `simp` and `arc_ref` are valid; token ensures
+                // exclusive access to shared state.
                 unsafe {
                     batch_worker_body(
                         simp,
@@ -516,7 +526,9 @@ pub(crate) fn run_batch_with_orchestrator<S, B, O>(
                 }
 
                 let delta = backend.disarm(&mut ctx);
+                // SAFETY: token held; exclusive access to `sp`.
                 unsafe { drain_structop_accum(sp, cpu, &delta) };
+                // SAFETY: token held; clears ops_context before releasing.
                 unsafe { clear_ops_and_finish(sp, orch_ref, worker_id) };
 
                 backend.worker_teardown(ctx);

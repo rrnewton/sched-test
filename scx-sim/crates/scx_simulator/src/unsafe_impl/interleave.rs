@@ -302,7 +302,9 @@ struct InterleaveCtx {
     worker_id: WorkerId,
 }
 
-// Raw pointers are Send — we enforce single-access via token passing.
+// SAFETY: InterleaveCtx holds a raw pointer to a TokenRing that lives in
+// a `thread::scope` block on the main thread. Access is serialized by
+// the token-passing protocol — only the token holder calls `maybe_yield`.
 unsafe impl Send for InterleaveCtx {}
 
 thread_local! {
@@ -349,6 +351,9 @@ pub fn maybe_yield() {
         None => return,
     };
 
+    // SAFETY: `ctx.ring` was set from a valid `&TokenRing` reference in
+    // `install()`. The TokenRing lives in a `thread::scope` block on the
+    // main thread and outlives all worker threads.
     let ring = unsafe { &*ctx.ring };
 
     // Save per-callback context from the CALLBACK_CTX thread-local.
