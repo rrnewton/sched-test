@@ -199,6 +199,8 @@ pub(crate) fn setup_pmu_timer(
     let timer = perf::try_create_pmu_timer(break_on);
     let timer_fd = match &timer {
         Some(t) => {
+            // SAFETY: `SYS_gettid` returns the caller's thread ID. No
+            // pointer arguments; always succeeds.
             let tid = unsafe { libc::syscall(libc::SYS_gettid) } as libc::pid_t;
             if let Err(e) = t.set_signal_delivery(tid, preempt::PREEMPT_SIGNAL) {
                 tracing::warn!("preemptive: signal delivery setup failed: {e}");

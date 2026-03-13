@@ -83,7 +83,10 @@ impl PreemptionBackend for E9PatchBackend {
     type WorkerCtx = E9PatchWorkerCtx;
 
     fn global_setup(&self) {
+        // SAFETY: `mmap_shared_rbc()` has been called before any e9patch
+        // backend usage, making E9_SHARED_ADDR a valid pointer.
         let p = unsafe { preempt::e9_shared_rbc() };
+        // SAFETY: `p` is a valid pointer to the mmap'd shared state page.
         let counter = unsafe { (*p).counter };
         info!(
             addr = format_args!("{:#x}", preempt::E9_SHARED_ADDR),
@@ -121,10 +124,13 @@ impl PreemptionBackend for E9PatchBackend {
                 panic!("E9PatchBackend::arm() expects RbcTarget::Relative, got Absolute");
             }
         };
+        // SAFETY: `self.fns.arm` is a valid function pointer resolved from
+        // the loaded `.so` via `E9PatchFns::resolve`. Token held.
         unsafe { (self.fns.arm)(timeslice) };
     }
 
     fn disarm(&self, _ctx: &mut E9PatchWorkerCtx) -> StructopDelta {
+        // SAFETY: `self.fns.disarm` is a valid function pointer. Token held.
         unsafe { (self.fns.disarm)() };
         StructopDelta {
             rbc_total: 0,
@@ -142,7 +148,8 @@ impl PreemptionBackend for E9PatchBackend {
         // the trampoline which accesses the fixed address. The page is
         // one 4K page; leaking it is harmless.
         //
-        // Disarm so the trampoline becomes a no-op (armed=0 → early return).
+        // Disarm so the trampoline becomes a no-op (armed=0 -> early return).
+        // SAFETY: `self.fns.disarm` is a valid function pointer.
         unsafe { (self.fns.disarm)() };
     }
 

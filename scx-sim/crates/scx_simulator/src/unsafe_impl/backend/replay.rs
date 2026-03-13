@@ -286,6 +286,8 @@ impl PreemptionBackend for ReplayBackend {
         }
         // Disable and close breakpoint fd.
         if ctx.bp_fd >= 0 {
+            // SAFETY: `bp_fd` is a valid perf_event fd obtained from
+            // `perf_event_open`. PERF_IOC_DISABLE is a valid ioctl.
             unsafe {
                 libc::ioctl(ctx.bp_fd, scx_perf::PERF_IOC_DISABLE, 0 as libc::c_ulong);
             }
@@ -300,6 +302,7 @@ impl PreemptionBackend for ReplayBackend {
     fn worker_teardown(&self, ctx: ReplayWorkerCtx) {
         // Close breakpoint fd (was leaked from HwBreakpoint via forget).
         if ctx.bp_fd >= 0 {
+            // SAFETY: `bp_fd` is a valid fd; closed exactly once here.
             unsafe { libc::close(ctx.bp_fd) };
         }
         preempt::uninstall_replay();

@@ -199,11 +199,16 @@ pub struct SimTask {
 impl SimTask {
     /// Create a new simulated task from a definition.
     pub fn new(def: &TaskDef, nr_cpus: u32) -> Self {
+        // SAFETY: `sim_task_alloc` allocates a zeroed `task_struct` on the
+        // heap. The returned pointer is non-null (asserted below).
         let raw = unsafe { ffi::sim_task_alloc() };
         assert!(!raw.is_null(), "sim_task_alloc returned null");
 
         let scx_weight = sched_weight_to_cgroup(nice_to_weight(def.nice));
 
+        // SAFETY: `raw` is a valid, non-null task_struct pointer just
+        // allocated above. All ffi setter functions operate on fields
+        // within the allocation and are safe for any valid pointer.
         unsafe {
             ffi::sim_task_set_pid(raw, def.pid.0);
             // The kernel stores cgroup-weight-space [1..10000] in p->scx.weight,
@@ -291,17 +296,21 @@ impl SimTask {
 
     /// Read the task's current slice from the C task_struct.
     pub fn get_slice(&self) -> u64 {
+        // SAFETY: `self.raw` is non-null and valid (invariant of SimTask).
         unsafe { ffi::sim_task_get_slice(self.raw) }
     }
 
     /// Read the task's dsq_vtime from the C task_struct.
     pub fn get_dsq_vtime(&self) -> Vtime {
+        // SAFETY: `self.raw` is non-null and valid (invariant of SimTask).
         Vtime(unsafe { ffi::sim_task_get_dsq_vtime(self.raw) })
     }
 }
 
 impl Drop for SimTask {
     fn drop(&mut self) {
+        // SAFETY: `self.raw` was allocated by `sim_task_alloc` in `new()` and
+        // is freed exactly once here. No other code frees this pointer.
         unsafe {
             ffi::sim_task_free(self.raw);
         }

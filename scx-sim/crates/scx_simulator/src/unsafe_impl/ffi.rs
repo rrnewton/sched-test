@@ -656,7 +656,9 @@ impl DynamicScheduler {
         .unwrap_or_else(|e| panic!("failed to load {path}: {e}"))
         .into();
 
-        // Probe for {prefix}_setup — call it if present
+        // Probe for {prefix}_setup -- call it if present
+        // SAFETY: The `.so` was loaded with RTLD_NOW. If the symbol exists,
+        // it has the expected `SetupFn` signature (from our build system).
         unsafe {
             let setup_sym = format!("{prefix}_setup");
             if let Ok(sym) = lib.get::<SetupFn>(setup_sym.as_bytes()) {
@@ -665,6 +667,8 @@ impl DynamicScheduler {
             }
         }
 
+        // SAFETY: The library contains the expected ops symbols with
+        // correct signatures (built by our build system).
         let ops = unsafe { Self::load_ops(&lib, prefix) };
         Self {
             _lib: lib,
@@ -729,6 +733,8 @@ impl DynamicScheduler {
         );
         let sched = Self::lavd(nr_cpus);
         type SetupMultiDomainFn = unsafe extern "C" fn(u32);
+        // SAFETY: Symbol resolved from a `.so` built by our build system.
+        // The function expects a u32 domain count.
         unsafe {
             let sym: libloading::Symbol<SetupMultiDomainFn> = sched
                 ._lib
@@ -750,6 +756,8 @@ impl DynamicScheduler {
     pub fn lavd_configure(&self, per_cpu_dsq: bool, pinned_slice_ns: u64, mig_delta_pct: u8) {
         type SetU32Fn = unsafe extern "C" fn(u32);
         type SetU64Fn = unsafe extern "C" fn(u64);
+        // SAFETY: Symbols resolved from a `.so` built by our build system.
+        // The functions expect the declared parameter types.
         unsafe {
             let sym: libloading::Symbol<SetU32Fn> = self
                 ._lib
@@ -778,6 +786,7 @@ impl DynamicScheduler {
     /// instrumentation paths in balance.bpf.c.
     pub fn lavd_set_monitored(&self, monitored: bool) {
         type SetU32Fn = unsafe extern "C" fn(u32);
+        // SAFETY: Symbol resolved from a `.so` built by our build system.
         unsafe {
             let sym: libloading::Symbol<SetU32Fn> = self
                 ._lib
@@ -795,6 +804,7 @@ impl DynamicScheduler {
     /// triggering. Disabling core compaction keeps all domains active.
     pub fn lavd_set_no_core_compaction(&self, no_compact: bool) {
         type SetU32Fn = unsafe extern "C" fn(u32);
+        // SAFETY: Symbol resolved from a `.so` built by our build system.
         unsafe {
             let sym: libloading::Symbol<SetU32Fn> = self
                 ._lib
@@ -812,6 +822,7 @@ impl DynamicScheduler {
     /// Must be called after construction and before `Simulator::run()`.
     pub fn lavd_set_power_mode(&self, mode: LavdPowerMode) {
         type SetPowerModeFn = unsafe extern "C" fn(i32);
+        // SAFETY: Symbol resolved from a `.so` built by our build system.
         unsafe {
             let sym: libloading::Symbol<SetPowerModeFn> = self
                 ._lib
@@ -831,6 +842,7 @@ impl DynamicScheduler {
     /// Must be called after construction and before `Simulator::run()`.
     pub fn lavd_set_autopilot(&self, on: bool) {
         type SetAutopilotFn = unsafe extern "C" fn(i32);
+        // SAFETY: Symbol resolved from a `.so` built by our build system.
         unsafe {
             let sym: libloading::Symbol<SetAutopilotFn> = self
                 ._lib
@@ -863,6 +875,7 @@ impl DynamicScheduler {
     /// Set to `0` to disable the limit (default).
     pub fn lavd_set_cgroup_bw_max(&self, max: u32) {
         type SetU32Fn = unsafe extern "C" fn(u32);
+        // SAFETY: Symbol resolved from a `.so` built by our build system.
         unsafe {
             let sym: libloading::Symbol<SetU32Fn> = self
                 ._lib
@@ -875,6 +888,7 @@ impl DynamicScheduler {
     /// Get the current cgroup_bw count (number of active cgroups tracked).
     pub fn lavd_get_cgroup_bw_count(&self) -> u32 {
         type GetU32Fn = unsafe extern "C" fn() -> u32;
+        // SAFETY: Symbol resolved from a `.so` built by our build system.
         unsafe {
             let sym: libloading::Symbol<GetU32Fn> = self
                 ._lib
@@ -898,6 +912,7 @@ impl DynamicScheduler {
         let sched = Self::cosmos(nr_cpus);
         // Call cosmos_configure_numa in the loaded .so
         type ConfigureNumaFn = unsafe extern "C" fn(u32, u32);
+        // SAFETY: Symbol resolved from a `.so` built by our build system.
         unsafe {
             let sym: libloading::Symbol<ConfigureNumaFn> = sched
                 ._lib
@@ -1209,6 +1224,8 @@ impl Scheduler for DynamicScheduler {
     }
 
     fn resolve_e9_fns(&self) -> Option<crate::backend::e9patch::E9PatchFns> {
+        // SAFETY: The library contains symbols from our build system.
+        // `E9PatchFns::resolve` looks up `e9_arm`/`e9_disarm` symbols.
         unsafe { crate::backend::e9patch::E9PatchFns::resolve(&self._lib) }
     }
 

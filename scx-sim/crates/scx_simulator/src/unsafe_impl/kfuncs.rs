@@ -494,7 +494,11 @@ impl SimulatorState {
     /// needs `&mut SimCpu` while we also hold `&mut DsqManager`.
     ///
     /// Returns true if a task was consumed.
-    pub fn consume_dsq_to_local(&mut self, dsq_id: crate::types::DsqId, cpu: crate::types::CpuId) -> bool {
+    pub fn consume_dsq_to_local(
+        &mut self,
+        dsq_id: crate::types::DsqId,
+        cpu: crate::types::CpuId,
+    ) -> bool {
         let cpu_idx = cpu.0 as usize;
         // SAFETY: cpu_idx is within bounds (validated by the engine).
         // The split borrow is sound because cpus_ptr[cpu_idx] and dsqs
@@ -525,6 +529,9 @@ impl SimulatorState {
     /// and when the task is picked to run.
     pub fn clear_task_queued(&mut self, pid: Pid) {
         if let Some(&raw) = self.task_pid_to_raw.get(&pid) {
+            // SAFETY: `raw` is a valid task_struct pointer obtained from
+            // `task_pid_to_raw`, which stores pointers allocated by
+            // `sim_task_alloc` during task creation.
             unsafe {
                 let flags = crate::ffi::sim_task_get_scx_flags(raw as *mut c_void);
                 if flags & SCX_TASK_QUEUED != 0 {
@@ -539,6 +546,7 @@ impl SimulatorState {
 
     fn set_scx_flag(&self, pid: Pid, flag: u32) {
         if let Some(&raw) = self.task_pid_to_raw.get(&pid) {
+            // SAFETY: `raw` is a valid task_struct pointer from `task_pid_to_raw`.
             unsafe {
                 let flags = crate::ffi::sim_task_get_scx_flags(raw as *mut c_void);
                 if flags & flag == 0 {
@@ -1049,6 +1057,8 @@ pub fn exit_sim() {
     // passes, so we need to sync it back before clearing.
     if let Some(ctx) = get_callback_ctx() {
         if let Some(ptr) = SIM_STATE.with(|cell| cell.get()) {
+            // SAFETY: `ptr` was installed by `enter_sim` and is valid.
+            // The caller holds the token; exclusive access is ensured.
             unsafe {
                 (*ptr).current_cpu = ctx.current_cpu;
                 (*ptr).ops_context = ctx.ops_context;
@@ -1063,6 +1073,7 @@ pub fn exit_sim() {
             // Clear ops_context AFTER pausing the timer, so any pending
             // PMU signal (from the last kfunc's rearm) still sees the
             // correct callback context rather than None.
+            // SAFETY: `ptr` is valid; exclusive access by token.
             unsafe {
                 (*ptr).ops_context = OpsContext::None;
             }
@@ -1088,6 +1099,8 @@ pub fn exit_sim_no_clear_ops() {
     // Sync CALLBACK_CTX back (same as exit_sim but without clearing ops_context).
     if let Some(ctx) = get_callback_ctx() {
         if let Some(ptr) = SIM_STATE.with(|cell| cell.get()) {
+            // SAFETY: `ptr` was installed by `enter_sim` and is valid.
+            // The caller holds the token; exclusive access is ensured.
             unsafe {
                 (*ptr).current_cpu = ctx.current_cpu;
                 (*ptr).ops_context = ctx.ops_context;
@@ -1223,6 +1236,9 @@ where
             .get()
             .expect("kfunc called outside of simulator context");
         let result = {
+            // SAFETY: `ptr` was installed by `enter_sim` and is valid until
+            // `exit_sim`. The caller holds the execution token, ensuring
+            // exclusive access to the pointed-to SimulatorState.
             let sim = unsafe { &mut *ptr };
             sim.rbc_kfunc_calls += 1;
             sim.rbc_kfunc_ns += cost_ns;
@@ -1335,14 +1351,18 @@ pub extern "C" fn scx_bpf_select_cpu_dfl(
     crate::preempt::set_current_kfunc("select_cpu_dfl");
     crate::interleave::maybe_yield();
     with_sim(kfunc_cost::COMPLEX, |sim| {
+        // SAFETY: `p` is a valid task_struct pointer from the scheduler.
         let cpus_ptr = unsafe { ffi::sim_task_get_cpus_ptr(p) };
         let allowed = |cpu: u32| -> bool {
+            // SAFETY: `cpus_ptr` is either null (allow all) or a valid
+            // cpumask pointer from the C task_struct.
             cpus_ptr.is_null() || unsafe { ffi::bpf_cpumask_test_cpu(cpu, cpus_ptr) }
         };
 
         let prev = CpuId(prev_cpu as u32);
         // Prefer prev_cpu if it's idle and allowed
         if (prev.0 as usize) < sim.cpus.len() && sim.cpu_is_idle(prev) && allowed(prev.0) {
+            // SAFETY: `is_idle` is a valid pointer provided by the caller.
             unsafe { *is_idle = true };
             debug!(
                 prev_cpu,
@@ -1359,6 +1379,7 @@ pub extern "C" fn scx_bpf_select_cpu_dfl(
             .find(|c| c.is_idle() && c.local_dsq.is_empty() && allowed(c.id.0))
         {
             let cpu_id = cpu.id;
+            // SAFETY: `is_idle` is a valid pointer provided by the caller.
             unsafe { *is_idle = true };
             debug!(
                 prev_cpu,
@@ -1368,6 +1389,7 @@ pub extern "C" fn scx_bpf_select_cpu_dfl(
             );
             return cpu_id.0 as i32;
         }
+        // SAFETY: `is_idle` is a valid pointer provided by the caller.
         unsafe { *is_idle = false };
         // Fall back to prev_cpu if allowed, otherwise first allowed CPU
         let fallback = if allowed(prev.0) {
@@ -1467,6 +1489,7 @@ pub extern "C" fn scx_bpf_dsq_insert(p: *mut c_void, dsq_id: u64, slice: u64, en
     crate::interleave::maybe_yield();
     with_sim(kfunc_cost::MODERATE, |sim| {
         let pid = sim.task_pid_from_raw(p);
+        // SAFETY: `p` is a valid task_struct pointer from the scheduler.
         unsafe { ffi::sim_task_set_slice(p, slice) };
         debug!(pid = pid.0, dsq_id, slice = %FmtN(slice), "enter:kfunc dsq_insert");
 
@@ -1550,6 +1573,9 @@ pub extern "C" fn scx_bpf_dsq_move_to_local(dsq_id: u64) -> bool {
         let cpu_idx = sim.current_cpu.0 as usize;
         // Need to split borrow: extract cpu mutably, pass dsqs mutably
         let cpus_ptr = sim.cpus.as_mut_ptr();
+        // SAFETY: `cpu_idx` is within bounds (validated by the engine).
+        // The split borrow is sound because `cpus_ptr[cpu_idx]` and
+        // `sim.dsqs` are disjoint fields of SimulatorState.
         let cpu = unsafe { &mut *cpus_ptr.add(cpu_idx) };
         let result = sim.dsqs.move_to_local(DsqId(dsq_id), cpu);
         debug!(dsq_id, result, "enter:kfunc dsq_move_to_local");
@@ -1696,6 +1722,9 @@ pub extern "C" fn scx_bpf_error_bstr(fmt: *const i8, _data: *const u64, _data_sz
     let msg = if fmt.is_null() {
         "scheduler error (null fmt)".to_string()
     } else {
+        // SAFETY: `fmt` is non-null. `CStr::from_ptr` reads until the
+        // null terminator. The pointer comes from C scheduler code which
+        // passes a string literal.
         let cstr = unsafe { std::ffi::CStr::from_ptr(fmt) };
         cstr.to_string_lossy().into_owned()
     };
@@ -2032,11 +2061,13 @@ pub extern "C" fn scx_bpf_task_cgroup(p: *mut c_void, _subsys_id: i32) -> *mut c
         return ptr::null_mut();
     }
     // Get the task's cgroup from the C-side task_struct
+    // SAFETY: `p` is a non-null, valid task_struct pointer (checked above).
     let cgrp = unsafe { ffi::sim_task_get_cgroup(p) };
     if !cgrp.is_null() {
         return cgrp;
     }
     // Fallback: return root cgroup (task not assigned to any cgroup)
+    // SAFETY: `sim_get_root_cgroup` returns the statically allocated root.
     unsafe { ffi::sim_get_root_cgroup() }
 }
 
