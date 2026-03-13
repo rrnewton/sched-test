@@ -29,19 +29,16 @@
 //! trace.dump();
 //! ```
 
-// === Modules with unsafe code (remain at crate root) ===
-pub mod backend;
+// === Modules that mix safe/unsafe (remain at crate root for now) ===
 pub mod cgroup;
 pub mod engine;
-pub mod ffi;
-pub mod interleave;
-pub mod kfuncs;
-pub mod preempt;
-pub mod probes;
 pub mod task;
 
 // === Safe modules (zero unsafe) — grouped under safe/ ===
 pub mod safe;
+
+// === Unsafe-heavy modules — grouped under unsafe_impl/ ===
+pub mod unsafe_impl;
 
 // Re-export safe modules at crate root so `crate::types`, `crate::dsq`, etc.
 // continue to resolve for all internal `use crate::xxx` paths.
@@ -59,6 +56,15 @@ pub use safe::stats;
 pub use safe::trace;
 pub use safe::types;
 pub use safe::workloads;
+
+// Re-export unsafe_impl sub-modules at crate root for backward compatibility.
+// All internal `crate::ffi`, `crate::kfuncs`, etc. paths continue to resolve.
+pub use unsafe_impl::backend;
+pub use unsafe_impl::ffi;
+pub use unsafe_impl::interleave;
+pub use unsafe_impl::kfuncs;
+pub use unsafe_impl::preempt;
+pub use unsafe_impl::probes;
 
 // Re-export the main public types for convenience.
 pub use cgroup::{CgroupId, CgroupInfo, CgroupRegistry, DEFAULT_MAX_CGROUPS};

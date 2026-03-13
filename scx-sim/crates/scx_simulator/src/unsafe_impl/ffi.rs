@@ -1,4 +1,13 @@
 //! FFI declarations for scheduler ops and task_struct accessors.
+//!
+//! # Safety
+//!
+//! This module is almost entirely `unsafe` by nature: it declares `extern "C"`
+//! blocks for C functions (`sim_task_*`, scheduler ops), performs `dlopen`/
+//! `dlsym` to load scheduler `.so` files at runtime, and manipulates raw
+//! `*mut c_void` pointers to opaque `task_struct` and `scx_init_task_args`
+//! objects. Callers must ensure that pointers passed to these functions are
+//! valid, non-null, and point to objects of the correct type.
 
 use std::ffi::c_void;
 use std::path::Path;

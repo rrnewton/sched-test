@@ -7,6 +7,15 @@
 //! the generic [`run_preemptive_dispatch`] and [`run_preemptive_batch`]
 //! drivers handle the common worker lifecycle.
 //!
+//! # Safety
+//!
+//! Sub-modules perform `unsafe` operations including: `perf_event_open` and
+//! `ioctl` syscalls for PMU timer setup (`pmu.rs`), `/proc/self/mem` writes
+//! for hardware breakpoint replay (`replay.rs`), binary patching of loaded
+//! `.so` files via e9patch (`e9patch.rs`), and raw `mmap` of shared memory
+//! regions. All backends manipulate raw pointers and file descriptors that
+//! must remain valid for the duration of the interleaving session.
+//!
 //! Thread synchronization is decoupled from preemption instrumentation via
 //! the [`ThreadOrchestrator`] trait, which captures the wait/yield/finish
 //! protocol. Both [`PreemptRing`] (futex-based) and

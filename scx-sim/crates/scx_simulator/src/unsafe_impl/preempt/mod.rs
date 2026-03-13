@@ -5,6 +5,14 @@
 //! number of retired conditional branches; the signal handler parks the worker
 //! via futex and the [`PreemptRing`] passes execution to another worker.
 //!
+//! # Safety
+//!
+//! This module contains extensive `unsafe` code: signal handler registration
+//! (`sigaction`), raw `futex()` syscalls, inline assembly for reading RIP,
+//! atomic operations with `SeqCst` ordering for cross-thread communication,
+//! and raw file-descriptor manipulation for PMU `perf_event_open`. The signal
+//! handler path is constrained to async-signal-safe primitives only.
+//!
 //! ## Determinism
 //!
 //! RBC (Retired Branch Conditionals) counts only *retired* (committed) branches,
