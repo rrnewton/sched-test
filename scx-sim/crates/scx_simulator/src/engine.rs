@@ -1775,7 +1775,15 @@ impl<S: Scheduler> Simulator<S> {
         let interleave_enabled =
             s.sim.interleave || s.sim.preemptive.is_some() || s.sim.native_concurrent.is_some();
 
-        'event_loop: while let Some(t) = s.events.peek_time() {
+        // Drop the outer guard before entering the event loop.
+        // The event loop manages its own guard lifecycle.
+        drop(s);
+        'event_loop: loop {
+            let mut s = sim_arc.lock().unwrap();
+            let t = match s.events.peek_time() {
+                Some(t) => t,
+                None => break,
+            };
             if t > scenario.duration_ns {
                 break;
             }
@@ -1819,15 +1827,17 @@ impl<S: Scheduler> Simulator<S> {
                     s = sim_arc.lock().unwrap();
                     if let Some(err) = check_bpf_error(&mut s.sim, ignore_bpf_errors) {
                         exit_kind = err;
+                        drop(s);
                         break 'event_loop;
                     }
                 }
             }
         }
 
-        // Flush running tasks: emit SimulationEnd for any task still on-CPU
-        // Relock the guard after event loop (may have been dropped during processing).
-        s = sim_arc.lock().unwrap();
+        // Flush running tasks: emit SimulationEnd for any task still on-CPU.
+        // The guard `s` may or may not be held depending on loop exit path.
+        // Shadow `s` with a fresh lock to avoid self-deadlock.
+        let mut s = sim_arc.lock().unwrap();
         for cpu_idx in 0..s.sim.cpus.len() {
             if let Some(pid) = s.sim.cpus[cpu_idx].current_task {
                 s.sim.trace.record(
@@ -2286,6 +2296,7 @@ impl<S: Scheduler> Simulator<S> {
                     self.scheduler.enqueue(raw, 0);
                 });
                 let s = &mut *guard;
+                s.sim.resolve_pending_dispatch(cpu);
             }
         }
 
@@ -2613,30 +2624,29 @@ impl<S: Scheduler> Simulator<S> {
 
         // Call cgroup_init (refresh CSS iterator so the callback can use
         // bpf_for_each(css, ...) with the newly created cgroup included).
-        // TODO(sim_arc): convert this enter_sim/exit_sim block to sim_callback!
-        unsafe {
-            let cpu = s.sim.current_cpu;
-            let raw = s.cgroup_registry.get_raw(cgid).unwrap();
-            kfuncs::enter_sim(&mut s.sim, cpu);
-            unsafe { s.cgroup_registry.prepare_css_iter_from_root() };
-            start_rbc(&mut s.sim);
-            let rc = self.scheduler.cgroup_init(raw, std::ptr::null_mut());
-            charge_sched_time(&mut s.sim, cpu, "cgroup_init");
-            kfuncs::exit_sim();
+        let cpu = s.sim.current_cpu;
+        let raw = s.cgroup_registry.get_raw(cgid).unwrap();
+        unsafe { s.cgroup_registry.prepare_css_iter_from_root() };
+        start_rbc(&mut s.sim);
+        let rc;
+        sim_callback!(s, guard, sim_arc, cpu, {
+            rc = self.scheduler.cgroup_init(raw, std::ptr::null_mut());
+        });
+        let s = &mut *guard;
+        charge_sched_time(&mut s.sim, cpu, "cgroup_init");
 
-            if rc != 0 {
-                info!(
-                    name = %event.name,
-                    rc,
-                    "CGROUP INIT FAILED"
-                );
-                // Scheduler returned an error - treat as exhaustion
-                return Some(ExitKind::ErrorCgroupExhausted {
-                    cgroup_name: event.name.clone(),
-                    active_count: current_count,
-                    max_cgroups,
-                });
-            }
+        if rc != 0 {
+            info!(
+                name = %event.name,
+                rc,
+                "CGROUP INIT FAILED"
+            );
+            // Scheduler returned an error - treat as exhaustion
+            return Some(ExitKind::ErrorCgroupExhausted {
+                cgroup_name: event.name.clone(),
+                active_count: current_count,
+                max_cgroups,
+            });
         }
 
         None
@@ -2807,7 +2817,6 @@ impl<S: Scheduler> Simulator<S> {
         monitor: &mut dyn Monitor,
     ) {
         let mut guard = sim_arc.lock().unwrap();
-        let s = &mut *guard;
         {
             let s = &mut *guard;
             let task = match s.tasks.get_mut(&pid) {
@@ -2899,126 +2908,120 @@ impl<S: Scheduler> Simulator<S> {
         // do_enqueue_task before either select_cpu or enqueue.
         s.sim.set_task_ops_state(pid, OpsTaskState::Queued);
 
-        // TODO(sim_arc): convert this enter_sim/exit_sim block to sim_callback!
-        unsafe {
-            kfuncs::enter_sim(&mut s.sim, wake_cpu);
-            s.sim.pending_dispatch = None;
-            set_ops_context(&mut s.sim, OpsContext::SelectCpu);
-            s.sim.waker_task_raw = waker_raw;
-            start_rbc(&mut s.sim);
+        // select_cpu: release lock, call C, reacquire
+        s.sim.pending_dispatch = None;
+        set_ops_context(&mut s.sim, OpsContext::SelectCpu);
+        s.sim.waker_task_raw = waker_raw;
+        start_rbc(&mut s.sim);
+        let selected_cpu_raw;
+        sim_callback!(s, guard, sim_arc, wake_cpu, {
+            selected_cpu_raw = self.scheduler.select_cpu(raw, prev_cpu.0 as i32, enq_flags);
+        });
+        let s = &mut *guard;
 
-            let selected_cpu_raw = self.scheduler.select_cpu(raw, prev_cpu.0 as i32, enq_flags);
-            // Kernel clamping: if select_cpu returns >= nr_cpu_ids, the
-            // kernel falls back to prev_cpu (select_task_rq_scx semantics).
-            let nr_cpus = s.sim.cpus.len() as u32;
-            let selected_cpu = if (selected_cpu_raw as u32) >= nr_cpus {
-                debug!(
-                    pid = pid.0,
-                    returned = selected_cpu_raw,
-                    nr_cpus,
-                    prev_cpu = prev_cpu.0,
-                    "select_cpu returned out-of-range CPU, falling back to prev_cpu"
-                );
-                prev_cpu
-            } else {
-                CpuId(selected_cpu_raw as u32)
-            };
-            charge_sched_time(&mut s.sim, selected_cpu, "select_cpu");
-            maybe_record_checkpoint(&s.sim, CheckpointEvent::SelectCpu, selected_cpu);
-            s.sim.waker_task_raw = None;
-            s.sim.current_cpu = selected_cpu;
-            // Update task_last_cpu after select_cpu (kernel sets task_cpu
-            // in set_task_cpu after select_task_rq, before enqueue).
-            s.sim.task_last_cpu.insert(pid, selected_cpu);
-            kfuncs::set_sim_clock(
-                s.sim.cpus[selected_cpu.0 as usize].local_clock,
-                Some(selected_cpu),
-            );
+        // Kernel clamping: if select_cpu returns >= nr_cpu_ids, the
+        // kernel falls back to prev_cpu (select_task_rq_scx semantics).
+        let nr_cpus = s.sim.cpus.len() as u32;
+        let selected_cpu = if (selected_cpu_raw as u32) >= nr_cpus {
             debug!(
                 pid = pid.0,
+                returned = selected_cpu_raw,
+                nr_cpus,
                 prev_cpu = prev_cpu.0,
-                selected_cpu = selected_cpu.0,
-                "enter:structop select_cpu"
+                "select_cpu returned out-of-range CPU, falling back to prev_cpu"
             );
+            prev_cpu
+        } else {
+            CpuId(selected_cpu_raw as u32)
+        };
+        charge_sched_time(&mut s.sim, selected_cpu, "select_cpu");
+        maybe_record_checkpoint(&s.sim, CheckpointEvent::SelectCpu, selected_cpu);
+        s.sim.waker_task_raw = None;
+        s.sim.current_cpu = selected_cpu;
+        // Update task_last_cpu after select_cpu (kernel sets task_cpu
+        // in set_task_cpu after select_task_rq, before enqueue).
+        s.sim.task_last_cpu.insert(pid, selected_cpu);
+        kfuncs::set_sim_clock(
+            s.sim.cpus[selected_cpu.0 as usize].local_clock,
+            Some(selected_cpu),
+        );
+        debug!(
+            pid = pid.0,
+            prev_cpu = prev_cpu.0,
+            selected_cpu = selected_cpu.0,
+            "enter:structop select_cpu"
+        );
 
-            // Resolve deferred dispatch: SCX_DSQ_LOCAL -> selected_cpu
-            // (kernel semantics: LOCAL resolves to the CPU select_cpu returned)
-            let direct_dispatched = s.sim.resolve_pending_dispatch(selected_cpu);
-            kfuncs::exit_sim();
+        // Resolve deferred dispatch: SCX_DSQ_LOCAL -> selected_cpu
+        // (kernel semantics: LOCAL resolves to the CPU select_cpu returned)
+        let direct_dispatched = s.sim.resolve_pending_dispatch(selected_cpu);
+
+        s.sim.trace.record(
+            s.sim.clock,
+            wake_cpu,
+            TraceKind::SelectTaskRq {
+                pid,
+                prev_cpu,
+                selected_cpu,
+            },
+        );
+
+        let task = s.tasks.get_mut(&pid).unwrap();
+        task.prev_cpu = selected_cpu;
+
+        if let Some(dd_cpu) = direct_dispatched {
+            // Task was directly dispatched — skip enqueue (kernel semantics)
+            s.sim.current_cpu = dd_cpu;
+            kfuncs::set_sim_clock(s.sim.cpus[dd_cpu.0 as usize].local_clock, Some(dd_cpu));
+            debug!(pid = pid.0, target_cpu = dd_cpu.0, "direct dispatch");
+            drop(guard);
+            self.try_dispatch_and_run(dd_cpu, sim_arc, monitor);
+        } else {
+            // Task was not directly dispatched; call enqueue
+            debug!(pid = pid.0, enq_flags, "enter:structop enqueue");
+            sim_callback!(s, guard, sim_arc, selected_cpu, {
+                self.scheduler.enqueue(raw, enq_flags);
+            });
+            let s = &mut *guard;
+            s.sim.resolve_pending_dispatch(selected_cpu);
 
             s.sim.trace.record(
                 s.sim.clock,
-                wake_cpu,
-                TraceKind::SelectTaskRq {
+                selected_cpu,
+                TraceKind::EnqueueTask {
                     pid,
-                    prev_cpu,
-                    selected_cpu,
+                    enq_flags: SCX_ENQ_WAKEUP,
                 },
             );
 
-            let task = s.tasks.get_mut(&pid).unwrap();
-            task.prev_cpu = selected_cpu;
+            // Try to dispatch on idle CPUs
+            let idle_cpus: Vec<CpuId> = s
+                .sim
+                .cpus
+                .iter()
+                .filter(|c| c.is_idle())
+                .map(|c| c.id)
+                .collect();
 
-            if let Some(dd_cpu) = direct_dispatched {
-                // Task was directly dispatched — skip enqueue (kernel semantics)
-                s.sim.current_cpu = dd_cpu;
-                kfuncs::set_sim_clock(s.sim.cpus[dd_cpu.0 as usize].local_clock, Some(dd_cpu));
-                debug!(pid = pid.0, target_cpu = dd_cpu.0, "direct dispatch");
+            // Guard: suppress nested dispatch_concurrent when already
+            // inside a concurrent batch (process_batch_concurrent).
+            let use_concurrent = (s.sim.interleave
+                || s.sim.preemptive.is_some()
+                || s.sim.native_concurrent.is_some())
+                && idle_cpus.len() >= 2;
+
+            if use_concurrent {
                 drop(guard);
-                self.try_dispatch_and_run(dd_cpu, sim_arc, monitor);
-                guard = sim_arc.lock().unwrap();
+                self.dispatch_concurrent(&idle_cpus, sim_arc, monitor);
             } else {
-                // Task was not directly dispatched; call enqueue
-                kfuncs::enter_sim(&mut s.sim, selected_cpu);
-                debug!(pid = pid.0, enq_flags, "enter:structop enqueue");
-                self.scheduler.enqueue(raw, enq_flags);
-                kfuncs::exit_sim();
-
-                s.sim.trace.record(
-                    s.sim.clock,
-                    selected_cpu,
-                    TraceKind::EnqueueTask {
-                        pid,
-                        enq_flags: SCX_ENQ_WAKEUP,
-                    },
-                );
-
-                // Try to dispatch on idle CPUs
-                let idle_cpus: Vec<CpuId> = s
-                    .sim
-                    .cpus
-                    .iter()
-                    .filter(|c| c.is_idle())
-                    .map(|c| c.id)
-                    .collect();
-
-                // Guard: suppress nested dispatch_concurrent when already
-                // inside a concurrent batch (process_batch_concurrent).
-                // Worker threads reach here via process_event -> handle_task_wake.
-                // Spawning nested concurrent threads would deadlock the token
-                // ring and corrupt shared state. Removable once the engine uses
-                // dynamic window batching (Phase 3) that eliminates re-entrant
-                // concurrent dispatch entirely.
-                if (s.sim.interleave
-                    || s.sim.preemptive.is_some()
-                    || s.sim.native_concurrent.is_some())
-                    && idle_cpus.len() >= 2
-                {
+                for cpu in idle_cpus {
                     drop(guard);
-                    self.dispatch_concurrent(&idle_cpus, sim_arc, monitor);
+                    self.try_dispatch_and_run(cpu, sim_arc, monitor);
                     guard = sim_arc.lock().unwrap();
-                } else {
-                    for cpu in idle_cpus {
-                        drop(guard);
-                        self.try_dispatch_and_run(cpu, sim_arc, monitor);
-                        guard = sim_arc.lock().unwrap();
-                    }
                 }
             }
         }
     }
-
-    /// Handle a task's time slice expiring.
     fn handle_slice_expired(&self, cpu: CpuId, sim_arc: &SimArc, monitor: &mut dyn Monitor) {
         let mut guard = sim_arc.lock().unwrap();
         let s = &mut *guard;
@@ -3046,9 +3049,8 @@ impl<S: Scheduler> Simulator<S> {
         let slice = task.get_slice();
         task.run_remaining_ns = task.run_remaining_ns.saturating_sub(slice);
 
-        let task_name = task.name.as_str();
         info!(
-            task = task_name,
+            task = task.name.as_str(),
             pid = pid.0,
             ran_ns = %FmtN(slice),
             "PREEMPTED"
@@ -3057,6 +3059,9 @@ impl<S: Scheduler> Simulator<S> {
         // Stop the task - entire slice was consumed
         let raw = task.raw();
         task.state = TaskState::Runnable;
+
+        // Drop guard before calling stop_and_reenqueue (which locks internally)
+        drop(guard);
 
         // Shared stop -> re-enqueue -> dispatch spine. The PutPrevTask and
         // EnqueueTask trace records are specific to the slice-expired path
@@ -3191,25 +3196,28 @@ impl<S: Scheduler> Simulator<S> {
         if !still_runnable {
             // Kernel clears SCX_TASK_QUEUED when a task goes to sleep.
             s.sim.clear_task_queued(pid);
-            // TODO(sim_arc): convert this enter_sim/exit_sim block to sim_callback!
-            unsafe {
-                kfuncs::enter_sim(&mut s.sim, cpu);
-                let ops_state = s.sim.task_ops_state.get(&pid).copied().unwrap_or_default();
-                if ops_state == OpsTaskState::Queued {
-                    set_ops_context(&mut s.sim, OpsContext::Dequeue);
-                    debug!(pid = pid.0, "enter:structop dequeue");
-                    start_rbc(&mut s.sim);
-                    self.scheduler.dequeue(raw, SCX_DEQ_SLEEP);
-                    charge_sched_time(&mut s.sim, cpu, "dequeue");
-                    s.sim.set_task_ops_state(pid, OpsTaskState::None);
-                }
-                set_ops_context(&mut s.sim, OpsContext::Quiescent);
-                debug!(pid = pid.0, "enter:structop quiescent");
+            let ops_state = s.sim.task_ops_state.get(&pid).copied().unwrap_or_default();
+            if ops_state == OpsTaskState::Queued {
+                set_ops_context(&mut s.sim, OpsContext::Dequeue);
+                debug!(pid = pid.0, "enter:structop dequeue");
                 start_rbc(&mut s.sim);
-                self.scheduler.quiescent(raw, SCX_DEQ_SLEEP);
-                charge_sched_time(&mut s.sim, cpu, "quiescent");
-                kfuncs::exit_sim();
+                sim_callback!(s, guard, sim_arc, cpu, {
+                    self.scheduler.dequeue(raw, SCX_DEQ_SLEEP);
+                });
+                let s = &mut *guard;
+                charge_sched_time(&mut s.sim, cpu, "dequeue");
+                s.sim.set_task_ops_state(pid, OpsTaskState::None);
             }
+            // Rebind after potential sim_callback! in the if block
+            let s = &mut *guard;
+            set_ops_context(&mut s.sim, OpsContext::Quiescent);
+            debug!(pid = pid.0, "enter:structop quiescent");
+            start_rbc(&mut s.sim);
+            sim_callback!(s, guard, sim_arc, cpu, {
+                self.scheduler.quiescent(raw, SCX_DEQ_SLEEP);
+            });
+            let s = &mut *guard;
+            charge_sched_time(&mut s.sim, cpu, "quiescent");
 
             // Monitor: Quiescent probe
             monitor.sample(&ProbeContext {
@@ -3222,6 +3230,7 @@ impl<S: Scheduler> Simulator<S> {
             });
         }
 
+        let s = &mut *guard;
         let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
         s.sim.trace.record(
             __local_t,
@@ -3283,6 +3292,7 @@ impl<S: Scheduler> Simulator<S> {
                         self.scheduler.enqueue(raw, 0);
                     });
                     let s = &mut *guard;
+                    s.sim.resolve_pending_dispatch(cpu);
 
                     let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
         s.sim.trace.record(
@@ -3356,6 +3366,7 @@ impl<S: Scheduler> Simulator<S> {
                                         self.scheduler.enqueue(raw, 0);
                                     });
                                     let s = &mut *guard;
+                                    s.sim.resolve_pending_dispatch(cpu);
                                     let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
         s.sim.trace.record(
             __local_t,
@@ -3656,7 +3667,7 @@ impl<S: Scheduler> Simulator<S> {
                 let backend = E9PatchBackend {
                     timeslice_min: preemptive_cfg.timeslice_min,
                     timeslice_max: preemptive_cfg.timeslice_max,
-                    fns: e9_fns.expect("e9_fns must be resolved"),
+                    fns: s.sim.e9_fns.expect("e9_fns must be resolved"),
                 };
                 crate::backend::run_preemptive_dispatch(
                     &dispatch_cpus,
@@ -3980,7 +3991,6 @@ impl<S: Scheduler> Simulator<S> {
         monitor: &mut dyn Monitor,
     ) {
         let mut guard = sim_arc.lock().unwrap();
-        let s = &mut *guard;
         let mut cpu_ids: Vec<CpuId> = per_cpu.keys().copied().collect();
         cpu_ids.sort(); // deterministic worker-to-CPU assignment
         let nr_workers = cpu_ids.len();
@@ -4001,7 +4011,6 @@ impl<S: Scheduler> Simulator<S> {
                 );
                 guard = sim_arc.lock().unwrap();
             }
-            let s = &mut *guard;
             return;
         }
 
@@ -4009,27 +4018,26 @@ impl<S: Scheduler> Simulator<S> {
         // (which access state via raw pointers) don't touch a PMU fd bound
         // to the main thread. Workers have their own per-thread measurement
         // counters. Restored after the concurrent block returns.
-        let main_rbc_counter = s.sim.rbc_counter.take();
+        let main_rbc_counter = guard.sim.rbc_counter.take();
 
         // Advance each CPU's clock before spawning.
         for &cpu in &cpu_ids {
-            s.sim.advance_cpu_clock(cpu);
+            guard.sim.advance_cpu_clock(cpu);
         }
 
-        let interleave_seed = s.sim.next_prng();
+        let interleave_seed = guard.sim.next_prng();
 
         // SAFETY: token passing ensures only one thread accesses shared
         // state at a time. Raw pointers avoid Send/Sync bounds on types
         // that are effectively single-threaded under the token.
         let sim_send = SendPtr(self as *const Simulator<S> as *mut Simulator<S>);
-        let state_send = SendPtr(&mut s.sim as *mut SimulatorState);
+        let state_send = SendPtr(&mut guard.sim as *mut SimulatorState);
 
         // Save conditions before dropping guard (workers lock sim_arc internally)
-        let is_native = s.sim.native_concurrent.is_some();
-        let preemptive_cfg = s.sim.preemptive.clone();
-        let replay_backend_present = s.sim.replay_backend.is_some();
-        let e9_fns = s.sim.e9_fns;
-        drop(s);
+        let is_native = guard.sim.native_concurrent.is_some();
+        let preemptive_cfg = guard.sim.preemptive.clone();
+        let replay_backend_present = guard.sim.replay_backend.is_some();
+        let e9_fns = guard.sim.e9_fns;
         drop(guard);
 
         if is_native {
@@ -4441,6 +4449,9 @@ impl<S: Scheduler> Simulator<S> {
             self.scheduler.enqueue(raw, 0);
         });
         let s = &mut *guard;
+
+        // Resolve deferred dispatch from enqueue callback
+        s.sim.resolve_pending_dispatch(cpu);
 
         // Caller-specific traces after enqueue
         post_enqueue(&mut s.sim, cpu, pid);
