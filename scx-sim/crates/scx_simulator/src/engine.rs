@@ -1039,17 +1039,11 @@ fn maybe_record_checkpoint(state: &SimulatorState, event: CheckpointEvent, cpu: 
 ///
 /// Sets up CPU context, calls `scheduler.dispatch()`, and resolves deferred
 /// dispatch. Caller must have already entered sim and acquired the token.
-///
-/// # Safety
-///
-/// `sp` must point to a valid `SimulatorState` and `schp` to a valid scheduler.
-/// Must be called inside an `enter_sim` / `exit_sim` scope.
-pub(crate) unsafe fn dispatch_worker_body<S: Scheduler>(
-    sp: *mut SimulatorState,
-    schp: *const S,
+pub(crate) fn dispatch_worker_body<S: Scheduler>(
+    sim: &mut SimulatorState,
+    scheduler: &S,
     cpu: CpuId,
 ) {
-    let sim = &mut *sp;
     sim.current_cpu = cpu;
     set_ops_context(sim, OpsContext::Dispatch);
 
@@ -1058,7 +1052,10 @@ pub(crate) unsafe fn dispatch_worker_body<S: Scheduler>(
         .and_then(|pid| sim.task_pid_to_raw.get(&pid).copied())
         .map_or(std::ptr::null_mut(), |raw| raw as *mut c_void);
 
-    (*schp).dispatch(cpu.0 as i32, prev_raw);
+    // SAFETY: `scheduler` is a valid reference to a `Scheduler`. The
+    // `prev_raw` pointer is either null or a valid task_struct pointer from
+    // `task_pid_to_raw`. The FFI dispatch callback requires these invariants.
+    unsafe { scheduler.dispatch(cpu.0 as i32, prev_raw) };
     sim.resolve_pending_dispatch(cpu);
 }
 
@@ -1066,13 +1063,8 @@ pub(crate) unsafe fn dispatch_worker_body<S: Scheduler>(
 /// concurrent batch processing paths.
 ///
 /// Processes all events for a single CPU sequentially.
-///
-/// # Safety
-///
-/// `sim_state` must point to valid, exclusively-accessible data.
-/// Must be called inside an `enter_sim` / `exit_sim` scope.
-pub(crate) unsafe fn batch_worker_body<S: Scheduler>(
-    simp: *const Simulator<S>,
+pub(crate) fn batch_worker_body<S: Scheduler>(
+    sim: &Simulator<S>,
     sim_arc: &SimArc,
     cpu_events: Vec<Event>,
     watchdog_timeout: Option<TimeNs>,
@@ -1080,7 +1072,7 @@ pub(crate) unsafe fn batch_worker_body<S: Scheduler>(
     max_cgroups: u32,
 ) {
     for event in cpu_events {
-        (*simp).process_event(
+        sim.process_event(
             event,
             sim_arc,
             watchdog_timeout,
