@@ -2619,6 +2619,20 @@ pub unsafe fn e9_shared_rbc() -> *mut E9SharedRbc {
     E9_SHARED_ADDR as *mut E9SharedRbc
 }
 
+/// Read the current e9patch software branch counter value.
+///
+/// Returns the counter value from the shared mmap'd page. The counter
+/// is decremented on each Jcc in the instrumented `.so`, so
+/// `snapshot - current = branches executed`.
+///
+/// Panics if the shared page has not been mmap'd (e9_shared_rbc is null).
+pub fn e9_read_counter() -> i64 {
+    // SAFETY: When e9patch mode is active, mmap_shared_rbc() has already
+    // been called, making E9_SHARED_ADDR a valid pointer. The single-writer
+    // access model (token ring) ensures no concurrent mutation.
+    unsafe { (*e9_shared_rbc()).counter }
+}
+
 /// Map the shared RBC state page at the fixed address.
 ///
 /// Returns the pointer on success, or panics if the mmap fails.

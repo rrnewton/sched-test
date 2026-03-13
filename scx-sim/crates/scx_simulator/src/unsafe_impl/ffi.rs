@@ -113,6 +113,155 @@ extern "C" {
 }
 
 // ---------------------------------------------------------------------------
+// Safe wrappers for global-state FFI functions
+// ---------------------------------------------------------------------------
+//
+// These wrap the raw `extern "C"` functions above so that engine.rs (and
+// other safe modules) can call them without `unsafe` blocks. The safety
+// invariants are documented once here rather than at every call site.
+//
+// The functions that accept raw `*mut c_void` parameters suppress the
+// `clippy::not_unsafe_ptr_arg_deref` lint because they are *intentionally*
+// safe wrappers: the `unsafe` block is encapsulated inside, and the engine
+// guarantees that all raw pointers passed to these functions point to valid,
+// live C structs (allocated via `sim_task_alloc` / `sim_cgroup_alloc`).
+
+/// Reset global task-struct layout tables (lazy-init flags, etc.).
+///
+/// Must be called before each simulation run for deterministic behavior.
+/// Safe because it only resets global statics in the linked C code.
+pub fn reset_task_state() {
+    // SAFETY: Resets global static variables in sim_task.c.
+    // No pointers involved — just zeroing flags and tables.
+    unsafe {
+        sim_task_reset();
+        sim_sdt_reset();
+    }
+}
+
+/// Mark a CPU present in the all-CPUs cpumask.
+pub fn cpumask_set_all(cpu: i32) {
+    // SAFETY: Sets a bit in a global cpumask. The CPU index is
+    // validated by the C code (no out-of-bounds if within NR_CPUS).
+    unsafe { scx_test_set_all_cpumask(cpu) }
+}
+
+/// Mark a CPU as idle in the C idle cpumask.
+pub fn cpumask_set_idle(cpu: i32) {
+    // SAFETY: Sets a bit in a global cpumask.
+    unsafe { scx_test_set_idle_cpumask(cpu) }
+}
+
+/// Mark a CPU as idle in the SMT-level idle cpumask.
+pub fn cpumask_set_idle_smt(cpu: i32) {
+    // SAFETY: Sets a bit in a global cpumask.
+    unsafe { scx_test_set_idle_smtmask(cpu) }
+}
+
+/// Test and clear a CPU's idle bit. Returns true if the CPU was idle.
+pub fn test_and_clear_cpu_idle(cpu: i32) -> bool {
+    // SAFETY: Atomically tests and clears a bit in a global cpumask.
+    unsafe { scx_bpf_test_and_clear_cpu_idle(cpu) }
+}
+
+/// Allocate a new idle task (PF_IDLE=0x2, mm=NULL).
+///
+/// Returns a raw pointer that must eventually be freed with
+/// [`free_task_raw`].
+pub fn alloc_idle_task() -> *mut c_void {
+    // SAFETY: sim_task_alloc returns a heap-allocated, zeroed task_struct.
+    // sim_task_set_flags sets a u32 field on the struct.
+    unsafe {
+        let p = sim_task_alloc();
+        assert!(!p.is_null(), "sim_task_alloc returned null");
+        sim_task_set_flags(p, 0x2); // PF_IDLE
+        p
+    }
+}
+
+/// Free a raw task_struct pointer.
+///
+/// # Safety
+/// `p` must have been obtained from `sim_task_alloc` and not yet freed.
+pub unsafe fn free_task_raw(p: *mut c_void) {
+    sim_task_free(p);
+}
+
+/// Get a task's time slice from the raw C struct.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn task_get_slice(raw: *mut c_void) -> u64 {
+    // SAFETY: The caller guarantees `raw` is a valid task_struct pointer.
+    unsafe { sim_task_get_slice(raw) }
+}
+
+/// Set a task's time slice on the raw C struct.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn task_set_slice(raw: *mut c_void, slice: u64) {
+    // SAFETY: The caller guarantees `raw` is a valid task_struct pointer.
+    unsafe { sim_task_set_slice(raw, slice) }
+}
+
+/// Set `p->se.sum_exec_runtime` on a raw task_struct.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn task_set_sum_exec_runtime(raw: *mut c_void, ns: u64) {
+    // SAFETY: The caller guarantees `raw` is a valid task_struct pointer.
+    unsafe { sim_task_set_sum_exec_runtime(raw, ns) }
+}
+
+/// Get `p->se.sum_exec_runtime` from a raw task_struct.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn task_get_sum_exec_runtime(raw: *mut c_void) -> u64 {
+    // SAFETY: The caller guarantees `raw` is a valid task_struct pointer.
+    unsafe { sim_task_get_sum_exec_runtime(raw) }
+}
+
+/// Set the `mm` pointer on a raw task_struct.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn task_set_mm(raw: *mut c_void, mm: *mut c_void) {
+    // SAFETY: The caller guarantees `raw` is a valid task_struct pointer.
+    // `mm` may be null (kernel threads).
+    unsafe { sim_task_set_mm(raw, mm) }
+}
+
+/// Set the `real_parent` pointer on a raw task_struct.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn task_set_real_parent(child: *mut c_void, parent: *mut c_void) {
+    // SAFETY: Both pointers must be valid task_struct pointers.
+    unsafe { sim_task_set_real_parent(child, parent) }
+}
+
+/// Set the cgroup pointer on a raw task_struct.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn task_set_cgroup(raw: *mut c_void, cgrp: *mut c_void) {
+    // SAFETY: `raw` must be a valid task_struct, `cgrp` a valid cgroup.
+    unsafe { sim_task_set_cgroup(raw, cgrp) }
+}
+
+/// Get the cpus_ptr (cpumask) from a raw task_struct.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn task_get_cpus_ptr(raw: *mut c_void) -> *const c_void {
+    // SAFETY: The caller guarantees `raw` is a valid task_struct pointer.
+    unsafe { sim_task_get_cpus_ptr(raw) }
+}
+
+/// Set up cpumask pointer, clear it, set individual CPUs, and set
+/// nr_cpus_allowed on a raw task_struct.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn task_setup_cpumask(raw: *mut c_void, allowed_cpus: Option<&[crate::types::CpuId]>) {
+    // SAFETY: `raw` is a valid task_struct pointer.
+    unsafe {
+        sim_task_setup_cpus_ptr(raw);
+        if let Some(cpus) = allowed_cpus {
+            sim_task_clear_cpumask(raw);
+            for cpu in cpus {
+                sim_task_set_cpumask_cpu(raw, cpu.0 as i32);
+            }
+            sim_task_set_nr_cpus_allowed(raw, cpus.len() as i32);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Scheduler trait
 // ---------------------------------------------------------------------------
 
