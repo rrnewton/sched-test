@@ -4,6 +4,13 @@
 //! and wraps them for safe(r) access. [`LavdMonitor`] implements the
 //! [`Monitor`](crate::monitor::Monitor) trait to sample LAVD state at
 //! each scheduling event.
+//!
+//! # Safety
+//!
+//! This module resolves C function pointers via `dlsym` at runtime and
+//! calls them through `unsafe extern "C" fn` types. The resolved pointers
+//! are valid only for the lifetime of the loaded scheduler `.so`. Callers
+//! must ensure the scheduler remains loaded while [`LavdProbes`] is in use.
 
 use std::ffi::c_void;
 
