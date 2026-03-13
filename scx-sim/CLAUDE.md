@@ -91,6 +91,10 @@ File issues for bugs, TODOs, and feature work rather than leaving stale TODO
 comments in code. Reference issue IDs (e.g. sim-1) in commit messages when
 closing issues.
 
+NEVER edit .beads/ files directly. Always use the mb CLI to create,
+  update, and close issues. Direct edits produce corrupt issue files
+  (wrong filename format, missing metadata) that break the tracker.
+
 Performance Benchmarks
 ========================================
 

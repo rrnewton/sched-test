@@ -6,11 +6,13 @@ issue_type: epic
 labels:
 - safety
 - refactor
-created_at: 2026-03-13T10:42:00.000000000+00:00
-updated_at: 2026-03-13T10:42:00.000000000+00:00
+created_at: 2026-03-13T17:58:05.872847892+00:00
+updated_at: 2026-03-13T17:58:05.872847892+00:00
 ---
 
 # Description
+
+## Description
 
 Establish a clear architectural boundary between safe simulation logic and
 unsafe FFI/hardware code in the scx_simulator crate.
