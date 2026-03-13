@@ -35,8 +35,9 @@ pub struct CgroupInfo {
     raw: *mut c_void,
 }
 
-// Safety: CgroupInfo holds a raw pointer to a heap-allocated C struct.
-// The pointer is only accessed within the simulator (single-threaded).
+// SAFETY: CgroupInfo holds a raw pointer to a heap-allocated C struct.
+// The pointer is only accessed within the simulator's single-threaded
+// execution model (enforced by the Arc<Mutex> / token-ring protocol).
 unsafe impl Send for CgroupInfo {}
 unsafe impl Sync for CgroupInfo {}
 
@@ -94,6 +95,8 @@ impl CgroupRegistry {
     ///   Use `DEFAULT_MAX_CGROUPS` (10000) for normal tests, or a lower value
     ///   (e.g., 50) to test resource exhaustion scenarios.
     pub fn new(nr_cpus: u32, max_cgroups: u32) -> Self {
+        // SAFETY: `sim_get_root_cgroup` returns a pointer to a statically
+        // allocated root cgroup in sim_task.c. Always valid.
         let root_raw = unsafe { sim_get_root_cgroup() };
         let root = CgroupInfo {
             cgid: CgroupId::ROOT,
@@ -198,13 +201,16 @@ impl CgroupRegistry {
         let level = parent.level + 1;
         let parent_raw = parent.raw;
 
-        // Allocate the C struct cgroup
+        // SAFETY: `sim_cgroup_alloc` allocates a C `struct cgroup` on the
+        // heap. `parent_raw` is a valid cgroup pointer from the registry.
         let raw = unsafe { sim_cgroup_alloc(cgid.0, level, parent_raw) };
         assert!(!raw.is_null(), "sim_cgroup_alloc returned null");
 
         // Set cpuset if specified
         if let Some(ref cpus) = cpuset {
             let cpu_ids: Vec<u32> = cpus.iter().map(|c| c.0).collect();
+            // SAFETY: `raw` was just allocated and verified non-null.
+            // `cpu_ids.as_ptr()` is valid for `cpu_ids.len()` elements.
             unsafe {
                 sim_cgroup_set_cpuset(raw, cpu_ids.as_ptr(), cpu_ids.len() as u32);
             }
@@ -311,6 +317,8 @@ impl CgroupRegistry {
         if let Some(info) = self.cgroups.get_mut(&cgid) {
             // Update C-side
             let cpu_ids: Vec<u32> = new_cpuset.iter().map(|c| c.0).collect();
+            // SAFETY: `info.raw` is a valid cgroup pointer from the registry.
+            // `cpu_ids.as_ptr()` is valid for `cpu_ids.len()` elements.
             unsafe {
                 sim_cgroup_set_cpuset(info.raw, cpu_ids.as_ptr(), cpu_ids.len() as u32);
             }
@@ -360,6 +368,8 @@ impl Drop for CgroupRegistry {
         // Free all non-root cgroups (root is statically allocated in sim_task.c)
         for (cgid, info) in self.cgroups.iter() {
             if *cgid != CgroupId::ROOT && !info.raw.is_null() {
+                // SAFETY: `info.raw` was allocated by `sim_cgroup_alloc` and
+                // is freed exactly once here during registry teardown.
                 unsafe { sim_cgroup_free(info.raw) };
             }
         }
@@ -388,6 +398,9 @@ fn with_cgroup_registry<R>(f: impl FnOnce(&CgroupRegistry) -> R) -> Option<R> {
     // Try raw pointer path first (engine holds the guard)
     if crate::kfuncs::sim_state_is_bundled() {
         if let Some(sim_ptr) = crate::kfuncs::sim_state_ptr() {
+            // SAFETY: `sim_ptr` is a valid pointer to a SimState installed by
+            // `enter_sim`. The engine holds the MutexGuard, ensuring exclusive
+            // access. We only take an immutable reference.
             let sim_state = unsafe { &*(sim_ptr as *mut SimState) };
             return Some(f(&sim_state.cgroup_registry));
         }
@@ -402,6 +415,10 @@ fn with_cgroup_registry<R>(f: impl FnOnce(&CgroupRegistry) -> R) -> Option<R> {
 fn with_cgroup_registry_mut<R>(f: impl FnOnce(&mut CgroupRegistry) -> R) -> Option<R> {
     if crate::kfuncs::sim_state_is_bundled() {
         if let Some(sim_ptr) = crate::kfuncs::sim_state_ptr() {
+            // SAFETY: `sim_ptr` is a valid pointer to a SimState installed by
+            // `enter_sim`. The engine holds the MutexGuard, ensuring exclusive
+            // access. We take a mutable reference which is sound because
+            // the single-threaded token protocol prevents aliasing.
             let sim_state = unsafe { &mut *(sim_ptr as *mut SimState) };
             return Some(f(&mut sim_state.cgroup_registry));
         }
@@ -422,6 +439,7 @@ pub extern "C" fn sim_cgroup_lookup_by_id(cgid: u64) -> *mut c_void {
             .map(|info| info.raw)
             .unwrap_or_else(ptr::null_mut)
     })
+    // SAFETY: `sim_get_root_cgroup` returns the statically allocated root cgroup.
     .unwrap_or_else(|| unsafe { sim_get_root_cgroup() })
 }
 
@@ -432,6 +450,7 @@ pub extern "C" fn sim_cgroup_lookup_by_id(cgid: u64) -> *mut c_void {
 pub extern "C" fn sim_cgroup_lookup_ancestor(cgrp: *mut c_void, level: u32) -> *mut c_void {
     if cgrp.is_null() {
         if level == 0 {
+            // SAFETY: `sim_get_root_cgroup` returns the statically allocated root.
             return unsafe { sim_get_root_cgroup() };
         }
         return ptr::null_mut();
