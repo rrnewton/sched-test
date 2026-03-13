@@ -15,7 +15,7 @@ use tracing::{debug, info, trace, warn};
 use crate::backend::e9patch::E9PatchBackend;
 use crate::backend::pmu::PmuBackend;
 use crate::backend::replay::ReplayBackend;
-use crate::backend::{PreemptionBackend, SendPtr, StructopDelta};
+use crate::backend::{PreemptionBackend, SendPtr};
 use crate::cgroup::{CgroupId, CgroupRegistry};
 use crate::cpu::{IrqContext, LastStopReason, SimCpu};
 use crate::dsq::DsqManager;
@@ -32,6 +32,7 @@ use crate::scenario::{
 };
 use crate::scheduler_wrapper::{OptionalPtr, SchedulerWrapper, TaskPtr};
 use crate::task::{OpsTaskState, Phase, SimTask, TaskState};
+use crate::task_wrapper::SimTaskHandle;
 use crate::trace::{DsqSampleTrigger, Trace, TraceKind};
 use crate::types::{CpuId, DsqId, KickFlags, Pid, TimeNs};
 
@@ -1250,7 +1251,9 @@ impl<S: Scheduler> Simulator<S> {
         // Allocate a synthetic idle task for bpf_get_current_task_btf() fallback.
         // In the kernel, there's always a task running (idle task on idle CPUs).
         // PF_IDLE = 0x2, mm = NULL (calloc-zeroed).
-        let idle_task_raw = ffi::alloc_idle_task();
+        // The RAII handle owns the C allocation; Drop frees it automatically.
+        let idle_task_handle = SimTaskHandle::new_idle();
+        let idle_task_raw = idle_task_handle.as_raw();
 
         for def in &scenario.tasks {
             let task = SimTask::new(def, nr_cpus);
@@ -1908,10 +1911,9 @@ impl<S: Scheduler> Simulator<S> {
 
         // (Cgroup registry is now part of SimState, no separate cleanup needed.)
 
-        // Free the synthetic idle task
-        // SAFETY: idle_task_raw was allocated via ffi::alloc_idle_task()
-        // and is only freed here, exactly once.
-        unsafe { ffi::free_task_raw(idle_task_raw) };
+        // The synthetic idle task is freed automatically when `idle_task_handle`
+        // goes out of scope (RAII Drop). No manual unsafe free needed.
+        drop(idle_task_handle);
 
         // Set the exit kind on the trace
         s.sim.trace.set_exit_kind(exit_kind);
@@ -3737,57 +3739,7 @@ impl<S: Scheduler> Simulator<S> {
         sched_send: &SendPtr<S>,
         seed: u32,
     ) {
-        use crate::interleave::{self, TokenRing, WorkerId};
-
-        let ring = TokenRing::new(dispatch_cpus.len(), seed);
-
-        std::thread::scope(|s| {
-            let ring_ref = &ring;
-            // Capture &SendPtr (which is Send+Sync) rather than raw
-            // pointers (which are !Send).
-            let state_ref = state_send;
-            let sched_ref = sched_send;
-
-            for (i, &cpu) in dispatch_cpus.iter().enumerate() {
-                let worker_id = WorkerId(i);
-
-                s.spawn(move || {
-                    let sp = state_ref.0;
-                    let schp = sched_ref.0 as *const S;
-
-                    interleave::install(ring_ref, worker_id);
-
-                    ring_ref.wait_for_token(worker_id);
-
-                    // Enter sim AFTER acquiring the token to avoid racing on
-                    // SimulatorState.current_cpu with other workers.
-                    // SAFETY: token passing ensures exclusive access to `sp`.
-                    // `sp` is valid for the lifetime of the scope.
-                    unsafe { kfuncs::enter_sim(&mut *sp, cpu) };
-
-                    // SAFETY: `sp` and `schp` are valid pointers; exclusive
-                    // access is ensured by the token ring protocol.
-                    unsafe {
-                        debug!(cpu = cpu.0, "enter:structop dispatch (concurrent)");
-                        dispatch_worker_body(sp, schp, cpu);
-                    }
-
-                    // Drain per-worker interleave count into structop accumulator.
-                    let delta = StructopDelta {
-                        rbc_total: 0,
-                        interleave_count: crate::preempt::structop_info().interleave_count,
-                    };
-                    // SAFETY: token held; exclusive access to `sp`.
-                    unsafe { crate::backend::drain_structop_accum(sp, cpu, &delta) };
-                    // SAFETY: token held; clears ops_context before releasing.
-                    unsafe { crate::backend::clear_ops_and_finish(sp, ring_ref, worker_id) };
-                    interleave::uninstall();
-                });
-            }
-
-            ring.start();
-            ring.wait_all_done();
-        });
+        crate::backend::run_cooperative_dispatch(dispatch_cpus, state_send, sched_send, seed);
     }
 
     /// Process events using the dynamic concurrency window.
@@ -4144,64 +4096,17 @@ impl<S: Scheduler> Simulator<S> {
         duration_ns: TimeNs,
         max_cgroups: u32,
     ) {
-        use crate::interleave::{self, TokenRing, WorkerId};
-
-        let ring = TokenRing::new(cpu_ids.len(), seed);
-
-        std::thread::scope(|s| {
-            let ring_ref = &ring;
-            let sim_ref = sim_send;
-            let state_ref = state_send;
-            let arc_ref = sim_arc;
-            let per_cpu_ref = &per_cpu;
-
-            for (i, &cpu) in cpu_ids.iter().enumerate() {
-                let worker_id = WorkerId(i);
-                let cpu_events = per_cpu_ref.get(&cpu).cloned().unwrap_or_default();
-
-                s.spawn(move || {
-                    let simp = sim_ref.0 as *const Simulator<S>;
-
-                    interleave::install(ring_ref, worker_id);
-                    ring_ref.wait_for_token(worker_id);
-
-                    // Enter sim AFTER acquiring the token to avoid racing on
-                    // SimulatorState.current_cpu with other workers.
-                    let sp = state_ref.0;
-                    // SAFETY: token passing ensures exclusive access to `sp`.
-                    unsafe { kfuncs::enter_sim(&mut *sp, cpu) };
-
-                    // Process all events for this CPU sequentially.
-                    // Yields happen at kfunc boundaries within handlers.
-                    // SAFETY: `simp` and `arc_ref` are valid; token ensures
-                    // exclusive access to shared state.
-                    unsafe {
-                        batch_worker_body(
-                            simp,
-                            arc_ref,
-                            cpu_events,
-                            watchdog_timeout,
-                            duration_ns,
-                            max_cgroups,
-                        );
-                    }
-
-                    // Drain per-worker interleave count into structop accumulator.
-                    let delta = StructopDelta {
-                        rbc_total: 0,
-                        interleave_count: crate::preempt::structop_info().interleave_count,
-                    };
-                    // SAFETY: token held; exclusive access to `sp`.
-                    unsafe { crate::backend::drain_structop_accum(sp, cpu, &delta) };
-                    // SAFETY: token held; clears ops_context before releasing.
-                    unsafe { crate::backend::clear_ops_and_finish(sp, ring_ref, worker_id) };
-                    interleave::uninstall();
-                });
-            }
-
-            ring.start();
-            ring.wait_all_done();
-        });
+        crate::backend::run_cooperative_batch(
+            &per_cpu,
+            cpu_ids,
+            sim_send,
+            state_send,
+            sim_arc,
+            seed,
+            watchdog_timeout,
+            duration_ns,
+            max_cgroups,
+        );
 
         debug!(
             workers = cpu_ids.len(),

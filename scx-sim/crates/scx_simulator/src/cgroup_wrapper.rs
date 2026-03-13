@@ -166,6 +166,7 @@ impl Drop for SimCgroupHandle {
 /// has been invoked for this cgroup.
 ///
 /// No-op if `raw` is null.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn free_cgroup_raw(raw: *mut c_void) {
     if !raw.is_null() {
         // SAFETY: The caller guarantees that `raw` was obtained from
