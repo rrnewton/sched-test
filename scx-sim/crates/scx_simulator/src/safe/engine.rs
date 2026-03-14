@@ -31,7 +31,8 @@ use crate::scenario::{
     CgroupCpusetChangeEvent, CgroupCreateEvent, CgroupDestroyEvent, IrqType, PreemptMode, Scenario,
 };
 use crate::scheduler_wrapper::{OptionalPtr, SchedulerWrapper, TaskPtr};
-use crate::task::{OpsTaskState, Phase, SimTask, TaskState};
+use crate::sim_task::SimTask;
+use crate::task::{OpsTaskState, Phase, TaskState};
 use crate::task_wrapper::SimTaskHandle;
 use crate::trace::{DsqSampleTrigger, Trace, TraceKind};
 use crate::types::{CpuId, DsqId, KickFlags, Pid, TimeNs};
