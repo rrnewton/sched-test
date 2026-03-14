@@ -528,6 +528,7 @@ fn parse_hex_or_dec(s: &str) -> Result<u64, String> {
 mod tests {
     use super::*;
 
+    #[allow(clippy::too_many_arguments)]
     fn make_record(
         seq: u64,
         rbc: u64,

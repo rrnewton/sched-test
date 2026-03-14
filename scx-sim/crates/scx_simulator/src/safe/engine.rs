@@ -1778,7 +1778,6 @@ impl<S: Scheduler> Simulator<S> {
                     exit_kind = err;
                     break 'event_loop;
                 }
-                s = sim_arc.lock().unwrap();
             } else {
                 // No interleaving: process all events sequentially in
                 // original priority order (preserves backward-compatible
@@ -1937,6 +1936,7 @@ impl<S: Scheduler> Simulator<S> {
     /// Returns `Some(ExitKind)` if the simulation should stop (watchdog stall,
     /// cgroup exhaustion). The caller checks BPF errors separately.
     #[allow(clippy::too_many_arguments)]
+    #[allow(unused_assignments)]
     fn process_event(
         &self,
         event: Event,
@@ -2086,7 +2086,6 @@ impl<S: Scheduler> Simulator<S> {
                 guard = sim_arc.lock().unwrap();
             }
         }
-        let s = &mut *guard;
         None
     }
 
@@ -2230,7 +2229,6 @@ impl<S: Scheduler> Simulator<S> {
         if should_preempt && s.sim.cpus[cpu.0 as usize].current_task.is_some() {
             drop(guard);
             self.preempt_current(cpu, sim_arc, monitor);
-            guard = sim_arc.lock().unwrap();
         }
     }
 
@@ -2328,7 +2326,6 @@ impl<S: Scheduler> Simulator<S> {
         // Try to dispatch work to the newly online CPU
         drop(guard);
         self.try_dispatch_and_run(cpu, sim_arc, monitor);
-        guard = sim_arc.lock().unwrap();
     }
 
     /// Handle a higher-priority scheduler class taking a CPU (cpu_release).
@@ -2407,7 +2404,6 @@ impl<S: Scheduler> Simulator<S> {
         // Try to dispatch work
         drop(guard);
         self.try_dispatch_and_run(cpu, sim_arc, monitor);
-        guard = sim_arc.lock().unwrap();
     }
 
     /// Handle a cgroup migration: move a task between cgroups.
@@ -2487,16 +2483,12 @@ impl<S: Scheduler> Simulator<S> {
             self.cgroup_migrate_enqueue(pid, raw, cpu, sim_arc);
             guard = sim_arc.lock().unwrap();
         }
-        let s = &mut *guard;
 
         // Flush staged events from cgroup_move or re-enqueue callbacks
         {
             let s = &mut *guard;
-            {
-                let s = &mut *guard;
-                flush_staged_events(&mut s.sim, &mut s.events);
-            }
-        };
+            flush_staged_events(&mut s.sim, &mut s.events);
+        }
     }
 
     /// Dequeue a task before cgroup migration (sched_change_begin).
@@ -3415,16 +3407,12 @@ impl<S: Scheduler> Simulator<S> {
         // Flush staged events from enqueue callbacks
         {
             let s = &mut *guard;
-            {
-                let s = &mut *guard;
-                flush_staged_events(&mut s.sim, &mut s.events);
-            }
-        };
+            flush_staged_events(&mut s.sim, &mut s.events);
+        }
 
         // Dispatch next task on this CPU
         drop(guard);
         self.try_dispatch_and_run(cpu, sim_arc, monitor);
-        guard = sim_arc.lock().unwrap();
     }
 
     /// Try to dispatch and run a task on the given CPU.
@@ -3499,7 +3487,6 @@ impl<S: Scheduler> Simulator<S> {
         // before going idle.
         drop(guard);
         self.post_dispatch_run(cpu, true, sim_arc, monitor);
-        guard = sim_arc.lock().unwrap();
     }
 
     /// Post-dispatch: try global DSQ fallback, then start running or go idle.
@@ -3541,7 +3528,6 @@ impl<S: Scheduler> Simulator<S> {
                 .record(__local_t, cpu, TraceKind::PickTask { pid });
             drop(guard);
             self.start_running(cpu, pid, sim_arc, monitor);
-            guard = sim_arc.lock().unwrap();
         } else {
             // CPU is idle — update the C idle cpumask so
             // scx_bpf_test_and_clear_cpu_idle works correctly
@@ -3599,7 +3585,6 @@ impl<S: Scheduler> Simulator<S> {
                 self.try_dispatch_and_run(cpu, sim_arc, monitor);
                 guard = sim_arc.lock().unwrap();
             }
-            let s = &mut *guard;
             return;
         }
 
@@ -3727,7 +3712,6 @@ impl<S: Scheduler> Simulator<S> {
             self.post_dispatch_run(cpu, false, sim_arc, monitor);
             guard = sim_arc.lock().unwrap();
         }
-        let s = &mut *guard;
 
         // Flush staged events from the concurrent dispatches.
         {
@@ -3783,7 +3767,6 @@ impl<S: Scheduler> Simulator<S> {
             return Some(err);
         }
         guard = sim_arc.lock().unwrap();
-        let s = &mut *guard;
 
         // 2. Per-CPU events: concurrent if 2+ CPUs, with dynamic window
         //    expansion after each batch.
@@ -3862,7 +3845,6 @@ impl<S: Scheduler> Simulator<S> {
                 return Some(err);
             }
             guard = sim_arc.lock().unwrap();
-            let s = &mut *guard;
 
             // Continue the loop with the new per-CPU events.
             per_cpu = new_per_cpu;
@@ -3889,7 +3871,6 @@ impl<S: Scheduler> Simulator<S> {
         monitor: &mut dyn Monitor,
     ) -> Option<ExitKind> {
         let mut guard = sim_arc.lock().unwrap();
-        let s = &mut *guard;
         for event in events_list {
             drop(guard);
             if let Some(err) = self.process_event(
@@ -4118,7 +4099,6 @@ impl<S: Scheduler> Simulator<S> {
                 .record(__local_t, cpu, TraceKind::PickTask { pid });
             drop(guard);
             self.start_running(cpu, pid, sim_arc, monitor);
-            guard = sim_arc.lock().unwrap();
         } else {
             // CPU is idle
             ffi::cpumask_set_idle(cpu.0 as i32);
@@ -4150,7 +4130,6 @@ impl<S: Scheduler> Simulator<S> {
         }
         drop(guard);
         self.start_running(cpu, pid, sim_arc, monitor);
-        guard = sim_arc.lock().unwrap();
     }
 
     /// Handle a `KickDelivered` event: process a delivered IPI on the target CPU.
@@ -4169,18 +4148,15 @@ impl<S: Scheduler> Simulator<S> {
         if flags.contains(KickFlags::PREEMPT) && s.sim.cpus[cpu.0 as usize].current_task.is_some() {
             drop(guard);
             self.preempt_current(cpu, sim_arc, monitor);
-            guard = sim_arc.lock().unwrap();
         } else if flags.contains(KickFlags::IDLE) {
             let is_idle = s.sim.cpus[cpu.0 as usize].current_task.is_none();
             if is_idle {
                 drop(guard);
                 self.try_dispatch_and_run(cpu, sim_arc, monitor);
-                guard = sim_arc.lock().unwrap();
             }
         } else {
             drop(guard);
             self.try_dispatch_and_run(cpu, sim_arc, monitor);
-            guard = sim_arc.lock().unwrap();
         }
     }
 
@@ -4242,7 +4218,6 @@ impl<S: Scheduler> Simulator<S> {
             |_, _, _| {}, // no extra traces before enqueue
             |_, _, _| {}, // no extra traces after enqueue
         );
-        guard = sim_arc.lock().unwrap();
     }
 
     /// Stop a running task, re-enqueue it, and dispatch the next task.
@@ -4329,16 +4304,9 @@ impl<S: Scheduler> Simulator<S> {
         post_enqueue(&mut s.sim, cpu, pid);
 
         // Flush staged events + dispatch next task
-        {
-            let s = &mut *guard;
-            {
-                let s = &mut *guard;
-                flush_staged_events(&mut s.sim, &mut s.events);
-            }
-        };
+        flush_staged_events(&mut s.sim, &mut s.events);
         drop(guard);
         self.try_dispatch_and_run(cpu, sim_arc, monitor);
-        guard = sim_arc.lock().unwrap();
     }
 
     /// Start running a task on a CPU.
@@ -4354,8 +4322,6 @@ impl<S: Scheduler> Simulator<S> {
         if matches!(task.state, TaskState::Exited) {
             drop(guard);
             self.try_dispatch_and_run(cpu, sim_arc, monitor);
-            guard = sim_arc.lock().unwrap();
-            let s = &mut *guard;
             return;
         }
 

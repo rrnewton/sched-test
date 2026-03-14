@@ -5,9 +5,9 @@
 
 pub mod bpf_trace;
 pub mod cpu;
-pub mod engine;
 pub mod det_hashmap;
 pub mod dsq;
+pub mod engine;
 pub mod fmt;
 pub mod monitor;
 pub mod perf;
