@@ -17,10 +17,16 @@
 //! | `backend` | PMU perf_event ioctls, hardware breakpoints, `/proc` mmap, e9patch binary patching |
 //! | `interleave`| `UnsafeCell`-based token ring, raw thread synchronization |
 //! | `probes` | `dlsym` function-pointer resolution, raw C function calls |
+//! | `cgroup_wrapper` | Raw-pointer `scx_cgroup` manipulation, C struct interop |
+//! | `scheduler_wrapper` | Raw `sched_ext_ops` pointer management, `dlsym`-loaded callbacks |
+//! | `task_wrapper` | Raw `task_struct` pointer wrapping, unsafe field accessors |
 
 pub mod backend;
+pub mod cgroup_wrapper;
 pub mod ffi;
 pub mod interleave;
 pub mod kfuncs;
 pub mod preempt;
 pub mod probes;
+pub mod scheduler_wrapper;
+pub mod task_wrapper;
