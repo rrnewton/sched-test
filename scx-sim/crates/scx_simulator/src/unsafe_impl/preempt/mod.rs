@@ -2965,7 +2965,7 @@ mod tests {
         // Must be in range.
         for _ in 0..100 {
             let ts = ring.roll_timeslice(50, 500);
-            assert!(ts >= 50 && ts <= 500, "timeslice {ts} out of range");
+            assert!((50..=500).contains(&ts), "timeslice {ts} out of range");
         }
         // Degenerate range.
         assert_eq!(ring.roll_timeslice(100, 100), 100);

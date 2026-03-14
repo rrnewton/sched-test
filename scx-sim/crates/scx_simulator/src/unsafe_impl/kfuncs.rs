@@ -2265,7 +2265,7 @@ mod tests {
     #[test]
     fn test_create_dsq() {
         let _lock = SIM_LOCK.lock().unwrap();
-        let mut state = test_state(1);
+        let state = test_state(1);
 
         let arc = test_sim_arc(state);
 
@@ -2316,7 +2316,7 @@ mod tests {
     #[test]
     fn test_dsq_insert_deferred() {
         let _lock = SIM_LOCK.lock().unwrap();
-        let mut state = test_state(1);
+        let state = test_state(1);
         let arc = test_sim_arc(state);
 
         let p = register_task(&mut arc.lock().unwrap().sim, Pid(1));
@@ -2367,7 +2367,7 @@ mod tests {
     #[test]
     fn test_resolve_pending_dispatch_global() {
         let _lock = SIM_LOCK.lock().unwrap();
-        let mut state = test_state(2);
+        let state = test_state(2);
         let arc = test_sim_arc(state);
 
         let p = register_task(&mut arc.lock().unwrap().sim, Pid(1));
@@ -2390,7 +2390,7 @@ mod tests {
     #[test]
     fn test_resolve_pending_dispatch_local() {
         let _lock = SIM_LOCK.lock().unwrap();
-        let mut state = test_state(2);
+        let state = test_state(2);
         let arc = test_sim_arc(state);
 
         let p = register_task(&mut arc.lock().unwrap().sim, Pid(1));
@@ -2415,7 +2415,7 @@ mod tests {
     #[test]
     fn test_resolve_pending_dispatch_local_on_valid() {
         let _lock = SIM_LOCK.lock().unwrap();
-        let mut state = test_state(4);
+        let state = test_state(4);
         let arc = test_sim_arc(state);
 
         let p = register_task(&mut arc.lock().unwrap().sim, Pid(1));
@@ -2445,7 +2445,7 @@ mod tests {
     #[test]
     fn test_resolve_pending_dispatch_local_on_cpumask_violation() {
         let _lock = SIM_LOCK.lock().unwrap();
-        let mut state = test_state(4);
+        let state = test_state(4);
         let arc = test_sim_arc(state);
 
         let p = register_task(&mut arc.lock().unwrap().sim, Pid(1));
@@ -2511,7 +2511,7 @@ mod tests {
     #[test]
     fn test_resolve_pending_dispatch_local_on_cpumask_valid() {
         let _lock = SIM_LOCK.lock().unwrap();
-        let mut state = test_state(4);
+        let state = test_state(4);
         let arc = test_sim_arc(state);
 
         let p = register_task(&mut arc.lock().unwrap().sim, Pid(1));
@@ -2559,7 +2559,7 @@ mod tests {
     #[test]
     fn test_resolve_pending_dispatch_local_on_migration_disabled_violation() {
         let _lock = SIM_LOCK.lock().unwrap();
-        let mut state = test_state(32);
+        let state = test_state(32);
         let arc = test_sim_arc(state);
 
         let p = register_task(&mut arc.lock().unwrap().sim, Pid(1));
@@ -2635,7 +2635,7 @@ mod tests {
     #[test]
     fn test_resolve_pending_dispatch_local_on_migration_disabled_same_cpu_ok() {
         let _lock = SIM_LOCK.lock().unwrap();
-        let mut state = test_state(16);
+        let state = test_state(16);
         let arc = test_sim_arc(state);
 
         let p = register_task(&mut arc.lock().unwrap().sim, Pid(1));
@@ -2679,7 +2679,7 @@ mod tests {
     #[test]
     fn test_resolve_pending_dispatch_local_on_migration_enabled_can_move() {
         let _lock = SIM_LOCK.lock().unwrap();
-        let mut state = test_state(16);
+        let state = test_state(16);
         let arc = test_sim_arc(state);
 
         let p = register_task(&mut arc.lock().unwrap().sim, Pid(1));
@@ -2767,7 +2767,7 @@ mod tests {
     #[test]
     fn test_select_cpu_dfl_prefers_prev_if_idle() {
         let _lock = SIM_LOCK.lock().unwrap();
-        let mut state = test_state(4);
+        let state = test_state(4);
         // All CPUs idle, prev_cpu=2 should be returned
         let arc = test_sim_arc(state);
 
@@ -2889,7 +2889,7 @@ mod tests {
     #[test]
     fn test_nr_cpu_ids() {
         let _lock = SIM_LOCK.lock().unwrap();
-        let mut state = test_state(8);
+        let state = test_state(8);
 
         let arc = test_sim_arc(state);
 
@@ -2941,7 +2941,7 @@ mod tests {
     #[test]
     fn test_bpf_task_from_pid() {
         let _lock = SIM_LOCK.lock().unwrap();
-        let mut state = test_state(1);
+        let state = test_state(1);
         let arc = test_sim_arc(state);
 
         let raw = register_task(&mut arc.lock().unwrap().sim, Pid(42));
@@ -2985,7 +2985,7 @@ mod tests {
     #[test]
     fn test_get_current_task_btf() {
         let _lock = SIM_LOCK.lock().unwrap();
-        let mut state = test_state(2);
+        let state = test_state(2);
         let arc = test_sim_arc(state);
 
         let raw = register_task(&mut arc.lock().unwrap().sim, Pid(7));
@@ -3005,7 +3005,7 @@ mod tests {
     #[test]
     fn test_get_current_task_btf_idle() {
         let _lock = SIM_LOCK.lock().unwrap();
-        let mut state = test_state(1);
+        let state = test_state(1);
         // No task running on CPU 0
 
         let arc = test_sim_arc(state);
@@ -3025,7 +3025,7 @@ mod tests {
     #[test]
     fn test_cpu_curr() {
         let _lock = SIM_LOCK.lock().unwrap();
-        let mut state = test_state(2);
+        let state = test_state(2);
         let arc = test_sim_arc(state);
 
         let raw = register_task(&mut arc.lock().unwrap().sim, Pid(5));
@@ -3052,7 +3052,7 @@ mod tests {
     #[test]
     fn test_kick_cpu() {
         let _lock = SIM_LOCK.lock().unwrap();
-        let mut state = test_state(4);
+        let state = test_state(4);
 
         let arc = test_sim_arc(state);
 
@@ -3083,7 +3083,7 @@ mod tests {
     #[test]
     fn test_kick_cpu_out_of_range() {
         let _lock = SIM_LOCK.lock().unwrap();
-        let mut state = test_state(2);
+        let state = test_state(2);
 
         let arc = test_sim_arc(state);
 
@@ -3198,7 +3198,7 @@ mod tests {
     #[test]
     fn test_task_running() {
         let _lock = SIM_LOCK.lock().unwrap();
-        let mut state = test_state(2);
+        let state = test_state(2);
         let arc = test_sim_arc(state);
 
         let raw_running = register_task(&mut arc.lock().unwrap().sim, Pid(1));
@@ -3264,7 +3264,7 @@ mod tests {
     #[test]
     fn test_cgroup_kfuncs() {
         let _lock = SIM_LOCK.lock().unwrap();
-        let mut state = test_state(1);
+        let state = test_state(1);
 
         let arc = test_sim_arc(state);
 
@@ -3311,7 +3311,7 @@ mod tests {
     #[test]
     fn test_sdt_task_alloc_data_free() {
         let _lock = SIM_LOCK.lock().unwrap();
-        let mut state = test_state(1);
+        let state = test_state(1);
         let arc = test_sim_arc(state);
 
         let p = register_task(&mut arc.lock().unwrap().sim, Pid(100));
@@ -3346,7 +3346,7 @@ mod tests {
     #[test]
     fn test_sdt_task_multiple_tasks() {
         let _lock = SIM_LOCK.lock().unwrap();
-        let mut state = test_state(2);
+        let state = test_state(2);
         let arc = test_sim_arc(state);
 
         let p1 = register_task(&mut arc.lock().unwrap().sim, Pid(10));
@@ -3378,7 +3378,7 @@ mod tests {
     #[test]
     fn test_sdt_task_data_null_before_alloc() {
         let _lock = SIM_LOCK.lock().unwrap();
-        let mut state = test_state(1);
+        let state = test_state(1);
         let arc = test_sim_arc(state);
 
         let p = register_task(&mut arc.lock().unwrap().sim, Pid(50));
