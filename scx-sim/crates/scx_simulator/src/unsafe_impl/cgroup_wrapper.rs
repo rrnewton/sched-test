@@ -39,6 +39,14 @@ use crate::types::CpuId;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CgroupPtr(*mut c_void);
 
+// Safety: CgroupPtr is a non-owning, non-null pointer to a C `struct cgroup`.
+// All cgroup pointers are only accessed while the simulator mutex is held
+// (or from C callbacks that run inside the mutex-protected sim_callback!
+// macro). The single-writer / mutex-protected access model makes sharing
+// across threads safe.
+unsafe impl Send for CgroupPtr {}
+unsafe impl Sync for CgroupPtr {}
+
 impl CgroupPtr {
     /// Wrap a raw cgroup pointer, panicking if null.
     ///
@@ -71,6 +79,22 @@ pub struct SimCgroupHandle {
     /// Non-null pointer to the C `struct cgroup`. Guaranteed non-null
     /// from construction until `drop`.
     raw: *mut c_void,
+}
+
+// Safety: SimCgroupHandle is an owning RAII wrapper around a heap-allocated
+// C `struct cgroup`. The simulator accesses these exclusively while holding
+// the SimState mutex (or from C callbacks inside the mutex-protected
+// sim_callback! macro). The single-writer / mutex-protected access model
+// makes sending and sharing across threads safe.
+unsafe impl Send for SimCgroupHandle {}
+unsafe impl Sync for SimCgroupHandle {}
+
+impl std::fmt::Debug for SimCgroupHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SimCgroupHandle")
+            .field("raw", &self.raw)
+            .finish()
+    }
 }
 
 impl SimCgroupHandle {
@@ -155,6 +179,82 @@ impl Drop for SimCgroupHandle {
         // call the pointer is dangling, but we are being dropped so no
         // further access is possible.
         unsafe { ffi::sim_cgroup_free(self.raw) }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CgroupAlloc — discriminated ownership for root vs. heap-allocated cgroups
+// ---------------------------------------------------------------------------
+
+/// Discriminated ownership wrapper for cgroup C allocations.
+///
+/// The root cgroup is statically allocated in C (`sim_get_root_cgroup`) and
+/// must never be freed. All other cgroups are heap-allocated via
+/// `sim_cgroup_alloc` and must be freed exactly once. This enum encodes
+/// that distinction at the type level, eliminating the need for manual
+/// `is_root` checks and `unsafe impl Send/Sync` on the containing struct.
+///
+/// `CgroupAlloc` is `Send + Sync` because its inner types are.
+#[derive(Debug)]
+pub enum CgroupAlloc {
+    /// Statically-allocated root cgroup (never freed).
+    Root(CgroupPtr),
+    /// Heap-allocated cgroup (freed on drop via [`SimCgroupHandle`]).
+    Owned(SimCgroupHandle),
+}
+
+impl CgroupAlloc {
+    /// Get the raw `*mut c_void` pointer for FFI calls.
+    pub fn as_raw(&self) -> *mut c_void {
+        match self {
+            CgroupAlloc::Root(ptr) => ptr.as_raw(),
+            CgroupAlloc::Owned(handle) => handle.as_raw(),
+        }
+    }
+
+    /// Get a [`CgroupPtr`] for this allocation.
+    pub fn as_ptr(&self) -> CgroupPtr {
+        match self {
+            CgroupAlloc::Root(ptr) => *ptr,
+            CgroupAlloc::Owned(handle) => handle.as_ptr(),
+        }
+    }
+
+    /// Set the cpuset (allowed CPUs) for this cgroup.
+    ///
+    /// Delegates to [`SimCgroupHandle::set_cpuset`] for owned cgroups,
+    /// or calls the FFI function directly for the root.
+    pub fn set_cpuset(&self, cpus: &[CpuId]) {
+        match self {
+            CgroupAlloc::Root(ptr) => {
+                let cpu_ids: Vec<u32> = cpus.iter().map(|c| c.0).collect();
+                // SAFETY: Root pointer is always valid (statically allocated).
+                unsafe {
+                    ffi::sim_cgroup_set_cpuset(
+                        ptr.as_raw(),
+                        cpu_ids.as_ptr(),
+                        cpu_ids.len() as u32,
+                    );
+                }
+            }
+            CgroupAlloc::Owned(handle) => handle.set_cpuset(cpus),
+        }
+    }
+
+    /// Consume this allocation and return the raw pointer WITHOUT freeing.
+    ///
+    /// For `Owned` variants, this calls [`SimCgroupHandle::into_raw`] to
+    /// prevent the destructor from firing. The caller becomes responsible
+    /// for eventually calling [`free_cgroup_raw`].
+    ///
+    /// # Panics
+    /// Panics if called on the `Root` variant (the root cgroup must never
+    /// be detached from the registry).
+    pub fn into_raw(self) -> *mut c_void {
+        match self {
+            CgroupAlloc::Root(_) => panic!("cannot detach the root cgroup"),
+            CgroupAlloc::Owned(handle) => handle.into_raw(),
+        }
     }
 }
 
