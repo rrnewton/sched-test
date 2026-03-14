@@ -1,13 +1,14 @@
 ---
 title: 'Safety boundary refactor: safe/ + unsafe_impl/ module split'
-status: open
+status: closed
 priority: 1
 issue_type: epic
 labels:
 - safety
 - refactor
 created_at: 2026-03-13T17:58:05.872847892+00:00
-updated_at: 2026-03-13T17:58:05.872847892+00:00
+updated_at: 2026-03-14T15:31:08.339730189+00:00
+closed_at: 2026-03-14T15:31:08.339730059+00:00
 ---
 
 # Description
