@@ -72,7 +72,9 @@ pub use unsafe_impl::task_wrapper;
 
 // Re-export the main public types for convenience.
 pub use cgroup::{CgroupId, CgroupInfo, CgroupRegistry, DEFAULT_MAX_CGROUPS};
-pub use cgroup_wrapper::{free_cgroup_raw, CgroupPtr, CssIterGuard, SimCgroupHandle};
+pub use cgroup_wrapper::{
+    free_cgroup_raw, CgroupAlloc, CgroupPtr, CssIterGuard, SimCgroupHandle,
+};
 pub use engine::{ExitKind, SimulationResult, Simulator};
 pub use ffi::{
     discover_schedulers, DebuggerInfo, DynamicScheduler, LavdPowerMode, Scheduler, SchedulerInfo,
