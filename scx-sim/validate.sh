@@ -13,6 +13,19 @@ echo "=== Running cargo fmt --check ==="
 cargo fmt --all -- --check
 
 echo ""
+echo "=== Checking safe/ contains no unsafe code ==="
+# Belt-and-suspenders: safe/mod.rs has #![forbid(unsafe_code)] which the
+# compiler enforces, but this grep catches it before compilation even starts.
+# Match unsafe blocks, fns, impls, and traits — skip comment-only lines.
+SAFE_DIR="crates/scx_simulator/src/safe"
+if grep -rn --include='*.rs' -E '\bunsafe\s+(fn|impl|trait|\{)' "$SAFE_DIR" \
+   | grep -v '^\S*:\s*//' ; then
+    echo "ERROR: unsafe code found in $SAFE_DIR — this directory must remain 100% safe."
+    exit 1
+fi
+echo "  No unsafe code found in $SAFE_DIR — OK"
+
+echo ""
 echo "=== Running cargo clippy ==="
 cargo clippy --all -- -D warnings
 
