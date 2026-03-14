@@ -2,6 +2,10 @@
 //!
 //! These modules are grouped here to make the safety boundary explicit:
 //! everything under `safe/` is guaranteed free of `unsafe` code.
+//!
+//! The `forbid(unsafe_code)` attribute below is enforced by the compiler and
+//! cannot be overridden by inner `#[allow(unsafe_code)]` in submodules.
+#![forbid(unsafe_code)]
 
 pub mod bpf_trace;
 pub mod cpu;
