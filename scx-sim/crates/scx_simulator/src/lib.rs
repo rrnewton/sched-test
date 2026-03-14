@@ -29,12 +29,9 @@
 //! trace.dump();
 //! ```
 
-// === Modules that mix safe/unsafe (remain at crate root for now) ===
+// === Modules that mix safe/unsafe (remain at crate root) ===
 pub mod cgroup;
-pub mod cgroup_wrapper;
-pub mod scheduler_wrapper;
 pub mod task;
-pub mod task_wrapper;
 
 // === Safe modules (zero unsafe) — grouped under safe/ ===
 pub mod safe;
@@ -63,11 +60,14 @@ pub use safe::workloads;
 // Re-export unsafe_impl sub-modules at crate root for backward compatibility.
 // All internal `crate::ffi`, `crate::kfuncs`, etc. paths continue to resolve.
 pub use unsafe_impl::backend;
+pub use unsafe_impl::cgroup_wrapper;
 pub use unsafe_impl::ffi;
 pub use unsafe_impl::interleave;
 pub use unsafe_impl::kfuncs;
 pub use unsafe_impl::preempt;
 pub use unsafe_impl::probes;
+pub use unsafe_impl::scheduler_wrapper;
+pub use unsafe_impl::task_wrapper;
 
 // Re-export the main public types for convenience.
 pub use cgroup::{CgroupId, CgroupInfo, CgroupRegistry, DEFAULT_MAX_CGROUPS};
