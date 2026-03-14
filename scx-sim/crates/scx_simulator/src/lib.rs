@@ -29,9 +29,8 @@
 //! trace.dump();
 //! ```
 
-// === Re-export façades (thin modules at crate root for path compatibility) ===
+// === Modules not yet fully partitioned ===
 pub mod cgroup;
-pub mod task;
 
 // === Safe modules (zero unsafe) — grouped under safe/ ===
 pub mod safe;
@@ -53,6 +52,7 @@ pub(crate) use safe::perfetto;
 pub use safe::rtapp;
 pub use safe::scenario;
 pub use safe::stats;
+pub use safe::task;
 pub use safe::trace;
 pub use safe::types;
 pub use safe::workloads;
@@ -67,6 +67,7 @@ pub use unsafe_impl::kfuncs;
 pub use unsafe_impl::preempt;
 pub use unsafe_impl::probes;
 pub use unsafe_impl::scheduler_wrapper;
+pub use unsafe_impl::sim_task;
 pub use unsafe_impl::task_wrapper;
 
 // Re-export the main public types for convenience.
@@ -107,6 +108,7 @@ pub use safe::trace::{
 pub use safe::types::{CpuId, DsqId, KickFlags, MmId, Pid, TimeNs, Vtime};
 pub use scheduler_wrapper::{OptionalPtr, SchedulerWrapper, TaskPtr};
 pub use task::{nice_to_weight, sched_weight_to_cgroup, Phase, RepeatMode, TaskBehavior, TaskDef};
+pub use sim_task::SimTask;
 pub use task_wrapper::SimTaskHandle;
 
 use std::sync::Mutex;

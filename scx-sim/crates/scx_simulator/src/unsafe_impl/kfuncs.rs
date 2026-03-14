@@ -43,7 +43,8 @@ use crate::ffi;
 use crate::fmt::FmtN;
 use crate::perf::RbcCounter;
 use crate::scenario::{NativeConcurrentConfig, NoiseConfig, OverheadConfig, PreemptiveConfig};
-use crate::task::{OpsTaskState, SimTask};
+use crate::sim_task::SimTask;
+use crate::task::OpsTaskState;
 use crate::trace::{DispatchRejectReason, DsqSampleTrigger, Trace, TraceKind};
 use crate::types::{CpuId, DsqId, KickFlags, Pid, TimeNs, Vtime};
 
