@@ -889,8 +889,10 @@ Done. Captured ops + kfunc trace.
         let bpf_stats = trace.compute_stats();
 
         // Create a simple simulated stats for comparison
-        let mut sim_stats = TraceStats::default();
-        sim_stats.duration_ns = 4_000_000;
+        let mut sim_stats = TraceStats {
+            duration_ns: 4_000_000,
+            ..Default::default()
+        };
         sim_stats.tasks.insert(
             Pid(100),
             TaskStats {
