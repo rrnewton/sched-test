@@ -107,8 +107,8 @@ pub use safe::trace::{
 };
 pub use safe::types::{CpuId, DsqId, KickFlags, MmId, Pid, TimeNs, Vtime};
 pub use scheduler_wrapper::{OptionalPtr, SchedulerWrapper, TaskPtr};
-pub use task::{nice_to_weight, sched_weight_to_cgroup, Phase, RepeatMode, TaskBehavior, TaskDef};
 pub use sim_task::SimTask;
+pub use task::{nice_to_weight, sched_weight_to_cgroup, Phase, RepeatMode, TaskBehavior, TaskDef};
 pub use task_wrapper::SimTaskHandle;
 
 use std::sync::Mutex;
