@@ -3618,7 +3618,14 @@ impl<S: Scheduler> Simulator<S> {
 
         let interleave_seed = s.sim.next_prng();
 
-        if s.sim.native_concurrent.is_some() {
+        // Save conditions before dropping guard (workers lock sim_arc internally).
+        let is_native = s.sim.native_concurrent.is_some();
+        let preemptive_cfg = s.sim.preemptive.clone();
+        let replay_backend = s.sim.replay_backend.take();
+        let e9_fns = s.sim.e9_fns;
+        drop(guard);
+
+        if is_native {
             // Native concurrent: all workers run freely in parallel with
             // no PMU, no signals, no token ring serialisation.
             use crate::backend::native::{NativeOrchestrator, NullBackend};
@@ -3628,17 +3635,19 @@ impl<S: Scheduler> Simulator<S> {
                 &dispatch_cpus,
                 &state_send,
                 &sched_send,
+                sim_arc,
                 &ring,
                 &orchestrator,
                 &NullBackend,
             );
-        } else if let Some(ref preemptive_cfg) = s.sim.preemptive {
-            if let Some(ref backend) = s.sim.replay_backend {
+        } else if let Some(ref preemptive_cfg) = preemptive_cfg {
+            if let Some(ref backend) = replay_backend {
                 assert!(backend.is_precise(), "replay requires a precise backend");
                 crate::backend::replay_dispatch_with_retry(
                     &dispatch_cpus,
                     &state_send,
                     &sched_send,
+                    sim_arc,
                     interleave_seed,
                     backend,
                 );
@@ -3646,12 +3655,13 @@ impl<S: Scheduler> Simulator<S> {
                 let backend = E9PatchBackend {
                     timeslice_min: preemptive_cfg.timeslice_min,
                     timeslice_max: preemptive_cfg.timeslice_max,
-                    fns: s.sim.e9_fns.expect("e9_fns must be resolved"),
+                    fns: e9_fns.expect("e9_fns must be resolved"),
                 };
                 crate::backend::run_preemptive_dispatch(
                     &dispatch_cpus,
                     &state_send,
                     &sched_send,
+                    sim_arc,
                     interleave_seed,
                     &backend,
                 );
@@ -3666,6 +3676,7 @@ impl<S: Scheduler> Simulator<S> {
                     &dispatch_cpus,
                     &state_send,
                     &sched_send,
+                    sim_arc,
                     interleave_seed,
                     &backend,
                 );
@@ -3675,8 +3686,16 @@ impl<S: Scheduler> Simulator<S> {
                 &dispatch_cpus,
                 &state_send,
                 &sched_send,
+                sim_arc,
                 interleave_seed,
             );
+        }
+
+        // Re-acquire guard for Phase 2 post-processing.
+        guard = sim_arc.lock().unwrap();
+        // Restore replay_backend if it was temporarily removed.
+        if replay_backend.is_some() {
+            guard.sim.replay_backend = replay_backend;
         }
 
         // Phase 2: sequential post-processing on the engine thread.
@@ -3958,7 +3977,7 @@ impl<S: Scheduler> Simulator<S> {
         // Save conditions before dropping guard (workers lock sim_arc internally)
         let is_native = guard.sim.native_concurrent.is_some();
         let preemptive_cfg = guard.sim.preemptive.clone();
-        let replay_backend_present = guard.sim.replay_backend.is_some();
+        let replay_backend = guard.sim.replay_backend.take();
         let e9_fns = guard.sim.e9_fns;
         drop(guard);
 
@@ -3982,9 +4001,7 @@ impl<S: Scheduler> Simulator<S> {
                 &NullBackend,
             );
         } else if let Some(ref preemptive_cfg) = preemptive_cfg {
-            if replay_backend_present {
-                let guard_temp = sim_arc.lock().unwrap();
-                let backend = guard_temp.sim.replay_backend.as_ref().unwrap();
+            if let Some(ref backend) = replay_backend {
                 crate::backend::run_preemptive_batch(
                     &per_cpu,
                     &cpu_ids,
@@ -4056,6 +4073,10 @@ impl<S: Scheduler> Simulator<S> {
 
         // Relock after concurrent block
         guard = sim_arc.lock().unwrap();
+        // Restore replay_backend if it was temporarily removed.
+        if replay_backend.is_some() {
+            guard.sim.replay_backend = replay_backend;
+        }
         let s = &mut *guard;
         s.sim.rbc_counter = main_rbc_counter;
 
