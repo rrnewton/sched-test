@@ -29,7 +29,7 @@
 //! trace.dump();
 //! ```
 
-// === Modules that mix safe/unsafe (remain at crate root) ===
+// === Re-export façades (thin modules at crate root for path compatibility) ===
 pub mod cgroup;
 pub mod task;
 
