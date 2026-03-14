@@ -373,6 +373,7 @@ pub(crate) fn run_preemptive_dispatch<S, B>(
     dispatch_cpus: &[CpuId],
     state_send: &SendPtr<SimulatorState>,
     sched_send: &SendPtr<SchedulerWrapper<S>>,
+    sim_arc: &SimArc,
     seed: u32,
     backend: &B,
 ) where
@@ -380,7 +381,15 @@ pub(crate) fn run_preemptive_dispatch<S, B>(
     B: PreemptionBackend,
 {
     let ring = PreemptRing::new(dispatch_cpus.len(), seed);
-    run_dispatch_with_orchestrator(dispatch_cpus, state_send, sched_send, &ring, &ring, backend);
+    run_dispatch_with_orchestrator(
+        dispatch_cpus,
+        state_send,
+        sched_send,
+        sim_arc,
+        &ring,
+        &ring,
+        backend,
+    );
 }
 
 /// Inner dispatch driver parameterised over [`ThreadOrchestrator`].
@@ -391,6 +400,7 @@ pub(crate) fn run_dispatch_with_orchestrator<S, B, O>(
     dispatch_cpus: &[CpuId],
     state_send: &SendPtr<SimulatorState>,
     sched_send: &SendPtr<SchedulerWrapper<S>>,
+    sim_arc: &SimArc,
     ring: &PreemptRing,
     orchestrator: &O,
     backend: &B,
@@ -414,6 +424,12 @@ pub(crate) fn run_dispatch_with_orchestrator<S, B, O>(
                 let sp = state_ref.0;
                 let schp = sched_ref.0 as *const SchedulerWrapper<S>;
 
+                // Install SIM_ARC in this worker thread so kfuncs called
+                // from scheduler C code can lock the SimState mutex.
+                // Worker threads don't inherit the engine thread's
+                // ENGINE_SIM_ARC thread-local, so we install directly.
+                kfuncs::install_sim_arc(sim_arc);
+
                 let mut ctx = backend.worker_setup(ring_ref, worker_id);
                 orch_ref.wait_for_token(worker_id);
 
@@ -434,6 +450,8 @@ pub(crate) fn run_dispatch_with_orchestrator<S, B, O>(
                 // SAFETY: token held; exclusive access to `sp`.
                 unsafe { drain_structop_accum(sp, cpu, &delta) };
                 // SAFETY: token held; clears ops_context before releasing.
+                // clear_ops_and_finish calls exit_sim_no_clear_ops which
+                // clears SIM_ARC.
                 unsafe { clear_ops_and_finish(sp, orch_ref, worker_id) };
 
                 backend.worker_teardown(ctx);
@@ -526,6 +544,10 @@ pub(crate) fn run_batch_with_orchestrator<S, B, O>(
                 let simp = sim_ref.0 as *const Simulator<S>;
                 let sp = state_ref.0;
 
+                // Install SIM_ARC in this worker thread so kfuncs called
+                // from scheduler C code can lock the SimState mutex.
+                kfuncs::install_sim_arc(arc_ref);
+
                 let mut ctx = backend.worker_setup(ring_ref, worker_id);
                 orch_ref.wait_for_token(worker_id);
 
@@ -551,6 +573,8 @@ pub(crate) fn run_batch_with_orchestrator<S, B, O>(
                 // SAFETY: token held; exclusive access to `sp`.
                 unsafe { drain_structop_accum(sp, cpu, &delta) };
                 // SAFETY: token held; clears ops_context before releasing.
+                // clear_ops_and_finish calls exit_sim_no_clear_ops which
+                // clears SIM_ARC.
                 unsafe { clear_ops_and_finish(sp, orch_ref, worker_id) };
 
                 backend.worker_teardown(ctx);
@@ -586,6 +610,7 @@ pub(crate) fn run_cooperative_dispatch<S: Scheduler>(
     dispatch_cpus: &[CpuId],
     state_send: &SendPtr<SimulatorState>,
     sched_send: &SendPtr<SchedulerWrapper<S>>,
+    sim_arc: &SimArc,
     seed: u32,
 ) {
     let ring = TokenRing::new(dispatch_cpus.len(), seed);
@@ -601,6 +626,10 @@ pub(crate) fn run_cooperative_dispatch<S: Scheduler>(
             s.spawn(move || {
                 let sp = state_ref.0;
                 let schp = sched_ref.0 as *const SchedulerWrapper<S>;
+
+                // Install SIM_ARC in this worker thread so kfuncs called
+                // from scheduler C code can lock the SimState mutex.
+                kfuncs::install_sim_arc(sim_arc);
 
                 interleave::install(ring_ref, worker_id);
                 ring_ref.wait_for_token(worker_id);
@@ -621,6 +650,8 @@ pub(crate) fn run_cooperative_dispatch<S: Scheduler>(
                     interleave_count: crate::preempt::structop_info().interleave_count,
                 };
                 // SAFETY: same pointer validity as above; token still held.
+                // clear_ops_and_finish calls exit_sim_no_clear_ops which
+                // clears SIM_ARC.
                 unsafe {
                     drain_structop_accum(sp, cpu, &delta);
                     clear_ops_and_finish(sp, ring_ref, worker_id);
@@ -668,6 +699,10 @@ pub(crate) fn run_cooperative_batch<S: Scheduler>(
                 let simp = sim_ref.0 as *const Simulator<S>;
                 let sp = state_ref.0;
 
+                // Install SIM_ARC in this worker thread so kfuncs called
+                // from scheduler C code can lock the SimState mutex.
+                kfuncs::install_sim_arc(arc_ref);
+
                 interleave::install(ring_ref, worker_id);
                 ring_ref.wait_for_token(worker_id);
 
@@ -693,6 +728,8 @@ pub(crate) fn run_cooperative_batch<S: Scheduler>(
                     interleave_count: crate::preempt::structop_info().interleave_count,
                 };
                 // SAFETY: same pointer validity as above; token still held.
+                // clear_ops_and_finish calls exit_sim_no_clear_ops which
+                // clears SIM_ARC.
                 unsafe {
                     drain_structop_accum(sp, cpu, &delta);
                     clear_ops_and_finish(sp, ring_ref, worker_id);
@@ -729,6 +766,7 @@ pub(crate) fn replay_dispatch_with_retry<S: Scheduler>(
     dispatch_cpus: &[CpuId],
     state_send: &SendPtr<SimulatorState>,
     sched_send: &SendPtr<SchedulerWrapper<S>>,
+    sim_arc: &SimArc,
     seed: u32,
     backend: &replay::ReplayBackend,
 ) {
@@ -738,7 +776,14 @@ pub(crate) fn replay_dispatch_with_retry<S: Scheduler>(
     // If already in breakpoint-only mode, no retry needed for PMU overshoot.
     if backend.no_pmu_signal() {
         reset_replay_state();
-        run_preemptive_dispatch(dispatch_cpus, state_send, sched_send, seed, backend);
+        run_preemptive_dispatch(
+            dispatch_cpus,
+            state_send,
+            sched_send,
+            sim_arc,
+            seed,
+            backend,
+        );
         return;
     }
 
@@ -746,7 +791,14 @@ pub(crate) fn replay_dispatch_with_retry<S: Scheduler>(
     for attempt in 1..=REPLAY_PMU_MAX_RETRIES {
         reset_replay_state();
         backend.reset_cursors();
-        run_preemptive_dispatch(dispatch_cpus, state_send, sched_send, seed, backend);
+        run_preemptive_dispatch(
+            dispatch_cpus,
+            state_send,
+            sched_send,
+            sim_arc,
+            seed,
+            backend,
+        );
         if !REPLAY_OVERSHOT.load(SeqCst) {
             return; // Success — no overshoot.
         }
@@ -763,7 +815,14 @@ pub(crate) fn replay_dispatch_with_retry<S: Scheduler>(
     let bp_backend = backend.with_bp_only();
     for attempt in 1..=REPLAY_BP_ONLY_MAX_RETRIES {
         reset_replay_state();
-        run_preemptive_dispatch(dispatch_cpus, state_send, sched_send, seed, &bp_backend);
+        run_preemptive_dispatch(
+            dispatch_cpus,
+            state_send,
+            sched_send,
+            sim_arc,
+            seed,
+            &bp_backend,
+        );
         if !REPLAY_OVERSHOT.load(SeqCst) {
             return; // Success.
         }
