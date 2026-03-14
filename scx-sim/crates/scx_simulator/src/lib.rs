@@ -32,7 +32,6 @@
 // === Modules that mix safe/unsafe (remain at crate root for now) ===
 pub mod cgroup;
 pub mod cgroup_wrapper;
-pub mod engine;
 pub mod scheduler_wrapper;
 pub mod task;
 pub mod task_wrapper;
@@ -49,6 +48,7 @@ pub use safe::bpf_trace;
 pub use safe::cpu;
 pub use safe::det_hashmap;
 pub use safe::dsq;
+pub use safe::engine;
 pub use safe::fmt;
 pub use safe::monitor;
 pub use safe::perf;
