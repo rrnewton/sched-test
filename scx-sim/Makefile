@@ -6,7 +6,10 @@
 # Use the venv python if available, otherwise system python3
 PYTHON := $(or $(wildcard .venv/bin/python3),python3)
 
-.PHONY: benchmark
+.PHONY: benchmark benchmark-perf
 
 benchmark:
 	$(PYTHON) scripts/benchmark.py run
+
+benchmark-perf:
+	$(PYTHON) scripts/benchmark.py run --perf --no-build

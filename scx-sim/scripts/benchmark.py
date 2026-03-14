@@ -10,6 +10,7 @@ Usage:
     python3 scripts/benchmark.py run                    # Full benchmark suite
     python3 scripts/benchmark.py run --no-build         # Skip cargo build
     python3 scripts/benchmark.py run --csv out.csv --append --git-metadata
+    python3 scripts/benchmark.py run --perf --filter-mode sequential --no-build
     python3 scripts/benchmark.py plot-history data/benchmarks/CPU/perf_history.csv
 """
 
@@ -17,10 +18,11 @@ import argparse
 import csv
 import json
 import os
+import re
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -58,6 +60,22 @@ CSV_COLUMNS = [
 GIT_META_COLUMNS = [
     "timestamp", "git_commit", "git_depth", "git_branch", "git_dirty",
 ]
+
+# Patterns that indicate mutex/lock overhead in perf reports.
+# These are split into exact-substring patterns and word-boundary patterns.
+# Word-boundary patterns use \b to avoid false positives like "clock" matching "lock".
+_MUTEX_EXACT_PATTERNS = [
+    "mutex", "pthread_mutex", "futex",
+    "Mutex::lock", "MutexGuard", "try_lock",
+    "with_sim", "clone_sim_arc", "sim_rbc_pause", "sim_rbc_resume",
+    "spin_lock", "rwlock",
+]
+
+# Compiled regex: combine exact substrings with case-insensitive matching
+_MUTEX_RE = re.compile(
+    "|".join(re.escape(p) for p in _MUTEX_EXACT_PATTERNS),
+    re.IGNORECASE,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +157,27 @@ class BenchmarkResult:
     simulated_ns: int
     wall_clock_ms: float
     speedup_factor: float
+    perf_report: Optional[str] = field(default=None, repr=False)
+
+
+def _run_perf_report(perf_data_path: str) -> str:
+    """Extract top functions from a perf.data file via perf report.
+
+    Uses --call-graph none to produce a compact flat list of hot symbols
+    rather than expanded call trees that would consume too many lines.
+    """
+    report = subprocess.run(
+        [
+            "perf", "report",
+            "-i", perf_data_path,
+            "--stdio", "--no-children", "-n",
+            "--percent-limit", "0.5",
+            "--call-graph", "none",
+        ],
+        capture_output=True, text=True,
+    )
+    lines = report.stdout.splitlines()[:60]
+    return "\n".join(lines)
 
 
 def run_single_benchmark(
@@ -146,14 +185,27 @@ def run_single_benchmark(
     scheduler: str,
     mode_name: str,
     mode_flags: list[str],
+    *,
+    perf: bool = False,
 ) -> BenchmarkResult:
     """Run one scxsim invocation and measure wall-clock time."""
     simulated_ns = read_workload_duration_ns(workload_path)
 
-    cmd = [
+    scxsim_cmd = [
         str(SCXSIM), "run", str(workload_path),
         "-s", scheduler,
     ] + mode_flags
+
+    label = f"{workload_path.stem}_{scheduler}_{mode_name}"
+    perf_data = f"/tmp/perf_bench_{label}.data"
+
+    if perf:
+        cmd = [
+            "perf", "record", "-g", "--call-graph", "dwarf",
+            "-o", perf_data, "--",
+        ] + scxsim_cmd
+    else:
+        cmd = scxsim_cmd
 
     env = os.environ.copy()
     env["RUST_LOG"] = "warn"
@@ -169,7 +221,6 @@ def run_single_benchmark(
         stderr_preview = result.stderr.strip()[:200]
         if stderr_preview:
             print(f"    stderr: {stderr_preview}")
-        # Return a result with 0 speedup to indicate failure
         return BenchmarkResult(
             workload=workload_path.stem,
             scheduler=scheduler,
@@ -182,6 +233,10 @@ def run_single_benchmark(
     wall_clock_ms = elapsed_s * 1000
     speedup = simulated_ns / (elapsed_s * 1e9) if elapsed_s > 0 else 0.0
 
+    perf_report = None
+    if perf and Path(perf_data).is_file():
+        perf_report = _run_perf_report(perf_data)
+
     return BenchmarkResult(
         workload=workload_path.stem,
         scheduler=scheduler,
@@ -189,6 +244,7 @@ def run_single_benchmark(
         simulated_ns=simulated_ns,
         wall_clock_ms=wall_clock_ms,
         speedup_factor=speedup,
+        perf_report=perf_report,
     )
 
 
@@ -199,8 +255,17 @@ def should_skip_mode(mode_name: str) -> bool:
     return False
 
 
-def run_benchmark_matrix() -> list[BenchmarkResult]:
-    """Run the full benchmark matrix and return results."""
+def run_benchmark_matrix(
+    *,
+    perf: bool = False,
+    filter_mode: Optional[str] = None,
+) -> list[BenchmarkResult]:
+    """Run the benchmark matrix and return results.
+
+    Args:
+        perf: Wrap each run with ``perf record`` and collect profiles.
+        filter_mode: If set, only run modes whose name matches this string.
+    """
     results: list[BenchmarkResult] = []
     workloads = [WORKLOADS_DIR / name for name in WORKLOAD_NAMES]
 
@@ -210,12 +275,22 @@ def run_benchmark_matrix() -> list[BenchmarkResult]:
             print(f"ERROR: workload not found: {wl}", file=sys.stderr)
             sys.exit(1)
 
-    total = len(workloads) * len(SCHEDULERS) * len(MODES)
+    active_modes = [
+        (name, flags) for name, flags in MODES
+        if filter_mode is None or name == filter_mode
+    ]
+    if filter_mode and not active_modes:
+        valid = ", ".join(name for name, _ in MODES)
+        print(f"ERROR: --filter-mode '{filter_mode}' matches no modes. "
+              f"Valid: {valid}", file=sys.stderr)
+        sys.exit(1)
+
+    total = len(workloads) * len(SCHEDULERS) * len(active_modes)
     done = 0
 
     for wl in workloads:
         for scheduler in SCHEDULERS:
-            for mode_name, mode_flags in MODES:
+            for mode_name, mode_flags in active_modes:
                 done += 1
                 if should_skip_mode(mode_name):
                     print(f"  [{done}/{total}] SKIP {wl.stem}/{scheduler}/{mode_name}"
@@ -225,11 +300,18 @@ def run_benchmark_matrix() -> list[BenchmarkResult]:
                 label = f"{wl.stem}/{scheduler}/{mode_name}"
                 print(f"  [{done}/{total}] {label} ...", end="", flush=True)
 
-                result = run_single_benchmark(wl, scheduler, mode_name, mode_flags)
+                result = run_single_benchmark(
+                    wl, scheduler, mode_name, mode_flags, perf=perf,
+                )
 
                 if result.speedup_factor > 0:
                     print(f" {result.speedup_factor:.2f}x"
                           f" ({result.wall_clock_ms:.0f}ms)")
+                    if result.perf_report:
+                        print(f"\n    --- perf report: {label} ---")
+                        for line in result.perf_report.splitlines():
+                            print(f"    {line}")
+                        print()
                 results.append(result)
 
     return results
@@ -495,6 +577,59 @@ def generate_history_html(csv_path: Path, html_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Perf: mutex overhead summary
+# ---------------------------------------------------------------------------
+
+def _extract_mutex_overhead(report: str) -> list[tuple[float, str]]:
+    """Parse perf report lines and return (percent, symbol) for mutex hits.
+
+    Each interesting line looks like:
+        4.20%   12345  scxsim  libfoo.so  [.] some::function
+    We extract the percent and symbol for lines matching MUTEX_PATTERNS.
+    """
+    pct_re = re.compile(r"^\s*(\d+\.\d+)%\s+.+\]\s+(.+)$")
+    hits: list[tuple[float, str]] = []
+    for line in report.splitlines():
+        m = pct_re.match(line)
+        if not m:
+            continue
+        pct, symbol = float(m.group(1)), m.group(2).strip()
+        if _MUTEX_RE.search(symbol):
+            hits.append((pct, symbol))
+    return hits
+
+
+def print_mutex_overhead_summary(results: list[BenchmarkResult]) -> None:
+    """Print a table of mutex/lock overhead per benchmark."""
+    profiled = [(r, r.perf_report) for r in results if r.perf_report]
+    if not profiled:
+        return
+
+    print("\n=== Mutex / Lock Overhead Summary ===\n")
+    print(f"{'Benchmark':<45} {'Mutex %':>8}  Top mutex symbols")
+    print("-" * 100)
+
+    for result, report in profiled:
+        label = f"{result.workload}/{result.scheduler}/{result.mode}"
+        hits = _extract_mutex_overhead(report)
+        total_pct = sum(pct for pct, _ in hits)
+        top_syms = ", ".join(
+            f"{sym} ({pct:.1f}%)" for pct, sym in sorted(hits, reverse=True)[:3]
+        )
+        print(f"{label:<45} {total_pct:>7.2f}%  {top_syms or '(none)'}")
+
+    overall_pcts = []
+    for _, report in profiled:
+        hits = _extract_mutex_overhead(report)
+        overall_pcts.append(sum(pct for pct, _ in hits))
+    if overall_pcts:
+        avg = sum(overall_pcts) / len(overall_pcts)
+        print("-" * 100)
+        print(f"{'Average across benchmarks':<45} {avg:>7.2f}%")
+    print()
+
+
+# ---------------------------------------------------------------------------
 # Subcommand: run
 # ---------------------------------------------------------------------------
 
@@ -515,14 +650,20 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"ERROR: {SCXSIM} not found", file=sys.stderr)
         return 1
 
+    use_perf = getattr(args, "perf", False)
+    filter_mode = getattr(args, "filter_mode", None)
+
     print("=== Running benchmark matrix ===")
-    results = run_benchmark_matrix()
+    results = run_benchmark_matrix(perf=use_perf, filter_mode=filter_mode)
 
     # Filter to successful results for summary
     successful = [r for r in results if r.speedup_factor > 0]
     failed = [r for r in results if r.speedup_factor == 0]
 
     print(f"\n=== Results: {len(successful)} passed, {len(failed)} failed ===")
+
+    if use_perf:
+        print_mutex_overhead_summary(results)
 
     # Write CSV
     csv_path = Path(args.csv) if args.csv else PROJECT_ROOT / "benchmark_results.csv"
@@ -579,6 +720,14 @@ def main() -> int:
     run_parser.add_argument(
         "--git-metadata", action="store_true",
         help="Include git commit/depth/branch/dirty columns in CSV",
+    )
+    run_parser.add_argument(
+        "--perf", action="store_true",
+        help="Profile each benchmark with perf record and show hottest functions",
+    )
+    run_parser.add_argument(
+        "--filter-mode", type=str, default=None, dest="filter_mode",
+        help="Only run benchmarks for this mode (e.g. sequential, interleave)",
     )
 
     # --- plot-history ---
