@@ -1153,6 +1153,15 @@ pub fn clock_window_check(_cpu: CpuId, _local_clock: TimeNs) {
 ///
 /// Locks `SIM_ARC` to get exclusive access to `SimulatorState`.
 ///
+/// After acquiring the lock, restores `sim.current_cpu` (and related
+/// identity fields) from the thread-local `CALLBACK_CTX`. This is
+/// necessary because cooperative interleaving (`maybe_yield()`) can
+/// transfer the execution token to another worker, which overwrites
+/// `sim.current_cpu` via its raw pointer.  Without this restore, kfuncs
+/// that read `sim.current_cpu` after a yield (e.g. `dsq_move_to_local`)
+/// would operate on the wrong CPU, causing tasks to be dispatched to
+/// the wrong local DSQ and producing stalls.
+///
 /// # Panics
 /// Panics if `SIM_ARC` is not installed.
 fn with_sim<F, R>(cost_ns: u64, f: F) -> R
@@ -1165,6 +1174,17 @@ where
     let result = {
         let mut guard = arc.lock().unwrap();
         let sim = &mut guard.sim;
+        // Restore identity fields from thread-local context.
+        // After a cooperative yield (`maybe_yield()`), another worker may
+        // have overwritten `sim.current_cpu` via its raw pointer.  The
+        // thread-local `CALLBACK_CTX` preserves each worker's true CPU
+        // across yields.  Restoring here ensures every kfunc sees the
+        // correct CPU for the calling worker.
+        if let Some(ctx) = get_callback_ctx() {
+            sim.current_cpu = ctx.current_cpu;
+            sim.ops_context = ctx.ops_context;
+            sim.waker_task_raw = ctx.waker_task_raw;
+        }
         sim.rbc_kfunc_calls += 1;
         sim.rbc_kfunc_ns += cost_ns;
         rbc_pause_inner(sim);
