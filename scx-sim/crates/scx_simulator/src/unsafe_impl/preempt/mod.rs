@@ -2559,7 +2559,13 @@ extern "C" fn replay_bp_handler(
     let counter_now = read_rbc_count(rctx.timer_fd);
     if cursor.advance() {
         if let Some(next) = cursor.current_target() {
-            arm_replay_next_target(rctx.timer_fd, rctx.bp_fd, next, counter_now);
+            arm_replay_next_target(
+                rctx.timer_fd,
+                rctx.bp_fd,
+                next,
+                counter_now,
+                rctx.no_pmu_signal,
+            );
         }
     }
 }
@@ -2567,28 +2573,44 @@ extern "C" fn replay_bp_handler(
 /// Arm the next replay target using either PMU timer or breakpoint-only mode.
 ///
 /// In normal (PMU) mode: arms the PMU timer to fire at
-/// `target_rbc - REPLAY_MARGIN`. In breakpoint-only mode (timer_fd < 0):
-/// arms the breakpoint directly at the target instruction pointer.
+/// `target_rbc - REPLAY_MARGIN`. If the delta to the target is zero
+/// (target is too close for the PMU to fire in time), falls back to
+/// breakpoint-only for this specific target.
+///
+/// In breakpoint-only mode (`no_pmu_signal`): arms the breakpoint
+/// directly at the target instruction pointer.
 fn arm_replay_next_target(
     timer_fd: RawFd,
     bp_fd: RawFd,
     target: &PreemptionRecord,
     current_counter: u64,
+    no_pmu_signal: bool,
 ) {
-    if timer_fd >= 0 {
-        // Compute delta period: fire when the counter approaches
-        // target.structop_rbc (cumulative). Don't reset the counter.
-        let absolute_target = target.structop_rbc.saturating_sub(REPLAY_MARGIN);
-        let delta = absolute_target.saturating_sub(current_counter).max(1);
-        let mut period = delta;
-        // SAFETY: `timer_fd` is a valid perf_event fd. These ioctls set
-        // the overflow period and enable counting.
-        unsafe {
-            libc::ioctl(timer_fd, scx_perf::PERF_IOC_PERIOD, &mut period as *mut u64);
-            libc::ioctl(timer_fd, scx_perf::PERF_IOC_ENABLE, 0 as libc::c_ulong);
-        }
-    } else {
+    if no_pmu_signal {
+        // Breakpoint-only mode: arm the breakpoint directly.
         arm_breakpoint(bp_fd, target.instruction_pointer);
+        return;
+    }
+
+    // PMU mode: compute delta to the REPLAY_MARGIN approach point.
+    let delta = target
+        .structop_rbc
+        .saturating_sub(REPLAY_MARGIN)
+        .saturating_sub(current_counter);
+
+    if delta == 0 {
+        // Target is too close for PMU — arm breakpoint directly
+        // for this target (per-target bp-only fast path).
+        arm_breakpoint(bp_fd, target.instruction_pointer);
+        return;
+    }
+
+    let mut period = delta;
+    // SAFETY: `timer_fd` is a valid perf_event fd. These ioctls set
+    // the overflow period and enable counting.
+    unsafe {
+        libc::ioctl(timer_fd, scx_perf::PERF_IOC_PERIOD, &mut period as *mut u64);
+        libc::ioctl(timer_fd, scx_perf::PERF_IOC_ENABLE, 0 as libc::c_ulong);
     }
 }
 
