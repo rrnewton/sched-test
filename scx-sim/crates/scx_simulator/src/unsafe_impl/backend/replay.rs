@@ -20,7 +20,7 @@ use crate::backend::{
 use crate::interleave::WorkerId;
 use crate::perf;
 use crate::preempt::trace::PreemptionTrace;
-use crate::preempt::{self, PreemptRing, ReplayCursor};
+use crate::preempt::{self, PreemptRing, ReplayCursor, REPLAY_MARGIN};
 
 /// Hardware breakpoint replay preemption backend.
 ///
@@ -232,10 +232,10 @@ impl PreemptionBackend for ReplayBackend {
         let cursor = &self.cursors[ctx.worker_idx];
         let first = cursor.current_target()?;
 
-        if self.no_pmu_signal {
-            // Breakpoint-only mode: use a relative count of 0 (the
-            // breakpoint handler checks RBC on each hit). The target
-            // RIP is the instruction pointer from the recorded trace.
+        if self.no_pmu_signal || first.structop_rbc < REPLAY_MARGIN {
+            // Breakpoint-only mode, or target is too close for PMU to fire
+            // before overshooting: use Relative(0) so the breakpoint handler
+            // checks RBC on each hit to find the right dynamic instance.
             Some(PreemptTarget {
                 count_rbc: RbcTarget::Relative(RelativeRbc(0)),
                 target_rip: Some(first.instruction_pointer),
