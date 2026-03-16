@@ -15,6 +15,80 @@ use scx_simulator::{
 
 mod real_run;
 
+/// Environment variable set after ASLR is disabled to prevent infinite re-exec.
+const ASLR_DISABLED_ENV: &str = "SCX_SIM_ASLR_DISABLED";
+
+/// Disable ASLR for this process by setting the `ADDR_NO_RANDOMIZE` personality
+/// flag and re-executing. This ensures scheduler .so base addresses are stable
+/// across runs, which is critical for deterministic instruction pointer values
+/// in preemption traces and replay.
+///
+/// The re-exec pattern is standard (used by rr, valgrind, etc.): `personality()`
+/// only affects new process images, so we must re-exec for it to take effect.
+///
+/// Returns without re-exec if:
+/// - `SCX_SIM_ASLR_DISABLED=1` is set (already re-exec'd)
+/// - `--no-disable-aslr` is present in argv
+fn ensure_aslr_disabled() {
+    // Already re-exec'd — nothing to do.
+    if std::env::var(ASLR_DISABLED_ENV).as_deref() == Ok("1") {
+        return;
+    }
+
+    // User explicitly opted out.
+    if std::env::args().any(|a| a == "--no-disable-aslr") {
+        return;
+    }
+
+    // Query current personality.
+    let current = unsafe { libc::personality(0xffff_ffff) };
+    if current < 0 {
+        eprintln!("warning: personality() query failed, skipping ASLR disable");
+        return;
+    }
+
+    let no_randomize = libc::ADDR_NO_RANDOMIZE as libc::c_ulong;
+
+    // Already disabled (e.g. by parent process or kernel config).
+    if current as libc::c_ulong & no_randomize != 0 {
+        return;
+    }
+
+    // Set ADDR_NO_RANDOMIZE and re-exec.
+    let new_persona = current as libc::c_ulong | no_randomize;
+    let ret = unsafe { libc::personality(new_persona) };
+    if ret < 0 {
+        eprintln!("warning: personality(ADDR_NO_RANDOMIZE) failed, skipping ASLR disable");
+        return;
+    }
+
+    reexec_with_aslr_disabled();
+}
+
+/// Re-exec the current process with `SCX_SIM_ASLR_DISABLED=1` set. The new
+/// process image inherits the `ADDR_NO_RANDOMIZE` personality flag set by the
+/// caller. This function never returns — it exits after the child completes.
+fn reexec_with_aslr_disabled() -> ! {
+    // Mark that we've disabled ASLR so the re-exec'd process skips this path.
+    std::env::set_var(ASLR_DISABLED_ENV, "1");
+
+    let exe = std::env::current_exe().unwrap_or_else(|e| {
+        panic!("failed to determine current executable for ASLR re-exec: {e}");
+    });
+    let args: Vec<String> = std::env::args().collect();
+
+    eprintln!("scxsim: disabling ASLR and re-executing...");
+
+    let status = std::process::Command::new(&exe)
+        .args(&args[1..])
+        .status()
+        .unwrap_or_else(|e| {
+            panic!("failed to re-exec {} for ASLR disable: {e}", exe.display());
+        });
+
+    std::process::exit(status.code().unwrap_or(1));
+}
+
 /// How to run the workload.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
 pub enum RealRunMode {
@@ -68,6 +142,12 @@ impl PreemptModeArg {
 #[derive(Parser)]
 #[command(name = "scxsim", about = "sched_ext simulator")]
 struct Cli {
+    /// Do not disable ASLR. By default scxsim disables ASLR via
+    /// personality(ADDR_NO_RANDOMIZE) and re-execs so that .so base addresses
+    /// are stable across runs (important for deterministic replay).
+    #[arg(long, global = true)]
+    no_disable_aslr: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -327,6 +407,11 @@ struct ReplayArgs {
 }
 
 fn main() {
+    // Disable ASLR before anything else so that the scheduler .so is loaded
+    // at a stable base address. This must happen before CLI parsing because
+    // it may re-exec the process.
+    ensure_aslr_disabled();
+
     let cli = Cli::parse();
     init_tracing();
 
