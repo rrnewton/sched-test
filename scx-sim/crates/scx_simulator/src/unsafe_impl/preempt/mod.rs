@@ -2750,6 +2750,21 @@ pub fn mmap_shared_rbc() -> *mut E9SharedRbc {
     shared
 }
 
+/// Switch the e9 shared yield function pointer to replay mode.
+///
+/// After calling this, the C trampoline's `call_yield()` will invoke
+/// `e9_replay_yield` instead of `e9_preempt_yield`. Must be called
+/// after `mmap_shared_rbc()`.
+///
+/// # Safety
+/// The shared RBC page must have been mmap'd via `mmap_shared_rbc()`.
+pub fn set_e9_replay_yield() {
+    // SAFETY: mmap_shared_rbc() has been called, making E9_SHARED_ADDR valid.
+    unsafe {
+        (*e9_shared_rbc()).yield_fn = e9_replay_yield as *const std::ffi::c_void;
+    }
+}
+
 /// Unmap the shared RBC state page.
 pub fn munmap_shared_rbc() {
     // SAFETY: E9_SHARED_ADDR was mapped by `mmap_shared_rbc()`.
@@ -2852,6 +2867,152 @@ pub unsafe extern "C" fn e9_preempt_yield() -> u64 {
 
     // 6. Roll new timeslice from PRNG and return it.
     ring.roll_timeslice(pctx.timeslice_min, pctx.timeslice_max)
+}
+
+// ---------------------------------------------------------------------------
+// e9patch REPLAY — thread-local context and yield function
+// ---------------------------------------------------------------------------
+
+/// Thread-local context for a worker in E9PATCH REPLAY mode.
+///
+/// Unlike recording mode (which rolls random timeslices from PRNG),
+/// replay mode reads preemption targets from a cursor and computes
+/// deltas to arm the e9 counter at the exact branch count.
+#[derive(Clone, Copy)]
+struct E9ReplayCtx {
+    /// Pointer to the per-worker replay cursor (lives in `E9PatchReplayBackend`).
+    cursor: *const ReplayCursor,
+    /// Pointer to the per-worker accumulated RBC cell (lives in `E9PatchReplayBackend`).
+    accumulated_rbc: *const Cell<u64>,
+}
+
+// SAFETY: E9ReplayCtx holds raw pointers to data that lives in a
+// `thread::scope` block. Access is serialized by the token-passing protocol.
+unsafe impl Send for E9ReplayCtx {}
+
+thread_local! {
+    static E9_REPLAY_CTX: Cell<Option<E9ReplayCtx>> = const { Cell::new(None) };
+}
+
+/// Install e9 replay context on the current worker thread.
+///
+/// Must be called during worker setup for e9patch replay mode.
+pub fn install_e9_replay(cursor: &ReplayCursor, accumulated_rbc: &Cell<u64>) {
+    E9_REPLAY_CTX.with(|c| {
+        c.set(Some(E9ReplayCtx {
+            cursor: cursor as *const ReplayCursor,
+            accumulated_rbc: accumulated_rbc as *const Cell<u64>,
+        }));
+    });
+}
+
+/// Remove e9 replay context from the current thread.
+pub fn uninstall_e9_replay() {
+    E9_REPLAY_CTX.with(|c| c.set(None));
+}
+
+/// Called from the C trampoline when the e9 counter expires during REPLAY.
+///
+/// Unlike [`e9_preempt_yield`] (recording mode), this function:
+/// 1. Advances the replay cursor instead of recording a new preemption
+/// 2. Computes the delta to the NEXT target instead of rolling a random timeslice
+/// 3. Returns `u64::MAX` when all targets are exhausted (disarms the counter)
+///
+/// The PRNG is still consumed for synchronization with recording mode.
+///
+/// # Safety
+///
+/// Must be called from a thread with both `PREEMPT_CTX` and `E9_REPLAY_CTX`
+/// installed (i.e., a worker thread inside e9patch replay dispatch).
+#[no_mangle]
+pub unsafe extern "C" fn e9_replay_yield() -> u64 {
+    E9_YIELD_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    // Get ring and worker_id from PREEMPT_CTX.
+    let pctx = match PREEMPT_CTX.with(|c| c.get()) {
+        Some(ctx) => ctx,
+        None => return u64::MAX,
+    };
+    // SAFETY: `pctx.ring` is a valid pointer set during `install()`.
+    let ring = unsafe { &*pctx.ring };
+    let wid = pctx.worker_id;
+
+    // Get replay context.
+    let rctx = match E9_REPLAY_CTX.with(|c| c.get()) {
+        Some(ctx) => ctx,
+        None => return u64::MAX,
+    };
+    // SAFETY: `rctx.cursor` and `rctx.accumulated_rbc` are valid pointers
+    // set during `install_e9_replay()`.
+    let cursor = unsafe { &*rctx.cursor };
+    let accum_cell = unsafe { &*rctx.accumulated_rbc };
+
+    // Read per-callback context.
+    let saved = match crate::kfuncs::get_callback_ctx() {
+        None => return u64::MAX,
+        Some(c) => c,
+    };
+
+    // Get the current target that just fired.
+    let current_target = match cursor.current_target() {
+        Some(t) => t,
+        None => return u64::MAX, // No more targets — disarm.
+    };
+
+    // Update accumulated RBC from the target we just hit.
+    accum_cell.set(current_target.structop_rbc);
+
+    // Record the preemption point for structop accounting.
+    let saved_ops = current_ops_context();
+    set_current_ops_context(saved_ops);
+    record_rbc_preemption(0);
+    let sinfo = structop_info();
+    ring.record_preemption(0, 0, saved.current_cpu, wid, sinfo);
+
+    tracing::debug!(
+        "preempt:e9replay ops={} kfunc={} structop#{}:{} target_rbc={}",
+        sinfo.ops_context.short_name(),
+        if sinfo.kfunc_name.is_empty() {
+            "none"
+        } else {
+            sinfo.kfunc_name
+        },
+        sinfo.cpu_count,
+        sinfo.global_count,
+        current_target.structop_rbc,
+    );
+
+    // Yield token (futex-based).
+    ring.inc_signal_preempt();
+    if ring.yield_token(wid) {
+        inc_interleave();
+    }
+
+    // Restore context.
+    crate::kfuncs::install_callback_ctx(saved);
+
+    // Advance cursor to the next target.
+    cursor.advance();
+
+    // Consume PRNG for synchronization (recording mode rolls a timeslice
+    // after each yield; we must match that consumption).
+    let _timeslice = ring.roll_timeslice(pctx.timeslice_min, pctx.timeslice_max);
+
+    // Compute delta to next target and return it as the new counter value.
+    match cursor.current_target() {
+        Some(next) => {
+            let accumulated = accum_cell.get();
+            if next.structop_rbc <= accumulated {
+                // Next target is at or before current position — fire immediately.
+                // This shouldn't normally happen (targets are monotonically
+                // increasing), but handle it gracefully.
+                1
+            } else {
+                next.structop_rbc - accumulated
+            }
+        }
+        None => u64::MAX, // No more targets — disarm.
+    }
 }
 
 // ---------------------------------------------------------------------------

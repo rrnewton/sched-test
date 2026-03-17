@@ -12,7 +12,7 @@ use rand::rngs::SmallRng;
 use rand::{RngCore, SeedableRng};
 use tracing::{debug, info, trace, warn};
 
-use crate::backend::e9patch::E9PatchBackend;
+use crate::backend::e9patch::{E9PatchBackend, E9PatchReplayBackend};
 use crate::backend::pmu::PmuBackend;
 use crate::backend::replay::ReplayBackend;
 use crate::backend::{PreemptionBackend, SendPtr};
@@ -1345,8 +1345,9 @@ impl<S: Scheduler> Simulator<S> {
             interleave: scenario.interleave,
             preemptive: scenario.preemptive.clone(),
             replay_trace: scenario.replay_trace.clone(),
-            replay_backend: None, // Initialized below after state is built.
-            e9_fns: None,         // Initialized below if e9patch mode is active.
+            replay_backend: None,    // Initialized below after state is built.
+            e9_replay_backend: None, // Initialized below if e9 replay is active.
+            e9_fns: None,            // Initialized below if e9patch mode is active.
             structop_accum: vec![
                 crate::preempt::StructopInfo::default();
                 scenario.nr_cpus as usize
@@ -1354,7 +1355,7 @@ impl<S: Scheduler> Simulator<S> {
             native_concurrent: scenario.native_concurrent,
         };
 
-        // Build the persistent ReplayBackend once if we have a replay trace.
+        // Build the persistent replay backend once if we have a replay trace.
         // This must happen after state construction because the backend holds
         // cursors that track progress across dispatch rounds -- creating a
         // fresh backend each round would reset cursors to index 0.
@@ -1363,30 +1364,51 @@ impl<S: Scheduler> Simulator<S> {
         // trace.num_workers(). In any given round, only a subset of CPUs may
         // need dispatch, and the worker count varies. Extra workers beyond the
         // trace's worker count get empty cursors (no targets to replay).
+        let is_e9_mode = state
+            .preemptive
+            .as_ref()
+            .is_some_and(|cfg| cfg.preempt_mode == PreemptMode::E9patch);
+
         if let Some(ref trace) = state.replay_trace {
             let (ts_min, ts_max) = state
                 .preemptive
                 .as_ref()
                 .map(|cfg| (cfg.timeslice_min, cfg.timeslice_max))
                 .unwrap_or((100, 500));
-            state.replay_backend = Some(ReplayBackend::new(
-                trace,
-                nr_cpus as usize,
-                ts_min,
-                ts_max,
-                scenario.no_pmu_signal,
-            ));
+
+            if is_e9_mode {
+                // E9patch replay: resolve fns first, then build backend.
+                let e9_fns = self.scheduler.resolve_e9_fns().unwrap_or_else(|| {
+                    panic!(
+                        "e9patch replay mode requires e9 trampoline symbols in the \
+                         scheduler .so. Rebuild with: make -C schedulers e9"
+                    )
+                });
+                state.e9_fns = Some(e9_fns);
+                state.e9_replay_backend = Some(E9PatchReplayBackend::new(
+                    trace,
+                    nr_cpus as usize,
+                    ts_min,
+                    ts_max,
+                    e9_fns,
+                ));
+            } else {
+                state.replay_backend = Some(ReplayBackend::new(
+                    trace,
+                    nr_cpus as usize,
+                    ts_min,
+                    ts_max,
+                    scenario.no_pmu_signal,
+                ));
+            }
         }
 
-        // Resolve e9patch function pointers if e9patch mode is active.
+        // Resolve e9patch function pointers if e9patch mode is active
+        // (recording, not replay — replay resolves them above).
         // The shared RBC page must already be mmap'd (done by the caller
         // before loading the .so, since e9-instrumented Jcc instructions
         // access the fixed address during DT_INIT).
-        if state
-            .preemptive
-            .as_ref()
-            .is_some_and(|cfg| cfg.preempt_mode == PreemptMode::E9patch)
-        {
+        if is_e9_mode && state.e9_fns.is_none() {
             state.e9_fns = self.scheduler.resolve_e9_fns();
             if state.e9_fns.is_none() {
                 panic!(
@@ -3608,6 +3630,7 @@ impl<S: Scheduler> Simulator<S> {
         let is_native = s.sim.native_concurrent.is_some();
         let preemptive_cfg = s.sim.preemptive.clone();
         let replay_backend = s.sim.replay_backend.take();
+        let e9_replay_backend = s.sim.e9_replay_backend.take();
         let e9_fns = s.sim.e9_fns;
         drop(guard);
 
@@ -3627,7 +3650,17 @@ impl<S: Scheduler> Simulator<S> {
                 &NullBackend,
             );
         } else if let Some(ref preemptive_cfg) = preemptive_cfg {
-            if let Some(ref backend) = replay_backend {
+            if let Some(ref backend) = e9_replay_backend {
+                // E9patch replay: deterministic, no retry needed.
+                crate::backend::run_preemptive_dispatch(
+                    &dispatch_cpus,
+                    &state_send,
+                    &sched_send,
+                    sim_arc,
+                    interleave_seed,
+                    backend,
+                );
+            } else if let Some(ref backend) = replay_backend {
                 assert!(backend.is_precise(), "replay requires a precise backend");
                 crate::backend::replay_dispatch_with_retry(
                     &dispatch_cpus,
@@ -3679,9 +3712,12 @@ impl<S: Scheduler> Simulator<S> {
 
         // Re-acquire guard for Phase 2 post-processing.
         guard = sim_arc.lock().unwrap();
-        // Restore replay_backend if it was temporarily removed.
+        // Restore replay backends if they were temporarily removed.
         if replay_backend.is_some() {
             guard.sim.replay_backend = replay_backend;
+        }
+        if e9_replay_backend.is_some() {
+            guard.sim.e9_replay_backend = e9_replay_backend;
         }
 
         // Phase 2: sequential post-processing on the engine thread.
@@ -3960,6 +3996,7 @@ impl<S: Scheduler> Simulator<S> {
         let is_native = guard.sim.native_concurrent.is_some();
         let preemptive_cfg = guard.sim.preemptive.clone();
         let replay_backend = guard.sim.replay_backend.take();
+        let e9_replay_backend = guard.sim.e9_replay_backend.take();
         let e9_fns = guard.sim.e9_fns;
         drop(guard);
 
@@ -3983,7 +4020,21 @@ impl<S: Scheduler> Simulator<S> {
                 &NullBackend,
             );
         } else if let Some(ref preemptive_cfg) = preemptive_cfg {
-            if let Some(ref backend) = replay_backend {
+            if let Some(ref backend) = e9_replay_backend {
+                // E9patch replay: deterministic, no retry needed.
+                crate::backend::run_preemptive_batch(
+                    &per_cpu,
+                    &cpu_ids,
+                    &sim_send,
+                    &state_send,
+                    sim_arc,
+                    interleave_seed,
+                    watchdog_timeout,
+                    duration_ns,
+                    max_cgroups,
+                    backend,
+                );
+            } else if let Some(ref backend) = replay_backend {
                 crate::backend::run_preemptive_batch(
                     &per_cpu,
                     &cpu_ids,
@@ -4055,9 +4106,12 @@ impl<S: Scheduler> Simulator<S> {
 
         // Relock after concurrent block
         guard = sim_arc.lock().unwrap();
-        // Restore replay_backend if it was temporarily removed.
+        // Restore replay backends if they were temporarily removed.
         if replay_backend.is_some() {
             guard.sim.replay_backend = replay_backend;
+        }
+        if e9_replay_backend.is_some() {
+            guard.sim.e9_replay_backend = e9_replay_backend;
         }
         let s = &mut *guard;
         s.sim.rbc_counter = main_rbc_counter;

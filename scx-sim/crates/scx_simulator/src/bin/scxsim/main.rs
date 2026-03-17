@@ -402,6 +402,14 @@ struct ReplayArgs {
     #[arg(long)]
     no_pmu_signal: bool,
 
+    /// Preemption mechanism for replay.
+    ///
+    /// pmu: PMU + hardware breakpoint replay (default, requires PMU hardware).
+    /// e9patch: Software RBC via e9patch-instrumented .so (deterministic,
+    ///          no PMU needed, requires _e9.so variant).
+    #[arg(long, value_enum, default_value_t = PreemptModeArg::Pmu)]
+    preempt_mode: PreemptModeArg,
+
     /// Pause before ops.init() so a debugger can attach.
     ///
     /// After the scheduler .so is loaded, writes an lldb breakpoint script
@@ -550,19 +558,22 @@ fn run(args: &RunArgs) -> Result<(), String> {
 /// Extract the scheduler prefix from a .so path.
 ///
 /// Given a path like `/path/to/libscx_simple.so`, returns `"simple"`.
+/// For e9 variants like `/path/to/libscx_simple_e9.so`, also returns
+/// `"simple"` (strips the `_e9` suffix).
 /// Panics if the filename does not match the `libscx_<name>.so` pattern.
 fn scheduler_prefix_from_path(path: &Path) -> String {
     let filename = path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or_else(|| panic!("invalid scheduler path: {}", path.display()));
-    filename
+    let name = filename
         .strip_prefix("libscx_")
         .and_then(|s| s.strip_suffix(".so"))
         .unwrap_or_else(|| {
             panic!("scheduler .so filename must match libscx_<name>.so, got: {filename}")
-        })
-        .to_string()
+        });
+    // Strip _e9 suffix if present — the ops symbols use the base name.
+    name.strip_suffix("_e9").unwrap_or(name).to_string()
 }
 
 /// Resolve the scheduler .so path for replay.
@@ -599,6 +610,37 @@ fn resolve_scheduler_path(
     Ok(path)
 }
 
+/// Derive the `_e9.so` variant path from a regular `.so` path.
+///
+/// Transforms `libscx_foo.so` into `libscx_foo_e9.so`. Used when
+/// `--preempt-mode e9patch` is specified for replay without an explicit
+/// `--scheduler-file` override.
+fn derive_e9_scheduler_path(base_path: &Path) -> Result<PathBuf, String> {
+    let stem = base_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| format!("cannot derive e9 path from: {}", base_path.display()))?;
+
+    // If it already ends with _e9, use as-is.
+    if stem.ends_with("_e9") {
+        return Ok(base_path.to_path_buf());
+    }
+
+    let e9_name = format!("{stem}_e9.so");
+    let e9_path = base_path.with_file_name(e9_name);
+    if e9_path.exists() {
+        eprintln!("replay: using e9patch variant: {}", e9_path.display());
+        Ok(e9_path)
+    } else {
+        Err(format!(
+            "e9patch scheduler variant not found: {}\n\
+             Build with: make -C schedulers e9\n\
+             Or pass --scheduler-file <path_to_e9.so>",
+            e9_path.display()
+        ))
+    }
+}
+
 fn replay_simulation(args: &ReplayArgs) -> Result<(), String> {
     use std::io::BufReader;
 
@@ -617,14 +659,7 @@ fn replay_simulation(args: &ReplayArgs) -> Result<(), String> {
     let metadata = pre_trace.metadata();
 
     // Resolve scheduler .so path: CLI --scheduler-file overrides trace metadata.
-    let scheduler_path = resolve_scheduler_path(args.scheduler_file.as_deref(), metadata)?;
-    let prefix = scheduler_prefix_from_path(&scheduler_path);
-    let so_path_str = scheduler_path.to_str().unwrap_or_else(|| {
-        panic!(
-            "scheduler path is not valid UTF-8: {}",
-            scheduler_path.display()
-        )
-    });
+    let mut scheduler_path = resolve_scheduler_path(args.scheduler_file.as_deref(), metadata)?;
 
     // Extract required metadata fields, panicking on missing values.
     let nr_cpus = metadata
@@ -645,6 +680,28 @@ fn replay_simulation(args: &ReplayArgs) -> Result<(), String> {
     let timeslice_max = metadata
         .timeslice_max
         .unwrap_or_else(|| panic!("trace file missing required metadata: timeslice_max"));
+
+    let use_e9_replay = args.preempt_mode == PreemptModeArg::E9patch;
+
+    // Map the shared RBC state page if e9patch replay mode is requested.
+    // Must happen BEFORE loading the _e9.so (the instrumented Jcc
+    // instructions access the fixed address during DT_INIT).
+    if use_e9_replay {
+        scx_simulator::preempt::mmap_shared_rbc();
+    }
+
+    // For e9patch replay, derive the _e9.so path from the trace's .so path
+    // if the user didn't provide an explicit --scheduler-file override.
+    if use_e9_replay && args.scheduler_file.is_none() {
+        scheduler_path = derive_e9_scheduler_path(&scheduler_path)?;
+    }
+    let prefix = scheduler_prefix_from_path(&scheduler_path);
+    let so_path_str = scheduler_path.to_str().unwrap_or_else(|| {
+        panic!(
+            "scheduler path is not valid UTF-8: {}",
+            scheduler_path.display()
+        )
+    });
 
     // Now load the scheduler with the correct nr_cpus.
     let sched = DynamicScheduler::load(so_path_str, &prefix, nr_cpus);
@@ -691,7 +748,7 @@ fn replay_simulation(args: &ReplayArgs) -> Result<(), String> {
             timeslice_max,
             cooperative_only: false,
             break_on: trace.break_on(),
-            preempt_mode: PreemptMode::Pmu,
+            preempt_mode: args.preempt_mode.to_preempt_mode(),
         });
 
     for i in 0..nr_tasks {

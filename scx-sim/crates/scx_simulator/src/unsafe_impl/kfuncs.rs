@@ -393,6 +393,12 @@ pub struct SimulatorState {
     /// round would reset cursors to index 0, causing targets from all
     /// rounds to be replayed from the beginning every time.
     pub(crate) replay_backend: Option<crate::backend::replay::ReplayBackend>,
+    /// Persistent e9patch replay backend (created once, reused across rounds).
+    ///
+    /// Used when replaying a trace with e9patch software branch counting
+    /// instead of PMU + HW breakpoints. Holds per-worker cursors and
+    /// accumulated RBC counters.
+    pub(crate) e9_replay_backend: Option<crate::backend::e9patch::E9PatchReplayBackend>,
     /// SHARED-READ: Set once during `Simulator::run()`, read-only afterward.
     ///
     /// Resolved e9patch C trampoline function pointers (from the loaded `.so`).
@@ -2214,6 +2220,7 @@ mod tests {
             preemptive: None,
             replay_trace: None,
             replay_backend: None,
+            e9_replay_backend: None,
             e9_fns: None,
             structop_accum: vec![crate::preempt::StructopInfo::default(); nr_cpus as usize],
             native_concurrent: None,
