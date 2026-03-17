@@ -502,6 +502,9 @@ impl SimulatorState {
     /// `dsqs` simultaneously, which is necessary because `move_to_local`
     /// needs `&mut SimCpu` while we also hold `&mut DsqManager`.
     ///
+    /// Skips tasks whose cpumask does not include the target CPU, mirroring
+    /// the kernel's `consume_dispatch_q()` behavior.
+    ///
     /// Returns true if a task was consumed.
     pub fn consume_dsq_to_local(
         &mut self,
@@ -514,7 +517,15 @@ impl SimulatorState {
         // are disjoint fields of SimulatorState.
         let cpus_ptr = self.cpus.as_mut_ptr();
         let sim_cpu = unsafe { &mut *cpus_ptr.add(cpu_idx) };
-        self.dsqs.move_to_local(dsq_id, sim_cpu)
+        let task_map = &self.task_pid_to_raw;
+        self.dsqs.move_to_local_filtered(dsq_id, sim_cpu, |pid| {
+            let Some(&raw) = task_map.get(&pid) else {
+                return true;
+            };
+            let task_ptr = raw as *mut c_void;
+            let task_cpus = unsafe { ffi::sim_task_get_cpus_ptr(task_ptr) };
+            task_cpus.is_null() || unsafe { ffi::bpf_cpumask_test_cpu(cpu.0, task_cpus) }
+        })
     }
 
     /// Set the per-task ops_state and, when transitioning to Queued,
@@ -1534,17 +1545,30 @@ pub extern "C" fn scx_bpf_dsq_insert_vtime(
     })
 }
 
-/// Move the head of a DSQ to the current CPU's local DSQ.
+/// Move the first eligible task from a DSQ to the current CPU's local DSQ.
+///
+/// Mirrors the kernel's `consume_dispatch_q()` which iterates the DSQ and
+/// skips tasks whose cpumask does not include the consuming CPU.
 #[no_mangle]
 pub extern "C" fn scx_bpf_dsq_move_to_local(dsq_id: u64) -> bool {
     crate::preempt::set_current_kfunc("dsq_move_to_local");
     crate::interleave::maybe_yield();
     with_sim(kfunc_cost::COMPLEX, |sim| {
         let cpu_idx = sim.current_cpu.0 as usize;
-        // Need to split borrow: extract cpu mutably, pass dsqs mutably
+        let current_cpu = sim.current_cpu;
+        // Split borrow: extract cpu mutably, build cpumask predicate from
+        // task_pid_to_raw, then pass dsqs mutably.
         let cpus_ptr = sim.cpus.as_mut_ptr();
         let cpu = unsafe { &mut *cpus_ptr.add(cpu_idx) };
-        let result = sim.dsqs.move_to_local(DsqId(dsq_id), cpu);
+        let task_map = &sim.task_pid_to_raw;
+        let result = sim.dsqs.move_to_local_filtered(DsqId(dsq_id), cpu, |pid| {
+            let Some(&raw) = task_map.get(&pid) else {
+                return true;
+            };
+            let task_ptr = raw as *mut c_void;
+            let task_cpus = unsafe { ffi::sim_task_get_cpus_ptr(task_ptr) };
+            task_cpus.is_null() || unsafe { ffi::bpf_cpumask_test_cpu(current_cpu.0, task_cpus) }
+        });
         debug!(dsq_id, result, "enter:kfunc dsq_move_to_local");
 
         let local_t = sim.cpus[cpu_idx].local_clock;
