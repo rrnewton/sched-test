@@ -92,6 +92,17 @@ fi
 echo "  stress.py smoke tests passed (exit code: $rc)"
 
 echo ""
+echo "=== Running ASLR stability test ==="
+# The ASLR test needs a release binary (it tests the re-exec path).
+RELEASE_BIN="target/release/scxsim"
+if [ -x "$RELEASE_BIN" ]; then
+    ./scripts/test_aslr.sh "$RELEASE_BIN"
+else
+    echo "  (skipped: $RELEASE_BIN not found; run: cargo build --release)"
+    record_skip "ASLR stability test (release binary not found)"
+fi
+
+echo ""
 echo "=== All checks passed ==="
 
 if [ ${#SKIPPED[@]} -gt 0 ]; then

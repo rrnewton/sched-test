@@ -158,6 +158,12 @@ enum Command {
     Run(RunArgs),
     /// Replay a recorded preemption trace.
     Replay(ReplayArgs),
+    /// Print address-space layout for ASLR verification.
+    ///
+    /// Loads the scheduler, prints .so base, heap, and stack addresses,
+    /// then exits. Used by the ASLR stability test.
+    #[command(hide = true)]
+    PrintAddresses(PrintAddressesArgs),
 }
 
 /// Arguments for the `run` subcommand.
@@ -406,6 +412,14 @@ struct ReplayArgs {
     wait_debugger: bool,
 }
 
+/// Arguments for the `print-addresses` subcommand.
+#[derive(Parser)]
+struct PrintAddressesArgs {
+    /// Scheduler name.
+    #[arg(short, long, default_value = "simple")]
+    scheduler: String,
+}
+
 fn main() {
     // Disable ASLR before anything else so that the scheduler .so is loaded
     // at a stable base address. This must happen before CLI parsing because
@@ -418,6 +432,7 @@ fn main() {
     let result = match cli.command {
         Command::Run(args) => run(&args),
         Command::Replay(args) => replay_simulation(&args),
+        Command::PrintAddresses(args) => print_addresses(&args),
     };
 
     if let Err(e) = result {
@@ -950,6 +965,31 @@ fn run_simulation(args: &RunArgs, scenario: Scenario) -> Result<(), String> {
     if trace.has_error() {
         return Err(format!("simulation error: {:?}", trace.exit_kind()));
     }
+
+    Ok(())
+}
+
+/// Print address-space layout for ASLR verification.
+///
+/// Loads the scheduler .so, allocates a heap object, and prints three
+/// addresses (so_base, heap, stack) in a stable machine-readable format.
+/// The caller (ASLR test) runs this twice and compares the output.
+fn print_addresses(args: &PrintAddressesArgs) -> Result<(), String> {
+    let _sched = load_scheduler(&args.scheduler, 4, false)?;
+    let _lock = SIM_LOCK.lock().unwrap();
+    let so_base = scheduler_so_base();
+
+    // Heap: allocate a boxed value and take its address.
+    let heap_obj = Box::new(42u64);
+    let heap_addr = &*heap_obj as *const u64 as u64;
+
+    // Stack: address of a local variable.
+    let stack_var: u64 = 0xDEAD;
+    let stack_addr = &stack_var as *const u64 as u64;
+
+    println!("so_base=0x{so_base:x}");
+    println!("heap=0x{heap_addr:x}");
+    println!("stack=0x{stack_addr:x}");
 
     Ok(())
 }
