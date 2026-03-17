@@ -4,6 +4,12 @@
 //! at every conditional branch (Jcc). The trampoline decrements a shared
 //! counter and yields via `e9_preempt_yield` when it expires.
 //!
+//! Contains two backends:
+//! - [`E9PatchBackend`]: Recording mode — random PRNG timeslices.
+//! - [`E9PatchReplayBackend`]: Replay mode — reads targets from a recorded
+//!   trace and arms the counter at exact branch deltas. No PMU hardware,
+//!   no retry logic, fully deterministic.
+//!
 //! **State sharing**: Both the e9-injected trampoline and the `.so`'s
 //! arm/disarm functions access a shared `E9SharedRbc` struct at a fixed
 //! mmap'd address ([`E9_SHARED_ADDR`]). No RIP-relative addressing, no
@@ -18,11 +24,14 @@
 //!
 //! [`E9_SHARED_ADDR`]: crate::preempt::E9_SHARED_ADDR
 
+use std::cell::Cell;
+
 use tracing::{debug, info};
 
 use crate::backend::{PreemptTarget, PreemptionBackend, RbcTarget, RelativeRbc, StructopDelta};
 use crate::interleave::WorkerId;
-use crate::preempt::{self, PreemptRing};
+use crate::preempt::trace::PreemptionTrace;
+use crate::preempt::{self, PreemptRing, ReplayCursor};
 
 /// Function pointer types for the C trampoline API in the scheduler `.so`.
 type ArmFn = unsafe extern "C" fn(u64);
@@ -161,5 +170,210 @@ impl PreemptionBackend for E9PatchBackend {
             e9_yield_calls = yield_calls,
             "e9patch interleave: complete"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// E9PatchReplayBackend — deterministic replay via software branch counting
+// ---------------------------------------------------------------------------
+
+/// e9patch replay preemption backend.
+///
+/// Replays a recorded preemption trace using e9patch software branch
+/// counting. Each worker's C trampoline fires at exact branch deltas
+/// computed from the trace's cumulative `structop_rbc` values.
+///
+/// Advantages over PMU + HW breakpoint replay:
+/// - **No PMU hardware needed** — works in VMs, containers, CI
+/// - **Fully deterministic** — software counting, no skid
+/// - **No retry logic** — never overshoots
+/// - **Single mechanism** — no two-signal coordination
+pub(crate) struct E9PatchReplayBackend {
+    /// Per-worker cursors into the replay trace.
+    cursors: Vec<ReplayCursor>,
+    /// Per-worker accumulated RBC (cumulative from dispatch round start).
+    ///
+    /// `Cell` is safe because each worker only accesses its own cell,
+    /// enforced by the token-passing protocol.
+    accumulated_rbc: Vec<Cell<u64>>,
+    /// Minimum timeslice from the recording scenario (for PRNG sync).
+    timeslice_min: u64,
+    /// Maximum timeslice from the recording scenario (for PRNG sync).
+    timeslice_max: u64,
+    /// Resolved e9patch function pointers.
+    fns: E9PatchFns,
+}
+
+// SAFETY: E9PatchReplayBackend fields are accessed under the token-passing
+// protocol: each worker accesses only its own cursor and accumulated_rbc
+// Cell. The E9PatchFns are thread-safe function pointers. The Vec<Cell<u64>>
+// is not Sync by default, but single-writer access is guaranteed by the
+// token ring.
+unsafe impl Sync for E9PatchReplayBackend {}
+
+impl E9PatchReplayBackend {
+    /// Create a new e9patch replay backend from a recorded preemption trace.
+    ///
+    /// Builds per-worker cursors from the trace, one per dispatch CPU.
+    /// `timeslice_min` / `timeslice_max` must match the recording scenario's
+    /// preemptive config to keep the PRNG sequence in sync.
+    pub fn new(
+        trace: &PreemptionTrace,
+        num_workers: usize,
+        timeslice_min: u64,
+        timeslice_max: u64,
+        fns: E9PatchFns,
+    ) -> Self {
+        let cursors = (0..num_workers)
+            .map(|i| {
+                let targets = trace.worker_trace(WorkerId(i)).to_vec();
+                ReplayCursor::new(targets)
+            })
+            .collect();
+        let accumulated_rbc = (0..num_workers).map(|_| Cell::new(0)).collect();
+        E9PatchReplayBackend {
+            cursors,
+            accumulated_rbc,
+            timeslice_min,
+            timeslice_max,
+            fns,
+        }
+    }
+
+    /// Reset all cursors and accumulated RBC to the beginning (for retry).
+    #[allow(dead_code)] // Infrastructure for potential future retry logic.
+    pub fn reset_cursors(&self) {
+        for c in &self.cursors {
+            c.reset();
+        }
+        for a in &self.accumulated_rbc {
+            a.set(0);
+        }
+    }
+}
+
+/// Per-worker state for the e9patch replay backend.
+pub(crate) struct E9PatchReplayWorkerCtx {
+    worker_idx: usize,
+}
+
+impl PreemptionBackend for E9PatchReplayBackend {
+    type WorkerCtx = E9PatchReplayWorkerCtx;
+
+    fn global_setup(&self) {
+        // Switch yield_fn to the replay variant before workers start.
+        preempt::set_e9_replay_yield();
+
+        // Verify the shared RBC page is accessible.
+        let p = unsafe { preempt::e9_shared_rbc() };
+        let counter = unsafe { (*p).counter };
+        info!(
+            addr = format_args!("{:#x}", preempt::E9_SHARED_ADDR),
+            counter, "e9patch replay: shared state page verified"
+        );
+    }
+
+    fn worker_setup(&self, ring: &PreemptRing, worker_id: WorkerId) -> E9PatchReplayWorkerCtx {
+        let i = worker_id.0;
+        let cursor = &self.cursors[i];
+        let accum = &self.accumulated_rbc[i];
+
+        // Install PREEMPT_CTX for cooperative yields at kfunc boundaries.
+        // Uses replay_mode so rearm_timer consumes PRNG without resetting
+        // the e9 counter.
+        preempt::install_replay_preempt(
+            ring,
+            worker_id,
+            -1, // No timer fd needed — e9patch doesn't use PMU.
+            self.timeslice_min,
+            self.timeslice_max,
+        );
+
+        // Install E9_REPLAY_CTX so `e9_replay_yield()` can access the
+        // cursor and accumulated_rbc.
+        preempt::install_e9_replay(cursor, accum);
+
+        debug!(
+            worker = i,
+            targets = cursor.len(),
+            "e9patch replay: worker setup"
+        );
+
+        E9PatchReplayWorkerCtx { worker_idx: i }
+    }
+
+    fn build_target(
+        &self,
+        ctx: &E9PatchReplayWorkerCtx,
+        ring: &PreemptRing,
+    ) -> Option<PreemptTarget> {
+        // Consume PRNG to match recording's PmuBackend::arm() which calls
+        // roll_timeslice. Without this, PRNG sequences diverge and
+        // pick_next returns different worker IDs.
+        let _timeslice = ring.roll_timeslice(self.timeslice_min, self.timeslice_max);
+
+        let cursor = &self.cursors[ctx.worker_idx];
+        let first = cursor.current_target()?;
+        let accumulated = self.accumulated_rbc[ctx.worker_idx].get();
+        let delta = first.structop_rbc.saturating_sub(accumulated);
+
+        Some(PreemptTarget {
+            count_rbc: RbcTarget::Relative(RelativeRbc(delta)),
+            target_rip: Some(first.instruction_pointer),
+        })
+    }
+
+    fn arm(&self, _ctx: &mut E9PatchReplayWorkerCtx, target: PreemptTarget) {
+        let delta = match target.count_rbc {
+            RbcTarget::Relative(RelativeRbc(n)) => n,
+            RbcTarget::Absolute(_) => {
+                panic!(
+                    "E9PatchReplayBackend::arm() expects RbcTarget::Relative, \
+                     got Absolute"
+                );
+            }
+        };
+        // Arm the e9 counter to fire after `delta` branches.
+        // SAFETY: `self.fns.arm` is a valid function pointer resolved from
+        // the loaded `.so` via `E9PatchFns::resolve`. Token held.
+        unsafe { (self.fns.arm)(delta) };
+    }
+
+    fn disarm(&self, _ctx: &mut E9PatchReplayWorkerCtx) -> StructopDelta {
+        // SAFETY: `self.fns.disarm` is a valid function pointer. Token held.
+        unsafe { (self.fns.disarm)() };
+        StructopDelta {
+            rbc_total: 0,
+            interleave_count: preempt::structop_info().interleave_count,
+        }
+    }
+
+    fn worker_teardown(&self, _ctx: E9PatchReplayWorkerCtx) {
+        preempt::uninstall_e9_replay();
+        preempt::uninstall();
+    }
+
+    fn global_teardown(&self) {
+        // Disarm so the trampoline becomes a no-op (armed=0 -> early return).
+        // SAFETY: `self.fns.disarm` is a valid function pointer.
+        unsafe { (self.fns.disarm)() };
+    }
+
+    fn log_completion(&self, ring: &PreemptRing) {
+        let yield_calls = preempt::e9_yield_call_count();
+        info!(
+            signal_preemptions = ring.signal_preemptions(),
+            cooperative_yields = ring.cooperative_yields(),
+            e9_yield_calls = yield_calls,
+            "e9patch replay interleave: complete"
+        );
+    }
+
+    fn is_precise(&self) -> bool {
+        true
+    }
+
+    fn read_count(&self, _ctx: &E9PatchReplayWorkerCtx) -> u64 {
+        preempt::e9_read_counter() as u64
     }
 }
