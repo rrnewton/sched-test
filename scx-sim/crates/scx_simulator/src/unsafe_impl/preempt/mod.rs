@@ -2364,8 +2364,9 @@ extern "C" fn replay_pmu_handler(
 
 /// Validate structop name and count match between trace and replay.
 ///
-/// Async-signal-safe: uses only StackWriter + write_stderr + abort.
-/// Panics (aborts) with a clear message on mismatch.
+/// Async-signal-safe: uses only StackWriter + write_stderr.
+/// On mismatch, sets `REPLAY_OVERSHOT` so the outer retry loop can
+/// discard this attempt and retry, rather than fatally aborting.
 fn replay_validate_structop(target: &PreemptionRecord, sinfo: &StructopInfo) {
     // Skip validation if overshoot detected (possibly concurrent).
     if REPLAY_OVERSHOT.load(SeqCst) {
@@ -2378,14 +2379,15 @@ fn replay_validate_structop(target: &PreemptionRecord, sinfo: &StructopInfo) {
         let mut w = StackWriter::new(&mut buf);
         let _ = writeln!(
             w,
-            "REPLAY MISMATCH: ops context at seq={}: trace={}, replay={}",
+            "REPLAY OVERSHOOT: ops context mismatch at seq={}: trace={}, replay={} \
+             — flagging retry",
             target.sequence,
             target.ops_context.short_name(),
             sinfo.ops_context.short_name(),
         );
         write_stderr(w.as_bytes());
-        // SAFETY: `libc::abort()` is async-signal-safe per POSIX.
-        unsafe { libc::abort() };
+        REPLAY_OVERSHOT.store(true, SeqCst);
+        return;
     }
 
     // Validate structop counts match.
@@ -2394,7 +2396,8 @@ fn replay_validate_structop(target: &PreemptionRecord, sinfo: &StructopInfo) {
         let mut w = StackWriter::new(&mut buf);
         let _ = writeln!(
             w,
-            "REPLAY MISMATCH: structop at seq={}: trace={}:{}, replay={}:{}",
+            "REPLAY OVERSHOOT: structop mismatch at seq={}: trace={}:{}, replay={}:{} \
+             — flagging retry",
             target.sequence,
             target.structop_local,
             target.structop_global,
@@ -2402,8 +2405,8 @@ fn replay_validate_structop(target: &PreemptionRecord, sinfo: &StructopInfo) {
             sinfo.global_count,
         );
         write_stderr(w.as_bytes());
-        // SAFETY: `libc::abort()` is async-signal-safe per POSIX.
-        unsafe { libc::abort() };
+        REPLAY_OVERSHOT.store(true, SeqCst);
+        return;
     }
 
     // Soft-check kfunc_count: warn but don't abort on mismatch.
@@ -2528,7 +2531,12 @@ extern "C" fn replay_bp_handler(
         None => return,
     };
     let saved_cpu = saved.current_cpu;
-    let saved_ops_ctx = saved.ops_context;
+
+    // Read ops_context from per-thread TLS rather than CALLBACK_CTX,
+    // matching the recording handler (preempt_handler). CALLBACK_CTX
+    // may diverge from the thread-local after yield/restore cycles;
+    // using the same source as recording avoids replay mismatches.
+    let saved_ops_ctx = current_ops_context();
 
     // 4. Track structop RBC.
     record_rbc_preemption(target.rbc_count);
