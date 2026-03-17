@@ -1,10 +1,11 @@
 ---
 title: Replay SIGABRT crashes during preemptive determinism testing
-status: open
+status: closed
 priority: 2
 issue_type: bug
 created_at: 2026-03-14T17:14:47.731384547+00:00
-updated_at: 2026-03-15T20:06:32.771099009+00:00
+updated_at: 2026-03-17T14:01:45.416512823+00:00
+closed_at: 2026-03-17T14:01:45.416512733+00:00
 ---
 
 # Description
