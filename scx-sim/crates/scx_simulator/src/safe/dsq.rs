@@ -96,6 +96,35 @@ impl Dsq {
         result
     }
 
+    /// Pop the first task matching a predicate, in priority order.
+    ///
+    /// Like `pop`, but skips tasks for which `predicate` returns false.
+    /// This mirrors the kernel's DSQ iterator behavior where
+    /// `scx_bpf_dsq_move_to_local` skips tasks that can't run on the
+    /// consuming CPU (e.g. cpumask mismatch).
+    pub fn pop_first_matching(&mut self, predicate: impl Fn(Pid) -> bool) -> Option<Pid> {
+        let result = match self.mode {
+            DsqMode::Priq => {
+                let key = self
+                    .vtime_entries
+                    .iter()
+                    .find(|(_, &pid)| predicate(pid))
+                    .map(|(&k, _)| k)?;
+                let pid = self.vtime_entries.remove(&key).unwrap();
+                Some(pid)
+            }
+            DsqMode::Fifo => {
+                let pos = self.fifo_entries.iter().position(|&pid| predicate(pid))?;
+                self.fifo_entries.remove(pos)
+            }
+            DsqMode::Empty => None,
+        };
+        if self.is_empty() {
+            self.mode = DsqMode::Empty;
+        }
+        result
+    }
+
     /// Number of queued tasks.
     pub fn len(&self) -> usize {
         self.vtime_entries.len() + self.fifo_entries.len()
@@ -196,6 +225,26 @@ impl DsqManager {
     pub fn move_to_local(&mut self, dsq_id: DsqId, cpu: &mut SimCpu) -> bool {
         if let Some(dsq) = self.dsqs.get_mut(&dsq_id) {
             if let Some(pid) = dsq.pop() {
+                cpu.local_dsq.push_back(pid);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Move the first task matching a predicate from a DSQ to a CPU's local DSQ.
+    ///
+    /// Like `move_to_local`, but skips tasks for which `predicate` returns
+    /// false. This mirrors the kernel's `scx_bpf_dsq_move_to_local` which
+    /// skips tasks that can't run on the consuming CPU (cpumask check).
+    pub fn move_to_local_filtered(
+        &mut self,
+        dsq_id: DsqId,
+        cpu: &mut SimCpu,
+        predicate: impl Fn(Pid) -> bool,
+    ) -> bool {
+        if let Some(dsq) = self.dsqs.get_mut(&dsq_id) {
+            if let Some(pid) = dsq.pop_first_matching(predicate) {
                 cpu.local_dsq.push_back(pid);
                 return true;
             }
