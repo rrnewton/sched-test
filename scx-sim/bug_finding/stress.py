@@ -18,6 +18,7 @@ Usage:
 import argparse
 import json
 import logging
+import multiprocessing
 import os
 import random
 import shutil
@@ -307,6 +308,14 @@ E9_DETERMINISM_REPEATS = 3
 WATCHDOG_TIMEOUT = DEFAULT_WATCHDOG_TIMEOUT
 SIM_DURATION = DEFAULT_SIM_DURATION
 DETERMINISM_MODE = False
+
+# PMU token pool: limits concurrent PMU-signal preemptive instances
+PMU_TOKEN_POOL: Optional[multiprocessing.Semaphore] = None
+MAX_PMU_CONCURRENT = 4  # Default: 4 concurrent PMU users (configurable via --max-pmu)
+
+# PMU stats counters (shared across processes)
+PMU_ACQUIRED: Optional[multiprocessing.Value] = None
+PMU_REDIRECTED: Optional[multiprocessing.Value] = None
 
 # Global logger (configured in main)
 log: logging.Logger = logging.getLogger("stress")
@@ -921,8 +930,42 @@ def run_determinism_e9patch(config: TestConfig) -> Optional[Finding]:
         )
 
 
-def run_one(config: TestConfig) -> Optional[Finding]:
-    """Run a single simulation and return a Finding if it fails."""
+# Worker-local copies of config generation parameters (set by _init_worker)
+_WORKER_SCHEDULERS: list[str] = []
+_WORKER_WORKLOADS: list[Path] = []
+_WORKER_MODES: list[str] = []
+_WORKER_USE_RANDOM_WORKLOADS: bool = False
+
+
+def _init_worker(
+    pmu_pool: Optional[multiprocessing.Semaphore],
+    pmu_acquired: Optional[multiprocessing.Value],
+    pmu_redirected: Optional[multiprocessing.Value],
+    schedulers: list[str],
+    workloads: list[str],
+    modes: list[str],
+    use_random_workloads: bool,
+) -> None:
+    """Initializer for pool workers: install shared PMU state as globals."""
+    global PMU_TOKEN_POOL, PMU_ACQUIRED, PMU_REDIRECTED
+    global _WORKER_SCHEDULERS, _WORKER_WORKLOADS, _WORKER_MODES
+    global _WORKER_USE_RANDOM_WORKLOADS
+    PMU_TOKEN_POOL = pmu_pool
+    PMU_ACQUIRED = pmu_acquired
+    PMU_REDIRECTED = pmu_redirected
+    _WORKER_SCHEDULERS = schedulers
+    _WORKER_WORKLOADS = [Path(w) for w in workloads]
+    _WORKER_MODES = modes
+    _WORKER_USE_RANDOM_WORKLOADS = use_random_workloads
+
+
+def needs_pmu_token(config: TestConfig) -> bool:
+    """Check if this config needs PMU hardware (preemptive mode, not e9patch)."""
+    return config.interleave_mode == "preemptive"
+
+
+def _run_config(config: TestConfig) -> Optional[Finding]:
+    """Execute a single simulation config and return a Finding on failure."""
     # In determinism mode, use specialized handlers per interleave mode.
     if DETERMINISM_MODE:
         if config.interleave_mode == "preemptive":
@@ -987,6 +1030,68 @@ def run_one(config: TestConfig) -> Optional[Finding]:
             stdout="",
             wall_time_sec=elapsed,
         )
+
+
+# Number of retries to find a non-PMU config when PMU tokens are exhausted.
+_PMU_RETRY_LIMIT = 3
+
+
+def _record_pmu_acquired() -> None:
+    """Atomically increment the PMU-acquired counter."""
+    if PMU_ACQUIRED is not None:
+        with PMU_ACQUIRED.get_lock():
+            PMU_ACQUIRED.value += 1
+
+
+def _record_pmu_redirected() -> None:
+    """Atomically increment the PMU-redirected counter."""
+    if PMU_REDIRECTED is not None:
+        with PMU_REDIRECTED.get_lock():
+            PMU_REDIRECTED.value += 1
+
+
+def run_one(config: TestConfig) -> Optional[Finding]:
+    """Run a single simulation, gating PMU access via the token pool.
+
+    If this config needs PMU and no token is immediately available, we retry
+    up to _PMU_RETRY_LIMIT times to regenerate a non-PMU config.  If all
+    retries also need PMU, we sleep briefly and block-acquire a token.
+    """
+    if not needs_pmu_token(config) or PMU_TOKEN_POOL is None:
+        return _run_config(config)
+
+    if PMU_TOKEN_POOL.acquire(block=False):
+        _record_pmu_acquired()
+        try:
+            return _run_config(config)
+        finally:
+            PMU_TOKEN_POOL.release()
+
+    # PMU busy -- try to regenerate a non-PMU config.
+    # We use a per-call RNG seeded from the config to stay deterministic
+    # within each worker while still producing varied retries.
+    retry_rng = random.Random(config.seed ^ config.iteration)
+    for _ in range(_PMU_RETRY_LIMIT):
+        alt = generate_configs(
+            retry_rng,
+            _WORKER_SCHEDULERS,
+            _WORKER_WORKLOADS,
+            _WORKER_MODES,
+            use_random_workloads=_WORKER_USE_RANDOM_WORKLOADS,
+        )
+        alt.iteration = config.iteration
+        if not needs_pmu_token(alt):
+            _record_pmu_redirected()
+            return _run_config(alt)
+
+    # All retries also need PMU -- sleep briefly then block.
+    time.sleep(0.1)
+    PMU_TOKEN_POOL.acquire(block=True)
+    _record_pmu_acquired()
+    try:
+        return _run_config(config)
+    finally:
+        PMU_TOKEN_POOL.release()
 
 
 def _random_sim_params(rng: random.Random) -> SimParams:
@@ -1133,6 +1238,12 @@ def main():
              "generated rt-app JSON. Also randomizes simulator parameters "
              "(rbc-ns, watchdog timeout, noise, overhead).",
     )
+    parser.add_argument(
+        "--max-pmu",
+        type=int,
+        default=MAX_PMU_CONCURRENT,
+        help=f"Max concurrent PMU preemptive runs (default: {MAX_PMU_CONCURRENT})",
+    )
     args = parser.parse_args()
 
     # Handle --list-workloads early (before other setup)
@@ -1222,6 +1333,7 @@ def main():
         print(f"  Watchdog choices: {WATCHDOG_CHOICES}")
     print(f"Interleave modes: {', '.join(modes)}")
     print(f"Watchdog: {WATCHDOG_TIMEOUT}, sim duration: {SIM_DURATION}")
+    print(f"Max PMU concurrent: {args.max_pmu}")
     if "e9patch" in modes:
         print(f"e9patch determinism repeats: {E9_DETERMINISM_REPEATS}")
     print(f"Output: {OUTPUT_DIR}")
@@ -1240,6 +1352,12 @@ def main():
     log.info(f"Interleave modes: {', '.join(modes)}")
     log.info(f"Watchdog timeout: {WATCHDOG_TIMEOUT}")
     log.info(f"Sim duration: {SIM_DURATION}")
+    log.info(f"Max PMU concurrent: {args.max_pmu}")
+
+    # Initialize shared PMU token pool and stats counters
+    pmu_pool = multiprocessing.Semaphore(args.max_pmu)
+    pmu_acquired = multiprocessing.Value("i", 0)
+    pmu_redirected = multiprocessing.Value("i", 0)
 
     findings: list[Finding] = []
     total_runs = 0
@@ -1248,8 +1366,19 @@ def main():
     # Pre-generate a batch of configs
     batch_size = args.jobs * 4
 
+    # Serialize workload paths as strings for cross-process pickling
+    workload_strs = [str(w) for w in workloads]
+
     try:
-        with ProcessPoolExecutor(max_workers=args.jobs) as pool:
+        with ProcessPoolExecutor(
+            max_workers=args.jobs,
+            initializer=_init_worker,
+            initargs=(
+                pmu_pool, pmu_acquired, pmu_redirected,
+                schedulers, workload_strs, modes,
+                args.random_workloads,
+            ),
+        ) as pool:
             pending = {}
             iteration = 0
 
@@ -1334,6 +1463,8 @@ def main():
 
     # Final report
     elapsed_total = (time.monotonic() - start_time) / 60
+    pmu_acq = pmu_acquired.value
+    pmu_redir = pmu_redirected.value
     print(f"\n\n{'=' * 60}")
     print(f"Stress test complete")
     print(f"{'=' * 60}")
@@ -1341,6 +1472,7 @@ def main():
     print(f"  Findings:    {len(findings)}")
     print(f"  Master seed: {master_seed}")
     print(f"  Elapsed:     {elapsed_total:.1f} minutes")
+    print(f"  PMU tokens:  {pmu_acq} acquired, {pmu_redir} redirected to non-PMU")
 
     log.info("=" * 60)
     log.info("Stress test complete")
@@ -1349,6 +1481,7 @@ def main():
     log.info(f"Findings: {len(findings)}")
     log.info(f"Master seed: {master_seed}")
     log.info(f"Elapsed: {elapsed_total:.1f} minutes")
+    log.info(f"PMU tokens: {pmu_acq} acquired, {pmu_redir} redirected to non-PMU")
 
     if findings:
         print(f"\n  Findings by type:")
