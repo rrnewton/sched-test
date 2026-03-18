@@ -442,11 +442,24 @@ class Finding:
         if self.error_type.startswith("record_"):
             # Phase 1 failed during preemptive determinism
             cmd.append("--record-preemptions /tmp/repro.preempt")
-        elif self.error_type.startswith("replay_"):
-            # Phase 2 failed during preemptive determinism (record+replay)
+        elif self.error_type.startswith(("replay_", "replay2_")):
+            # Replay failed during preemptive determinism (record+replay)
             record_cmd = " ".join(cmd + ["--record-preemptions /tmp/repro.preempt"])
             replay_cmd = f"{SCXSIM} replay /tmp/repro.preempt"
             return f"{record_cmd} && {replay_cmd}"
+        elif self.error_type in (
+            "replay_output_mismatch", "replay_nondeterminism",
+        ):
+            # Record then replay twice to compare
+            record_cmd = " ".join(cmd + ["--record-preemptions /tmp/repro.preempt"])
+            replay_cmd = f"{SCXSIM} replay /tmp/repro.preempt"
+            return f"{record_cmd} && {replay_cmd} && {replay_cmd}"
+        elif self.error_type in ("e9_replay_", "cross_replay_mismatch"):
+            # Cross-mechanism: record + e9patch replay + hw replay
+            record_cmd = " ".join(cmd + ["--record-preemptions /tmp/repro.preempt"])
+            e9_replay = f"{SCXSIM} replay /tmp/repro.preempt --preempt-mode e9patch"
+            hw_replay = f"{SCXSIM} replay /tmp/repro.preempt"
+            return f"{record_cmd} && {e9_replay} && {hw_replay}"
         elif self.error_type == "determinism":
             cmd.append("--determinism-check")
         return " ".join(cmd)
@@ -509,8 +522,157 @@ def classify_error(returncode: int, stderr: str) -> str:
         return "other"
 
 
+_SIMULATION_METRIC_KEYS = [
+    "total_events", "total_ticks", "total_yields", "total_preempts",
+    "total_sleeps", "total_wakes", "total_idle_periods",
+    "global_dsq_dispatches", "local_dsq_dispatches",
+]
+
+
+def _extract_simulation_metrics(stdout: str) -> dict[str, str]:
+    """Extract determinism-relevant metrics from scxsim stdout."""
+    metrics: dict[str, str] = {}
+    for line in stdout.splitlines():
+        stripped = line.strip()
+        for key in _SIMULATION_METRIC_KEYS:
+            if stripped.startswith(f"{key}:"):
+                metrics[key] = stripped.split(":")[-1].strip()
+    return metrics
+
+
+def _compare_simulation_metrics(
+    metrics_a: dict[str, str],
+    metrics_b: dict[str, str],
+    label_a: str,
+    label_b: str,
+) -> str:
+    """Compare two sets of simulation metrics.
+
+    Returns empty string if identical, otherwise a description of first
+    divergence.
+    """
+    all_keys = sorted(set(metrics_a) | set(metrics_b))
+    for key in all_keys:
+        val_a = metrics_a.get(key, "(missing)")
+        val_b = metrics_b.get(key, "(missing)")
+        if val_a != val_b:
+            return (
+                f"metric '{key}' differs ({label_a} vs {label_b}): "
+                f"{val_a} vs {val_b}"
+            )
+    return ""
+
+
+def _run_replay(
+    trace_path: str,
+    extra_args: Optional[list[str]] = None,
+) -> subprocess.CompletedProcess:
+    """Execute a scxsim replay command and return the CompletedProcess."""
+    cmd = [str(SCXSIM), "replay", trace_path]
+    if extra_args:
+        cmd.extend(extra_args)
+    return subprocess.run(
+        cmd, capture_output=True, text=True, timeout=PROCESS_TIMEOUT_SEC
+    )
+
+
+def _make_finding(
+    config: TestConfig,
+    error_type: str,
+    exit_code: int,
+    stderr: str,
+    stdout: str,
+    start: float,
+) -> Finding:
+    """Create a Finding with wall_time computed from start."""
+    return Finding(
+        config=config,
+        error_type=error_type,
+        exit_code=exit_code,
+        stderr=stderr.strip(),
+        stdout=stdout.strip(),
+        wall_time_sec=time.monotonic() - start,
+    )
+
+
+def _record_preemptions(
+    config: TestConfig, trace_path: str, start: float,
+) -> tuple[Optional[Finding], Optional[subprocess.CompletedProcess]]:
+    """Record preemption points. Returns (finding, result) -- finding is set
+    only on failure."""
+    cmd = build_base_cmd(config) + ["--record-preemptions", trace_path]
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, timeout=PROCESS_TIMEOUT_SEC
+    )
+    if result.returncode != 0:
+        error_type = classify_error(result.returncode, result.stderr)
+        return (
+            _make_finding(
+                config, f"record_{error_type}",
+                result.returncode, result.stderr, result.stdout, start,
+            ),
+            None,
+        )
+    return None, result
+
+
+def _check_replay_vs_record(
+    config: TestConfig,
+    record_result: subprocess.CompletedProcess,
+    replay_result: subprocess.CompletedProcess,
+    start: float,
+) -> Optional[Finding]:
+    """Compare record and replay metrics, return Finding on mismatch."""
+    record_metrics = _extract_simulation_metrics(record_result.stdout)
+    replay_metrics = _extract_simulation_metrics(replay_result.stdout)
+    diff = _compare_simulation_metrics(
+        record_metrics, replay_metrics, "record", "replay",
+    )
+    if diff:
+        combined_stderr = (
+            f"record vs replay output mismatch: {diff}\n\n"
+            f"--- record stdout ---\n{record_result.stdout.strip()}\n\n"
+            f"--- replay stdout ---\n{replay_result.stdout.strip()}"
+        )
+        return _make_finding(
+            config, "replay_output_mismatch",
+            1, combined_stderr, replay_result.stdout, start,
+        )
+    return None
+
+
+def _check_replay_replay(
+    config: TestConfig,
+    replay1_result: subprocess.CompletedProcess,
+    replay2_result: subprocess.CompletedProcess,
+    start: float,
+) -> Optional[Finding]:
+    """Compare two replay runs, return Finding on mismatch."""
+    metrics1 = _extract_simulation_metrics(replay1_result.stdout)
+    metrics2 = _extract_simulation_metrics(replay2_result.stdout)
+    diff = _compare_simulation_metrics(metrics1, metrics2, "replay1", "replay2")
+    if diff:
+        combined_stderr = (
+            f"replay nondeterminism: {diff}\n\n"
+            f"--- replay 1 stdout ---\n{replay1_result.stdout.strip()}\n\n"
+            f"--- replay 2 stdout ---\n{replay2_result.stdout.strip()}"
+        )
+        return _make_finding(
+            config, "replay_nondeterminism",
+            1, combined_stderr, replay1_result.stdout, start,
+        )
+    return None
+
+
 def run_determinism_preemptive(config: TestConfig) -> Optional[Finding]:
-    """Record preemption points in run 1, replay them in run 2, compare."""
+    """Record preemption points, replay, compare outputs, replay again.
+
+    Checks:
+    1. Record with PMU succeeds
+    2. Replay with HW breakpoint succeeds
+    3. Record vs replay metrics match (replay_output_mismatch)
+    4. Two replays of same trace match (replay_nondeterminism)
+    """
     start = time.monotonic()
     tmpfile = None
     try:
@@ -519,66 +681,135 @@ def run_determinism_preemptive(config: TestConfig) -> Optional[Finding]:
         )
         tmpfile.close()
 
-        # Run 1: record preemption points (nondeterministic PMU)
-        cmd1 = build_base_cmd(config) + ["--record-preemptions", tmpfile.name]
-        result1 = subprocess.run(
-            cmd1, capture_output=True, text=True, timeout=PROCESS_TIMEOUT_SEC
+        # Phase 1: record preemption points (nondeterministic PMU)
+        finding, record_result = _record_preemptions(
+            config, tmpfile.name, start,
         )
-        if result1.returncode != 0:
-            elapsed = time.monotonic() - start
-            error_type = classify_error(result1.returncode, result1.stderr)
-            return Finding(
-                config=config,
-                error_type=f"record_{error_type}",
-                exit_code=result1.returncode,
-                stderr=result1.stderr.strip(),
-                stdout=result1.stdout.strip(),
-                wall_time_sec=elapsed,
+        if finding:
+            return finding
+
+        # Phase 2: replay preemption points (deterministic hw breakpoint)
+        replay1 = _run_replay(tmpfile.name)
+        if replay1.returncode != 0:
+            error_type = classify_error(replay1.returncode, replay1.stderr)
+            return _make_finding(
+                config, f"replay_{error_type}",
+                replay1.returncode, replay1.stderr, replay1.stdout, start,
             )
 
-        # Run 2: replay preemption points (deterministic hw breakpoint).
-        # Replay is a separate subcommand; the trace file embeds all
-        # scenario parameters (cpus, seed, duration, scheduler .so path).
-        cmd2 = [str(SCXSIM), "replay", tmpfile.name]
-        result2 = subprocess.run(
-            cmd2, capture_output=True, text=True, timeout=PROCESS_TIMEOUT_SEC
+        # Phase 3: compare record vs replay metrics
+        finding = _check_replay_vs_record(
+            config, record_result, replay1, start,
         )
-        elapsed = time.monotonic() - start
+        if finding:
+            return finding
 
-        if result2.returncode != 0:
-            error_type = classify_error(result2.returncode, result2.stderr)
-            return Finding(
-                config=config,
-                error_type=f"replay_{error_type}",
-                exit_code=result2.returncode,
-                stderr=result2.stderr.strip(),
-                stdout=result2.stdout.strip(),
-                wall_time_sec=elapsed,
+        # Phase 4: replay again, compare with first replay
+        replay2 = _run_replay(tmpfile.name)
+        if replay2.returncode != 0:
+            error_type = classify_error(replay2.returncode, replay2.stderr)
+            return _make_finding(
+                config, f"replay2_{error_type}",
+                replay2.returncode, replay2.stderr, replay2.stdout, start,
             )
 
-        # Both runs succeeded — determinism check passed
+        return _check_replay_replay(config, replay1, replay2, start)
+
+    except subprocess.TimeoutExpired:
+        return _make_finding(
+            config, "timeout", -1,
+            f"process timed out after {PROCESS_TIMEOUT_SEC}s", "", start,
+        )
+    except Exception as e:
+        return _make_finding(config, "other", -1, str(e), "", start)
+    finally:
+        if tmpfile and os.path.exists(tmpfile.name):
+            os.unlink(tmpfile.name)
+
+
+def run_determinism_preemptive_e9_replay(
+    config: TestConfig,
+) -> Optional[Finding]:
+    """Record with PMU, replay with e9patch, compare outputs.
+
+    Cross-mechanism test: verifies that e9patch replay of a PMU-recorded
+    trace produces the same results as HW breakpoint replay.
+
+    Checks:
+    1. Record with PMU succeeds
+    2. Replay with e9patch succeeds
+    3. Replay with HW breakpoint succeeds
+    4. e9patch replay vs HW breakpoint replay metrics match
+    """
+    start = time.monotonic()
+    tmpfile = None
+    try:
+        tmpfile = tempfile.NamedTemporaryFile(
+            suffix=".preempt", delete=False, prefix="scxsim_"
+        )
+        tmpfile.close()
+
+        # Phase 1: record preemption points (nondeterministic PMU)
+        finding, _record_result = _record_preemptions(
+            config, tmpfile.name, start,
+        )
+        if finding:
+            return finding
+
+        # Phase 2: replay with e9patch
+        e9_replay = _run_replay(
+            tmpfile.name, ["--preempt-mode", "e9patch"],
+        )
+        if e9_replay.returncode != 0:
+            error_type = classify_error(
+                e9_replay.returncode, e9_replay.stderr,
+            )
+            return _make_finding(
+                config, f"e9_replay_{error_type}",
+                e9_replay.returncode, e9_replay.stderr,
+                e9_replay.stdout, start,
+            )
+
+        # Phase 3: replay with HW breakpoint (reference)
+        hw_replay = _run_replay(tmpfile.name)
+        if hw_replay.returncode != 0:
+            error_type = classify_error(
+                hw_replay.returncode, hw_replay.stderr,
+            )
+            return _make_finding(
+                config, f"replay_{error_type}",
+                hw_replay.returncode, hw_replay.stderr,
+                hw_replay.stdout, start,
+            )
+
+        # Phase 4: compare e9patch replay vs HW breakpoint replay metrics
+        e9_metrics = _extract_simulation_metrics(e9_replay.stdout)
+        hw_metrics = _extract_simulation_metrics(hw_replay.stdout)
+        diff = _compare_simulation_metrics(
+            e9_metrics, hw_metrics, "e9patch_replay", "hw_replay",
+        )
+        if diff:
+            combined_stderr = (
+                f"cross-mechanism replay mismatch: {diff}\n\n"
+                f"--- e9patch replay stdout ---\n"
+                f"{e9_replay.stdout.strip()}\n\n"
+                f"--- hw replay stdout ---\n"
+                f"{hw_replay.stdout.strip()}"
+            )
+            return _make_finding(
+                config, "cross_replay_mismatch",
+                1, combined_stderr, e9_replay.stdout, start,
+            )
+
         return None
 
     except subprocess.TimeoutExpired:
-        elapsed = time.monotonic() - start
-        return Finding(
-            config=config,
-            error_type="timeout",
-            exit_code=-1,
-            stderr=f"process timed out after {PROCESS_TIMEOUT_SEC}s",
-            stdout="",
-            wall_time_sec=elapsed,
+        return _make_finding(
+            config, "timeout", -1,
+            f"process timed out after {PROCESS_TIMEOUT_SEC}s", "", start,
         )
     except Exception as e:
-        elapsed = time.monotonic() - start
-        return Finding(
-            config=config,
-            error_type="other",
-            exit_code=-1,
-            stderr=str(e),
-            stdout="",
-            wall_time_sec=elapsed,
-        )
+        return _make_finding(config, "other", -1, str(e), "", start)
     finally:
         if tmpfile and os.path.exists(tmpfile.name):
             os.unlink(tmpfile.name)
@@ -695,7 +926,14 @@ def run_one(config: TestConfig) -> Optional[Finding]:
     # In determinism mode, use specialized handlers per interleave mode.
     if DETERMINISM_MODE:
         if config.interleave_mode == "preemptive":
-            return run_determinism_preemptive(config)
+            finding = run_determinism_preemptive(config)
+            if finding:
+                return finding
+            # If e9patch schedulers are available, also test cross-mechanism
+            # replay (PMU record -> e9patch replay) on ~30% of runs.
+            if e9_schedulers_available() and random.random() < 0.3:
+                return run_determinism_preemptive_e9_replay(config)
+            return None
         elif config.interleave_mode == "e9patch":
             return run_determinism_e9patch(config)
 
