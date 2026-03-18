@@ -1188,6 +1188,11 @@ where
     let arc = SIM_ARC
         .with(|c| c.borrow().clone())
         .expect("kfunc called outside of simulator context (SIM_ARC not installed)");
+    // Disable PMU timer BEFORE acquiring the mutex.  If the signal fires
+    // while the mutex is held, the handler parks this worker via
+    // yield_token().  Any other worker woken next will block on the same
+    // mutex → deadlock.  Disabling the timer first closes that window.
+    crate::preempt::pause_timer();
     let result = {
         let mut guard = arc.lock().unwrap();
         let sim = &mut guard.sim;
@@ -1205,7 +1210,6 @@ where
         sim.rbc_kfunc_calls += 1;
         sim.rbc_kfunc_ns += cost_ns;
         rbc_pause_inner(sim);
-        crate::preempt::pause_timer();
         let result = f(sim);
         rbc_resume_inner(sim);
         result

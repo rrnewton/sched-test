@@ -1,0 +1,15 @@
+# Nextest timeout configuration.
+#
+# Ensures validate.sh never hangs: tests that exceed the slow-timeout
+# period are terminated after `terminate-after` additional periods.
+#
+#   effective timeout = period * (1 + terminate-after)
+#
+# Default profile: 60s * 3 = 180s for unit tests.
+# "ci" profile: tighter timeouts for automated runs.
+
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 2 }
+
+[profile.ci]
+slow-timeout = { period = "30s", terminate-after = 2 }

@@ -1413,6 +1413,18 @@ unsafe impl Send for PreemptCtx {}
 
 thread_local! {
     static PREEMPT_CTX: Cell<Option<PreemptCtx>> = const { Cell::new(None) };
+    /// When non-zero, the PMU signal handler must NOT yield.
+    ///
+    /// This prevents a deadlock where a PMU signal fires while the thread
+    /// holds the SIM_ARC mutex.  The handler parks the worker via
+    /// `yield_token()`, the woken worker blocks on the same mutex, and
+    /// the system deadlocks.  Setting this flag before `Mutex::lock()`
+    /// and clearing it after drop tells the handler to just disable the
+    /// timer and return — the next cooperative yield at a kfunc boundary
+    /// will yield instead.
+    ///
+    /// The flag is a `Cell<u32>` (not `bool`) to support nesting.
+    static PREEMPT_INHIBIT: Cell<u32> = const { Cell::new(0) };
 }
 
 /// Install preemptive interleave context on the current worker thread.
@@ -1440,6 +1452,50 @@ pub fn install(
 /// Remove preemptive interleave context from the current thread.
 pub fn uninstall() {
     PREEMPT_CTX.with(|c| c.set(None));
+}
+
+/// Inhibit PMU preemption on the current thread.
+///
+/// While inhibited, the PMU signal handler disables the timer and returns
+/// immediately instead of yielding.  This MUST be called before acquiring
+/// any mutex that other preemptive workers may also contend on (notably
+/// `SIM_ARC`).  Calls nest: each `inhibit_preemption()` must be paired
+/// with a matching [`allow_preemption`].
+///
+/// No-op on threads without a `PREEMPT_CTX` (e.g. the main thread).
+///
+/// **Async-signal-safe**: reads/writes a `Cell<u32>` thread-local, which is
+/// safe from signal handlers (single-threaded, no allocation).
+pub fn inhibit_preemption() {
+    if PREEMPT_CTX.with(|c| c.get()).is_none() {
+        return;
+    }
+    PREEMPT_INHIBIT.with(|c| c.set(c.get() + 1));
+}
+
+/// Allow PMU preemption again (undo one level of [`inhibit_preemption`]).
+///
+/// When the count drops to zero, the signal handler will yield normally.
+/// No-op on threads without a `PREEMPT_CTX` (e.g. the main thread).
+pub fn allow_preemption() {
+    if PREEMPT_CTX.with(|c| c.get()).is_none() {
+        return;
+    }
+    PREEMPT_INHIBIT.with(|c| {
+        let cur = c.get();
+        debug_assert!(
+            cur > 0,
+            "allow_preemption without matching inhibit_preemption"
+        );
+        c.set(cur - 1);
+    });
+}
+
+/// Check whether preemption is currently inhibited on this thread.
+///
+/// **Async-signal-safe**: reads a `Cell<u32>` thread-local.
+fn is_preemption_inhibited() -> bool {
+    PREEMPT_INHIBIT.with(|c| c.get() > 0)
 }
 
 /// Install preemptive interleave context for replay mode.
@@ -1826,6 +1882,15 @@ extern "C" fn preempt_handler(
         Some(ctx) => ctx,
         None => return, // Not in a preemptive interleave context.
     };
+
+    // If preemption is inhibited (e.g. the thread is about to acquire or
+    // holds a Mutex), do NOT yield.  Just disable the timer so it doesn't
+    // fire again until the next `resume_timer()` / `rearm_timer()` call
+    // at a kfunc boundary, where a cooperative yield will happen instead.
+    if is_preemption_inhibited() {
+        disable_timer(pctx.timer_fd);
+        return;
+    }
 
     // SAFETY: `pctx.ring` is a valid pointer set during `install()`.
     // The PreemptRing lives in a `thread::scope` block and outlives workers.

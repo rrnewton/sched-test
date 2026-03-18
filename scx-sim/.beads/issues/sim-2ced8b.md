@@ -1,10 +1,11 @@
 ---
 title: Cosmos scheduler stalls under interleaving modes
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-03-14T17:14:33.710225849+00:00
-updated_at: 2026-03-14T17:14:33.710225849+00:00
+updated_at: 2026-03-15T21:01:16.391084735+00:00
+closed_at: 2026-03-15T21:01:16.391084614+00:00
 ---
 
 # Description
