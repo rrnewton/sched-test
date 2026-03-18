@@ -272,19 +272,24 @@ impl PreemptionTrace {
         all.sort_by_key(|r| r.sequence);
 
         for rec in all {
-            let rip_offset = if so_base > 0 && rec.instruction_pointer >= so_base {
-                rec.instruction_pointer - so_base
-            } else {
-                rec.instruction_pointer
-            };
             let kfn = if rec.kfunc_name.is_empty() {
                 "-"
             } else {
                 rec.kfunc_name
             };
+            // Only emit rip_offset when the RIP is actually within the .so.
+            // For non-.so RIPs (main binary, libc, etc.), omit rip_offset
+            // entirely — the deserializer falls back to the raw `rip=` value.
+            // Previously, raw absolute addresses were stored as "offsets",
+            // producing garbage when added to a different so_base on replay.
+            let rip_offset_str = if so_base > 0 && rec.instruction_pointer >= so_base {
+                format!(" rip_offset=0x{:x}", rec.instruction_pointer - so_base)
+            } else {
+                String::new()
+            };
             writeln!(
                 w,
-                "seq={} ops={} kfunc={} structop={}:{} kfunc_count={} rbc={} timeslice={} rip=0x{:x} rip_offset=0x{:x} insn={} cpu={} worker={}",
+                "seq={} ops={} kfunc={} structop={}:{} kfunc_count={} rbc={} timeslice={} rip=0x{:x}{} insn={} cpu={} worker={}",
                 rec.sequence,
                 rec.ops_context.short_name(),
                 kfn,
@@ -294,7 +299,7 @@ impl PreemptionTrace {
                 rec.structop_rbc,
                 rec.rbc_count,
                 rec.instruction_pointer,
-                rip_offset,
+                rip_offset_str,
                 format_insn_bytes(&rec.insn_bytes),
                 rec.cpu_id.0,
                 rec.worker_id.0,
@@ -946,5 +951,63 @@ mod tests {
         assert!(parse_insn_hex("aabb").is_err());
         // Invalid hex chars.
         assert!(parse_insn_hex("gghhiijjkk").is_err());
+    }
+
+    #[test]
+    fn test_non_so_rip_roundtrip() {
+        // Regression test for sim-bfc6d3: RIPs outside the .so range
+        // (e.g. libc at 0x7ffff7d0xxxx, main binary at 0x555555xxxxxx)
+        // must NOT be stored as rip_offset. Previously, the raw absolute
+        // address was stored as "offset", producing garbage on replay
+        // when added to a different so_base.
+        let so_base: u64 = 0x7ffff7eb0000; // typical .so ASLR address
+        let so_rip: u64 = 0x7ffff7eb1234; // inside .so
+        let libc_rip: u64 = 0x7ffff7d01234; // below .so (libc)
+        let main_rip: u64 = 0x5555557f37e0; // main binary (far below .so)
+
+        let records = vec![
+            make_record(0, 100, so_rip, 0, 0, 1, 1, 100),
+            make_record(1, 200, libc_rip, 0, 0, 1, 1, 300),
+            make_record(2, 300, main_rip, 1, 1, 1, 2, 300),
+        ];
+
+        let trace = PreemptionTrace::from_records(&records, 2, PmuEvent::RetiredBranchConditional);
+
+        // Serialize.
+        let mut buf = Vec::new();
+        trace.serialize(&mut buf, so_base).unwrap();
+        let text = String::from_utf8(buf.clone()).unwrap();
+
+        // The .so RIP should have rip_offset.
+        // The non-.so RIPs should NOT have rip_offset.
+        let lines: Vec<&str> = text.lines().filter(|l| l.starts_with("seq=")).collect();
+        assert_eq!(lines.len(), 3);
+        assert!(
+            lines[0].contains("rip_offset="),
+            "so RIP should have rip_offset"
+        );
+        assert!(
+            !lines[1].contains("rip_offset="),
+            "libc RIP should NOT have rip_offset"
+        );
+        assert!(
+            !lines[2].contains("rip_offset="),
+            "main binary RIP should NOT have rip_offset"
+        );
+
+        // Deserialize at a DIFFERENT so_base — non-.so RIPs must be preserved.
+        let replay_base: u64 = 0x7ffff8000000;
+        let mut cursor = std::io::Cursor::new(buf);
+        let trace2 = PreemptionTrace::deserialize(&mut cursor, replay_base).unwrap();
+
+        let w0 = trace2.worker_trace(WorkerId(0));
+        // .so RIP: offset 0x1234, new base 0x7ffff8000000 → 0x7ffff8001234
+        assert_eq!(w0[0].instruction_pointer, replay_base + 0x1234);
+        // libc RIP: preserved as raw absolute address
+        assert_eq!(w0[1].instruction_pointer, libc_rip);
+
+        let w1 = trace2.worker_trace(WorkerId(1));
+        // main binary RIP: preserved as raw absolute address
+        assert_eq!(w1[0].instruction_pointer, main_rip);
     }
 }
