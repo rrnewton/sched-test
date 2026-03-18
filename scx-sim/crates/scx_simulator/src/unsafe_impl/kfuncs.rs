@@ -2061,7 +2061,7 @@ pub extern "C" fn scx_bpf_task_cgroup(p: *mut c_void, _subsys_id: i32) -> *mut c
 /// or the root cgroup if no registry is installed.
 #[no_mangle]
 pub extern "C" fn bpf_cgroup_from_id(id: u64) -> *mut c_void {
-    crate::cgroup::sim_cgroup_lookup_by_id(id)
+    crate::cgroup_ffi::sim_cgroup_lookup_by_id(id)
 }
 
 /// Get the ancestor cgroup at a given hierarchy level. Returns NULL if the
@@ -2072,7 +2072,7 @@ pub extern "C" fn bpf_cgroup_ancestor(cgrp: *mut c_void, level: i32) -> *mut c_v
     if cgrp.is_null() || level < 0 {
         return ptr::null_mut();
     }
-    crate::cgroup::sim_cgroup_lookup_ancestor(cgrp, level as u32)
+    crate::cgroup_ffi::sim_cgroup_lookup_ancestor(cgrp, level as u32)
 }
 
 /// Acquire a reference on a cgroup. No-op in the simulator.

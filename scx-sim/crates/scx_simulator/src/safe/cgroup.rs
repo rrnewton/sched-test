@@ -1,12 +1,16 @@
 //! Cgroup modeling for the simulator.
 //!
 //! This module provides a cgroup registry that tracks a hierarchy of cgroups,
-//! each with an ID, level, parent, and optional cpuset. It interfaces with
-//! C code to allocate `struct cgroup` structures that match the kernel's layout.
+//! each with an ID, level, parent, and optional cpuset. It delegates all C
+//! struct allocation/deallocation to the RAII wrappers in
+//! [`crate::cgroup_wrapper`], keeping this module free of `unsafe` code.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
 
+use crate::cgroup_wrapper::{
+    free_cgroup_raw, CgroupAlloc, CgroupPtr, CssIterGuard, SimCgroupHandle,
+};
 use crate::types::CpuId;
 
 /// Unique cgroup identifier (kernel's cgroup->kn->id).
@@ -19,7 +23,11 @@ impl CgroupId {
 }
 
 /// Information about a cgroup in the hierarchy.
-#[derive(Debug, Clone)]
+///
+/// Owns the underlying C `struct cgroup` allocation via [`CgroupAlloc`].
+/// The root cgroup uses `CgroupAlloc::Root` (non-owning, never freed);
+/// all other cgroups use `CgroupAlloc::Owned` (RAII, freed on drop).
+#[derive(Debug)]
 pub struct CgroupInfo {
     /// Unique cgroup ID.
     pub cgid: CgroupId,
@@ -31,19 +39,14 @@ pub struct CgroupInfo {
     pub cpuset: Option<Vec<CpuId>>,
     /// Name of the cgroup (for debugging/scenario API).
     pub name: String,
-    /// Raw pointer to the C `struct cgroup` allocation.
-    raw: *mut c_void,
+    /// RAII handle to the C `struct cgroup` allocation.
+    alloc: CgroupAlloc,
 }
 
-// Safety: CgroupInfo holds a raw pointer to a heap-allocated C struct.
-// The pointer is only accessed within the simulator (single-threaded).
-unsafe impl Send for CgroupInfo {}
-unsafe impl Sync for CgroupInfo {}
-
 impl CgroupInfo {
-    /// Get the raw C `struct cgroup` pointer.
+    /// Get the raw C `struct cgroup` pointer for FFI calls.
     pub fn raw(&self) -> *mut c_void {
-        self.raw
+        self.alloc.as_raw()
     }
 }
 
@@ -59,6 +62,13 @@ pub const DEFAULT_MAX_CGROUPS: u32 = 10000;
 /// LAVD uses BPF hash maps with size limits (CBW_NR_CGRP_MAX = 2048,
 /// CBW_NR_CGRP_LLC_MAX = 65536). When these maps fill up, cgroup init
 /// fails with ENOMEM. The registry simulates this with configurable limits.
+///
+/// ## RAII ownership
+///
+/// Each `CgroupInfo` owns its C allocation via [`CgroupAlloc`]. When a
+/// `CgroupInfo` is removed from the registry (via `destroy_by_name`) or
+/// the registry is dropped, the C struct is freed automatically. The root
+/// cgroup uses `CgroupAlloc::Root` which does not free on drop.
 pub struct CgroupRegistry {
     /// Map from cgroup ID to cgroup info.
     cgroups: HashMap<CgroupId, CgroupInfo>,
@@ -77,14 +87,6 @@ pub struct CgroupRegistry {
     allocated_bpf_entries: u32,
 }
 
-// FFI declarations for C cgroup allocation functions.
-extern "C" {
-    fn sim_cgroup_alloc(cgid: u64, level: u32, parent: *mut c_void) -> *mut c_void;
-    fn sim_cgroup_free(cgrp: *mut c_void);
-    fn sim_get_root_cgroup() -> *mut c_void;
-    fn sim_cgroup_set_cpuset(cgrp: *mut c_void, cpus: *const u32, nr_cpus: u32);
-}
-
 impl CgroupRegistry {
     /// Create a new cgroup registry with only the root cgroup.
     ///
@@ -94,14 +96,13 @@ impl CgroupRegistry {
     ///   Use `DEFAULT_MAX_CGROUPS` (10000) for normal tests, or a lower value
     ///   (e.g., 50) to test resource exhaustion scenarios.
     pub fn new(nr_cpus: u32, max_cgroups: u32) -> Self {
-        let root_raw = unsafe { sim_get_root_cgroup() };
         let root = CgroupInfo {
             cgid: CgroupId::ROOT,
             level: 0,
             parent_cgid: CgroupId(0), // No parent
             cpuset: None,             // All CPUs
             name: String::new(),      // Root has no name
-            raw: root_raw,
+            alloc: CgroupAlloc::Root(SimCgroupHandle::root()),
         };
 
         let mut cgroups = HashMap::new();
@@ -171,12 +172,23 @@ impl CgroupRegistry {
 
     /// Get the raw C `struct cgroup` pointer for a cgroup ID.
     pub fn get_raw(&self, cgid: CgroupId) -> Option<*mut c_void> {
-        self.cgroups.get(&cgid).map(|info| info.raw)
+        self.cgroups.get(&cgid).map(|info| info.raw())
     }
 
     /// Get the root cgroup's raw pointer.
     pub fn root_raw(&self) -> *mut c_void {
-        self.cgroups[&CgroupId::ROOT].raw
+        self.cgroups[&CgroupId::ROOT].raw()
+    }
+
+    /// Find the cgroup ID that corresponds to a raw pointer.
+    ///
+    /// Used by FFI lookup functions that receive raw pointers from C and
+    /// need to resolve them back to a `CgroupId`.
+    pub fn find_cgid_by_raw(&self, raw: *mut c_void) -> Option<CgroupId> {
+        self.cgroups
+            .values()
+            .find(|info| info.raw() == raw)
+            .map(|info| info.cgid)
     }
 
     /// Create a new cgroup as a child of the given parent.
@@ -196,18 +208,14 @@ impl CgroupRegistry {
         self.next_cgid += 1;
 
         let level = parent.level + 1;
-        let parent_raw = parent.raw;
+        let parent_ptr = parent.alloc.as_ptr();
 
-        // Allocate the C struct cgroup
-        let raw = unsafe { sim_cgroup_alloc(cgid.0, level, parent_raw) };
-        assert!(!raw.is_null(), "sim_cgroup_alloc returned null");
+        // Allocate the C struct cgroup via the RAII handle.
+        let handle = SimCgroupHandle::new(cgid.0, level, parent_ptr);
 
-        // Set cpuset if specified
+        // Set cpuset if specified.
         if let Some(ref cpus) = cpuset {
-            let cpu_ids: Vec<u32> = cpus.iter().map(|c| c.0).collect();
-            unsafe {
-                sim_cgroup_set_cpuset(raw, cpu_ids.as_ptr(), cpu_ids.len() as u32);
-            }
+            handle.set_cpuset(cpus);
         }
 
         let info = CgroupInfo {
@@ -216,7 +224,7 @@ impl CgroupRegistry {
             parent_cgid,
             cpuset,
             name: name.to_string(),
-            raw,
+            alloc: CgroupAlloc::Owned(handle),
         };
 
         self.cgroups.insert(cgid, info);
@@ -309,12 +317,7 @@ impl CgroupRegistry {
         };
 
         if let Some(info) = self.cgroups.get_mut(&cgid) {
-            // Update C-side
-            let cpu_ids: Vec<u32> = new_cpuset.iter().map(|c| c.0).collect();
-            unsafe {
-                sim_cgroup_set_cpuset(info.raw, cpu_ids.as_ptr(), cpu_ids.len() as u32);
-            }
-            // Update Rust-side
+            info.alloc.set_cpuset(&new_cpuset);
             info.cpuset = Some(new_cpuset);
             true
         } else {
@@ -325,7 +328,9 @@ impl CgroupRegistry {
     /// Destroy a cgroup by name.
     ///
     /// Returns the raw pointer to the destroyed cgroup (for calling cgroup_exit),
-    /// or `None` if the cgroup was not found. The root cgroup cannot be destroyed.
+    /// or `None` if the cgroup was not found. The C allocation is detached from
+    /// the RAII handle via `into_raw()` so it is NOT freed here — the caller
+    /// must call [`free_cgroup_raw`] after `cgroup_exit`.
     ///
     /// # Panics
     /// Panics if attempting to destroy the root cgroup.
@@ -334,170 +339,21 @@ impl CgroupRegistry {
         assert!(cgid != CgroupId::ROOT, "cannot destroy root cgroup");
 
         let info = self.cgroups.remove(&cgid)?;
-        let raw = info.raw;
-
-        // Don't free here - the caller needs the raw pointer for cgroup_exit.
-        // The raw pointer will be freed after cgroup_exit is called.
-        Some(raw)
+        // Detach the raw pointer from the RAII handle so it is not freed
+        // on drop. The caller will free it after cgroup_exit.
+        Some(info.alloc.into_raw())
     }
 
     /// Free a raw cgroup pointer after cgroup_exit has been called.
     ///
     /// Must only be called with a pointer returned from `destroy_by_name`,
     /// and only after `cgroup_exit` has been called for that cgroup.
-    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    ///
+    /// Delegates to [`free_cgroup_raw`] from the cgroup_wrapper module.
     pub fn free_raw(&self, raw: *mut c_void) {
-        if !raw.is_null() {
-            // SAFETY: `raw` was allocated by `sim_cgroup_alloc` and is being
-            // freed exactly once after the cgroup has been unregistered.
-            unsafe { sim_cgroup_free(raw) };
-        }
+        free_cgroup_raw(raw);
     }
-}
 
-impl Drop for CgroupRegistry {
-    fn drop(&mut self) {
-        // Free all non-root cgroups (root is statically allocated in sim_task.c)
-        for (cgid, info) in self.cgroups.iter() {
-            if *cgid != CgroupId::ROOT && !info.raw.is_null() {
-                unsafe { sim_cgroup_free(info.raw) };
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Global registry pointer for C callback access
-// ---------------------------------------------------------------------------
-
-use std::ptr;
-
-/// Access the cgroup registry through the simulator state.
-///
-/// Uses `try_lock()` to avoid deadlocking when called from within
-/// `with_sim()` (which already holds the mutex). Returns `None` if
-/// `SIM_ARC` is not installed or if the lock is already held.
-fn with_cgroup_registry<R>(f: impl FnOnce(&CgroupRegistry) -> R) -> Option<R> {
-    let arc = crate::kfuncs::clone_sim_arc()?;
-    let guard = arc.try_lock().ok()?;
-    Some(f(&guard.cgroup_registry))
-}
-
-/// Mutable version of with_cgroup_registry.
-///
-/// Uses `try_lock()` to avoid re-entrant deadlock (same rationale as
-/// [`with_cgroup_registry`]).
-fn with_cgroup_registry_mut<R>(f: impl FnOnce(&mut CgroupRegistry) -> R) -> Option<R> {
-    let arc = crate::kfuncs::clone_sim_arc()?;
-    let mut guard = arc.try_lock().ok()?;
-    Some(f(&mut guard.cgroup_registry))
-}
-
-/// Look up a cgroup by ID (called from C).
-///
-/// Returns the raw cgroup pointer, or null if not found.
-#[no_mangle]
-pub extern "C" fn sim_cgroup_lookup_by_id(cgid: u64) -> *mut c_void {
-    with_cgroup_registry(|registry| {
-        registry
-            .get(CgroupId(cgid))
-            .map(|info| info.raw)
-            .unwrap_or_else(ptr::null_mut)
-    })
-    .unwrap_or_else(|| unsafe { sim_get_root_cgroup() })
-}
-
-/// Look up a cgroup's ancestor at a given level (called from C).
-///
-/// Returns the ancestor's raw cgroup pointer, or null if invalid.
-#[no_mangle]
-pub extern "C" fn sim_cgroup_lookup_ancestor(cgrp: *mut c_void, level: u32) -> *mut c_void {
-    if cgrp.is_null() {
-        if level == 0 {
-            return unsafe { sim_get_root_cgroup() };
-        }
-        return ptr::null_mut();
-    }
-    with_cgroup_registry(|registry| {
-        let cgid = registry
-            .cgroups
-            .values()
-            .find(|info| info.raw == cgrp)
-            .map(|info| info.cgid);
-        match cgid {
-            Some(id) => registry
-                .ancestor(id, level)
-                .map(|info| info.raw)
-                .unwrap_or_else(ptr::null_mut),
-            None => ptr::null_mut(),
-        }
-    })
-    .unwrap_or_else(ptr::null_mut)
-}
-
-// ---------------------------------------------------------------------------
-// FFI functions for BPF map entry allocation (called from C schedulers)
-// ---------------------------------------------------------------------------
-
-/// Try to allocate a BPF map entry for a cgroup (called from C).
-///
-/// Returns 0 on success, -12 (ENOMEM) if the maximum cgroup limit has been
-/// reached. This simulates BPF hash map insertion failures.
-#[no_mangle]
-pub extern "C" fn sim_cgroup_registry_allocate() -> i32 {
-    with_cgroup_registry_mut(|registry| match registry.try_allocate_bpf_entry() {
-        Ok(()) => 0,
-        Err(e) => e,
-    })
-    .unwrap_or(0)
-}
-
-/// Free a BPF map entry for a cgroup (called from C).
-///
-/// Decrements the allocated entry count. Safe to call even if no entry
-/// was allocated.
-#[no_mangle]
-pub extern "C" fn sim_cgroup_registry_free() {
-    with_cgroup_registry_mut(|registry| {
-        registry.free_bpf_entry();
-    });
-}
-
-/// Get the current number of allocated BPF entries (called from C).
-///
-/// Returns 0 if no registry is installed.
-#[no_mangle]
-pub extern "C" fn sim_cgroup_registry_allocated_count() -> u32 {
-    with_cgroup_registry(|registry| registry.allocated_bpf_entries()).unwrap_or(0)
-}
-
-/// Get the maximum cgroup limit (called from C).
-///
-/// Returns 0 if no registry is installed.
-#[no_mangle]
-pub extern "C" fn sim_cgroup_registry_max() -> u32 {
-    with_cgroup_registry(|registry| registry.max_cgroups()).unwrap_or(0)
-}
-
-/// Set the maximum cgroup limit (called from C).
-///
-/// This allows schedulers to dynamically configure the cgroup limit.
-/// No-op if no registry is installed.
-#[no_mangle]
-pub extern "C" fn sim_cgroup_registry_set_max(max: u32) {
-    with_cgroup_registry_mut(|registry| {
-        registry.set_max_cgroups(max);
-    });
-}
-
-// FFI declarations for CSS iterator
-extern "C" {
-    fn sim_css_iter_reset();
-    fn sim_css_iter_add(cgrp: *mut c_void);
-    fn sim_css_iter_set_root(root: *mut c_void);
-}
-
-impl CgroupRegistry {
     /// Prepare the CSS iterator for iteration from the given root.
     ///
     /// This populates the C-side iteration list with all descendants
@@ -507,21 +363,13 @@ impl CgroupRegistry {
     /// Must be called from the simulator's single-threaded context
     /// (which is guaranteed by the Arc<Mutex> / token-ring protocol).
     pub fn prepare_css_iter(&self, root_cgid: CgroupId) {
-        // SAFETY: These C functions manipulate global iteration state.
-        // The simulator's single-threaded execution model (enforced by
-        // the sim_callback!/token-ring protocol) ensures no concurrent
-        // access to this state.
-        unsafe {
-            sim_css_iter_reset();
-
-            if let Some(root) = self.cgroups.get(&root_cgid) {
-                sim_css_iter_set_root(root.raw);
-
-                // Add all descendants in pre-order
-                for info in self.iter_descendants(root_cgid) {
-                    sim_css_iter_add(info.raw);
-                }
-            }
+        if let Some(root) = self.cgroups.get(&root_cgid) {
+            let root_ptr = root.alloc.as_ptr();
+            let descendants: Vec<CgroupPtr> = self
+                .iter_descendants(root_cgid)
+                .map(|info| info.alloc.as_ptr())
+                .collect();
+            let _guard = CssIterGuard::prepare(root_ptr, &descendants);
         }
     }
 
@@ -534,6 +382,9 @@ impl CgroupRegistry {
         self.prepare_css_iter(CgroupId::ROOT);
     }
 }
+
+// No manual Drop needed — `CgroupAlloc::Owned` frees via RAII on drop,
+// and `CgroupAlloc::Root` is a non-owning pointer that is not freed.
 
 #[cfg(test)]
 mod tests {
