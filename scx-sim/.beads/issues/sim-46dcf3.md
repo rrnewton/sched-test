@@ -1,10 +1,11 @@
 ---
 title: Simple scheduler stalls under cooperative interleaving
-status: open
+status: closed
 priority: 2
 issue_type: bug
 created_at: 2026-03-14T17:14:39.248206127+00:00
-updated_at: 2026-03-14T17:14:39.248206127+00:00
+updated_at: 2026-03-15T21:01:16.392803260+00:00
+closed_at: 2026-03-15T21:01:16.392803190+00:00
 ---
 
 # Description

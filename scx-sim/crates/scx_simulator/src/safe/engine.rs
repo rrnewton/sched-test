@@ -1114,8 +1114,17 @@ macro_rules! sim_callback {
         // $s is no longer used. NLL ends its borrow on $guard.
         drop($guard);
         kfuncs::install_sim_arc(&$arc);
+        // Allow PMU preemption during scheduler C code.
+        // process_event inhibits preemption around the entire event
+        // processing to prevent signal handler deadlocks with the
+        // SIM_ARC mutex.  Here we temporarily allow it while C code
+        // runs, since the mutex is not held.
+        crate::preempt::allow_preemption();
         $call
+        // Re-inhibit preemption before re-acquiring the mutex.
+        crate::preempt::inhibit_preemption();
         kfuncs::clear_sim_arc();
+        crate::preempt::pause_timer();
         $guard = $arc.lock().unwrap();
         if let Some(__ctx) = kfuncs::get_callback_ctx() {
             $guard.sim.current_cpu = __ctx.current_cpu;
@@ -1123,7 +1132,6 @@ macro_rules! sim_callback {
             $guard.sim.waker_task_raw = __ctx.waker_task_raw;
         }
         kfuncs::clear_callback_ctx();
-        crate::preempt::pause_timer();
         // Caller must rebind: let $s = &mut *$guard;
     };
 }
@@ -1961,6 +1969,34 @@ impl<S: Scheduler> Simulator<S> {
     #[allow(clippy::too_many_arguments)]
     #[allow(unused_assignments)]
     fn process_event(
+        &self,
+        event: Event,
+        sim_arc: &SimArc,
+        watchdog_timeout: Option<TimeNs>,
+        duration_ns: TimeNs,
+        max_cgroups: u32,
+        monitor: &mut dyn Monitor,
+    ) -> Option<ExitKind> {
+        // Inhibit PMU preemption for the entire event processing.
+        // The signal handler will skip yield_token() while this is set,
+        // preventing deadlocks where the handler parks a worker that
+        // holds the SIM_ARC mutex.  Preemption is briefly allowed
+        // inside sim_callback! during scheduler C code execution.
+        crate::preempt::inhibit_preemption();
+        let result = self.process_event_inner(
+            event,
+            sim_arc,
+            watchdog_timeout,
+            duration_ns,
+            max_cgroups,
+            monitor,
+        );
+        crate::preempt::allow_preemption();
+        result
+    }
+
+    #[allow(unused_assignments)]
+    fn process_event_inner(
         &self,
         event: Event,
         sim_arc: &SimArc,
