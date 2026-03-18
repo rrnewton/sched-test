@@ -876,6 +876,23 @@ fn print_simulation_summary(trace: &Trace, tasks: &HashMap<Pid, SimTask>, final_
     }
 }
 
+/// Print preemption-related RBC stats at end of simulation.
+///
+/// Shows the longest total RBC for any single structop, the longest
+/// unbroken interval between kfuncs, and the REPLAY_MARGIN constant
+/// for comparison. Only printed when RBC data was collected.
+fn print_preemption_stats(longest_structop_rbc: u64, longest_rbc_interval: u64, _is_e9: bool) {
+    if longest_structop_rbc == 0 {
+        return;
+    }
+    let margin = crate::preempt::REPLAY_MARGIN;
+    println!();
+    println!("Preemption stats:");
+    println!("  longest_structop_rbc:    {longest_structop_rbc}");
+    println!("  longest_rbc_interval:    {longest_rbc_interval}  (between kfuncs)");
+    println!("  REPLAY_MARGIN:           {margin}");
+}
+
 /// Reset kfunc accumulators and enable the RBC counter before an ops call.
 ///
 /// Set `ops_context` on both shared `SimulatorState` and the per-thread
@@ -901,10 +918,14 @@ fn start_rbc(state: &mut SimulatorState) {
     if state.e9_fns.is_some() {
         // e9patch mode: snapshot the deterministic software counter.
         // The counter decrements on each Jcc, so `snapshot - current = branches`.
-        state.rbc_e9_snapshot = crate::preempt::e9_read_counter();
+        let snapshot = crate::preempt::e9_read_counter();
+        state.rbc_e9_snapshot = snapshot;
+        state.rbc_e9_last_kfunc = snapshot;
     } else if let Some(ref rbc) = state.rbc_counter {
         let _ = rbc.reset();
         let _ = rbc.enable();
+        // PMU counter starts at 0 after reset.
+        state.rbc_pmu_last_kfunc = 0;
     }
 }
 
@@ -944,6 +965,15 @@ fn charge_sched_time(state: &mut SimulatorState, cpu: CpuId, ops: &str) {
         // Counter decrements, so snapshot - current = branches executed.
         // Clamp to 0 in case the counter was re-armed between start and now.
         let count = (state.rbc_e9_snapshot - current).max(0) as u64;
+        // Track the final RBC interval (from last kfunc to structop end).
+        let final_interval = (state.rbc_e9_last_kfunc - current).max(0) as u64;
+        if final_interval > state.longest_rbc_interval {
+            state.longest_rbc_interval = final_interval;
+        }
+        // Track longest total structop RBC.
+        if count > state.longest_structop_rbc {
+            state.longest_structop_rbc = count;
+        }
         if let Some(ns_per_rbc) = state.sched_overhead_rbc_ns {
             let rbc_ns = count * ns_per_rbc;
             let kfunc_ns = state.rbc_kfunc_ns;
@@ -965,6 +995,15 @@ fn charge_sched_time(state: &mut SimulatorState, cpu: CpuId, ops: &str) {
     } else if let Some(ref rbc) = state.rbc_counter {
         let _ = rbc.disable();
         let count = rbc.read().unwrap_or(0);
+        // Track the final RBC interval (from last kfunc to structop end).
+        let final_interval = count.saturating_sub(state.rbc_pmu_last_kfunc);
+        if final_interval > state.longest_rbc_interval {
+            state.longest_rbc_interval = final_interval;
+        }
+        // Track longest total structop RBC (PMU mode -- nondeterministic).
+        if count > state.longest_structop_rbc {
+            state.longest_structop_rbc = count;
+        }
         if let Some(ns_per_rbc) = state.sched_overhead_rbc_ns {
             let rbc_ns = count * ns_per_rbc;
             let kfunc_ns = state.rbc_kfunc_ns;
@@ -1349,6 +1388,10 @@ impl<S: Scheduler> Simulator<S> {
             rbc_kfunc_calls: 0,
             rbc_kfunc_ns: 0,
             rbc_e9_snapshot: 0,
+            rbc_e9_last_kfunc: 0,
+            rbc_pmu_last_kfunc: 0,
+            longest_structop_rbc: 0,
+            longest_rbc_interval: 0,
             bpf_error: None,
             interleave: scenario.interleave,
             preemptive: scenario.preemptive.clone(),
@@ -1942,6 +1985,13 @@ impl<S: Scheduler> Simulator<S> {
 
         // Print structop summary (per-CPU ops callbacks, RBC, kfuncs).
         crate::preempt::print_structop_summary(&s.sim.structop_accum);
+
+        // Print preemption stats (longest structop and interval RBC counts).
+        print_preemption_stats(
+            s.sim.longest_structop_rbc,
+            s.sim.longest_rbc_interval,
+            s.sim.e9_fns.is_some(),
+        );
 
         // Clear ENGINE_SIM_ARC.
         kfuncs::clear_engine_sim_arc();
