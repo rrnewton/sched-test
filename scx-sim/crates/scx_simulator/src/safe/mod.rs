@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 pub mod bpf_trace;
+pub mod cgroup;
 pub mod cpu;
 pub mod det_hashmap;
 pub mod dsq;

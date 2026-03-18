@@ -29,9 +29,6 @@
 //! trace.dump();
 //! ```
 
-// === Modules not yet fully partitioned ===
-pub mod cgroup;
-
 // === Safe modules (zero unsafe) — grouped under safe/ ===
 pub mod safe;
 
@@ -41,6 +38,7 @@ pub mod unsafe_impl;
 // Re-export safe modules at crate root so `crate::types`, `crate::dsq`, etc.
 // continue to resolve for all internal `use crate::xxx` paths.
 pub use safe::bpf_trace;
+pub use safe::cgroup;
 pub use safe::cpu;
 pub use safe::det_hashmap;
 pub use safe::dsq;
@@ -60,6 +58,7 @@ pub use safe::workloads;
 // Re-export unsafe_impl sub-modules at crate root for backward compatibility.
 // All internal `crate::ffi`, `crate::kfuncs`, etc. paths continue to resolve.
 pub use unsafe_impl::backend;
+pub use unsafe_impl::cgroup_ffi;
 pub use unsafe_impl::cgroup_wrapper;
 pub use unsafe_impl::ffi;
 pub use unsafe_impl::interleave;
