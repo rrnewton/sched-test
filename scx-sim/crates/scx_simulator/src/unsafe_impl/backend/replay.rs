@@ -311,10 +311,31 @@ impl PreemptionBackend for ReplayBackend {
     }
 
     fn log_completion(&self, ring: &PreemptRing) {
+        let mut total_targets: usize = 0;
+        let mut total_consumed: usize = 0;
+        for (i, cursor) in self.cursors.iter().enumerate() {
+            let consumed = cursor.consumed();
+            let len = cursor.len();
+            total_targets += len;
+            total_consumed += consumed;
+            if consumed < len {
+                tracing::warn!(
+                    worker = i,
+                    consumed,
+                    total = len,
+                    skipped = len - consumed,
+                    "replay: worker did not consume all targets"
+                );
+            }
+        }
         debug!(
             signal_preemptions = ring.signal_preemptions(),
             cooperative_yields = ring.cooperative_yields(),
-            "replay interleave: complete"
+            consumed = total_consumed,
+            total = total_targets,
+            "replay interleave: complete — consumed {}/{} targets",
+            total_consumed,
+            total_targets,
         );
     }
 

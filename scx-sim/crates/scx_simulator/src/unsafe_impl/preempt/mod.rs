@@ -2137,6 +2137,11 @@ impl ReplayCursor {
         self.targets.is_empty()
     }
 
+    /// Number of targets consumed (advanced past) so far.
+    pub fn consumed(&self) -> usize {
+        self.next_idx.load(SeqCst).min(self.targets.len())
+    }
+
     /// Accumulated overhead branches from signal-handler execution.
     #[allow(dead_code)] // Infrastructure for rdpmc accounting.
     pub fn overhead(&self) -> u64 {
@@ -2371,7 +2376,13 @@ extern "C" fn replay_pmu_handler(
     // 1. Disable PMU timer to prevent recursive signals.
     disable_timer(rctx.timer_fd);
 
-    // 1a. One-time warning about non-deterministic PMU skid.
+    // 1a. If preemption is inhibited (e.g. thread holds a Mutex),
+    // do NOT proceed — consistent with the recording handler.
+    if is_preemption_inhibited() {
+        return;
+    }
+
+    // 1b. One-time warning about non-deterministic PMU skid.
     if !REPLAY_PMU_WARNING_SHOWN.swap(true, SeqCst) {
         let mut buf = [0u8; 256];
         let mut w = StackWriter::new(&mut buf);
@@ -2562,6 +2573,17 @@ extern "C" fn replay_bp_handler(
 
     // 1. Disable breakpoint to prevent re-firing immediately.
     disable_timer(rctx.bp_fd);
+
+    // 1a. If preemption is inhibited (e.g. thread holds a Mutex),
+    // re-arm the breakpoint and return — consistent with recording handler.
+    if is_preemption_inhibited() {
+        let target = match cursor.current_target() {
+            Some(t) => *t,
+            None => return,
+        };
+        arm_breakpoint(rctx.bp_fd, target.instruction_pointer);
+        return;
+    }
 
     // 2. Read the current target (should exist since the PMU handler armed us).
     let target = match cursor.current_target() {
