@@ -234,10 +234,15 @@ impl Default for NativeConcurrentConfig {
 /// The timeslice (in PMU events) is rolled uniformly in
 /// `[timeslice_min, timeslice_max]` from the interleave PRNG.
 ///
-/// The default is min=max=1, requesting the smallest possible timeslice.
-/// In practice, PMU skid means the actual preemption point will be tens
-/// to hundreds of events after the requested count, so even min=1
-/// produces a useful range of preemption points.
+/// The default is min=100, max=500, which provides a good balance between
+/// preemption coverage and signal overhead. With PMU skid (~30-100 events),
+/// actual preemption happens 130-600 branches after the last kfunc boundary.
+///
+/// WARNING: min=max=1 causes severe performance degradation with multi-worker
+/// workloads (e.g. 8 tasks on 4 CPUs). The PMU fires after every ~30 branches
+/// (1 requested + skid), generating ~10,000 signals/ms/worker. With 4 workers
+/// that is ~40,000 signals/ms, each costing ~1-5us of real time, making a
+/// 200ms simulation take minutes instead of milliseconds.
 #[derive(Debug, Clone)]
 pub struct PreemptiveConfig {
     /// Minimum timeslice in PMU events.
@@ -261,8 +266,8 @@ pub struct PreemptiveConfig {
 impl Default for PreemptiveConfig {
     fn default() -> Self {
         PreemptiveConfig {
-            timeslice_min: 1,
-            timeslice_max: 1,
+            timeslice_min: 100,
+            timeslice_max: 500,
             cooperative_only: false,
             break_on: PmuEvent::RetiredBranchConditional,
             preempt_mode: PreemptMode::Pmu,

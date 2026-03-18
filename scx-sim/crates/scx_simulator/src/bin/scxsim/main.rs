@@ -259,17 +259,23 @@ struct RunArgs {
     /// Minimum preemptive timeslice in retired conditional branches.
     ///
     /// Controls the lower bound of the random timeslice range used by
-    /// --preemptive mode. Default: 1 (PMU skid means actual preemption
-    /// is tens to hundreds of branches later).
-    #[arg(long, default_value_t = 1, requires = "preemptive")]
+    /// --preemptive mode. Default: 100. With PMU skid (~30-100 branches),
+    /// actual preemption fires at ~130-200 branches after the last kfunc.
+    ///
+    /// WARNING: Very small values (e.g. 1) cause severe signal overhead
+    /// with multi-worker workloads, making simulations hang.
+    #[arg(long, default_value_t = 100, requires = "preemptive")]
     timeslice_min: u64,
 
     /// Maximum preemptive timeslice in retired conditional branches.
     ///
     /// Controls the upper bound of the random timeslice range used by
-    /// --preemptive mode. Default: 1 (PMU skid means actual preemption
-    /// is tens to hundreds of branches later).
-    #[arg(long, default_value_t = 1, requires = "preemptive")]
+    /// --preemptive mode. Default: 500. With PMU skid (~30-100 branches),
+    /// actual preemption fires at ~130-600 branches after the last kfunc.
+    ///
+    /// WARNING: Very small values (e.g. 1) cause severe signal overhead
+    /// with multi-worker workloads, making simulations hang.
+    #[arg(long, default_value_t = 500, requires = "preemptive")]
     timeslice_max: u64,
 
     /// Which PMU event to break on for preemptive interleaving.
