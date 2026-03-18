@@ -360,6 +360,30 @@ pub struct SimulatorState {
     /// number of Jcc instructions executed as `snapshot - current_counter`.
     /// This gives a deterministic branch count (unlike the PMU hardware counter).
     pub rbc_e9_snapshot: i64,
+    /// Snapshot of the e9 counter at the last kfunc boundary (or structop start).
+    ///
+    /// Used to compute the RBC interval between successive kfuncs within a
+    /// single structop. Reset in `start_rbc()` to the same value as
+    /// `rbc_e9_snapshot`. Updated in `with_sim()` after each kfunc.
+    pub rbc_e9_last_kfunc: i64,
+    /// PMU counter reading at the last kfunc boundary (or structop start).
+    ///
+    /// Analogous to `rbc_e9_last_kfunc` but for the PMU hardware counter.
+    /// The PMU counter accumulates (not decrements), so the interval is
+    /// `current - last_kfunc`. Reset in `start_rbc()` to 0.
+    pub rbc_pmu_last_kfunc: u64,
+    /// Highest total RBC count observed for any single structop call.
+    ///
+    /// Updated in `charge_sched_time()` after each structop completes.
+    /// Tracks the maximum across all CPUs and all ops callbacks.
+    pub longest_structop_rbc: u64,
+    /// Longest unbroken RBC interval between kfuncs within any structop.
+    ///
+    /// When a structop runs C code, it periodically calls kfuncs (which pause
+    /// the counter). The interval between two kfunc calls is an unbroken run
+    /// of scheduler C code. This tracks the maximum of those intervals.
+    /// Updated in `with_sim()` and `charge_sched_time()`.
+    pub longest_rbc_interval: u64,
     /// SHARED-MUTABLE: Any kfunc on any CPU can set a BPF error. First-write
     /// wins (subsequent errors are ignored). Needs Mutex or atomic Option.
     ///
@@ -1209,6 +1233,27 @@ where
         }
         sim.rbc_kfunc_calls += 1;
         sim.rbc_kfunc_ns += cost_ns;
+        // Track the longest unbroken RBC interval between kfuncs.
+        // Read the counter now before pausing to capture the interval
+        // since the last kfunc (or since start_rbc).
+        if sim.e9_fns.is_some() {
+            let current = crate::preempt::e9_read_counter();
+            // e9 counter decrements, so interval = last - current.
+            let interval = (sim.rbc_e9_last_kfunc - current).max(0) as u64;
+            if interval > sim.longest_rbc_interval {
+                sim.longest_rbc_interval = interval;
+            }
+            sim.rbc_e9_last_kfunc = current;
+        } else if let Some(ref rbc) = sim.rbc_counter {
+            // PMU counter accumulates, so interval = current - last.
+            if let Ok(current) = rbc.read() {
+                let interval = current.saturating_sub(sim.rbc_pmu_last_kfunc);
+                if interval > sim.longest_rbc_interval {
+                    sim.longest_rbc_interval = interval;
+                }
+                sim.rbc_pmu_last_kfunc = current;
+            }
+        }
         rbc_pause_inner(sim);
         let result = f(sim);
         rbc_resume_inner(sim);
@@ -2243,6 +2288,10 @@ mod tests {
             rbc_kfunc_calls: 0,
             rbc_kfunc_ns: 0,
             rbc_e9_snapshot: 0,
+            rbc_e9_last_kfunc: 0,
+            rbc_pmu_last_kfunc: 0,
+            longest_structop_rbc: 0,
+            longest_rbc_interval: 0,
             bpf_error: None,
             interleave: false,
             preemptive: None,
