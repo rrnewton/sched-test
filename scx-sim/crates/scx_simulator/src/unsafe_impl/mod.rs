@@ -12,6 +12,7 @@
 //! | Module | Unsafe surface |
 //! |-------------|------------------------------------------------------|
 //! | `ffi` | `extern "C"` declarations, raw pointer manipulation, `dlopen`/`dlsym` calls |
+//! | `cgroup_ffi`| `#[no_mangle] extern "C"` cgroup lookup/registry entry points called from C |
 //! | `kfuncs` | `#[no_mangle] extern "C"` kfunc entry points, thread-local raw-pointer state |
 //! | `preempt` | Signal handlers, futex syscalls, atomics, inline assembly |
 //! | `backend` | PMU perf_event ioctls, hardware breakpoints, `/proc` mmap, e9patch binary patching |
@@ -23,6 +24,7 @@
 //! | `task_wrapper` | Raw `task_struct` pointer wrapping, unsafe field accessors |
 
 pub mod backend;
+pub mod cgroup_ffi;
 pub mod cgroup_wrapper;
 pub mod ffi;
 pub mod interleave;
