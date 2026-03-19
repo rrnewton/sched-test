@@ -1212,10 +1212,21 @@ where
     let arc = SIM_ARC
         .with(|c| c.borrow().clone())
         .expect("kfunc called outside of simulator context (SIM_ARC not installed)");
-    // Disable PMU timer BEFORE acquiring the mutex.  If the signal fires
-    // while the mutex is held, the handler parks this worker via
-    // yield_token().  Any other worker woken next will block on the same
-    // mutex → deadlock.  Disabling the timer first closes that window.
+    // Inhibit preemption and disable the PMU timer BEFORE acquiring the
+    // mutex. A PMU signal may already be queued in the kernel from a
+    // counter overflow that occurred before we reach this point. Merely
+    // disabling the counter via `pause_timer()` (ioctl) does not prevent
+    // delivery of an already-queued signal — it can arrive on return from
+    // the ioctl or any subsequent syscall (e.g., the futex inside
+    // `arc.lock()`). If the handler runs while the mutex is held, it
+    // parks this worker via `yield_token()`, and the woken worker blocks
+    // on the same mutex, causing a deadlock.
+    //
+    // `inhibit_preemption()` sets a thread-local flag that the handler
+    // checks; when set, the handler disables the timer and returns
+    // without yielding. Combined with `pause_timer()`, this closes both
+    // the "future overflow" and "pending signal" windows.
+    crate::preempt::inhibit_preemption();
     crate::preempt::pause_timer();
     let result = {
         let mut guard = arc.lock().unwrap();
@@ -1259,6 +1270,9 @@ where
         rbc_resume_inner(sim);
         result
     };
+    // Guard dropped: SIM_ARC unlocked. Allow preemption before re-arming
+    // the timer so the handler can yield at the next natural point.
+    crate::preempt::allow_preemption();
     crate::preempt::resume_timer();
     crate::preempt::maybe_yield_preemptive_post();
     crate::preempt::set_current_kfunc("");
