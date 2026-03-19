@@ -266,8 +266,8 @@ pub struct PreemptiveConfig {
 impl Default for PreemptiveConfig {
     fn default() -> Self {
         PreemptiveConfig {
-            timeslice_min: 100,
-            timeslice_max: 500,
+            timeslice_min: 300,
+            timeslice_max: 1500,
             cooperative_only: false,
             break_on: PmuEvent::RetiredBranchConditional,
             preempt_mode: PreemptMode::Pmu,
