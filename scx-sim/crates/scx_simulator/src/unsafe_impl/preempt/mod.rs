@@ -1610,8 +1610,13 @@ fn cooperative_yield_impl(phase: KfuncYieldPhase) {
     // outlives all worker threads.
     let ring = unsafe { &*ctx.ring };
 
-    // Disable the PMU timer during the cooperative yield to prevent
-    // a preemptive signal from firing while we're in Rust/yield code.
+    // Inhibit preemption and disable the PMU timer for the duration of
+    // the cooperative yield. `disable_timer` prevents new overflows, but
+    // a signal may already be queued. `inhibit_preemption` ensures the
+    // handler just disables the timer and returns without calling
+    // `yield_token`, which would corrupt the token ring state (nested
+    // yield from signal handler inside cooperative yield code).
+    inhibit_preemption();
     disable_timer(ctx.timer_fd);
 
     // Save per-callback context from CALLBACK_CTX thread-local.
@@ -1662,6 +1667,9 @@ fn cooperative_yield_impl(phase: KfuncYieldPhase) {
     // Resume measurement counter now that we're running again.
     enable_measurement(ctx.measure_fd);
     crate::kfuncs::install_callback_ctx(saved);
+
+    // Re-allow preemption now that the yield is complete.
+    allow_preemption();
 
     // Timer management depends on the phase:
     // - Pre: stays disabled — with_sim() will re-arm via resume_timer().
