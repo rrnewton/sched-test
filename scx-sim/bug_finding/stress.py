@@ -311,7 +311,7 @@ DETERMINISM_MODE = False
 
 # PMU token pool: limits concurrent PMU-signal preemptive instances
 PMU_TOKEN_POOL: Optional[multiprocessing.Semaphore] = None
-MAX_PMU_CONCURRENT = 4  # Default: 4 concurrent PMU users (configurable via --max-pmu)
+MAX_PMU_CONCURRENT = max(os.cpu_count() // 3, 4)  # Default: nproc/3 (scaling test shows ~86% efficiency)
 
 # PMU stats counters (shared across processes)
 PMU_ACQUIRED: Optional[multiprocessing.Value] = None
