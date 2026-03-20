@@ -82,7 +82,7 @@ E9PATCH ?= $(or $(wildcard $(SIMULATOR_DIR)/third_party/e9patch/e9patch),$(shell
 
 # --- Build rules ---
 
-.PHONY: all clean e9 $(SCHEDS)
+.PHONY: all clean e9 e9-rip-trampoline $(SCHEDS)
 
 ifeq ($(BPF_INCLUDE),)
 all:
@@ -204,6 +204,8 @@ $(foreach s,$(SCHEDS),$(eval $(call SO_RULE,$(s))))
 E9COMPILE ?= $(SIMULATOR_DIR)/third_party/e9patch/e9compile.sh
 E9_TRAMPOLINE_SRC := $(SIMULATOR_DIR)/csrc/e9_rbc_trampoline.c
 E9_TRAMPOLINE_BIN := $(BUILD_DIR)/e9_rbc_trampoline
+E9_RIP_TRAMPOLINE_SRC := $(SIMULATOR_DIR)/csrc/e9_rip_trampoline.c
+E9_RIP_TRAMPOLINE_BIN := $(BUILD_DIR)/e9_rip_trampoline
 
 # Build the trampoline binary using e9compile.sh (must run from e9patch dir
 # so that #include "stdlib.c" resolves to e9patch/examples/stdlib.c).
@@ -217,6 +219,18 @@ $(E9_TRAMPOLINE_BIN): $(E9_TRAMPOLINE_SRC) | $(BUILD_DIR)
 	mv $(SIMULATOR_DIR)/third_party/e9patch/e9_rbc_trampoline $(E9_TRAMPOLINE_BIN)
 	rm -f $(SIMULATOR_DIR)/third_party/e9patch/e9_rbc_trampoline.c \
 	      $(SIMULATOR_DIR)/third_party/e9patch/e9_rbc_trampoline.o
+
+# Build the RIP trampoline binary for arbitrary-address replay.
+$(E9_RIP_TRAMPOLINE_BIN): $(E9_RIP_TRAMPOLINE_SRC) | $(BUILD_DIR)
+	@if [ ! -f "$(E9COMPILE)" ]; then \
+		echo "ERROR: e9compile.sh not found. Build e9patch: cd third_party/e9patch && ./build.sh"; \
+		exit 1; \
+	fi
+	cp $(E9_RIP_TRAMPOLINE_SRC) $(SIMULATOR_DIR)/third_party/e9patch/e9_rip_trampoline.c
+	cd $(SIMULATOR_DIR)/third_party/e9patch && ./e9compile.sh e9_rip_trampoline.c
+	mv $(SIMULATOR_DIR)/third_party/e9patch/e9_rip_trampoline $(E9_RIP_TRAMPOLINE_BIN)
+	rm -f $(SIMULATOR_DIR)/third_party/e9patch/e9_rip_trampoline.c \
+	      $(SIMULATOR_DIR)/third_party/e9patch/e9_rip_trampoline.o
 
 define E9_RULE
 $(BUILD_DIR)/libscx_$(1)_e9.so: $(BUILD_DIR)/libscx_$(1).so $(E9_TRAMPOLINE_BIN)
@@ -232,8 +246,14 @@ endef
 $(foreach s,$(SCHEDS),$(eval $(call E9_RULE,$(s))))
 
 E9_TARGETS := $(foreach s,$(SCHEDS),$(BUILD_DIR)/libscx_$(s)_e9.so)
-e9: $(E9_TARGETS)
+e9: $(E9_TARGETS) $(E9_RIP_TRAMPOLINE_BIN)
 	@echo "Built $(words $(E9_TARGETS)) e9patch scheduler(s): $(SCHEDS)"
+	@echo "Built RIP trampoline: $(E9_RIP_TRAMPOLINE_BIN)"
+
+# Standalone target for the RIP trampoline (used by e9patch RIP replay).
+.PHONY: e9-rip-trampoline
+e9-rip-trampoline: $(E9_RIP_TRAMPOLINE_BIN)
+	@echo "Built RIP trampoline: $(E9_RIP_TRAMPOLINE_BIN)"
 
 # Create build directory
 $(BUILD_DIR):

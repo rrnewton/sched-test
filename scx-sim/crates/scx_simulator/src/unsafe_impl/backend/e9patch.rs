@@ -6,15 +6,22 @@
 //!
 //! Contains two backends:
 //! - [`E9PatchBackend`]: Recording mode — random PRNG timeslices.
-//! - [`E9PatchReplayBackend`]: Replay mode — reads targets from a recorded
-//!   trace and arms the counter at exact branch deltas. No PMU hardware,
-//!   no retry logic, fully deterministic.
+//! - [`E9PatchReplayBackend`]: Replay mode — supports two sub-modes:
+//!   - **Branch-count mode** (`break_on: rbc`): arms the counter at exact
+//!     branch deltas from the trace's cumulative `structop_rbc` values.
+//!   - **RIP mode** (`break_on: insn`): patches specific instruction
+//!     addresses from the trace and fires when execution reaches the armed
+//!     RIP. Uses a separate shared state page at [`E9_RIP_SHARED_ADDR`].
 //!
 //! **State sharing**: Both the e9-injected trampoline and the `.so`'s
 //! arm/disarm functions access a shared `E9SharedRbc` struct at a fixed
 //! mmap'd address ([`E9_SHARED_ADDR`]). No RIP-relative addressing, no
 //! dlsym — just a hardcoded `movabs` load. The Rust backend mmaps the
 //! page before loading the `_e9.so`.
+//!
+//! The RIP replay sub-mode uses a *second* shared page at
+//! [`E9_RIP_SHARED_ADDR`] with an `armed_rip` field that the RIP
+//! trampoline checks on each patched instruction.
 //!
 //! **Worker identity**: The shared struct does NOT contain ring_ptr or
 //! worker_id — those come from Rust thread-local storage (`PREEMPT_CTX`)
@@ -25,6 +32,7 @@
 //! [`E9_SHARED_ADDR`]: crate::preempt::E9_SHARED_ADDR
 
 use std::cell::Cell;
+use std::path::{Path, PathBuf};
 
 use tracing::{debug, info};
 
@@ -174,18 +182,114 @@ impl PreemptionBackend for E9PatchBackend {
 }
 
 // ---------------------------------------------------------------------------
-// E9PatchReplayBackend — deterministic replay via software branch counting
+// E9PatchReplayBackend — deterministic replay (branch-count or RIP-targeted)
 // ---------------------------------------------------------------------------
+
+/// Fixed mmap address for the RIP-targeted replay shared state.
+///
+/// One page (0x1000) above [`E9_SHARED_ADDR`] to avoid collision with the
+/// branch-counting shared state.
+///
+/// [`E9_SHARED_ADDR`]: crate::preempt::E9_SHARED_ADDR
+pub const E9_RIP_SHARED_ADDR: usize = 0x1E9_001_000;
+
+/// Shared state for RIP-targeted e9patch replay.
+///
+/// Mapped at [`E9_RIP_SHARED_ADDR`] via `mmap(MAP_FIXED)`. The RIP
+/// trampoline (`e9_rip_trampoline.c`) reads `armed_rip` on every hit
+/// and calls `yield_fn` when the current instruction address matches.
+///
+/// This struct is separate from [`E9SharedRbc`] because the RIP replay
+/// mechanism is independent of branch counting: it fires on specific
+/// instruction addresses rather than at branch-count thresholds.
+///
+/// [`E9SharedRbc`]: crate::preempt::E9SharedRbc
+#[repr(C)]
+pub struct E9RipShared {
+    /// The target instruction address (0 = disarmed).
+    pub armed_rip: u64,
+    /// Yield function pointer (`e9_replay_yield`).
+    pub yield_fn: *const std::ffi::c_void,
+}
+
+// SAFETY: E9RipShared is a plain-old-data struct at a fixed mmap'd address.
+// Single-writer access is enforced by the PreemptRing token-passing protocol.
+unsafe impl Send for E9RipShared {}
+unsafe impl Sync for E9RipShared {}
+
+/// Get a pointer to the RIP shared state.
+///
+/// # Safety
+/// [`mmap_rip_shared`] must have been called first.
+unsafe fn e9_rip_shared() -> *mut E9RipShared {
+    E9_RIP_SHARED_ADDR as *mut E9RipShared
+}
+
+/// Map the RIP-targeted shared state page at the fixed address.
+///
+/// Must be called before loading the `_e9rip.so` (the RIP-patched
+/// scheduler variant). The RIP trampoline reads from this page at
+/// each patched instruction.
+pub fn mmap_rip_shared() -> *mut E9RipShared {
+    let addr = E9_RIP_SHARED_ADDR as *mut std::ffi::c_void;
+    // SAFETY: `mmap` with MAP_FIXED at our chosen address. The address
+    // is one page above E9_SHARED_ADDR in an obscure gap.
+    let ptr = unsafe {
+        libc::mmap(
+            addr,
+            std::mem::size_of::<E9RipShared>(),
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED,
+            -1,
+            0,
+        )
+    };
+    assert!(
+        ptr != libc::MAP_FAILED,
+        "e9patch RIP: mmap at {E9_RIP_SHARED_ADDR:#x} failed (address in use?)"
+    );
+    let shared = ptr as *mut E9RipShared;
+    // SAFETY: `shared` points to the freshly mmap'd page.
+    unsafe {
+        (*shared).armed_rip = 0;
+        (*shared).yield_fn = preempt::e9_replay_yield as *const std::ffi::c_void;
+    }
+    shared
+}
+
+/// Arm the RIP trampoline to fire at the given instruction address.
+///
+/// # Safety
+/// [`mmap_rip_shared`] must have been called. Token must be held.
+unsafe fn arm_rip(rip: u64) {
+    (*e9_rip_shared()).armed_rip = rip;
+}
+
+/// Disarm the RIP trampoline (set armed_rip to 0).
+///
+/// # Safety
+/// [`mmap_rip_shared`] must have been called. Token must be held.
+unsafe fn disarm_rip() {
+    (*e9_rip_shared()).armed_rip = 0;
+}
 
 /// e9patch replay preemption backend.
 ///
-/// Replays a recorded preemption trace using e9patch software branch
-/// counting. Each worker's C trampoline fires at exact branch deltas
-/// computed from the trace's cumulative `structop_rbc` values.
+/// Replays a recorded preemption trace using e9patch. Supports two modes:
+///
+/// **Branch-count mode** (`rip_mode = false`, for `break_on: rbc` traces):
+/// Each worker's C trampoline fires at exact branch deltas computed from
+/// the trace's cumulative `structop_rbc` values.
+///
+/// **RIP mode** (`rip_mode = true`, for `break_on: insn` traces):
+/// The `.so` is additionally patched at specific instruction addresses
+/// from the trace. When execution reaches an armed RIP, the RIP trampoline
+/// calls `e9_replay_yield()` to yield and advance the cursor. Branch
+/// counting still runs (for progress tracking) but doesn't trigger yields.
 ///
 /// Advantages over PMU + HW breakpoint replay:
 /// - **No PMU hardware needed** — works in VMs, containers, CI
-/// - **Fully deterministic** — software counting, no skid
+/// - **Fully deterministic** — software counting/patching, no skid
 /// - **No retry logic** — never overshoots
 /// - **Single mechanism** — no two-signal coordination
 pub(crate) struct E9PatchReplayBackend {
@@ -202,6 +306,12 @@ pub(crate) struct E9PatchReplayBackend {
     timeslice_max: u64,
     /// Resolved e9patch function pointers.
     fns: E9PatchFns,
+    /// Whether to use RIP-targeted mode (for `break_on: insn` traces).
+    ///
+    /// When true, the backend arms the RIP shared page instead of the
+    /// branch counter. The `.so` must have been patched at the target
+    /// RIP addresses (via `create_e9rip_so`).
+    rip_mode: bool,
 }
 
 // SAFETY: E9PatchReplayBackend fields are accessed under the token-passing
@@ -217,12 +327,16 @@ impl E9PatchReplayBackend {
     /// Builds per-worker cursors from the trace, one per dispatch CPU.
     /// `timeslice_min` / `timeslice_max` must match the recording scenario's
     /// preemptive config to keep the PRNG sequence in sync.
+    ///
+    /// Set `rip_mode = true` for `break_on: insn` traces where preemption
+    /// points can be at arbitrary instruction addresses.
     pub fn new(
         trace: &PreemptionTrace,
         num_workers: usize,
         timeslice_min: u64,
         timeslice_max: u64,
         fns: E9PatchFns,
+        rip_mode: bool,
     ) -> Self {
         let cursors = (0..num_workers)
             .map(|i| {
@@ -237,7 +351,14 @@ impl E9PatchReplayBackend {
             timeslice_min,
             timeslice_max,
             fns,
+            rip_mode,
         }
+    }
+
+    /// Whether this backend is in RIP-targeted mode.
+    #[allow(dead_code)] // Exposed for diagnostic / testing use.
+    pub fn rip_mode(&self) -> bool {
+        self.rip_mode
     }
 
     /// Reset all cursors and accumulated RBC to the beginning (for retry).
@@ -264,13 +385,36 @@ impl PreemptionBackend for E9PatchReplayBackend {
         // Switch yield_fn to the replay variant before workers start.
         preempt::set_e9_replay_yield();
 
-        // Verify the shared RBC page is accessible.
-        let p = unsafe { preempt::e9_shared_rbc() };
-        let counter = unsafe { (*p).counter };
-        info!(
-            addr = format_args!("{:#x}", preempt::E9_SHARED_ADDR),
-            counter, "e9patch replay: shared state page verified"
-        );
+        if self.rip_mode {
+            // RIP mode: set up the RIP shared page.
+            unsafe {
+                (*e9_rip_shared()).yield_fn = preempt::e9_replay_yield as *const std::ffi::c_void;
+            }
+
+            // Disarm the Jcc counter — in RIP mode, the Jcc trampoline
+            // still decrements the counter for progress tracking, but we
+            // keep it disarmed (armed=0) so it never yields. Only the RIP
+            // trampoline yields.
+            unsafe {
+                let rbc = preempt::e9_shared_rbc();
+                (*rbc).armed = 0;
+                (*rbc).counter = i64::MAX;
+            }
+
+            info!(
+                rip_addr = format_args!("{E9_RIP_SHARED_ADDR:#x}"),
+                rbc_addr = format_args!("{:#x}", preempt::E9_SHARED_ADDR),
+                "e9patch RIP replay: shared state pages verified"
+            );
+        } else {
+            // Branch-count mode: verify the shared RBC page.
+            let p = unsafe { preempt::e9_shared_rbc() };
+            let counter = unsafe { (*p).counter };
+            info!(
+                addr = format_args!("{:#x}", preempt::E9_SHARED_ADDR),
+                counter, "e9patch replay: shared state page verified"
+            );
+        }
     }
 
     fn worker_setup(&self, ring: &PreemptRing, worker_id: WorkerId) -> E9PatchReplayWorkerCtx {
@@ -293,9 +437,11 @@ impl PreemptionBackend for E9PatchReplayBackend {
         // cursor and accumulated_rbc.
         preempt::install_e9_replay(cursor, accum);
 
+        let mode_str = if self.rip_mode { "RIP" } else { "branch-count" };
         debug!(
             worker = i,
             targets = cursor.len(),
+            mode = mode_str,
             "e9patch replay: worker setup"
         );
 
@@ -314,34 +460,63 @@ impl PreemptionBackend for E9PatchReplayBackend {
 
         let cursor = &self.cursors[ctx.worker_idx];
         let first = cursor.current_target()?;
-        let accumulated = self.accumulated_rbc[ctx.worker_idx].get();
-        let delta = first.structop_rbc.saturating_sub(accumulated);
 
-        Some(PreemptTarget {
-            count_rbc: RbcTarget::Relative(RelativeRbc(delta)),
-            target_rip: Some(first.instruction_pointer),
-        })
+        if self.rip_mode {
+            // RIP mode: fire when execution reaches the target RIP.
+            // The branch count is irrelevant — use Relative(0) as sentinel.
+            Some(PreemptTarget {
+                count_rbc: RbcTarget::Relative(RelativeRbc(0)),
+                target_rip: Some(first.instruction_pointer),
+            })
+        } else {
+            // Branch-count mode: compute delta to the target's cumulative RBC.
+            let accumulated = self.accumulated_rbc[ctx.worker_idx].get();
+            let delta = first.structop_rbc.saturating_sub(accumulated);
+            Some(PreemptTarget {
+                count_rbc: RbcTarget::Relative(RelativeRbc(delta)),
+                target_rip: Some(first.instruction_pointer),
+            })
+        }
     }
 
     fn arm(&self, _ctx: &mut E9PatchReplayWorkerCtx, target: PreemptTarget) {
-        let delta = match target.count_rbc {
-            RbcTarget::Relative(RelativeRbc(n)) => n,
-            RbcTarget::Absolute(_) => {
-                panic!(
-                    "E9PatchReplayBackend::arm() expects RbcTarget::Relative, \
-                     got Absolute"
-                );
-            }
-        };
-        // Arm the e9 counter to fire after `delta` branches.
-        // SAFETY: `self.fns.arm` is a valid function pointer resolved from
-        // the loaded `.so` via `E9PatchFns::resolve`. Token held.
-        unsafe { (self.fns.arm)(delta) };
+        if self.rip_mode {
+            let rip = target
+                .target_rip
+                .expect("E9PatchReplayBackend RIP mode requires target_rip");
+
+            // Arm the RIP trampoline at this specific address.
+            // SAFETY: mmap_rip_shared() was called during setup. Token held.
+            unsafe { arm_rip(rip) };
+
+            // Keep the Jcc counter disarmed — only the RIP trampoline yields.
+            // SAFETY: disarm is a valid function pointer. Token held.
+            unsafe { (self.fns.disarm)() };
+        } else {
+            let delta = match target.count_rbc {
+                RbcTarget::Relative(RelativeRbc(n)) => n,
+                RbcTarget::Absolute(_) => {
+                    panic!(
+                        "E9PatchReplayBackend::arm() expects RbcTarget::Relative, \
+                         got Absolute"
+                    );
+                }
+            };
+            // Arm the e9 counter to fire after `delta` branches.
+            // SAFETY: arm is a valid function pointer. Token held.
+            unsafe { (self.fns.arm)(delta) };
+        }
     }
 
     fn disarm(&self, _ctx: &mut E9PatchReplayWorkerCtx) -> StructopDelta {
-        // SAFETY: `self.fns.disarm` is a valid function pointer. Token held.
-        unsafe { (self.fns.disarm)() };
+        if self.rip_mode {
+            // Disarm the RIP trampoline.
+            // SAFETY: mmap_rip_shared() was called during setup. Token held.
+            unsafe { disarm_rip() };
+        } else {
+            // SAFETY: disarm is a valid function pointer. Token held.
+            unsafe { (self.fns.disarm)() };
+        }
         StructopDelta {
             rbc_total: 0,
             interleave_count: preempt::structop_info().interleave_count,
@@ -354,17 +529,27 @@ impl PreemptionBackend for E9PatchReplayBackend {
     }
 
     fn global_teardown(&self) {
-        // Disarm so the trampoline becomes a no-op (armed=0 -> early return).
-        // SAFETY: `self.fns.disarm` is a valid function pointer.
-        unsafe { (self.fns.disarm)() };
+        if self.rip_mode {
+            // Disarm both trampolines.
+            unsafe {
+                disarm_rip();
+                (self.fns.disarm)();
+            }
+        } else {
+            // Disarm so the trampoline becomes a no-op.
+            // SAFETY: disarm is a valid function pointer.
+            unsafe { (self.fns.disarm)() };
+        }
     }
 
     fn log_completion(&self, ring: &PreemptRing) {
         let yield_calls = preempt::e9_yield_call_count();
+        let mode_str = if self.rip_mode { "RIP" } else { "branch-count" };
         info!(
             signal_preemptions = ring.signal_preemptions(),
             cooperative_yields = ring.cooperative_yields(),
             e9_yield_calls = yield_calls,
+            mode = mode_str,
             "e9patch replay interleave: complete"
         );
     }
@@ -375,5 +560,331 @@ impl PreemptionBackend for E9PatchReplayBackend {
 
     fn read_count(&self, _ctx: &E9PatchReplayWorkerCtx) -> u64 {
         preempt::e9_read_counter() as u64
+    }
+}
+
+// ---------------------------------------------------------------------------
+// E9tool helpers — runtime .so patching for RIP-targeted replay
+// ---------------------------------------------------------------------------
+
+/// Extract unique instruction addresses from a preemption trace.
+///
+/// Returns a sorted, deduplicated list of all non-zero RIPs across all
+/// workers. Used to determine which addresses need e9patch instrumentation
+/// for RIP-targeted replay.
+pub fn collect_trace_rips(trace: &PreemptionTrace) -> Vec<u64> {
+    let mut rips: Vec<u64> = (0..trace.num_workers())
+        .flat_map(|i| {
+            trace
+                .worker_trace(WorkerId(i))
+                .iter()
+                .map(|r| r.instruction_pointer)
+                .filter(|&rip| rip != 0)
+        })
+        .collect();
+    rips.sort_unstable();
+    rips.dedup();
+    rips
+}
+
+/// Build an e9tool command to create a RIP-patched scheduler `.so`.
+///
+/// The output `.so` has two kinds of instrumentation:
+/// 1. Every Jcc patched with `rbc_trampoline` (for branch counting, same
+///    as the standard `_e9.so`).
+/// 2. Each target RIP from the trace patched with `rip_trampoline(addr)`
+///    (for precise RIP-targeted yield).
+///
+/// Returns `(command, output_path)`.
+pub fn build_e9_rip_command(
+    input_so: &Path,
+    rips: &[u64],
+    e9tool_path: &Path,
+    rbc_trampoline_bin: &Path,
+    rip_trampoline_bin: &Path,
+) -> (std::process::Command, PathBuf) {
+    let output = derive_e9rip_path(input_so);
+    let mut cmd = std::process::Command::new(e9tool_path);
+
+    // First: instrument all Jcc with the branch-counting trampoline.
+    cmd.arg("-M").arg("jcc");
+    cmd.arg("-P")
+        .arg(format!("rbc_trampoline()@{}", rbc_trampoline_bin.display()));
+
+    // Then: instrument each target RIP with the RIP trampoline.
+    for &rip in rips {
+        cmd.arg("-M").arg(format!("addr={rip:#x}"));
+        cmd.arg("-P").arg(format!(
+            "rip_trampoline(addr)@{}",
+            rip_trampoline_bin.display()
+        ));
+    }
+
+    cmd.arg("-o").arg(&output);
+    cmd.arg(input_so);
+
+    (cmd, output)
+}
+
+/// Derive the `_e9rip.so` path from a base `.so` path.
+///
+/// Transforms `libscx_foo.so` into `libscx_foo_e9rip.so`.
+/// Transforms `libscx_foo_e9.so` into `libscx_foo_e9rip.so`.
+pub fn derive_e9rip_path(base: &Path) -> PathBuf {
+    let stem = base
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown");
+    let clean_stem = stem.strip_suffix("_e9").unwrap_or(stem);
+    base.with_file_name(format!("{clean_stem}_e9rip.so"))
+}
+
+/// Attempt to find e9tool in the standard locations.
+///
+/// Checks `third_party/e9patch/e9tool` relative to the simulator root,
+/// then falls back to `$PATH`.
+pub fn find_e9tool() -> Option<PathBuf> {
+    // Check relative to the manifest directory (compile-time).
+    let third_party = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|root| root.join("third_party/e9patch/e9tool"));
+    if let Some(ref p) = third_party {
+        if p.exists() {
+            return Some(p.clone());
+        }
+    }
+    // Fall back to PATH.
+    which_in_path("e9tool")
+}
+
+/// Attempt to find a binary on `$PATH`.
+fn which_in_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|dir| dir.join(name))
+            .find(|p| p.exists())
+    })
+}
+
+/// Locate the compiled e9patch trampoline binary for branch counting.
+///
+/// Checks `schedulers/build/e9_rbc_trampoline` relative to the simulator
+/// root.
+pub fn find_rbc_trampoline() -> Option<PathBuf> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())?;
+    let path = root.join("schedulers/build/e9_rbc_trampoline");
+    path.exists().then_some(path)
+}
+
+/// Locate the compiled e9patch trampoline binary for RIP-targeted replay.
+///
+/// Checks `schedulers/build/e9_rip_trampoline` relative to the simulator
+/// root.
+pub fn find_rip_trampoline() -> Option<PathBuf> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())?;
+    let path = root.join("schedulers/build/e9_rip_trampoline");
+    path.exists().then_some(path)
+}
+
+/// Create a RIP-patched `.so` by running e9tool on the base scheduler `.so`.
+///
+/// Instruments the base `.so` with both Jcc branch-counting trampolines
+/// and RIP-specific trampolines at each target address from the trace.
+///
+/// Returns the path to the newly created `_e9rip.so`, or an error string
+/// if any tool is missing or e9tool fails.
+pub fn create_e9rip_so(base_so: &Path, rips: &[u64]) -> Result<PathBuf, String> {
+    let e9tool = find_e9tool()
+        .ok_or_else(|| "e9tool not found. Build e9patch: make install-e9patch".to_string())?;
+
+    let rbc_tramp = find_rbc_trampoline().ok_or_else(|| {
+        "e9_rbc_trampoline binary not found. Build with: make -C schedulers e9".to_string()
+    })?;
+
+    let rip_tramp = find_rip_trampoline().ok_or_else(|| {
+        "e9_rip_trampoline binary not found. \
+         Build with: make -C schedulers e9-rip-trampoline"
+            .to_string()
+    })?;
+
+    let (mut cmd, output_path) =
+        build_e9_rip_command(base_so, rips, &e9tool, &rbc_tramp, &rip_tramp);
+
+    info!(
+        base_so = %base_so.display(),
+        output = %output_path.display(),
+        num_rips = rips.len(),
+        "e9patch RIP replay: creating instrumented .so"
+    );
+
+    let result = cmd
+        .output()
+        .map_err(|e| format!("failed to run e9tool: {e}"))?;
+
+    if !result.status.success() {
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        return Err(format!(
+            "e9tool failed (exit {}): {}",
+            result.status, stderr
+        ));
+    }
+
+    if !output_path.exists() {
+        return Err(format!(
+            "e9tool succeeded but output not found: {}",
+            output_path.display()
+        ));
+    }
+
+    info!(
+        output = %output_path.display(),
+        "e9patch RIP replay: instrumented .so created"
+    );
+    Ok(output_path)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_derive_e9rip_path_from_base() {
+        let base = Path::new("/path/to/libscx_simple.so");
+        let result = derive_e9rip_path(base);
+        assert_eq!(result, PathBuf::from("/path/to/libscx_simple_e9rip.so"));
+    }
+
+    #[test]
+    fn test_derive_e9rip_path_from_e9() {
+        let base = Path::new("/path/to/libscx_simple_e9.so");
+        let result = derive_e9rip_path(base);
+        assert_eq!(result, PathBuf::from("/path/to/libscx_simple_e9rip.so"));
+    }
+
+    #[test]
+    fn test_collect_trace_rips_deduplication() {
+        use crate::preempt::PreemptionRecord;
+
+        let records = vec![
+            PreemptionRecord {
+                rbc_count: 100,
+                instruction_pointer: 0x1000,
+                cpu_id: crate::types::CpuId(0),
+                worker_id: WorkerId(0),
+                sequence: 0,
+                structop_local: 1,
+                structop_global: 1,
+                structop_rbc: 100,
+                ops_context: crate::kfuncs::OpsContext::None,
+                kfunc_name: "",
+                kfunc_count: 0,
+                insn_bytes: [0; crate::preempt::INSN_BYTES_LEN],
+            },
+            PreemptionRecord {
+                rbc_count: 200,
+                instruction_pointer: 0x2000,
+                cpu_id: crate::types::CpuId(0),
+                worker_id: WorkerId(0),
+                sequence: 1,
+                structop_local: 2,
+                structop_global: 2,
+                structop_rbc: 300,
+                ops_context: crate::kfuncs::OpsContext::None,
+                kfunc_name: "",
+                kfunc_count: 0,
+                insn_bytes: [0; crate::preempt::INSN_BYTES_LEN],
+            },
+            PreemptionRecord {
+                rbc_count: 150,
+                instruction_pointer: 0x1000, // duplicate
+                cpu_id: crate::types::CpuId(1),
+                worker_id: WorkerId(1),
+                sequence: 2,
+                structop_local: 1,
+                structop_global: 3,
+                structop_rbc: 150,
+                ops_context: crate::kfuncs::OpsContext::None,
+                kfunc_name: "",
+                kfunc_count: 0,
+                insn_bytes: [0; crate::preempt::INSN_BYTES_LEN],
+            },
+        ];
+
+        let trace =
+            PreemptionTrace::from_records(&records, 2, crate::perf::PmuEvent::InstructionsRetired);
+
+        let rips = collect_trace_rips(&trace);
+        assert_eq!(rips, vec![0x1000, 0x2000]);
+    }
+
+    #[test]
+    fn test_collect_trace_rips_excludes_zero() {
+        use crate::preempt::PreemptionRecord;
+
+        let records = vec![PreemptionRecord {
+            rbc_count: 0,
+            instruction_pointer: 0, // cooperative yield, no RIP
+            cpu_id: crate::types::CpuId(0),
+            worker_id: WorkerId(0),
+            sequence: 0,
+            structop_local: 1,
+            structop_global: 1,
+            structop_rbc: 0,
+            ops_context: crate::kfuncs::OpsContext::None,
+            kfunc_name: "",
+            kfunc_count: 0,
+            insn_bytes: [0; crate::preempt::INSN_BYTES_LEN],
+        }];
+
+        let trace =
+            PreemptionTrace::from_records(&records, 1, crate::perf::PmuEvent::InstructionsRetired);
+
+        let rips = collect_trace_rips(&trace);
+        assert!(rips.is_empty());
+    }
+
+    #[test]
+    fn test_e9_rip_shared_layout() {
+        // Verify the shared struct layout matches what the C trampoline expects.
+        assert_eq!(std::mem::size_of::<E9RipShared>(), 16);
+        assert_eq!(
+            std::mem::offset_of!(E9RipShared, armed_rip),
+            0,
+            "armed_rip must be at offset 0"
+        );
+        assert_eq!(
+            std::mem::offset_of!(E9RipShared, yield_fn),
+            8,
+            "yield_fn must be at offset 8"
+        );
+    }
+
+    #[test]
+    fn test_e9_rip_shared_addr_no_collision() {
+        // The RIP shared address must not collide with the RBC shared address.
+        assert_ne!(
+            E9_RIP_SHARED_ADDR,
+            preempt::E9_SHARED_ADDR,
+            "E9_RIP_SHARED_ADDR must differ from E9_SHARED_ADDR"
+        );
+        // And they must be at least one page apart.
+        let diff = if E9_RIP_SHARED_ADDR > preempt::E9_SHARED_ADDR {
+            E9_RIP_SHARED_ADDR - preempt::E9_SHARED_ADDR
+        } else {
+            preempt::E9_SHARED_ADDR - E9_RIP_SHARED_ADDR
+        };
+        assert!(
+            diff >= 4096,
+            "shared addresses must be at least one page apart"
+        );
     }
 }
