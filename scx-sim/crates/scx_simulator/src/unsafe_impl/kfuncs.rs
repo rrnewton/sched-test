@@ -1076,17 +1076,23 @@ pub fn exit_sim() {
     // passes, so we need to sync it back before clearing.
     if let Some(ctx) = get_callback_ctx() {
         if let Some(arc) = clone_sim_arc() {
+            crate::preempt::inhibit_preemption();
             let mut guard = arc.lock().unwrap();
             guard.sim.current_cpu = ctx.current_cpu;
             guard.sim.ops_context = ctx.ops_context;
             guard.sim.waker_task_raw = ctx.waker_task_raw;
+            drop(guard);
+            crate::preempt::allow_preemption();
         }
     }
     clear_callback_ctx();
     crate::preempt::pause_timer();
     if let Some(arc) = clone_sim_arc() {
+        crate::preempt::inhibit_preemption();
         let mut guard = arc.lock().unwrap();
         guard.sim.ops_context = OpsContext::None;
+        drop(guard);
+        crate::preempt::allow_preemption();
     }
     // Also clear per-thread TLS so structop boundary detection and the
     // signal handler see None between callbacks.
@@ -1107,10 +1113,13 @@ pub fn exit_sim_no_clear_ops() {
     // Sync CALLBACK_CTX back (same as exit_sim but without clearing ops_context).
     if let Some(ctx) = get_callback_ctx() {
         if let Some(arc) = clone_sim_arc() {
+            crate::preempt::inhibit_preemption();
             let mut guard = arc.lock().unwrap();
             guard.sim.current_cpu = ctx.current_cpu;
             guard.sim.ops_context = ctx.ops_context;
             guard.sim.waker_task_raw = ctx.waker_task_raw;
+            drop(guard);
+            crate::preempt::allow_preemption();
         }
     }
     clear_callback_ctx();
@@ -1330,9 +1339,15 @@ fn rbc_resume_inner(sim: &SimulatorState) {
 /// it means the depth counter was already incremented and the RBC counter
 /// already disabled by the lock holder. In that case, we only bump the
 /// depth counter to maintain correct nesting.
+///
+/// Inhibits preemption around the `try_lock()` to prevent the PMU signal
+/// handler from yielding while the mutex is briefly held. Without this, a
+/// stale queued signal can park the worker (via `yield_token()`) while the
+/// mutex guard is live, causing the woken worker to block on the same mutex.
 #[no_mangle]
 pub extern "C" fn sim_rbc_pause() {
     if let Some(arc) = SIM_ARC.with(|c| c.borrow().clone()) {
+        crate::preempt::inhibit_preemption();
         match arc.try_lock() {
             Ok(guard) => rbc_pause_inner(&guard.sim),
             Err(_) => {
@@ -1342,6 +1357,7 @@ pub extern "C" fn sim_rbc_pause() {
                 RBC_PAUSE_DEPTH.with(|d| d.set(d.get() + 1));
             }
         }
+        crate::preempt::allow_preemption();
     }
 }
 
@@ -1351,9 +1367,14 @@ pub extern "C" fn sim_rbc_pause() {
 /// deadlock. When the lock is already held (inside `with_sim()`), we only
 /// decrement the depth counter since `rbc_resume_inner()` will be called
 /// by `with_sim()` when it finishes.
+///
+/// Inhibits preemption around the `try_lock()` for the same reason as
+/// [`sim_rbc_pause`] — prevents signal-handler deadlock while the mutex
+/// is briefly held.
 #[no_mangle]
 pub extern "C" fn sim_rbc_resume() {
     if let Some(arc) = SIM_ARC.with(|c| c.borrow().clone()) {
+        crate::preempt::inhibit_preemption();
         match arc.try_lock() {
             Ok(guard) => rbc_resume_inner(&guard.sim),
             Err(_) => {
@@ -1366,6 +1387,7 @@ pub extern "C" fn sim_rbc_resume() {
                 });
             }
         }
+        crate::preempt::allow_preemption();
     }
 }
 
