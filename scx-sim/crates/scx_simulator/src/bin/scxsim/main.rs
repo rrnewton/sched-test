@@ -646,6 +646,88 @@ fn derive_e9_scheduler_path(base_path: &Path) -> Result<PathBuf, String> {
     }
 }
 
+/// Create a RIP-patched `_e9rip.so` for e9patch RIP-targeted replay.
+///
+/// Loads the base scheduler `.so` temporarily to determine `so_base`,
+/// re-loads the trace with the correct base, extracts unique RIP offsets,
+/// then runs e9tool to create the patched `.so` with both Jcc and
+/// RIP-specific trampolines.
+///
+/// Returns the path to the `_e9rip.so` on success.
+fn create_e9rip_scheduler(base_so_path: &Path, trace_file: &Path) -> Result<PathBuf, String> {
+    use scx_simulator::backend::e9patch;
+    use std::io::BufReader;
+
+    // Check if a cached _e9rip.so already exists.
+    let e9rip_path = e9patch::derive_e9rip_path(base_so_path);
+    if e9rip_path.exists() {
+        eprintln!(
+            "replay: using cached e9patch RIP variant: {}",
+            e9rip_path.display()
+        );
+        return Ok(e9rip_path);
+    }
+
+    // Load the base .so temporarily to discover so_base.
+    let prefix = scheduler_prefix_from_path(base_so_path);
+    let base_so_str = base_so_path.to_str().unwrap_or_else(|| {
+        panic!(
+            "scheduler path is not valid UTF-8: {}",
+            base_so_path.display()
+        )
+    });
+
+    // Temporarily load the base .so to get so_base for RIP reconstruction.
+    // This load is scoped so the .so is unloaded before we create and load
+    // the patched variant.
+    let so_base = {
+        let _sched = DynamicScheduler::load(base_so_str, &prefix, 1);
+        let _lock = SIM_LOCK.lock().unwrap();
+        scheduler_so_base()
+    };
+
+    // Re-deserialize the trace with the correct so_base.
+    let file = std::fs::File::open(trace_file)
+        .map_err(|e| format!("cannot open trace file {}: {e}", trace_file.display()))?;
+    let mut reader = BufReader::new(file);
+    let trace = PreemptionTrace::deserialize(&mut reader, so_base)
+        .map_err(|e| format!("failed to parse trace file: {e}"))?;
+
+    // Extract unique RIPs and convert to .so-relative offsets for e9tool.
+    let rips = e9patch::collect_trace_rips(&trace);
+    if rips.is_empty() {
+        return Err("e9patch RIP mode: no non-zero RIPs found in trace. \
+             Cannot create RIP-patched .so."
+            .to_string());
+    }
+
+    // Convert absolute RIPs to .so-relative offsets (ELF virtual addresses).
+    let rip_offsets: Vec<u64> = rips
+        .iter()
+        .filter_map(|&rip| {
+            if so_base > 0 && rip >= so_base {
+                Some(rip - so_base)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if rip_offsets.is_empty() {
+        return Err("e9patch RIP mode: no RIPs within the scheduler .so range. \
+             The trace may have been recorded with a different scheduler."
+            .to_string());
+    }
+
+    eprintln!(
+        "replay: creating e9patch RIP variant with {} target addresses",
+        rip_offsets.len()
+    );
+
+    // Run e9tool to create the _e9rip.so.
+    e9patch::create_e9rip_so(base_so_path, &rip_offsets)
+}
+
 fn replay_simulation(args: &ReplayArgs) -> Result<(), String> {
     use std::io::BufReader;
 
@@ -687,6 +769,7 @@ fn replay_simulation(args: &ReplayArgs) -> Result<(), String> {
         .unwrap_or_else(|| panic!("trace file missing required metadata: timeslice_max"));
 
     let use_e9_replay = args.preempt_mode == PreemptModeArg::E9patch;
+    let use_e9_rip_mode = use_e9_replay && pre_trace.break_on() == PmuEvent::InstructionsRetired;
 
     // Map the shared RBC state page if e9patch replay mode is requested.
     // Must happen BEFORE loading the _e9.so (the instrumented Jcc
@@ -695,11 +778,27 @@ fn replay_simulation(args: &ReplayArgs) -> Result<(), String> {
         scx_simulator::preempt::mmap_shared_rbc();
     }
 
+    // Map the RIP shared state page if e9patch RIP mode is detected.
+    // Must happen BEFORE loading the _e9rip.so.
+    if use_e9_rip_mode {
+        scx_simulator::backend::e9patch::mmap_rip_shared();
+        eprintln!("replay: detected break_on=insn trace, using e9patch RIP mode");
+    }
+
     // For e9patch replay, derive the _e9.so path from the trace's .so path
     // if the user didn't provide an explicit --scheduler-file override.
-    if use_e9_replay && args.scheduler_file.is_none() {
+    // In RIP mode, we skip this — we'll create a _e9rip.so at runtime.
+    if use_e9_replay && !use_e9_rip_mode && args.scheduler_file.is_none() {
         scheduler_path = derive_e9_scheduler_path(&scheduler_path)?;
     }
+
+    // For e9patch RIP mode: load the base .so first to get so_base,
+    // then create the _e9rip.so with RIP-targeted trampolines, then
+    // reload with the patched .so.
+    if use_e9_rip_mode {
+        scheduler_path = create_e9rip_scheduler(&scheduler_path, &args.trace_file)?;
+    }
+
     let prefix = scheduler_prefix_from_path(&scheduler_path);
     let so_path_str = scheduler_path.to_str().unwrap_or_else(|| {
         panic!(
