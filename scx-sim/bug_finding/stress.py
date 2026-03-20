@@ -14,11 +14,14 @@ Usage:
     python3 stress.py --e9patch               # Only test e9patch mode
     python3 stress.py --random-workloads      # Enable randomized workloads + params
 """
+from __future__ import annotations
 
 import argparse
 import json
 import logging
 import multiprocessing
+import multiprocessing.sharedctypes
+import multiprocessing.synchronize
 import os
 import random
 import shutil
@@ -27,11 +30,11 @@ import subprocess
 import tempfile
 import sys
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import Future, ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -78,13 +81,13 @@ def _get_generated_workloads_dir() -> Path:
     return _GENERATED_WORKLOADS_DIR
 
 
-def _gen_phases_run_only(rng: random.Random) -> list[dict]:
+def _gen_phases_run_only(rng: random.Random) -> list[dict[str, Any]]:
     """Generate a run-only phase list."""
     run_us = rng.choice([1000, 2000, 5000, 10000, 20000])
     return [{"run": run_us}]
 
 
-def _gen_phases_run_sleep(rng: random.Random) -> list[dict]:
+def _gen_phases_run_sleep(rng: random.Random) -> list[dict[str, Any]]:
     """Generate a run+sleep phase list."""
     run_us = rng.choice([1000, 2000, 5000, 10000])
     sleep_us = rng.choice([1000, 5000, 10000, 20000])
@@ -93,11 +96,11 @@ def _gen_phases_run_sleep(rng: random.Random) -> list[dict]:
 
 def _gen_phases_run_sleep_wake(
     rng: random.Random, other_task_name: Optional[str],
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """Generate a run+sleep+wake phase list (with resume if target exists)."""
     run_us = rng.choice([2000, 5000, 10000])
     sleep_us = rng.choice([5000, 10000, 20000])
-    phases: list[dict] = [{"run": run_us}]
+    phases: list[dict[str, Any]] = [{"run": run_us}]
     if other_task_name:
         phases[0]["resume"] = other_task_name
     phases[0]["sleep"] = sleep_us
@@ -106,12 +109,12 @@ def _gen_phases_run_sleep_wake(
 
 def _gen_phases_mixed(
     rng: random.Random, other_task_name: Optional[str],
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     """Generate a mixed-pattern phase list with multiple run/sleep segments."""
-    phases: list[dict] = []
+    phases: list[dict[str, Any]] = []
     n_segments = rng.randint(2, 4)
     for _ in range(n_segments):
-        entry: dict = {}
+        entry: dict[str, Any] = {}
         entry["run"] = rng.choice([1000, 2000, 5000, 10000])
         if rng.random() < 0.5:
             entry["sleep"] = rng.choice([1000, 5000, 10000])
@@ -133,7 +136,7 @@ def _build_task_phases(
     rng: random.Random,
     pattern: str,
     other_task_name: Optional[str],
-) -> dict:
+) -> dict[str, Any]:
     """Build a single task's top-level JSON object from a phase pattern.
 
     For multi-segment patterns (mixed), uses the rt-app 'phases' sub-object.
@@ -170,7 +173,7 @@ def generate_random_workload(rng: random.Random) -> Path:
 
     # Build task definitions
     task_names = [f"t{i}" for i in range(task_count)]
-    tasks: dict = {}
+    tasks: dict[str, Any] = {}
     for idx, name in enumerate(task_names):
         # Per-task pattern: 70% dominant, 30% random
         if rng.random() < 0.7:
@@ -223,7 +226,7 @@ def generate_random_workload(rng: random.Random) -> Path:
     return Path(path)
 
 
-def _scale_run_times(task_obj: dict, factor: float) -> None:
+def _scale_run_times(task_obj: dict[str, Any], factor: float) -> None:
     """Scale all 'run' values in a task object by a factor."""
     for key in list(task_obj.keys()):
         if key.startswith("run") and isinstance(task_obj[key], int):
@@ -234,7 +237,7 @@ def _scale_run_times(task_obj: dict, factor: float) -> None:
                 _scale_run_times(phase, factor)
 
 
-def _add_suspend_for_resume_targets(tasks: dict) -> None:
+def _add_suspend_for_resume_targets(tasks: dict[str, Any]) -> None:
     """For tasks that are resume targets, add a suspend if they lack one."""
     resume_targets: set[str] = set()
     for task_obj in tasks.values():
@@ -248,7 +251,7 @@ def _add_suspend_for_resume_targets(tasks: dict) -> None:
                 _prepend_suspend(task_obj, target_name)
 
 
-def _collect_resume_targets(obj: dict, targets: set[str]) -> None:
+def _collect_resume_targets(obj: dict[str, Any], targets: set[str]) -> None:
     """Recursively collect all resume target names from a task object."""
     for key, val in obj.items():
         if key.startswith("resume") and isinstance(val, str):
@@ -259,7 +262,7 @@ def _collect_resume_targets(obj: dict, targets: set[str]) -> None:
                     _collect_resume_targets(phase, targets)
 
 
-def _prepend_suspend(task_obj: dict, task_name: str) -> None:
+def _prepend_suspend(task_obj: dict[str, Any], task_name: str) -> None:
     """Prepend a suspend event to a task so it can be woken by resume."""
     if "phases" in task_obj:
         # Multi-phase: add a suspend phase at the beginning
@@ -310,12 +313,13 @@ SIM_DURATION = DEFAULT_SIM_DURATION
 DETERMINISM_MODE = False
 
 # PMU token pool: limits concurrent PMU-signal preemptive instances
-PMU_TOKEN_POOL: Optional[multiprocessing.Semaphore] = None
-MAX_PMU_CONCURRENT = max(os.cpu_count() // 3, 4)  # Default: nproc/3 (scaling test shows ~86% efficiency)
+PMU_TOKEN_POOL: Optional[multiprocessing.synchronize.Semaphore] = None
+_CPU_COUNT = os.cpu_count() or 1
+MAX_PMU_CONCURRENT = max(_CPU_COUNT // 3, 4)  # Default: nproc/3 (scaling test shows ~86% efficiency)
 
 # PMU stats counters (shared across processes)
-PMU_ACQUIRED: Optional[multiprocessing.Value] = None
-PMU_REDIRECTED: Optional[multiprocessing.Value] = None
+PMU_ACQUIRED: Optional[multiprocessing.sharedctypes.Synchronized[int]] = None
+PMU_REDIRECTED: Optional[multiprocessing.sharedctypes.Synchronized[int]] = None
 
 # Global logger (configured in main)
 log: logging.Logger = logging.getLogger("stress")
@@ -575,7 +579,7 @@ def _compare_simulation_metrics(
 def _run_replay(
     trace_path: str,
     extra_args: Optional[list[str]] = None,
-) -> subprocess.CompletedProcess:
+) -> subprocess.CompletedProcess[str]:
     """Execute a scxsim replay command and return the CompletedProcess."""
     cmd = [str(SCXSIM), "replay", trace_path]
     if extra_args:
@@ -606,7 +610,7 @@ def _make_finding(
 
 def _record_preemptions(
     config: TestConfig, trace_path: str, start: float,
-) -> tuple[Optional[Finding], Optional[subprocess.CompletedProcess]]:
+) -> tuple[Optional[Finding], Optional[subprocess.CompletedProcess[str]]]:
     """Record preemption points. Returns (finding, result) -- finding is set
     only on failure."""
     cmd = build_base_cmd(config) + ["--record-preemptions", trace_path]
@@ -627,8 +631,8 @@ def _record_preemptions(
 
 def _check_replay_vs_record(
     config: TestConfig,
-    record_result: subprocess.CompletedProcess,
-    replay_result: subprocess.CompletedProcess,
+    record_result: subprocess.CompletedProcess[str],
+    replay_result: subprocess.CompletedProcess[str],
     start: float,
 ) -> Optional[Finding]:
     """Compare record and replay metrics, return Finding on mismatch."""
@@ -652,8 +656,8 @@ def _check_replay_vs_record(
 
 def _check_replay_replay(
     config: TestConfig,
-    replay1_result: subprocess.CompletedProcess,
-    replay2_result: subprocess.CompletedProcess,
+    replay1_result: subprocess.CompletedProcess[str],
+    replay2_result: subprocess.CompletedProcess[str],
     start: float,
 ) -> Optional[Finding]:
     """Compare two replay runs, return Finding on mismatch."""
@@ -696,6 +700,7 @@ def run_determinism_preemptive(config: TestConfig) -> Optional[Finding]:
         )
         if finding:
             return finding
+        assert record_result is not None
 
         # Phase 2: replay preemption points (deterministic hw breakpoint)
         replay1 = _run_replay(tmpfile.name)
@@ -938,9 +943,9 @@ _WORKER_USE_RANDOM_WORKLOADS: bool = False
 
 
 def _init_worker(
-    pmu_pool: Optional[multiprocessing.Semaphore],
-    pmu_acquired: Optional[multiprocessing.Value],
-    pmu_redirected: Optional[multiprocessing.Value],
+    pmu_pool: Optional[multiprocessing.synchronize.Semaphore],
+    pmu_acquired: Optional[multiprocessing.sharedctypes.Synchronized[int]],
+    pmu_redirected: Optional[multiprocessing.sharedctypes.Synchronized[int]],
     schedulers: list[str],
     workloads: list[str],
     modes: list[str],
@@ -1167,7 +1172,7 @@ def save_finding(finding: Finding, finding_num: int) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def main():
+def main() -> int:
     parser = argparse.ArgumentParser(description="Stress test scx_simulator")
     parser.add_argument(
         "--duration",
@@ -1379,7 +1384,7 @@ def main():
                 args.random_workloads,
             ),
         ) as pool:
-            pending = {}
+            pending: dict[Future[Optional[Finding]], TestConfig] = {}
             iteration = 0
 
             while time.monotonic() < deadline or pending:

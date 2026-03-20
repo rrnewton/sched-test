@@ -110,7 +110,7 @@ def read_workload_duration_ns(workload_path: Path) -> int:
     return int(dur_secs * 1_000_000_000)
 
 
-def get_git_metadata() -> dict:
+def get_git_metadata() -> dict[str, str]:
     """Collect git commit, depth, branch, dirty status."""
     def _git(*args: str) -> str:
         result = subprocess.run(
@@ -325,7 +325,7 @@ def write_csv(
     results: list[BenchmarkResult],
     csv_path: Path,
     append: bool,
-    git_metadata: Optional[dict],
+    git_metadata: Optional[dict[str, str]],
 ) -> None:
     """Write or append benchmark results to a CSV file."""
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -376,8 +376,8 @@ def generate_bar_chart_html(
 ) -> None:
     """Generate a grouped bar chart HTML file using Plotly."""
     try:
-        import plotly.graph_objects as go  # type: ignore[import]
-        from plotly.subplots import make_subplots  # type: ignore[import]
+        import plotly.graph_objects as go  # type: ignore[import-untyped]
+        from plotly.subplots import make_subplots  # type: ignore[import-untyped]
     except ImportError:
         print("WARNING: plotly not installed; skipping HTML generation.")
         print("  Install with: .venv/bin/pip install plotly pandas")
@@ -480,9 +480,9 @@ def generate_bar_chart_html(
 def generate_history_html(csv_path: Path, html_path: Path) -> None:
     """Generate a time-series dashboard from historical benchmark CSV."""
     try:
-        import pandas as pd  # type: ignore[import]
-        import plotly.graph_objects as go  # type: ignore[import]
-        from plotly.subplots import make_subplots  # type: ignore[import]
+        import pandas as pd  # type: ignore[import-untyped]
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
     except ImportError:
         print("ERROR: plotly/pandas not installed.", file=sys.stderr)
         print("  Install with: .venv/bin/pip install plotly pandas", file=sys.stderr)
