@@ -27,6 +27,12 @@ Adhere to high-performance Rust patterns (unboxing, minimizing allocation, etc).
 
 Read OPTIMIZATION.md for more details.
 
+Python Code
+----------------------------------------
+All Python code must be strictly typed with type annotations on all
+function signatures (parameters and return types). Use `mypy --strict`
+or `pyright` for type checking. This is enforced by `validate.sh`.
+
 NEVER commit files containing your local username, home directory paths, or other
 machine-specific absolute paths. Use relative paths, `~`, environment variables,
 or generic placeholders like `<REPO_ROOT>` instead.
