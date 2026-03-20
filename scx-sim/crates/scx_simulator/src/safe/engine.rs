@@ -1436,12 +1436,18 @@ impl<S: Scheduler> Simulator<S> {
                     )
                 });
                 state.e9_fns = Some(e9_fns);
+                // Auto-detect RIP mode from the trace's break_on event.
+                // Traces recorded with --break-on insn have preemption
+                // points at arbitrary instruction addresses (not just Jcc),
+                // requiring a RIP-patched .so and RIP-targeted replay.
+                let rip_mode = trace.break_on() == crate::perf::PmuEvent::InstructionsRetired;
                 state.e9_replay_backend = Some(E9PatchReplayBackend::new(
                     trace,
                     nr_cpus as usize,
                     ts_min,
                     ts_max,
                     e9_fns,
+                    rip_mode,
                 ));
             } else {
                 state.replay_backend = Some(ReplayBackend::new(
