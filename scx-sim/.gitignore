@@ -32,3 +32,6 @@ benchmark_results.csv
 
 # Python venv (created locally, not tracked)
 .venv/
+
+# Debug output (sweep results, ad-hoc investigation, etc.)
+debug/
