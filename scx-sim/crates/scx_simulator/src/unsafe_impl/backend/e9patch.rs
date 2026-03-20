@@ -587,6 +587,45 @@ pub fn collect_trace_rips(trace: &PreemptionTrace) -> Vec<u64> {
     rips
 }
 
+/// Classify whether instruction bytes represent a Jcc (conditional branch).
+///
+/// Returns `true` if the first bytes of `insn` encode a conditional branch:
+/// - `0x70..=0x7F`: short Jcc (2 bytes: `7x rel8`)
+/// - `0x0F 0x80..=0x0F 0x8F`: near Jcc (6 bytes: `0F 8x rel32`)
+/// - `0xE3`: JCXZ/JECXZ/JRCXZ (2 bytes: `E3 rel8`)
+///
+/// This matters for e9patch RIP replay: when a target RIP is a Jcc, both
+/// the Jcc trampoline (branch counting) and RIP trampoline (replay yield)
+/// match the same instruction. e9patch composes them correctly — see
+/// [`build_e9_rip_command`] doc comment for details.
+///
+/// # Arguments
+/// * `insn` - Raw instruction bytes at the target RIP (at least 2 bytes).
+pub fn is_jcc_instruction(insn: &[u8]) -> bool {
+    match insn.first() {
+        Some(&b) if (0x70..=0x7F).contains(&b) => true,
+        Some(&0xE3) => true,
+        Some(&0x0F) => matches!(insn.get(1), Some(&b) if (0x80..=0x8F).contains(&b)),
+        _ => false,
+    }
+}
+
+/// Count how many of the target RIPs in a trace are Jcc instructions.
+///
+/// Iterates all preemption records and checks the instruction bytes at
+/// each preemption point. Returns the count of records where the
+/// instruction is a Jcc (conditional branch).
+///
+/// This is a diagnostic to understand how often the Jcc-at-RIP
+/// composition case arises in practice.
+pub fn count_jcc_rips(trace: &PreemptionTrace) -> usize {
+    (0..trace.num_workers())
+        .flat_map(|i| trace.worker_trace(WorkerId(i)).iter())
+        .filter(|r| r.instruction_pointer != 0)
+        .filter(|r| is_jcc_instruction(&r.insn_bytes))
+        .count()
+}
+
 /// Build an e9tool command to create a RIP-patched scheduler `.so`.
 ///
 /// The output `.so` has two kinds of instrumentation:
@@ -594,6 +633,29 @@ pub fn collect_trace_rips(trace: &PreemptionTrace) -> Vec<u64> {
 ///    as the standard `_e9.so`).
 /// 2. Each target RIP from the trace patched with `rip_trampoline(addr)`
 ///    (for precise RIP-targeted yield).
+///
+/// # Jcc-at-RIP composition
+///
+/// When a target RIP happens to be a Jcc instruction, **both** trampolines
+/// match the same instruction. e9patch handles this correctly via trampoline
+/// composition (see e9tool-user-guide.md, "Composing Trampolines"):
+///
+/// ```text
+/// rbc_trampoline(); rip_trampoline(addr); <original Jcc>; break;
+/// ```
+///
+/// Both trampolines use the default `before` position, so they execute in
+/// **command-line order** before the original instruction. The Jcc
+/// trampoline comes first and always returns immediately in RIP mode
+/// (counter = `i64::MAX`, armed = 0). The RIP trampoline then checks
+/// `armed_rip` and yields if matched.
+///
+/// This is safe because:
+/// - The Jcc trampoline's fast path (`counter > 0`) exits immediately
+///   without side effects when the counter is at `i64::MAX`.
+/// - The RIP trampoline independently checks `armed_rip` from its own
+///   shared page at [`E9_RIP_SHARED_ADDR`].
+/// - No state is shared between the two trampolines.
 ///
 /// Returns `(command, output_path)`.
 pub fn build_e9_rip_command(
@@ -607,11 +669,17 @@ pub fn build_e9_rip_command(
     let mut cmd = std::process::Command::new(e9tool_path);
 
     // First: instrument all Jcc with the branch-counting trampoline.
+    // IMPORTANT: Jcc match must come first so that for Jcc instructions
+    // that are also RIP targets, the branch counter fires before the RIP
+    // check. In RIP mode the Jcc trampoline is a no-op (armed=0), but the
+    // ordering ensures branch counting stays consistent if we ever need it.
     cmd.arg("-M").arg("jcc");
     cmd.arg("-P")
         .arg(format!("rbc_trampoline()@{}", rbc_trampoline_bin.display()));
 
     // Then: instrument each target RIP with the RIP trampoline.
+    // For Jcc instructions, e9patch composes this with the Jcc trampoline
+    // above — both fire in sequence (see doc comment).
     for &rip in rips {
         cmd.arg("-M").arg(format!("addr={rip:#x}"));
         cmd.arg("-P").arg(format!(
@@ -886,5 +954,249 @@ mod tests {
             diff >= 4096,
             "shared addresses must be at least one page apart"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // is_jcc_instruction tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_is_jcc_short_all_variants() {
+        // Short Jcc: 0x70..=0x7F followed by rel8.
+        for opcode in 0x70u8..=0x7F {
+            let insn = [opcode, 0x0A, 0x00, 0x00, 0x00];
+            assert!(
+                is_jcc_instruction(&insn),
+                "short Jcc opcode {opcode:#04x} should be classified as Jcc"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_jcc_near_all_variants() {
+        // Near Jcc: 0x0F 0x80..=0x0F 0x8F followed by rel32.
+        for second in 0x80u8..=0x8F {
+            let insn = [0x0F, second, 0x65, 0x03, 0x00];
+            assert!(
+                is_jcc_instruction(&insn),
+                "near Jcc 0x0F {second:#04x} should be classified as Jcc"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_jcc_jcxz() {
+        // JCXZ/JECXZ/JRCXZ: 0xE3 rel8.
+        let insn = [0xE3, 0x10, 0x00, 0x00, 0x00];
+        assert!(is_jcc_instruction(&insn));
+    }
+
+    #[test]
+    fn test_is_jcc_non_jcc_instructions() {
+        // push rbp
+        assert!(!is_jcc_instruction(&[0x55, 0x41, 0x57, 0x41, 0x56]));
+        // call [rip+disp32]
+        assert!(!is_jcc_instruction(&[0xFF, 0x15, 0x9D, 0x62, 0x31]));
+        // REX.W prefix (cmp rdx, rbx)
+        assert!(!is_jcc_instruction(&[0x48, 0x39, 0xDA, 0x74, 0x30]));
+        // movups xmmword ptr [rsp+...]
+        assert!(!is_jcc_instruction(&[0x0F, 0x11, 0x84, 0x24, 0x88]));
+        // setcc (0F 94 — NOT a Jcc despite 0x0F prefix)
+        assert!(!is_jcc_instruction(&[0x0F, 0x94, 0xC3, 0xE8, 0xE2]));
+        // nop padding
+        assert!(!is_jcc_instruction(&[0x66, 0x66, 0x66, 0x64, 0x48]));
+        // lea
+        assert!(!is_jcc_instruction(&[0x48, 0x8D, 0x80, 0x98, 0xF1]));
+        // ret
+        assert!(!is_jcc_instruction(&[0xC3, 0x00, 0x00, 0x00, 0x00]));
+        // unconditional jmp (near)
+        assert!(!is_jcc_instruction(&[0xE9, 0x10, 0x00, 0x00, 0x00]));
+        // unconditional jmp (short)
+        assert!(!is_jcc_instruction(&[0xEB, 0x10, 0x00, 0x00, 0x00]));
+        // call near
+        assert!(!is_jcc_instruction(&[0xE8, 0x10, 0x00, 0x00, 0x00]));
+    }
+
+    #[test]
+    fn test_is_jcc_empty_and_short() {
+        // Edge cases: empty slice, single byte.
+        assert!(!is_jcc_instruction(&[]));
+        assert!(is_jcc_instruction(&[0x74])); // short je (only 1 byte)
+        assert!(!is_jcc_instruction(&[0x0F])); // incomplete near Jcc
+    }
+
+    #[test]
+    fn test_is_jcc_real_trace_data() {
+        // Instruction bytes from actual preemption trace (see task description):
+        // seq=9:  jne +0x0a (short) at rip=0x7ffff7e69dd7
+        assert!(is_jcc_instruction(&[0x75, 0x0A, 0x48, 0x83, 0xF8]));
+        // seq=12: jl +0x365 (near) at rip=0x7ffff7e63a1d
+        assert!(is_jcc_instruction(&[0x0F, 0x8C, 0x65, 0x03, 0x00]));
+        // seq=0:  push rbp (not Jcc)
+        assert!(!is_jcc_instruction(&[0x55, 0x41, 0x57, 0x41, 0x56]));
+        // seq=5:  test rcx,rcx (not Jcc — 48 85 c9)
+        assert!(!is_jcc_instruction(&[0x48, 0x85, 0xC9, 0x75, 0x0A]));
+    }
+
+    // -----------------------------------------------------------------------
+    // count_jcc_rips tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_count_jcc_rips_mixed_trace() {
+        use crate::preempt::PreemptionRecord;
+
+        let records = vec![
+            // Non-Jcc: push rbp (0x55)
+            PreemptionRecord {
+                rbc_count: 100,
+                instruction_pointer: 0x1000,
+                cpu_id: crate::types::CpuId(0),
+                worker_id: WorkerId(0),
+                sequence: 0,
+                structop_local: 1,
+                structop_global: 1,
+                structop_rbc: 100,
+                ops_context: crate::kfuncs::OpsContext::None,
+                kfunc_name: "",
+                kfunc_count: 0,
+                insn_bytes: [0x55, 0x41, 0x57, 0x41, 0x56],
+            },
+            // Jcc: jne short (0x75 0x0A)
+            PreemptionRecord {
+                rbc_count: 200,
+                instruction_pointer: 0x2000,
+                cpu_id: crate::types::CpuId(0),
+                worker_id: WorkerId(0),
+                sequence: 1,
+                structop_local: 2,
+                structop_global: 2,
+                structop_rbc: 200,
+                ops_context: crate::kfuncs::OpsContext::None,
+                kfunc_name: "",
+                kfunc_count: 0,
+                insn_bytes: [0x75, 0x0A, 0x48, 0x83, 0xF8],
+            },
+            // Jcc: jl near (0x0F 0x8C)
+            PreemptionRecord {
+                rbc_count: 300,
+                instruction_pointer: 0x3000,
+                cpu_id: crate::types::CpuId(1),
+                worker_id: WorkerId(1),
+                sequence: 2,
+                structop_local: 1,
+                structop_global: 3,
+                structop_rbc: 300,
+                ops_context: crate::kfuncs::OpsContext::None,
+                kfunc_name: "",
+                kfunc_count: 0,
+                insn_bytes: [0x0F, 0x8C, 0x65, 0x03, 0x00],
+            },
+            // Cooperative yield (rip=0, should be excluded)
+            PreemptionRecord {
+                rbc_count: 0,
+                instruction_pointer: 0,
+                cpu_id: crate::types::CpuId(0),
+                worker_id: WorkerId(0),
+                sequence: 3,
+                structop_local: 3,
+                structop_global: 4,
+                structop_rbc: 0,
+                ops_context: crate::kfuncs::OpsContext::None,
+                kfunc_name: "",
+                kfunc_count: 0,
+                insn_bytes: [0; crate::preempt::INSN_BYTES_LEN],
+            },
+        ];
+
+        let trace =
+            PreemptionTrace::from_records(&records, 2, crate::perf::PmuEvent::InstructionsRetired);
+
+        assert_eq!(
+            count_jcc_rips(&trace),
+            2,
+            "should find 2 Jcc preemption points"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // build_e9_rip_command Jcc-at-RIP composition tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_e9_rip_command_jcc_precedes_rip() {
+        // Verify that Jcc trampoline comes before RIP trampolines in the
+        // command line, ensuring correct composition ordering.
+        let input = Path::new("/path/to/libscx_lavd.so");
+        let rips = &[0x7ffff7e69dd7, 0x7ffff7e63a1d]; // Two Jcc addresses
+        let e9tool = Path::new("/usr/bin/e9tool");
+        let rbc_tramp = Path::new("/build/e9_rbc_trampoline");
+        let rip_tramp = Path::new("/build/e9_rip_trampoline");
+
+        let (cmd, _output) = build_e9_rip_command(input, rips, e9tool, rbc_tramp, rip_tramp);
+
+        // get_args() returns each flag and value as separate entries:
+        // ["-M", "jcc", "-P", "rbc_trampoline()@...", "-M", "addr=0x...", ...]
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+
+        // Find positions of key arguments.
+        let jcc_match_pos = args.iter().position(|a| a == "jcc").unwrap();
+        let rbc_patch_pos = args
+            .iter()
+            .position(|a| a.contains("rbc_trampoline"))
+            .unwrap();
+        let first_rip_match_pos = args.iter().position(|a| a.starts_with("addr=")).unwrap();
+        let first_rip_patch_pos = args
+            .iter()
+            .position(|a| a.contains("rip_trampoline"))
+            .unwrap();
+
+        // Jcc match and patch must precede all RIP matches and patches.
+        assert!(
+            jcc_match_pos < first_rip_match_pos,
+            "Jcc match (-M jcc) at position {jcc_match_pos} must precede \
+             first RIP match at position {first_rip_match_pos}. \
+             e9patch composes trampolines in command-line order, so the Jcc \
+             trampoline must fire first to maintain branch counting."
+        );
+        assert!(
+            rbc_patch_pos < first_rip_patch_pos,
+            "rbc_trampoline patch at position {rbc_patch_pos} must precede \
+             first rip_trampoline patch at position {first_rip_patch_pos}."
+        );
+    }
+
+    #[test]
+    fn test_build_e9_rip_command_generates_all_rip_patches() {
+        // Verify each target RIP gets its own -M/-P pair.
+        let input = Path::new("/path/to/libscx_lavd.so");
+        let rips = &[0x1000, 0x2000, 0x3000];
+        let e9tool = Path::new("/usr/bin/e9tool");
+        let rbc_tramp = Path::new("/build/e9_rbc_trampoline");
+        let rip_tramp = Path::new("/build/e9_rip_trampoline");
+
+        let (cmd, _output) = build_e9_rip_command(input, rips, e9tool, rbc_tramp, rip_tramp);
+
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+
+        // Should have exactly 3 addr= matches.
+        let addr_matches: Vec<_> = args.iter().filter(|a| a.starts_with("addr=")).collect();
+        assert_eq!(addr_matches.len(), 3);
+        assert_eq!(addr_matches[0], "addr=0x1000");
+        assert_eq!(addr_matches[1], "addr=0x2000");
+        assert_eq!(addr_matches[2], "addr=0x3000");
+
+        // Each addr match should be followed by a rip_trampoline patch.
+        let rip_patches: Vec<_> = args
+            .iter()
+            .filter(|a| a.contains("rip_trampoline"))
+            .collect();
+        assert_eq!(rip_patches.len(), 3);
     }
 }
