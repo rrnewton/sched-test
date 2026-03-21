@@ -107,10 +107,14 @@ echo "=== Running Python type checks ==="
 # Find all Python files (excluding venv and build dirs)
 PYTHON_FILES=$(find . -name "*.py" -not -path "./.venv/*" -not -path "./target/*" -not -path "./debug/*")
 if [ -n "$PYTHON_FILES" ]; then
+    MYPY_CMD=""
     if command -v mypy &>/dev/null; then
-        mypy --strict $PYTHON_FILES
-    elif .venv/bin/mypy --strict $PYTHON_FILES 2>/dev/null; then
-        true
+        MYPY_CMD="mypy"
+    elif [ -x .venv/bin/mypy ]; then
+        MYPY_CMD=".venv/bin/mypy"
+    fi
+    if [ -n "$MYPY_CMD" ]; then
+        $MYPY_CMD --strict $PYTHON_FILES
     else
         echo "WARNING: mypy not found, skipping Python type checks"
         echo "  Install with: pip install mypy (or .venv/bin/pip install mypy)"

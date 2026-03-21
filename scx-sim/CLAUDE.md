@@ -136,6 +136,19 @@ Dependencies and Missing Software
 Never work around a missing dependency with a compromised fallback. If software
 is needed, install it — build from source, use the package manager, or ask the
 user for help. The `~/bin/` directory is on `$PATH` for locally-built tools.
+
+**NEVER skip a validation step because a tool is missing.** Install the tool
+and run the check. If installation fails, escalate to the human — do NOT
+silently skip the check and report success. A skipped check is a lie. Examples:
+
+- mypy not found → `pip install mypy` (or `.venv/bin/pip install mypy`), then run it
+- clippy not available → install it, don't skip lint
+- a test runner is missing → install it, don't skip tests
+
+The same principle applies to test failures: if a test fails, fix it or
+escalate. Never comment out, skip, or ignore a failing test to make the suite
+"pass."
+
 Common tools already available:
 
 - **rt-app**: `~/bin/rt-app` (built from `~/playground/rt-app`)
