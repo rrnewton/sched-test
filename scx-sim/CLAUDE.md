@@ -61,10 +61,15 @@ If you validate some changes with a new manual or temporary test, that test shou
 
 NEVER add binary files or large serialized artifacts to version control without explicit permission. Always carefully review what you are adding with `git add`, and update `.gitignore` as needed.
 
-Testing Required Before Push: preferrably agent-driven, manual if necessary
-----------------------------------------
+Pre-submit or push: also validate
+---------------------------------
 
-**NEVER push code that has only coded but never tested and actually run.** 
+Even if we didn't COMMIT new code, but are just rebasing or restacking changes or merging, we should still run `./validate.sh` to make sure we are in a good state before submitting or pushing.
+
+Testing Required Before Push: preferrably agent-driven, manual if necessary
+---------------------------------------------------------------------------
+
+**NEVER push code that has only coded but never tested and actually run.**
 
 Try hard to test code YOURSELF (as the agent), installing dependencies
 as needed, using VMs, debuggers, or other tools at your disposal.
