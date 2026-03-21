@@ -28,6 +28,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
+use std::os::unix::io::RawFd;
 use std::ptr;
 use std::sync::{Arc, Mutex};
 
@@ -1221,6 +1222,12 @@ where
     let arc = SIM_ARC
         .with(|c| c.borrow().clone())
         .expect("kfunc called outside of simulator context (SIM_ARC not installed)");
+    // Disable the RBC counter FIRST so that none of the Rust infrastructure
+    // below (mutex lock, preemption management, context restore) contributes
+    // branches to the PMU count. This is critical for determinism: mutex
+    // contention (CAS vs futex slow path) adds a variable number of branches
+    // that differ between runs. See sim-70abc8.
+    disable_rbc_counter();
     // Inhibit preemption and disable the PMU timer BEFORE acquiring the
     // mutex. A PMU signal may already be queued in the kernel from a
     // counter overflow that occurred before we reach this point. Merely
@@ -1254,8 +1261,9 @@ where
         sim.rbc_kfunc_calls += 1;
         sim.rbc_kfunc_ns += cost_ns;
         // Track the longest unbroken RBC interval between kfuncs.
-        // Read the counter now before pausing to capture the interval
-        // since the last kfunc (or since start_rbc).
+        // The counter was disabled at the top of with_sim(), so
+        // reading it now returns the stopped value — the exact count
+        // at the point we left C code.
         if sim.e9_fns.is_some() {
             let current = crate::preempt::e9_read_counter();
             // e9 counter decrements, so interval = last - current.
@@ -1285,6 +1293,9 @@ where
     crate::preempt::resume_timer();
     crate::preempt::maybe_yield_preemptive_post();
     crate::preempt::set_current_kfunc("");
+    // Re-enable the RBC counter LAST, right before returning to C code.
+    // All Rust infrastructure above runs with the counter disabled.
+    enable_rbc_counter();
     result
 }
 
@@ -1298,47 +1309,126 @@ where
 // prematurely re-enabling the counter.
 thread_local! {
     static RBC_PAUSE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Cached raw fd of the main-thread RBC counter (or -1 if none).
+    ///
+    /// Set by [`set_rbc_counter_fd`] during `start_rbc()`. Enables
+    /// [`disable_rbc_counter`] / [`enable_rbc_counter`] to pause/resume
+    /// the PMU counter without needing `&SimulatorState` (and hence
+    /// without acquiring the `SIM_ARC` mutex). This is critical for
+    /// keeping infrastructure branches (mutex lock/unlock, preemption
+    /// management) out of the PMU measurement window.
+    static RBC_COUNTER_FD: std::cell::Cell<RawFd> = const { std::cell::Cell::new(-1) };
 }
 
-/// Inner RBC pause logic. Called with `&SimulatorState` already available.
-fn rbc_pause_inner(sim: &SimulatorState) {
+/// Cache the main-thread RBC counter fd in TLS for lock-free access.
+///
+/// Called by `start_rbc()` in engine.rs when the counter is created/reset.
+/// Pass -1 to clear (e.g., when the counter is taken out during concurrent
+/// batch processing).
+pub fn set_rbc_counter_fd(fd: RawFd) {
+    RBC_COUNTER_FD.with(|c| c.set(fd));
+}
+
+/// Set the RBC pause depth directly.
+///
+/// Called by `start_rbc()` to initialize the depth to 1 (counter disabled).
+/// `sim_callback!`'s `enable_rbc_counter()` will transition depth 1→0
+/// to enable the counter right before C code runs.
+pub fn set_rbc_pause_depth(depth: u32) {
+    RBC_PAUSE_DEPTH.with(|d| d.set(depth));
+}
+
+/// Disable the main-thread RBC counter (nesting-safe, lock-free).
+///
+/// Increments the pause depth. At the outermost level (depth 0 → 1),
+/// disables the PMU counter via ioctl and pauses the per-worker
+/// measurement counter. Complete no-op if no counter is cached (fd < 0),
+/// i.e. when called from `sim_callback!` for ops callbacks that don't
+/// call `start_rbc()` (init-time callbacks without RBC measurement).
+///
+/// This is the primary mechanism for excluding Rust infrastructure
+/// branches from the PMU measurement. Call before mutex operations,
+/// preemption management, or any other Rust code that should not be
+/// counted as scheduler overhead.
+pub fn disable_rbc_counter() {
+    // Fast path: no counter active — skip depth tracking entirely.
+    // This avoids polluting the depth counter when sim_callback! is used
+    // without start_rbc() (e.g. update_idle during init).
+    if RBC_COUNTER_FD.with(|c| c.get()) < 0 {
+        return;
+    }
     let depth = RBC_PAUSE_DEPTH.with(|d| {
         let cur = d.get();
         d.set(cur + 1);
         cur
     });
     if depth == 0 {
-        if let Some(ref rbc) = sim.rbc_counter {
-            let _ = rbc.disable();
+        let fd = RBC_COUNTER_FD.with(|c| c.get());
+        // SAFETY: fd is a valid perf_event fd cached from RbcCounter.
+        // PERF_EVENT_IOC_DISABLE is a valid ioctl for perf_event fds.
+        unsafe {
+            libc::ioctl(fd, scx_perf::PERF_IOC_DISABLE, 0 as libc::c_ulong);
         }
         crate::preempt::pause_measurement();
     }
 }
 
-/// Inner RBC resume logic. Called with `&SimulatorState` already available.
-fn rbc_resume_inner(sim: &SimulatorState) {
+/// Enable the main-thread RBC counter (nesting-safe, lock-free).
+///
+/// Decrements the pause depth. At the outermost level (depth 1 → 0),
+/// enables the PMU counter via ioctl and resumes the per-worker
+/// measurement counter. Complete no-op if no counter is cached (fd < 0).
+///
+/// Call after Rust infrastructure completes, right before returning
+/// to C scheduler code.
+pub fn enable_rbc_counter() {
+    // Fast path: no counter active — skip depth tracking entirely.
+    if RBC_COUNTER_FD.with(|c| c.get()) < 0 {
+        return;
+    }
     let depth = RBC_PAUSE_DEPTH.with(|d| {
         let cur = d.get();
-        debug_assert!(cur > 0, "rbc_resume_inner without matching rbc_pause_inner");
+        debug_assert!(
+            cur > 0,
+            "enable_rbc_counter without matching disable_rbc_counter"
+        );
         d.set(cur - 1);
         cur - 1
     });
     if depth == 0 {
-        if let Some(ref rbc) = sim.rbc_counter {
-            let _ = rbc.enable();
+        let fd = RBC_COUNTER_FD.with(|c| c.get());
+        // SAFETY: fd is a valid perf_event fd cached from RbcCounter.
+        // PERF_EVENT_IOC_ENABLE is a valid ioctl for perf_event fds.
+        unsafe {
+            libc::ioctl(fd, scx_perf::PERF_IOC_ENABLE, 0 as libc::c_ulong);
         }
         crate::preempt::resume_measurement();
     }
 }
 
+/// Inner RBC pause logic. Called with `&SimulatorState` already available.
+///
+/// Delegates to [`disable_rbc_counter`] which uses the cached fd instead
+/// of `sim.rbc_counter` — this avoids requiring the lock to pause/resume
+/// the counter around infrastructure code.
+fn rbc_pause_inner(_sim: &SimulatorState) {
+    disable_rbc_counter();
+}
+
+/// Inner RBC resume logic. Called with `&SimulatorState` already available.
+///
+/// Delegates to [`enable_rbc_counter`] which uses the cached fd instead
+/// of `sim.rbc_counter`.
+fn rbc_resume_inner(_sim: &SimulatorState) {
+    enable_rbc_counter();
+}
+
 /// Pause the PMU RBC counter from C code.
 ///
-/// Uses `try_lock()` instead of `lock()` to avoid deadlocking when called
-/// from within `with_sim()`. The `with_sim()` function already holds the
-/// mutex and calls `rbc_pause_inner()` directly, so when `try_lock()` fails
-/// it means the depth counter was already incremented and the RBC counter
-/// already disabled by the lock holder. In that case, we only bump the
-/// depth counter to maintain correct nesting.
+/// Disables the counter immediately (via cached fd) so that the Rust
+/// infrastructure below (preemption inhibit, mutex try_lock) is NOT
+/// counted. Uses nesting-safe [`disable_rbc_counter`] so nested
+/// calls from within `with_sim()` are handled correctly.
 ///
 /// Inhibits preemption around the `try_lock()` to prevent the PMU signal
 /// handler from yielding while the mutex is briefly held. Without this, a
@@ -1346,49 +1436,33 @@ fn rbc_resume_inner(sim: &SimulatorState) {
 /// mutex guard is live, causing the woken worker to block on the same mutex.
 #[no_mangle]
 pub extern "C" fn sim_rbc_pause() {
-    if let Some(arc) = SIM_ARC.with(|c| c.borrow().clone()) {
+    // Disable the counter FIRST so infrastructure branches are not counted.
+    disable_rbc_counter();
+    // Preemption management is now outside the measurement window.
+    if SIM_ARC.with(|c| c.borrow().is_some()) {
         crate::preempt::inhibit_preemption();
-        match arc.try_lock() {
-            Ok(guard) => rbc_pause_inner(&guard.sim),
-            Err(_) => {
-                // Lock already held by with_sim() on this thread.
-                // with_sim() already called rbc_pause_inner(), so just
-                // bump the depth counter for correct nesting.
-                RBC_PAUSE_DEPTH.with(|d| d.set(d.get() + 1));
-            }
-        }
         crate::preempt::allow_preemption();
     }
 }
 
 /// Resume the PMU RBC counter from C code.
 ///
-/// Mirror of [`sim_rbc_pause`]: uses `try_lock()` to avoid re-entrant
-/// deadlock. When the lock is already held (inside `with_sim()`), we only
-/// decrement the depth counter since `rbc_resume_inner()` will be called
-/// by `with_sim()` when it finishes.
+/// Re-enables the counter (via cached fd) AFTER all Rust infrastructure
+/// completes, right before returning to C code. Uses nesting-safe
+/// [`enable_rbc_counter`] so nested calls from within `with_sim()` are
+/// handled correctly.
 ///
-/// Inhibits preemption around the `try_lock()` for the same reason as
-/// [`sim_rbc_pause`] — prevents signal-handler deadlock while the mutex
-/// is briefly held.
+/// Inhibits preemption around the operation for the same reason as
+/// [`sim_rbc_pause`] — prevents signal-handler deadlock.
 #[no_mangle]
 pub extern "C" fn sim_rbc_resume() {
-    if let Some(arc) = SIM_ARC.with(|c| c.borrow().clone()) {
+    // Preemption management runs with the counter still disabled.
+    if SIM_ARC.with(|c| c.borrow().is_some()) {
         crate::preempt::inhibit_preemption();
-        match arc.try_lock() {
-            Ok(guard) => rbc_resume_inner(&guard.sim),
-            Err(_) => {
-                // Lock already held by with_sim() on this thread.
-                // Just decrement the depth counter.
-                RBC_PAUSE_DEPTH.with(|d| {
-                    let cur = d.get();
-                    debug_assert!(cur > 0, "sim_rbc_resume without matching sim_rbc_pause");
-                    d.set(cur - 1);
-                });
-            }
-        }
         crate::preempt::allow_preemption();
     }
+    // Re-enable the counter LAST, right before returning to C code.
+    enable_rbc_counter();
 }
 
 // ---------------------------------------------------------------------------
