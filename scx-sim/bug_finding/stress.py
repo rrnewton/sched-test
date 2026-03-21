@@ -460,9 +460,7 @@ class Finding:
             record_cmd = " ".join(cmd + ["--record-preemptions /tmp/repro.preempt"])
             replay_cmd = f"{SCXSIM} replay /tmp/repro.preempt"
             return f"{record_cmd} && {replay_cmd}"
-        elif self.error_type in (
-            "replay_output_mismatch", "replay_nondeterminism",
-        ):
+        elif self.error_type == "replay_nondeterminism":
             # Record then replay twice to compare
             record_cmd = " ".join(cmd + ["--record-preemptions /tmp/repro.preempt"])
             replay_cmd = f"{SCXSIM} replay /tmp/repro.preempt"
@@ -629,31 +627,6 @@ def _record_preemptions(
     return None, result
 
 
-def _check_replay_vs_record(
-    config: TestConfig,
-    record_result: subprocess.CompletedProcess[str],
-    replay_result: subprocess.CompletedProcess[str],
-    start: float,
-) -> Optional[Finding]:
-    """Compare record and replay metrics, return Finding on mismatch."""
-    record_metrics = _extract_simulation_metrics(record_result.stdout)
-    replay_metrics = _extract_simulation_metrics(replay_result.stdout)
-    diff = _compare_simulation_metrics(
-        record_metrics, replay_metrics, "record", "replay",
-    )
-    if diff:
-        combined_stderr = (
-            f"record vs replay output mismatch: {diff}\n\n"
-            f"--- record stdout ---\n{record_result.stdout.strip()}\n\n"
-            f"--- replay stdout ---\n{replay_result.stdout.strip()}"
-        )
-        return _make_finding(
-            config, "replay_output_mismatch",
-            1, combined_stderr, replay_result.stdout, start,
-        )
-    return None
-
-
 def _check_replay_replay(
     config: TestConfig,
     replay1_result: subprocess.CompletedProcess[str],
@@ -678,13 +651,18 @@ def _check_replay_replay(
 
 
 def run_determinism_preemptive(config: TestConfig) -> Optional[Finding]:
-    """Record preemption points, replay, compare outputs, replay again.
+    """Record preemption points, replay twice, compare replay outputs.
 
     Checks:
     1. Record with PMU succeeds
     2. Replay with HW breakpoint succeeds
-    3. Record vs replay metrics match (replay_output_mismatch)
-    4. Two replays of same trace match (replay_nondeterminism)
+    3. Two replays of same trace match (replay_nondeterminism)
+
+    Note: we do NOT compare record vs replay metrics because PMU
+    recording is inherently nondeterministic (hardware skid), so the
+    recording run's trace metrics (total_events, total_ticks, etc.)
+    will naturally differ from the replay's.  The meaningful
+    determinism check is replay-vs-replay: same trace, same mechanism.
     """
     start = time.monotonic()
     tmpfile = None
@@ -695,12 +673,11 @@ def run_determinism_preemptive(config: TestConfig) -> Optional[Finding]:
         tmpfile.close()
 
         # Phase 1: record preemption points (nondeterministic PMU)
-        finding, record_result = _record_preemptions(
+        finding, _record_result = _record_preemptions(
             config, tmpfile.name, start,
         )
         if finding:
             return finding
-        assert record_result is not None
 
         # Phase 2: replay preemption points (deterministic hw breakpoint)
         replay1 = _run_replay(tmpfile.name)
@@ -711,14 +688,7 @@ def run_determinism_preemptive(config: TestConfig) -> Optional[Finding]:
                 replay1.returncode, replay1.stderr, replay1.stdout, start,
             )
 
-        # Phase 3: compare record vs replay metrics
-        finding = _check_replay_vs_record(
-            config, record_result, replay1, start,
-        )
-        if finding:
-            return finding
-
-        # Phase 4: replay again, compare with first replay
+        # Phase 3: replay again, compare with first replay
         replay2 = _run_replay(tmpfile.name)
         if replay2.returncode != 0:
             error_type = classify_error(replay2.returncode, replay2.stderr)
