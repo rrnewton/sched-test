@@ -9,6 +9,32 @@ cd "$(dirname "$0")"
 SKIPPED=()
 record_skip() { SKIPPED+=("$1"); }
 
+echo "=== Checking for merge conflict markers ==="
+CONFLICT_FILES=$(grep -rl --include='*.rs' --include='*.py' --include='*.sh' \
+    --include='*.c' --include='*.h' --include='*.toml' --include='Makefile' \
+    -E '^(<{7}|={7}|>{7})' . \
+    --exclude-dir=.venv --exclude-dir=target --exclude-dir=.git \
+    --exclude-dir=third_party 2>/dev/null || true)
+if [ -n "$CONFLICT_FILES" ]; then
+    echo "ERROR: Merge conflict markers found in:"
+    echo "$CONFLICT_FILES"
+    exit 1
+fi
+echo "  No merge conflict markers — OK"
+
+echo ""
+echo "=== Checking Makefile syntax ==="
+# Dry-run the Makefile to catch parse errors (missing separators, conflict
+# markers, etc.). make -n prints commands without running them; a parse error
+# causes a non-zero exit with "missing separator" or similar on stderr.
+if make -n --warn-undefined-variables 2>&1 | grep -qi 'missing separator\|parse error\|unterminated'; then
+    echo "ERROR: Makefile has syntax errors:"
+    make -n 2>&1 | grep -i 'error\|separator' | head -5
+    exit 1
+fi
+echo "  Makefile syntax OK"
+
+echo ""
 echo "=== Running cargo fmt --check ==="
 cargo fmt --all -- --check
 
