@@ -122,7 +122,7 @@ impl BreakOn {
 /// Which preemption mechanism to use for mid-C-code preemption.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
 pub enum PreemptModeArg {
-    /// PMU hardware timer (default, nondeterministic).
+    /// PMU hardware timer (default; signal delivery has skid).
     #[default]
     Pmu,
     /// e9patch software RBC (deterministic, debugger-compatible).
@@ -286,7 +286,7 @@ struct RunArgs {
 
     /// Preemption mechanism for mid-C-code preemption.
     ///
-    /// pmu: Hardware PMU timer (default, nondeterministic due to skid).
+    /// pmu: Hardware PMU timer (default; signal delivery has skid but counter values are exact).
     /// e9patch: Software RBC via e9patch-instrumented .so (deterministic,
     ///          debugger-compatible, requires _e9.so variant).
     #[arg(long, value_enum, default_value_t = PreemptModeArg::Pmu, requires = "preemptive")]

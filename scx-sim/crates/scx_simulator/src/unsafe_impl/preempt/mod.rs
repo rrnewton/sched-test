@@ -1909,7 +1909,7 @@ extern "C" fn preempt_handler(
 
     // 1a. Pause measurement counter immediately — the signal handler's own
     //     branches should not contribute to the scheduler overhead RBC count.
-    //     Without this, the nondeterministic timing of signal delivery adds
+    //     Without this, the variable timing of signal delivery (skid) adds
     //     a variable number of handler branches to the RBC total.
     disable_measurement(pctx.measure_fd);
 

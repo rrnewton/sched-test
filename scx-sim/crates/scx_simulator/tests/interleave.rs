@@ -1017,8 +1017,9 @@ fn pmu_preemptive_scenario(nr_cpus: u32, nr_tasks: u32, seed: u32, duration_ms: 
 
 /// Test that PMU-based preemptive interleaving actually fires.
 ///
-/// PMU preemption is inherently nondeterministic due to signal delivery
-/// skid (tens to hundreds of branches). This test verifies that the PMU
+/// PMU signal delivery has skid (tens to hundreds of branches), so the
+/// preemption POINT varies between runs. However, RBC counter values are
+/// deterministic for a given instruction stream. This test verifies that the PMU
 /// timer fires and produces preemption records, NOT that the results are
 /// deterministic. For deterministic replay, use --record-preemptions /
 /// --replay-preemptions.

@@ -337,7 +337,7 @@ pub struct SimulatorState {
     /// RBC counter for measuring scheduler C code overhead (None = disabled).
     ///
     /// In e9patch mode this is `None` — the e9 software counter provides a
-    /// deterministic branch count instead of the nondeterministic PMU.
+    /// deterministic branch count instead of the PMU (which has signal skid).
     pub rbc_counter: Option<RbcCounter>,
     /// SHARED-READ: Configuration set at init, never mutated during simulation.
     ///

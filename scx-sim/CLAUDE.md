@@ -184,6 +184,26 @@ Examples:
 The philosophy: it is better to crash loudly with a clear error than to
 silently produce incorrect results that waste hours of debugging.
 
+PMU RBC Determinism
+========================================
+
+PMU Retired Branch Conditional (RBC) counters ARE deterministic for a given
+sequential instruction stream. This is the foundational principle of Mozilla
+RR and Hermit. **Never claim that RBC counter values are inherently
+nondeterministic due to hardware or microarchitecture.** That is false.
+
+Two things are true simultaneously:
+- **Counter reads are DETERMINISTIC**: same instruction stream → same RBC count.
+- **Signal delivery has skid**: the PMU overflow signal arrives a few
+  instructions after the counter hits the target. This makes the *preemption
+  point* nondeterministic, but the *counter value* at any given instruction
+  is exact.
+
+If we observe nondeterministic RBC values in the simulator, it is OUR BUG —
+not hardware. Possible causes to investigate: signal handler code adding
+branches, shared-library init differences, kernel-injected code (vDSO),
+counter reset timing, or thread scheduling affecting instruction streams.
+
 Kernel Fidelity
 ========================================
 
