@@ -1,10 +1,11 @@
 ---
 title: Hardware breakpoint replay for deterministic preemption
-status: open
+status: closed
 priority: 1
 issue_type: feature
 created_at: 2026-02-22T01:45:21.927615654+00:00
-updated_at: 2026-02-22T01:45:21.927615654+00:00
+updated_at: 2026-03-21T01:00:51.378743054+00:00
+closed_at: 2026-03-21T01:00:51.378742944+00:00
 ---
 
 # Description

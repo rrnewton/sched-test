@@ -1,12 +1,13 @@
 ---
 title: Determinism failures persist across all schedulers and modes
-status: open
+status: closed
 priority: 1
 issue_type: bug
 depends_on:
   sim-e0791: related
 created_at: 2026-03-14T17:15:02.657643074+00:00
-updated_at: 2026-03-15T19:32:26.912181371+00:00
+updated_at: 2026-03-21T01:00:53.545184527+00:00
+closed_at: 2026-03-21T01:00:53.545184437+00:00
 ---
 
 # Description
