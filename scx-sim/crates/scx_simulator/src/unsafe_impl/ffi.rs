@@ -646,7 +646,7 @@ impl DynamicScheduler {
         // SAFETY: The .so is built by our build system from known-safe C source.
         // Use RTLD_NOW for eager binding so all PLT entries are resolved at
         // load time. Without this, lazy PLT resolution during simulation adds
-        // nondeterministic dynamic-linker branches to the PMU RBC counter.
+        // variable dynamic-linker branches that perturb the RBC counter.
         let lib: libloading::Library = unsafe {
             libloading::os::unix::Library::open(
                 Some(path),

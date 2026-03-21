@@ -193,7 +193,7 @@ impl NoiseConfig {
 /// Which preemption mechanism to use for mid-C-code preemption.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PreemptMode {
-    /// PMU hardware timer (near-zero overhead, nondeterministic due to skid).
+    /// PMU hardware timer (near-zero overhead; signal delivery has skid but counter values are exact).
     #[default]
     Pmu,
     /// e9patch software RBC (deterministic, debugger-compatible, requires

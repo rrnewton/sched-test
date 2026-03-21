@@ -947,7 +947,8 @@ fn update_sum_exec(raw: *mut c_void, base: TimeNs, elapsed: TimeNs) {
 ///    `.so`. `start_rbc()` snapshots the counter; here we compute the difference.
 ///    Fully deterministic — no PMU hardware involved.
 /// 2. **PMU** (`rbc_counter.is_some()`): Uses the hardware PMU counter.
-///    Nondeterministic due to PMU skid and real CPU scheduling.
+///    Signal delivery has skid but counter values are deterministic for
+///    a given instruction stream. See sim-70abc8 for known measurement bugs.
 /// 3. **Fallback** (neither): Uses accumulated kfunc cost with a minimum floor.
 fn charge_sched_time(state: &mut SimulatorState, cpu: CpuId, ops: &str) {
     let idx = cpu.0 as usize;
@@ -1000,7 +1001,7 @@ fn charge_sched_time(state: &mut SimulatorState, cpu: CpuId, ops: &str) {
         if final_interval > state.longest_rbc_interval {
             state.longest_rbc_interval = final_interval;
         }
-        // Track longest total structop RBC (PMU mode -- nondeterministic).
+        // Track longest total structop RBC (PMU mode).
         if count > state.longest_structop_rbc {
             state.longest_structop_rbc = count;
         }
@@ -1334,7 +1335,7 @@ impl<S: Scheduler> Simulator<S> {
         // Build simulator state (shared with kfuncs via thread-local)
         //
         // In e9patch mode, the e9 software counter provides a deterministic
-        // branch count — skip creating the nondeterministic PMU counter.
+        // branch count — skip creating the PMU counter (which has signal skid).
         // The e9 trampoline counts every Jcc in the instrumented `.so`,
         // which is exactly the set of branches the PMU counter measures.
         let is_e9 = scenario
