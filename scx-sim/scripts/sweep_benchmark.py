@@ -281,8 +281,8 @@ def generate_sweep_html(
 ) -> None:
     """Generate a single HTML with 3 sweep plots."""
     try:
-        import plotly.graph_objects as go  # type: ignore[import-not-found]
-        from plotly.subplots import make_subplots  # type: ignore[import-not-found]
+        import plotly.graph_objects as go  # type: ignore[import-untyped,import-not-found,unused-ignore]
+        from plotly.subplots import make_subplots  # type: ignore[import-untyped,import-not-found,unused-ignore]
     except ImportError:
         print("WARNING: plotly not installed; skipping HTML generation.")
         print("  Install with: .venv/bin/pip install plotly pandas")
