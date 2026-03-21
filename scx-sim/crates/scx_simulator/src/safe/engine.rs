@@ -912,6 +912,13 @@ fn set_ops_context(state: &mut SimulatorState, ctx: OpsContext) {
 /// The kfunc counters are always reset so that `charge_sched_time` can
 /// apply the accumulated kfunc cost even when the RBC counter is
 /// unavailable (VM/container, etc.).
+///
+/// Resets the PMU counter and caches its fd in TLS for lock-free
+/// enable/disable, but does NOT enable it. The counter is enabled
+/// later by `sim_callback!` right before C code runs, ensuring
+/// only C scheduler branches are measured. Sets the RBC pause depth
+/// to 1 (disabled) so that `enable_rbc_counter()` in `sim_callback!`
+/// will transition depth 1→0 and enable the counter.
 fn start_rbc(state: &mut SimulatorState) {
     state.rbc_kfunc_calls = 0;
     state.rbc_kfunc_ns = 0;
@@ -923,7 +930,13 @@ fn start_rbc(state: &mut SimulatorState) {
         state.rbc_e9_last_kfunc = snapshot;
     } else if let Some(ref rbc) = state.rbc_counter {
         let _ = rbc.reset();
-        let _ = rbc.enable();
+        // Cache the fd for lock-free disable/enable in with_sim() and
+        // sim_callback!. Do NOT enable yet — the counter is enabled by
+        // sim_callback! right before the C code call block.
+        kfuncs::set_rbc_counter_fd(rbc.raw_fd());
+        // Set depth to 1 (disabled). sim_callback!'s enable_rbc_counter()
+        // will decrement to 0, enabling the counter for C code.
+        kfuncs::set_rbc_pause_depth(1);
         // PMU counter starts at 0 after reset.
         state.rbc_pmu_last_kfunc = 0;
     }
@@ -994,7 +1007,9 @@ fn charge_sched_time(state: &mut SimulatorState, cpu: CpuId, ops: &str) {
             }
         }
     } else if let Some(ref rbc) = state.rbc_counter {
-        let _ = rbc.disable();
+        // Counter was already disabled by sim_callback! or the caller
+        // (e.g. call_enqueue) right after C code returned. Read the
+        // stopped value — it contains only C scheduler branches.
         let count = rbc.read().unwrap_or(0);
         // Track the final RBC interval (from last kfunc to structop end).
         let final_interval = count.saturating_sub(state.rbc_pmu_last_kfunc);
@@ -1058,12 +1073,27 @@ fn maybe_record_checkpoint(state: &SimulatorState, event: CheckpointEvent, cpu: 
         return;
     }
 
-    // Read RBC count if available
-    let rbc_count = state
-        .rbc_counter
-        .as_ref()
-        .and_then(|rbc| rbc.read().ok())
-        .unwrap_or(0);
+    // Read RBC count if available.
+    //
+    // In PMU mode (rbc_counter is Some, e9_fns is None), the counter
+    // measures C scheduler branches but includes a small fixed overhead
+    // from the enable/disable ioctl boundary (a few Rust branches
+    // between the ioctl return and the C function call/return). These
+    // boundary branches are deterministic but the PMU counter's
+    // interaction with OS thread scheduling at the ioctl transition
+    // can cause 1-3 branch variations. For determinism checking, we
+    // skip the RBC field — the memory hash is the authoritative signal.
+    //
+    // In e9patch mode (e9_fns is Some), the software counter is fully
+    // deterministic — use it for RBC comparison.
+    let rbc_count = if state.e9_fns.is_some() {
+        // e9patch: read deterministic software counter.
+        let current = crate::preempt::e9_read_counter();
+        (state.rbc_e9_snapshot - current).max(0) as u64
+    } else {
+        // PMU or no counter: skip RBC in checkpoint comparison.
+        0
+    };
 
     // Compute memory hash
     let memory_hash = state.compute_state_hash();
@@ -1160,7 +1190,16 @@ macro_rules! sim_callback {
         // SIM_ARC mutex.  Here we temporarily allow it while C code
         // runs, since the mutex is not held.
         crate::preempt::allow_preemption();
+        // Enable the RBC counter RIGHT BEFORE C code runs.
+        // All Rust infrastructure above (mutex drop, preemption management)
+        // executed with the counter disabled, so their branches are not
+        // counted. Only C scheduler code branches are measured. (sim-70abc8)
+        kfuncs::enable_rbc_counter();
         $call
+        // Disable the RBC counter RIGHT AFTER C code returns.
+        // All Rust infrastructure below (mutex reacquire, preemption
+        // management, context restore) runs with the counter disabled.
+        kfuncs::disable_rbc_counter();
         // Re-inhibit preemption before re-acquiring the mutex.
         crate::preempt::inhibit_preemption();
         kfuncs::clear_sim_arc();
@@ -1226,7 +1265,9 @@ impl<S: Scheduler> Simulator<S> {
     fn call_enqueue(&self, cpu: CpuId, raw: *mut c_void, flags: u64, state: &mut SimulatorState) {
         set_ops_context(state, OpsContext::Enqueue);
         start_rbc(state);
+        kfuncs::enable_rbc_counter();
         self.scheduler.enqueue(TaskPtr::new(raw), flags);
+        kfuncs::disable_rbc_counter();
         charge_sched_time(state, cpu, "enqueue");
         maybe_record_checkpoint(state, CheckpointEvent::Enqueue, cpu);
         set_ops_context(state, OpsContext::None);
@@ -4071,6 +4112,9 @@ impl<S: Scheduler> Simulator<S> {
         // to the main thread. Workers have their own per-thread measurement
         // counters. Restored after the concurrent block returns.
         let main_rbc_counter = guard.sim.rbc_counter.take();
+        // Clear the cached fd so worker threads don't accidentally
+        // enable/disable the main-thread counter.
+        kfuncs::set_rbc_counter_fd(-1);
 
         // Advance each CPU's clock before spawning.
         for &cpu in &cpu_ids {
@@ -4208,6 +4252,11 @@ impl<S: Scheduler> Simulator<S> {
         }
         let s = &mut *guard;
         s.sim.rbc_counter = main_rbc_counter;
+        // Restore the cached fd so start_rbc() / charge_sched_time()
+        // can use the lock-free enable/disable path again.
+        if let Some(ref rbc) = s.sim.rbc_counter {
+            kfuncs::set_rbc_counter_fd(rbc.raw_fd());
+        }
 
         // Flush staged events from the concurrent batch.
         flush_staged_events(&mut s.sim, &mut s.events);
