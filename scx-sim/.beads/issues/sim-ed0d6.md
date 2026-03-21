@@ -1,10 +1,11 @@
 ---
 title: Re-enable Mitosis scheduler after kptr/RAII API update
-status: open
+status: closed
 priority: 2
 issue_type: task
 created_at: 2026-02-20T02:46:33.837344986+00:00
-updated_at: 2026-02-20T02:46:33.837344986+00:00
+updated_at: 2026-03-21T18:10:01.992473508+00:00
+closed_at: 2026-03-21T18:10:01.992473408+00:00
 ---
 
 # Description
