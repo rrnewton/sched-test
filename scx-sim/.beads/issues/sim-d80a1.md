@@ -1,10 +1,11 @@
 ---
 title: 'Mitosis vtime starvation: tasks permanently starved on 1-CPU scenarios'
-status: open
+status: closed
 priority: 1
 issue_type: task
 created_at: 2026-02-19T23:46:39.324129470+00:00
-updated_at: 2026-02-19T23:46:39.324129470+00:00
+updated_at: 2026-03-21T01:00:50.656101036+00:00
+closed_at: 2026-03-21T01:00:50.656100935+00:00
 ---
 
 # Description

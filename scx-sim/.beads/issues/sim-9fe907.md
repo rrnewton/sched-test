@@ -1,10 +1,11 @@
 ---
 title: PMU preemptive livelock with small timeslices (< longest_structop_rbc / 8)
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-03-19T19:42:17.503280966+00:00
-updated_at: 2026-03-19T19:42:17.503280966+00:00
+updated_at: 2026-03-21T01:00:52.089540462+00:00
+closed_at: 2026-03-21T01:00:52.089540382+00:00
 ---
 
 # Description
