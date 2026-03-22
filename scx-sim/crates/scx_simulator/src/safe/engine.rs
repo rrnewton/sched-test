@@ -1196,12 +1196,17 @@ macro_rules! sim_callback {
         // counted. Only C scheduler code branches are measured. (sim-70abc8)
         kfuncs::enable_rbc_counter();
         $call
-        // Disable the RBC counter RIGHT AFTER C code returns.
-        // All Rust infrastructure below (mutex reacquire, preemption
-        // management, context restore) runs with the counter disabled.
-        kfuncs::disable_rbc_counter();
-        // Re-inhibit preemption before re-acquiring the mutex.
+        // Re-inhibit preemption IMMEDIATELY after C code returns.
+        // This must happen before disable_rbc_counter() to close a
+        // race window: if a queued PMU signal fires between $call
+        // returning and inhibit_preemption(), the handler would yield
+        // (count is 0), parking this worker while another worker tries
+        // to lock SIM_ARC, causing a token-ring/mutex deadlock.
         crate::preempt::inhibit_preemption();
+        // Disable the RBC counter after inhibiting preemption.
+        // All Rust infrastructure below (mutex reacquire, context
+        // restore) runs with the counter disabled.
+        kfuncs::disable_rbc_counter();
         kfuncs::clear_sim_arc();
         crate::preempt::pause_timer();
         $guard = $arc.lock().unwrap();
