@@ -185,6 +185,11 @@ impl EngineRing {
         self.total
     }
 
+    /// Current finished bitmask (one bit per worker).
+    pub fn finished_mask(&self) -> u64 {
+        self.finished_mask.load(SeqCst)
+    }
+
     /// Look up the `CpuId` for a given worker.
     pub fn cpu_for_worker(&self, worker: WorkerId) -> CpuId {
         self.worker_cpu_map[worker.0]
