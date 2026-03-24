@@ -143,7 +143,12 @@ impl PreemptionBackend for ReplayBackend {
         }
     }
 
-    fn worker_setup(&self, ring: &PreemptRing, engine: &EngineRing, worker_id: WorkerId) -> ReplayWorkerCtx {
+    fn worker_setup(
+        &self,
+        ring: &PreemptRing,
+        engine: &EngineRing,
+        worker_id: WorkerId,
+    ) -> ReplayWorkerCtx {
         let i = worker_id.0;
         let cursor = &self.cursors[i];
 
@@ -215,7 +220,15 @@ impl PreemptionBackend for ReplayBackend {
         );
 
         // Install replay context (replaces normal preempt context).
-        preempt::install_replay(ring, engine, worker_id, timer_fd, bp_fd, cursor, self.no_pmu_signal);
+        preempt::install_replay(
+            ring,
+            engine,
+            worker_id,
+            timer_fd,
+            bp_fd,
+            cursor,
+            self.no_pmu_signal,
+        );
 
         ReplayWorkerCtx {
             timer,

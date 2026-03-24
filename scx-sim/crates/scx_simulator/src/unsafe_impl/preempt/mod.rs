@@ -1809,7 +1809,7 @@ extern "C" fn preempt_handler(
 
     // 6. Yield to engine (futex-based, signal-safe). Blocks until re-selected.
     ring.inc_signal_preempt(); // atomic, signal-safe
-    // SAFETY: `pctx.engine` was set from a valid `&EngineRing` in `install()`.
+                               // SAFETY: `pctx.engine` was set from a valid `&EngineRing` in `install()`.
     let engine = unsafe { &*pctx.engine };
     if engine.yield_to_engine(pctx.worker_id, YieldReason::Preemption) {
         inc_interleave(); // TLS, safe (signal masked during handler)

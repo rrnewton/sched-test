@@ -112,7 +112,12 @@ impl PreemptionBackend for E9PatchBackend {
         );
     }
 
-    fn worker_setup(&self, ring: &PreemptRing, engine: &EngineRing, worker_id: WorkerId) -> E9PatchWorkerCtx {
+    fn worker_setup(
+        &self,
+        ring: &PreemptRing,
+        engine: &EngineRing,
+        worker_id: WorkerId,
+    ) -> E9PatchWorkerCtx {
         // Install Rust-side preempt TLS. The C-side shared state is set
         // in arm() after the token is acquired.
         preempt::install(
@@ -419,7 +424,12 @@ impl PreemptionBackend for E9PatchReplayBackend {
         }
     }
 
-    fn worker_setup(&self, ring: &PreemptRing, engine: &EngineRing, worker_id: WorkerId) -> E9PatchReplayWorkerCtx {
+    fn worker_setup(
+        &self,
+        ring: &PreemptRing,
+        engine: &EngineRing,
+        worker_id: WorkerId,
+    ) -> E9PatchReplayWorkerCtx {
         let i = worker_id.0;
         let cursor = &self.cursors[i];
         let accum = &self.accumulated_rbc[i];
