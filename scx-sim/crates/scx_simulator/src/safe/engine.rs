@@ -3722,7 +3722,7 @@ impl<S: Scheduler> Simulator<S> {
     ///
     /// Phase 1 (concurrent): each CPU's dispatch callback runs on a
     /// separate OS thread, interleaved at kfunc boundaries by the
-    /// [`TokenRing`] (cooperative mode) or [`PreemptRing`] (preemptive
+    /// [`EngineRing`] (cooperative mode) or [`PreemptRing`] (preemptive
     /// mode). Only one thread is active at a time.
     ///
     /// Phase 2 (sequential): global DSQ fallback, start_running, and

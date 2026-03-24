@@ -958,11 +958,7 @@ mod tests {
             "E9_RIP_SHARED_ADDR must differ from E9_SHARED_ADDR"
         );
         // And they must be at least one page apart.
-        let diff = if E9_RIP_SHARED_ADDR > preempt::E9_SHARED_ADDR {
-            E9_RIP_SHARED_ADDR - preempt::E9_SHARED_ADDR
-        } else {
-            preempt::E9_SHARED_ADDR - E9_RIP_SHARED_ADDR
-        };
+        let diff = E9_RIP_SHARED_ADDR.abs_diff(preempt::E9_SHARED_ADDR);
         assert!(
             diff >= 4096,
             "shared addresses must be at least one page apart"

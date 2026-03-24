@@ -34,14 +34,15 @@
 //!
 //! ## Relationship to [`interleave`]
 //!
-//! - [`interleave::TokenRing`] uses `Mutex`/`Condvar` for cooperative yields at
-//!   kfunc boundaries.
+//! - [`interleave::maybe_yield`] dispatches cooperative yields at kfunc
+//!   boundaries via the installed ring (currently [`EngineRing`]).
 //! - [`PreemptRing`] uses atomics/futex for both cooperative and preemptive
 //!   yields, making it safe to call from signal handlers.
 //!
-//! When preemptive interleaving is enabled, `PreemptRing` replaces `TokenRing`.
-//! The existing [`interleave::maybe_yield`] cooperative yield points continue
-//! to work — they call into `PreemptRing` instead of `TokenRing`.
+//! When preemptive interleaving is enabled, `PreemptRing` replaces
+//! `EngineRing`. The existing [`interleave::maybe_yield`] cooperative yield
+//! points continue to work -- they call into `PreemptRing` instead of
+//! `EngineRing`.
 //!
 //! [`interleave`]: crate::interleave
 
@@ -1397,7 +1398,7 @@ impl std::fmt::Display for KfuncYieldPhase {
 /// Cooperative yield point for kfunc entry (using the PreemptRing).
 ///
 /// Functionally identical to [`interleave::maybe_yield`] but uses the
-/// futex-based `PreemptRing` instead of `Mutex`/`Condvar` `TokenRing`.
+/// futex-based `PreemptRing` instead of `Mutex`/`Condvar` cooperative yields.
 ///
 /// The PMU timer is disabled on entry and stays disabled on return.
 /// The caller (via `with_sim()` -> `resume_timer()`) is responsible for

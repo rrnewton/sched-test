@@ -18,8 +18,8 @@
 //!
 //! Thread synchronization is decoupled from preemption instrumentation via
 //! the [`ThreadOrchestrator`] trait, which captures the wait/yield/finish
-//! protocol. Both [`PreemptRing`] (futex-based) and
-//! [`TokenRing`](crate::interleave::TokenRing) (Mutex/Condvar-based)
+//! protocol. [`PreemptRing`] (futex-based) and
+//! [`EngineRing`](crate::engine_ring::EngineRing) (engine-mediated)
 //! implement this trait, enabling future backends (e.g. native concurrency)
 //! to provide alternative synchronization strategies.
 
@@ -49,8 +49,8 @@ use crate::types::{CpuId, TimeNs};
 /// worker execution.
 ///
 /// Decouples the wait/yield/finish protocol from preemption instrumentation.
-/// Both [`PreemptRing`] (futex-based, signal-safe) and
-/// [`TokenRing`](crate::interleave::TokenRing) (Mutex/Condvar-based)
+/// [`PreemptRing`] (futex-based, signal-safe) and
+/// [`EngineRing`](crate::engine_ring::EngineRing) (engine-mediated)
 /// implement this trait. Future backends (e.g. native concurrency with no
 /// serialization) can provide alternative implementations.
 ///
@@ -93,8 +93,8 @@ pub(crate) trait ThreadOrchestrator: Sync {
     /// switch), `false` if the same worker was re-selected (no-op yield).
     ///
     /// Currently called through concrete types (`PreemptRing::yield_token`,
-    /// `TokenRing::yield_token`) rather than through the trait, but is part
-    /// of the orchestrator protocol surface for future backends.
+    /// `EngineRing::yield_to_engine`) rather than through the trait, but is
+    /// part of the orchestrator protocol surface for future backends.
     #[allow(dead_code)]
     fn yield_token(&self, worker_id: WorkerId) -> bool;
 
@@ -123,11 +123,11 @@ pub(crate) trait ThreadOrchestrator: Sync {
 /// # Safety
 ///
 /// Callers must ensure only one thread accesses the pointed-to data at a time
-/// (enforced by PreemptRing / TokenRing token passing).
+/// (enforced by PreemptRing / EngineRing token passing).
 pub(crate) struct SendPtr<T>(pub(super) *mut T);
 // SAFETY: SendPtr wraps a raw pointer for cross-thread transfer.
 // Callers must ensure only one thread accesses the pointed-to data at
-// a time, which is enforced by the PreemptRing / TokenRing protocol.
+// a time, which is enforced by the PreemptRing / EngineRing protocol.
 unsafe impl<T> Send for SendPtr<T> {}
 unsafe impl<T> Sync for SendPtr<T> {}
 
