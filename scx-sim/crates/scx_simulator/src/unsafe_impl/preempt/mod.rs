@@ -48,9 +48,10 @@
 use core::fmt::Write as FmtWrite;
 use std::cell::Cell;
 use std::os::unix::io::RawFd;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering::SeqCst};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::SeqCst};
 use std::sync::Mutex;
 
+use crate::engine_ring::{EngineRing, TimeslicePrng, YieldReason};
 use crate::interleave::WorkerId;
 use crate::kfuncs::OpsContext;
 use crate::types::CpuId;
@@ -739,47 +740,6 @@ fn maybe_collect_global(record: PreemptionRecord) {
 }
 
 // ---------------------------------------------------------------------------
-// Futex wrappers (async-signal-safe — raw syscalls only)
-// ---------------------------------------------------------------------------
-
-/// Atomically check `*futex == expected` and sleep until woken.
-///
-/// Returns immediately (spurious wakeup) if the value has changed.
-fn futex_wait(futex: &AtomicU32, expected: u32) {
-    // SAFETY: `SYS_futex` with FUTEX_WAIT is async-signal-safe.
-    // `futex` is a valid pointer to an AtomicU32.
-    unsafe {
-        libc::syscall(
-            libc::SYS_futex,
-            futex as *const AtomicU32,
-            libc::FUTEX_WAIT | libc::FUTEX_PRIVATE_FLAG,
-            expected,
-            std::ptr::null::<libc::timespec>(),
-            std::ptr::null::<u32>(),
-            0u32,
-        );
-    }
-    // Return value intentionally ignored — spurious wakeups handled by caller.
-}
-
-/// Wake up to `count` threads blocked on `futex`.
-fn futex_wake(futex: &AtomicU32, count: i32) {
-    // SAFETY: `SYS_futex` with FUTEX_WAKE is async-signal-safe.
-    // `futex` is a valid pointer to an AtomicU32.
-    unsafe {
-        libc::syscall(
-            libc::SYS_futex,
-            futex as *const AtomicU32,
-            libc::FUTEX_WAKE | libc::FUTEX_PRIVATE_FLAG,
-            count,
-            std::ptr::null::<libc::timespec>(),
-            std::ptr::null::<u32>(),
-            0u32,
-        );
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Structop tracking — per-callback context for trace messages
 // ---------------------------------------------------------------------------
 
@@ -1119,33 +1079,19 @@ pub fn compute_so_hash_from_path(path: &str) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
-// PreemptRing — futex-based token ring (signal-safe)
+// PreemptRing — preemption record store and counters
 // ---------------------------------------------------------------------------
 
-/// Per-worker state values.
-const PARKED: u32 = 0;
-const RUNNING: u32 = 1;
-
-/// Signal-safe token ring using atomics and futex.
+/// Preemption instrumentation: record store, counters, and timeslice PRNG.
 ///
-/// All methods are safe to call from signal handlers. The PRNG access is
-/// serialized using a spinlock to ensure deterministic ordering.
-///
-/// NOTE: This intentionally uses a hand-rolled xorshift32 rather than
-/// `rand::rngs::SmallRng` because the PRNG state must live in an `AtomicU32`
-/// for signal-handler safety — standard library RNGs have multi-word state
-/// that cannot be stored atomically.
+/// Previously also handled thread orchestration (futex-based token ring).
+/// That role is now filled by [`EngineRing`](crate::engine_ring::EngineRing);
+/// `PreemptRing` retains only instrumentation and timeslice generation.
 pub struct PreemptRing {
-    /// Per-worker state: `PARKED` or `RUNNING`.
-    workers: Box<[AtomicU32]>,
-    /// PRNG state (xorshift32). Access is serialized via CAS in `next_prng()`.
-    prng: AtomicU32,
     /// Total number of workers.
     total: usize,
-    /// Bitmask of finished workers (up to 64).
-    finished_mask: AtomicU64,
-    /// Orchestrator wake word: 0 = not all done, 1 = all done.
-    all_done: AtomicU32,
+    /// Timeslice PRNG (async-signal-safe, see [`TimeslicePrng`]).
+    timeslice: TimeslicePrng,
     /// Count of signal-driven (PMU) preemptions (signal-safe increment).
     signal_preempt_count: AtomicU64,
     /// Count of cooperative yields at kfunc boundaries (safe Rust).
@@ -1155,7 +1101,7 @@ pub struct PreemptRing {
 }
 
 impl PreemptRing {
-    /// Create a new preemptive ring for `total` workers.
+    /// Create a new preempt ring for `total` workers.
     ///
     /// # Panics
     /// Panics if `total` is 0 or exceeds 64.
@@ -1164,66 +1110,18 @@ impl PreemptRing {
             total > 0 && total <= 64,
             "PreemptRing supports 1–64 workers, got {total}"
         );
-        let seed = if seed == 0 { 1 } else { seed };
-        let workers: Box<[AtomicU32]> = (0..total).map(|_| AtomicU32::new(PARKED)).collect();
         PreemptRing {
-            workers,
-            prng: AtomicU32::new(seed),
             total,
-            finished_mask: AtomicU64::new(0),
-            all_done: AtomicU32::new(0),
+            timeslice: TimeslicePrng::new(seed),
             signal_preempt_count: AtomicU64::new(0),
             cooperative_yield_count: AtomicU64::new(0),
             preemption_records: PreemptionRecordStore::new(),
         }
     }
 
-    /// Atomically advance the xorshift32 PRNG and return the new value.
-    ///
-    /// Uses CAS loop to ensure atomic read-modify-write, preventing races
-    /// where two threads could load the same state and skip PRNG values.
-    fn next_prng(&self) -> u32 {
-        loop {
-            let old = self.prng.load(SeqCst);
-            let mut x = old;
-            x ^= x << 13;
-            x ^= x >> 17;
-            x ^= x << 5;
-            if self.prng.compare_exchange(old, x, SeqCst, SeqCst).is_ok() {
-                return x;
-            }
-            // CAS failed - another thread updated the PRNG; retry.
-        }
-    }
-
-    fn pick_next(&self) -> Option<WorkerId> {
-        let mask = self.finished_mask.load(SeqCst);
-        let n_finished = mask.count_ones() as usize;
-        let n_remaining = self.total - n_finished;
-        if n_remaining == 0 {
-            return None;
-        }
-        let idx = (self.next_prng() as usize) % n_remaining;
-        let mut count = 0;
-        for i in 0..self.total {
-            if mask & (1u64 << i) == 0 {
-                if count == idx {
-                    return Some(WorkerId(i));
-                }
-                count += 1;
-            }
-        }
-        unreachable!()
-    }
-
     /// Roll a random timeslice in `[min, max]` using the ring's PRNG.
     pub fn roll_timeslice(&self, min: u64, max: u64) -> u64 {
-        debug_assert!(max >= min);
-        let range = max - min;
-        if range == 0 {
-            return min;
-        }
-        min + (self.next_prng() as u64) % (range + 1)
+        self.timeslice.roll_timeslice(min, max)
     }
 
     /// Increment the signal-driven preemption counter.
@@ -1300,78 +1198,9 @@ impl PreemptRing {
         self.preemption_records.drain()
     }
 
-    /// Orchestrator: select the first worker via PRNG and wake it.
-    pub fn start(&self) {
-        if let Some(first) = self.pick_next() {
-            self.workers[first.0].store(RUNNING, SeqCst);
-            futex_wake(&self.workers[first.0], 1);
-        }
-    }
-
-    /// Worker: block until this worker is selected.
-    pub fn wait_for_token(&self, my_id: WorkerId) {
-        loop {
-            if self.workers[my_id.0].load(SeqCst) == RUNNING {
-                break;
-            }
-            futex_wait(&self.workers[my_id.0], PARKED);
-        }
-    }
-
-    /// Worker: release token, select next worker via PRNG, block until
-    /// re-selected.
-    ///
-    /// **Async-signal-safe**: safe to call from signal handlers.
-    ///
-    /// Returns `true` if a different worker was selected (actual context
-    /// switch), `false` if the PRNG re-selected the same worker (no-op yield).
-    ///
-    /// Ordering: parks self BEFORE waking next, preventing the race where
-    /// the next worker yields back before we enter futex_wait.
-    pub fn yield_token(&self, my_id: WorkerId) -> bool {
-        // Park ourselves first to prevent wake-before-wait races.
-        self.workers[my_id.0].store(PARKED, SeqCst);
-
-        let switched = if let Some(next) = self.pick_next() {
-            self.workers[next.0].store(RUNNING, SeqCst);
-            futex_wake(&self.workers[next.0], 1);
-            next != my_id
-        } else {
-            false
-        };
-
-        // Wait until re-selected.
-        loop {
-            if self.workers[my_id.0].load(SeqCst) != PARKED {
-                break;
-            }
-            futex_wait(&self.workers[my_id.0], PARKED);
-        }
-
-        switched
-    }
-
-    /// Worker: mark as finished and wake the next worker (or signal
-    /// all-done to the orchestrator).
-    pub fn finish(&self, my_id: WorkerId) {
-        self.finished_mask.fetch_or(1u64 << my_id.0, SeqCst);
-        if self.finished_mask.load(SeqCst).count_ones() as usize == self.total {
-            self.all_done.store(1, SeqCst);
-            futex_wake(&self.all_done, 1);
-        } else if let Some(next) = self.pick_next() {
-            self.workers[next.0].store(RUNNING, SeqCst);
-            futex_wake(&self.workers[next.0], 1);
-        }
-    }
-
-    /// Orchestrator: block until all workers have finished.
-    pub fn wait_all_done(&self) {
-        loop {
-            if self.all_done.load(SeqCst) != 0 {
-                break;
-            }
-            futex_wait(&self.all_done, 0);
-        }
+    /// Total number of workers.
+    pub fn total(&self) -> usize {
+        self.total
     }
 }
 
@@ -1383,6 +1212,7 @@ impl PreemptRing {
 #[derive(Clone, Copy)]
 struct PreemptCtx {
     ring: *const PreemptRing,
+    engine: *const EngineRing,
     worker_id: WorkerId,
     /// Raw fd of the RBC timer (for disable/enable in signal handler).
     timer_fd: RawFd,
@@ -1406,9 +1236,9 @@ struct PreemptCtx {
     replay_mode: bool,
 }
 
-// SAFETY: PreemptCtx holds a raw pointer to a PreemptRing that lives in
-// a `thread::scope` block on the main thread. Access is serialized by
-// the token-passing protocol.
+// SAFETY: PreemptCtx holds raw pointers to a PreemptRing and EngineRing
+// that live in a `thread::scope` block on the main thread. Access is
+// serialized by the token-passing protocol.
 unsafe impl Send for PreemptCtx {}
 
 thread_local! {
@@ -1417,7 +1247,7 @@ thread_local! {
     ///
     /// This prevents a deadlock where a PMU signal fires while the thread
     /// holds the SIM_ARC mutex.  The handler parks the worker via
-    /// `yield_token()`, the woken worker blocks on the same mutex, and
+    /// `yield_to_engine()`, the woken worker blocks on the same mutex, and
     /// the system deadlocks.  Setting this flag before `Mutex::lock()`
     /// and clearing it after drop tells the handler to just disable the
     /// timer and return — the next cooperative yield at a kfunc boundary
@@ -1430,6 +1260,7 @@ thread_local! {
 /// Install preemptive interleave context on the current worker thread.
 pub fn install(
     ring: &PreemptRing,
+    engine: &EngineRing,
     worker_id: WorkerId,
     timer_fd: RawFd,
     measure_fd: RawFd,
@@ -1439,6 +1270,7 @@ pub fn install(
     PREEMPT_CTX.with(|c| {
         c.set(Some(PreemptCtx {
             ring: ring as *const PreemptRing,
+            engine: engine as *const EngineRing,
             worker_id,
             timer_fd,
             measure_fd,
@@ -1513,6 +1345,7 @@ fn is_preemption_inhibited() -> bool {
 /// Also sets `measure_fd = -1` (replay doesn't use a measurement counter).
 pub fn install_replay_preempt(
     ring: &PreemptRing,
+    engine: &EngineRing,
     worker_id: WorkerId,
     timer_fd: RawFd,
     timeslice_min: u64,
@@ -1521,6 +1354,7 @@ pub fn install_replay_preempt(
     PREEMPT_CTX.with(|c| {
         c.set(Some(PreemptCtx {
             ring: ring as *const PreemptRing,
+            engine: engine as *const EngineRing,
             worker_id,
             timer_fd,
             measure_fd: -1,
@@ -1614,7 +1448,7 @@ fn cooperative_yield_impl(phase: KfuncYieldPhase) {
     // the cooperative yield. `disable_timer` prevents new overflows, but
     // a signal may already be queued. `inhibit_preemption` ensures the
     // handler just disables the timer and returns without calling
-    // `yield_token`, which would corrupt the token ring state (nested
+    // `yield_to_engine`, which would corrupt the ring state (nested
     // yield from signal handler inside cooperative yield code).
     inhibit_preemption();
     disable_timer(ctx.timer_fd);
@@ -1643,7 +1477,7 @@ fn cooperative_yield_impl(phase: KfuncYieldPhase) {
         sinfo.kfunc_name
     };
 
-    // Release token and block until re-selected (futex-based).
+    // Yield to engine (futex-based, signal-safe). Blocks until re-selected.
     ring.inc_cooperative_yield();
     tracing::debug!(
         "preempt:{phase} cooperative, ops={ops} kfunc={kfn} structop#{0}:{1} kfunc#{2} (rbc={3})",
@@ -1654,7 +1488,9 @@ fn cooperative_yield_impl(phase: KfuncYieldPhase) {
     );
     // Pause measurement counter during yield (don't count parked time).
     disable_measurement(ctx.measure_fd);
-    if ring.yield_token(ctx.worker_id) {
+    // SAFETY: `ctx.engine` was set from a valid `&EngineRing` in `install()`.
+    let engine = unsafe { &*ctx.engine };
+    if engine.yield_to_engine(ctx.worker_id, YieldReason::Cooperative) {
         inc_interleave();
     }
 
@@ -1971,9 +1807,11 @@ extern "C" fn preempt_handler(
     // 5. Measurement counter was already paused at the top of the handler
     //    (step 1a), so we don't need to disable it again before yielding.
 
-    // 6. Yield token (futex-based, signal-safe). Blocks until re-selected.
+    // 6. Yield to engine (futex-based, signal-safe). Blocks until re-selected.
     ring.inc_signal_preempt(); // atomic, signal-safe
-    if ring.yield_token(pctx.worker_id) {
+    // SAFETY: `pctx.engine` was set from a valid `&EngineRing` in `install()`.
+    let engine = unsafe { &*pctx.engine };
+    if engine.yield_to_engine(pctx.worker_id, YieldReason::Preemption) {
         inc_interleave(); // TLS, safe (signal masked during handler)
     }
 
@@ -2172,6 +2010,7 @@ impl ReplayCursor {
 #[derive(Clone, Copy)]
 struct ReplayCtx {
     ring: *const PreemptRing,
+    engine: *const EngineRing,
     worker_id: WorkerId,
     /// Raw fd of the RBC timer.
     timer_fd: RawFd,
@@ -2198,6 +2037,7 @@ thread_local! {
 /// Install replay context on the current worker thread.
 pub fn install_replay(
     ring: &PreemptRing,
+    engine: &EngineRing,
     worker_id: WorkerId,
     timer_fd: RawFd,
     bp_fd: RawFd,
@@ -2207,6 +2047,7 @@ pub fn install_replay(
     REPLAY_CTX.with(|c| {
         c.set(Some(ReplayCtx {
             ring: ring as *const PreemptRing,
+            engine: engine as *const EngineRing,
             worker_id,
             timer_fd,
             bp_fd,
@@ -2651,9 +2492,10 @@ extern "C" fn replay_bp_handler(
         sinfo,
     );
 
-    // 5. Yield token (futex-based, signal-safe).
+    // 5. Yield to engine (futex-based, signal-safe).
     ring.inc_signal_preempt();
-    ring.yield_token(rctx.worker_id);
+    let engine = unsafe { &*rctx.engine };
+    engine.yield_to_engine(rctx.worker_id, YieldReason::Preemption);
 
     // 6. Resumed — restore context.
     crate::kfuncs::install_callback_ctx(saved);
@@ -2959,9 +2801,10 @@ pub unsafe extern "C" fn e9_preempt_yield() -> u64 {
         sinfo.global_count,
     );
 
-    // 4. Yield token (futex-based).
+    // 4. Yield to engine (futex-based).
     ring.inc_signal_preempt();
-    if ring.yield_token(wid) {
+    let engine = unsafe { &*pctx.engine };
+    if engine.yield_to_engine(wid, YieldReason::Preemption) {
         inc_interleave();
     }
 
@@ -3085,9 +2928,10 @@ pub unsafe extern "C" fn e9_replay_yield() -> u64 {
         current_target.structop_rbc,
     );
 
-    // Yield token (futex-based).
+    // Yield to engine (futex-based).
     ring.inc_signal_preempt();
-    if ring.yield_token(wid) {
+    let engine = unsafe { &*pctx.engine };
+    if engine.yield_to_engine(wid, YieldReason::Preemption) {
         inc_interleave();
     }
 
@@ -3127,125 +2971,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_single_worker_completes() {
-        let ring = PreemptRing::new(1, 42);
-        ring.start();
-        ring.wait_for_token(WorkerId(0));
-        ring.finish(WorkerId(0));
-        ring.wait_all_done();
-    }
-
-    #[test]
-    fn test_two_workers_interleave() {
-        let ring = PreemptRing::new(2, 42);
-
-        std::thread::scope(|s| {
-            let ring_ref = &ring;
-
-            s.spawn(move || {
-                ring_ref.wait_for_token(WorkerId(0));
-                ring_ref.yield_token(WorkerId(0));
-                ring_ref.finish(WorkerId(0));
-            });
-
-            s.spawn(move || {
-                ring_ref.wait_for_token(WorkerId(1));
-                ring_ref.yield_token(WorkerId(1));
-                ring_ref.finish(WorkerId(1));
-            });
-
-            ring.start();
-            ring.wait_all_done();
-        });
-    }
-
-    #[test]
-    fn test_prng_determinism() {
-        let order1 = run_and_record_order(3, 12345);
-        let order2 = run_and_record_order(3, 12345);
-        assert_eq!(order1, order2, "same seed must give same order");
-    }
-
-    #[test]
-    fn test_different_seeds_may_differ() {
-        let order1 = run_and_record_order(4, 100);
-        let order2 = run_and_record_order(4, 999);
-        let _ = (order1, order2); // Just verify no panics.
-    }
-
-    #[test]
-    fn test_finish_without_yield() {
-        let ring = PreemptRing::new(2, 42);
-
-        std::thread::scope(|s| {
-            let ring_ref = &ring;
-
-            s.spawn(move || {
-                ring_ref.wait_for_token(WorkerId(0));
-                ring_ref.finish(WorkerId(0));
-            });
-
-            s.spawn(move || {
-                ring_ref.wait_for_token(WorkerId(1));
-                ring_ref.finish(WorkerId(1));
-            });
-
-            ring.start();
-            ring.wait_all_done();
-        });
-    }
-
-    #[test]
-    fn test_multiple_yields() {
-        let ring = PreemptRing::new(2, 42);
-
-        std::thread::scope(|s| {
-            let ring_ref = &ring;
-
-            s.spawn(move || {
-                ring_ref.wait_for_token(WorkerId(0));
-                ring_ref.yield_token(WorkerId(0));
-                ring_ref.yield_token(WorkerId(0));
-                ring_ref.yield_token(WorkerId(0));
-                ring_ref.finish(WorkerId(0));
-            });
-
-            s.spawn(move || {
-                ring_ref.wait_for_token(WorkerId(1));
-                ring_ref.yield_token(WorkerId(1));
-                ring_ref.finish(WorkerId(1));
-            });
-
-            ring.start();
-            ring.wait_all_done();
-        });
-    }
-
-    #[test]
-    fn test_many_workers_stress() {
-        // Stress test with many workers and many yields.
-        for seed in [1, 42, 12345, 999999] {
-            let n = 8;
-            let ring = PreemptRing::new(n, seed);
-
-            std::thread::scope(|s| {
-                let ring_ref = &ring;
-                for i in 0..n {
-                    s.spawn(move || {
-                        ring_ref.wait_for_token(WorkerId(i));
-                        for _ in 0..10 {
-                            ring_ref.yield_token(WorkerId(i));
-                        }
-                        ring_ref.finish(WorkerId(i));
-                    });
-                }
-                ring.start();
-                ring.wait_all_done();
-            });
-        }
-    }
-
-    #[test]
     fn test_roll_timeslice() {
         let ring = PreemptRing::new(1, 42);
         // Must be in range.
@@ -3257,36 +2982,31 @@ mod tests {
         assert_eq!(ring.roll_timeslice(100, 100), 100);
     }
 
-    fn run_and_record_order(n: usize, seed: u32) -> Vec<WorkerId> {
-        use std::sync::atomic::{AtomicUsize, Ordering};
+    #[test]
+    fn test_timeslice_determinism() {
+        // Same seed must produce the same timeslice sequence.
+        let ring1 = PreemptRing::new(1, 12345);
+        let ring2 = PreemptRing::new(1, 12345);
+        let seq1: Vec<u64> = (0..20).map(|_| ring1.roll_timeslice(10, 1000)).collect();
+        let seq2: Vec<u64> = (0..20).map(|_| ring2.roll_timeslice(10, 1000)).collect();
+        assert_eq!(seq1, seq2, "same seed must give same timeslice sequence");
+    }
 
-        let ring = PreemptRing::new(n, seed);
-        let order: Vec<AtomicUsize> = (0..n).map(|_| AtomicUsize::new(usize::MAX)).collect();
-        let counter = AtomicUsize::new(0);
+    #[test]
+    fn test_preempt_ring_counters() {
+        let ring = PreemptRing::new(2, 42);
+        assert_eq!(ring.signal_preemptions(), 0);
+        assert_eq!(ring.cooperative_yields(), 0);
+        ring.inc_signal_preempt();
+        ring.inc_signal_preempt();
+        ring.inc_cooperative_yield();
+        assert_eq!(ring.signal_preemptions(), 2);
+        assert_eq!(ring.cooperative_yields(), 1);
+    }
 
-        std::thread::scope(|s| {
-            for i in 0..n {
-                let ring_ref = &ring;
-                let order_ref = &order;
-                let counter_ref = &counter;
-                s.spawn(move || {
-                    ring_ref.wait_for_token(WorkerId(i));
-                    let seq = counter_ref.fetch_add(1, Ordering::SeqCst);
-                    order_ref[i].store(seq, Ordering::SeqCst);
-                    ring_ref.yield_token(WorkerId(i));
-                    ring_ref.finish(WorkerId(i));
-                });
-            }
-            ring.start();
-            ring.wait_all_done();
-        });
-
-        let mut pairs: Vec<(usize, WorkerId)> = order
-            .iter()
-            .enumerate()
-            .map(|(i, a)| (a.load(Ordering::SeqCst), WorkerId(i)))
-            .collect();
-        pairs.sort_by_key(|&(seq, _)| seq);
-        pairs.into_iter().map(|(_, id)| id).collect()
+    #[test]
+    fn test_preempt_ring_total() {
+        let ring = PreemptRing::new(4, 1);
+        assert_eq!(ring.total(), 4);
     }
 }
