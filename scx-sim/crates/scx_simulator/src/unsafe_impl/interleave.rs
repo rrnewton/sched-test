@@ -295,14 +295,50 @@ impl crate::backend::ThreadOrchestrator for TokenRing {
 // Thread-local yield-point plumbing
 // ---------------------------------------------------------------------------
 
+/// Yield function signature: takes a data pointer and worker ID, returns
+/// whether a context switch occurred.
+///
+/// **Async-signal-safe** requirement: implementations must use only atomics
+/// and futex syscalls (no locks, no allocation).
+type YieldFn = unsafe fn(*const (), WorkerId) -> bool;
+
+/// Token ring yield: calls `TokenRing::yield_token`.
+///
+/// # Safety
+///
+/// `data` must point to a valid `TokenRing`.
+unsafe fn yield_via_token_ring(data: *const (), worker_id: WorkerId) -> bool {
+    let ring = unsafe { &*(data as *const TokenRing) };
+    ring.yield_token(worker_id)
+}
+
+/// Engine ring yield: calls `EngineRing::yield_to_engine` with
+/// [`Cooperative`](crate::engine_ring::YieldReason::Cooperative).
+///
+/// # Safety
+///
+/// `data` must point to a valid `EngineRing`.
+unsafe fn yield_via_engine_ring(data: *const (), worker_id: WorkerId) -> bool {
+    use crate::engine_ring::{EngineRing, YieldReason};
+    let ring = unsafe { &*(data as *const EngineRing) };
+    ring.yield_to_engine(worker_id, YieldReason::Cooperative)
+}
+
 /// Thread-local interleave context installed on worker threads.
+///
+/// Uses a function-pointer indirection so that both [`TokenRing`]
+/// (Mutex/Condvar cooperative) and [`EngineRing`](crate::engine_ring::EngineRing)
+/// (futex engine-mediated) can be used through the same `maybe_yield()` path.
 #[derive(Clone, Copy)]
 struct InterleaveCtx {
-    ring: *const TokenRing,
+    /// Opaque pointer to the ring (TokenRing or EngineRing).
+    ring_data: *const (),
+    /// Function to call for yielding.
+    yield_fn: YieldFn,
     worker_id: WorkerId,
 }
 
-// SAFETY: InterleaveCtx holds a raw pointer to a TokenRing that lives in
+// SAFETY: InterleaveCtx holds a raw pointer to a ring that lives in
 // a `thread::scope` block on the main thread. Access is serialized by
 // the token-passing protocol — only the token holder calls `maybe_yield`.
 unsafe impl Send for InterleaveCtx {}
@@ -311,13 +347,27 @@ thread_local! {
     static INTERLEAVE_CTX: Cell<Option<InterleaveCtx>> = const { Cell::new(None) };
 }
 
-/// Install interleave context on the current worker thread.
+/// Install interleave context for a [`TokenRing`] on the current worker thread.
 ///
 /// Called by worker threads at startup, before waiting for the token.
 pub fn install(ring: &TokenRing, worker_id: WorkerId) {
     INTERLEAVE_CTX.with(|c| {
         c.set(Some(InterleaveCtx {
-            ring: ring as *const TokenRing,
+            ring_data: ring as *const TokenRing as *const (),
+            yield_fn: yield_via_token_ring,
+            worker_id,
+        }));
+    });
+}
+
+/// Install interleave context for an [`EngineRing`] on the current worker thread.
+///
+/// Called by worker threads at startup, before waiting for the token.
+pub fn install_engine_ring(ring: &crate::engine_ring::EngineRing, worker_id: WorkerId) {
+    INTERLEAVE_CTX.with(|c| {
+        c.set(Some(InterleaveCtx {
+            ring_data: ring as *const crate::engine_ring::EngineRing as *const (),
+            yield_fn: yield_via_engine_ring,
             worker_id,
         }));
     });
@@ -333,7 +383,8 @@ pub fn uninstall() {
 /// Dispatches to the appropriate interleaving backend:
 /// - If preemptive context is installed: uses [`preempt::maybe_yield_preemptive`]
 ///   (futex-based, signal-safe, PMU timer aware).
-/// - If cooperative context is installed: uses the `TokenRing` (Mutex/Condvar).
+/// - If cooperative context is installed: uses the installed ring's yield
+///   function (either [`TokenRing`] or [`EngineRing`]).
 /// - If neither is installed: no-op.
 ///
 /// # Safety contract
@@ -351,18 +402,17 @@ pub fn maybe_yield() {
         None => return,
     };
 
-    // SAFETY: `ctx.ring` was set from a valid `&TokenRing` reference in
-    // `install()`. The TokenRing lives in a `thread::scope` block on the
-    // main thread and outlives all worker threads.
-    let ring = unsafe { &*ctx.ring };
-
     // Save per-callback context from the CALLBACK_CTX thread-local.
     // This is async-signal-safe (Cell<Copy> read).
     let saved =
         crate::kfuncs::get_callback_ctx().expect("maybe_yield called outside simulator context");
 
     // Release token and block until re-selected.
-    if ring.yield_token(ctx.worker_id) {
+    // SAFETY: `ring_data` was set from a valid ring reference in
+    // `install()` or `install_engine_ring()`. The ring lives in a
+    // `thread::scope` block on the main thread and outlives all workers.
+    let switched = unsafe { (ctx.yield_fn)(ctx.ring_data, ctx.worker_id) };
+    if switched {
         crate::preempt::inc_interleave();
     }
 
