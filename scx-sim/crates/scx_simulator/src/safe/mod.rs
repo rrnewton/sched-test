@@ -7,6 +7,7 @@
 //! cannot be overridden by inner `#[allow(unsafe_code)]` in submodules.
 #![forbid(unsafe_code)]
 
+pub mod atomic_types;
 pub mod bpf_trace;
 pub mod cgroup;
 pub mod cpu;
