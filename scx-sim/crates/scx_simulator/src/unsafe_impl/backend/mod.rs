@@ -33,8 +33,9 @@ use std::collections::HashMap;
 use tracing::debug;
 
 use crate::engine::{batch_worker_body, dispatch_worker_body, Simulator};
+use crate::engine_ring::{pick_by_min_clock, EngineRing, YieldReason};
 use crate::ffi::Scheduler;
-use crate::interleave::{self, TokenRing, WorkerId};
+use crate::interleave::{self, WorkerId};
 use crate::kfuncs::{self, OpsContext, SimArc, SimulatorState};
 use crate::preempt::PreemptRing;
 use crate::scheduler_wrapper::SchedulerWrapper;
@@ -600,20 +601,20 @@ pub(crate) fn run_batch_with_orchestrator<S, B, O>(
 // FFI calls are confined here so that `engine.rs` remains free of
 // `unsafe` blocks for the cooperative path.
 
-/// Cooperative concurrent dispatch via [`TokenRing`].
+/// Cooperative concurrent dispatch via [`EngineRing`].
 ///
 /// Each worker runs `dispatch_worker_body` for a single CPU, yielding at
-/// kfunc boundaries through the installed interleave hook. The per-worker
-/// lifecycle (enter_sim, body, drain structop, clear ops, finish) matches
-/// the preemptive drivers but without instrumentation setup/teardown.
+/// kfunc boundaries through the installed interleave hook. At each yield,
+/// control returns to the engine thread which picks the next worker by
+/// minimum local clock.
 pub(crate) fn run_cooperative_dispatch<S: Scheduler>(
     dispatch_cpus: &[CpuId],
     state_send: &SendPtr<SimulatorState>,
     sched_send: &SendPtr<SchedulerWrapper<S>>,
     sim_arc: &SimArc,
-    seed: u32,
+    _seed: u32,
 ) {
-    let ring = TokenRing::new(dispatch_cpus.len(), seed);
+    let ring = EngineRing::new(dispatch_cpus);
 
     std::thread::scope(|s| {
         let ring_ref = &ring;
@@ -631,7 +632,7 @@ pub(crate) fn run_cooperative_dispatch<S: Scheduler>(
                 // from scheduler C code can lock the SimState mutex.
                 kfuncs::install_sim_arc(sim_arc);
 
-                interleave::install(ring_ref, worker_id);
+                interleave::install_engine_ring(ring_ref, worker_id);
                 ring_ref.wait_for_token(worker_id);
 
                 // SAFETY: `sp` points to a valid `SimulatorState` (owned
@@ -660,16 +661,24 @@ pub(crate) fn run_cooperative_dispatch<S: Scheduler>(
             });
         }
 
-        ring.start();
-        ring.wait_all_done();
+        // Engine thread: pick the first worker and run the decision loop.
+        let first = pick_first_by_min_clock(dispatch_cpus, state_send);
+        ring.start_first_worker(first);
+        ring.engine_loop(|_yielded, reason| {
+            if reason == YieldReason::Finished {
+                // Find any non-finished worker by min clock.
+                return engine_pick_next(dispatch_cpus, state_send, &ring);
+            }
+            engine_pick_next(dispatch_cpus, state_send, &ring)
+        });
     });
 }
 
-/// Cooperative concurrent batch event processing via [`TokenRing`].
+/// Cooperative concurrent batch event processing via [`EngineRing`].
 ///
 /// Each worker processes all events for a single CPU sequentially via
-/// `batch_worker_body`. The lifecycle matches [`run_cooperative_dispatch`]
-/// but operates on per-CPU event batches rather than single dispatch calls.
+/// `batch_worker_body`. At each yield, control returns to the engine
+/// thread which picks the next worker by minimum local clock.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_cooperative_batch<S: Scheduler>(
     per_cpu: &HashMap<CpuId, Vec<crate::engine::Event>>,
@@ -677,12 +686,12 @@ pub(crate) fn run_cooperative_batch<S: Scheduler>(
     sim_send: &SendPtr<Simulator<S>>,
     state_send: &SendPtr<SimulatorState>,
     sim_arc: &SimArc,
-    seed: u32,
+    _seed: u32,
     watchdog_timeout: Option<TimeNs>,
     duration_ns: TimeNs,
     max_cgroups: u32,
 ) {
-    let ring = TokenRing::new(cpu_ids.len(), seed);
+    let ring = EngineRing::new(cpu_ids);
 
     std::thread::scope(|s| {
         let ring_ref = &ring;
@@ -703,7 +712,7 @@ pub(crate) fn run_cooperative_batch<S: Scheduler>(
                 // from scheduler C code can lock the SimState mutex.
                 kfuncs::install_sim_arc(arc_ref);
 
-                interleave::install(ring_ref, worker_id);
+                interleave::install_engine_ring(ring_ref, worker_id);
                 ring_ref.wait_for_token(worker_id);
 
                 // SAFETY: `sp` points to a valid `SimulatorState` and
@@ -738,9 +747,59 @@ pub(crate) fn run_cooperative_batch<S: Scheduler>(
             });
         }
 
-        ring.start();
-        ring.wait_all_done();
+        // Engine thread: pick the first worker and run the decision loop.
+        let first = pick_first_by_min_clock(cpu_ids, state_send);
+        ring.start_first_worker(first);
+        ring.engine_loop(|_yielded, reason| {
+            if reason == YieldReason::Finished {
+                return engine_pick_next(cpu_ids, state_send, &ring);
+            }
+            engine_pick_next(cpu_ids, state_send, &ring)
+        });
     });
+}
+
+/// Pick the next worker by minimum local clock.
+///
+/// Reads each CPU's `local_clock` from `SimulatorState` and selects the
+/// non-finished worker whose CPU has the smallest clock. Ties are broken
+/// by `CpuId` for determinism.
+///
+/// # Safety
+///
+/// `state_send.0` must point to a valid `SimulatorState`. The engine
+/// thread has exclusive access when all workers are parked.
+fn engine_pick_next(
+    cpu_ids: &[CpuId],
+    state_send: &SendPtr<SimulatorState>,
+    ring: &EngineRing,
+) -> Option<WorkerId> {
+    let finished = ring.finished_mask();
+    // SAFETY: engine thread has exclusive access — all workers are parked.
+    let state = unsafe { &*state_send.0 };
+    pick_by_min_clock(
+        cpu_ids.iter().enumerate().map(|(i, &cpu)| {
+            let clock = state.cpus[cpu.0 as usize].local_clock;
+            (WorkerId(i), cpu, clock)
+        }),
+        finished,
+    )
+}
+
+/// Pick the first worker to start (by min local clock).
+fn pick_first_by_min_clock(
+    cpu_ids: &[CpuId],
+    state_send: &SendPtr<SimulatorState>,
+) -> WorkerId {
+    let state = unsafe { &*state_send.0 };
+    pick_by_min_clock(
+        cpu_ids.iter().enumerate().map(|(i, &cpu)| {
+            let clock = state.cpus[cpu.0 as usize].local_clock;
+            (WorkerId(i), cpu, clock)
+        }),
+        0, // no workers finished yet
+    )
+    .unwrap_or(WorkerId(0))
 }
 
 // ---------------------------------------------------------------------------
