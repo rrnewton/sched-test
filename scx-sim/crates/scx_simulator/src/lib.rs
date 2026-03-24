@@ -37,6 +37,7 @@ pub mod unsafe_impl;
 
 // Re-export safe modules at crate root so `crate::types`, `crate::dsq`, etc.
 // continue to resolve for all internal `use crate::xxx` paths.
+pub(crate) use safe::atomic_types;
 pub use safe::bpf_trace;
 pub use safe::cgroup;
 pub use safe::cpu;
