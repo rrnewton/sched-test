@@ -118,28 +118,6 @@ pub(crate) trait ThreadOrchestrator: Sync {
     fn finish(&self, worker_id: WorkerId);
 }
 
-impl ThreadOrchestrator for PreemptRing {
-    fn start(&self) {
-        PreemptRing::start(self);
-    }
-
-    fn wait_all_done(&self) {
-        PreemptRing::wait_all_done(self);
-    }
-
-    fn wait_for_token(&self, worker_id: WorkerId) {
-        PreemptRing::wait_for_token(self, worker_id);
-    }
-
-    fn yield_token(&self, worker_id: WorkerId) -> bool {
-        PreemptRing::yield_token(self, worker_id)
-    }
-
-    fn finish(&self, worker_id: WorkerId) {
-        PreemptRing::finish(self, worker_id);
-    }
-}
-
 /// Wrapper to send raw pointers across thread boundaries.
 ///
 /// # Safety
@@ -252,7 +230,7 @@ pub(crate) trait PreemptionBackend: Sync {
     fn global_teardown(&self) {}
 
     /// Create per-worker instrumentation state and install preemption TLS.
-    fn worker_setup(&self, ring: &PreemptRing, worker_id: WorkerId) -> Self::WorkerCtx;
+    fn worker_setup(&self, ring: &PreemptRing, engine: &EngineRing, worker_id: WorkerId) -> Self::WorkerCtx;
 
     /// Build the preemption target for this worker, consuming PRNG state
     /// from the ring to maintain deterministic sequencing.
@@ -366,10 +344,8 @@ pub(crate) unsafe fn clear_ops_and_finish<O: ThreadOrchestrator>(
 /// common lifecycle (structop drain, ops_context clear, synchronization
 /// protocol) is handled here.
 ///
-/// Thread synchronization (wait/finish/start/wait_all_done) is routed
-/// through the [`ThreadOrchestrator`] trait. For preemptive backends the
-/// orchestrator is the `PreemptRing` itself; the `PreemptRing` is still
-/// needed for PRNG/recording/timeslice functionality.
+/// Thread synchronization is routed through the [`EngineRing`]. Workers
+/// yield to the engine which picks the next worker by min-local-clock.
 pub(crate) fn run_preemptive_dispatch<S, B>(
     dispatch_cpus: &[CpuId],
     state_send: &SendPtr<SimulatorState>,
@@ -382,21 +358,65 @@ pub(crate) fn run_preemptive_dispatch<S, B>(
     B: PreemptionBackend,
 {
     let ring = PreemptRing::new(dispatch_cpus.len(), seed);
-    run_dispatch_with_orchestrator(
-        dispatch_cpus,
-        state_send,
-        sched_send,
-        sim_arc,
-        &ring,
-        &ring,
-        backend,
-    );
+    let engine = EngineRing::new(dispatch_cpus);
+
+    backend.global_setup();
+
+    std::thread::scope(|s| {
+        let ring_ref = &ring;
+        let engine_ref = &engine;
+        let state_ref = state_send;
+        let sched_ref = sched_send;
+
+        for (i, &cpu) in dispatch_cpus.iter().enumerate() {
+            let worker_id = WorkerId(i);
+
+            s.spawn(move || {
+                let sp = state_ref.0;
+                let schp = sched_ref.0 as *const SchedulerWrapper<S>;
+
+                kfuncs::install_sim_arc(sim_arc);
+
+                let mut ctx = backend.worker_setup(ring_ref, engine_ref, worker_id);
+                engine_ref.wait_for_token(worker_id);
+
+                // SAFETY: token passing ensures exclusive access to `sp`.
+                unsafe { kfuncs::enter_sim(&mut *sp, cpu) };
+
+                build_and_arm(backend, &mut ctx, ring_ref);
+
+                // SAFETY: `sp` and `schp` are valid; token ensures exclusive access.
+                unsafe {
+                    debug!(cpu = cpu.0, "enter:structop dispatch (preemptive)");
+                    dispatch_worker_body(&mut *sp, &*schp, cpu);
+                }
+
+                let delta = backend.disarm(&mut ctx);
+                unsafe { drain_structop_accum(sp, cpu, &delta) };
+                unsafe { clear_ops_and_finish(sp, engine_ref, worker_id) };
+
+                backend.worker_teardown(ctx);
+            });
+        }
+
+        let first = pick_first_by_min_clock(dispatch_cpus, state_send);
+        engine.start_first_worker(first);
+        engine.engine_loop(|_yielded, reason| {
+            if reason == YieldReason::Finished {
+                return engine_pick_next(dispatch_cpus, state_send, &engine);
+            }
+            engine_pick_next(dispatch_cpus, state_send, &engine)
+        });
+    });
+
+    backend.log_completion(&ring);
+    backend.global_teardown();
 }
 
-/// Inner dispatch driver parameterised over [`ThreadOrchestrator`].
+/// Run concurrent dispatch with a separate [`ThreadOrchestrator`].
 ///
-/// Separated from [`run_preemptive_dispatch`] so that future backends can
-/// supply a different orchestrator while reusing the same worker lifecycle.
+/// Used by native-concurrent mode (NativeOrchestrator) where all workers
+/// run freely in parallel without engine-mediated scheduling.
 pub(crate) fn run_dispatch_with_orchestrator<S, B, O>(
     dispatch_cpus: &[CpuId],
     state_send: &SendPtr<SimulatorState>,
@@ -410,10 +430,15 @@ pub(crate) fn run_dispatch_with_orchestrator<S, B, O>(
     B: PreemptionBackend,
     O: ThreadOrchestrator,
 {
+    // Native mode doesn't install preempt TLS, so we create a dummy
+    // EngineRing for the worker_setup signature (unused in practice).
+    let dummy_engine = EngineRing::new(dispatch_cpus);
+
     backend.global_setup();
 
     std::thread::scope(|s| {
         let ring_ref = ring;
+        let engine_ref = &dummy_engine;
         let orch_ref = orchestrator;
         let state_ref = state_send;
         let sched_ref = sched_send;
@@ -425,34 +450,22 @@ pub(crate) fn run_dispatch_with_orchestrator<S, B, O>(
                 let sp = state_ref.0;
                 let schp = sched_ref.0 as *const SchedulerWrapper<S>;
 
-                // Install SIM_ARC in this worker thread so kfuncs called
-                // from scheduler C code can lock the SimState mutex.
-                // Worker threads don't inherit the engine thread's
-                // ENGINE_SIM_ARC thread-local, so we install directly.
                 kfuncs::install_sim_arc(sim_arc);
 
-                let mut ctx = backend.worker_setup(ring_ref, worker_id);
+                let mut ctx = backend.worker_setup(ring_ref, engine_ref, worker_id);
                 orch_ref.wait_for_token(worker_id);
 
-                // Enter sim AFTER acquiring the token to avoid racing on
-                // SimulatorState.current_cpu with other workers.
-                // SAFETY: token passing ensures exclusive access to `sp`.
                 unsafe { kfuncs::enter_sim(&mut *sp, cpu) };
 
                 build_and_arm(backend, &mut ctx, ring_ref);
 
-                // SAFETY: `sp` and `schp` are valid; token ensures exclusive access.
                 unsafe {
                     debug!(cpu = cpu.0, "enter:structop dispatch (preemptive)");
                     dispatch_worker_body(&mut *sp, &*schp, cpu);
                 }
 
                 let delta = backend.disarm(&mut ctx);
-                // SAFETY: token held; exclusive access to `sp`.
                 unsafe { drain_structop_accum(sp, cpu, &delta) };
-                // SAFETY: token held; clears ops_context before releasing.
-                // clear_ops_and_finish calls exit_sim_no_clear_ops which
-                // clears SIM_ARC.
                 unsafe { clear_ops_and_finish(sp, orch_ref, worker_id) };
 
                 backend.worker_teardown(ctx);
@@ -488,28 +501,70 @@ pub(crate) fn run_preemptive_batch<S, B>(
     B: PreemptionBackend,
 {
     let ring = PreemptRing::new(cpu_ids.len(), seed);
-    run_batch_with_orchestrator(
-        per_cpu,
-        cpu_ids,
-        sim_send,
-        state_send,
-        sim_arc,
-        &ring,
-        &ring,
-        watchdog_timeout,
-        duration_ns,
-        max_cgroups,
-        backend,
-    );
+    let engine = EngineRing::new(cpu_ids);
+
+    backend.global_setup();
+
+    std::thread::scope(|s| {
+        let ring_ref = &ring;
+        let engine_ref = &engine;
+        let sim_ref = sim_send;
+        let state_ref = state_send;
+        let arc_ref = sim_arc;
+
+        for (i, &cpu) in cpu_ids.iter().enumerate() {
+            let worker_id = WorkerId(i);
+            let cpu_events = per_cpu.get(&cpu).cloned().unwrap_or_default();
+
+            s.spawn(move || {
+                let simp = sim_ref.0 as *const Simulator<S>;
+                let sp = state_ref.0;
+
+                kfuncs::install_sim_arc(arc_ref);
+
+                let mut ctx = backend.worker_setup(ring_ref, engine_ref, worker_id);
+                engine_ref.wait_for_token(worker_id);
+
+                unsafe { kfuncs::enter_sim(&mut *sp, cpu) };
+
+                build_and_arm(backend, &mut ctx, ring_ref);
+
+                unsafe {
+                    batch_worker_body(
+                        &*simp,
+                        arc_ref,
+                        cpu_events,
+                        watchdog_timeout,
+                        duration_ns,
+                        max_cgroups,
+                    );
+                }
+
+                let delta = backend.disarm(&mut ctx);
+                unsafe { drain_structop_accum(sp, cpu, &delta) };
+                unsafe { clear_ops_and_finish(sp, engine_ref, worker_id) };
+
+                backend.worker_teardown(ctx);
+            });
+        }
+
+        let first = pick_first_by_min_clock(cpu_ids, state_send);
+        engine.start_first_worker(first);
+        engine.engine_loop(|_yielded, reason| {
+            if reason == YieldReason::Finished {
+                return engine_pick_next(cpu_ids, state_send, &engine);
+            }
+            engine_pick_next(cpu_ids, state_send, &engine)
+        });
+    });
+
+    backend.log_completion(&ring);
+    backend.global_teardown();
 }
 
-/// Inner batch driver parameterised over [`ThreadOrchestrator`].
+/// Run concurrent batch with a separate [`ThreadOrchestrator`].
 ///
-/// Separated from [`run_preemptive_batch`] so that future backends can
-/// supply a different orchestrator while reusing the same worker lifecycle.
-///
-/// `state_send` points to the `sim` field of a `SimState`. Workers recover
-/// the containing `SimState` via pointer cast (the `sim` field is first).
+/// Used by native-concurrent mode where all workers run freely in parallel.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_batch_with_orchestrator<S, B, O>(
     per_cpu: &HashMap<CpuId, Vec<crate::engine::Event>>,
@@ -528,10 +583,13 @@ pub(crate) fn run_batch_with_orchestrator<S, B, O>(
     B: PreemptionBackend,
     O: ThreadOrchestrator,
 {
+    let dummy_engine = EngineRing::new(cpu_ids);
+
     backend.global_setup();
 
     std::thread::scope(|s| {
         let ring_ref = ring;
+        let engine_ref = &dummy_engine;
         let orch_ref = orchestrator;
         let sim_ref = sim_send;
         let state_ref = state_send;
@@ -545,20 +603,15 @@ pub(crate) fn run_batch_with_orchestrator<S, B, O>(
                 let simp = sim_ref.0 as *const Simulator<S>;
                 let sp = state_ref.0;
 
-                // Install SIM_ARC in this worker thread so kfuncs called
-                // from scheduler C code can lock the SimState mutex.
                 kfuncs::install_sim_arc(arc_ref);
 
-                let mut ctx = backend.worker_setup(ring_ref, worker_id);
+                let mut ctx = backend.worker_setup(ring_ref, engine_ref, worker_id);
                 orch_ref.wait_for_token(worker_id);
 
-                // SAFETY: token passing ensures exclusive access to `sp`.
                 unsafe { kfuncs::enter_sim(&mut *sp, cpu) };
 
                 build_and_arm(backend, &mut ctx, ring_ref);
 
-                // SAFETY: `simp` and `arc_ref` are valid; token ensures
-                // exclusive access to shared state.
                 unsafe {
                     batch_worker_body(
                         &*simp,
@@ -571,11 +624,7 @@ pub(crate) fn run_batch_with_orchestrator<S, B, O>(
                 }
 
                 let delta = backend.disarm(&mut ctx);
-                // SAFETY: token held; exclusive access to `sp`.
                 unsafe { drain_structop_accum(sp, cpu, &delta) };
-                // SAFETY: token held; clears ops_context before releasing.
-                // clear_ops_and_finish calls exit_sim_no_clear_ops which
-                // clears SIM_ARC.
                 unsafe { clear_ops_and_finish(sp, orch_ref, worker_id) };
 
                 backend.worker_teardown(ctx);

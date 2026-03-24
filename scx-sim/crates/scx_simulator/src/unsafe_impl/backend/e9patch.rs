@@ -37,6 +37,7 @@ use std::path::{Path, PathBuf};
 use tracing::{debug, info};
 
 use crate::backend::{PreemptTarget, PreemptionBackend, RbcTarget, RelativeRbc, StructopDelta};
+use crate::engine_ring::EngineRing;
 use crate::interleave::WorkerId;
 use crate::preempt::trace::PreemptionTrace;
 use crate::preempt::{self, PreemptRing, ReplayCursor};
@@ -111,11 +112,12 @@ impl PreemptionBackend for E9PatchBackend {
         );
     }
 
-    fn worker_setup(&self, ring: &PreemptRing, worker_id: WorkerId) -> E9PatchWorkerCtx {
+    fn worker_setup(&self, ring: &PreemptRing, engine: &EngineRing, worker_id: WorkerId) -> E9PatchWorkerCtx {
         // Install Rust-side preempt TLS. The C-side shared state is set
         // in arm() after the token is acquired.
         preempt::install(
             ring,
+            engine,
             worker_id,
             -1,
             -1,
@@ -417,7 +419,7 @@ impl PreemptionBackend for E9PatchReplayBackend {
         }
     }
 
-    fn worker_setup(&self, ring: &PreemptRing, worker_id: WorkerId) -> E9PatchReplayWorkerCtx {
+    fn worker_setup(&self, ring: &PreemptRing, engine: &EngineRing, worker_id: WorkerId) -> E9PatchReplayWorkerCtx {
         let i = worker_id.0;
         let cursor = &self.cursors[i];
         let accum = &self.accumulated_rbc[i];
@@ -427,6 +429,7 @@ impl PreemptionBackend for E9PatchReplayBackend {
         // the e9 counter.
         preempt::install_replay_preempt(
             ring,
+            engine,
             worker_id,
             -1, // No timer fd needed — e9patch doesn't use PMU.
             self.timeslice_min,
