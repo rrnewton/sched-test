@@ -20,7 +20,6 @@
 //!                                     store RUNNING for next
 //!                                     futex_wake(workers[next])
 //!                                     loop back to futex_wait
-//! (woken, resumes work)
 //! ```
 //!
 //! When a worker finishes, it sets its bit in `finished_mask`, publishes
@@ -33,55 +32,23 @@
 //! All worker-side methods are 100% async-signal-safe: only atomic stores
 //! and raw `futex()` syscalls. This allows the PMU signal handler to call
 //! [`EngineRing::yield_to_engine`] directly.
+//!
+//! # Type layout
+//!
+//! The safe enum/wrapper types (`WorkerState`, `AtomicWorkerState`,
+//! `EngineWakeState`, `AtomicEngineWake`, `YieldReason`, etc.) live in
+//! [`crate::atomic_types`]. This module adds the futex-using extension
+//! methods and contains `EngineRing` itself.
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::SeqCst};
+use std::sync::atomic::AtomicU32;
 
+use crate::atomic_types::{
+    AtomicEngineWake, AtomicFinishedMask, AtomicWorkerState, AtomicYieldReason,
+    AtomicYieldedWorker, EngineWakeState, WorkerState,
+};
+pub use crate::atomic_types::{TimeslicePrng, YieldReason};
 use crate::interleave::WorkerId;
 use crate::types::CpuId;
-
-// ---------------------------------------------------------------------------
-// TimeslicePrng — extracted from PreemptRing for centralized PRNG
-// ---------------------------------------------------------------------------
-
-/// Atomic xorshift32 PRNG for timeslice generation.
-///
-/// All methods are async-signal-safe (atomic CAS only).
-pub struct TimeslicePrng {
-    state: AtomicU32,
-}
-
-impl TimeslicePrng {
-    /// Create a new PRNG with the given seed (0 is promoted to 1).
-    pub fn new(seed: u32) -> Self {
-        Self {
-            state: AtomicU32::new(if seed == 0 { 1 } else { seed }),
-        }
-    }
-
-    /// Atomically advance the xorshift32 PRNG and return the new value.
-    pub fn next(&self) -> u32 {
-        loop {
-            let old = self.state.load(SeqCst);
-            let mut x = old;
-            x ^= x << 13;
-            x ^= x >> 17;
-            x ^= x << 5;
-            if self.state.compare_exchange(old, x, SeqCst, SeqCst).is_ok() {
-                return x;
-            }
-        }
-    }
-
-    /// Roll a random timeslice in `[min, max]`.
-    pub fn roll_timeslice(&self, min: u64, max: u64) -> u64 {
-        debug_assert!(max >= min);
-        let range = max - min;
-        if range == 0 {
-            return min;
-        }
-        min + (self.next() as u64) % (range + 1)
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Futex wrappers (async-signal-safe)
@@ -127,220 +94,56 @@ fn futex_wake(futex: &AtomicU32, count: i32) {
 }
 
 // ---------------------------------------------------------------------------
-// YieldReason
+// Futex extension methods for AtomicWorkerState
 // ---------------------------------------------------------------------------
-
-/// Why a worker yielded control to the engine.
-///
-/// Encoded as `u32` for async-signal-safe atomic storage.
-#[repr(u32)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum YieldReason {
-    /// Cooperative yield at a kfunc boundary.
-    Cooperative = 1,
-    /// PMU-driven preemption (signal handler).
-    Preemption = 2,
-    /// Worker has finished its dispatch round.
-    Finished = 3,
-}
-
-impl YieldReason {
-    /// Convert from raw `u32`. Returns `None` for invalid values.
-    fn from_u32(v: u32) -> Option<Self> {
-        match v {
-            1 => Some(Self::Cooperative),
-            2 => Some(Self::Preemption),
-            3 => Some(Self::Finished),
-            _ => None,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Typed atomic wrappers (zero-cost, repr(transparent))
-// ---------------------------------------------------------------------------
-
-/// Per-worker state: parked (blocked on futex) or running (holds token).
-#[repr(u32)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WorkerState {
-    Parked = 0,
-    Running = 1,
-}
-
-/// Atomic wrapper for [`WorkerState`]. Enforces that only valid states
-/// are stored. All operations use SeqCst and are async-signal-safe.
-#[repr(transparent)]
-struct AtomicWorkerState(AtomicU32);
+// These methods require futex syscalls and therefore cannot live in the safe
+// partition. They access the inner AtomicU32 via the `inner()` accessor.
 
 impl AtomicWorkerState {
-    fn new_parked() -> Self {
-        Self(AtomicU32::new(WorkerState::Parked as u32))
-    }
-
-    fn park(&self) {
-        self.0.store(WorkerState::Parked as u32, SeqCst);
-    }
-
-    fn set_running(&self) {
-        self.0.store(WorkerState::Running as u32, SeqCst);
-    }
-
-    fn is_running(&self) -> bool {
-        self.0.load(SeqCst) == WorkerState::Running as u32
-    }
-
     /// Block until this worker transitions to [`WorkerState::Running`].
     ///
     /// **Async-signal-safe**: only atomic loads and futex syscalls.
-    fn wait_until_running(&self) {
+    pub(crate) fn wait_until_running(&self) {
         loop {
             if self.is_running() {
                 break;
             }
-            futex_wait(&self.0, WorkerState::Parked as u32);
+            futex_wait(self.inner(), WorkerState::Parked as u32);
         }
     }
 
     /// Wake one thread blocked on this worker's futex.
-    fn futex_wake_one(&self) {
-        futex_wake(&self.0, 1);
+    pub(crate) fn futex_wake_one(&self) {
+        futex_wake(self.inner(), 1);
     }
 }
 
-/// Engine wake state: sleeping (waiting for work) or woken (worker yielded).
-#[repr(u32)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EngineWakeState {
-    Sleeping = 0,
-    Woken = 1,
-}
-
-/// Atomic wrapper for [`EngineWakeState`]. Controls the engine's futex-based
-/// sleep/wake protocol. All operations use SeqCst and are async-signal-safe.
-#[repr(transparent)]
-struct AtomicEngineWake(AtomicU32);
+// ---------------------------------------------------------------------------
+// Futex extension methods for AtomicEngineWake
+// ---------------------------------------------------------------------------
 
 impl AtomicEngineWake {
-    fn new_sleeping() -> Self {
-        Self(AtomicU32::new(EngineWakeState::Sleeping as u32))
-    }
-
-    fn set_sleeping(&self) {
-        self.0.store(EngineWakeState::Sleeping as u32, SeqCst);
-    }
-
-    fn is_woken(&self) -> bool {
-        self.0.load(SeqCst) == EngineWakeState::Woken as u32
-    }
-
     /// Signal the engine that a worker has yielded.
-    fn wake(&self) {
-        self.0.store(EngineWakeState::Woken as u32, SeqCst);
-        futex_wake(&self.0, 1);
+    pub(crate) fn wake(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.inner().store(EngineWakeState::Woken as u32, SeqCst);
+        futex_wake(self.inner(), 1);
     }
 
     /// Block until the engine is woken by a worker.
-    fn wait_until_woken(&self) {
+    pub(crate) fn wait_until_woken(&self) {
         loop {
             if self.is_woken() {
                 break;
             }
-            futex_wait(&self.0, EngineWakeState::Sleeping as u32);
+            futex_wait(self.inner(), EngineWakeState::Sleeping as u32);
         }
-    }
-
-    /// Set sleeping and futex-wait if still sleeping. Used by `wait_all_done`
-    /// to block until the next worker event.
-    fn sleep_and_wait(&self) {
-        self.set_sleeping();
     }
 
     /// Futex-wait on the underlying word (used after `sleep_and_wait` with
     /// a re-check between the store and the wait).
-    fn futex_wait_sleeping(&self) {
-        futex_wait(&self.0, EngineWakeState::Sleeping as u32);
-    }
-}
-
-/// Atomic storage for [`YieldReason`]. Wraps an `AtomicU32` and enforces
-/// that only valid `YieldReason` discriminants are stored.
-/// All operations use SeqCst and are async-signal-safe.
-#[repr(transparent)]
-struct AtomicYieldReason(AtomicU32);
-
-impl AtomicYieldReason {
-    fn new() -> Self {
-        Self(AtomicU32::new(0))
-    }
-
-    fn store(&self, reason: YieldReason) {
-        self.0.store(reason as u32, SeqCst);
-    }
-
-    /// Load the stored reason. Panics on invalid discriminant (data corruption).
-    fn load(&self) -> YieldReason {
-        let raw = self.0.load(SeqCst);
-        YieldReason::from_u32(raw)
-            .unwrap_or_else(|| panic!("AtomicYieldReason: invalid discriminant {raw}"))
-    }
-}
-
-/// Sentinel: no worker has yielded yet.
-const NO_WORKER: u32 = u32::MAX;
-
-/// Atomic storage for the yielded worker index. Stores a `WorkerId` index
-/// or [`NO_WORKER`] sentinel. All operations use SeqCst and are
-/// async-signal-safe.
-#[repr(transparent)]
-struct AtomicYieldedWorker(AtomicU32);
-
-impl AtomicYieldedWorker {
-    fn new() -> Self {
-        Self(AtomicU32::new(NO_WORKER))
-    }
-
-    fn store(&self, worker: WorkerId) {
-        self.0.store(worker.0 as u32, SeqCst);
-    }
-
-    fn load(&self) -> WorkerId {
-        WorkerId(self.0.load(SeqCst) as usize)
-    }
-}
-
-/// Atomic bitmask of finished workers (up to 64). Each bit corresponds
-/// to a `WorkerId`. All operations use SeqCst and are async-signal-safe.
-#[repr(transparent)]
-struct AtomicFinishedMask(AtomicU64);
-
-impl AtomicFinishedMask {
-    fn new() -> Self {
-        Self(AtomicU64::new(0))
-    }
-
-    /// Atomically set the bit for the given worker.
-    fn mark_finished(&self, worker: WorkerId) {
-        self.0.fetch_or(1u64 << worker.0, SeqCst);
-    }
-
-    /// Load the raw bitmask.
-    fn load(&self) -> u64 {
-        self.0.load(SeqCst)
-    }
-
-    /// Whether all `total` workers have their bits set.
-    fn is_all_done(&self, total: usize) -> bool {
-        self.load().count_ones() as usize == total
-    }
-
-    /// Build the full bitmask for `total` workers (all bits set).
-    fn full_mask(total: usize) -> u64 {
-        if total == 64 {
-            u64::MAX
-        } else {
-            (1u64 << total) - 1
-        }
+    pub(crate) fn futex_wait_sleeping(&self) {
+        futex_wait(self.inner(), EngineWakeState::Sleeping as u32);
     }
 }
 
@@ -621,7 +424,7 @@ pub fn pick_by_min_clock(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 
     #[test]
     fn test_single_worker() {
@@ -765,21 +568,6 @@ mod tests {
     }
 
     #[test]
-    fn test_yield_reason_roundtrip() {
-        for reason in [
-            YieldReason::Cooperative,
-            YieldReason::Preemption,
-            YieldReason::Finished,
-        ] {
-            let raw = reason as u32;
-            let recovered = YieldReason::from_u32(raw);
-            assert_eq!(recovered, Some(reason));
-        }
-        assert_eq!(YieldReason::from_u32(0), None);
-        assert_eq!(YieldReason::from_u32(99), None);
-    }
-
-    #[test]
     fn test_thread_orchestrator_trait_single_worker() {
         use crate::backend::ThreadOrchestrator;
 
@@ -802,88 +590,5 @@ mod tests {
         });
 
         assert!(ring.all_done());
-    }
-
-    // -----------------------------------------------------------------------
-    // Wrapper type unit tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_atomic_worker_state_transitions() {
-        let state = AtomicWorkerState::new_parked();
-        assert!(!state.is_running());
-
-        state.set_running();
-        assert!(state.is_running());
-
-        state.park();
-        assert!(!state.is_running());
-    }
-
-    #[test]
-    fn test_atomic_engine_wake_transitions() {
-        let wake = AtomicEngineWake::new_sleeping();
-        assert!(!wake.is_woken());
-
-        wake.0.store(EngineWakeState::Woken as u32, SeqCst);
-        assert!(wake.is_woken());
-
-        wake.set_sleeping();
-        assert!(!wake.is_woken());
-    }
-
-    #[test]
-    fn test_atomic_yield_reason_roundtrip() {
-        let atomic = AtomicYieldReason::new();
-        for reason in [
-            YieldReason::Cooperative,
-            YieldReason::Preemption,
-            YieldReason::Finished,
-        ] {
-            atomic.store(reason);
-            assert_eq!(atomic.load(), reason);
-        }
-    }
-
-    #[test]
-    #[should_panic(expected = "invalid discriminant")]
-    fn test_atomic_yield_reason_panics_on_invalid() {
-        let atomic = AtomicYieldReason::new();
-        // Raw 0 is not a valid YieldReason discriminant.
-        let _ = atomic.load();
-    }
-
-    #[test]
-    fn test_atomic_yielded_worker_roundtrip() {
-        let atomic = AtomicYieldedWorker::new();
-        // Sentinel value maps to WorkerId(u32::MAX as usize).
-        let sentinel = atomic.load();
-        assert_eq!(sentinel.0, u32::MAX as usize);
-
-        atomic.store(WorkerId(42));
-        assert_eq!(atomic.load(), WorkerId(42));
-    }
-
-    #[test]
-    fn test_atomic_finished_mask_operations() {
-        let mask = AtomicFinishedMask::new();
-        assert_eq!(mask.load(), 0);
-        assert!(!mask.is_all_done(3));
-
-        mask.mark_finished(WorkerId(0));
-        assert_eq!(mask.load(), 0b001);
-        assert!(!mask.is_all_done(3));
-
-        mask.mark_finished(WorkerId(1));
-        mask.mark_finished(WorkerId(2));
-        assert_eq!(mask.load(), 0b111);
-        assert!(mask.is_all_done(3));
-    }
-
-    #[test]
-    fn test_finished_mask_full_mask() {
-        assert_eq!(AtomicFinishedMask::full_mask(1), 0b1);
-        assert_eq!(AtomicFinishedMask::full_mask(3), 0b111);
-        assert_eq!(AtomicFinishedMask::full_mask(64), u64::MAX);
     }
 }
