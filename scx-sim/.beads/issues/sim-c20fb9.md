@@ -1,10 +1,10 @@
 ---
 title: Centralize Dispatch/Context-Switch Logic
-status: open
+status: in_progress
 priority: 2
 issue_type: feature
 created_at: 2026-03-24T18:03:56.275830929+00:00
-updated_at: 2026-03-24T18:20:07.051232890+00:00
+updated_at: 2026-03-24T18:20:22.104728369+00:00
 ---
 
 # Description
@@ -214,3 +214,34 @@ After Phase C specifically:
 | unsafe_impl/interleave.rs | Cooperative yield -> EngineRing; eventually delete TokenRing |
 | unsafe_impl/backend/mod.rs | Unify dispatch drivers; adapt PreemptionBackend lifecycle |
 | safe/engine.rs | Use WorkerPool + EngineRing; simplify dispatch paths |
+
+---
+
+## Implementation Status (2026-03-24)
+
+Branch: `centralize-dispatch` (4 commits ahead of `simulator.v4`)
+
+| Phase | Status | Commit | Notes |
+|-------|--------|--------|-------|
+| A: EngineRing | DONE | 84f590a | 621-line module, 8 unit tests, TimeslicePrng |
+| B: Cooperative wiring | DONE | d7df88e | InterleaveCtx uses fn-pointer indirection, engine_loop with min-clock |
+| C: Preemptive wiring | DONE | 373e5a4 | All yield paths through EngineRing, xorshift32 gone from preempt/mod.rs |
+| D: Persistent threads | TODO | — | WorkerPool not yet implemented |
+| E: Delete legacy | TODO | — | TokenRing, old dispatch drivers still present |
+
+### What changed vs the plan
+
+- TimeslicePrng was placed in engine_ring.rs (not a separate file) since it's
+  small and logically part of the new centralized infrastructure.
+- InterleaveCtx uses a function-pointer indirection (YieldFn + data pointer)
+  rather than a union/enum, keeping it Copy and async-signal-safe.
+- run_dispatch_with_orchestrator / run_batch_with_orchestrator kept alive for
+  NativeOrchestrator (native-concurrent mode) — they create a dummy EngineRing
+  for the worker_setup signature.
+- ReplayCtx also got an engine pointer (replay signal handlers need it too).
+- The `seed` parameter is now unused in cooperative mode (min-clock is
+  inherently deterministic without PRNG).
+
+### All tests passing
+
+200+ tests (unit + integration), 0 clippy warnings, clean build.
