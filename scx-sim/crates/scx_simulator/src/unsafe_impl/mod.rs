@@ -23,6 +23,7 @@
 //! | `scheduler_wrapper` | Raw `sched_ext_ops` pointer management, `dlsym`-loaded callbacks |
 //! | `sim_task` | `SimTask` runtime type: raw `task_struct` allocation, FFI field access, deallocation |
 //! | `task_wrapper` | Raw `task_struct` pointer wrapping, unsafe field accessors |
+//! | `worker_pool` | Persistent worker thread pool with futex-based park/wake protocol |
 
 pub mod backend;
 pub mod cgroup_ffi;
@@ -36,3 +37,4 @@ pub mod probes;
 pub mod scheduler_wrapper;
 pub mod sim_task;
 pub mod task_wrapper;
+pub mod worker_pool;
