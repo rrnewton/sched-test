@@ -17,6 +17,7 @@ use crate::backend::pmu::setup_pmu_timer;
 use crate::backend::{
     AbsoluteRbc, PreemptTarget, PreemptionBackend, RbcTarget, RelativeRbc, StructopDelta,
 };
+use crate::engine_ring::EngineRing;
 use crate::interleave::WorkerId;
 use crate::perf;
 use crate::preempt::trace::PreemptionTrace;
@@ -142,7 +143,7 @@ impl PreemptionBackend for ReplayBackend {
         }
     }
 
-    fn worker_setup(&self, ring: &PreemptRing, worker_id: WorkerId) -> ReplayWorkerCtx {
+    fn worker_setup(&self, ring: &PreemptRing, engine: &EngineRing, worker_id: WorkerId) -> ReplayWorkerCtx {
         let i = worker_id.0;
         let cursor = &self.cursors[i];
 
@@ -206,6 +207,7 @@ impl PreemptionBackend for ReplayBackend {
         // replay timer period with random timeslices.
         preempt::install_replay_preempt(
             ring,
+            engine,
             worker_id,
             timer_fd,
             self.timeslice_min,
@@ -213,7 +215,7 @@ impl PreemptionBackend for ReplayBackend {
         );
 
         // Install replay context (replaces normal preempt context).
-        preempt::install_replay(ring, worker_id, timer_fd, bp_fd, cursor, self.no_pmu_signal);
+        preempt::install_replay(ring, engine, worker_id, timer_fd, bp_fd, cursor, self.no_pmu_signal);
 
         ReplayWorkerCtx {
             timer,

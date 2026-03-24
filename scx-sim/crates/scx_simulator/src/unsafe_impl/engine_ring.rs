@@ -40,6 +40,50 @@ use crate::interleave::WorkerId;
 use crate::types::CpuId;
 
 // ---------------------------------------------------------------------------
+// TimeslicePrng — extracted from PreemptRing for centralized PRNG
+// ---------------------------------------------------------------------------
+
+/// Atomic xorshift32 PRNG for timeslice generation.
+///
+/// All methods are async-signal-safe (atomic CAS only).
+pub struct TimeslicePrng {
+    state: AtomicU32,
+}
+
+impl TimeslicePrng {
+    /// Create a new PRNG with the given seed (0 is promoted to 1).
+    pub fn new(seed: u32) -> Self {
+        Self {
+            state: AtomicU32::new(if seed == 0 { 1 } else { seed }),
+        }
+    }
+
+    /// Atomically advance the xorshift32 PRNG and return the new value.
+    pub fn next(&self) -> u32 {
+        loop {
+            let old = self.state.load(SeqCst);
+            let mut x = old;
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            if self.state.compare_exchange(old, x, SeqCst, SeqCst).is_ok() {
+                return x;
+            }
+        }
+    }
+
+    /// Roll a random timeslice in `[min, max]`.
+    pub fn roll_timeslice(&self, min: u64, max: u64) -> u64 {
+        debug_assert!(max >= min);
+        let range = max - min;
+        if range == 0 {
+            return min;
+        }
+        min + (self.next() as u64) % (range + 1)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Futex wrappers (async-signal-safe)
 // ---------------------------------------------------------------------------
 // Local copies identical to `crate::preempt::{futex_wait, futex_wake}`.
