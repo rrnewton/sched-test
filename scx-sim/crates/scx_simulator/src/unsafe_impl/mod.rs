@@ -16,6 +16,7 @@
 //! | `kfuncs` | `#[no_mangle] extern "C"` kfunc entry points, thread-local raw-pointer state |
 //! | `preempt` | Signal handlers, futex syscalls, atomics, inline assembly |
 //! | `backend` | PMU perf_event ioctls, hardware breakpoints, `/proc` mmap, e9patch binary patching |
+//! | `engine_ring`| Futex-based engine-mediated thread orchestrator (futex + atomics only) |
 //! | `interleave`| `UnsafeCell`-based token ring, raw thread synchronization |
 //! | `probes` | `dlsym` function-pointer resolution, raw C function calls |
 //! | `cgroup_wrapper` | Raw-pointer `scx_cgroup` manipulation, C struct interop |
@@ -26,6 +27,7 @@
 pub mod backend;
 pub mod cgroup_ffi;
 pub mod cgroup_wrapper;
+pub mod engine_ring;
 pub mod ffi;
 pub mod interleave;
 pub mod kfuncs;

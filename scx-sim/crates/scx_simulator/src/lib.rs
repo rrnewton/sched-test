@@ -60,6 +60,7 @@ pub use safe::workloads;
 pub use unsafe_impl::backend;
 pub use unsafe_impl::cgroup_ffi;
 pub use unsafe_impl::cgroup_wrapper;
+pub use unsafe_impl::engine_ring;
 pub use unsafe_impl::ffi;
 pub use unsafe_impl::interleave;
 pub use unsafe_impl::kfuncs;
