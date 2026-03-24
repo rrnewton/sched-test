@@ -69,6 +69,7 @@ pub use unsafe_impl::probes;
 pub use unsafe_impl::scheduler_wrapper;
 pub use unsafe_impl::sim_task;
 pub use unsafe_impl::task_wrapper;
+pub use unsafe_impl::worker_pool;
 
 // Re-export the main public types for convenience.
 pub use cgroup::{CgroupId, CgroupInfo, CgroupRegistry, DEFAULT_MAX_CGROUPS};
