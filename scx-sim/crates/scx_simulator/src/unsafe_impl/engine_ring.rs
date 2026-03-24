@@ -664,11 +664,11 @@ mod tests {
             let counter_ref = &counter;
 
             // Spawn 3 worker threads.
-            for i in 0..3 {
+            for (i, order_slot) in order_ref.iter().enumerate() {
                 s.spawn(move || {
                     ring_ref.wait_for_token(WorkerId(i));
                     let seq = counter_ref.fetch_add(1, SeqCst);
-                    order_ref[i].store(seq, SeqCst);
+                    order_slot.store(seq, SeqCst);
                     // Yield once, then finish.
                     ring_ref.yield_to_engine(WorkerId(i), YieldReason::Cooperative);
                     ring_ref.finish_worker(WorkerId(i));

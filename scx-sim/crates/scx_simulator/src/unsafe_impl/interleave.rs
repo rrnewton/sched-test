@@ -1,14 +1,15 @@
-//! Concurrent callback interleaving via token-passing.
+//! Concurrent callback interleaving via engine-mediated token-passing.
 //!
 //! Runs scheduler callbacks on separate OS threads, with only one thread
-//! active at a time. A PRNG-driven scheduler controls which thread gets
-//! the "token" at each kfunc yield point, enabling deterministic
-//! exploration of different interleavings.
+//! active at a time. The [`EngineRing`](crate::engine_ring::EngineRing)
+//! (futex-based, engine-mediated) controls which thread gets the "token"
+//! at each kfunc yield point, enabling deterministic exploration of
+//! different interleavings.
 //!
 //! ## Determinism
 //!
 //! Interleaving is fully deterministic for a given seed:
-//! - PRNG determines worker selection order
+//! - Engine picks the next worker by minimum local clock
 //! - Token passing serializes all state access
 //! - Same seed → same interleaving → same trace
 //!
@@ -19,11 +20,11 @@
 //!
 //! ## Architecture
 //!
-//! The orchestrator (engine thread) spawns one worker per CPU in the
-//! concurrent group. Workers block on a condvar until the PRNG selects
-//! them. At each kfunc entry point, [`maybe_yield`] releases the token
-//! and selects the next worker, allowing a different CPU's dispatch
-//! callback to make progress.
+//! The engine thread spawns one worker per CPU in the concurrent group.
+//! Workers block until the engine selects them. At each kfunc entry point,
+//! [`maybe_yield`] releases the token and returns control to the engine,
+//! which picks the next worker by minimum local clock, allowing a different
+//! CPU's dispatch callback to make progress.
 //!
 //! ## Safety
 //!
@@ -34,9 +35,13 @@
 //! worker yields.
 
 use std::cell::Cell;
+
+#[cfg(test)]
 use std::sync::{Condvar, Mutex};
 
+#[cfg(test)]
 use rand::rngs::SmallRng;
+#[cfg(test)]
 use rand::{RngCore, SeedableRng};
 
 /// Worker identity within a concurrent group.
@@ -44,9 +49,14 @@ use rand::{RngCore, SeedableRng};
 pub struct WorkerId(pub usize);
 
 // ---------------------------------------------------------------------------
-// TokenRing — PRNG-driven cooperative scheduler
+// TokenRing — PRNG-driven cooperative scheduler (test-only)
+//
+// TokenRing is retained behind #[cfg(test)] for unit tests that verify
+// PRNG-driven interleaving determinism and the on_yield callback protocol.
+// Production code uses EngineRing (futex-based, engine-mediated).
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
 /// Opaque handle passed to [`OnYieldFn`] callbacks, providing controlled
 /// access to worker-selection logic without exposing `TokenState` internals.
 ///
@@ -56,6 +66,7 @@ pub struct YieldContext<'a> {
     state: &'a mut TokenState,
 }
 
+#[cfg(test)]
 impl YieldContext<'_> {
     /// Pick the next non-finished worker using the deterministic PRNG.
     ///
@@ -77,26 +88,19 @@ impl YieldContext<'_> {
     }
 }
 
-/// Callback type for engine-mediated yield decisions.
-///
-/// Invoked inside `yield_token` when a worker yields. Receives the yielding
-/// worker's ID and a [`YieldContext`] that provides worker-selection helpers.
-/// Returns the [`WorkerId`] to activate next, or `None` if all workers are
-/// done (should not normally happen during a yield).
-///
-/// In Phase 1 (sim-a730ac) this is always `None` (PRNG-direct path). Later
-/// phases install a callback that wakes the simulator engine for
-/// clock-update / event-queue inspection between yields.
+/// Callback type for engine-mediated yield decisions (test-only).
+#[cfg(test)]
 pub type OnYieldFn = Box<dyn Fn(WorkerId, &mut YieldContext<'_>) -> Option<WorkerId> + Send + Sync>;
 
-/// Token-passing scheduler for concurrent callback interleaving.
+/// Token-passing scheduler for concurrent callback interleaving (test-only).
 ///
 /// Workers block on a condvar until selected by the PRNG. Only one worker
 /// is active at a time, ensuring single-threaded access to shared state.
 ///
-/// An optional [`OnYieldFn`] callback can override worker selection at each
-/// yield point, enabling the simulator engine to participate in scheduling
-/// decisions (see `ai_docs/widened_concurrency_plan.md`, Phase 1).
+/// Production code uses [`EngineRing`](crate::engine_ring::EngineRing)
+/// instead. TokenRing is retained for unit tests that verify PRNG-driven
+/// interleaving determinism.
+#[cfg(test)]
 pub struct TokenRing {
     mu: Mutex<TokenState>,
     cv: Condvar,
@@ -106,6 +110,7 @@ pub struct TokenRing {
     on_yield: Option<OnYieldFn>,
 }
 
+#[cfg(test)]
 struct TokenState {
     /// Which worker currently holds the token.
     active: Option<WorkerId>,
@@ -117,6 +122,7 @@ struct TokenState {
     rng: SmallRng,
 }
 
+#[cfg(test)]
 impl TokenState {
     fn is_finished(&self, id: WorkerId) -> bool {
         self.finished_mask & (1u64 << id.0) != 0
@@ -160,6 +166,7 @@ impl TokenState {
 /// Otherwise falls through to PRNG-based selection. This is a free function
 /// (not a method on `TokenRing`) to avoid borrowing `self` while the
 /// `MutexGuard<TokenState>` is held.
+#[cfg(test)]
 fn pick_next_for_yield(
     on_yield: &Option<OnYieldFn>,
     yielding: WorkerId,
@@ -173,6 +180,7 @@ fn pick_next_for_yield(
     }
 }
 
+#[cfg(test)]
 impl TokenRing {
     /// Create a new token ring for `total` workers.
     ///
@@ -186,7 +194,7 @@ impl TokenRing {
     pub fn new(total: usize, seed: u32) -> Self {
         assert!(
             total > 0 && total <= 64,
-            "TokenRing supports 1–64 workers, got {total}"
+            "TokenRing supports 1-64 workers, got {total}"
         );
         TokenRing {
             mu: Mutex::new(TokenState {
@@ -201,11 +209,6 @@ impl TokenRing {
     }
 
     /// Builder: install an [`OnYieldFn`] callback for engine-mediated yield.
-    ///
-    /// When set, every `yield_token` call invokes the callback to decide
-    /// which worker to resume, instead of using the PRNG directly. This
-    /// is infrastructure for simulator-in-the-loop (Phase 1 of
-    /// sim-a730ac); the default (`None`) preserves existing behavior.
     pub fn with_on_yield(mut self, f: OnYieldFn) -> Self {
         self.on_yield = Some(f);
         self
@@ -230,10 +233,6 @@ impl TokenRing {
     ///
     /// Returns `true` if a different worker was selected (actual context
     /// switch), `false` if the same worker was re-selected (no-op yield).
-    ///
-    /// If an [`OnYieldFn`] callback is installed, it decides the next
-    /// worker. Otherwise, the PRNG picks the next non-finished worker
-    /// directly (the original/default behavior).
     pub fn yield_token(&self, my_id: WorkerId) -> bool {
         let mut state = self.mu.lock().unwrap();
         debug_assert_eq!(state.active, Some(my_id));
@@ -269,6 +268,7 @@ impl TokenRing {
     }
 }
 
+#[cfg(test)]
 impl crate::backend::ThreadOrchestrator for TokenRing {
     fn start(&self) {
         TokenRing::start(self);
@@ -302,11 +302,12 @@ impl crate::backend::ThreadOrchestrator for TokenRing {
 /// and futex syscalls (no locks, no allocation).
 type YieldFn = unsafe fn(*const (), WorkerId) -> bool;
 
-/// Token ring yield: calls `TokenRing::yield_token`.
+/// Token ring yield: calls `TokenRing::yield_token` (test-only).
 ///
 /// # Safety
 ///
 /// `data` must point to a valid `TokenRing`.
+#[cfg(test)]
 unsafe fn yield_via_token_ring(data: *const (), worker_id: WorkerId) -> bool {
     let ring = unsafe { &*(data as *const TokenRing) };
     ring.yield_token(worker_id)
@@ -326,12 +327,12 @@ unsafe fn yield_via_engine_ring(data: *const (), worker_id: WorkerId) -> bool {
 
 /// Thread-local interleave context installed on worker threads.
 ///
-/// Uses a function-pointer indirection so that both [`TokenRing`]
-/// (Mutex/Condvar cooperative) and [`EngineRing`](crate::engine_ring::EngineRing)
-/// (futex engine-mediated) can be used through the same `maybe_yield()` path.
+/// Uses a function-pointer indirection so that the
+/// [`EngineRing`](crate::engine_ring::EngineRing) (futex engine-mediated)
+/// yield path is decoupled from the `maybe_yield()` call site.
 #[derive(Clone, Copy)]
 struct InterleaveCtx {
-    /// Opaque pointer to the ring (TokenRing or EngineRing).
+    /// Opaque pointer to the ring (EngineRing).
     ring_data: *const (),
     /// Function to call for yielding.
     yield_fn: YieldFn,
@@ -340,16 +341,18 @@ struct InterleaveCtx {
 
 // SAFETY: InterleaveCtx holds a raw pointer to a ring that lives in
 // a `thread::scope` block on the main thread. Access is serialized by
-// the token-passing protocol — only the token holder calls `maybe_yield`.
+// the token-passing protocol -- only the token holder calls `maybe_yield`.
 unsafe impl Send for InterleaveCtx {}
 
 thread_local! {
     static INTERLEAVE_CTX: Cell<Option<InterleaveCtx>> = const { Cell::new(None) };
 }
 
-/// Install interleave context for a [`TokenRing`] on the current worker thread.
+/// Install interleave context for a [`TokenRing`] on the current worker
+/// thread (test-only).
 ///
 /// Called by worker threads at startup, before waiting for the token.
+#[cfg(test)]
 pub fn install(ring: &TokenRing, worker_id: WorkerId) {
     INTERLEAVE_CTX.with(|c| {
         c.set(Some(InterleaveCtx {
@@ -384,7 +387,7 @@ pub fn uninstall() {
 /// - If preemptive context is installed: uses [`preempt::maybe_yield_preemptive`]
 ///   (futex-based, signal-safe, PMU timer aware).
 /// - If cooperative context is installed: uses the installed ring's yield
-///   function (either [`TokenRing`] or [`EngineRing`]).
+///   function ([`EngineRing`](crate::engine_ring::EngineRing)).
 /// - If neither is installed: no-op.
 ///
 /// # Safety contract
