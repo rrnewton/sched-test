@@ -45,7 +45,12 @@ impl PreemptionBackend for PmuBackend {
         preempt::uninstall_signal_handler();
     }
 
-    fn worker_setup(&self, ring: &PreemptRing, engine: &EngineRing, worker_id: WorkerId) -> PmuWorkerCtx {
+    fn worker_setup(
+        &self,
+        ring: &PreemptRing,
+        engine: &EngineRing,
+        worker_id: WorkerId,
+    ) -> PmuWorkerCtx {
         // Create per-thread PMU timer (may be unavailable in VMs).
         // Skip if cooperative_only mode is requested.
         let (timer, timer_fd) = setup_pmu_timer(self.cooperative_only, self.break_on);

@@ -127,23 +127,6 @@ fn futex_wake(futex: &AtomicU32, count: i32) {
 }
 
 // ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
-/// Worker is parked (blocked on futex). Matches `PreemptRing::PARKED`.
-const PARKED: u32 = 0;
-/// Worker is running (holds the execution token). Matches `PreemptRing::RUNNING`.
-const RUNNING: u32 = 1;
-
-/// Engine futex word: engine is sleeping, waiting for a worker to yield.
-const ENGINE_SLEEPING: u32 = 0;
-/// Engine futex word: a worker has yielded and the engine should wake.
-const ENGINE_WOKEN: u32 = 1;
-
-/// Sentinel value for `yielded_worker` indicating no worker has yielded yet.
-const NO_WORKER: u32 = u32::MAX;
-
-// ---------------------------------------------------------------------------
 // YieldReason
 // ---------------------------------------------------------------------------
 
@@ -174,6 +157,194 @@ impl YieldReason {
 }
 
 // ---------------------------------------------------------------------------
+// Typed atomic wrappers (zero-cost, repr(transparent))
+// ---------------------------------------------------------------------------
+
+/// Per-worker state: parked (blocked on futex) or running (holds token).
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerState {
+    Parked = 0,
+    Running = 1,
+}
+
+/// Atomic wrapper for [`WorkerState`]. Enforces that only valid states
+/// are stored. All operations use SeqCst and are async-signal-safe.
+#[repr(transparent)]
+struct AtomicWorkerState(AtomicU32);
+
+impl AtomicWorkerState {
+    fn new_parked() -> Self {
+        Self(AtomicU32::new(WorkerState::Parked as u32))
+    }
+
+    fn park(&self) {
+        self.0.store(WorkerState::Parked as u32, SeqCst);
+    }
+
+    fn set_running(&self) {
+        self.0.store(WorkerState::Running as u32, SeqCst);
+    }
+
+    fn is_running(&self) -> bool {
+        self.0.load(SeqCst) == WorkerState::Running as u32
+    }
+
+    /// Block until this worker transitions to [`WorkerState::Running`].
+    ///
+    /// **Async-signal-safe**: only atomic loads and futex syscalls.
+    fn wait_until_running(&self) {
+        loop {
+            if self.is_running() {
+                break;
+            }
+            futex_wait(&self.0, WorkerState::Parked as u32);
+        }
+    }
+
+    /// Wake one thread blocked on this worker's futex.
+    fn futex_wake_one(&self) {
+        futex_wake(&self.0, 1);
+    }
+}
+
+/// Engine wake state: sleeping (waiting for work) or woken (worker yielded).
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EngineWakeState {
+    Sleeping = 0,
+    Woken = 1,
+}
+
+/// Atomic wrapper for [`EngineWakeState`]. Controls the engine's futex-based
+/// sleep/wake protocol. All operations use SeqCst and are async-signal-safe.
+#[repr(transparent)]
+struct AtomicEngineWake(AtomicU32);
+
+impl AtomicEngineWake {
+    fn new_sleeping() -> Self {
+        Self(AtomicU32::new(EngineWakeState::Sleeping as u32))
+    }
+
+    fn set_sleeping(&self) {
+        self.0.store(EngineWakeState::Sleeping as u32, SeqCst);
+    }
+
+    fn is_woken(&self) -> bool {
+        self.0.load(SeqCst) == EngineWakeState::Woken as u32
+    }
+
+    /// Signal the engine that a worker has yielded.
+    fn wake(&self) {
+        self.0.store(EngineWakeState::Woken as u32, SeqCst);
+        futex_wake(&self.0, 1);
+    }
+
+    /// Block until the engine is woken by a worker.
+    fn wait_until_woken(&self) {
+        loop {
+            if self.is_woken() {
+                break;
+            }
+            futex_wait(&self.0, EngineWakeState::Sleeping as u32);
+        }
+    }
+
+    /// Set sleeping and futex-wait if still sleeping. Used by `wait_all_done`
+    /// to block until the next worker event.
+    fn sleep_and_wait(&self) {
+        self.set_sleeping();
+    }
+
+    /// Futex-wait on the underlying word (used after `sleep_and_wait` with
+    /// a re-check between the store and the wait).
+    fn futex_wait_sleeping(&self) {
+        futex_wait(&self.0, EngineWakeState::Sleeping as u32);
+    }
+}
+
+/// Atomic storage for [`YieldReason`]. Wraps an `AtomicU32` and enforces
+/// that only valid `YieldReason` discriminants are stored.
+/// All operations use SeqCst and are async-signal-safe.
+#[repr(transparent)]
+struct AtomicYieldReason(AtomicU32);
+
+impl AtomicYieldReason {
+    fn new() -> Self {
+        Self(AtomicU32::new(0))
+    }
+
+    fn store(&self, reason: YieldReason) {
+        self.0.store(reason as u32, SeqCst);
+    }
+
+    /// Load the stored reason. Panics on invalid discriminant (data corruption).
+    fn load(&self) -> YieldReason {
+        let raw = self.0.load(SeqCst);
+        YieldReason::from_u32(raw)
+            .unwrap_or_else(|| panic!("AtomicYieldReason: invalid discriminant {raw}"))
+    }
+}
+
+/// Sentinel: no worker has yielded yet.
+const NO_WORKER: u32 = u32::MAX;
+
+/// Atomic storage for the yielded worker index. Stores a `WorkerId` index
+/// or [`NO_WORKER`] sentinel. All operations use SeqCst and are
+/// async-signal-safe.
+#[repr(transparent)]
+struct AtomicYieldedWorker(AtomicU32);
+
+impl AtomicYieldedWorker {
+    fn new() -> Self {
+        Self(AtomicU32::new(NO_WORKER))
+    }
+
+    fn store(&self, worker: WorkerId) {
+        self.0.store(worker.0 as u32, SeqCst);
+    }
+
+    fn load(&self) -> WorkerId {
+        WorkerId(self.0.load(SeqCst) as usize)
+    }
+}
+
+/// Atomic bitmask of finished workers (up to 64). Each bit corresponds
+/// to a `WorkerId`. All operations use SeqCst and are async-signal-safe.
+#[repr(transparent)]
+struct AtomicFinishedMask(AtomicU64);
+
+impl AtomicFinishedMask {
+    fn new() -> Self {
+        Self(AtomicU64::new(0))
+    }
+
+    /// Atomically set the bit for the given worker.
+    fn mark_finished(&self, worker: WorkerId) {
+        self.0.fetch_or(1u64 << worker.0, SeqCst);
+    }
+
+    /// Load the raw bitmask.
+    fn load(&self) -> u64 {
+        self.0.load(SeqCst)
+    }
+
+    /// Whether all `total` workers have their bits set.
+    fn is_all_done(&self, total: usize) -> bool {
+        self.load().count_ones() as usize == total
+    }
+
+    /// Build the full bitmask for `total` workers (all bits set).
+    fn full_mask(total: usize) -> u64 {
+        if total == 64 {
+            u64::MAX
+        } else {
+            (1u64 << total) - 1
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // EngineRing
 // ---------------------------------------------------------------------------
 
@@ -183,17 +354,16 @@ impl YieldReason {
 /// decisions (e.g. pick the worker with the smallest local clock) and wakes
 /// the chosen worker. All worker-side operations are async-signal-safe.
 pub struct EngineRing {
-    /// Per-worker state: `PARKED` (0) or `RUNNING` (1).
-    workers: Box<[AtomicU32]>,
-    /// Engine wake futex word. Workers store `ENGINE_WOKEN` and wake this
-    /// to hand control to the engine.
-    engine_wake: AtomicU32,
+    /// Per-worker state: parked or running.
+    workers: Box<[AtomicWorkerState]>,
+    /// Engine wake futex word. Workers signal this to hand control to the engine.
+    engine_wake: AtomicEngineWake,
     /// Which worker just yielded (written by worker, read by engine).
-    yielded_worker: AtomicU32,
+    yielded_worker: AtomicYieldedWorker,
     /// Why the worker yielded (written by worker, read by engine).
-    yield_reason: AtomicU32,
+    yield_reason: AtomicYieldReason,
     /// Bitmask of finished workers (up to 64).
-    finished_mask: AtomicU64,
+    finished_mask: AtomicFinishedMask,
     /// Total number of workers.
     total: usize,
     /// `WorkerId` -> `CpuId` mapping for tie-breaking in min-clock selection.
@@ -212,13 +382,15 @@ impl EngineRing {
             total > 0 && total <= 64,
             "EngineRing supports 1-64 workers, got {total}"
         );
-        let workers: Box<[AtomicU32]> = (0..total).map(|_| AtomicU32::new(PARKED)).collect();
+        let workers: Box<[AtomicWorkerState]> = (0..total)
+            .map(|_| AtomicWorkerState::new_parked())
+            .collect();
         EngineRing {
             workers,
-            engine_wake: AtomicU32::new(ENGINE_SLEEPING),
-            yielded_worker: AtomicU32::new(NO_WORKER),
-            yield_reason: AtomicU32::new(0),
-            finished_mask: AtomicU64::new(0),
+            engine_wake: AtomicEngineWake::new_sleeping(),
+            yielded_worker: AtomicYieldedWorker::new(),
+            yield_reason: AtomicYieldReason::new(),
+            finished_mask: AtomicFinishedMask::new(),
             total,
             worker_cpu_map: worker_cpu_map.into(),
         }
@@ -231,7 +403,7 @@ impl EngineRing {
 
     /// Current finished bitmask (one bit per worker).
     pub fn finished_mask(&self) -> u64 {
-        self.finished_mask.load(SeqCst)
+        self.finished_mask.load()
     }
 
     /// Look up the `CpuId` for a given worker.
@@ -241,17 +413,12 @@ impl EngineRing {
 
     /// Whether all workers have finished.
     fn all_done(&self) -> bool {
-        let mask = self.finished_mask.load(SeqCst);
-        mask.count_ones() as usize == self.total
+        self.finished_mask.is_all_done(self.total)
     }
 
     /// Build the full finished bitmask for `self.total` workers.
     fn full_mask(&self) -> u64 {
-        if self.total == 64 {
-            u64::MAX
-        } else {
-            (1u64 << self.total) - 1
-        }
+        AtomicFinishedMask::full_mask(self.total)
     }
 
     // -----------------------------------------------------------------------
@@ -262,12 +429,7 @@ impl EngineRing {
     ///
     /// **Async-signal-safe**: only atomic loads and futex syscalls.
     pub fn wait_for_token(&self, worker_id: WorkerId) {
-        loop {
-            if self.workers[worker_id.0].load(SeqCst) == RUNNING {
-                break;
-            }
-            futex_wait(&self.workers[worker_id.0], PARKED);
-        }
+        self.workers[worker_id.0].wait_until_running();
     }
 
     /// Worker: yield control to the engine with the given reason.
@@ -280,23 +442,17 @@ impl EngineRing {
     /// **Async-signal-safe**: only atomic stores and futex syscalls.
     pub fn yield_to_engine(&self, worker_id: WorkerId, reason: YieldReason) -> bool {
         // 1. Park ourselves to prevent wake-before-wait races.
-        self.workers[worker_id.0].store(PARKED, SeqCst);
+        self.workers[worker_id.0].park();
 
         // 2. Publish yield info for the engine to read.
-        self.yielded_worker.store(worker_id.0 as u32, SeqCst);
-        self.yield_reason.store(reason as u32, SeqCst);
+        self.yielded_worker.store(worker_id);
+        self.yield_reason.store(reason);
 
         // 3. Wake the engine.
-        self.engine_wake.store(ENGINE_WOKEN, SeqCst);
-        futex_wake(&self.engine_wake, 1);
+        self.engine_wake.wake();
 
         // 4. Block until the engine wakes us.
-        loop {
-            if self.workers[worker_id.0].load(SeqCst) == RUNNING {
-                break;
-            }
-            futex_wait(&self.workers[worker_id.0], PARKED);
-        }
+        self.workers[worker_id.0].wait_until_running();
 
         true
     }
@@ -309,15 +465,14 @@ impl EngineRing {
     ///
     /// **Async-signal-safe**: only atomic stores and futex_wake.
     pub fn finish_worker(&self, worker_id: WorkerId) {
-        self.finished_mask.fetch_or(1u64 << worker_id.0, SeqCst);
+        self.finished_mask.mark_finished(worker_id);
 
         // Publish yield info so the engine knows who finished.
-        self.yielded_worker.store(worker_id.0 as u32, SeqCst);
-        self.yield_reason.store(YieldReason::Finished as u32, SeqCst);
+        self.yielded_worker.store(worker_id);
+        self.yield_reason.store(YieldReason::Finished);
 
         // Wake the engine (non-blocking).
-        self.engine_wake.store(ENGINE_WOKEN, SeqCst);
-        futex_wake(&self.engine_wake, 1);
+        self.engine_wake.wake();
     }
 
     // -----------------------------------------------------------------------
@@ -328,8 +483,8 @@ impl EngineRing {
     ///
     /// Typically called before entering [`engine_loop`](Self::engine_loop).
     pub fn start_first_worker(&self, first: WorkerId) {
-        self.workers[first.0].store(RUNNING, SeqCst);
-        futex_wake(&self.workers[first.0], 1);
+        self.workers[first.0].set_running();
+        self.workers[first.0].futex_wake_one();
     }
 
     /// Engine: main scheduling loop.
@@ -352,27 +507,12 @@ impl EngineRing {
     {
         loop {
             // Park the engine until a worker yields.
-            self.engine_wake.store(ENGINE_SLEEPING, SeqCst);
-            loop {
-                if self.engine_wake.load(SeqCst) == ENGINE_WOKEN {
-                    break;
-                }
-                futex_wait(&self.engine_wake, ENGINE_SLEEPING);
-            }
+            self.engine_wake.set_sleeping();
+            self.engine_wake.wait_until_woken();
 
             // Read yield info published by the worker.
-            let raw_worker = self.yielded_worker.load(SeqCst);
-            let raw_reason = self.yield_reason.load(SeqCst);
-
-            let yielded = WorkerId(raw_worker as usize);
-            // SAFETY-ish: invalid reason values should never appear because
-            // only `yield_to_engine` writes the reason field with valid enum
-            // discriminants. Panic loudly on corruption.
-            let reason = YieldReason::from_u32(raw_reason).unwrap_or_else(|| {
-                panic!(
-                    "EngineRing: invalid yield_reason {raw_reason} from worker {raw_worker}"
-                )
-            });
+            let yielded = self.yielded_worker.load();
+            let reason = self.yield_reason.load();
 
             // Check if everyone is done.
             if self.all_done() {
@@ -382,8 +522,8 @@ impl EngineRing {
             // Ask the engine for the next worker to run.
             match on_yield(yielded, reason) {
                 Some(next) => {
-                    self.workers[next.0].store(RUNNING, SeqCst);
-                    futex_wake(&self.workers[next.0], 1);
+                    self.workers[next.0].set_running();
+                    self.workers[next.0].futex_wake_one();
                 }
                 None => {
                     break;
@@ -409,15 +549,15 @@ impl crate::backend::ThreadOrchestrator for EngineRing {
         // Uses futex on engine_wake to avoid busy-waiting: each worker
         // finish wakes the engine, which gives us a convenient wakeup.
         loop {
-            if self.finished_mask.load(SeqCst) == self.full_mask() {
+            if self.finished_mask() == self.full_mask() {
                 break;
             }
             // Wait on engine_wake as a proxy -- workers wake this on yield.
-            self.engine_wake.store(ENGINE_SLEEPING, SeqCst);
-            if self.finished_mask.load(SeqCst) == self.full_mask() {
+            self.engine_wake.sleep_and_wait();
+            if self.finished_mask() == self.full_mask() {
                 break;
             }
-            futex_wait(&self.engine_wake, ENGINE_SLEEPING);
+            self.engine_wake.futex_wait_sleeping();
         }
     }
 
@@ -541,7 +681,7 @@ mod tests {
             ring.engine_loop(|_yielded, reason| {
                 if reason == YieldReason::Finished {
                     // Find any non-finished worker.
-                    let mask = ring.finished_mask.load(SeqCst);
+                    let mask = ring.finished_mask();
                     for i in 0..ring.total() {
                         if mask & (1u64 << i) == 0 {
                             return Some(WorkerId(i));
@@ -550,7 +690,7 @@ mod tests {
                     return None;
                 }
                 // Round-robin among non-finished workers.
-                let mask = ring.finished_mask.load(SeqCst);
+                let mask = ring.finished_mask();
                 for _ in 0..ring.total() {
                     let candidate = next_rr % ring.total();
                     next_rr += 1;
@@ -567,11 +707,7 @@ mod tests {
         // Verify all 3 workers recorded an activation.
         for (i, slot) in activation_order.iter().enumerate() {
             let seq = slot.load(SeqCst);
-            assert_ne!(
-                seq,
-                usize::MAX,
-                "worker {i} was never activated"
-            );
+            assert_ne!(seq, usize::MAX, "worker {i} was never activated");
         }
     }
 
@@ -666,5 +802,88 @@ mod tests {
         });
 
         assert!(ring.all_done());
+    }
+
+    // -----------------------------------------------------------------------
+    // Wrapper type unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_atomic_worker_state_transitions() {
+        let state = AtomicWorkerState::new_parked();
+        assert!(!state.is_running());
+
+        state.set_running();
+        assert!(state.is_running());
+
+        state.park();
+        assert!(!state.is_running());
+    }
+
+    #[test]
+    fn test_atomic_engine_wake_transitions() {
+        let wake = AtomicEngineWake::new_sleeping();
+        assert!(!wake.is_woken());
+
+        wake.0.store(EngineWakeState::Woken as u32, SeqCst);
+        assert!(wake.is_woken());
+
+        wake.set_sleeping();
+        assert!(!wake.is_woken());
+    }
+
+    #[test]
+    fn test_atomic_yield_reason_roundtrip() {
+        let atomic = AtomicYieldReason::new();
+        for reason in [
+            YieldReason::Cooperative,
+            YieldReason::Preemption,
+            YieldReason::Finished,
+        ] {
+            atomic.store(reason);
+            assert_eq!(atomic.load(), reason);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid discriminant")]
+    fn test_atomic_yield_reason_panics_on_invalid() {
+        let atomic = AtomicYieldReason::new();
+        // Raw 0 is not a valid YieldReason discriminant.
+        let _ = atomic.load();
+    }
+
+    #[test]
+    fn test_atomic_yielded_worker_roundtrip() {
+        let atomic = AtomicYieldedWorker::new();
+        // Sentinel value maps to WorkerId(u32::MAX as usize).
+        let sentinel = atomic.load();
+        assert_eq!(sentinel.0, u32::MAX as usize);
+
+        atomic.store(WorkerId(42));
+        assert_eq!(atomic.load(), WorkerId(42));
+    }
+
+    #[test]
+    fn test_atomic_finished_mask_operations() {
+        let mask = AtomicFinishedMask::new();
+        assert_eq!(mask.load(), 0);
+        assert!(!mask.is_all_done(3));
+
+        mask.mark_finished(WorkerId(0));
+        assert_eq!(mask.load(), 0b001);
+        assert!(!mask.is_all_done(3));
+
+        mask.mark_finished(WorkerId(1));
+        mask.mark_finished(WorkerId(2));
+        assert_eq!(mask.load(), 0b111);
+        assert!(mask.is_all_done(3));
+    }
+
+    #[test]
+    fn test_finished_mask_full_mask() {
+        assert_eq!(AtomicFinishedMask::full_mask(1), 0b1);
+        assert_eq!(AtomicFinishedMask::full_mask(3), 0b111);
+        assert_eq!(AtomicFinishedMask::full_mask(64), u64::MAX);
     }
 }

@@ -32,7 +32,12 @@ pub(crate) struct NullWorkerCtx;
 impl PreemptionBackend for NullBackend {
     type WorkerCtx = NullWorkerCtx;
 
-    fn worker_setup(&self, _ring: &PreemptRing, _engine: &EngineRing, worker_id: WorkerId) -> NullWorkerCtx {
+    fn worker_setup(
+        &self,
+        _ring: &PreemptRing,
+        _engine: &EngineRing,
+        worker_id: WorkerId,
+    ) -> NullWorkerCtx {
         // Do NOT install preempt TLS here. Workers in native-concurrent mode
         // run freely with no preemptive yield points. Installing PREEMPT_CTX
         // would cause maybe_yield_preemptive() to call PreemptRing::yield_token(),
