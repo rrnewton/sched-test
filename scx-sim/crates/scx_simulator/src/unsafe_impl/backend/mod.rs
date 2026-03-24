@@ -230,7 +230,12 @@ pub(crate) trait PreemptionBackend: Sync {
     fn global_teardown(&self) {}
 
     /// Create per-worker instrumentation state and install preemption TLS.
-    fn worker_setup(&self, ring: &PreemptRing, engine: &EngineRing, worker_id: WorkerId) -> Self::WorkerCtx;
+    fn worker_setup(
+        &self,
+        ring: &PreemptRing,
+        engine: &EngineRing,
+        worker_id: WorkerId,
+    ) -> Self::WorkerCtx;
 
     /// Build the preemption target for this worker, consuming PRNG state
     /// from the ring to maintain deterministic sequencing.
@@ -836,10 +841,7 @@ fn engine_pick_next(
 }
 
 /// Pick the first worker to start (by min local clock).
-fn pick_first_by_min_clock(
-    cpu_ids: &[CpuId],
-    state_send: &SendPtr<SimulatorState>,
-) -> WorkerId {
+fn pick_first_by_min_clock(cpu_ids: &[CpuId], state_send: &SendPtr<SimulatorState>) -> WorkerId {
     let state = unsafe { &*state_send.0 };
     pick_by_min_clock(
         cpu_ids.iter().enumerate().map(|(i, &cpu)| {
