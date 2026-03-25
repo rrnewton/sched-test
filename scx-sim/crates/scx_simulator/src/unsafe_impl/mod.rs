@@ -24,10 +24,12 @@
 //! | `sim_task` | `SimTask` runtime type: raw `task_struct` allocation, FFI field access, deallocation |
 //! | `task_wrapper` | Raw `task_struct` pointer wrapping, unsafe field accessors |
 //! | `worker_pool` | Persistent worker thread pool with futex-based park/wake protocol |
+//! | `dispatch_pool` | Production dispatch via persistent threads (wraps `worker_pool`) |
 
 pub mod backend;
 pub mod cgroup_ffi;
 pub mod cgroup_wrapper;
+pub mod dispatch_pool;
 pub mod engine_ring;
 pub mod ffi;
 pub mod interleave;
