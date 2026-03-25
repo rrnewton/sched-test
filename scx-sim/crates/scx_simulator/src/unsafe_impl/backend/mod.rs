@@ -299,7 +299,11 @@ pub(crate) trait PreemptionBackend: Sync {
 ///
 /// Shared by [`run_preemptive_dispatch`] and [`run_preemptive_batch`] to
 /// avoid duplicating the `build_target` + `arm` sequence.
-fn build_and_arm<B: PreemptionBackend>(backend: &B, ctx: &mut B::WorkerCtx, ring: &PreemptRing) {
+pub(crate) fn build_and_arm<B: PreemptionBackend>(
+    backend: &B,
+    ctx: &mut B::WorkerCtx,
+    ring: &PreemptRing,
+) {
     if let Some(target) = backend.build_target(ctx, ring) {
         backend.arm(ctx, target);
     }
@@ -823,7 +827,7 @@ pub(crate) fn run_cooperative_batch<S: Scheduler>(
 ///
 /// `state_send.0` must point to a valid `SimulatorState`. The engine
 /// thread has exclusive access when all workers are parked.
-fn engine_pick_next(
+pub(crate) fn engine_pick_next(
     cpu_ids: &[CpuId],
     state_send: &SendPtr<SimulatorState>,
     ring: &EngineRing,
@@ -841,7 +845,10 @@ fn engine_pick_next(
 }
 
 /// Pick the first worker to start (by min local clock).
-fn pick_first_by_min_clock(cpu_ids: &[CpuId], state_send: &SendPtr<SimulatorState>) -> WorkerId {
+pub(crate) fn pick_first_by_min_clock(
+    cpu_ids: &[CpuId],
+    state_send: &SendPtr<SimulatorState>,
+) -> WorkerId {
     let state = unsafe { &*state_send.0 };
     pick_by_min_clock(
         cpu_ids.iter().enumerate().map(|(i, &cpu)| {
