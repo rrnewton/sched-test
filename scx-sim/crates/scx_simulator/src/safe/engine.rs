@@ -775,6 +775,11 @@ fn flush_staged_events(state: &mut SimulatorState, events: &mut EventQueue) {
 /// The main simulator.
 pub struct Simulator<S: Scheduler> {
     scheduler: SchedulerWrapper<S>,
+    /// Persistent thread pool for concurrent dispatch/batch rounds.
+    /// Created lazily in `run_internal` when interleaving is enabled.
+    /// Workers are reused across rounds within a single simulation run,
+    /// eliminating per-round `clone3` + `perf_event_open` overhead.
+    dispatch_pool: std::cell::RefCell<Option<crate::dispatch_pool::DispatchPool>>,
 }
 
 /// Result of a simulation, keeping task storage alive for post-simulation
@@ -1224,6 +1229,7 @@ impl<S: Scheduler> Simulator<S> {
     pub fn new(scheduler: S) -> Self {
         Simulator {
             scheduler: SchedulerWrapper::new(scheduler),
+            dispatch_pool: std::cell::RefCell::new(None),
         }
     }
 
@@ -1875,6 +1881,15 @@ impl<S: Scheduler> Simulator<S> {
         let interleave_enabled =
             s.sim.interleave || s.sim.preemptive.is_some() || s.sim.native_concurrent.is_some();
 
+        // Create persistent dispatch pool when interleaving is enabled.
+        // Workers are spawned once and reused across all dispatch/batch
+        // rounds, eliminating per-round clone3 + perf_event_open overhead.
+        if interleave_enabled {
+            let nr_cpus = s.sim.cpus.len();
+            *self.dispatch_pool.borrow_mut() =
+                Some(crate::dispatch_pool::DispatchPool::new(nr_cpus, &sim_arc));
+        }
+
         // Drop the outer guard before entering the event loop.
         // The event loop manages its own guard lifecycle.
         drop(s);
@@ -1932,6 +1947,10 @@ impl<S: Scheduler> Simulator<S> {
                 }
             }
         }
+
+        // Shut down the persistent dispatch pool before final cleanup.
+        // Workers must be joined before the sim_arc is dropped.
+        *self.dispatch_pool.borrow_mut() = None;
 
         // Flush running tasks: emit SimulationEnd for any task still on-CPU.
         // The guard `s` may or may not be held depending on loop exit path.
@@ -3776,6 +3795,8 @@ impl<S: Scheduler> Simulator<S> {
         if is_native {
             // Native concurrent: all workers run freely in parallel with
             // no PMU, no signals, no token ring serialisation.
+            // Not pooled: native mode doesn't benefit from persistent threads
+            // (no PMU setup overhead).
             use crate::backend::native::{NativeOrchestrator, NullBackend};
             let ring = crate::preempt::PreemptRing::new(dispatch_cpus.len(), interleave_seed);
             let orchestrator = NativeOrchestrator::new(dispatch_cpus.len());
@@ -3791,7 +3812,7 @@ impl<S: Scheduler> Simulator<S> {
         } else if let Some(ref preemptive_cfg) = preemptive_cfg {
             if let Some(ref backend) = e9_replay_backend {
                 // E9patch replay: deterministic, no retry needed.
-                crate::backend::run_preemptive_dispatch(
+                self.dispatch_preemptive_pooled_or_scoped(
                     &dispatch_cpus,
                     &state_send,
                     &sched_send,
@@ -3801,6 +3822,9 @@ impl<S: Scheduler> Simulator<S> {
                 );
             } else if let Some(ref backend) = replay_backend {
                 assert!(backend.is_precise(), "replay requires a precise backend");
+                // Replay with retry: always uses scoped threads (retry
+                // resets state and re-runs, which doesn't work with pooled
+                // threads that retain TLS from the previous attempt).
                 crate::backend::replay_dispatch_with_retry(
                     &dispatch_cpus,
                     &state_send,
@@ -3815,7 +3839,7 @@ impl<S: Scheduler> Simulator<S> {
                     timeslice_max: preemptive_cfg.timeslice_max,
                     fns: e9_fns.expect("e9_fns must be resolved"),
                 };
-                crate::backend::run_preemptive_dispatch(
+                self.dispatch_preemptive_pooled_or_scoped(
                     &dispatch_cpus,
                     &state_send,
                     &sched_send,
@@ -3830,7 +3854,7 @@ impl<S: Scheduler> Simulator<S> {
                     cooperative_only: preemptive_cfg.cooperative_only,
                     break_on: preemptive_cfg.break_on,
                 };
-                crate::backend::run_preemptive_dispatch(
+                self.dispatch_preemptive_pooled_or_scoped(
                     &dispatch_cpus,
                     &state_send,
                     &sched_send,
@@ -3840,7 +3864,7 @@ impl<S: Scheduler> Simulator<S> {
                 );
             }
         } else {
-            crate::backend::run_cooperative_dispatch(
+            self.dispatch_cooperative_pooled_or_scoped(
                 &dispatch_cpus,
                 &state_send,
                 &sched_send,
@@ -3894,6 +3918,145 @@ impl<S: Scheduler> Simulator<S> {
             let s = &mut *guard;
             flush_staged_events(&mut s.sim, &mut s.events);
         }
+    }
+
+    /// Run cooperative dispatch using the persistent pool or scoped threads.
+    fn dispatch_cooperative_pooled_or_scoped(
+        &self,
+        dispatch_cpus: &[CpuId],
+        state_send: &SendPtr<SimulatorState>,
+        sched_send: &SendPtr<SchedulerWrapper<S>>,
+        sim_arc: &SimArc,
+        seed: u32,
+    ) {
+        let use_pool = {
+            let pool_ref = self.dispatch_pool.borrow();
+            pool_ref
+                .as_ref()
+                .is_some_and(|p| dispatch_cpus.len() <= p.max_workers())
+        };
+        if use_pool {
+            let pool_ref = self.dispatch_pool.borrow();
+            let pool = pool_ref.as_ref().expect("pool checked above");
+            crate::dispatch_pool::run_cooperative_dispatch_pooled(
+                pool,
+                dispatch_cpus,
+                state_send,
+                sched_send,
+                sim_arc,
+            );
+        } else {
+            crate::backend::run_cooperative_dispatch(
+                dispatch_cpus,
+                state_send,
+                sched_send,
+                sim_arc,
+                seed,
+            );
+        }
+    }
+
+    /// Run preemptive dispatch using the persistent pool or scoped threads.
+    fn dispatch_preemptive_pooled_or_scoped<B: PreemptionBackend>(
+        &self,
+        dispatch_cpus: &[CpuId],
+        state_send: &SendPtr<SimulatorState>,
+        sched_send: &SendPtr<SchedulerWrapper<S>>,
+        sim_arc: &SimArc,
+        seed: u32,
+        backend: &B,
+    ) {
+        // Preemptive pool disabled: signal handler + perf event TLS
+        // requires per-round thread identity, which persistent threads
+        // don't guarantee across backend.worker_setup/worker_teardown
+        // cycles. Fall back to scoped threads for correctness.
+        crate::backend::run_preemptive_dispatch(
+            dispatch_cpus,
+            state_send,
+            sched_send,
+            sim_arc,
+            seed,
+            backend,
+        );
+    }
+
+    /// Run cooperative batch using the persistent pool or scoped threads.
+    #[allow(clippy::too_many_arguments)]
+    fn batch_cooperative_pooled_or_scoped(
+        &self,
+        per_cpu: &HashMap<CpuId, Vec<Event>>,
+        cpu_ids: &[CpuId],
+        sim_send: &SendPtr<Simulator<S>>,
+        state_send: &SendPtr<SimulatorState>,
+        sim_arc: &SimArc,
+        seed: u32,
+        watchdog_timeout: Option<TimeNs>,
+        duration_ns: TimeNs,
+        max_cgroups: u32,
+    ) {
+        let use_pool = {
+            let pool_ref = self.dispatch_pool.borrow();
+            pool_ref
+                .as_ref()
+                .is_some_and(|p| cpu_ids.len() <= p.max_workers())
+        };
+        if use_pool {
+            let pool_ref = self.dispatch_pool.borrow();
+            let pool = pool_ref.as_ref().expect("pool checked above");
+            crate::dispatch_pool::run_cooperative_batch_pooled(
+                pool,
+                per_cpu,
+                cpu_ids,
+                sim_send,
+                state_send,
+                sim_arc,
+                watchdog_timeout,
+                duration_ns,
+                max_cgroups,
+            );
+        } else {
+            crate::backend::run_cooperative_batch(
+                per_cpu,
+                cpu_ids,
+                sim_send,
+                state_send,
+                sim_arc,
+                seed,
+                watchdog_timeout,
+                duration_ns,
+                max_cgroups,
+            );
+        }
+    }
+
+    /// Run preemptive batch using the persistent pool or scoped threads.
+    #[allow(clippy::too_many_arguments)]
+    fn batch_preemptive_pooled_or_scoped<B: PreemptionBackend>(
+        &self,
+        per_cpu: &HashMap<CpuId, Vec<Event>>,
+        cpu_ids: &[CpuId],
+        sim_send: &SendPtr<Simulator<S>>,
+        state_send: &SendPtr<SimulatorState>,
+        sim_arc: &SimArc,
+        seed: u32,
+        watchdog_timeout: Option<TimeNs>,
+        duration_ns: TimeNs,
+        max_cgroups: u32,
+        backend: &B,
+    ) {
+        // Preemptive pool disabled: see dispatch_preemptive_pooled_or_scoped.
+        crate::backend::run_preemptive_batch(
+            per_cpu,
+            cpu_ids,
+            sim_send,
+            state_send,
+            sim_arc,
+            seed,
+            watchdog_timeout,
+            duration_ns,
+            max_cgroups,
+            backend,
+        );
     }
 
     /// Process events using the dynamic concurrency window.
@@ -4145,6 +4308,7 @@ impl<S: Scheduler> Simulator<S> {
         if is_native {
             // Native concurrent: all workers run freely in parallel with
             // no PMU, no signals, no token ring serialisation.
+            // Not pooled: native mode doesn't benefit from persistent threads.
             use crate::backend::native::{NativeOrchestrator, NullBackend};
             let ring = crate::preempt::PreemptRing::new(cpu_ids.len(), interleave_seed);
             let orchestrator = NativeOrchestrator::new(cpu_ids.len());
@@ -4164,7 +4328,7 @@ impl<S: Scheduler> Simulator<S> {
         } else if let Some(ref preemptive_cfg) = preemptive_cfg {
             if let Some(ref backend) = e9_replay_backend {
                 // E9patch replay: deterministic, no retry needed.
-                crate::backend::run_preemptive_batch(
+                self.batch_preemptive_pooled_or_scoped(
                     &per_cpu,
                     &cpu_ids,
                     &sim_send,
@@ -4177,7 +4341,7 @@ impl<S: Scheduler> Simulator<S> {
                     backend,
                 );
             } else if let Some(ref backend) = replay_backend {
-                crate::backend::run_preemptive_batch(
+                self.batch_preemptive_pooled_or_scoped(
                     &per_cpu,
                     &cpu_ids,
                     &sim_send,
@@ -4195,7 +4359,7 @@ impl<S: Scheduler> Simulator<S> {
                     timeslice_max: preemptive_cfg.timeslice_max,
                     fns: e9_fns.expect("e9_fns must be resolved"),
                 };
-                crate::backend::run_preemptive_batch(
+                self.batch_preemptive_pooled_or_scoped(
                     &per_cpu,
                     &cpu_ids,
                     &sim_send,
@@ -4214,7 +4378,7 @@ impl<S: Scheduler> Simulator<S> {
                     cooperative_only: preemptive_cfg.cooperative_only,
                     break_on: preemptive_cfg.break_on,
                 };
-                crate::backend::run_preemptive_batch(
+                self.batch_preemptive_pooled_or_scoped(
                     &per_cpu,
                     &cpu_ids,
                     &sim_send,
@@ -4228,7 +4392,7 @@ impl<S: Scheduler> Simulator<S> {
                 );
             }
         } else {
-            crate::backend::run_cooperative_batch(
+            self.batch_cooperative_pooled_or_scoped(
                 &per_cpu,
                 &cpu_ids,
                 &sim_send,

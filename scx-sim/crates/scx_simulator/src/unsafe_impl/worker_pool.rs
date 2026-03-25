@@ -150,6 +150,19 @@ impl CompletionStatus {
 // WorkDesc — per-worker work description
 // ---------------------------------------------------------------------------
 
+/// Type-erased per-round work function.
+///
+/// Called by persistent worker threads each round. The context pointer
+/// carries round-specific state (EngineRing, SimulatorState, etc.)
+/// cast to `*const ()`. Workers cast it back to the concrete type.
+///
+/// # Safety
+///
+/// The caller must ensure `ctx` points to valid data for the duration
+/// of the function call. The pointed-to data must match the concrete
+/// type expected by this function.
+pub type RoundFn = unsafe fn(WorkerId, *const ());
+
 /// Describes the work a worker should perform in one round.
 ///
 /// Written by the engine before issuing a command, read by the worker
@@ -162,6 +175,14 @@ pub struct WorkDesc {
     /// command (Dispatch vs Batch). The engine sets this before waking
     /// the worker; the worker reads it after being woken.
     pub payload: u64,
+    /// Type-erased work function for this round. Set by the engine before
+    /// waking the worker. `None` means the worker should use the default
+    /// `work_fn` from pool creation.
+    pub round_fn: Option<RoundFn>,
+    /// Context pointer passed to `round_fn`. Valid only while the worker
+    /// is executing (the engine ensures the pointed-to data outlives the
+    /// round).
+    pub round_ctx: *const (),
 }
 
 impl Default for WorkDesc {
@@ -169,13 +190,16 @@ impl Default for WorkDesc {
         Self {
             cpu: WorkerId(0),
             payload: 0,
+            round_fn: None,
+            round_ctx: std::ptr::null(),
         }
     }
 }
 
-// SAFETY: WorkDesc contains only Copy types. Access is synchronized by the
-// command futex: engine writes before storing the command, worker reads after
-// loading the command.
+// SAFETY: WorkDesc fields are synchronized by the command futex: engine
+// writes before storing the command, worker reads after loading the command.
+// The raw pointer (`round_ctx`) is only dereferenced on the worker thread
+// while the engine-provided data is alive (guaranteed by the protocol).
 unsafe impl Send for WorkDesc {}
 unsafe impl Sync for WorkDesc {}
 
@@ -365,6 +389,46 @@ impl WorkerPool {
         }
     }
 
+    /// Wake the first `count` workers with the given command.
+    ///
+    /// Unlike [`run_round`](Self::run_round), this does NOT wait for
+    /// completion. The caller must call [`wait_workers_complete`] after
+    /// performing any engine-side work (e.g. running an engine loop).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `count` exceeds the pool size.
+    pub fn wake_workers(&self, count: usize, cmd: WorkerCommand) {
+        assert!(
+            count <= self.total,
+            "wake_workers: count ({count}) exceeds pool size ({})",
+            self.total
+        );
+        for i in 0..count {
+            self.issue_command(WorkerId(i), cmd);
+        }
+    }
+
+    /// Wait for the first `count` workers to complete and re-park.
+    ///
+    /// Must be called after [`wake_workers`](Self::wake_workers) to
+    /// collect completions.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `count` exceeds the pool size.
+    pub fn wait_workers_complete(&self, count: usize) {
+        assert!(
+            count <= self.total,
+            "wait_workers_complete: count ({count}) exceeds pool size ({})",
+            self.total
+        );
+        for i in 0..count {
+            self.wait_for_completion(WorkerId(i));
+            self.wait_idle(WorkerId(i));
+        }
+    }
+
     /// Shut down all workers and join their threads.
     ///
     /// Workers receive the `Shutdown` command, exit their loops, and the
@@ -449,7 +513,16 @@ fn worker_loop<W>(
         // The SeqCst command store provides happens-before.
         let desc = unsafe { &*(*work_descs.add(worker_id.0)).get() };
 
-        work_fn(worker_id, cmd, desc);
+        // If the work desc carries a round-specific function, call it.
+        // Otherwise fall back to the pool-level work_fn.
+        if let Some(round_fn) = desc.round_fn {
+            // SAFETY: round_ctx was set by the engine and points to valid
+            // data for the duration of this round (engine waits for
+            // completion before dropping the context).
+            unsafe { round_fn(worker_id, desc.round_ctx) };
+        } else {
+            work_fn(worker_id, cmd, desc);
+        }
 
         // Signal completion, then reset command to Idle so the engine
         // knows we're parked and can safely write the next work desc.
@@ -668,6 +741,8 @@ mod tests {
                 WorkDesc {
                     cpu: WorkerId(i),
                     payload: (i as u64 + 1) * 10,
+                    round_fn: None,
+                    round_ctx: std::ptr::null(),
                 },
             );
         }
