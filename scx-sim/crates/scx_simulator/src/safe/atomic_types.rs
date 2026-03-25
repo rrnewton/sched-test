@@ -150,9 +150,9 @@ pub(crate) enum EngineWakeState {
 /// Atomic wrapper for [`EngineWakeState`]. Controls the engine's futex-based
 /// sleep/wake protocol. All operations use SeqCst and are async-signal-safe.
 ///
-/// The futex-based blocking methods (`wake`, `wait_until_woken`,
-/// `futex_wait_sleeping`) live in `engine_ring.rs` and access the inner
-/// `AtomicU32` via [`inner()`](Self::inner).
+/// The futex-based blocking methods (`wake`, `futex_wait_sleeping`) live in
+/// `engine_ring.rs` and access the inner `AtomicU32` via
+/// [`inner()`](Self::inner).
 #[repr(transparent)]
 pub(crate) struct AtomicEngineWake(AtomicU32);
 
@@ -161,18 +161,18 @@ impl AtomicEngineWake {
         Self(AtomicU32::new(EngineWakeState::Sleeping as u32))
     }
 
-    pub(crate) fn set_sleeping(&self) {
-        self.0.store(EngineWakeState::Sleeping as u32, SeqCst);
-    }
-
-    pub(crate) fn is_woken(&self) -> bool {
-        self.0.load(SeqCst) == EngineWakeState::Woken as u32
-    }
-
-    /// Set state to sleeping (no futex syscall -- just the store).
-    /// The caller in `engine_ring.rs` follows up with a futex_wait if needed.
-    pub(crate) fn sleep_and_wait(&self) {
-        self.set_sleeping();
+    /// Atomically set Sleeping and return the previous state.
+    ///
+    /// This is the standard edge-triggered wakeup pattern: the caller
+    /// checks the returned old value to detect pending wakes that arrived
+    /// between the last processing and this call.
+    pub(crate) fn swap_sleeping(&self) -> EngineWakeState {
+        let old = self.0.swap(EngineWakeState::Sleeping as u32, SeqCst);
+        match old {
+            x if x == EngineWakeState::Sleeping as u32 => EngineWakeState::Sleeping,
+            x if x == EngineWakeState::Woken as u32 => EngineWakeState::Woken,
+            _ => panic!("AtomicEngineWake: invalid state {old}"),
+        }
     }
 
     /// Access the underlying `AtomicU32` for futex operations in
@@ -312,15 +312,20 @@ mod tests {
     }
 
     #[test]
-    fn test_atomic_engine_wake_transitions() {
+    fn test_atomic_engine_wake_swap_sleeping() {
         let wake = AtomicEngineWake::new_sleeping();
-        assert!(!wake.is_woken());
 
+        // Swap from Sleeping -> Sleeping returns Sleeping.
+        assert_eq!(wake.swap_sleeping(), EngineWakeState::Sleeping);
+
+        // Simulate a worker wake signal.
         wake.inner().store(EngineWakeState::Woken as u32, SeqCst);
-        assert!(wake.is_woken());
 
-        wake.set_sleeping();
-        assert!(!wake.is_woken());
+        // Swap from Woken -> Sleeping returns Woken (consumed the signal).
+        assert_eq!(wake.swap_sleeping(), EngineWakeState::Woken);
+
+        // Second swap without intervening wake returns Sleeping.
+        assert_eq!(wake.swap_sleeping(), EngineWakeState::Sleeping);
     }
 
     #[test]
