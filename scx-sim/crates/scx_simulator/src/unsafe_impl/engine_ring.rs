@@ -130,18 +130,8 @@ impl AtomicEngineWake {
         futex_wake(self.inner(), 1);
     }
 
-    /// Block until the engine is woken by a worker.
-    pub(crate) fn wait_until_woken(&self) {
-        loop {
-            if self.is_woken() {
-                break;
-            }
-            futex_wait(self.inner(), EngineWakeState::Sleeping as u32);
-        }
-    }
-
-    /// Futex-wait on the underlying word (used after `sleep_and_wait` with
-    /// a re-check between the store and the wait).
+    /// Block until the engine_wake word changes from Sleeping.
+    /// Only call after `swap_sleeping()` returned `Sleeping`.
     pub(crate) fn futex_wait_sleeping(&self) {
         futex_wait(self.inner(), EngineWakeState::Sleeping as u32);
     }
@@ -309,28 +299,30 @@ impl EngineRing {
         F: FnMut(WorkerId, YieldReason) -> Option<WorkerId>,
     {
         loop {
-            // Park the engine until a worker yields.
-            self.engine_wake.set_sleeping();
-            self.engine_wake.wait_until_woken();
+            // Atomically swap to Sleeping and check old value.
+            // If old was Woken, a worker already signaled -- skip the wait.
+            let old = self.engine_wake.swap_sleeping();
+            if old == EngineWakeState::Sleeping {
+                // No pending signal. Wait for a worker to wake us.
+                self.engine_wake.futex_wait_sleeping();
+                // Spurious wakeup possible -- re-check at top of loop.
+                continue;
+            }
 
-            // Read yield info published by the worker.
+            // old == Woken: a worker yielded. Read the yield info.
             let yielded = self.yielded_worker.load();
             let reason = self.yield_reason.load();
 
-            // Check if everyone is done.
             if self.all_done() {
                 break;
             }
 
-            // Ask the engine for the next worker to run.
             match on_yield(yielded, reason) {
                 Some(next) => {
                     self.workers[next.0].set_running();
                     self.workers[next.0].futex_wake_one();
                 }
-                None => {
-                    break;
-                }
+                None => break,
             }
         }
     }
@@ -355,12 +347,12 @@ impl crate::backend::ThreadOrchestrator for EngineRing {
             if self.finished_mask() == self.full_mask() {
                 break;
             }
-            // Wait on engine_wake as a proxy -- workers wake this on yield.
-            self.engine_wake.sleep_and_wait();
-            if self.finished_mask() == self.full_mask() {
-                break;
+            // Atomically swap to Sleeping; if a worker already signaled
+            // (Woken), re-check the mask immediately without blocking.
+            let old = self.engine_wake.swap_sleeping();
+            if old == EngineWakeState::Sleeping {
+                self.engine_wake.futex_wait_sleeping();
             }
-            self.engine_wake.futex_wait_sleeping();
         }
     }
 
