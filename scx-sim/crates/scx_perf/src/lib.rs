@@ -117,6 +117,7 @@ struct CpuIdInfo {
 
 impl CpuIdInfo {
     /// Query CPUID to get vendor string and full family ID.
+    #[allow(unused_unsafe)] // __cpuid became safe in Rust 1.91+
     fn detect() -> Self {
         // CPUID leaf 0: vendor string in EBX:EDX:ECX
         let leaf0 = unsafe { std::arch::x86_64::__cpuid(0) };
