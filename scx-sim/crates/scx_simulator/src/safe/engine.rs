@@ -3966,9 +3966,9 @@ impl<S: Scheduler> Simulator<S> {
         seed: u32,
         backend: &B,
     ) {
-        // Preemptive pool disabled: signal handler + perf event TLS
-        // requires per-round thread identity, which persistent threads
-        // don't guarantee across backend.worker_setup/worker_teardown
+        // TODO(sim-b431b6): Preemptive pool disabled — signal handler +
+        // perf event TLS requires per-round thread identity, which persistent
+        // threads don't guarantee across backend.worker_setup/worker_teardown
         // cycles. Fall back to scoped threads for correctness.
         crate::backend::run_preemptive_dispatch(
             dispatch_cpus,
