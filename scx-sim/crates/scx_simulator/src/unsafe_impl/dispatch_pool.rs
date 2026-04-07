@@ -25,22 +25,20 @@
 //! `wait_workers_complete`. The EngineRing protocol ensures only one
 //! worker accesses shared state at a time.
 
-use std::collections::HashMap;
-
 use tracing::debug;
 
 use crate::backend::{
     build_and_arm, clear_ops_and_finish, drain_structop_accum, engine_pick_next,
     pick_first_by_min_clock, PreemptionBackend, SendPtr, StructopDelta,
 };
-use crate::engine::{batch_worker_body, dispatch_worker_body, Simulator};
+use crate::engine::dispatch_worker_body;
 use crate::engine_ring::{EngineRing, YieldReason};
 use crate::ffi::Scheduler;
 use crate::interleave::{self, WorkerId};
 use crate::kfuncs::{self, SimArc, SimulatorState};
 use crate::preempt::PreemptRing;
 use crate::scheduler_wrapper::SchedulerWrapper;
-use crate::types::{CpuId, TimeNs};
+use crate::types::CpuId;
 use crate::worker_pool::{WorkDesc, WorkerCommand, WorkerPool};
 
 // ---------------------------------------------------------------------------
@@ -240,122 +238,6 @@ pub(crate) fn run_cooperative_dispatch_pooled<S: Scheduler>(
 }
 
 // ---------------------------------------------------------------------------
-// Cooperative batch via DispatchPool
-// ---------------------------------------------------------------------------
-
-/// Per-round context for cooperative batch.
-struct CoopBatchCtx {
-    ring: *const EngineRing,
-    sp: *mut SimulatorState,
-    /// Type-erased simulator pointer (*const Simulator<S>).
-    sim: *const (),
-    sim_arc: *const SimArc,
-    cpus: *const CpuId,
-    /// Per-CPU event lists. Workers index by CPU to get their events.
-    per_cpu: *const HashMap<CpuId, Vec<crate::engine::Event>>,
-    watchdog_timeout: Option<TimeNs>,
-    duration_ns: TimeNs,
-    max_cgroups: u32,
-}
-
-unsafe impl Send for CoopBatchCtx {}
-unsafe impl Sync for CoopBatchCtx {}
-
-/// Type-erased cooperative batch worker body.
-///
-/// # Safety
-///
-/// Same invariants as [`coop_dispatch_worker`].
-unsafe fn coop_batch_worker<S: Scheduler>(worker_id: WorkerId, ctx_ptr: *const ()) {
-    let ctx = &*(ctx_ptr as *const CoopBatchCtx);
-    let ring = &*ctx.ring;
-    let sp = ctx.sp;
-    let simp = ctx.sim as *const Simulator<S>;
-    let sim_arc = &*ctx.sim_arc;
-    let cpu = *ctx.cpus.add(worker_id.0);
-    let cpu_events = (*ctx.per_cpu).get(&cpu).cloned().unwrap_or_default();
-
-    kfuncs::install_sim_arc(sim_arc);
-    interleave::install_engine_ring(ring, worker_id);
-    ring.wait_for_token(worker_id);
-
-    kfuncs::enter_sim(&mut *sp, cpu);
-    batch_worker_body(
-        &*simp,
-        sim_arc,
-        cpu_events,
-        ctx.watchdog_timeout,
-        ctx.duration_ns,
-        ctx.max_cgroups,
-    );
-
-    let delta = StructopDelta {
-        rbc_total: 0,
-        interleave_count: crate::preempt::structop_info().interleave_count,
-    };
-    drain_structop_accum(sp, cpu, &delta);
-    clear_ops_and_finish(sp, ring, worker_id);
-    interleave::uninstall();
-}
-
-/// Run cooperative batch using a persistent [`DispatchPool`].
-/// Uses the pool's persistent [`EngineRing`] (reset between rounds).
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn run_cooperative_batch_pooled<S: Scheduler>(
-    pool: &DispatchPool,
-    per_cpu: &HashMap<CpuId, Vec<crate::engine::Event>>,
-    cpu_ids: &[CpuId],
-    sim_send: &SendPtr<Simulator<S>>,
-    state_send: &SendPtr<SimulatorState>,
-    sim_arc: &SimArc,
-    seed: u32,
-    watchdog_timeout: Option<TimeNs>,
-    duration_ns: TimeNs,
-    max_cgroups: u32,
-) {
-    let nr = cpu_ids.len();
-    pool.reset_rings(seed);
-    let ring = pool.engine_ring();
-
-    let ctx = CoopBatchCtx {
-        ring,
-        sp: state_send.0,
-        sim: sim_send.0 as *const (),
-        sim_arc,
-        cpus: cpu_ids.as_ptr(),
-        per_cpu,
-        watchdog_timeout,
-        duration_ns,
-        max_cgroups,
-    };
-
-    for i in 0..nr {
-        pool.pool.set_work_desc(
-            WorkerId(i),
-            WorkDesc {
-                cpu: WorkerId(i),
-                payload: 0,
-                round_fn: Some(coop_batch_worker::<S>),
-                round_ctx: &ctx as *const CoopBatchCtx as *const (),
-            },
-        );
-    }
-
-    pool.pool.wake_workers(nr, WorkerCommand::Batch);
-
-    let first = pick_first_by_min_clock(cpu_ids, state_send);
-    ring.start_first_worker(first);
-    ring.engine_loop(|_yielded, reason| {
-        if reason == YieldReason::Finished {
-            return engine_pick_next(cpu_ids, state_send, ring);
-        }
-        engine_pick_next(cpu_ids, state_send, ring)
-    });
-
-    pool.pool.wait_workers_complete(nr);
-}
-
-// ---------------------------------------------------------------------------
 // Preemptive dispatch via DispatchPool
 // ---------------------------------------------------------------------------
 
@@ -465,141 +347,6 @@ pub(crate) fn run_preemptive_dispatch_pooled<S: Scheduler, B: PreemptionBackend>
             return engine_pick_next(dispatch_cpus, state_send, engine);
         }
         engine_pick_next(dispatch_cpus, state_send, engine)
-    });
-
-    pool.pool.wait_workers_complete(nr);
-
-    backend.log_completion(ring);
-    backend.global_teardown();
-}
-
-// ---------------------------------------------------------------------------
-// Preemptive batch via DispatchPool
-// ---------------------------------------------------------------------------
-
-/// Per-round context for preemptive batch.
-#[allow(dead_code)]
-struct PreemptBatchCtx {
-    ring: *const PreemptRing,
-    engine: *const EngineRing,
-    sp: *mut SimulatorState,
-    /// Type-erased simulator pointer (*const Simulator<S>).
-    sim: *const (),
-    sim_arc: *const SimArc,
-    cpus: *const CpuId,
-    per_cpu: *const HashMap<CpuId, Vec<crate::engine::Event>>,
-    backend: *const (),
-    watchdog_timeout: Option<TimeNs>,
-    duration_ns: TimeNs,
-    max_cgroups: u32,
-}
-
-unsafe impl Send for PreemptBatchCtx {}
-unsafe impl Sync for PreemptBatchCtx {}
-
-/// Type-erased preemptive batch worker body.
-///
-/// # Safety
-///
-/// Same invariants as [`preempt_dispatch_worker`].
-#[allow(dead_code)]
-unsafe fn preempt_batch_worker<S: Scheduler, B: PreemptionBackend>(
-    worker_id: WorkerId,
-    ctx_ptr: *const (),
-) {
-    let ctx = &*(ctx_ptr as *const PreemptBatchCtx);
-    let ring = &*ctx.ring;
-    let engine = &*ctx.engine;
-    let sp = ctx.sp;
-    let simp = ctx.sim as *const Simulator<S>;
-    let sim_arc = &*ctx.sim_arc;
-    let cpu = *ctx.cpus.add(worker_id.0);
-    let backend = &*(ctx.backend as *const B);
-    let cpu_events = (*ctx.per_cpu).get(&cpu).cloned().unwrap_or_default();
-
-    kfuncs::install_sim_arc(sim_arc);
-
-    let mut bctx = backend.worker_setup(ring, engine, worker_id);
-    engine.wait_for_token(worker_id);
-
-    kfuncs::enter_sim(&mut *sp, cpu);
-    build_and_arm(backend, &mut bctx, ring);
-
-    batch_worker_body(
-        &*simp,
-        sim_arc,
-        cpu_events,
-        ctx.watchdog_timeout,
-        ctx.duration_ns,
-        ctx.max_cgroups,
-    );
-
-    let delta = backend.disarm(&mut bctx);
-    drain_structop_accum(sp, cpu, &delta);
-    clear_ops_and_finish(sp, engine, worker_id);
-    backend.worker_teardown(bctx);
-}
-
-/// Run preemptive batch using a persistent [`DispatchPool`].
-/// Uses the pool's persistent [`EngineRing`] and [`PreemptRing`]
-/// (reset between rounds).
-#[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
-pub(crate) fn run_preemptive_batch_pooled<S: Scheduler, B: PreemptionBackend>(
-    pool: &DispatchPool,
-    per_cpu: &HashMap<CpuId, Vec<crate::engine::Event>>,
-    cpu_ids: &[CpuId],
-    sim_send: &SendPtr<Simulator<S>>,
-    state_send: &SendPtr<SimulatorState>,
-    sim_arc: &SimArc,
-    seed: u32,
-    watchdog_timeout: Option<TimeNs>,
-    duration_ns: TimeNs,
-    max_cgroups: u32,
-    backend: &B,
-) {
-    let nr = cpu_ids.len();
-    pool.reset_rings(seed);
-    let ring = pool.preempt_ring();
-    let engine = pool.engine_ring();
-
-    backend.global_setup();
-
-    let ctx = PreemptBatchCtx {
-        ring,
-        engine,
-        sp: state_send.0,
-        sim: sim_send.0 as *const (),
-        sim_arc,
-        cpus: cpu_ids.as_ptr(),
-        per_cpu,
-        backend: backend as *const B as *const (),
-        watchdog_timeout,
-        duration_ns,
-        max_cgroups,
-    };
-
-    for i in 0..nr {
-        pool.pool.set_work_desc(
-            WorkerId(i),
-            WorkDesc {
-                cpu: WorkerId(i),
-                payload: 0,
-                round_fn: Some(preempt_batch_worker::<S, B>),
-                round_ctx: &ctx as *const PreemptBatchCtx as *const (),
-            },
-        );
-    }
-
-    pool.pool.wake_workers(nr, WorkerCommand::Batch);
-
-    let first = pick_first_by_min_clock(cpu_ids, state_send);
-    engine.start_first_worker(first);
-    engine.engine_loop(|_yielded, reason| {
-        if reason == YieldReason::Finished {
-            return engine_pick_next(cpu_ids, state_send, engine);
-        }
-        engine_pick_next(cpu_ids, state_send, engine)
     });
 
     pool.pool.wait_workers_complete(nr);

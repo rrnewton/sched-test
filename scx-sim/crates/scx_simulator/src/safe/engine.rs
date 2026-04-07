@@ -4,7 +4,7 @@
 //! clock, CPU/task state, and drives the scheduler through its ops callbacks.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, HashMap};
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
@@ -512,7 +512,6 @@ impl EventQueue {
     }
 
     /// Pop the next event (earliest timestamp, then lowest tiebreaker).
-    #[allow(dead_code)]
     pub(crate) fn pop(&mut self) -> Option<Event> {
         self.heap.pop().map(|Reverse(e)| e)
     }
@@ -520,56 +519,6 @@ impl EventQueue {
     /// Peek at the next event's timestamp without removing it.
     pub(crate) fn peek_time(&self) -> Option<TimeNs> {
         self.heap.peek().map(|Reverse(e)| e.time_ns)
-    }
-
-    /// Pop all events at exactly timestamp `t`.
-    ///
-    /// Returns events in priority order (lowest `seq` first).
-    pub(crate) fn drain_at(&mut self, t: TimeNs) -> Vec<Event> {
-        let mut batch = Vec::new();
-        while let Some(Reverse(e)) = self.heap.peek() {
-            if e.time_ns != t {
-                break;
-            }
-            batch.push(self.heap.pop().unwrap().0);
-        }
-        batch
-    }
-
-    /// Pop per-CPU events whose timestamps fall within the dynamic
-    /// concurrency window `[0, deadline]`, but only for CPUs not already
-    /// in `active_cpus`. Global events (no CPU) are left in the queue.
-    ///
-    /// Returns the newly-discovered events, sorted by (time, seq).
-    fn drain_concurrent_window(
-        &mut self,
-        deadline: TimeNs,
-        active_cpus: &std::collections::HashSet<CpuId>,
-    ) -> Vec<Event> {
-        let mut discovered = Vec::new();
-        // We need to pop and re-push events we don't want. Collect
-        // candidates in one pass.
-        let mut reinsert = Vec::new();
-        while let Some(Reverse(e)) = self.heap.peek() {
-            if e.time_ns > deadline {
-                break;
-            }
-            let event = self.heap.pop().unwrap().0;
-            match event.kind.cpu() {
-                Some(cpu) if !active_cpus.contains(&cpu) => {
-                    discovered.push(event);
-                }
-                _ => {
-                    // Global event or CPU already active: put back.
-                    reinsert.push(event);
-                }
-            }
-        }
-        // Re-insert events we didn't take.
-        for event in reinsert {
-            self.heap.push(Reverse(event));
-        }
-        discovered
     }
 }
 
@@ -696,52 +645,6 @@ pub(crate) enum EventKind {
     /// Consumes logical time (`ipi_delivery_ns`), modeling the
     /// inter-processor interrupt latency between the source and target CPU.
     KickDelivered { cpu: CpuId, flags: KickFlags },
-}
-
-impl EventKind {
-    /// Return the CPU this event is associated with, or `None` for global events.
-    ///
-    /// Per-CPU events (ticks, slice expiry, phase completion, hotplug, task
-    /// wakes, timer fired, etc.) are eligible for concurrent batch processing
-    /// when multiple CPUs have events at the same timestamp. Global events
-    /// (cgroup operations) are processed sequentially first.
-    fn cpu(&self) -> Option<CpuId> {
-        match self {
-            EventKind::Tick { cpu }
-            | EventKind::SliceExpired { cpu }
-            | EventKind::TaskPhaseComplete { cpu }
-            | EventKind::CpuOffline { cpu }
-            | EventKind::CpuOnline { cpu }
-            | EventKind::CpuRelease { cpu }
-            | EventKind::CpuAcquire { cpu }
-            | EventKind::IrqStart { cpu, .. }
-            | EventKind::IrqEnd { cpu }
-            | EventKind::TaskWake { cpu, .. }
-            | EventKind::DsqConsume { cpu }
-            | EventKind::StartRunning { cpu, .. }
-            | EventKind::KickDelivered { cpu, .. }
-            | EventKind::TimerFired { cpu }
-            | EventKind::CgroupMigrate { cpu, .. }
-            | EventKind::CgroupCreate { cpu, .. }
-            | EventKind::CgroupDestroy { cpu, .. }
-            | EventKind::CgroupCpusetChange { cpu, .. } => Some(*cpu),
-        }
-    }
-}
-
-/// Partition a batch of same-timestamp events into global (no CPU) and
-/// per-CPU buckets. Global events should be processed sequentially first;
-/// per-CPU events on distinct CPUs can be processed concurrently.
-fn group_events_by_cpu(batch: Vec<Event>) -> (Vec<Event>, HashMap<CpuId, Vec<Event>>) {
-    let mut global = Vec::new();
-    let mut per_cpu: HashMap<CpuId, Vec<Event>> = HashMap::new();
-    for event in batch {
-        match event.kind.cpu() {
-            Some(cpu) => per_cpu.entry(cpu).or_default().push(event),
-            None => global.push(event),
-        }
-    }
-    (global, per_cpu)
 }
 
 /// Flush staged events from `SimulatorState` into the event queue.
@@ -1132,30 +1035,6 @@ pub(crate) fn dispatch_worker_body<S: Scheduler>(
     sim.resolve_pending_dispatch(cpu);
 }
 
-/// Core batch worker body shared by cooperative and preemptive
-/// concurrent batch processing paths.
-///
-/// Processes all events for a single CPU sequentially.
-pub(crate) fn batch_worker_body<S: Scheduler>(
-    sim: &Simulator<S>,
-    sim_arc: &SimArc,
-    cpu_events: Vec<Event>,
-    watchdog_timeout: Option<TimeNs>,
-    duration_ns: TimeNs,
-    max_cgroups: u32,
-) {
-    for event in cpu_events {
-        sim.process_event(
-            event,
-            sim_arc,
-            watchdog_timeout,
-            duration_ns,
-            max_cgroups,
-            &mut NoopMonitor,
-        );
-    }
-}
-
 /// Drop the MutexGuard, install SIM_ARC, call scheduler code, then reacquire.
 ///
 /// Takes `$s` (the `&mut SimState` deref of `$guard`) and shadows it to
@@ -1406,8 +1285,8 @@ impl<S: Scheduler> Simulator<S> {
             // invisible — those paths use per-thread `measure_counter`
             // instances instead. Sequential callbacks (global events,
             // single-CPU batches) still run on the main thread and benefit
-            // from this counter. `process_batch_concurrent` temporarily takes
-            // the counter out of state during concurrent processing to prevent
+            // from this counter. Concurrent processing temporarily takes
+            // the counter out of state to prevent
             // worker threads from accessing a main-thread-only PMU fd.
             perf::try_create_rbc_counter()
         } else {
@@ -1915,46 +1794,27 @@ impl<S: Scheduler> Simulator<S> {
             }
             s.sim.clock = t;
 
-            if interleave_enabled {
-                // Dynamic concurrency window: start with same-timestamp
-                // events, then expand as CPU clocks advance.
-                drop(s);
-                if let Some(err) = self.process_dynamic_window(
-                    t,
-                    &sim_arc,
-                    watchdog_timeout,
-                    scenario.duration_ns,
-                    max_cgroups,
-                    ignore_bpf_errors,
-                    monitor,
-                ) {
+            // Pop one event at a time and process it. Interleaving happens
+            // naturally via dispatch_concurrent inside process_event when
+            // multiple CPUs become idle — no explicit batching needed.
+            let event = s.events.pop().expect("peek succeeded but pop failed");
+            drop(s);
+            if let Some(err) = self.process_event(
+                event,
+                &sim_arc,
+                watchdog_timeout,
+                scenario.duration_ns,
+                max_cgroups,
+                monitor,
+            ) {
+                exit_kind = err;
+                break 'event_loop;
+            }
+            {
+                let mut s = sim_arc.lock().unwrap();
+                if let Some(err) = check_bpf_error(&mut s.sim, ignore_bpf_errors) {
                     exit_kind = err;
                     break 'event_loop;
-                }
-            } else {
-                // No interleaving: process all events sequentially in
-                // original priority order (preserves backward-compatible
-                // determinism).
-                let batch = s.events.drain_at(t);
-                for event in batch {
-                    drop(s);
-                    if let Some(err) = self.process_event(
-                        event,
-                        &sim_arc,
-                        watchdog_timeout,
-                        scenario.duration_ns,
-                        max_cgroups,
-                        monitor,
-                    ) {
-                        exit_kind = err;
-                        break 'event_loop;
-                    }
-                    s = sim_arc.lock().unwrap();
-                    if let Some(err) = check_bpf_error(&mut s.sim, ignore_bpf_errors) {
-                        exit_kind = err;
-                        drop(s);
-                        break 'event_loop;
-                    }
                 }
             }
         }
@@ -3176,7 +3036,7 @@ impl<S: Scheduler> Simulator<S> {
                 .collect();
 
             // Guard: suppress nested dispatch_concurrent when already
-            // inside a concurrent batch (process_batch_concurrent).
+            // inside a concurrent batch.
             let use_concurrent = (s.sim.interleave
                 || s.sim.preemptive.is_some()
                 || s.sim.native_concurrent.is_some())
@@ -3996,458 +3856,6 @@ impl<S: Scheduler> Simulator<S> {
             seed,
             backend,
         );
-    }
-
-    /// Run cooperative batch using the persistent pool or scoped threads.
-    #[allow(clippy::too_many_arguments)]
-    fn batch_cooperative_pooled_or_scoped(
-        &self,
-        per_cpu: &HashMap<CpuId, Vec<Event>>,
-        cpu_ids: &[CpuId],
-        sim_send: &SendPtr<Simulator<S>>,
-        state_send: &SendPtr<SimulatorState>,
-        sim_arc: &SimArc,
-        seed: u32,
-        watchdog_timeout: Option<TimeNs>,
-        duration_ns: TimeNs,
-        max_cgroups: u32,
-    ) {
-        let use_pool = {
-            let pool_ref = self.dispatch_pool.borrow();
-            pool_ref
-                .as_ref()
-                .is_some_and(|p| cpu_ids.len() <= p.max_workers())
-        };
-        if use_pool {
-            let pool_ref = self.dispatch_pool.borrow();
-            let pool = pool_ref.as_ref().expect("pool checked above");
-            crate::dispatch_pool::run_cooperative_batch_pooled(
-                pool,
-                per_cpu,
-                cpu_ids,
-                sim_send,
-                state_send,
-                sim_arc,
-                seed,
-                watchdog_timeout,
-                duration_ns,
-                max_cgroups,
-            );
-        } else {
-            crate::backend::run_cooperative_batch(
-                per_cpu,
-                cpu_ids,
-                sim_send,
-                state_send,
-                sim_arc,
-                seed,
-                watchdog_timeout,
-                duration_ns,
-                max_cgroups,
-            );
-        }
-    }
-
-    /// Run preemptive batch using the persistent pool or scoped threads.
-    #[allow(clippy::too_many_arguments)]
-    fn batch_preemptive_pooled_or_scoped<B: PreemptionBackend>(
-        &self,
-        per_cpu: &HashMap<CpuId, Vec<Event>>,
-        cpu_ids: &[CpuId],
-        sim_send: &SendPtr<Simulator<S>>,
-        state_send: &SendPtr<SimulatorState>,
-        sim_arc: &SimArc,
-        seed: u32,
-        watchdog_timeout: Option<TimeNs>,
-        duration_ns: TimeNs,
-        max_cgroups: u32,
-        backend: &B,
-    ) {
-        // Preemptive pool disabled: see dispatch_preemptive_pooled_or_scoped.
-        crate::backend::run_preemptive_batch(
-            per_cpu,
-            cpu_ids,
-            sim_send,
-            state_send,
-            sim_arc,
-            seed,
-            watchdog_timeout,
-            duration_ns,
-            max_cgroups,
-            backend,
-        );
-    }
-
-    /// Process events using the dynamic concurrency window.
-    ///
-    /// Starts with all events at timestamp `t`, partitions them into global
-    /// (sequential) and per-CPU (concurrent), processes each group, then
-    /// checks whether CPU clock advancement exposed new events that should
-    /// be processed concurrently. Repeats until no more events fall within
-    /// the expanded window.
-    ///
-    /// The window grows organically: as structops execute, `charge_sched_time`
-    /// advances CPU local clocks. Events on other CPUs whose timestamps fall
-    /// within `[t, max_local_clock]` are pulled into successive concurrent
-    /// batches, modeling the kernel's overlapping execution on different CPUs.
-    ///
-    /// Returns `Some(ExitKind)` on error, `None` on success.
-    #[allow(clippy::too_many_arguments)]
-    fn process_dynamic_window(
-        &self,
-        t: TimeNs,
-        sim_arc: &SimArc,
-        watchdog_timeout: Option<TimeNs>,
-        duration_ns: TimeNs,
-        max_cgroups: u32,
-        ignore_bpf_errors: bool,
-        monitor: &mut dyn Monitor,
-    ) -> Option<ExitKind> {
-        let mut guard = sim_arc.lock().unwrap();
-        let s = &mut *guard;
-        // Start with all events at the initial timestamp.
-        let batch = s.events.drain_at(t);
-
-        // Partition into global (sequential) and per-CPU (concurrent).
-        let (global, mut per_cpu) = group_events_by_cpu(batch);
-
-        // 1. Global events: always processed sequentially first.
-        drop(guard);
-        if let Some(err) = self.process_events_sequential(
-            global,
-            sim_arc,
-            watchdog_timeout,
-            duration_ns,
-            max_cgroups,
-            ignore_bpf_errors,
-            monitor,
-        ) {
-            return Some(err);
-        }
-        guard = sim_arc.lock().unwrap();
-
-        // 2. Per-CPU events: concurrent if 2+ CPUs, with dynamic window
-        //    expansion after each batch.
-        loop {
-            if per_cpu.len() >= 2 {
-                drop(guard);
-                self.process_batch_concurrent(
-                    per_cpu,
-                    sim_arc,
-                    watchdog_timeout,
-                    duration_ns,
-                    max_cgroups,
-                    monitor,
-                );
-                guard = sim_arc.lock().unwrap();
-            } else if !per_cpu.is_empty() {
-                // Single CPU: sequential processing.
-                let mut events_flat: Vec<Event> = per_cpu.into_values().flatten().collect();
-                events_flat.sort();
-                drop(guard);
-                if let Some(err) = self.process_events_sequential(
-                    events_flat,
-                    sim_arc,
-                    watchdog_timeout,
-                    duration_ns,
-                    max_cgroups,
-                    ignore_bpf_errors,
-                    monitor,
-                ) {
-                    return Some(err);
-                }
-                guard = sim_arc.lock().unwrap();
-            }
-            let s = &mut *guard;
-
-            // Dynamic window expansion: check if CPU clocks advanced
-            // past any pending events on uninvolved CPUs.
-            let max_clock = s.sim.cpus.iter().map(|c| c.local_clock).max().unwrap_or(t);
-
-            if max_clock <= t {
-                // No clock advancement beyond the initial timestamp.
-                break;
-            }
-
-            // Don't pull events past the simulation duration.
-            let deadline = max_clock.min(duration_ns);
-
-            // Collect events within the expanded window.
-            let active_cpus: HashSet<CpuId> = HashSet::new();
-            let newly_discovered = s.events.drain_concurrent_window(deadline, &active_cpus);
-
-            if newly_discovered.is_empty() {
-                break;
-            }
-
-            trace!(
-                discovered = newly_discovered.len(),
-                max_clock,
-                "dynamic window: discovered concurrent events"
-            );
-
-            // Partition newly discovered events.
-            let (new_global, new_per_cpu) = group_events_by_cpu(newly_discovered);
-
-            // Process any global events sequentially first.
-            drop(guard);
-            if let Some(err) = self.process_events_sequential(
-                new_global,
-                sim_arc,
-                watchdog_timeout,
-                duration_ns,
-                max_cgroups,
-                ignore_bpf_errors,
-                monitor,
-            ) {
-                return Some(err);
-            }
-            guard = sim_arc.lock().unwrap();
-
-            // Continue the loop with the new per-CPU events.
-            per_cpu = new_per_cpu;
-            if per_cpu.is_empty() {
-                break;
-            }
-        }
-
-        None
-    }
-
-    /// Process a list of events sequentially, checking for errors after each.
-    ///
-    /// Returns `Some(ExitKind)` on the first error, `None` if all succeed.
-    #[allow(clippy::too_many_arguments)]
-    fn process_events_sequential(
-        &self,
-        events_list: Vec<Event>,
-        sim_arc: &SimArc,
-        watchdog_timeout: Option<TimeNs>,
-        duration_ns: TimeNs,
-        max_cgroups: u32,
-        ignore_bpf_errors: bool,
-        monitor: &mut dyn Monitor,
-    ) -> Option<ExitKind> {
-        let mut guard = sim_arc.lock().unwrap();
-        for event in events_list {
-            drop(guard);
-            if let Some(err) = self.process_event(
-                event,
-                sim_arc,
-                watchdog_timeout,
-                duration_ns,
-                max_cgroups,
-                monitor,
-            ) {
-                return Some(err);
-            }
-            guard = sim_arc.lock().unwrap();
-            let s = &mut *guard;
-            if let Some(err) = check_bpf_error(&mut s.sim, ignore_bpf_errors) {
-                return Some(err);
-            }
-        }
-        None
-    }
-
-    /// Process per-CPU events at the same timestamp concurrently.
-    ///
-    /// Each CPU's events are handled on a separate OS thread, interleaved
-    /// at kfunc boundaries via token passing. This models the real kernel
-    /// where scheduler callbacks on different CPUs race with each other
-    /// (e.g., tick on CPU 0 racing with dispatch on CPU 1).
-    ///
-    /// During the concurrent phase, kicked CPUs are staged as
-    /// `KickDelivered` events via `staged_events` and flushed into the
-    /// event queue after all workers complete.
-    #[allow(clippy::too_many_arguments)]
-    fn process_batch_concurrent(
-        &self,
-        per_cpu: HashMap<CpuId, Vec<Event>>,
-        sim_arc: &SimArc,
-        watchdog_timeout: Option<TimeNs>,
-        duration_ns: TimeNs,
-        max_cgroups: u32,
-        monitor: &mut dyn Monitor,
-    ) {
-        let mut guard = sim_arc.lock().unwrap();
-        let mut cpu_ids: Vec<CpuId> = per_cpu.keys().copied().collect();
-        cpu_ids.sort(); // deterministic worker-to-CPU assignment
-        let nr_workers = cpu_ids.len();
-
-        // Single CPU: no interleaving benefit, process sequentially.
-        if nr_workers < 2 {
-            let mut flat: Vec<Event> = per_cpu.into_values().flatten().collect();
-            flat.sort();
-            for event in flat {
-                drop(guard);
-                self.process_event(
-                    event,
-                    sim_arc,
-                    watchdog_timeout,
-                    duration_ns,
-                    max_cgroups,
-                    monitor,
-                );
-                guard = sim_arc.lock().unwrap();
-            }
-            return;
-        }
-
-        // Temporarily remove the main-thread RBC counter so worker threads
-        // (which access state via raw pointers) don't touch a PMU fd bound
-        // to the main thread. Workers have their own per-thread measurement
-        // counters. Restored after the concurrent block returns.
-        let main_rbc_counter = guard.sim.rbc_counter.take();
-        // Clear the cached fd so worker threads don't accidentally
-        // enable/disable the main-thread counter.
-        kfuncs::set_rbc_counter_fd(-1);
-
-        // Advance each CPU's clock before spawning.
-        for &cpu in &cpu_ids {
-            guard.sim.advance_cpu_clock(cpu);
-        }
-
-        let interleave_seed = guard.sim.next_prng();
-
-        // SAFETY: token passing ensures only one thread accesses shared
-        // state at a time. Raw pointers avoid Send/Sync bounds on types
-        // that are effectively single-threaded under the token.
-        let sim_send = SendPtr::from_ref(self);
-        let state_send = SendPtr::from_mut(&mut guard.sim);
-
-        // Save conditions before dropping guard (workers lock sim_arc internally)
-        let is_native = guard.sim.native_concurrent.is_some();
-        let preemptive_cfg = guard.sim.preemptive.clone();
-        let replay_backend = guard.sim.replay_backend.take();
-        let e9_replay_backend = guard.sim.e9_replay_backend.take();
-        let e9_fns = guard.sim.e9_fns;
-        drop(guard);
-
-        if is_native {
-            // Native concurrent: all workers run freely in parallel with
-            // no PMU, no signals, no token ring serialisation.
-            // Not pooled: native mode doesn't benefit from persistent threads.
-            use crate::backend::native::{NativeOrchestrator, NullBackend};
-            let ring = crate::preempt::PreemptRing::new(cpu_ids.len(), interleave_seed);
-            let orchestrator = NativeOrchestrator::new(cpu_ids.len());
-            crate::backend::run_batch_with_orchestrator(
-                &per_cpu,
-                &cpu_ids,
-                &sim_send,
-                &state_send,
-                sim_arc,
-                &ring,
-                &orchestrator,
-                watchdog_timeout,
-                duration_ns,
-                max_cgroups,
-                &NullBackend,
-            );
-        } else if let Some(ref preemptive_cfg) = preemptive_cfg {
-            if let Some(ref backend) = e9_replay_backend {
-                // E9patch replay: deterministic, no retry needed.
-                self.batch_preemptive_pooled_or_scoped(
-                    &per_cpu,
-                    &cpu_ids,
-                    &sim_send,
-                    &state_send,
-                    sim_arc,
-                    interleave_seed,
-                    watchdog_timeout,
-                    duration_ns,
-                    max_cgroups,
-                    backend,
-                );
-            } else if let Some(ref backend) = replay_backend {
-                self.batch_preemptive_pooled_or_scoped(
-                    &per_cpu,
-                    &cpu_ids,
-                    &sim_send,
-                    &state_send,
-                    sim_arc,
-                    interleave_seed,
-                    watchdog_timeout,
-                    duration_ns,
-                    max_cgroups,
-                    backend,
-                );
-            } else if preemptive_cfg.preempt_mode == PreemptMode::E9patch {
-                let backend = E9PatchBackend {
-                    timeslice_min: preemptive_cfg.timeslice_min,
-                    timeslice_max: preemptive_cfg.timeslice_max,
-                    fns: e9_fns.expect("e9_fns must be resolved"),
-                };
-                self.batch_preemptive_pooled_or_scoped(
-                    &per_cpu,
-                    &cpu_ids,
-                    &sim_send,
-                    &state_send,
-                    sim_arc,
-                    interleave_seed,
-                    watchdog_timeout,
-                    duration_ns,
-                    max_cgroups,
-                    &backend,
-                );
-            } else {
-                let backend = PmuBackend {
-                    timeslice_min: preemptive_cfg.timeslice_min,
-                    timeslice_max: preemptive_cfg.timeslice_max,
-                    cooperative_only: preemptive_cfg.cooperative_only,
-                    break_on: preemptive_cfg.break_on,
-                };
-                self.batch_preemptive_pooled_or_scoped(
-                    &per_cpu,
-                    &cpu_ids,
-                    &sim_send,
-                    &state_send,
-                    sim_arc,
-                    interleave_seed,
-                    watchdog_timeout,
-                    duration_ns,
-                    max_cgroups,
-                    &backend,
-                );
-            }
-        } else {
-            self.batch_cooperative_pooled_or_scoped(
-                &per_cpu,
-                &cpu_ids,
-                &sim_send,
-                &state_send,
-                sim_arc,
-                interleave_seed,
-                watchdog_timeout,
-                duration_ns,
-                max_cgroups,
-            );
-
-            debug!(
-                workers = cpu_ids.len(),
-                "batch-concurrent cooperative: complete"
-            );
-        }
-
-        // Relock after concurrent block
-        guard = sim_arc.lock().unwrap();
-        // Restore replay backends if they were temporarily removed.
-        if replay_backend.is_some() {
-            guard.sim.replay_backend = replay_backend;
-        }
-        if e9_replay_backend.is_some() {
-            guard.sim.e9_replay_backend = e9_replay_backend;
-        }
-        let s = &mut *guard;
-        s.sim.rbc_counter = main_rbc_counter;
-        // Restore the cached fd so start_rbc() / charge_sched_time()
-        // can use the lock-free enable/disable path again.
-        if let Some(ref rbc) = s.sim.rbc_counter {
-            kfuncs::set_rbc_counter_fd(rbc.raw_fd());
-        }
-
-        // Flush staged events from the concurrent batch.
-        flush_staged_events(&mut s.sim, &mut s.events);
     }
 
     /// Handle a `DsqConsume` event: consume from global DSQ into local DSQ.
