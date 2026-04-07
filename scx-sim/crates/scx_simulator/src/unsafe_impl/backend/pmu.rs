@@ -166,6 +166,24 @@ impl PreemptionBackend for PmuBackend {
         // timer + measure_counter dropped here — closes the perf fds
     }
 
+    fn worker_initial_setup(
+        &self,
+        ring: &PreemptRing,
+        engine: &EngineRing,
+        worker_id: WorkerId,
+    ) -> PmuWorkerCtx {
+        // Identical to worker_setup for PMU: open fds, install TLS.
+        // The split lifecycle means this runs once at pool creation
+        // rather than once per round.
+        self.worker_setup(ring, engine, worker_id)
+    }
+
+    fn worker_final_teardown(&self, ctx: PmuWorkerCtx) {
+        // Identical to worker_teardown: uninstall TLS, close fds.
+        // Runs once at pool shutdown rather than once per round.
+        self.worker_teardown(ctx);
+    }
+
     fn log_completion(&self, ring: &PreemptRing) {
         debug!(
             signal_preemptions = ring.signal_preemptions(),
