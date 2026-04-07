@@ -275,6 +275,15 @@ impl PreemptionRecordStore {
         Some(seq)
     }
 
+    /// Reset the record store for reuse (not signal-safe).
+    ///
+    /// Zeros the count so new records overwrite old slots. The underlying
+    /// `AtomicU64` array is not cleared — stale data is harmless because
+    /// `drain()` only reads up to `count`.
+    pub(crate) fn reset(&self) {
+        self.count.store(0, SeqCst);
+    }
+
     /// Retrieve all records (not signal-safe, call after simulation).
     pub(crate) fn drain(&self) -> Vec<PreemptionRecord> {
         let count = self.count.load(SeqCst).min(MAX_PREEMPTION_RECORDS);
@@ -1202,6 +1211,22 @@ impl PreemptRing {
     /// Total number of workers.
     pub fn total(&self) -> usize {
         self.total
+    }
+
+    /// Reset the ring for reuse in a new round.
+    ///
+    /// Reseeds the PRNG and clears all counters and records. The ring can
+    /// then be reused for another dispatch/batch round without reallocation
+    /// (avoids the 426 KB `PreemptionRecordStore` allocation per round).
+    ///
+    /// # Safety contract
+    ///
+    /// All workers must be parked (not executing) when this is called.
+    pub fn reset(&self, seed: u32) {
+        self.timeslice.reseed(seed);
+        self.signal_preempt_count.store(0, SeqCst);
+        self.cooperative_yield_count.store(0, SeqCst);
+        self.preemption_records.reset();
     }
 }
 

@@ -58,6 +58,11 @@ impl TimeslicePrng {
         }
         min + (self.next() as u64) % (range + 1)
     }
+
+    /// Re-seed the PRNG for a new round (0 is promoted to 1).
+    pub fn reseed(&self, seed: u32) {
+        self.state.store(if seed == 0 { 1 } else { seed }, SeqCst);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -120,6 +125,11 @@ impl AtomicWorkerState {
         self.0.store(WorkerState::Parked as u32, SeqCst);
     }
 
+    /// Alias for [`park`](Self::park) — used by `EngineRing::reset()`.
+    pub(crate) fn set_parked(&self) {
+        self.park();
+    }
+
     pub(crate) fn set_running(&self) {
         self.0.store(WorkerState::Running as u32, SeqCst);
     }
@@ -161,6 +171,11 @@ impl AtomicEngineWake {
         Self(AtomicU32::new(EngineWakeState::Sleeping as u32))
     }
 
+    /// Reset to sleeping state — used by `EngineRing::reset()`.
+    pub(crate) fn reset_sleeping(&self) {
+        self.0.store(EngineWakeState::Sleeping as u32, SeqCst);
+    }
+
     /// Atomically set Sleeping and return the previous state.
     ///
     /// This is the standard edge-triggered wakeup pattern: the caller
@@ -197,6 +212,11 @@ impl AtomicYieldReason {
         Self(AtomicU32::new(0))
     }
 
+    /// Reset to initial state — used by `EngineRing::reset()`.
+    pub(crate) fn reset(&self) {
+        self.0.store(0, SeqCst);
+    }
+
     pub(crate) fn store(&self, reason: YieldReason) {
         self.0.store(reason as u32, SeqCst);
     }
@@ -227,6 +247,11 @@ impl AtomicYieldedWorker {
         Self(AtomicU32::new(NO_WORKER))
     }
 
+    /// Reset to initial state — used by `EngineRing::reset()`.
+    pub(crate) fn reset(&self) {
+        self.0.store(NO_WORKER, SeqCst);
+    }
+
     pub(crate) fn store(&self, worker: WorkerId) {
         self.0.store(worker.0 as u32, SeqCst);
     }
@@ -248,6 +273,11 @@ pub(crate) struct AtomicFinishedMask(AtomicU64);
 impl AtomicFinishedMask {
     pub(crate) fn new() -> Self {
         Self(AtomicU64::new(0))
+    }
+
+    /// Reset to initial state (no workers finished) — used by `EngineRing::reset()`.
+    pub(crate) fn reset(&self) {
+        self.0.store(0, SeqCst);
     }
 
     /// Atomically set the bit for the given worker.

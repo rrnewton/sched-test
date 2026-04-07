@@ -1884,10 +1884,21 @@ impl<S: Scheduler> Simulator<S> {
         // Create persistent dispatch pool when interleaving is enabled.
         // Workers are spawned once and reused across all dispatch/batch
         // rounds, eliminating per-round clone3 + perf_event_open overhead.
+        //
+        // When preemptive mode is active, install the signal handler once
+        // here (at simulation start) instead of per-round. The handler
+        // persists until the pool is dropped at simulation end.
+        let preemptive_at_start = s.sim.preemptive.is_some();
         if interleave_enabled {
             let nr_cpus = s.sim.cpus.len();
-            *self.dispatch_pool.borrow_mut() =
-                Some(crate::dispatch_pool::DispatchPool::new(nr_cpus, &sim_arc));
+            let cpu_ids: Vec<crate::types::CpuId> =
+                (0..nr_cpus as u32).map(crate::types::CpuId).collect();
+            if preemptive_at_start {
+                crate::preempt::install_signal_handler();
+            }
+            *self.dispatch_pool.borrow_mut() = Some(crate::dispatch_pool::DispatchPool::new(
+                nr_cpus, &sim_arc, &cpu_ids, 0,
+            ));
         }
 
         // Drop the outer guard before entering the event loop.
@@ -1951,6 +1962,12 @@ impl<S: Scheduler> Simulator<S> {
         // Shut down the persistent dispatch pool before final cleanup.
         // Workers must be joined before the sim_arc is dropped.
         *self.dispatch_pool.borrow_mut() = None;
+
+        // Uninstall the signal handler after pool shutdown. This must happen
+        // after all worker threads are joined to avoid stray SIGSTKFLT.
+        if preemptive_at_start {
+            crate::preempt::uninstall_signal_handler();
+        }
 
         // Flush running tasks: emit SimulationEnd for any task still on-CPU.
         // The guard `s` may or may not be held depending on loop exit path.
@@ -3944,6 +3961,7 @@ impl<S: Scheduler> Simulator<S> {
                 state_send,
                 sched_send,
                 sim_arc,
+                seed,
             );
         } else {
             crate::backend::run_cooperative_dispatch(
@@ -4010,6 +4028,7 @@ impl<S: Scheduler> Simulator<S> {
                 sim_send,
                 state_send,
                 sim_arc,
+                seed,
                 watchdog_timeout,
                 duration_ns,
                 max_cgroups,

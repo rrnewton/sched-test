@@ -194,6 +194,26 @@ impl EngineRing {
         self.total
     }
 
+    /// Reset the ring for reuse in a new round.
+    ///
+    /// Resets all per-worker state, engine wake, yield info, and finished
+    /// mask to their initial values. The ring can then be used for another
+    /// dispatch/batch round without reallocation.
+    ///
+    /// # Safety contract
+    ///
+    /// All workers must be parked (not executing) when this is called.
+    /// The engine thread calls this between rounds.
+    pub fn reset(&self) {
+        for w in self.workers.iter() {
+            w.set_parked();
+        }
+        self.engine_wake.reset_sleeping();
+        self.yielded_worker.reset();
+        self.yield_reason.reset();
+        self.finished_mask.reset();
+    }
+
     /// Current finished bitmask (one bit per worker).
     pub fn finished_mask(&self) -> u64 {
         self.finished_mask.load()
@@ -581,6 +601,65 @@ mod tests {
             ring.engine_loop(|_yielded, _reason| None);
         });
 
+        assert!(ring.all_done());
+    }
+
+    #[test]
+    fn test_reset_allows_reuse() {
+        let ring = EngineRing::new(&[CpuId(0), CpuId(1)]);
+
+        // Round 1: run two workers to completion.
+        std::thread::scope(|s| {
+            let ring_ref = &ring;
+            for i in 0..2 {
+                s.spawn(move || {
+                    ring_ref.wait_for_token(WorkerId(i));
+                    ring_ref.finish_worker(WorkerId(i));
+                });
+            }
+            ring.start_first_worker(WorkerId(0));
+            ring.engine_loop(|_yielded, reason| {
+                if reason == YieldReason::Finished {
+                    let mask = ring.finished_mask();
+                    for i in 0..ring.total() {
+                        if mask & (1u64 << i) == 0 {
+                            return Some(WorkerId(i));
+                        }
+                    }
+                    return None;
+                }
+                None
+            });
+        });
+        assert!(ring.all_done());
+
+        // Reset and run Round 2.
+        ring.reset();
+        assert!(!ring.all_done());
+        assert_eq!(ring.finished_mask(), 0);
+
+        std::thread::scope(|s| {
+            let ring_ref = &ring;
+            for i in 0..2 {
+                s.spawn(move || {
+                    ring_ref.wait_for_token(WorkerId(i));
+                    ring_ref.finish_worker(WorkerId(i));
+                });
+            }
+            ring.start_first_worker(WorkerId(1));
+            ring.engine_loop(|_yielded, reason| {
+                if reason == YieldReason::Finished {
+                    let mask = ring.finished_mask();
+                    for i in 0..ring.total() {
+                        if mask & (1u64 << i) == 0 {
+                            return Some(WorkerId(i));
+                        }
+                    }
+                    return None;
+                }
+                None
+            });
+        });
         assert!(ring.all_done());
     }
 }
