@@ -202,7 +202,7 @@ pub struct PreemptTarget {
 /// points, ensuring consistent structop accounting, ops_context clearing,
 /// and token ring protocol across all backends.
 ///
-/// # Lifecycle (per worker)
+/// # Lifecycle (per worker, per-round — legacy `thread::scope` path)
 ///
 /// 1. [`worker_setup`] — create instrumentation state, install TLS
 /// 2. `ring.wait_for_token(worker_id)` — acquire execution token
@@ -213,11 +213,30 @@ pub struct PreemptTarget {
 /// 7. Common: drain structop, clear ops_context, finish, exit_sim
 /// 8. [`worker_teardown`] — uninstall TLS, close fds
 ///
+/// # Persistent worker lifecycle (split TLS, `DispatchPool` path)
+///
+/// At simulation start:
+/// 1. [`global_setup`] — install signal handler (once)
+/// 2. [`worker_initial_setup`] — open PMU fds, install TLS (once per thread)
+///
+/// Per round:
+/// 3. [`round_reconfigure`] — cheap ioctl-only reconfiguration
+/// 4. [`build_target`] + [`arm`] — construct and apply preemption target
+/// 5. Worker body runs
+/// 6. [`disarm`] — disable instrumentation, return accounting deltas
+///
+/// At simulation end:
+/// 7. [`worker_final_teardown`] — uninstall TLS, close fds (once per thread)
+/// 8. [`global_teardown`] — uninstall signal handler (once)
+///
 /// [`worker_setup`]: PreemptionBackend::worker_setup
 /// [`build_target`]: PreemptionBackend::build_target
 /// [`arm`]: PreemptionBackend::arm
 /// [`disarm`]: PreemptionBackend::disarm
 /// [`worker_teardown`]: PreemptionBackend::worker_teardown
+/// [`worker_initial_setup`]: PreemptionBackend::worker_initial_setup
+/// [`round_reconfigure`]: PreemptionBackend::round_reconfigure
+/// [`worker_final_teardown`]: PreemptionBackend::worker_final_teardown
 pub(crate) trait PreemptionBackend: Sync {
     /// Per-worker context created during setup, carried through arm/disarm.
     type WorkerCtx: Send;
@@ -230,12 +249,40 @@ pub(crate) trait PreemptionBackend: Sync {
     fn global_teardown(&self) {}
 
     /// Create per-worker instrumentation state and install preemption TLS.
+    ///
+    /// Legacy per-round path: opens fds, installs TLS, everything at once.
     fn worker_setup(
         &self,
         ring: &PreemptRing,
         engine: &EngineRing,
         worker_id: WorkerId,
     ) -> Self::WorkerCtx;
+
+    /// One-time per-worker setup for persistent threads.
+    ///
+    /// Opens PMU fds, installs signal handler TLS (PREEMPT_CTX),
+    /// installs interleave TLS (INTERLEAVE_CTX). Called once at pool
+    /// creation, not per round.
+    ///
+    /// Default: delegates to [`worker_setup`](Self::worker_setup).
+    #[allow(dead_code)] // Wired up in persistent-worker path (sim-e34b08)
+    fn worker_initial_setup(
+        &self,
+        ring: &PreemptRing,
+        engine: &EngineRing,
+        worker_id: WorkerId,
+    ) -> Self::WorkerCtx {
+        self.worker_setup(ring, engine, worker_id)
+    }
+
+    /// Per-round reconfiguration for persistent workers (cheap, no syscalls).
+    ///
+    /// Resets/re-arms PMU counters via ioctl, updates context pointers.
+    /// Called at the start of each round after `ring.reset()`.
+    ///
+    /// Default: no-op (for backends that don't need per-round reconfiguration).
+    #[allow(dead_code)] // Wired up in persistent-worker path (sim-e34b08)
+    fn round_reconfigure(&self, _ctx: &mut Self::WorkerCtx, _ring: &PreemptRing) {}
 
     /// Build the preemption target for this worker, consuming PRNG state
     /// from the ring to maintain deterministic sequencing.
@@ -257,7 +304,20 @@ pub(crate) trait PreemptionBackend: Sync {
 
     /// Per-worker cleanup: uninstall preemption TLS, close fds.
     /// Called after the worker has released the token and exited sim.
+    ///
+    /// Legacy per-round path: full teardown every round.
     fn worker_teardown(&self, ctx: Self::WorkerCtx);
+
+    /// One-time per-worker teardown for persistent threads.
+    ///
+    /// Uninstalls TLS and closes PMU fds. Called once at pool shutdown,
+    /// not per round.
+    ///
+    /// Default: delegates to [`worker_teardown`](Self::worker_teardown).
+    #[allow(dead_code)] // Wired up in persistent-worker path (sim-e34b08)
+    fn worker_final_teardown(&self, ctx: Self::WorkerCtx) {
+        self.worker_teardown(ctx);
+    }
 
     /// Log the completion summary after all workers finish.
     fn log_completion(&self, ring: &PreemptRing);

@@ -52,16 +52,31 @@ use crate::worker_pool::{WorkDesc, WorkerCommand, WorkerPool};
 /// Created once per simulation run. Reuses threads across all dispatch
 /// and batch rounds, eliminating `clone3` + `perf_event_open` overhead
 /// from per-round `std::thread::scope`.
+///
+/// Owns a persistent [`EngineRing`] and [`PreemptRing`] that are
+/// [`reset()`](EngineRing::reset) between rounds instead of reallocated.
+/// This avoids per-round allocation of the 426 KB `PreemptionRecordStore`
+/// and per-round futex-word arrays.
 pub(crate) struct DispatchPool {
     pool: WorkerPool,
+    /// Persistent engine ring, allocated once for `max_workers` CPUs.
+    engine_ring: EngineRing,
+    /// Persistent preempt ring, allocated once for `max_workers` workers.
+    preempt_ring: PreemptRing,
 }
 
 impl DispatchPool {
     /// Create a pool with `max_workers` persistent threads.
     ///
     /// Workers install `SIM_ARC` once at creation and persist until the
-    /// pool is dropped.
-    pub fn new(max_workers: usize, sim_arc: &SimArc) -> Self {
+    /// pool is dropped. The `cpu_ids` slice maps worker index to CPU ID
+    /// and is used to initialize the persistent `EngineRing`.
+    pub fn new(max_workers: usize, sim_arc: &SimArc, cpu_ids: &[CpuId], seed: u32) -> Self {
+        assert!(
+            cpu_ids.len() == max_workers,
+            "cpu_ids.len() ({}) must equal max_workers ({max_workers})",
+            cpu_ids.len()
+        );
         let sim_arc_clone = sim_arc.clone();
         let pool = WorkerPool::new(
             max_workers,
@@ -73,12 +88,37 @@ impl DispatchPool {
                 // Default work_fn unused; all rounds use WorkDesc.round_fn.
             },
         );
-        DispatchPool { pool }
+        let engine_ring = EngineRing::new(cpu_ids);
+        let preempt_ring = PreemptRing::new(max_workers, seed);
+        DispatchPool {
+            pool,
+            engine_ring,
+            preempt_ring,
+        }
     }
 
     /// Number of worker threads in the pool.
     pub fn max_workers(&self) -> usize {
         self.pool.total()
+    }
+
+    /// Access the persistent engine ring.
+    pub fn engine_ring(&self) -> &EngineRing {
+        &self.engine_ring
+    }
+
+    /// Access the persistent preempt ring.
+    pub fn preempt_ring(&self) -> &PreemptRing {
+        &self.preempt_ring
+    }
+
+    /// Reset both rings for a new round.
+    ///
+    /// Must be called before each dispatch/batch round to clear per-round
+    /// state (finished mask, yield info, PRNG, preemption records).
+    pub fn reset_rings(&self, seed: u32) {
+        self.engine_ring.reset();
+        self.preempt_ring.reset(seed);
     }
 }
 
@@ -150,18 +190,21 @@ unsafe fn coop_dispatch_worker<S: Scheduler>(worker_id: WorkerId, ctx_ptr: *cons
 ///
 /// Replaces [`run_cooperative_dispatch`](crate::backend::run_cooperative_dispatch)
 /// when a pool is available, eliminating per-round thread creation.
+/// Uses the pool's persistent [`EngineRing`] (reset between rounds).
 pub(crate) fn run_cooperative_dispatch_pooled<S: Scheduler>(
     pool: &DispatchPool,
     dispatch_cpus: &[CpuId],
     state_send: &SendPtr<SimulatorState>,
     sched_send: &SendPtr<SchedulerWrapper<S>>,
     sim_arc: &SimArc,
+    seed: u32,
 ) {
     let nr = dispatch_cpus.len();
-    let ring = EngineRing::new(dispatch_cpus);
+    pool.reset_rings(seed);
+    let ring = pool.engine_ring();
 
     let ctx = CoopDispatchCtx {
-        ring: &ring,
+        ring,
         sp: state_send.0,
         sched: sched_send.0 as *const (),
         sim_arc,
@@ -188,9 +231,9 @@ pub(crate) fn run_cooperative_dispatch_pooled<S: Scheduler>(
     ring.start_first_worker(first);
     ring.engine_loop(|_yielded, reason| {
         if reason == YieldReason::Finished {
-            return engine_pick_next(dispatch_cpus, state_send, &ring);
+            return engine_pick_next(dispatch_cpus, state_send, ring);
         }
-        engine_pick_next(dispatch_cpus, state_send, &ring)
+        engine_pick_next(dispatch_cpus, state_send, ring)
     });
 
     pool.pool.wait_workers_complete(nr);
@@ -256,6 +299,7 @@ unsafe fn coop_batch_worker<S: Scheduler>(worker_id: WorkerId, ctx_ptr: *const (
 }
 
 /// Run cooperative batch using a persistent [`DispatchPool`].
+/// Uses the pool's persistent [`EngineRing`] (reset between rounds).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_cooperative_batch_pooled<S: Scheduler>(
     pool: &DispatchPool,
@@ -264,15 +308,17 @@ pub(crate) fn run_cooperative_batch_pooled<S: Scheduler>(
     sim_send: &SendPtr<Simulator<S>>,
     state_send: &SendPtr<SimulatorState>,
     sim_arc: &SimArc,
+    seed: u32,
     watchdog_timeout: Option<TimeNs>,
     duration_ns: TimeNs,
     max_cgroups: u32,
 ) {
     let nr = cpu_ids.len();
-    let ring = EngineRing::new(cpu_ids);
+    pool.reset_rings(seed);
+    let ring = pool.engine_ring();
 
     let ctx = CoopBatchCtx {
-        ring: &ring,
+        ring,
         sp: state_send.0,
         sim: sim_send.0 as *const (),
         sim_arc,
@@ -301,9 +347,9 @@ pub(crate) fn run_cooperative_batch_pooled<S: Scheduler>(
     ring.start_first_worker(first);
     ring.engine_loop(|_yielded, reason| {
         if reason == YieldReason::Finished {
-            return engine_pick_next(cpu_ids, state_send, &ring);
+            return engine_pick_next(cpu_ids, state_send, ring);
         }
-        engine_pick_next(cpu_ids, state_send, &ring)
+        engine_pick_next(cpu_ids, state_send, ring)
     });
 
     pool.pool.wait_workers_complete(nr);
@@ -369,6 +415,8 @@ unsafe fn preempt_dispatch_worker<S: Scheduler, B: PreemptionBackend>(
 }
 
 /// Run preemptive dispatch using a persistent [`DispatchPool`].
+/// Uses the pool's persistent [`EngineRing`] and [`PreemptRing`]
+/// (reset between rounds).
 #[allow(dead_code)]
 pub(crate) fn run_preemptive_dispatch_pooled<S: Scheduler, B: PreemptionBackend>(
     pool: &DispatchPool,
@@ -380,14 +428,15 @@ pub(crate) fn run_preemptive_dispatch_pooled<S: Scheduler, B: PreemptionBackend>
     backend: &B,
 ) {
     let nr = dispatch_cpus.len();
-    let ring = PreemptRing::new(nr, seed);
-    let engine = EngineRing::new(dispatch_cpus);
+    pool.reset_rings(seed);
+    let ring = pool.preempt_ring();
+    let engine = pool.engine_ring();
 
     backend.global_setup();
 
     let ctx = PreemptDispatchCtx {
-        ring: &ring,
-        engine: &engine,
+        ring,
+        engine,
         sp: state_send.0,
         sched: sched_send.0 as *const (),
         sim_arc,
@@ -413,14 +462,14 @@ pub(crate) fn run_preemptive_dispatch_pooled<S: Scheduler, B: PreemptionBackend>
     engine.start_first_worker(first);
     engine.engine_loop(|_yielded, reason| {
         if reason == YieldReason::Finished {
-            return engine_pick_next(dispatch_cpus, state_send, &engine);
+            return engine_pick_next(dispatch_cpus, state_send, engine);
         }
-        engine_pick_next(dispatch_cpus, state_send, &engine)
+        engine_pick_next(dispatch_cpus, state_send, engine)
     });
 
     pool.pool.wait_workers_complete(nr);
 
-    backend.log_completion(&ring);
+    backend.log_completion(ring);
     backend.global_teardown();
 }
 
@@ -492,6 +541,8 @@ unsafe fn preempt_batch_worker<S: Scheduler, B: PreemptionBackend>(
 }
 
 /// Run preemptive batch using a persistent [`DispatchPool`].
+/// Uses the pool's persistent [`EngineRing`] and [`PreemptRing`]
+/// (reset between rounds).
 #[allow(clippy::too_many_arguments)]
 #[allow(dead_code)]
 pub(crate) fn run_preemptive_batch_pooled<S: Scheduler, B: PreemptionBackend>(
@@ -508,14 +559,15 @@ pub(crate) fn run_preemptive_batch_pooled<S: Scheduler, B: PreemptionBackend>(
     backend: &B,
 ) {
     let nr = cpu_ids.len();
-    let ring = PreemptRing::new(nr, seed);
-    let engine = EngineRing::new(cpu_ids);
+    pool.reset_rings(seed);
+    let ring = pool.preempt_ring();
+    let engine = pool.engine_ring();
 
     backend.global_setup();
 
     let ctx = PreemptBatchCtx {
-        ring: &ring,
-        engine: &engine,
+        ring,
+        engine,
         sp: state_send.0,
         sim: sim_send.0 as *const (),
         sim_arc,
@@ -545,14 +597,14 @@ pub(crate) fn run_preemptive_batch_pooled<S: Scheduler, B: PreemptionBackend>(
     engine.start_first_worker(first);
     engine.engine_loop(|_yielded, reason| {
         if reason == YieldReason::Finished {
-            return engine_pick_next(cpu_ids, state_send, &engine);
+            return engine_pick_next(cpu_ids, state_send, engine);
         }
-        engine_pick_next(cpu_ids, state_send, &engine)
+        engine_pick_next(cpu_ids, state_send, engine)
     });
 
     pool.pool.wait_workers_complete(nr);
 
-    backend.log_completion(&ring);
+    backend.log_completion(ring);
     backend.global_teardown();
 }
 
@@ -637,7 +689,8 @@ mod tests {
     #[test]
     fn test_dispatch_pool_creation_and_drop() {
         let sim_arc = test_sim_arc();
-        let pool = DispatchPool::new(4, &sim_arc);
+        let cpu_ids = [CpuId(0), CpuId(1), CpuId(2), CpuId(3)];
+        let pool = DispatchPool::new(4, &sim_arc, &cpu_ids, 42);
         assert_eq!(pool.max_workers(), 4);
         // Drop calls shutdown via WorkerPool::drop.
     }
@@ -655,7 +708,7 @@ mod tests {
             counter.fetch_add(1, SeqCst);
         }
 
-        let pool = DispatchPool::new(3, &sim_arc);
+        let pool = DispatchPool::new(3, &sim_arc, &[CpuId(0), CpuId(1), CpuId(2)], 42);
 
         for i in 0..2 {
             pool.pool.set_work_desc(
@@ -687,7 +740,7 @@ mod tests {
             counter.fetch_add(1, SeqCst);
         }
 
-        let pool = DispatchPool::new(3, &sim_arc);
+        let pool = DispatchPool::new(3, &sim_arc, &[CpuId(0), CpuId(1), CpuId(2)], 42);
         let ctx_ptr = &*counter as *const AtomicUsize as *const ();
 
         // Run 5 rounds with 2 workers each.
