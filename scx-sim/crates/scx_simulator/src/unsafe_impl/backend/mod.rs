@@ -4,8 +4,8 @@
 //! Provides a trait-based abstraction for different preemption backends
 //! (PMU timer, hardware breakpoint replay, e9patch). Each backend
 //! implements [`PreemptionBackend`] to define how workers are instrumented;
-//! the generic [`run_preemptive_dispatch`] and [`run_preemptive_batch`]
-//! drivers handle the common worker lifecycle.
+//! the generic [`run_preemptive_dispatch`] driver handles the common
+//! worker lifecycle.
 //!
 //! # Safety
 //!
@@ -28,18 +28,16 @@ pub mod native;
 pub mod pmu;
 pub mod replay;
 
-use std::collections::HashMap;
-
 use tracing::debug;
 
-use crate::engine::{batch_worker_body, dispatch_worker_body, Simulator};
+use crate::engine::dispatch_worker_body;
 use crate::engine_ring::{pick_by_min_clock, EngineRing, YieldReason};
 use crate::ffi::Scheduler;
 use crate::interleave::{self, WorkerId};
 use crate::kfuncs::{self, OpsContext, SimArc, SimulatorState};
 use crate::preempt::PreemptRing;
 use crate::scheduler_wrapper::SchedulerWrapper;
-use crate::types::{CpuId, TimeNs};
+use crate::types::CpuId;
 
 // ---------------------------------------------------------------------------
 // ThreadOrchestrator — synchronization strategy abstraction
@@ -549,175 +547,15 @@ pub(crate) fn run_dispatch_with_orchestrator<S, B, O>(
     backend.global_teardown();
 }
 
-/// Run concurrent batch event processing using a [`PreemptionBackend`].
-///
-/// Like [`run_preemptive_dispatch`] but each worker processes a batch of
-/// events for its CPU via `batch_worker_body`.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn run_preemptive_batch<S, B>(
-    per_cpu: &HashMap<CpuId, Vec<crate::engine::Event>>,
-    cpu_ids: &[CpuId],
-    sim_send: &SendPtr<Simulator<S>>,
-    state_send: &SendPtr<SimulatorState>,
-    sim_arc: &SimArc,
-    seed: u32,
-    watchdog_timeout: Option<crate::types::TimeNs>,
-    duration_ns: crate::types::TimeNs,
-    max_cgroups: u32,
-    backend: &B,
-) where
-    S: Scheduler,
-    B: PreemptionBackend,
-{
-    let ring = PreemptRing::new(cpu_ids.len(), seed);
-    let engine = EngineRing::new(cpu_ids);
-
-    backend.global_setup();
-
-    std::thread::scope(|s| {
-        let ring_ref = &ring;
-        let engine_ref = &engine;
-        let sim_ref = sim_send;
-        let state_ref = state_send;
-        let arc_ref = sim_arc;
-
-        for (i, &cpu) in cpu_ids.iter().enumerate() {
-            let worker_id = WorkerId(i);
-            let cpu_events = per_cpu.get(&cpu).cloned().unwrap_or_default();
-
-            s.spawn(move || {
-                let simp = sim_ref.0 as *const Simulator<S>;
-                let sp = state_ref.0;
-
-                kfuncs::install_sim_arc(arc_ref);
-
-                let mut ctx = backend.worker_setup(ring_ref, engine_ref, worker_id);
-                engine_ref.wait_for_token(worker_id);
-
-                unsafe { kfuncs::enter_sim(&mut *sp, cpu) };
-
-                build_and_arm(backend, &mut ctx, ring_ref);
-
-                unsafe {
-                    batch_worker_body(
-                        &*simp,
-                        arc_ref,
-                        cpu_events,
-                        watchdog_timeout,
-                        duration_ns,
-                        max_cgroups,
-                    );
-                }
-
-                let delta = backend.disarm(&mut ctx);
-                unsafe { drain_structop_accum(sp, cpu, &delta) };
-                unsafe { clear_ops_and_finish(sp, engine_ref, worker_id) };
-
-                backend.worker_teardown(ctx);
-            });
-        }
-
-        let first = pick_first_by_min_clock(cpu_ids, state_send);
-        engine.start_first_worker(first);
-        engine.engine_loop(|_yielded, reason| {
-            if reason == YieldReason::Finished {
-                return engine_pick_next(cpu_ids, state_send, &engine);
-            }
-            engine_pick_next(cpu_ids, state_send, &engine)
-        });
-    });
-
-    backend.log_completion(&ring);
-    backend.global_teardown();
-}
-
-/// Run concurrent batch with a separate [`ThreadOrchestrator`].
-///
-/// Used by native-concurrent mode where all workers run freely in parallel.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn run_batch_with_orchestrator<S, B, O>(
-    per_cpu: &HashMap<CpuId, Vec<crate::engine::Event>>,
-    cpu_ids: &[CpuId],
-    sim_send: &SendPtr<Simulator<S>>,
-    state_send: &SendPtr<SimulatorState>,
-    sim_arc: &SimArc,
-    ring: &PreemptRing,
-    orchestrator: &O,
-    watchdog_timeout: Option<crate::types::TimeNs>,
-    duration_ns: crate::types::TimeNs,
-    max_cgroups: u32,
-    backend: &B,
-) where
-    S: Scheduler,
-    B: PreemptionBackend,
-    O: ThreadOrchestrator,
-{
-    let dummy_engine = EngineRing::new(cpu_ids);
-
-    backend.global_setup();
-
-    std::thread::scope(|s| {
-        let ring_ref = ring;
-        let engine_ref = &dummy_engine;
-        let orch_ref = orchestrator;
-        let sim_ref = sim_send;
-        let state_ref = state_send;
-        let arc_ref = sim_arc;
-
-        for (i, &cpu) in cpu_ids.iter().enumerate() {
-            let worker_id = WorkerId(i);
-            let cpu_events = per_cpu.get(&cpu).cloned().unwrap_or_default();
-
-            s.spawn(move || {
-                let simp = sim_ref.0 as *const Simulator<S>;
-                let sp = state_ref.0;
-
-                kfuncs::install_sim_arc(arc_ref);
-
-                let mut ctx = backend.worker_setup(ring_ref, engine_ref, worker_id);
-                orch_ref.wait_for_token(worker_id);
-
-                unsafe { kfuncs::enter_sim(&mut *sp, cpu) };
-
-                build_and_arm(backend, &mut ctx, ring_ref);
-
-                unsafe {
-                    batch_worker_body(
-                        &*simp,
-                        arc_ref,
-                        cpu_events,
-                        watchdog_timeout,
-                        duration_ns,
-                        max_cgroups,
-                    );
-                }
-
-                let delta = backend.disarm(&mut ctx);
-                unsafe { drain_structop_accum(sp, cpu, &delta) };
-                unsafe { clear_ops_and_finish(sp, orch_ref, worker_id) };
-
-                backend.worker_teardown(ctx);
-            });
-        }
-
-        orchestrator.start();
-        orchestrator.wait_all_done();
-    });
-
-    backend.log_completion(ring);
-    backend.global_teardown();
-}
-
 // ---------------------------------------------------------------------------
 // Cooperative (non-preemptive) worker drivers
 // ---------------------------------------------------------------------------
 //
-// These mirror [`run_dispatch_with_orchestrator`] and
-// [`run_batch_with_orchestrator`] but without a [`PreemptionBackend`].
-// Workers yield exclusively at kfunc boundaries via
-// `interleave::maybe_yield()`.  All raw-pointer dereferences and unsafe
-// FFI calls are confined here so that `engine.rs` remains free of
-// `unsafe` blocks for the cooperative path.
+// These mirror [`run_dispatch_with_orchestrator`] but without a
+// [`PreemptionBackend`]. Workers yield exclusively at kfunc boundaries
+// via `interleave::maybe_yield()`.  All raw-pointer dereferences and
+// unsafe FFI calls are confined here so that `engine.rs` remains free
+// of `unsafe` blocks for the cooperative path.
 
 /// Cooperative concurrent dispatch via [`EngineRing`].
 ///
@@ -788,91 +626,6 @@ pub(crate) fn run_cooperative_dispatch<S: Scheduler>(
                 return engine_pick_next(dispatch_cpus, state_send, &ring);
             }
             engine_pick_next(dispatch_cpus, state_send, &ring)
-        });
-    });
-}
-
-/// Cooperative concurrent batch event processing via [`EngineRing`].
-///
-/// Each worker processes all events for a single CPU sequentially via
-/// `batch_worker_body`. At each yield, control returns to the engine
-/// thread which picks the next worker by minimum local clock.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn run_cooperative_batch<S: Scheduler>(
-    per_cpu: &HashMap<CpuId, Vec<crate::engine::Event>>,
-    cpu_ids: &[CpuId],
-    sim_send: &SendPtr<Simulator<S>>,
-    state_send: &SendPtr<SimulatorState>,
-    sim_arc: &SimArc,
-    _seed: u32,
-    watchdog_timeout: Option<TimeNs>,
-    duration_ns: TimeNs,
-    max_cgroups: u32,
-) {
-    let ring = EngineRing::new(cpu_ids);
-
-    std::thread::scope(|s| {
-        let ring_ref = &ring;
-        let sim_ref = sim_send;
-        let state_ref = state_send;
-        let arc_ref = sim_arc;
-        let per_cpu_ref = &per_cpu;
-
-        for (i, &cpu) in cpu_ids.iter().enumerate() {
-            let worker_id = WorkerId(i);
-            let cpu_events = per_cpu_ref.get(&cpu).cloned().unwrap_or_default();
-
-            s.spawn(move || {
-                let simp = sim_ref.0 as *const Simulator<S>;
-                let sp = state_ref.0;
-
-                // Install SIM_ARC in this worker thread so kfuncs called
-                // from scheduler C code can lock the SimState mutex.
-                kfuncs::install_sim_arc(arc_ref);
-
-                interleave::install_engine_ring(ring_ref, worker_id);
-                ring_ref.wait_for_token(worker_id);
-
-                // SAFETY: `sp` points to a valid `SimulatorState` and
-                // `simp` to the containing `Simulator`, both owned by
-                // the engine and protected by the token-passing protocol.
-                // `arc_ref` is a shared reference to the `SimArc` whose
-                // lifetime is bound by `thread::scope`.
-                unsafe {
-                    kfuncs::enter_sim(&mut *sp, cpu);
-                    batch_worker_body(
-                        &*simp,
-                        arc_ref,
-                        cpu_events,
-                        watchdog_timeout,
-                        duration_ns,
-                        max_cgroups,
-                    );
-                }
-
-                let delta = StructopDelta {
-                    rbc_total: 0,
-                    interleave_count: crate::preempt::structop_info().interleave_count,
-                };
-                // SAFETY: same pointer validity as above; token still held.
-                // clear_ops_and_finish calls exit_sim_no_clear_ops which
-                // clears SIM_ARC.
-                unsafe {
-                    drain_structop_accum(sp, cpu, &delta);
-                    clear_ops_and_finish(sp, ring_ref, worker_id);
-                }
-                interleave::uninstall();
-            });
-        }
-
-        // Engine thread: pick the first worker and run the decision loop.
-        let first = pick_first_by_min_clock(cpu_ids, state_send);
-        ring.start_first_worker(first);
-        ring.engine_loop(|_yielded, reason| {
-            if reason == YieldReason::Finished {
-                return engine_pick_next(cpu_ids, state_send, &ring);
-            }
-            engine_pick_next(cpu_ids, state_send, &ring)
         });
     });
 }
