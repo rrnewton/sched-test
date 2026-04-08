@@ -53,6 +53,7 @@ type DisarmFn = unsafe extern "C" fn();
 ///
 /// [`E9_SHARED_ADDR`]: crate::preempt::E9_SHARED_ADDR
 #[derive(Clone, Copy)]
+#[allow(dead_code)] // Fields used by PreemptionBackend impls; callers temporarily removed
 pub struct E9PatchFns {
     arm: ArmFn,
     disarm: DisarmFn,
@@ -88,6 +89,7 @@ impl E9PatchFns {
 /// Each worker's C trampoline (compiled into the `_e9.so`) decrements a
 /// shared counter at every Jcc and calls `e9_preempt_yield()` when
 /// it expires. No PMU hardware, no signal handlers, fully deterministic.
+#[allow(dead_code)] // PreemptionBackend impl; callers temporarily removed
 pub(crate) struct E9PatchBackend {
     pub timeslice_min: u64,
     pub timeslice_max: u64,
@@ -95,6 +97,7 @@ pub(crate) struct E9PatchBackend {
 }
 
 /// Per-worker state for the e9patch backend (no hardware resources needed).
+#[allow(dead_code)] // PreemptionBackend impl; callers temporarily removed
 pub(crate) struct E9PatchWorkerCtx;
 
 impl PreemptionBackend for E9PatchBackend {
@@ -228,6 +231,7 @@ unsafe impl Sync for E9RipShared {}
 ///
 /// # Safety
 /// [`mmap_rip_shared`] must have been called first.
+#[allow(dead_code)] // Used by E9PatchReplayBackend impl
 unsafe fn e9_rip_shared() -> *mut E9RipShared {
     E9_RIP_SHARED_ADDR as *mut E9RipShared
 }
@@ -268,6 +272,7 @@ pub fn mmap_rip_shared() -> *mut E9RipShared {
 ///
 /// # Safety
 /// [`mmap_rip_shared`] must have been called. Token must be held.
+#[allow(dead_code)] // Used by E9PatchReplayBackend impl
 unsafe fn arm_rip(rip: u64) {
     (*e9_rip_shared()).armed_rip = rip;
 }
@@ -276,6 +281,7 @@ unsafe fn arm_rip(rip: u64) {
 ///
 /// # Safety
 /// [`mmap_rip_shared`] must have been called. Token must be held.
+#[allow(dead_code)] // Used by E9PatchReplayBackend impl
 unsafe fn disarm_rip() {
     (*e9_rip_shared()).armed_rip = 0;
 }
@@ -299,6 +305,7 @@ unsafe fn disarm_rip() {
 /// - **Fully deterministic** — software counting/patching, no skid
 /// - **No retry logic** — never overshoots
 /// - **Single mechanism** — no two-signal coordination
+#[allow(dead_code)] // PreemptionBackend impl; callers temporarily removed
 pub(crate) struct E9PatchReplayBackend {
     /// Per-worker cursors into the replay trace.
     cursors: Vec<ReplayCursor>,
@@ -381,6 +388,7 @@ impl E9PatchReplayBackend {
 }
 
 /// Per-worker state for the e9patch replay backend.
+#[allow(dead_code)] // PreemptionBackend impl; callers temporarily removed
 pub(crate) struct E9PatchReplayWorkerCtx {
     worker_idx: usize,
 }

@@ -229,11 +229,6 @@ impl EngineRing {
         self.finished_mask.is_all_done(self.total)
     }
 
-    /// Build the full finished bitmask for `self.total` workers.
-    fn full_mask(&self) -> u64 {
-        AtomicFinishedMask::full_mask(self.total)
-    }
-
     // -----------------------------------------------------------------------
     // Worker side (all async-signal-safe)
     // -----------------------------------------------------------------------
@@ -345,51 +340,6 @@ impl EngineRing {
                 None => break,
             }
         }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// ThreadOrchestrator implementation
-// ---------------------------------------------------------------------------
-
-impl crate::backend::ThreadOrchestrator for EngineRing {
-    fn start(&self) {
-        // Start worker 0 by default. The real usage goes through
-        // `start_first_worker` + `engine_loop` with a decision callback.
-        self.start_first_worker(WorkerId(0));
-    }
-
-    fn wait_all_done(&self) {
-        // Spin on the finished mask until all workers are done.
-        // Uses futex on engine_wake to avoid busy-waiting: each worker
-        // finish wakes the engine, which gives us a convenient wakeup.
-        loop {
-            if self.finished_mask() == self.full_mask() {
-                break;
-            }
-            // Atomically swap to Sleeping; if a worker already signaled
-            // (Woken), re-check the mask immediately without blocking.
-            let old = self.engine_wake.swap_sleeping();
-            if old == EngineWakeState::Sleeping {
-                self.engine_wake.futex_wait_sleeping();
-            }
-        }
-    }
-
-    fn wait_for_token(&self, worker_id: WorkerId) {
-        EngineRing::wait_for_token(self, worker_id);
-    }
-
-    fn yield_token(&self, worker_id: WorkerId) -> bool {
-        self.yield_to_engine(worker_id, YieldReason::Cooperative)
-    }
-
-    fn yield_to_engine(&self, worker_id: WorkerId) -> bool {
-        self.yield_to_engine(worker_id, YieldReason::Cooperative)
-    }
-
-    fn finish(&self, worker_id: WorkerId) {
-        self.finish_worker(worker_id);
     }
 }
 
@@ -577,31 +527,6 @@ mod tests {
         ];
         let result = pick_by_min_clock(data.iter().copied(), 0b11);
         assert_eq!(result, None, "all workers finished");
-    }
-
-    #[test]
-    fn test_thread_orchestrator_trait_single_worker() {
-        use crate::backend::ThreadOrchestrator;
-
-        let ring = EngineRing::new(&[CpuId(0)]);
-
-        std::thread::scope(|s| {
-            let ring_ref = &ring;
-
-            s.spawn(move || {
-                ring_ref.wait_for_token(WorkerId(0));
-                // Use trait method.
-                <EngineRing as ThreadOrchestrator>::finish(ring_ref, WorkerId(0));
-            });
-
-            // `start` from the trait wakes worker 0.
-            <EngineRing as ThreadOrchestrator>::start(&ring);
-
-            // Run engine loop to service the yield from finish_worker.
-            ring.engine_loop(|_yielded, _reason| None);
-        });
-
-        assert!(ring.all_done());
     }
 
     #[test]
