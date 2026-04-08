@@ -11,7 +11,7 @@ use std::sync::Barrier;
 
 use tracing::{debug, info};
 
-use super::{PreemptionBackend, StructopDelta, ThreadOrchestrator};
+use super::{PreemptionBackend, StructopDelta};
 use crate::engine_ring::EngineRing;
 use crate::interleave::WorkerId;
 use crate::preempt::PreemptRing;
@@ -24,9 +24,11 @@ use crate::preempt::PreemptRing;
 /// produces no preemption events. Used with `--native-concurrent` so that
 /// the generic `run_dispatch_with_orchestrator` / `run_batch_with_orchestrator`
 /// drivers can be reused without any hardware instrumentation.
+#[allow(dead_code)] // PreemptionBackend impl; callers temporarily removed
 pub(crate) struct NullBackend;
 
 /// Per-worker context for NullBackend — intentionally empty.
+#[allow(dead_code)] // PreemptionBackend impl; callers temporarily removed
 pub(crate) struct NullWorkerCtx;
 
 impl PreemptionBackend for NullBackend {
@@ -89,6 +91,7 @@ impl PreemptionBackend for NullBackend {
 /// Phase 1: no clock-window throttling — all workers start simultaneously
 /// (via a barrier) and finish independently. An atomic counter tracks
 /// completions so `wait_all_done` can detect when every worker has finished.
+#[allow(dead_code)] // Callers temporarily removed during dispatch refactor
 pub(crate) struct NativeOrchestrator {
     /// Barrier that workers wait on before starting work.
     barrier: Barrier,
@@ -99,6 +102,7 @@ pub(crate) struct NativeOrchestrator {
 }
 
 impl NativeOrchestrator {
+    #[allow(dead_code)] // Callers temporarily removed during dispatch refactor
     pub fn new(num_workers: usize) -> Self {
         // +1 for the orchestrator thread itself (which calls `start`).
         NativeOrchestrator {
@@ -107,33 +111,36 @@ impl NativeOrchestrator {
             total: num_workers,
         }
     }
-}
 
-impl ThreadOrchestrator for NativeOrchestrator {
-    fn start(&self) {
-        // Release all workers by participating in the barrier.
+    /// Orchestrator: release all workers by participating in the barrier.
+    #[allow(dead_code)]
+    pub fn start(&self) {
         self.barrier.wait();
     }
 
-    fn wait_all_done(&self) {
-        // Spin-wait until all workers have called `finish`.
+    /// Orchestrator: spin-wait until all workers have called `finish`.
+    #[allow(dead_code)]
+    pub fn wait_all_done(&self) {
         while self.finished.load(Relaxed) < self.total {
             std::hint::spin_loop();
         }
     }
 
-    fn wait_for_token(&self, _worker_id: WorkerId) {
-        // All workers wait on the barrier together — once released, they
-        // run concurrently with no further synchronisation.
+    /// Worker: wait on the barrier, then run concurrently.
+    #[allow(dead_code)]
+    pub fn wait_for_token(&self, _worker_id: WorkerId) {
         self.barrier.wait();
     }
 
-    fn yield_token(&self, _worker_id: WorkerId) -> bool {
-        // No token to yield — all workers run freely.
+    /// No token to yield — all workers run freely.
+    #[allow(dead_code)]
+    pub fn yield_token(&self, _worker_id: WorkerId) -> bool {
         false
     }
 
-    fn finish(&self, _worker_id: WorkerId) {
+    /// Worker: mark as finished.
+    #[allow(dead_code)]
+    pub fn finish(&self, _worker_id: WorkerId) {
         self.finished.fetch_add(1, Relaxed);
     }
 }

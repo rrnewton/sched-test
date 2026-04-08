@@ -12,10 +12,8 @@ use rand::rngs::SmallRng;
 use rand::{RngCore, SeedableRng};
 use tracing::{debug, info, trace, warn};
 
-use crate::backend::e9patch::{E9PatchBackend, E9PatchReplayBackend};
-use crate::backend::pmu::PmuBackend;
+use crate::backend::e9patch::E9PatchReplayBackend;
 use crate::backend::replay::ReplayBackend;
-use crate::backend::{PreemptionBackend, SendPtr};
 use crate::cgroup::{CgroupId, CgroupRegistry};
 use crate::cpu::{IrqContext, LastStopReason, SimCpu};
 use crate::dsq::DsqManager;
@@ -678,11 +676,6 @@ fn flush_staged_events(state: &mut SimulatorState, events: &mut EventQueue) {
 /// The main simulator.
 pub struct Simulator<S: Scheduler> {
     scheduler: SchedulerWrapper<S>,
-    /// Persistent thread pool for concurrent dispatch/batch rounds.
-    /// Created lazily in `run_internal` when interleaving is enabled.
-    /// Workers are reused across rounds within a single simulation run,
-    /// eliminating per-round `clone3` + `perf_event_open` overhead.
-    dispatch_pool: std::cell::RefCell<Option<crate::dispatch_pool::DispatchPool>>,
 }
 
 /// Result of a simulation, keeping task storage alive for post-simulation
@@ -1013,28 +1006,6 @@ fn maybe_record_checkpoint(state: &SimulatorState, event: CheckpointEvent, cpu: 
     record_checkpoint(event, instruction_pointer, rbc_count, memory_hash, cpu);
 }
 
-/// Core dispatch worker body shared by cooperative and preemptive
-/// concurrent dispatch paths.
-///
-/// Sets up CPU context, calls `scheduler.dispatch()`, and resolves deferred
-/// dispatch. Caller must have already entered sim and acquired the token.
-pub(crate) fn dispatch_worker_body<S: Scheduler>(
-    sim: &mut SimulatorState,
-    scheduler: &SchedulerWrapper<S>,
-    cpu: CpuId,
-) {
-    sim.current_cpu = cpu;
-    set_ops_context(sim, OpsContext::Dispatch);
-
-    let prev_pid = sim.cpus[cpu.0 as usize].prev_task;
-    let prev_raw = prev_pid
-        .and_then(|pid| sim.task_pid_to_raw.get(&pid).copied())
-        .map_or(std::ptr::null_mut(), |raw| raw as *mut c_void);
-
-    scheduler.dispatch(cpu.0 as i32, OptionalPtr::new(prev_raw));
-    sim.resolve_pending_dispatch(cpu);
-}
-
 /// Drop the MutexGuard, install SIM_ARC, call scheduler code, then reacquire.
 ///
 /// Takes `$s` (the `&mut SimState` deref of `$guard`) and shadows it to
@@ -1108,7 +1079,6 @@ impl<S: Scheduler> Simulator<S> {
     pub fn new(scheduler: S) -> Self {
         Simulator {
             scheduler: SchedulerWrapper::new(scheduler),
-            dispatch_pool: std::cell::RefCell::new(None),
         }
     }
 
@@ -1743,41 +1713,12 @@ impl<S: Scheduler> Simulator<S> {
             info!("cooperative interleaving enabled (kfunc boundaries only)");
         }
 
-        // Main event loop: process events with dynamic concurrency windows.
-        //
-        // When interleaving is enabled, the event loop uses dynamic
-        // concurrency windows instead of static same-timestamp batching.
-        // After processing a batch of same-timestamp events concurrently,
-        // the loop checks whether CPU clocks advanced past any pending
-        // s.events. If so, those events are pulled into a new concurrent
-        // batch, modeling the kernel's overlapping execution on different
-        // CPUs. The window grows organically based on structop execution
-        // cost.
-        //
-        // When interleaving is disabled, all events are processed
-        // sequentially in their original priority order (by seq
-        // tiebreaker), preserving backward-compatible determinism.
-        let interleave_enabled =
-            s.sim.interleave || s.sim.preemptive.is_some() || s.sim.native_concurrent.is_some();
-
-        // Create persistent dispatch pool when interleaving is enabled.
-        // Workers are spawned once and reused across all dispatch/batch
-        // rounds, eliminating per-round clone3 + perf_event_open overhead.
-        //
         // When preemptive mode is active, install the signal handler once
         // here (at simulation start) instead of per-round. The handler
-        // persists until the pool is dropped at simulation end.
+        // persists until uninstalled at simulation end.
         let preemptive_at_start = s.sim.preemptive.is_some();
-        if interleave_enabled {
-            let nr_cpus = s.sim.cpus.len();
-            let cpu_ids: Vec<crate::types::CpuId> =
-                (0..nr_cpus as u32).map(crate::types::CpuId).collect();
-            if preemptive_at_start {
-                crate::preempt::install_signal_handler();
-            }
-            *self.dispatch_pool.borrow_mut() = Some(crate::dispatch_pool::DispatchPool::new(
-                nr_cpus, &sim_arc, &cpu_ids, 0,
-            ));
+        if preemptive_at_start {
+            crate::preempt::install_signal_handler();
         }
 
         // Drop the outer guard before entering the event loop.
@@ -1794,9 +1735,7 @@ impl<S: Scheduler> Simulator<S> {
             }
             s.sim.clock = t;
 
-            // Pop one event at a time and process it. Interleaving happens
-            // naturally via dispatch_concurrent inside process_event when
-            // multiple CPUs become idle — no explicit batching needed.
+            // Pop one event at a time and process it.
             let event = s.events.pop().expect("peek succeeded but pop failed");
             drop(s);
             if let Some(err) = self.process_event(
@@ -1819,12 +1758,8 @@ impl<S: Scheduler> Simulator<S> {
             }
         }
 
-        // Shut down the persistent dispatch pool before final cleanup.
-        // Workers must be joined before the sim_arc is dropped.
-        *self.dispatch_pool.borrow_mut() = None;
-
-        // Uninstall the signal handler after pool shutdown. This must happen
-        // after all worker threads are joined to avoid stray SIGSTKFLT.
+        // Uninstall the signal handler after the event loop.
+        // This must happen after all worker threads are joined to avoid stray SIGSTKFLT.
         if preemptive_at_start {
             crate::preempt::uninstall_signal_handler();
         }
@@ -3035,22 +2970,13 @@ impl<S: Scheduler> Simulator<S> {
                 .map(|c| c.id)
                 .collect();
 
-            // Guard: suppress nested dispatch_concurrent when already
-            // inside a concurrent batch.
-            let use_concurrent = (s.sim.interleave
-                || s.sim.preemptive.is_some()
-                || s.sim.native_concurrent.is_some())
-                && idle_cpus.len() >= 2;
-
-            if use_concurrent {
+            // Dispatch each idle CPU sequentially. Interleaving happens
+            // naturally via the engine's pop-one-at-a-time event loop —
+            // no concurrent dispatch batching needed.
+            for cpu in idle_cpus {
                 drop(guard);
-                self.dispatch_concurrent(&idle_cpus, sim_arc, monitor);
-            } else {
-                for cpu in idle_cpus {
-                    drop(guard);
-                    self.try_dispatch_and_run(cpu, sim_arc, monitor);
-                    guard = sim_arc.lock().unwrap();
-                }
+                self.try_dispatch_and_run(cpu, sim_arc, monitor);
+                guard = sim_arc.lock().unwrap();
             }
         }
     }
@@ -3611,251 +3537,6 @@ impl<S: Scheduler> Simulator<S> {
             s.sim.trace.record(local_t, cpu, TraceKind::CpuIdle);
             info!(cpu = cpu.0, "IDLE");
         }
-    }
-
-    /// Run `scheduler.dispatch()` concurrently for multiple CPUs with
-    /// PRNG-driven token passing at kfunc yield points.
-    ///
-    /// Phase 1 (concurrent): each CPU's dispatch callback runs on a
-    /// separate OS thread, interleaved at kfunc boundaries by the
-    /// [`EngineRing`] (cooperative mode) or [`PreemptRing`] (preemptive
-    /// mode). Only one thread is active at a time.
-    ///
-    /// Phase 2 (sequential): global DSQ fallback, start_running, and
-    /// kicked-CPU processing happen on the engine thread.
-    fn dispatch_concurrent(&self, cpus: &[CpuId], sim_arc: &SimArc, monitor: &mut dyn Monitor) {
-        let mut guard = sim_arc.lock().unwrap();
-        let s = &mut *guard;
-        // Filter to CPUs that actually need dispatch (idle + empty local DSQ).
-        let dispatch_cpus: Vec<CpuId> = cpus
-            .iter()
-            .copied()
-            .filter(|&cpu| {
-                s.sim.cpus[cpu.0 as usize].current_task.is_none()
-                    && s.sim.cpus[cpu.0 as usize].local_dsq.is_empty()
-            })
-            .collect();
-
-        // Fall back to sequential for 0–1 CPUs (no interleaving benefit).
-        if dispatch_cpus.len() < 2 {
-            for &cpu in cpus {
-                drop(guard);
-                self.try_dispatch_and_run(cpu, sim_arc, monitor);
-                guard = sim_arc.lock().unwrap();
-            }
-            return;
-        }
-
-        // Phase 1: concurrent dispatch via scoped threads.
-        //
-        // SAFETY: token passing ensures only one thread accesses state/
-        // scheduler at a time. Raw pointers avoid Send/Sync bounds on
-        // types that are effectively single-threaded under the token.
-        let state_send = SendPtr::from_mut(&mut s.sim);
-        let sched_send = SendPtr::from_ref(&self.scheduler);
-
-        // Advance each CPU's clock before spawning (pure per-CPU, no races).
-        for &cpu in &dispatch_cpus {
-            s.sim.advance_cpu_clock(cpu);
-        }
-
-        let interleave_seed = s.sim.next_prng();
-
-        // Save conditions before dropping guard (workers lock sim_arc internally).
-        let is_native = s.sim.native_concurrent.is_some();
-        let preemptive_cfg = s.sim.preemptive.clone();
-        let replay_backend = s.sim.replay_backend.take();
-        let e9_replay_backend = s.sim.e9_replay_backend.take();
-        let e9_fns = s.sim.e9_fns;
-        drop(guard);
-
-        if is_native {
-            // Native concurrent: all workers run freely in parallel with
-            // no PMU, no signals, no token ring serialisation.
-            // Not pooled: native mode doesn't benefit from persistent threads
-            // (no PMU setup overhead).
-            use crate::backend::native::{NativeOrchestrator, NullBackend};
-            let ring = crate::preempt::PreemptRing::new(dispatch_cpus.len(), interleave_seed);
-            let orchestrator = NativeOrchestrator::new(dispatch_cpus.len());
-            crate::backend::run_dispatch_with_orchestrator(
-                &dispatch_cpus,
-                &state_send,
-                &sched_send,
-                sim_arc,
-                &ring,
-                &orchestrator,
-                &NullBackend,
-            );
-        } else if let Some(ref preemptive_cfg) = preemptive_cfg {
-            if let Some(ref backend) = e9_replay_backend {
-                // E9patch replay: deterministic, no retry needed.
-                self.dispatch_preemptive_pooled_or_scoped(
-                    &dispatch_cpus,
-                    &state_send,
-                    &sched_send,
-                    sim_arc,
-                    interleave_seed,
-                    backend,
-                );
-            } else if let Some(ref backend) = replay_backend {
-                assert!(backend.is_precise(), "replay requires a precise backend");
-                // Replay with retry: always uses scoped threads (retry
-                // resets state and re-runs, which doesn't work with pooled
-                // threads that retain TLS from the previous attempt).
-                crate::backend::replay_dispatch_with_retry(
-                    &dispatch_cpus,
-                    &state_send,
-                    &sched_send,
-                    sim_arc,
-                    interleave_seed,
-                    backend,
-                );
-            } else if preemptive_cfg.preempt_mode == PreemptMode::E9patch {
-                let backend = E9PatchBackend {
-                    timeslice_min: preemptive_cfg.timeslice_min,
-                    timeslice_max: preemptive_cfg.timeslice_max,
-                    fns: e9_fns.expect("e9_fns must be resolved"),
-                };
-                self.dispatch_preemptive_pooled_or_scoped(
-                    &dispatch_cpus,
-                    &state_send,
-                    &sched_send,
-                    sim_arc,
-                    interleave_seed,
-                    &backend,
-                );
-            } else {
-                let backend = PmuBackend {
-                    timeslice_min: preemptive_cfg.timeslice_min,
-                    timeslice_max: preemptive_cfg.timeslice_max,
-                    cooperative_only: preemptive_cfg.cooperative_only,
-                    break_on: preemptive_cfg.break_on,
-                };
-                self.dispatch_preemptive_pooled_or_scoped(
-                    &dispatch_cpus,
-                    &state_send,
-                    &sched_send,
-                    sim_arc,
-                    interleave_seed,
-                    &backend,
-                );
-            }
-        } else {
-            self.dispatch_cooperative_pooled_or_scoped(
-                &dispatch_cpus,
-                &state_send,
-                &sched_send,
-                sim_arc,
-                interleave_seed,
-            );
-        }
-
-        // Re-acquire guard for Phase 2 post-processing.
-        guard = sim_arc.lock().unwrap();
-        // Restore replay backends if they were temporarily removed.
-        if replay_backend.is_some() {
-            guard.sim.replay_backend = replay_backend;
-        }
-        if e9_replay_backend.is_some() {
-            guard.sim.e9_replay_backend = e9_replay_backend;
-        }
-
-        // Phase 2: sequential post-processing on the engine thread.
-        for &cpu in &dispatch_cpus {
-            let s = &mut *guard;
-            let prev_pid = s.sim.cpus[cpu.0 as usize].prev_task;
-            let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
-            s.sim
-                .trace
-                .record(__local_t, cpu, TraceKind::Balance { prev_pid });
-
-            // Monitor: Dispatched probe
-            if let Some(ppid) = prev_pid {
-                if let Some(task) = s.tasks.get(&ppid) {
-                    monitor.sample(&ProbeContext {
-                        point: ProbePoint::Dispatched,
-                        pid: ppid,
-                        cpu,
-                        time_ns: s.sim.cpus[cpu.0 as usize].local_clock,
-                        task_raw: task.raw(),
-                        trace: &s.sim.trace,
-                    });
-                }
-            }
-
-            // Global DSQ fallback + start running or idle (without update_idle
-            // notification — not safe during concurrent post-processing).
-            drop(guard);
-            self.post_dispatch_run(cpu, false, sim_arc, monitor);
-            guard = sim_arc.lock().unwrap();
-        }
-
-        // Flush staged events from the concurrent dispatches.
-        {
-            let s = &mut *guard;
-            flush_staged_events(&mut s.sim, &mut s.events);
-        }
-    }
-
-    /// Run cooperative dispatch using the persistent pool or scoped threads.
-    fn dispatch_cooperative_pooled_or_scoped(
-        &self,
-        dispatch_cpus: &[CpuId],
-        state_send: &SendPtr<SimulatorState>,
-        sched_send: &SendPtr<SchedulerWrapper<S>>,
-        sim_arc: &SimArc,
-        seed: u32,
-    ) {
-        let use_pool = {
-            let pool_ref = self.dispatch_pool.borrow();
-            pool_ref
-                .as_ref()
-                .is_some_and(|p| dispatch_cpus.len() <= p.max_workers())
-        };
-        if use_pool {
-            let pool_ref = self.dispatch_pool.borrow();
-            let pool = pool_ref.as_ref().expect("pool checked above");
-            crate::dispatch_pool::run_cooperative_dispatch_pooled(
-                pool,
-                dispatch_cpus,
-                state_send,
-                sched_send,
-                sim_arc,
-                seed,
-            );
-        } else {
-            crate::backend::run_cooperative_dispatch(
-                dispatch_cpus,
-                state_send,
-                sched_send,
-                sim_arc,
-                seed,
-            );
-        }
-    }
-
-    /// Run preemptive dispatch using the persistent pool or scoped threads.
-    fn dispatch_preemptive_pooled_or_scoped<B: PreemptionBackend>(
-        &self,
-        dispatch_cpus: &[CpuId],
-        state_send: &SendPtr<SimulatorState>,
-        sched_send: &SendPtr<SchedulerWrapper<S>>,
-        sim_arc: &SimArc,
-        seed: u32,
-        backend: &B,
-    ) {
-        // TODO(sim-b431b6): Preemptive pool disabled — signal handler +
-        // perf event TLS requires per-round thread identity, which persistent
-        // threads don't guarantee across backend.worker_setup/worker_teardown
-        // cycles. Fall back to scoped threads for correctness.
-        crate::backend::run_preemptive_dispatch(
-            dispatch_cpus,
-            state_send,
-            sched_send,
-            sim_arc,
-            seed,
-            backend,
-        );
     }
 
     /// Handle a `DsqConsume` event: consume from global DSQ into local DSQ.

@@ -58,6 +58,7 @@ pub(crate) struct ReplayBackend {
 }
 
 /// Per-worker state for the replay backend.
+#[allow(dead_code)] // PreemptionBackend impl; callers temporarily removed
 pub(crate) struct ReplayWorkerCtx {
     timer: Option<perf::RbcTimer>,
     timer_fd: RawFd,
@@ -94,6 +95,7 @@ impl ReplayBackend {
     }
 
     /// Whether this backend is in breakpoint-only mode.
+    #[allow(dead_code)] // Callers temporarily removed during dispatch refactor
     pub fn no_pmu_signal(&self) -> bool {
         self.no_pmu_signal
     }
@@ -102,6 +104,7 @@ impl ReplayBackend {
     ///
     /// Used by the retry logic when PMU signal attempts are exhausted
     /// and we fall back to breakpoint-only mode.
+    #[allow(dead_code)] // Callers temporarily removed during dispatch refactor
     pub fn with_bp_only(&self) -> Self {
         ReplayBackend {
             cursors: self
@@ -117,6 +120,7 @@ impl ReplayBackend {
     }
 
     /// Reset all cursors to the beginning for a retry attempt.
+    #[allow(dead_code)] // Callers temporarily removed during dispatch refactor
     pub fn reset_cursors(&self) {
         for c in &self.cursors {
             c.reset();

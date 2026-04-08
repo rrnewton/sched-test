@@ -20,6 +20,7 @@ use crate::preempt::{self, is_determinism_mode_enabled, PreemptRing};
 /// overflow) and a separate RBC measurement counter (for structop
 /// accounting). When the PMU is unavailable, workers still participate
 /// in the PreemptRing but only yield at cooperative kfunc boundaries.
+#[allow(dead_code)] // PreemptionBackend impl; callers temporarily removed
 pub(crate) struct PmuBackend {
     pub timeslice_min: u64,
     pub timeslice_max: u64,
@@ -28,6 +29,7 @@ pub(crate) struct PmuBackend {
 }
 
 /// Per-worker state for the PMU backend.
+#[allow(dead_code)] // PreemptionBackend impl; callers temporarily removed
 pub(crate) struct PmuWorkerCtx {
     timer: Option<RbcTimer>,
     timer_fd: RawFd,
