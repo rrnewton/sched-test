@@ -294,15 +294,6 @@ impl AtomicFinishedMask {
     pub(crate) fn is_all_done(&self, total: usize) -> bool {
         self.load().count_ones() as usize == total
     }
-
-    /// Build the full bitmask for `total` workers (all bits set).
-    pub(crate) fn full_mask(total: usize) -> u64 {
-        if total == 64 {
-            u64::MAX
-        } else {
-            (1u64 << total) - 1
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -404,13 +395,6 @@ mod tests {
         mask.mark_finished(WorkerId(2));
         assert_eq!(mask.load(), 0b111);
         assert!(mask.is_all_done(3));
-    }
-
-    #[test]
-    fn test_finished_mask_full_mask() {
-        assert_eq!(AtomicFinishedMask::full_mask(1), 0b1);
-        assert_eq!(AtomicFinishedMask::full_mask(3), 0b111);
-        assert_eq!(AtomicFinishedMask::full_mask(64), u64::MAX);
     }
 
     #[test]
