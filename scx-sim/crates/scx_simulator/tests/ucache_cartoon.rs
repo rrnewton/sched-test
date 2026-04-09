@@ -38,9 +38,9 @@ const SSD_WRITE_NS: u64 = 200_000; // 200us SSD write
 const WORKER_SLEEP_NS: u64 = 200_000; // 200us batching sleep (fast_pickup_schedule_us)
 const HOG_RUN_NS: u64 = 5_000_000; // 5ms CPU-bound chunk
 
-// IRQ parameters
+// IRQ parameters — 30% stolen time matches production ucache (~1/3 cores hammered)
 const IRQ_INTERVAL_NS: u64 = 200_000; // 200us between IRQs
-const IRQ_DURATION_NS: u64 = 10_000; // 10us per IRQ handler
+const IRQ_DURATION_NS: u64 = 60_000; // 60us per IRQ handler (30% stolen)
 const IRQ_CPU_COUNT: u32 = 5; // CPUs 0-4 get IRQ pressure
 
 fn worker_pid(i: i32) -> Pid {
