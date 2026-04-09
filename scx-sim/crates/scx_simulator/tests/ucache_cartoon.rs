@@ -16,10 +16,12 @@ use scx_simulator::*;
 mod common;
 
 /// PID assignment plan:
+///   Parent:  Pid(100) — shared parent so LAVD's wake_freq gate passes
 ///   Workers: Pid(1)..Pid(8)
 ///   Readers: Pid(9), Pid(10)
 ///   Writers: Pid(11), Pid(12)
 ///   CPU hogs: Pid(13)..Pid(16)
+const PARENT_PID: Pid = Pid(100);
 
 const NUM_CPUS: u32 = 16;
 const NUM_WORKERS: i32 = 8;
@@ -68,6 +70,26 @@ fn hog_pid(i: i32) -> Pid {
 fn build_scenario(with_irq: bool) -> Scenario {
     let mut builder = Scenario::builder().cpus(NUM_CPUS);
 
+    // --- shared parent task (required for LAVD wake_freq gating) ---
+    // LAVD only updates wake_freq when waker->real_parent == wakee->real_parent.
+    // All ucache threads are children of the same process (ucache server).
+    builder = builder.task(TaskDef {
+        name: "ucache_parent".into(),
+        pid: PARENT_PID,
+        nice: 0,
+        behavior: TaskBehavior {
+            phases: vec![Phase::Sleep(u64::MAX)], // sleeps forever, just exists as parent
+            repeat: RepeatMode::Once,
+        },
+        start_time_ns: 0,
+        mm_id: Some(MmId(1)),
+        allowed_cpus: None,
+        parent_pid: None,
+        cgroup_name: None,
+        task_flags: 0,
+        migration_disabled: 0,
+    });
+
     // --- ucache_workers ---
     // Worker i wakes reader (i % NUM_READERS) and writer (i % NUM_WRITERS).
     // After sleeping, worker is woken by its assigned reader.
@@ -92,7 +114,7 @@ fn build_scenario(with_irq: bool) -> Scenario {
             start_time_ns: i as u64 * 10_000, // stagger starts by 10us
             mm_id: Some(MmId(1)),              // shared address space for wake_freq
             allowed_cpus: None,                // free to migrate
-            parent_pid: None,
+            parent_pid: Some(PARENT_PID),      // shared parent for LAVD wake_freq gate
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
@@ -122,7 +144,7 @@ fn build_scenario(with_irq: bool) -> Scenario {
             start_time_ns: 0,
             mm_id: Some(MmId(1)),
             allowed_cpus: None,
-            parent_pid: None,
+            parent_pid: Some(PARENT_PID),
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
@@ -146,7 +168,7 @@ fn build_scenario(with_irq: bool) -> Scenario {
             start_time_ns: 0,
             mm_id: Some(MmId(1)),
             allowed_cpus: None,
-            parent_pid: None,
+            parent_pid: Some(PARENT_PID),
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
@@ -280,6 +302,42 @@ fn test_ucache_cartoon_lavd() {
         );
     }
     eprintln!("  IRQ events: {}", irq_events.len());
+
+    // Per-CPU placement analysis: count worker schedules on each CPU
+    eprintln!("\n=== Per-CPU Worker Placement ===");
+    let mut cpu_worker_count = vec![0u32; NUM_CPUS as usize];
+    let mut cpu_irq_worker_count = 0u32;
+    let mut cpu_clean_worker_count = 0u32;
+    for event in trace.events() {
+        if let TraceKind::TaskScheduled { pid } = &event.kind {
+            let is_worker = (0..NUM_WORKERS).any(|i| *pid == worker_pid(i));
+            if is_worker {
+                let cpu = event.cpu.0 as usize;
+                if cpu < cpu_worker_count.len() {
+                    cpu_worker_count[cpu] += 1;
+                    if (cpu as u32) < IRQ_CPU_COUNT {
+                        cpu_irq_worker_count += 1;
+                    } else {
+                        cpu_clean_worker_count += 1;
+                    }
+                }
+            }
+        }
+    }
+    let total_worker_sched: u32 = cpu_worker_count.iter().sum();
+    for (cpu, &count) in cpu_worker_count.iter().enumerate() {
+        if count > 0 {
+            let pct = 100.0 * count as f64 / total_worker_sched as f64;
+            let tag = if (cpu as u32) < IRQ_CPU_COUNT { " [IRQ]" } else { "" };
+            eprintln!("  CPU {:>2}: {:>6} ({:>5.1}%){}", cpu, count, pct, tag);
+        }
+    }
+    let irq_pct = 100.0 * cpu_irq_worker_count as f64 / total_worker_sched as f64;
+    let expected_pct = 100.0 * IRQ_CPU_COUNT as f64 / NUM_CPUS as f64;
+    eprintln!(
+        "\n  Workers on IRQ CPUs: {}/{} ({:.1}%, expected random: {:.1}%)",
+        cpu_irq_worker_count, total_worker_sched, irq_pct, expected_pct
+    );
 }
 
 /// Run without IRQ pressure as a baseline for comparison.
