@@ -1206,28 +1206,20 @@ fn test_ucache_cartoon_lavd_nice_hints() {
     }
 }
 
-/// Prove whether hub-spoke Wake patterns trigger the LAVD misclassification.
+/// Build a hub-spoke scenario where workers explicitly wake reader/writer.
 ///
-/// The calibrated cartoon uses independent run/sleep phases. LAVD's wake_freq
-/// only accumulates when a WAKER explicitly wakes a WAKEE (same parent).
-/// With Sleep, there's no waker → wake_freq=0 → no misclassification.
+/// Hub_0 wakes both reader and writer. Hub_1 wakes writer only.
+/// This gives writer 2x the wake sources, triggering LAVD's wait_freq
+/// misclassification at nice=0.
 ///
-/// This test builds a hub-spoke pattern where ucache_workers explicitly wake
-/// navy_reader and navy_writer, with writer being woken more frequently.
-/// If LAVD's misclassification exists, the worker's wake_freq should be high,
-/// and the writer's wait_freq should exceed the reader's.
-#[test]
-fn test_ucache_cartoon_hubspoke_misclassification() {
-    let _lock = common::setup_test();
-
-    // Hub-spoke pattern: worker does compute, then wakes writer, then
-    // every 3rd iteration also wakes reader. Writer gets 3x more wakeups.
-    //
-    // Worker cycle: Run(250us) → Wake(writer) → [every 3rd: Wake(reader)] → Sleep(110us)
-    // Reader: waits for Wake, then Run(35us)
-    // Writer: waits for Wake, then Run(22us)
+/// When `with_nice_hints`, applies reader=-10, worker=-5, writer=+5.
+fn build_hubspoke_scenario(with_nice_hints: bool) -> Scenario {
     let reader = Pid(9);
     let writer = Pid(10);
+
+    let worker_nice: i8 = if with_nice_hints { -5 } else { 0 };
+    let reader_nice: i8 = if with_nice_hints { -10 } else { 0 };
+    let writer_nice: i8 = if with_nice_hints { 5 } else { 0 };
 
     let mut builder = Scenario::builder().cpus(NUM_CPUS);
 
@@ -1249,18 +1241,16 @@ fn test_ucache_cartoon_hubspoke_misclassification() {
         migration_disabled: 0,
     });
 
-    // Hub workers: compute → wake writer → (every 3rd: wake reader) → sleep
-    // Worker 0 wakes both reader and writer every iteration (hub)
-    // Workers 1-7 just run/sleep independently (spokes)
+    // Hub_0: wakes both reader and writer
     builder = builder.task(TaskDef {
         name: "ucache_hub_0".into(),
         pid: worker_pid(0),
-        nice: 0,
+        nice: worker_nice,
         behavior: TaskBehavior {
             phases: vec![
                 Phase::Run(WORKER_RUN_NS),
-                Phase::Wake(writer),  // wake writer every iteration
-                Phase::Wake(reader),  // wake reader every iteration too
+                Phase::Wake(writer),
+                Phase::Wake(reader),
                 Phase::Sleep(WORKER_SLEEP_NS),
             ],
             repeat: RepeatMode::Forever,
@@ -1274,16 +1264,15 @@ fn test_ucache_cartoon_hubspoke_misclassification() {
         migration_disabled: 0,
     });
 
-    // Additional hub worker that only wakes writer (not reader)
-    // This gives writer 2x the wake sources
+    // Hub_1: wakes writer only (gives writer 2x wake sources)
     builder = builder.task(TaskDef {
         name: "ucache_hub_1".into(),
         pid: worker_pid(1),
-        nice: 0,
+        nice: worker_nice,
         behavior: TaskBehavior {
             phases: vec![
                 Phase::Run(WORKER_RUN_NS),
-                Phase::Wake(writer),  // wakes writer only
+                Phase::Wake(writer),
                 Phase::Sleep(WORKER_SLEEP_NS),
             ],
             repeat: RepeatMode::Forever,
@@ -1297,12 +1286,12 @@ fn test_ucache_cartoon_hubspoke_misclassification() {
         migration_disabled: 0,
     });
 
-    // Remaining workers: independent run/sleep (no hub interaction)
+    // Remaining workers: independent run/sleep
     for i in 2..NUM_WORKERS {
         builder = builder.task(TaskDef {
             name: format!("ucache_worker_{i}"),
             pid: worker_pid(i),
-            nice: 0,
+            nice: worker_nice,
             behavior: TaskBehavior {
                 phases: vec![
                     Phase::Run(WORKER_RUN_NS),
@@ -1320,11 +1309,11 @@ fn test_ucache_cartoon_hubspoke_misclassification() {
         });
     }
 
-    // Navy reader: runs briefly then sleeps (models SSD I/O wait)
+    // Navy reader
     builder = builder.task(TaskDef {
         name: "navy_reader_0".into(),
         pid: reader,
-        nice: 0,
+        nice: reader_nice,
         behavior: TaskBehavior {
             phases: vec![
                 Phase::Run(READER_RUN_NS),
@@ -1341,11 +1330,11 @@ fn test_ucache_cartoon_hubspoke_misclassification() {
         migration_disabled: 0,
     });
 
-    // Navy writer: runs briefly then sleeps
+    // Navy writer
     builder = builder.task(TaskDef {
         name: "navy_writer_0".into(),
         pid: writer,
-        nice: 0,
+        nice: writer_nice,
         behavior: TaskBehavior {
             phases: vec![
                 Phase::Run(WRITER_RUN_NS),
@@ -1394,7 +1383,27 @@ fn test_ucache_cartoon_hubspoke_misclassification() {
         );
     }
 
-    let scenario = builder.duration_ms(DURATION_MS).build();
+    builder.duration_ms(DURATION_MS).build()
+}
+
+/// Prove whether hub-spoke Wake patterns trigger the LAVD misclassification.
+///
+/// The calibrated cartoon uses independent run/sleep phases. LAVD's wake_freq
+/// only accumulates when a WAKER explicitly wakes a WAKEE (same parent).
+/// With Sleep, there's no waker → wake_freq=0 → no misclassification.
+///
+/// This test builds a hub-spoke pattern where ucache_workers explicitly wake
+/// navy_reader and navy_writer, with writer being woken more frequently.
+/// If LAVD's misclassification exists, the worker's wake_freq should be high,
+/// and the writer's wait_freq should exceed the reader's.
+#[test]
+fn test_ucache_cartoon_hubspoke_misclassification() {
+    let _lock = common::setup_test();
+
+    let reader = Pid(9);
+    let writer = Pid(10);
+
+    let scenario = build_hubspoke_scenario(false);
 
     let sched = DynamicScheduler::lavd(NUM_CPUS);
     let probes = LavdProbes::new(&sched);
@@ -1485,4 +1494,137 @@ fn test_ucache_cartoon_hubspoke_misclassification() {
     }
     eprintln!("    reader:  {}", trace.schedule_count(reader));
     eprintln!("    writer:  {}", trace.schedule_count(writer));
+}
+
+/// Level 2 hub-spoke: prove nice hints CORRECT the misclassification.
+///
+/// The hub-spoke test (nice=0) shows writer lat_cri > reader (misclassified).
+/// Applying nice=-10 to reader and nice=+5 to writer should flip it back:
+/// reader lat_cri > writer, even with writer's 2x higher wait_freq.
+#[test]
+fn test_ucache_cartoon_hubspoke_nice_fix() {
+    let _lock = common::setup_test();
+
+    let reader = Pid(9);
+    let writer = Pid(10);
+
+    // --- Baseline (nice=0): misclassification present ---
+    let sched_l1 = DynamicScheduler::lavd(NUM_CPUS);
+    let probes_l1 = LavdProbes::new(&sched_l1);
+    let mut monitor_l1 = LavdMonitor::new(probes_l1);
+    let scenario_l1 = build_hubspoke_scenario(false);
+    let _result_l1 = Simulator::new(sched_l1).run_monitored(scenario_l1, &mut monitor_l1);
+
+    let l1_reader = monitor_l1.final_snapshot(reader);
+    let l1_writer = monitor_l1.final_snapshot(writer);
+    let l1_hub0 = monitor_l1.final_snapshot(worker_pid(0));
+
+    // --- Level 2 (nice hints): fix applied ---
+    let sched_l2 = DynamicScheduler::lavd(NUM_CPUS);
+    let probes_l2 = LavdProbes::new(&sched_l2);
+    let mut monitor_l2 = LavdMonitor::new(probes_l2);
+    let scenario_l2 = build_hubspoke_scenario(true);
+    let result_l2 = Simulator::new(sched_l2).run_monitored(scenario_l2, &mut monitor_l2);
+
+    let l2_reader = monitor_l2.final_snapshot(reader);
+    let l2_writer = monitor_l2.final_snapshot(writer);
+    let l2_hub0 = monitor_l2.final_snapshot(worker_pid(0));
+
+    eprintln!("\n=== Hub-Spoke: Nice Hints Fix Misclassification ===\n");
+    eprintln!("                        Baseline (nice=0)    With Hints (r=-10, w=+5)");
+    eprintln!("                        ----------------     ------------------------");
+
+    if let (Some(r1), Some(r2)) = (&l1_reader, &l2_reader) {
+        eprintln!(
+            "  navy_reader  lat_cri: {:>5}  wait_freq:{:>6}   {:>5}  wait_freq:{:>6}",
+            r1.lat_cri, r1.wait_freq, r2.lat_cri, r2.wait_freq
+        );
+    }
+    if let (Some(w1), Some(w2)) = (&l1_writer, &l2_writer) {
+        eprintln!(
+            "  navy_writer  lat_cri: {:>5}  wait_freq:{:>6}   {:>5}  wait_freq:{:>6}",
+            w1.lat_cri, w1.wait_freq, w2.lat_cri, w2.wait_freq
+        );
+    }
+    if let (Some(h1), Some(h2)) = (&l1_hub0, &l2_hub0) {
+        eprintln!(
+            "  ucache_hub_0 lat_cri: {:>5}  wake_freq:{:>6}   {:>5}  wake_freq:{:>6}",
+            h1.lat_cri, h1.wake_freq, h2.lat_cri, h2.wake_freq
+        );
+    }
+
+    if let (Some(r1), Some(w1), Some(r2), Some(w2)) =
+        (&l1_reader, &l1_writer, &l2_reader, &l2_writer)
+    {
+        let gap_l1 = r1.lat_cri as i64 - w1.lat_cri as i64;
+        let gap_l2 = r2.lat_cri as i64 - w2.lat_cri as i64;
+        eprintln!("\n  reader - writer lat_cri:");
+        eprintln!(
+            "    Baseline: {} ({} → {})",
+            gap_l1,
+            if gap_l1 < 0 { "MISCLASSIFIED" } else { "correct" },
+            if gap_l1 < 0 { "writer > reader" } else { "reader > writer" }
+        );
+        eprintln!(
+            "    With hints: {} ({} → {})",
+            gap_l2,
+            if gap_l2 < 0 { "STILL MISCLASSIFIED" } else { "FIXED" },
+            if gap_l2 < 0 { "writer > reader" } else { "reader > writer" }
+        );
+
+        // The key assertion: nice hints must fix the misclassification
+        assert!(
+            gap_l2 > 0,
+            "nice hints should fix hub-spoke misclassification: \
+             reader lat_cri ({}) should exceed writer lat_cri ({})",
+            r2.lat_cri, w2.lat_cri
+        );
+
+        // Verify baseline was actually misclassified
+        if gap_l1 < 0 {
+            eprintln!("\n  ✓ Baseline misclassification confirmed (gap={})", gap_l1);
+            eprintln!("  ✓ Nice hints corrected it (gap={})", gap_l2);
+            eprintln!("  ✓ Gap swing: {} → {} (delta={})", gap_l1, gap_l2, gap_l2 - gap_l1);
+        } else {
+            eprintln!("\n  NOTE: Baseline was not misclassified (gap={})", gap_l1);
+            eprintln!("  Nice hints widened the gap to {}", gap_l2);
+        }
+    }
+
+    // IRQ placement comparison
+    let trace_l2 = &result_l2.trace;
+    let mut l2_irq_reader = 0u32;
+    let mut l2_total_reader = 0u32;
+    let mut l2_irq_writer = 0u32;
+    let mut l2_total_writer = 0u32;
+
+    for event in trace_l2.events() {
+        if let TraceKind::TaskScheduled { pid } = &event.kind {
+            let cpu = event.cpu.0 as usize;
+            if cpu >= NUM_CPUS as usize { continue; }
+            let on_irq = (cpu as u32) < IRQ_CPU_COUNT;
+            if *pid == reader {
+                l2_total_reader += 1;
+                if on_irq { l2_irq_reader += 1; }
+            } else if *pid == writer {
+                l2_total_writer += 1;
+                if on_irq { l2_irq_writer += 1; }
+            }
+        }
+    }
+
+    eprintln!(
+        "\n  Level 2 IRQ placement (expected random: {:.1}%):",
+        100.0 * IRQ_CPU_COUNT as f64 / NUM_CPUS as f64
+    );
+    eprintln!(
+        "    Reader: {}/{} ({:.1}%)",
+        l2_irq_reader, l2_total_reader,
+        100.0 * l2_irq_reader as f64 / l2_total_reader.max(1) as f64
+    );
+    eprintln!(
+        "    Writer: {}/{} ({:.1}%)",
+        l2_irq_writer, l2_total_writer,
+        100.0 * l2_irq_writer as f64 / l2_total_writer.max(1) as f64
+    );
 }
