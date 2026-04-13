@@ -1,10 +1,10 @@
 ---
 title: Purge old batch/phase architecture, complete persistent worker model
-status: open
+status: closed
 priority: 0
 issue_type: feature
 created_at: 2026-04-03T18:54:50.069483355+00:00
-updated_at: 2026-04-03T18:54:50.069483355+00:00
+updated_at: 2026-04-08T00:10:13.035540425+00:00
 ---
 
 # Description
