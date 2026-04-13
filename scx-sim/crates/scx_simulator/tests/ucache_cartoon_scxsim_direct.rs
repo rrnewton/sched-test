@@ -1628,3 +1628,167 @@ fn test_ucache_cartoon_hubspoke_nice_fix() {
         100.0 * l2_irq_writer as f64 / l2_total_writer.max(1) as f64
     );
 }
+
+// ============================================================================
+// Round-trip / cycle-time latency analysis
+// ============================================================================
+
+/// Helper: compute per-thread cycle times (inter-schedule intervals) from trace.
+///
+/// A "cycle" for an independent run+sleep thread is: scheduled → run → sleep →
+/// wake → scheduled. The cycle time = time between successive TaskScheduled
+/// events for the same PID. This is the closest proxy to "round-trip latency"
+/// for threads that don't participate in cross-thread wake chains.
+fn compute_cycle_times(trace: &Trace, pids: &[Pid]) -> Vec<u64> {
+    let mut last_sched: std::collections::HashMap<Pid, u64> = std::collections::HashMap::new();
+    let mut cycles: Vec<u64> = Vec::new();
+
+    for event in trace.events() {
+        if let TraceKind::TaskScheduled { pid } = &event.kind {
+            if pids.contains(pid) {
+                if let Some(prev) = last_sched.insert(*pid, event.time_ns) {
+                    let delta = event.time_ns.saturating_sub(prev);
+                    if delta > 0 {
+                        cycles.push(delta);
+                    }
+                }
+            }
+        }
+    }
+    cycles.sort();
+    cycles
+}
+
+fn pctl(sorted: &[u64], p: f64) -> u64 {
+    if sorted.is_empty() { return 0; }
+    sorted[((sorted.len() as f64 * p) as usize).min(sorted.len() - 1)]
+}
+
+fn cycle_avg(data: &[u64]) -> u64 {
+    if data.is_empty() { return 0; }
+    data.iter().sum::<u64>() / data.len() as u64
+}
+
+/// Measure per-thread cycle times across LAVD, tickless, and LAVD+nice for all
+/// thread types. Reports P50/P90/P99/max as the end-user-visible "round-trip"
+/// latency proxy.
+///
+/// In production ucache, the true round-trip is: client request → ucache_worker
+/// DRAM lookup → (on NVM miss) navy_reader SSD read → ucache_worker reply.
+/// The calibrated cartoon uses independent run+sleep (no cross-thread wake
+/// chains), so the measurable cycle time = run + sleep + scheduling overhead.
+///
+/// Expected cycle times:
+///   ucache_worker: 250us run + 110us sleep = 360us + overhead
+///   navy_reader:   35us  run + 250us sleep = 285us + overhead
+///   navy_writer:   22us  run + 198us sleep = 220us + overhead
+#[test]
+fn test_round_trip_latency() {
+    let _lock = common::setup_test();
+
+    let worker_pids: Vec<Pid> = (0..NUM_WORKERS).map(worker_pid).collect();
+    let reader_pids: Vec<Pid> = (0..NUM_READERS).map(reader_pid).collect();
+    let writer_pids: Vec<Pid> = (0..NUM_WRITERS).map(writer_pid).collect();
+
+    // ---- LAVD with IRQ (Level 1 baseline) ----
+    let sched_lavd = DynamicScheduler::lavd(NUM_CPUS);
+    let scenario_lavd = build_scenario(true);
+    let trace_lavd = Simulator::new(sched_lavd).run(scenario_lavd);
+
+    let lavd_worker_cycles = compute_cycle_times(&trace_lavd, &worker_pids);
+    let lavd_reader_cycles = compute_cycle_times(&trace_lavd, &reader_pids);
+    let lavd_writer_cycles = compute_cycle_times(&trace_lavd, &writer_pids);
+
+    // ---- Tickless (no scheduler intelligence) ----
+    let sched_tick = DynamicScheduler::tickless(NUM_CPUS);
+    let scenario_tick = build_scenario(true);
+    let trace_tick = Simulator::new(sched_tick).run(scenario_tick);
+
+    let tick_worker_cycles = compute_cycle_times(&trace_tick, &worker_pids);
+    let tick_reader_cycles = compute_cycle_times(&trace_tick, &reader_pids);
+    let tick_writer_cycles = compute_cycle_times(&trace_tick, &writer_pids);
+
+    // ---- LAVD with nice hints (Level 2) ----
+    let sched_nice = DynamicScheduler::lavd(NUM_CPUS);
+    let scenario_nice = build_scenario_inner(true, true);
+    let trace_nice = Simulator::new(sched_nice).run(scenario_nice);
+
+    let nice_worker_cycles = compute_cycle_times(&trace_nice, &worker_pids);
+    let nice_reader_cycles = compute_cycle_times(&trace_nice, &reader_pids);
+    let nice_writer_cycles = compute_cycle_times(&trace_nice, &writer_pids);
+
+    // ---- Report ----
+    eprintln!("\n=== Round-Trip (Cycle Time) Latency Report ===\n");
+    eprintln!("Definition: cycle time = time between successive TaskScheduled events");
+    eprintln!("for the same thread. Includes: run + sleep + scheduling delay + any");
+    eprintln!("IRQ-stolen time. This is the per-thread period, the closest proxy to");
+    eprintln!("end-user-visible request latency in the independent run+sleep model.\n");
+    eprintln!("Expected (no overhead): worker=360us, reader=285us, writer=220us\n");
+
+    let report_row = |label: &str, data: &[u64]| {
+        eprintln!(
+            "  {:<30}  N={:>5}  avg={:>7}  P50={:>7}  P90={:>7}  P99={:>7}  max={:>7}",
+            label, data.len(),
+            cycle_avg(data), pctl(data, 0.5), pctl(data, 0.9),
+            pctl(data, 0.99), data.last().copied().unwrap_or(0)
+        );
+    };
+
+    eprintln!("--- ucache_worker (expected cycle: 360 us = 360,000 ns) ---");
+    report_row("LAVD + IRQ (Level 1)", &lavd_worker_cycles);
+    report_row("Tickless + IRQ (baseline)", &tick_worker_cycles);
+    report_row("LAVD + IRQ + nice (Level 2)", &nice_worker_cycles);
+
+    eprintln!("\n--- navy_reader (expected cycle: 285 us = 285,000 ns) ---");
+    report_row("LAVD + IRQ (Level 1)", &lavd_reader_cycles);
+    report_row("Tickless + IRQ (baseline)", &tick_reader_cycles);
+    report_row("LAVD + IRQ + nice (Level 2)", &nice_reader_cycles);
+
+    eprintln!("\n--- navy_writer (expected cycle: 220 us = 220,000 ns) ---");
+    report_row("LAVD + IRQ (Level 1)", &lavd_writer_cycles);
+    report_row("Tickless + IRQ (baseline)", &tick_writer_cycles);
+    report_row("LAVD + IRQ + nice (Level 2)", &nice_writer_cycles);
+
+    // Summary comparison
+    eprintln!("\n--- Summary: P99 Cycle Time (ns) ---");
+    eprintln!(
+        "  {:>30}  {:>10}  {:>10}  {:>10}",
+        "Thread", "LAVD", "Tickless", "LAVD+nice"
+    );
+    eprintln!(
+        "  {:>30}  {:>10}  {:>10}  {:>10}",
+        "ucache_worker",
+        pctl(&lavd_worker_cycles, 0.99),
+        pctl(&tick_worker_cycles, 0.99),
+        pctl(&nice_worker_cycles, 0.99)
+    );
+    eprintln!(
+        "  {:>30}  {:>10}  {:>10}  {:>10}",
+        "navy_reader",
+        pctl(&lavd_reader_cycles, 0.99),
+        pctl(&tick_reader_cycles, 0.99),
+        pctl(&nice_reader_cycles, 0.99)
+    );
+    eprintln!(
+        "  {:>30}  {:>10}  {:>10}  {:>10}",
+        "navy_writer",
+        pctl(&lavd_writer_cycles, 0.99),
+        pctl(&tick_writer_cycles, 0.99),
+        pctl(&nice_writer_cycles, 0.99)
+    );
+
+    // Sanity: cycle times should be at least run+sleep duration
+    assert!(
+        pctl(&lavd_worker_cycles, 0.5) >= WORKER_RUN_NS + WORKER_SLEEP_NS,
+        "worker P50 cycle too short: {} < {}",
+        pctl(&lavd_worker_cycles, 0.5), WORKER_RUN_NS + WORKER_SLEEP_NS
+    );
+    assert!(
+        pctl(&lavd_reader_cycles, 0.5) >= READER_RUN_NS + READER_SLEEP_NS,
+        "reader P50 cycle too short"
+    );
+    assert!(
+        pctl(&lavd_writer_cycles, 0.5) >= WRITER_RUN_NS + WRITER_SLEEP_NS,
+        "writer P50 cycle too short"
+    );
+}
