@@ -207,6 +207,14 @@ struct RunArgs {
     #[arg(long, value_name = "DURATION")]
     end_time: Option<String>,
 
+    /// Warmup period in milliseconds.
+    ///
+    /// When set, trace statistics (summary, TraceStats) exclude events
+    /// that occurred before this simulated time. The simulation still runs
+    /// from time 0, but metrics only reflect post-warmup behavior.
+    #[arg(long, value_name = "MS")]
+    warmup_ms: Option<u64>,
+
     /// Write Perfetto trace JSON to file.
     #[arg(long, value_name = "PATH")]
     perfetto: Option<PathBuf>,
@@ -517,6 +525,9 @@ fn run(args: &RunArgs) -> Result<(), String> {
     if let Some(ref timeout) = args.watchdog_timeout {
         scenario.watchdog_timeout_ns =
             Some(parse_duration_ns(timeout).map_err(|e| format!("--watchdog-timeout: {e}"))?);
+    }
+    if let Some(warmup_ms) = args.warmup_ms {
+        scenario.warmup_ns = warmup_ms * 1_000_000;
     }
     if args.wait_debugger {
         scenario.wait_debugger = true;

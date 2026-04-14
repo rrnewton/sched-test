@@ -179,16 +179,18 @@ fn pctl(sorted: &[u64], p: f64) -> u64 {
 }
 
 /// Compute cycle times (inter-schedule intervals) per PID.
-fn compute_cycle_times(trace: &Trace, pids: &[Pid]) -> Vec<u64> {
+fn compute_cycle_times(trace: &Trace, pids: &[Pid], warmup_ns: u64) -> Vec<u64> {
     let mut last_sched: HashMap<Pid, u64> = HashMap::new();
     let mut cycles: Vec<u64> = Vec::new();
     for event in trace.events() {
         if let TraceKind::TaskScheduled { pid } = &event.kind {
             if pids.contains(pid) {
                 if let Some(prev) = last_sched.insert(*pid, event.time_ns) {
-                    let delta = event.time_ns.saturating_sub(prev);
-                    if delta > 0 {
-                        cycles.push(delta);
+                    if event.time_ns >= warmup_ns {
+                        let delta = event.time_ns.saturating_sub(prev);
+                        if delta > 0 {
+                            cycles.push(delta);
+                        }
                     }
                 }
             }
@@ -199,7 +201,7 @@ fn compute_cycle_times(trace: &Trace, pids: &[Pid]) -> Vec<u64> {
 }
 
 /// Compute scheduling latencies (wake-to-scheduled) for given PIDs.
-fn compute_sched_latencies(trace: &Trace, pids: &[Pid]) -> Vec<u64> {
+fn compute_sched_latencies(trace: &Trace, pids: &[Pid], warmup_ns: u64) -> Vec<u64> {
     let mut last_wake: HashMap<Pid, u64> = HashMap::new();
     let mut latencies: Vec<u64> = Vec::new();
     for event in trace.events() {
@@ -209,7 +211,9 @@ fn compute_sched_latencies(trace: &Trace, pids: &[Pid]) -> Vec<u64> {
             }
             TraceKind::TaskScheduled { pid } if pids.contains(pid) => {
                 if let Some(wake_time) = last_wake.remove(pid) {
-                    latencies.push(event.time_ns.saturating_sub(wake_time));
+                    if event.time_ns >= warmup_ns {
+                        latencies.push(event.time_ns.saturating_sub(wake_time));
+                    }
                 }
             }
             _ => {}
@@ -221,7 +225,7 @@ fn compute_sched_latencies(trace: &Trace, pids: &[Pid]) -> Vec<u64> {
 
 /// Compute time-weighted IRQ exposure for given PIDs.
 /// Returns (runtime_on_irq_ns, total_runtime_ns).
-fn compute_irq_exposure(trace: &Trace, pids: &[Pid]) -> (u64, u64) {
+fn compute_irq_exposure(trace: &Trace, pids: &[Pid], warmup_ns: u64) -> (u64, u64) {
     let mut running_since: HashMap<Pid, (u64, u32)> = HashMap::new();
     let mut irq_ns: u64 = 0;
     let mut total_ns: u64 = 0;
@@ -238,10 +242,14 @@ fn compute_irq_exposure(trace: &Trace, pids: &[Pid]) -> (u64, u64) {
                 if pids.contains(pid) =>
             {
                 if let Some((start, cpu)) = running_since.remove(pid) {
-                    let dur = event.time_ns.saturating_sub(start);
-                    total_ns += dur;
-                    if IRQ_CPUS.contains(&cpu) {
-                        irq_ns += dur;
+                    // Clamp start to warmup boundary
+                    let effective_start = start.max(warmup_ns);
+                    if event.time_ns > effective_start {
+                        let dur = event.time_ns - effective_start;
+                        total_ns += dur;
+                        if IRQ_CPUS.contains(&cpu) {
+                            irq_ns += dur;
+                        }
                     }
                 }
             }
@@ -397,6 +405,11 @@ fn csv_experiment_run() {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(1);
+    let warmup_ms: u64 = std::env::var("SCX_SIM_WARMUP_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let warmup_ns: u64 = warmup_ms * 1_000_000;
 
     let with_nice_hints = condition.contains("nice_hints") || condition.contains("level2");
     let timestamp = std::env::var("SCX_SIM_TIMESTAMP").unwrap_or_else(|_| {
@@ -512,8 +525,8 @@ fn csv_experiment_run() {
     let reader_pids: Vec<Pid> = (0..NUM_READERS).map(reader_pid).collect();
     let _writer_pids: Vec<Pid> = (0..NUM_WRITERS).map(writer_pid).collect();
 
-    let worker_cycles = compute_cycle_times(&trace, &worker_pids);
-    let reader_cycles = compute_cycle_times(&trace, &reader_pids);
+    let worker_cycles = compute_cycle_times(&trace, &worker_pids, warmup_ns);
+    let reader_cycles = compute_cycle_times(&trace, &reader_pids, warmup_ns);
 
     // E2E for cache_worker (aggregate across all worker PIDs)
     emit_latency_percentiles(
@@ -542,8 +555,8 @@ fn csv_experiment_run() {
     );
 
     // ---- Scheduling latency ----
-    let worker_sched_lat = compute_sched_latencies(&trace, &worker_pids);
-    let reader_sched_lat = compute_sched_latencies(&trace, &reader_pids);
+    let worker_sched_lat = compute_sched_latencies(&trace, &worker_pids, warmup_ns);
+    let reader_sched_lat = compute_sched_latencies(&trace, &reader_pids, warmup_ns);
 
     emit_latency_percentiles(
         &timestamp,
@@ -570,8 +583,8 @@ fn csv_experiment_run() {
     );
 
     // ---- IRQ exposure ----
-    let (worker_irq_ns, worker_total_ns) = compute_irq_exposure(&trace, &worker_pids);
-    let (reader_irq_ns, reader_total_ns) = compute_irq_exposure(&trace, &reader_pids);
+    let (worker_irq_ns, worker_total_ns) = compute_irq_exposure(&trace, &worker_pids, warmup_ns);
+    let (reader_irq_ns, reader_total_ns) = compute_irq_exposure(&trace, &reader_pids, warmup_ns);
 
     if worker_total_ns > 0 {
         let pct = 100.0 * worker_irq_ns as f64 / worker_total_ns as f64;
@@ -614,6 +627,9 @@ fn csv_experiment_run() {
     let mut reader_irq_count = 0u32;
     let mut reader_total_count = 0u32;
     for event in trace.events() {
+        if event.time_ns < warmup_ns {
+            continue;
+        }
         if let TraceKind::TaskScheduled { pid } = &event.kind {
             let on_irq = IRQ_CPUS.contains(&event.cpu.0);
             if worker_pids.contains(pid) {

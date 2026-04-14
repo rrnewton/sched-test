@@ -188,10 +188,16 @@ pub struct Trace {
     exit_kind: ExitKind,
     /// DSQ length samples for analyzing queue behavior under load.
     dsq_samples: Vec<DsqLengthSample>,
+    /// Warmup period: stats exclude events before this simulated time.
+    warmup_ns: TimeNs,
 }
 
 impl Trace {
     pub(crate) fn new(nr_cpus: u32, tasks: &[TaskDef]) -> Self {
+        Self::with_warmup(nr_cpus, tasks, 0)
+    }
+
+    pub(crate) fn with_warmup(nr_cpus: u32, tasks: &[TaskDef], warmup_ns: TimeNs) -> Self {
         let task_names = tasks.iter().map(|t| (t.pid, t.name.clone())).collect();
         Self {
             events: Vec::new(),
@@ -199,6 +205,7 @@ impl Trace {
             task_names,
             exit_kind: ExitKind::Normal,
             dsq_samples: Vec::new(),
+            warmup_ns,
         }
     }
 
@@ -228,6 +235,11 @@ impl Trace {
 
     pub(crate) fn record(&mut self, time_ns: TimeNs, cpu: CpuId, kind: TraceKind) {
         self.events.push(TraceEvent { time_ns, cpu, kind });
+    }
+
+    /// Get the warmup period in nanoseconds.
+    pub fn warmup_ns(&self) -> TimeNs {
+        self.warmup_ns
     }
 
     /// Get all events in chronological order.
@@ -404,12 +416,40 @@ impl Trace {
         (global, local)
     }
 
+    /// Like `dsq_dispatch_counts` but only counts events at or after `after_ns`.
+    fn dsq_dispatch_counts_after(&self, after_ns: TimeNs) -> (usize, usize) {
+        let mut global = 0usize;
+        let mut local = 0usize;
+        const LOCAL_DSQ_MASK: u64 = 0xC000_0000_0000_0000;
+
+        for event in &self.events {
+            if event.time_ns < after_ns {
+                continue;
+            }
+            match &event.kind {
+                TraceKind::DsqInsert { dsq_id, .. } | TraceKind::DsqInsertVtime { dsq_id, .. } => {
+                    if dsq_id.0 & LOCAL_DSQ_MASK != 0 {
+                        local += 1;
+                    } else {
+                        global += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        (global, local)
+    }
+
     /// Get a summary of trace statistics useful for realism comparison.
     ///
     /// Returns a struct with key metrics for comparing simulated vs real traces.
+    /// When `warmup_ns > 0`, events before that time are excluded from counts
+    /// (but still tracked for state like idle start times).
     pub fn summary(&self) -> TraceSummary {
         use std::collections::HashMap;
 
+        let warmup = self.warmup_ns;
         let mut total_ticks = 0usize;
         let mut total_yields = 0usize;
         let mut total_preempts = 0usize;
@@ -424,34 +464,65 @@ impl Trace {
 
         for event in &self.events {
             last_event_time = last_event_time.max(event.time_ns);
+
+            // Always track idle state transitions for correct duration accounting.
+            match &event.kind {
+                TraceKind::CpuIdle => {
+                    cpu_idle_since.insert(event.cpu, event.time_ns);
+                    if event.time_ns >= warmup {
+                        total_idle_periods += 1;
+                    }
+                }
+                TraceKind::TaskScheduled { .. } => {
+                    if let Some(idle_start) = cpu_idle_since.remove(&event.cpu) {
+                        // Only count idle duration within the post-warmup window.
+                        let effective_start = idle_start.max(warmup);
+                        if event.time_ns > effective_start {
+                            total_idle_duration_ns += event.time_ns.saturating_sub(effective_start);
+                        }
+                    }
+                }
+                _ => {}
+            }
+
+            // Skip counting non-idle events before warmup.
+            if event.time_ns < warmup {
+                continue;
+            }
+
             match &event.kind {
                 TraceKind::Tick { .. } => total_ticks += 1,
                 TraceKind::TaskYielded { .. } => total_yields += 1,
                 TraceKind::TaskPreempted { .. } => total_preempts += 1,
                 TraceKind::TaskSlept { .. } => total_sleeps += 1,
                 TraceKind::TaskWoke { .. } => total_wakes += 1,
-                TraceKind::CpuIdle => {
-                    total_idle_periods += 1;
-                    cpu_idle_since.insert(event.cpu, event.time_ns);
-                }
-                TraceKind::TaskScheduled { .. } => {
-                    if let Some(idle_start) = cpu_idle_since.remove(&event.cpu) {
-                        total_idle_duration_ns += event.time_ns.saturating_sub(idle_start);
-                    }
-                }
+                // CpuIdle and TaskScheduled already handled above.
                 _ => {}
             }
         }
 
         // Flush CPUs still idle at end of trace
         for idle_start in cpu_idle_since.values() {
-            total_idle_duration_ns += last_event_time.saturating_sub(*idle_start);
+            let effective_start = (*idle_start).max(warmup);
+            if last_event_time > effective_start {
+                total_idle_duration_ns += last_event_time.saturating_sub(effective_start);
+            }
         }
 
-        let (global_dsq, local_dsq) = self.dsq_dispatch_counts();
+        let total_events = if warmup > 0 {
+            self.events.iter().filter(|e| e.time_ns >= warmup).count()
+        } else {
+            self.events.len()
+        };
+
+        let (global_dsq, local_dsq) = if warmup > 0 {
+            self.dsq_dispatch_counts_after(warmup)
+        } else {
+            self.dsq_dispatch_counts()
+        };
 
         TraceSummary {
-            total_events: self.events.len(),
+            total_events,
             total_ticks,
             total_yields,
             total_preempts,
