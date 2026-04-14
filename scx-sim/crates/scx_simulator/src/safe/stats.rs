@@ -120,6 +120,8 @@ pub struct CpuStats {
     pub tick_interval: DistributionStats,
     /// Number of times this CPU went idle.
     pub idle_count: usize,
+    /// Total time this CPU spent idle (nanoseconds).
+    pub idle_duration_ns: TimeNs,
     /// Number of dispatch (balance) calls on this CPU.
     pub balance_count: usize,
 }
@@ -152,6 +154,7 @@ impl TraceStats {
         let mut task_last_scheduled: HashMap<Pid, TimeNs> = HashMap::new();
         let mut task_running_since: HashMap<Pid, TimeNs> = HashMap::new();
         let mut cpu_last_tick: HashMap<CpuId, TimeNs> = HashMap::new();
+        let mut cpu_idle_since: HashMap<CpuId, TimeNs> = HashMap::new();
         let mut last_event_time: TimeNs = 0;
 
         // Track if the last select_cpu did a direct dispatch (by checking
@@ -177,6 +180,13 @@ impl TraceStats {
                     });
                     task_stats.schedule_count += 1;
                     task_running_since.insert(*pid, event.time_ns);
+
+                    // End idle interval for this CPU if it was idle
+                    if let Some(idle_start) = cpu_idle_since.remove(&event.cpu) {
+                        let idle_dur = event.time_ns.saturating_sub(idle_start);
+                        let cpu_stats = stats.cpus.get_mut(&event.cpu).unwrap();
+                        cpu_stats.idle_duration_ns += idle_dur;
+                    }
 
                     // Compute inter-arrival time
                     if let Some(last_time) = task_last_scheduled.get(pid) {
@@ -254,6 +264,7 @@ impl TraceStats {
                 TraceKind::CpuIdle => {
                     let cpu_stats = stats.cpus.get_mut(&event.cpu).unwrap();
                     cpu_stats.idle_count += 1;
+                    cpu_idle_since.insert(event.cpu, event.time_ns);
                 }
 
                 TraceKind::Tick { .. } => {
@@ -277,6 +288,14 @@ impl TraceStats {
                 }
 
                 _ => {}
+            }
+        }
+
+        // Flush CPUs still idle at end of trace
+        for (cpu, idle_start) in &cpu_idle_since {
+            let idle_dur = last_event_time.saturating_sub(*idle_start);
+            if let Some(cpu_stats) = stats.cpus.get_mut(cpu) {
+                cpu_stats.idle_duration_ns += idle_dur;
             }
         }
 
@@ -334,8 +353,31 @@ impl TraceStats {
             );
             println!("    Balance calls: {}", cs.balance_count);
             println!("    Idle events:   {}", cs.idle_count);
+            println!(
+                "    Idle duration: {:.3}ms",
+                cs.idle_duration_ns as f64 / 1_000_000.0
+            );
+            if self.duration_ns > 0 {
+                let util = 1.0 - (cs.idle_duration_ns as f64 / self.duration_ns as f64);
+                println!("    Utilization:   {:.1}%", util * 100.0);
+            }
         }
         println!();
+
+        // Overall utilization across all CPUs
+        if !self.cpus.is_empty() && self.duration_ns > 0 {
+            let total_idle: u64 = self.cpus.values().map(|c| c.idle_duration_ns).sum();
+            let num_cpus = self.cpus.len() as u64;
+            let total_capacity = num_cpus * self.duration_ns;
+            let overall_util = 1.0 - (total_idle as f64 / total_capacity as f64);
+            println!(
+                "--- Overall CPU Utilization: {:.1}% ({} CPUs, {:.3}ms) ---",
+                overall_util * 100.0,
+                num_cpus,
+                self.duration_ns as f64 / 1_000_000.0,
+            );
+            println!();
+        }
 
         println!("--- Global Statistics ---");
         println!("  DSQ inserts (FIFO):    {}", self.dsq_insert_count);
