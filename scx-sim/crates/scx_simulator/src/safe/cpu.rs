@@ -62,6 +62,9 @@ pub struct SimCpu {
     /// Accumulated IRQ time stolen from the current running task (ns).
     /// Reset when the task stops or when accounted for in phase/slice events.
     pub irq_stolen_ns: TimeNs,
+    /// Cumulative IRQ time on this CPU since simulation start (ns).
+    /// Never reset. Used by `sim_scx_clock_task` to compute task-only clock.
+    pub irq_cumulative_ns: TimeNs,
 }
 
 impl SimCpu {
@@ -79,6 +82,7 @@ impl SimCpu {
             is_online: true,
             irq_context: IrqContext::None,
             irq_stolen_ns: 0,
+            irq_cumulative_ns: 0,
         }
     }
 
