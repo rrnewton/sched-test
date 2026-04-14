@@ -40,10 +40,18 @@ const IRQ_INTERVAL_NS: u64 = 10_000_000; // 10ms period (matching rt-app)
 const IRQ_DURATION_NS: u64 = 5_000_000; // 5ms burst (50% duty cycle)
 const IRQ_CPUS: [u32; 4] = [0, 2, 4, 6]; // even-numbered workload CPUs
 
-fn worker_pid(i: i32) -> Pid { Pid(1 + i) }
-fn reader_pid(i: i32) -> Pid { Pid(1 + NUM_WORKERS + i) }
-fn writer_pid(i: i32) -> Pid { Pid(1 + NUM_WORKERS + NUM_READERS + i) }
-fn hog_pid(i: i32) -> Pid { Pid(1 + NUM_WORKERS + NUM_READERS + NUM_WRITERS + i) }
+fn worker_pid(i: i32) -> Pid {
+    Pid(1 + i)
+}
+fn reader_pid(i: i32) -> Pid {
+    Pid(1 + NUM_WORKERS + i)
+}
+fn writer_pid(i: i32) -> Pid {
+    Pid(1 + NUM_WORKERS + NUM_READERS + i)
+}
+fn hog_pid(i: i32) -> Pid {
+    Pid(1 + NUM_WORKERS + NUM_READERS + NUM_WRITERS + i)
+}
 
 fn build_scenario(nr_cpus: u32, with_nice_hints: bool, duration_ms: u64) -> Scenario {
     let mut builder = Scenario::builder().cpus(nr_cpus);
@@ -164,7 +172,9 @@ fn build_scenario(nr_cpus: u32, with_nice_hints: bool, duration_ms: u64) -> Scen
 // ---- Metric extraction ----
 
 fn pctl(sorted: &[u64], p: f64) -> u64 {
-    if sorted.is_empty() { return 0; }
+    if sorted.is_empty() {
+        return 0;
+    }
     sorted[((sorted.len() as f64 * p) as usize).min(sorted.len() - 1)]
 }
 
@@ -257,30 +267,108 @@ fn emit_csv_row(
 ) {
     println!(
         "{},simulator,{},{},{},{},{},{},{},{},{},{},{}",
-        timestamp, scheduler, condition, thread_type, thread_id,
-        metric, percentile, value, unit, n, rep, notes
+        timestamp,
+        scheduler,
+        condition,
+        thread_type,
+        thread_id,
+        metric,
+        percentile,
+        value,
+        unit,
+        n,
+        rep,
+        notes
     );
 }
 
 // ---- Percentile metrics ----
 
 fn emit_latency_percentiles(
-    timestamp: &str, scheduler: &str, condition: &str,
-    thread_type: &str, thread_id: i32,
-    metric_name: &str, sorted: &[u64], rep: u32, notes: &str,
+    timestamp: &str,
+    scheduler: &str,
+    condition: &str,
+    thread_type: &str,
+    thread_id: i32,
+    metric_name: &str,
+    sorted: &[u64],
+    rep: u32,
+    notes: &str,
 ) {
     let n = sorted.len();
-    if n == 0 { return; }
-    emit_csv_row(timestamp, scheduler, condition, thread_type, thread_id,
-        metric_name, "p50", pctl(sorted, 0.50) as f64, "ns", n, rep, notes);
-    emit_csv_row(timestamp, scheduler, condition, thread_type, thread_id,
-        metric_name, "p90", pctl(sorted, 0.90) as f64, "ns", n, rep, notes);
-    emit_csv_row(timestamp, scheduler, condition, thread_type, thread_id,
-        metric_name, "p99", pctl(sorted, 0.99) as f64, "ns", n, rep, notes);
-    emit_csv_row(timestamp, scheduler, condition, thread_type, thread_id,
-        metric_name, "p999", pctl(sorted, 0.999) as f64, "ns", n, rep, notes);
-    emit_csv_row(timestamp, scheduler, condition, thread_type, thread_id,
-        metric_name, "max", *sorted.last().unwrap() as f64, "ns", n, rep, notes);
+    if n == 0 {
+        return;
+    }
+    emit_csv_row(
+        timestamp,
+        scheduler,
+        condition,
+        thread_type,
+        thread_id,
+        metric_name,
+        "p50",
+        pctl(sorted, 0.50) as f64,
+        "ns",
+        n,
+        rep,
+        notes,
+    );
+    emit_csv_row(
+        timestamp,
+        scheduler,
+        condition,
+        thread_type,
+        thread_id,
+        metric_name,
+        "p90",
+        pctl(sorted, 0.90) as f64,
+        "ns",
+        n,
+        rep,
+        notes,
+    );
+    emit_csv_row(
+        timestamp,
+        scheduler,
+        condition,
+        thread_type,
+        thread_id,
+        metric_name,
+        "p99",
+        pctl(sorted, 0.99) as f64,
+        "ns",
+        n,
+        rep,
+        notes,
+    );
+    emit_csv_row(
+        timestamp,
+        scheduler,
+        condition,
+        thread_type,
+        thread_id,
+        metric_name,
+        "p999",
+        pctl(sorted, 0.999) as f64,
+        "ns",
+        n,
+        rep,
+        notes,
+    );
+    emit_csv_row(
+        timestamp,
+        scheduler,
+        condition,
+        thread_type,
+        thread_id,
+        metric_name,
+        "max",
+        *sorted.last().unwrap() as f64,
+        "ns",
+        n,
+        rep,
+        notes,
+    );
 }
 
 // ---- Main test ----
@@ -290,23 +378,33 @@ fn csv_experiment_run() {
     let _lock = common::setup_test();
 
     let nr_cpus: u32 = std::env::var("SCX_SIM_CORES")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(16);
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16);
     let scheduler = std::env::var("SCX_SIM_SCHEDULER").unwrap_or_else(|_| "lavd".into());
     let condition = std::env::var("SCX_SIM_CONDITION").unwrap_or_else(|_| "level1_nice0".into());
     let duration_ms: u64 = std::env::var("SCX_SIM_DURATION_MS")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(500);
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(500);
     let seed: u32 = std::env::var("SCX_SIM_SEED")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(42);
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(42);
     let perfetto_path = std::env::var("SCX_SIM_PERFETTO").ok();
     let print_header = std::env::var("SCX_SIM_CSV_HEADER").as_deref() == Ok("1");
     let rep: u32 = std::env::var("SCX_SIM_REP")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(1);
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
 
     let with_nice_hints = condition.contains("nice_hints") || condition.contains("level2");
     let timestamp = std::env::var("SCX_SIM_TIMESTAMP").unwrap_or_else(|_| {
         // Fall back to current date via system command
-        let output = std::process::Command::new("date").arg("+%Y-%m-%d")
-            .output().expect("failed to run date");
+        let output = std::process::Command::new("date")
+            .arg("+%Y-%m-%d")
+            .output()
+            .expect("failed to run date");
         String::from_utf8(output.stdout).unwrap().trim().to_string()
     });
     let sched_label = match scheduler.as_str() {
@@ -335,19 +433,61 @@ fn csv_experiment_run() {
         // Emit LAVD-specific metrics
         let thread_map: Vec<(&str, i32, Pid)> = {
             let mut v = Vec::new();
-            for i in 0..NUM_WORKERS { v.push(("cache_worker", i, worker_pid(i))); }
-            for i in 0..NUM_READERS { v.push(("ssd_reader", i, reader_pid(i))); }
-            for i in 0..NUM_WRITERS { v.push(("ssd_writer", i, writer_pid(i))); }
+            for i in 0..NUM_WORKERS {
+                v.push(("cache_worker", i, worker_pid(i)));
+            }
+            for i in 0..NUM_READERS {
+                v.push(("ssd_reader", i, reader_pid(i)));
+            }
+            for i in 0..NUM_WRITERS {
+                v.push(("ssd_writer", i, writer_pid(i)));
+            }
             v
         };
         for (ttype, tid, pid) in &thread_map {
             if let Some(snap) = monitor.final_snapshot(*pid) {
-                emit_csv_row(&timestamp, sched_label, &condition, ttype, *tid,
-                    "lat_cri", "", snap.lat_cri as f64, "dimensionless", 1, rep, "final snapshot");
-                emit_csv_row(&timestamp, sched_label, &condition, ttype, *tid,
-                    "wake_freq", "", snap.wake_freq as f64, "dimensionless", 1, rep, "final snapshot");
-                emit_csv_row(&timestamp, sched_label, &condition, ttype, *tid,
-                    "wait_freq", "", snap.wait_freq as f64, "dimensionless", 1, rep, "final snapshot");
+                emit_csv_row(
+                    &timestamp,
+                    sched_label,
+                    &condition,
+                    ttype,
+                    *tid,
+                    "lat_cri",
+                    "",
+                    snap.lat_cri as f64,
+                    "dimensionless",
+                    1,
+                    rep,
+                    "final snapshot",
+                );
+                emit_csv_row(
+                    &timestamp,
+                    sched_label,
+                    &condition,
+                    ttype,
+                    *tid,
+                    "wake_freq",
+                    "",
+                    snap.wake_freq as f64,
+                    "dimensionless",
+                    1,
+                    rep,
+                    "final snapshot",
+                );
+                emit_csv_row(
+                    &timestamp,
+                    sched_label,
+                    &condition,
+                    ttype,
+                    *tid,
+                    "wait_freq",
+                    "",
+                    snap.wait_freq as f64,
+                    "dimensionless",
+                    1,
+                    rep,
+                    "final snapshot",
+                );
             }
         }
 
@@ -361,7 +501,8 @@ fn csv_experiment_run() {
     if let Some(ref path) = perfetto_path {
         let mut file = std::fs::File::create(path)
             .unwrap_or_else(|e| panic!("failed to create perfetto file {path}: {e}"));
-        trace.write_perfetto_json(&mut file)
+        trace
+            .write_perfetto_json(&mut file)
             .unwrap_or_else(|e| panic!("failed to write perfetto trace: {e}"));
         eprintln!("wrote perfetto trace to {path}");
     }
@@ -375,22 +516,58 @@ fn csv_experiment_run() {
     let reader_cycles = compute_cycle_times(&trace, &reader_pids);
 
     // E2E for cache_worker (aggregate across all worker PIDs)
-    emit_latency_percentiles(&timestamp, sched_label, &condition,
-        "cache_worker", 0, "e2e_latency", &worker_cycles, rep, "runsleep model");
+    emit_latency_percentiles(
+        &timestamp,
+        sched_label,
+        &condition,
+        "cache_worker",
+        0,
+        "e2e_latency",
+        &worker_cycles,
+        rep,
+        "runsleep model",
+    );
 
     // E2E for ssd_reader
-    emit_latency_percentiles(&timestamp, sched_label, &condition,
-        "ssd_reader", 0, "e2e_latency", &reader_cycles, rep, "runsleep model");
+    emit_latency_percentiles(
+        &timestamp,
+        sched_label,
+        &condition,
+        "ssd_reader",
+        0,
+        "e2e_latency",
+        &reader_cycles,
+        rep,
+        "runsleep model",
+    );
 
     // ---- Scheduling latency ----
     let worker_sched_lat = compute_sched_latencies(&trace, &worker_pids);
     let reader_sched_lat = compute_sched_latencies(&trace, &reader_pids);
 
-    emit_latency_percentiles(&timestamp, sched_label, &condition,
-        "cache_worker", 0, "sched_latency", &worker_sched_lat, rep, "");
+    emit_latency_percentiles(
+        &timestamp,
+        sched_label,
+        &condition,
+        "cache_worker",
+        0,
+        "sched_latency",
+        &worker_sched_lat,
+        rep,
+        "",
+    );
 
-    emit_latency_percentiles(&timestamp, sched_label, &condition,
-        "ssd_reader", 0, "sched_latency", &reader_sched_lat, rep, "");
+    emit_latency_percentiles(
+        &timestamp,
+        sched_label,
+        &condition,
+        "ssd_reader",
+        0,
+        "sched_latency",
+        &reader_sched_lat,
+        rep,
+        "",
+    );
 
     // ---- IRQ exposure ----
     let (worker_irq_ns, worker_total_ns) = compute_irq_exposure(&trace, &worker_pids);
@@ -398,15 +575,37 @@ fn csv_experiment_run() {
 
     if worker_total_ns > 0 {
         let pct = 100.0 * worker_irq_ns as f64 / worker_total_ns as f64;
-        emit_csv_row(&timestamp, sched_label, &condition,
-            "cache_worker", 0, "irq_exposure", "", pct, "pct",
-            worker_total_ns as usize, rep, "time-weighted");
+        emit_csv_row(
+            &timestamp,
+            sched_label,
+            &condition,
+            "cache_worker",
+            0,
+            "irq_exposure",
+            "",
+            pct,
+            "pct",
+            worker_total_ns as usize,
+            rep,
+            "time-weighted",
+        );
     }
     if reader_total_ns > 0 {
         let pct = 100.0 * reader_irq_ns as f64 / reader_total_ns as f64;
-        emit_csv_row(&timestamp, sched_label, &condition,
-            "ssd_reader", 0, "irq_exposure", "", pct, "pct",
-            reader_total_ns as usize, rep, "time-weighted");
+        emit_csv_row(
+            &timestamp,
+            sched_label,
+            &condition,
+            "ssd_reader",
+            0,
+            "irq_exposure",
+            "",
+            pct,
+            "pct",
+            reader_total_ns as usize,
+            rep,
+            "time-weighted",
+        );
     }
 
     // Also emit count-weighted IRQ exposure
@@ -419,26 +618,54 @@ fn csv_experiment_run() {
             let on_irq = IRQ_CPUS.contains(&event.cpu.0);
             if worker_pids.contains(pid) {
                 worker_total_count += 1;
-                if on_irq { worker_irq_count += 1; }
+                if on_irq {
+                    worker_irq_count += 1;
+                }
             } else if reader_pids.contains(pid) {
                 reader_total_count += 1;
-                if on_irq { reader_irq_count += 1; }
+                if on_irq {
+                    reader_irq_count += 1;
+                }
             }
         }
     }
     if worker_total_count > 0 {
         let pct = 100.0 * worker_irq_count as f64 / worker_total_count as f64;
-        emit_csv_row(&timestamp, sched_label, &condition,
-            "cache_worker", 0, "irq_exposure_count", "", pct, "pct",
-            worker_total_count as usize, rep, "count-weighted");
+        emit_csv_row(
+            &timestamp,
+            sched_label,
+            &condition,
+            "cache_worker",
+            0,
+            "irq_exposure_count",
+            "",
+            pct,
+            "pct",
+            worker_total_count as usize,
+            rep,
+            "count-weighted",
+        );
     }
     if reader_total_count > 0 {
         let pct = 100.0 * reader_irq_count as f64 / reader_total_count as f64;
-        emit_csv_row(&timestamp, sched_label, &condition,
-            "ssd_reader", 0, "irq_exposure_count", "", pct, "pct",
-            reader_total_count as usize, rep, "count-weighted");
+        emit_csv_row(
+            &timestamp,
+            sched_label,
+            &condition,
+            "ssd_reader",
+            0,
+            "irq_exposure_count",
+            "",
+            pct,
+            "pct",
+            reader_total_count as usize,
+            rep,
+            "count-weighted",
+        );
     }
 
-    eprintln!("csv_experiment: scheduler={} condition={} cores={} duration={}ms seed={}",
-        scheduler, condition, nr_cpus, duration_ms, seed);
+    eprintln!(
+        "csv_experiment: scheduler={} condition={} cores={} duration={}ms seed={}",
+        scheduler, condition, nr_cpus, duration_ms, seed
+    );
 }
