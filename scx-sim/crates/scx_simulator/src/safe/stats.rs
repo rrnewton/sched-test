@@ -107,6 +107,28 @@ pub struct TaskStats {
     pub preempt_count: usize,
     /// Number of sleep events (voluntary block).
     pub sleep_count: usize,
+    /// Scheduling latencies (enqueue-to-scheduled) in nanoseconds, sorted.
+    ///
+    /// Each sample is the wall-clock time from `EnqueueTask` to the next
+    /// `TaskScheduled` for this PID. Sorted ascending after `from_trace()`.
+    pub sched_latencies: Vec<TimeNs>,
+}
+
+impl TaskStats {
+    /// Return a scheduling latency percentile from the sorted `sched_latencies`.
+    ///
+    /// `p` is in the range 0.0..=1.0 (e.g. 0.99 for p99). Returns 0 if empty.
+    pub fn sched_latency_pctl(&self, p: f64) -> TimeNs {
+        percentile(&self.sched_latencies, p)
+    }
+}
+
+/// Compute a percentile from a pre-sorted slice. `p` in 0.0..=1.0. Returns 0 if empty.
+pub fn percentile(sorted: &[TimeNs], p: f64) -> TimeNs {
+    if sorted.is_empty() {
+        return 0;
+    }
+    sorted[((sorted.len() as f64 * p) as usize).min(sorted.len() - 1)]
 }
 
 /// Per-CPU statistics computed from a trace.
@@ -147,8 +169,13 @@ pub struct TraceStats {
 
 impl TraceStats {
     /// Compute statistics from a simulation trace.
+    ///
+    /// When the trace has a non-zero `warmup_ns`, events before that time
+    /// are still processed for state tracking (e.g. which CPU a task last ran
+    /// on) but are not counted in the final statistics.
     pub fn from_trace(trace: &Trace) -> Self {
         let mut stats = TraceStats::default();
+        let warmup = trace.warmup_ns();
 
         // Track last events for interval computation
         let mut task_last_scheduled: HashMap<Pid, TimeNs> = HashMap::new();
@@ -157,16 +184,17 @@ impl TraceStats {
         let mut cpu_idle_since: HashMap<CpuId, TimeNs> = HashMap::new();
         let mut last_event_time: TimeNs = 0;
 
-        // Track if the last select_cpu did a direct dispatch (by checking
-        // if DsqInsert with LOCAL DSQ happened between SelectTaskRq and EnqueueTask)
+        // Track if the last select_cpu did a direct dispatch
         let mut pending_select_cpu: HashMap<Pid, TimeNs> = HashMap::new();
         let mut pending_direct_dispatch: HashMap<Pid, bool> = HashMap::new();
+        // Track enqueue time for sched_latency (enqueue-to-scheduled)
+        let mut task_enqueue_time: HashMap<Pid, TimeNs> = HashMap::new();
 
         for event in trace.events() {
             last_event_time = last_event_time.max(event.time_ns);
+            let post_warmup = event.time_ns >= warmup;
 
-            // Ensure task and CPU entries exist
-            stats.tasks.entry(Pid(0)).or_default(); // placeholder
+            // Ensure CPU entries exist
             stats.cpus.entry(event.cpu).or_insert_with(|| CpuStats {
                 cpu: event.cpu,
                 ..Default::default()
@@ -178,20 +206,36 @@ impl TraceStats {
                         pid: *pid,
                         ..Default::default()
                     });
-                    task_stats.schedule_count += 1;
+                    if post_warmup {
+                        task_stats.schedule_count += 1;
+                    }
+
+                    // Record sched_latency (enqueue-to-scheduled)
+                    if let Some(enq_time) = task_enqueue_time.remove(pid) {
+                        if post_warmup {
+                            let latency = event.time_ns.saturating_sub(enq_time);
+                            task_stats.sched_latencies.push(latency);
+                        }
+                    }
+
                     task_running_since.insert(*pid, event.time_ns);
 
                     // End idle interval for this CPU if it was idle
                     if let Some(idle_start) = cpu_idle_since.remove(&event.cpu) {
-                        let idle_dur = event.time_ns.saturating_sub(idle_start);
-                        let cpu_stats = stats.cpus.get_mut(&event.cpu).unwrap();
-                        cpu_stats.idle_duration_ns += idle_dur;
+                        let effective_start = idle_start.max(warmup);
+                        if post_warmup || event.time_ns > effective_start {
+                            let idle_dur = event.time_ns.saturating_sub(effective_start);
+                            let cpu_stats = stats.cpus.get_mut(&event.cpu).unwrap();
+                            cpu_stats.idle_duration_ns += idle_dur;
+                        }
                     }
 
                     // Compute inter-arrival time
                     if let Some(last_time) = task_last_scheduled.get(pid) {
-                        let interval = event.time_ns.saturating_sub(*last_time);
-                        task_stats.inter_arrival.add(interval);
+                        if post_warmup {
+                            let interval = event.time_ns.saturating_sub(*last_time);
+                            task_stats.inter_arrival.add(interval);
+                        }
                     }
                     task_last_scheduled.insert(*pid, event.time_ns);
                 }
@@ -207,15 +251,20 @@ impl TraceStats {
 
                     // Compute run duration
                     if let Some(start_time) = task_running_since.remove(pid) {
-                        let duration = event.time_ns.saturating_sub(start_time);
-                        task_stats.run_duration.add(duration);
+                        if post_warmup {
+                            let effective_start = start_time.max(warmup);
+                            let duration = event.time_ns.saturating_sub(effective_start);
+                            task_stats.run_duration.add(duration);
+                        }
                     }
 
-                    match &event.kind {
-                        TraceKind::TaskPreempted { .. } => task_stats.preempt_count += 1,
-                        TraceKind::TaskYielded { .. } => task_stats.yield_count += 1,
-                        TraceKind::TaskSlept { .. } => task_stats.sleep_count += 1,
-                        _ => {}
+                    if post_warmup {
+                        match &event.kind {
+                            TraceKind::TaskPreempted { .. } => task_stats.preempt_count += 1,
+                            TraceKind::TaskYielded { .. } => task_stats.yield_count += 1,
+                            TraceKind::TaskSlept { .. } => task_stats.sleep_count += 1,
+                            _ => {}
+                        }
                     }
                 }
 
@@ -225,9 +274,10 @@ impl TraceStats {
                 }
 
                 TraceKind::DsqInsert { pid, dsq_id, .. } => {
-                    stats.dsq_insert_count += 1;
+                    if post_warmup {
+                        stats.dsq_insert_count += 1;
+                    }
 
-                    // Check if this is a direct dispatch (LOCAL DSQ during select_cpu)
                     if (dsq_id.is_local() || dsq_id.is_local_on())
                         && pending_select_cpu.contains_key(pid)
                     {
@@ -236,7 +286,9 @@ impl TraceStats {
                 }
 
                 TraceKind::DsqInsertVtime { .. } => {
-                    stats.dsq_insert_vtime_count += 1;
+                    if post_warmup {
+                        stats.dsq_insert_vtime_count += 1;
+                    }
                 }
 
                 TraceKind::EnqueueTask { pid, .. } => {
@@ -245,46 +297,60 @@ impl TraceStats {
                         ..Default::default()
                     });
 
-                    // Check if this followed a direct dispatch in select_cpu
                     let was_direct = pending_direct_dispatch.remove(pid).unwrap_or(false);
                     pending_select_cpu.remove(pid);
 
-                    if was_direct {
-                        task_stats.direct_dispatch_count += 1;
-                    } else {
-                        task_stats.enqueue_count += 1;
+                    if post_warmup {
+                        if was_direct {
+                            task_stats.direct_dispatch_count += 1;
+                        } else {
+                            task_stats.enqueue_count += 1;
+                        }
                     }
+
+                    // Always record enqueue time for sched_latency tracking.
+                    // The warmup check happens at TaskScheduled time.
+                    task_enqueue_time.insert(*pid, event.time_ns);
                 }
 
                 TraceKind::Balance { .. } => {
-                    let cpu_stats = stats.cpus.get_mut(&event.cpu).unwrap();
-                    cpu_stats.balance_count += 1;
+                    if post_warmup {
+                        let cpu_stats = stats.cpus.get_mut(&event.cpu).unwrap();
+                        cpu_stats.balance_count += 1;
+                    }
                 }
 
                 TraceKind::CpuIdle => {
-                    let cpu_stats = stats.cpus.get_mut(&event.cpu).unwrap();
-                    cpu_stats.idle_count += 1;
+                    if post_warmup {
+                        let cpu_stats = stats.cpus.get_mut(&event.cpu).unwrap();
+                        cpu_stats.idle_count += 1;
+                    }
                     cpu_idle_since.insert(event.cpu, event.time_ns);
                 }
 
                 TraceKind::Tick { .. } => {
                     let cpu_stats = stats.cpus.get_mut(&event.cpu).unwrap();
-                    cpu_stats.tick_count += 1;
+                    if post_warmup {
+                        cpu_stats.tick_count += 1;
 
-                    // Compute tick interval
-                    if let Some(last_tick) = cpu_last_tick.get(&event.cpu) {
-                        let interval = event.time_ns.saturating_sub(*last_tick);
-                        cpu_stats.tick_interval.add(interval);
+                        if let Some(last_tick) = cpu_last_tick.get(&event.cpu) {
+                            let interval = event.time_ns.saturating_sub(*last_tick);
+                            cpu_stats.tick_interval.add(interval);
+                        }
                     }
                     cpu_last_tick.insert(event.cpu, event.time_ns);
                 }
 
                 TraceKind::DsqMoveToLocal { .. } => {
-                    stats.dsq_move_to_local_count += 1;
+                    if post_warmup {
+                        stats.dsq_move_to_local_count += 1;
+                    }
                 }
 
                 TraceKind::KickCpu { .. } => {
-                    stats.kick_cpu_count += 1;
+                    if post_warmup {
+                        stats.kick_cpu_count += 1;
+                    }
                 }
 
                 _ => {}
@@ -293,15 +359,28 @@ impl TraceStats {
 
         // Flush CPUs still idle at end of trace
         for (cpu, idle_start) in &cpu_idle_since {
-            let idle_dur = last_event_time.saturating_sub(*idle_start);
-            if let Some(cpu_stats) = stats.cpus.get_mut(cpu) {
-                cpu_stats.idle_duration_ns += idle_dur;
+            let effective_start = (*idle_start).max(warmup);
+            if last_event_time > effective_start {
+                let idle_dur = last_event_time.saturating_sub(effective_start);
+                if let Some(cpu_stats) = stats.cpus.get_mut(cpu) {
+                    cpu_stats.idle_duration_ns += idle_dur;
+                }
             }
         }
 
         // Remove placeholder task entry
         stats.tasks.remove(&Pid(0));
-        stats.duration_ns = last_event_time;
+        stats.duration_ns = if warmup > 0 {
+            last_event_time.saturating_sub(warmup)
+        } else {
+            last_event_time
+        };
+
+        // Sort sched_latencies for percentile queries
+        for task_stats in stats.tasks.values_mut() {
+            task_stats.sched_latencies.sort_unstable();
+        }
+
         stats
     }
 
@@ -335,6 +414,17 @@ impl TraceStats {
             println!("    Yields:          {}", ts.yield_count);
             println!("    Preemptions:     {}", ts.preempt_count);
             println!("    Sleeps:          {}", ts.sleep_count);
+            if !ts.sched_latencies.is_empty() {
+                println!(
+                    "    Sched latency:   p50={:.3}us p90={:.3}us p99={:.3}us p999={:.3}us max={:.3}us ({} samples)",
+                    ts.sched_latency_pctl(0.50) as f64 / 1_000.0,
+                    ts.sched_latency_pctl(0.90) as f64 / 1_000.0,
+                    ts.sched_latency_pctl(0.99) as f64 / 1_000.0,
+                    ts.sched_latency_pctl(0.999) as f64 / 1_000.0,
+                    ts.sched_latencies.last().copied().unwrap_or(0) as f64 / 1_000.0,
+                    ts.sched_latencies.len(),
+                );
+            }
         }
         println!();
 
