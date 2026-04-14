@@ -103,7 +103,9 @@ pub use safe::scenario::{
     CgroupMigrateEvent, CpuPreemptEvent, HotplugEvent, IrqEvent, IrqType, NativeConcurrentConfig,
     NoiseConfig, OverheadConfig, PreemptMode, PreemptiveConfig, Scenario,
 };
-pub use safe::stats::{CpuStats, DistributionStats, TaskStats, TraceComparison, TraceStats};
+pub use safe::stats::{
+    percentile, CpuStats, DistributionStats, TaskStats, TraceComparison, TraceStats,
+};
 pub use safe::trace::{
     DsqLengthSample, DsqSampleTrigger, Trace, TraceEvent, TraceKind, TraceSummary,
 };

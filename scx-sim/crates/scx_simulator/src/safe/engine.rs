@@ -1267,7 +1267,7 @@ impl<S: Scheduler> Simulator<S> {
             cpus,
             dsqs: DsqManager::new(),
             current_cpu: CpuId(0),
-            trace: Trace::new(scenario.nr_cpus, &scenario.tasks),
+            trace: Trace::with_warmup(scenario.nr_cpus, &scenario.tasks, scenario.warmup_ns),
             clock: 0,
             task_raw_to_pid,
             task_pid_to_raw,

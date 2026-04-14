@@ -614,6 +614,14 @@ pub struct Scenario {
     /// attaches and the user types `continue`, execution proceeds to
     /// `ops.init()` and hits the first breakpoint.
     pub wait_debugger: bool,
+    /// Warmup period in nanoseconds.
+    ///
+    /// When set to a non-zero value, trace statistics (summary, TraceStats)
+    /// exclude events that occurred before this simulated time. The simulation
+    /// still runs from time 0, but metrics only reflect post-warmup behavior.
+    /// This allows scheduler internal state (EWMA, vruntime, etc.) to converge
+    /// before measurement begins.
+    pub warmup_ns: TimeNs,
 }
 
 /// Builder for constructing scenarios.
@@ -645,6 +653,7 @@ pub struct ScenarioBuilder {
     irq_events: Vec<IrqEvent>,
     native_concurrent: Option<NativeConcurrentConfig>,
     wait_debugger: bool,
+    warmup_ns: TimeNs,
 }
 
 impl Scenario {
@@ -677,6 +686,7 @@ impl Scenario {
             irq_events: Vec::new(),
             native_concurrent: None,
             wait_debugger: false,
+            warmup_ns: 0,
         }
     }
 }
@@ -765,6 +775,18 @@ impl ScenarioBuilder {
     /// Set the simulation duration in milliseconds.
     pub fn duration_ms(mut self, ms: u64) -> Self {
         self.duration_ns = ms * 1_000_000;
+        self
+    }
+
+    /// Set the warmup period in nanoseconds.
+    pub fn warmup_ns(mut self, ns: TimeNs) -> Self {
+        self.warmup_ns = ns;
+        self
+    }
+
+    /// Set the warmup period in milliseconds.
+    pub fn warmup_ms(mut self, ms: u64) -> Self {
+        self.warmup_ns = ms * 1_000_000;
         self
     }
 
@@ -1218,6 +1240,7 @@ impl ScenarioBuilder {
             irq_events: self.irq_events,
             native_concurrent: self.native_concurrent,
             wait_debugger: self.wait_debugger,
+            warmup_ns: self.warmup_ns,
         }
     }
 }
