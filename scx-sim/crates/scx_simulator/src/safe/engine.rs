@@ -2737,6 +2737,8 @@ impl<S: Scheduler> Simulator<S> {
         if s.sim.cpus[cpu.0 as usize].current_task.is_some() {
             s.sim.cpus[cpu.0 as usize].irq_stolen_ns += duration_ns;
         }
+        // Always accumulate cumulative IRQ time (for scx_clock_task)
+        s.sim.cpus[cpu.0 as usize].irq_cumulative_ns += duration_ns;
 
         // Process wakeups inline — the IRQ context is active, so
         // bpf_in_hardirq()/bpf_in_serving_softirq() returns true during
