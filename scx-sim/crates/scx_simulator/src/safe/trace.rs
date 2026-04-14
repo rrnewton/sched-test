@@ -54,6 +54,8 @@ pub struct TraceSummary {
     pub total_wakes: usize,
     /// Total number of CPU idle periods.
     pub total_idle_periods: usize,
+    /// Total idle duration across all CPUs (nanoseconds).
+    pub total_idle_duration_ns: u64,
     /// Count of dispatches to global DSQs.
     pub global_dsq_dispatches: usize,
     /// Count of dispatches to local (per-CPU) DSQs.
@@ -70,6 +72,11 @@ impl std::fmt::Display for TraceSummary {
         writeln!(f, "  total_sleeps:          {}", self.total_sleeps)?;
         writeln!(f, "  total_wakes:           {}", self.total_wakes)?;
         writeln!(f, "  total_idle_periods:    {}", self.total_idle_periods)?;
+        writeln!(
+            f,
+            "  total_idle_duration:   {:.3}ms",
+            self.total_idle_duration_ns as f64 / 1_000_000.0
+        )?;
         writeln!(f, "  global_dsq_dispatches: {}", self.global_dsq_dispatches)?;
         writeln!(f, "  local_dsq_dispatches:  {}", self.local_dsq_dispatches)
     }
@@ -401,23 +408,44 @@ impl Trace {
     ///
     /// Returns a struct with key metrics for comparing simulated vs real traces.
     pub fn summary(&self) -> TraceSummary {
+        use std::collections::HashMap;
+
         let mut total_ticks = 0usize;
         let mut total_yields = 0usize;
         let mut total_preempts = 0usize;
         let mut total_sleeps = 0usize;
         let mut total_wakes = 0usize;
         let mut total_idle_periods = 0usize;
+        let mut total_idle_duration_ns = 0u64;
+
+        // Track per-CPU idle start times for duration computation
+        let mut cpu_idle_since: HashMap<crate::types::CpuId, crate::types::TimeNs> = HashMap::new();
+        let mut last_event_time: crate::types::TimeNs = 0;
 
         for event in &self.events {
+            last_event_time = last_event_time.max(event.time_ns);
             match &event.kind {
                 TraceKind::Tick { .. } => total_ticks += 1,
                 TraceKind::TaskYielded { .. } => total_yields += 1,
                 TraceKind::TaskPreempted { .. } => total_preempts += 1,
                 TraceKind::TaskSlept { .. } => total_sleeps += 1,
                 TraceKind::TaskWoke { .. } => total_wakes += 1,
-                TraceKind::CpuIdle => total_idle_periods += 1,
+                TraceKind::CpuIdle => {
+                    total_idle_periods += 1;
+                    cpu_idle_since.insert(event.cpu, event.time_ns);
+                }
+                TraceKind::TaskScheduled { .. } => {
+                    if let Some(idle_start) = cpu_idle_since.remove(&event.cpu) {
+                        total_idle_duration_ns += event.time_ns.saturating_sub(idle_start);
+                    }
+                }
                 _ => {}
             }
+        }
+
+        // Flush CPUs still idle at end of trace
+        for idle_start in cpu_idle_since.values() {
+            total_idle_duration_ns += last_event_time.saturating_sub(*idle_start);
         }
 
         let (global_dsq, local_dsq) = self.dsq_dispatch_counts();
@@ -430,6 +458,7 @@ impl Trace {
             total_sleeps,
             total_wakes,
             total_idle_periods,
+            total_idle_duration_ns,
             global_dsq_dispatches: global_dsq,
             local_dsq_dispatches: local_dsq,
         }
