@@ -108,6 +108,16 @@ extern unsigned short sim_task_get_migration_disabled(struct task_struct *p);
 #define is_migration_disabled(p) (sim_task_get_migration_disabled(p) > 0)
 
 /*
+ * scx_clock_task / scx_clock_pelt override.
+ *
+ * Route to the simulator's kfunc which returns local_clock - irq_cumulative_ns.
+ * This lets LAVD's steal_util tracking detect IRQ-heavy CPUs as turbulent.
+ */
+extern u64 sim_scx_clock_task(u32 cpu);
+#define scx_clock_task(cpu) sim_scx_clock_task(cpu)
+#define scx_clock_pelt(cpu) sim_scx_clock_task(cpu)
+
+/*
  * =================================================================
  * Per-CPU context and map infrastructure
  * =================================================================

@@ -1790,6 +1790,26 @@ pub extern "C" fn scx_bpf_now() -> u64 {
     })
 }
 
+/// Simulated rq->clock_task: wall clock minus cumulative IRQ time.
+///
+/// In the kernel, rq->clock_task = rq->clock - cumulative IRQ/steal time.
+/// LAVD uses this to detect steal utilization on IRQ-heavy CPUs.
+#[no_mangle]
+pub extern "C" fn sim_scx_clock_task(cpu: u32) -> u64 {
+    crate::preempt::set_current_kfunc("scx_clock_task");
+    crate::interleave::maybe_yield();
+    with_sim(kfunc_cost::TRIVIAL, |sim| {
+        let idx = cpu as usize;
+        if idx < sim.cpus.len() {
+            sim.cpus[idx]
+                .local_clock
+                .saturating_sub(sim.cpus[idx].irq_cumulative_ns)
+        } else {
+            0
+        }
+    })
+}
+
 /// Get the current CPU ID.
 #[no_mangle]
 pub extern "C" fn bpf_get_smp_processor_id() -> u32 {
