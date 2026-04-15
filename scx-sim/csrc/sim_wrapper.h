@@ -13,6 +13,15 @@
 #include <scx_test_map.h>
 #include <scx_test_cpumask.h>
 
+/*
+ * Override BPF section attributes that cause linker conflicts in userspace.
+ * __kconfig puts variables in a special .kconfig section; without override,
+ * weak __kconfig declarations (like CONFIG_NO_HZ_IDLE) resolve to address
+ * 0 in -nostdlib .so files, causing SIGSEGV on access.
+ */
+#undef __kconfig
+#define __kconfig
+
 /* Include common.bpf.h to get type definitions and set the header guard.
  * When the scheduler .bpf.c re-includes it, it will be skipped. */
 #include <scx/common.bpf.h>
