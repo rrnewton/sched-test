@@ -680,6 +680,48 @@ fn csv_experiment_run() {
         );
     }
 
+    // ---- DSQ routing diagnostic ----
+    {
+        use std::collections::HashMap;
+        let mut dsq_counts: HashMap<u64, usize> = HashMap::new();
+        for event in trace.events() {
+            if event.time_ns < warmup_ns {
+                continue;
+            }
+            match &event.kind {
+                TraceKind::DsqInsert { dsq_id, .. } | TraceKind::DsqInsertVtime { dsq_id, .. } => {
+                    *dsq_counts.entry(dsq_id.0).or_insert(0) += 1;
+                }
+                _ => {}
+            }
+        }
+
+        let mut local = 0usize;
+        let mut cpdom = 0usize;
+        let mut percpu = 0usize;
+        for (&id, &count) in &dsq_counts {
+            if id & DsqId::FLAG_BUILTIN != 0 {
+                local += count;
+            } else if id & (1 << 12) != 0 {
+                cpdom += count;
+            } else {
+                percpu += count;
+            }
+        }
+        let total = local + cpdom + percpu;
+        if total > 0 {
+            eprintln!(
+                "  DSQ routing: local={} ({:.0}%) cpdom={} ({:.0}%) percpu={} ({:.0}%)",
+                local,
+                100.0 * local as f64 / total as f64,
+                cpdom,
+                100.0 * cpdom as f64 / total as f64,
+                percpu,
+                100.0 * percpu as f64 / total as f64,
+            );
+        }
+    }
+
     eprintln!(
         "csv_experiment: scheduler={} condition={} cores={} duration={}ms seed={}",
         scheduler, condition, nr_cpus, duration_ms, seed

@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 
 use crate::trace::{Trace, TraceKind};
-use crate::types::{CpuId, Pid, TimeNs};
+use crate::types::{CpuId, DsqId, Pid, TimeNs};
 
 /// Summary statistics for a distribution of values.
 #[derive(Debug, Clone, Default)]
@@ -165,6 +165,8 @@ pub struct TraceStats {
     pub dsq_move_to_local_count: usize,
     /// Number of kick_cpu calls.
     pub kick_cpu_count: usize,
+    /// Dispatch counts per DSQ ID (which DSQ each task was inserted into).
+    pub dsq_dispatch_histogram: HashMap<DsqId, usize>,
 }
 
 impl TraceStats {
@@ -276,6 +278,7 @@ impl TraceStats {
                 TraceKind::DsqInsert { pid, dsq_id, .. } => {
                     if post_warmup {
                         stats.dsq_insert_count += 1;
+                        *stats.dsq_dispatch_histogram.entry(*dsq_id).or_insert(0) += 1;
                     }
 
                     if (dsq_id.is_local() || dsq_id.is_local_on())
@@ -285,9 +288,10 @@ impl TraceStats {
                     }
                 }
 
-                TraceKind::DsqInsertVtime { .. } => {
+                TraceKind::DsqInsertVtime { dsq_id, .. } => {
                     if post_warmup {
                         stats.dsq_insert_vtime_count += 1;
+                        *stats.dsq_dispatch_histogram.entry(*dsq_id).or_insert(0) += 1;
                     }
                 }
 
@@ -474,6 +478,57 @@ impl TraceStats {
         println!("  DSQ inserts (vtime):   {}", self.dsq_insert_vtime_count);
         println!("  DSQ move_to_local:     {}", self.dsq_move_to_local_count);
         println!("  Kick CPU calls:        {}", self.kick_cpu_count);
+
+        // DSQ dispatch histogram — classify by type
+        if !self.dsq_dispatch_histogram.is_empty() {
+            let mut local_count = 0usize;
+            let mut cpdom_count = 0usize;
+            let mut percpu_count = 0usize;
+            let mut other_count = 0usize;
+            for (&dsq, &count) in &self.dsq_dispatch_histogram {
+                if dsq.is_local() || dsq.is_local_on() {
+                    local_count += count;
+                } else if dsq.0 & (1 << 12) != 0 {
+                    // LAVD_DSQ_TYPE_CPDOM (bit 12 set)
+                    cpdom_count += count;
+                } else if dsq.0 < 1024 {
+                    // Per-CPU DSQ (small IDs)
+                    percpu_count += count;
+                } else {
+                    other_count += count;
+                }
+            }
+            let total = local_count + cpdom_count + percpu_count + other_count;
+            println!("  DSQ routing:");
+            if local_count > 0 {
+                println!(
+                    "    Local/direct:   {:>6} ({:.1}%)",
+                    local_count,
+                    100.0 * local_count as f64 / total as f64,
+                );
+            }
+            if cpdom_count > 0 {
+                println!(
+                    "    Cpdom (shared): {:>6} ({:.1}%)",
+                    cpdom_count,
+                    100.0 * cpdom_count as f64 / total as f64,
+                );
+            }
+            if percpu_count > 0 {
+                println!(
+                    "    Per-CPU:        {:>6} ({:.1}%)",
+                    percpu_count,
+                    100.0 * percpu_count as f64 / total as f64,
+                );
+            }
+            if other_count > 0 {
+                println!(
+                    "    Other:          {:>6} ({:.1}%)",
+                    other_count,
+                    100.0 * other_count as f64 / total as f64,
+                );
+            }
+        }
         println!();
     }
 
