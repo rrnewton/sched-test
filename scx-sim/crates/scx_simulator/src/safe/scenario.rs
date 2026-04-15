@@ -332,6 +332,19 @@ pub struct OverheadConfig {
     /// Applied as a floor on the per-CPU clock advance between EnqueueTask and
     /// TaskScheduled. Set to 0 to disable. Default: 3000ns (3μs).
     pub wakeup_latency_floor_ns: TimeNs,
+    /// Standard deviation for wakeup latency jitter (ns).
+    ///
+    /// Adds normally-distributed jitter on top of the wakeup latency floor,
+    /// modeling variation from cache state, interrupt timing, and scheduler
+    /// path length. Production traces show p50→p90 spread of ~2-4x, which
+    /// a stddev of ~2μs reproduces well. Set to 0 to disable. Default: 2000ns.
+    pub wakeup_jitter_stddev_ns: TimeNs,
+    /// Extra latency (ns) when a task migrates to a different CPU.
+    ///
+    /// Models cache/TLB cold-start penalty when a task runs on a CPU different
+    /// from where it last ran. Production traces show significant migration
+    /// counts (e.g., 26k migrations for 252 threads in 191ms). Default: 10000ns (10μs).
+    pub migration_penalty_ns: TimeNs,
 }
 
 impl Default for OverheadConfig {
@@ -349,6 +362,8 @@ impl Default for OverheadConfig {
             ipi_delivery_ns: 200,
             update_idle_overhead_ns: 50,
             wakeup_latency_floor_ns: 3_000,
+            wakeup_jitter_stddev_ns: 2_000,
+            migration_penalty_ns: 10_000,
         }
     }
 }
@@ -393,6 +408,12 @@ impl OverheadConfig {
         }
         if let Some(v) = env_u64("SCX_SIM_WAKEUP_FLOOR_NS") {
             config.wakeup_latency_floor_ns = v;
+        }
+        if let Some(v) = env_u64("SCX_SIM_WAKEUP_JITTER_NS") {
+            config.wakeup_jitter_stddev_ns = v;
+        }
+        if let Some(v) = env_u64("SCX_SIM_MIGRATION_PENALTY_NS") {
+            config.migration_penalty_ns = v;
         }
 
         config
