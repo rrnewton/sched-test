@@ -137,10 +137,14 @@ fn build_scenario(
             pid: worker_pid(i),
             nice: worker_nice,
             behavior: TaskBehavior {
+                // 4-cycle pattern: 25% NVM miss rate → one Wake per 4 cycles.
+                // Inter-wake interval = 4 × 360μs = 1440μs > LAVD_LC_WAKE_INTERVAL_MIN (500μs).
+                // Matches production where ~25% of requests trigger an NVM read.
                 phases: vec![
-                    Phase::Run(WORKER_RUN_NS),
-                    Phase::Wake(target_reader),
-                    Phase::Sleep(WORKER_SLEEP_NS),
+                    Phase::Run(WORKER_RUN_NS), Phase::Sleep(WORKER_SLEEP_NS),
+                    Phase::Run(WORKER_RUN_NS), Phase::Sleep(WORKER_SLEEP_NS),
+                    Phase::Run(WORKER_RUN_NS), Phase::Sleep(WORKER_SLEEP_NS),
+                    Phase::Run(WORKER_RUN_NS), Phase::Wake(target_reader), Phase::Sleep(WORKER_SLEEP_NS),
                 ],
                 repeat: RepeatMode::Forever,
             },
