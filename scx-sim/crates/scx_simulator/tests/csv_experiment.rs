@@ -483,7 +483,17 @@ fn csv_experiment_run() {
     let cpus_per_llc: u32 = std::env::var("SCX_SIM_CPUS_PER_LLC")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(if nr_cpus > 16 { 12 } else { 0 });
+        .unwrap_or(if nr_cpus >= 48 {
+            // Use 2 domains (nr_cpus/2 CPUs each) to match production topology
+            // where ~35 CPUs/domain is typical. With 12 CPUs/domain, LAVD's
+            // can_direct_dispatch fails due to cpdom DSQ contention, causing
+            // reader starvation via lat_cri death spiral (see task notes).
+            nr_cpus / 2
+        } else if nr_cpus > 16 {
+            nr_cpus / 2
+        } else {
+            0
+        });
     let mut scenario = build_scenario(nr_cpus, cpus_per_llc, with_nice_hints, duration_ms);
     scenario.seed = seed;
 
