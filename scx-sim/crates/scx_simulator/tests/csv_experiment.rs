@@ -61,11 +61,16 @@ fn thread_counts(nr_cpus: u32) -> (i32, i32, i32, i32) {
     (workers, readers, writers, hogs)
 }
 
-/// Compute IRQ target CPUs: even-numbered CPUs up to ~1/3 of total.
+/// Compute IRQ target CPUs: ~1/3 of total, distributed uniformly via stride-3.
+///
+/// Uses every-3rd-CPU selection (0, 3, 6, 9, ...) instead of the old
+/// even-numbered approach (0, 2, 4, ...) which concentrated 80% of IRQ
+/// CPUs in domain 0 at 32c/2d. Stride-3 distributes evenly across LLC
+/// domains regardless of domain size.
 fn irq_cpus(nr_cpus: u32) -> Vec<u32> {
     let n_irq = (nr_cpus / 3).max(2);
     (0..nr_cpus)
-        .filter(|c| c % 2 == 0)
+        .step_by(3)
         .take(n_irq as usize)
         .collect()
 }
