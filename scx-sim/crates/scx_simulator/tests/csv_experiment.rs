@@ -23,10 +23,9 @@ mod common;
 // ---- Constants (same as ucache_cartoon_scxsim_direct.rs) ----
 
 const PARENT_PID: Pid = Pid(100);
-const NUM_WORKERS: i32 = 16;
-const NUM_READERS: i32 = 2;
-const NUM_WRITERS: i32 = 2;
-const NUM_HOGS: i32 = 4;
+// Thread counts are now computed from nr_cpus in build_scenario().
+// At 16 CPUs: 16 workers, 2 readers, 2 writers, 4 hogs (= 24 threads, 1.5/CPU)
+// At 48 CPUs: 48 workers, 6 readers, 6 writers, 12 hogs (= 72 threads, 1.5/CPU)
 
 const WORKER_RUN_NS: u64 = 250_000;
 const WORKER_SLEEP_NS: u64 = 110_000;
@@ -39,27 +38,48 @@ const HOG_SLEEP_NS: u64 = 750_000;
 
 const IRQ_INTERVAL_NS: u64 = 10_000_000; // 10ms period (matching rt-app)
 const IRQ_DURATION_NS: u64 = 3_300_000; // 3.3ms burst (33% duty cycle, matching VM BROAD profile)
-const IRQ_CPUS: [u32; 6] = [0, 2, 4, 6, 8, 10]; // even-numbered workload CPUs (matching VM BROAD profile)
+
+/// Compute thread counts scaled to nr_cpus (ratio: 1.5 threads/CPU total).
+/// Workers = nr_cpus, readers = nr_cpus/8, writers = nr_cpus/8, hogs = nr_cpus/4.
+fn thread_counts(nr_cpus: u32) -> (i32, i32, i32, i32) {
+    let workers = nr_cpus as i32;
+    let readers = (nr_cpus / 8).max(1) as i32;
+    let writers = (nr_cpus / 8).max(1) as i32;
+    let hogs = (nr_cpus / 4).max(1) as i32;
+    (workers, readers, writers, hogs)
+}
+
+/// Compute IRQ target CPUs: even-numbered CPUs up to ~1/3 of total.
+fn irq_cpus(nr_cpus: u32) -> Vec<u32> {
+    let n_irq = (nr_cpus / 3).max(2);
+    (0..nr_cpus).filter(|c| c % 2 == 0).take(n_irq as usize).collect()
+}
 
 fn worker_pid(i: i32) -> Pid {
     Pid(1 + i)
 }
-fn reader_pid(i: i32) -> Pid {
-    Pid(1 + NUM_WORKERS + i)
+fn reader_pid(i: i32, num_workers: i32) -> Pid {
+    Pid(1 + num_workers + i)
 }
-fn writer_pid(i: i32) -> Pid {
-    Pid(1 + NUM_WORKERS + NUM_READERS + i)
+fn writer_pid(i: i32, num_workers: i32, num_readers: i32) -> Pid {
+    Pid(1 + num_workers + num_readers + i)
 }
-fn hog_pid(i: i32) -> Pid {
-    Pid(1 + NUM_WORKERS + NUM_READERS + NUM_WRITERS + i)
+fn hog_pid(i: i32, num_workers: i32, num_readers: i32, num_writers: i32) -> Pid {
+    Pid(1 + num_workers + num_readers + num_writers + i)
 }
 
-fn build_scenario(nr_cpus: u32, with_nice_hints: bool, duration_ms: u64) -> Scenario {
+fn build_scenario(nr_cpus: u32, cpus_per_llc: u32, with_nice_hints: bool, duration_ms: u64) -> Scenario {
     let mut builder = Scenario::builder().cpus(nr_cpus);
+    if cpus_per_llc > 0 {
+        builder = builder.cpus_per_llc(cpus_per_llc);
+    }
 
     let worker_nice: i8 = if with_nice_hints { -5 } else { 0 };
     let reader_nice: i8 = if with_nice_hints { -10 } else { 0 };
     let writer_nice: i8 = if with_nice_hints { 5 } else { 0 };
+
+    let (num_workers, num_readers, num_writers, num_hogs) = thread_counts(nr_cpus);
+    let irq_cpu_list = irq_cpus(nr_cpus);
 
     // Shared parent task
     builder = builder.task(TaskDef {
@@ -79,7 +99,7 @@ fn build_scenario(nr_cpus: u32, with_nice_hints: bool, duration_ms: u64) -> Scen
         migration_disabled: 0,
     });
 
-    for i in 0..NUM_WORKERS {
+    for i in 0..num_workers {
         builder = builder.task(TaskDef {
             name: format!("ucache_worker_{i}"),
             pid: worker_pid(i),
@@ -98,10 +118,10 @@ fn build_scenario(nr_cpus: u32, with_nice_hints: bool, duration_ms: u64) -> Scen
         });
     }
 
-    for i in 0..NUM_READERS {
+    for i in 0..num_readers {
         builder = builder.task(TaskDef {
             name: format!("navy_reader_{i}"),
-            pid: reader_pid(i),
+            pid: reader_pid(i, num_workers),
             nice: reader_nice,
             behavior: TaskBehavior {
                 phases: vec![Phase::Run(READER_RUN_NS), Phase::Sleep(READER_SLEEP_NS)],
@@ -117,10 +137,10 @@ fn build_scenario(nr_cpus: u32, with_nice_hints: bool, duration_ms: u64) -> Scen
         });
     }
 
-    for i in 0..NUM_WRITERS {
+    for i in 0..num_writers {
         builder = builder.task(TaskDef {
             name: format!("navy_writer_{i}"),
-            pid: writer_pid(i),
+            pid: writer_pid(i, num_workers, num_readers),
             nice: writer_nice,
             behavior: TaskBehavior {
                 phases: vec![Phase::Run(WRITER_RUN_NS), Phase::Sleep(WRITER_SLEEP_NS)],
@@ -136,10 +156,10 @@ fn build_scenario(nr_cpus: u32, with_nice_hints: bool, duration_ms: u64) -> Scen
         });
     }
 
-    for i in 0..NUM_HOGS {
+    for i in 0..num_hogs {
         builder = builder.task(TaskDef {
             name: format!("cpu_hog_{i}"),
-            pid: hog_pid(i),
+            pid: hog_pid(i, num_workers, num_readers, num_writers),
             nice: 10,
             behavior: TaskBehavior {
                 phases: vec![Phase::Run(HOG_RUN_NS), Phase::Sleep(HOG_SLEEP_NS)],
@@ -156,7 +176,7 @@ fn build_scenario(nr_cpus: u32, with_nice_hints: bool, duration_ms: u64) -> Scen
     }
 
     // IRQ pressure on even-numbered CPUs (33% duty, matching VM BROAD profile)
-    for &cpu in IRQ_CPUS.iter() {
+    for &cpu in irq_cpu_list.iter() {
         builder = builder.periodic_irq(
             CpuId(cpu),
             IrqType::HardIrq,
@@ -226,7 +246,7 @@ fn compute_sched_latencies(trace: &Trace, pids: &[Pid], warmup_ns: u64) -> Vec<u
 
 /// Compute time-weighted IRQ exposure for given PIDs.
 /// Returns (runtime_on_irq_ns, total_runtime_ns).
-fn compute_irq_exposure(trace: &Trace, pids: &[Pid], warmup_ns: u64) -> (u64, u64) {
+fn compute_irq_exposure(trace: &Trace, pids: &[Pid], warmup_ns: u64, irq_cpu_list: &[u32]) -> (u64, u64) {
     let mut running_since: HashMap<Pid, (u64, u32)> = HashMap::new();
     let mut irq_ns: u64 = 0;
     let mut total_ns: u64 = 0;
@@ -248,7 +268,7 @@ fn compute_irq_exposure(trace: &Trace, pids: &[Pid], warmup_ns: u64) -> (u64, u6
                     if event.time_ns > effective_start {
                         let dur = event.time_ns - effective_start;
                         total_ns += dur;
-                        if IRQ_CPUS.contains(&cpu) {
+                        if irq_cpu_list.contains(&cpu) {
                             irq_ns += dur;
                         }
                     }
@@ -428,21 +448,34 @@ fn csv_experiment_run() {
     };
 
     // Build scenario
-    let mut scenario = build_scenario(nr_cpus, with_nice_hints, duration_ms);
+    let cpus_per_llc: u32 = std::env::var("SCX_SIM_CPUS_PER_LLC")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(if nr_cpus > 16 { 12 } else { 0 });
+    let mut scenario = build_scenario(nr_cpus, cpus_per_llc, with_nice_hints, duration_ms);
     scenario.seed = seed;
+
+    let (num_workers, num_readers, num_writers, _num_hogs) = thread_counts(nr_cpus);
+    let irq_cpu_list = irq_cpus(nr_cpus);
 
     // Create scheduler and optionally attach LAVD monitor
     let use_lavd = scheduler == "lavd";
+    let nr_domains = if cpus_per_llc > 0 { nr_cpus / cpus_per_llc } else { 1 };
 
     if print_header {
         println!("timestamp,mode,scheduler,condition,thread_type,thread_id,metric_name,percentile,value,unit,sample_count,rep,notes");
     }
 
     let trace = if use_lavd {
-        let sched = DynamicScheduler::lavd(nr_cpus);
-        // Match production LAVD config: pinned_slice_ns=3ms, mig_delta_pct=15%
-        // Production cmd: --pinned-slice-us 3000 --slice-min-us 3000 --slice-max-us 10000 --mig-delta-pct 15
-        sched.lavd_configure(false, 3_000_000, 15);
+        let sched = if nr_domains > 1 {
+            let s = DynamicScheduler::lavd_multi_domain(nr_cpus, nr_domains);
+            s.lavd_configure(false, 3_000_000, 15);
+            s
+        } else {
+            let s = DynamicScheduler::lavd(nr_cpus);
+            s.lavd_configure(false, 3_000_000, 15);
+            s
+        };
         let probes = LavdProbes::new(&sched);
         let mut monitor = LavdMonitor::new(probes);
         let result = Simulator::new(sched).run_monitored(scenario, &mut monitor);
@@ -450,14 +483,14 @@ fn csv_experiment_run() {
         // Emit LAVD-specific metrics
         let thread_map: Vec<(&str, i32, Pid)> = {
             let mut v = Vec::new();
-            for i in 0..NUM_WORKERS {
+            for i in 0..num_workers {
                 v.push(("cache_worker", i, worker_pid(i)));
             }
-            for i in 0..NUM_READERS {
-                v.push(("ssd_reader", i, reader_pid(i)));
+            for i in 0..num_readers {
+                v.push(("ssd_reader", i, reader_pid(i, num_workers)));
             }
-            for i in 0..NUM_WRITERS {
-                v.push(("ssd_writer", i, writer_pid(i)));
+            for i in 0..num_writers {
+                v.push(("ssd_writer", i, writer_pid(i, num_workers, num_readers)));
             }
             v
         };
@@ -525,9 +558,9 @@ fn csv_experiment_run() {
     }
 
     // ---- E2E cycle times ----
-    let worker_pids: Vec<Pid> = (0..NUM_WORKERS).map(worker_pid).collect();
-    let reader_pids: Vec<Pid> = (0..NUM_READERS).map(reader_pid).collect();
-    let _writer_pids: Vec<Pid> = (0..NUM_WRITERS).map(writer_pid).collect();
+    let worker_pids: Vec<Pid> = (0..num_workers).map(worker_pid).collect();
+    let reader_pids: Vec<Pid> = (0..num_readers).map(|i| reader_pid(i, num_workers)).collect();
+    let _writer_pids: Vec<Pid> = (0..num_writers).map(|i| writer_pid(i, num_workers, num_readers)).collect();
 
     let worker_cycles = compute_cycle_times(&trace, &worker_pids, warmup_ns);
     let reader_cycles = compute_cycle_times(&trace, &reader_pids, warmup_ns);
@@ -587,8 +620,8 @@ fn csv_experiment_run() {
     );
 
     // ---- IRQ exposure ----
-    let (worker_irq_ns, worker_total_ns) = compute_irq_exposure(&trace, &worker_pids, warmup_ns);
-    let (reader_irq_ns, reader_total_ns) = compute_irq_exposure(&trace, &reader_pids, warmup_ns);
+    let (worker_irq_ns, worker_total_ns) = compute_irq_exposure(&trace, &worker_pids, warmup_ns, &irq_cpu_list);
+    let (reader_irq_ns, reader_total_ns) = compute_irq_exposure(&trace, &reader_pids, warmup_ns, &irq_cpu_list);
 
     if worker_total_ns > 0 {
         let pct = 100.0 * worker_irq_ns as f64 / worker_total_ns as f64;
@@ -635,7 +668,7 @@ fn csv_experiment_run() {
             continue;
         }
         if let TraceKind::TaskScheduled { pid } = &event.kind {
-            let on_irq = IRQ_CPUS.contains(&event.cpu.0);
+            let on_irq = irq_cpu_list.contains(&event.cpu.0);
             if worker_pids.contains(pid) {
                 worker_total_count += 1;
                 if on_irq {
@@ -727,7 +760,8 @@ fn csv_experiment_run() {
     }
 
     eprintln!(
-        "csv_experiment: scheduler={} condition={} cores={} duration={}ms seed={}",
-        scheduler, condition, nr_cpus, duration_ms, seed
+        "csv_experiment: scheduler={} condition={} cores={} cpus_per_llc={} domains={} threads={} duration={}ms seed={}",
+        scheduler, condition, nr_cpus, cpus_per_llc, nr_domains,
+        num_workers + num_readers + num_writers + _num_hogs, duration_ms, seed
     );
 }
