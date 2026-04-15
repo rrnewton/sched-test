@@ -39,7 +39,7 @@ const HOG_SLEEP_NS: u64 = 750_000;
 
 const IRQ_INTERVAL_NS: u64 = 10_000_000; // 10ms period (matching rt-app)
 const IRQ_DURATION_NS: u64 = 3_300_000; // 3.3ms burst (33% duty cycle, matching VM BROAD profile)
-const IRQ_CPUS: [u32; 4] = [0, 2, 4, 6]; // even-numbered workload CPUs
+const IRQ_CPUS: [u32; 6] = [0, 2, 4, 6, 8, 10]; // even-numbered workload CPUs (matching VM BROAD profile)
 
 fn worker_pid(i: i32) -> Pid {
     Pid(1 + i)
