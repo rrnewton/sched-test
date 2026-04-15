@@ -3881,22 +3881,21 @@ impl<S: Scheduler> Simulator<S> {
             trace: &s.sim.trace,
         });
 
-        // Enforce wakeup latency floor + jitter + migration penalty.
+        // Enforce wakeup latency floor with heavy-tailed distribution.
         // Models kernel overhead (IPI, context switch, cache warming) that
-        // exists even with zero queuing delay.
+        // exists even with zero queuing delay. Uses log-normal base with
+        // rare heavy-tail spikes matching production p99/p50 ratios.
         if s.sim.overhead.enabled {
             let floor = s.sim.overhead.wakeup_latency_floor_ns;
-            let jitter_stddev = s.sim.overhead.wakeup_jitter_stddev_ns;
             let mig_penalty = s.sim.overhead.migration_penalty_ns;
 
             if let Some(enq_t) = s.tasks.get(&pid).and_then(|t| t.enqueued_at_ns) {
-                // Base floor + normally-distributed jitter
-                let jitter = if jitter_stddev > 0 {
-                    s.sim.sample_normal_ns(jitter_stddev)
+                // Heavy-tailed wakeup latency (log-normal + Pareto spikes)
+                let effective_floor = if floor > 0 {
+                    s.sim.sample_wakeup_latency_ns(floor)
                 } else {
                     0
                 };
-                let effective_floor = (floor as i64 + jitter).max(0) as u64;
 
                 // Migration penalty: extra cache/TLB warming cost
                 let effective_floor = if migrated && mig_penalty > 0 {
