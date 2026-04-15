@@ -522,13 +522,15 @@ fn csv_experiment_run() {
         //   --performance --slice-min-us 3000 --slice-max-us 10000 --mig-delta-pct 15
         // Production does NOT use --per-cpu-dsq or --pinned-slice-us.
         // per_cpu_dsq=false, pinned_slice_ns=0 → all tasks use shared cpdom DSQs.
+        // Override with SCX_SIM_PER_CPU_DSQ=1 for testing.
+        let per_cpu_dsq = std::env::var("SCX_SIM_PER_CPU_DSQ").as_deref() == Ok("1");
         let sched = if nr_domains > 1 {
             let s = DynamicScheduler::lavd_multi_domain(nr_cpus, nr_domains);
-            s.lavd_configure(false, 0, 15);
+            s.lavd_configure(per_cpu_dsq, 0, 15);
             s
         } else {
             let s = DynamicScheduler::lavd(nr_cpus);
-            s.lavd_configure(false, 0, 15);
+            s.lavd_configure(per_cpu_dsq, 0, 15);
             s
         };
         let probes = LavdProbes::new(&sched);
