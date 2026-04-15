@@ -508,15 +508,17 @@ fn csv_experiment_run() {
     }
 
     let trace = if use_lavd {
-        // per_cpu_dsq=true enables per-CPU DSQ migration checking in balance.bpf.c,
-        // which is needed for IRQ avoidance at scale (multi-domain).
+        // Match production LAVD config:
+        //   --performance --slice-min-us 3000 --slice-max-us 10000 --mig-delta-pct 15
+        // Production does NOT use --per-cpu-dsq or --pinned-slice-us.
+        // per_cpu_dsq=false, pinned_slice_ns=0 → all tasks use shared cpdom DSQs.
         let sched = if nr_domains > 1 {
             let s = DynamicScheduler::lavd_multi_domain(nr_cpus, nr_domains);
-            s.lavd_configure(true, 3_000_000, 15);
+            s.lavd_configure(false, 0, 15);
             s
         } else {
             let s = DynamicScheduler::lavd(nr_cpus);
-            s.lavd_configure(true, 3_000_000, 15);
+            s.lavd_configure(false, 0, 15);
             s
         };
         let probes = LavdProbes::new(&sched);
