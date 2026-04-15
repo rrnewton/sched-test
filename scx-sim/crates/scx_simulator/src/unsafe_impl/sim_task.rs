@@ -50,6 +50,13 @@ pub struct SimTask {
     /// base value at `running()` and computing `base + elapsed` before
     /// `tick()` and `stopping()` callbacks.
     pub sum_exec_base: TimeNs,
+    /// Timestamp (simulated ns) when the task was last enqueued.
+    ///
+    /// Used by the wakeup latency floor to ensure a minimum time between
+    /// enqueue and schedule, modeling kernel overhead (IPI, context switch
+    /// setup, cache warming). Set when EnqueueTask is recorded, consumed
+    /// when the task starts running.
+    pub enqueued_at_ns: Option<TimeNs>,
 }
 
 impl SimTask {
@@ -110,6 +117,7 @@ impl SimTask {
             prev_cpu: initial_cpu,
             runnable_at_ns: None,
             sum_exec_base: 0,
+            enqueued_at_ns: None,
         }
     }
 
