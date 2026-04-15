@@ -322,6 +322,16 @@ pub struct OverheadConfig {
     pub ipi_delivery_ns: TimeNs,
     /// Overhead for ops.update_idle() callback dispatch. Default: 50.
     pub update_idle_overhead_ns: TimeNs,
+    /// Minimum scheduling latency floor (ns) for wake→running transitions.
+    ///
+    /// Models kernel overhead that exists even with zero queuing: IPI delivery,
+    /// context switch setup, cache/TLB warming, and scheduler BPF callback
+    /// overhead. Production traces show cache_worker p50 of 2.7-6.1μs even on
+    /// lightly loaded machines (252 threads on 315 CPUs).
+    ///
+    /// Applied as a floor on the per-CPU clock advance between EnqueueTask and
+    /// TaskScheduled. Set to 0 to disable. Default: 3000ns (3μs).
+    pub wakeup_latency_floor_ns: TimeNs,
 }
 
 impl Default for OverheadConfig {
@@ -338,6 +348,7 @@ impl Default for OverheadConfig {
             running_overhead_ns: 50,
             ipi_delivery_ns: 200,
             update_idle_overhead_ns: 50,
+            wakeup_latency_floor_ns: 3_000,
         }
     }
 }
@@ -360,6 +371,30 @@ impl OverheadConfig {
             Some("1") => config.enabled = true,
             _ => {}
         }
+
+        // Per-parameter env var overrides for tuning against production traces.
+        fn env_u64(name: &str) -> Option<u64> {
+            std::env::var(name).ok()?.parse().ok()
+        }
+        if let Some(v) = env_u64("SCX_SIM_VOL_CSW_NS") {
+            config.voluntary_csw_ns = v;
+        }
+        if let Some(v) = env_u64("SCX_SIM_INVOL_CSW_NS") {
+            config.involuntary_csw_ns = v;
+        }
+        if let Some(v) = env_u64("SCX_SIM_CSW_JITTER_NS") {
+            config.csw_jitter_stddev_ns = v;
+        }
+        if let Some(v) = env_u64("SCX_SIM_IPI_NS") {
+            config.ipi_delivery_ns = v;
+        }
+        if let Some(v) = env_u64("SCX_SIM_DSQ_CONSUME_NS") {
+            config.dsq_consume_ns = v;
+        }
+        if let Some(v) = env_u64("SCX_SIM_WAKEUP_FLOOR_NS") {
+            config.wakeup_latency_floor_ns = v;
+        }
+
         config
     }
 
