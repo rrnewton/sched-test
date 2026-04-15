@@ -370,6 +370,14 @@ void lavd_fire_timer(void)
 }
 
 /*
+ * Cgroup bandwidth control stubs.
+ * LAVD calls these when enable_cpu_bw is set (off by default in simulator).
+ * Return false (not throttled) to satisfy the linker.
+ */
+bool scx_cgroup_bw_is_cgroup_throttled(u64 cgrp_id) { return false; }
+bool scx_cgroup_bw_is_task_throttled(u64 taskc_ptr) { return false; }
+
+/*
  * =================================================================
  * Kfunc stubs for BPF experimental functions
  * =================================================================
