@@ -40,9 +40,16 @@ const HOG_SLEEP_NS: u64 = 750_000;
 const IRQ_INTERVAL_NS: u64 = 10_000_000; // 10ms period (matching rt-app)
 const IRQ_DURATION_NS: u64 = 3_300_000; // 3.3ms burst (33% duty cycle, matching VM BROAD profile)
 
-/// Compute thread counts scaled to nr_cpus (ratio: 1.5 threads/CPU total).
-/// Thread counts: 0.9 threads/CPU default, or explicit override via env vars
-/// (SCX_SIM_WORKERS, SCX_SIM_READERS, SCX_SIM_WRITERS, SCX_SIM_HOGS).
+/// Compute thread counts scaled to nr_cpus.
+///
+/// Production has ~3.8 busy threads/CPU (1,208 busy threads on 316 CPUs).
+/// Key threads (workers+readers+writers) are ~0.8/CPU; the rest is background
+/// contention. Hog threads model this background pressure at ~2 hogs/CPU,
+/// giving ~2.8 total threads/CPU — enough to drive realistic cpdom dispatch
+/// routing instead of always finding idle CPUs for direct dispatch.
+///
+/// Override via env vars: SCX_SIM_WORKERS, SCX_SIM_READERS, SCX_SIM_WRITERS,
+/// SCX_SIM_HOGS.
 fn thread_counts(nr_cpus: u32) -> (i32, i32, i32, i32) {
     fn env_i32(name: &str) -> Option<i32> {
         std::env::var(name).ok()?.parse().ok()
@@ -56,8 +63,7 @@ fn thread_counts(nr_cpus: u32) -> (i32, i32, i32, i32) {
     let workers = ((nr_cpus * 2 / 3) as i32).max(4);
     let readers = ((nr_cpus / 12) as i32).max(1);
     let writers = ((nr_cpus / 12) as i32).max(1);
-    let target_total = (nr_cpus as f64 * 0.9) as i32;
-    let hogs = (target_total - workers - readers - writers).max(1);
+    let hogs = ((nr_cpus * 2) as i32).max(4);
     (workers, readers, writers, hogs)
 }
 
