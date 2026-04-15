@@ -52,7 +52,10 @@ fn thread_counts(nr_cpus: u32) -> (i32, i32, i32, i32) {
 /// Compute IRQ target CPUs: even-numbered CPUs up to ~1/3 of total.
 fn irq_cpus(nr_cpus: u32) -> Vec<u32> {
     let n_irq = (nr_cpus / 3).max(2);
-    (0..nr_cpus).filter(|c| c % 2 == 0).take(n_irq as usize).collect()
+    (0..nr_cpus)
+        .filter(|c| c % 2 == 0)
+        .take(n_irq as usize)
+        .collect()
 }
 
 fn worker_pid(i: i32) -> Pid {
@@ -68,7 +71,12 @@ fn hog_pid(i: i32, num_workers: i32, num_readers: i32, num_writers: i32) -> Pid 
     Pid(1 + num_workers + num_readers + num_writers + i)
 }
 
-fn build_scenario(nr_cpus: u32, cpus_per_llc: u32, with_nice_hints: bool, duration_ms: u64) -> Scenario {
+fn build_scenario(
+    nr_cpus: u32,
+    cpus_per_llc: u32,
+    with_nice_hints: bool,
+    duration_ms: u64,
+) -> Scenario {
     let mut builder = Scenario::builder().cpus(nr_cpus);
     if cpus_per_llc > 0 {
         builder = builder.cpus_per_llc(cpus_per_llc);
@@ -246,7 +254,12 @@ fn compute_sched_latencies(trace: &Trace, pids: &[Pid], warmup_ns: u64) -> Vec<u
 
 /// Compute time-weighted IRQ exposure for given PIDs.
 /// Returns (runtime_on_irq_ns, total_runtime_ns).
-fn compute_irq_exposure(trace: &Trace, pids: &[Pid], warmup_ns: u64, irq_cpu_list: &[u32]) -> (u64, u64) {
+fn compute_irq_exposure(
+    trace: &Trace,
+    pids: &[Pid],
+    warmup_ns: u64,
+    irq_cpu_list: &[u32],
+) -> (u64, u64) {
     let mut running_since: HashMap<Pid, (u64, u32)> = HashMap::new();
     let mut irq_ns: u64 = 0;
     let mut total_ns: u64 = 0;
@@ -460,7 +473,11 @@ fn csv_experiment_run() {
 
     // Create scheduler and optionally attach LAVD monitor
     let use_lavd = scheduler == "lavd";
-    let nr_domains = if cpus_per_llc > 0 { nr_cpus / cpus_per_llc } else { 1 };
+    let nr_domains = if cpus_per_llc > 0 {
+        nr_cpus / cpus_per_llc
+    } else {
+        1
+    };
 
     if print_header {
         println!("timestamp,mode,scheduler,condition,thread_type,thread_id,metric_name,percentile,value,unit,sample_count,rep,notes");
@@ -559,8 +576,12 @@ fn csv_experiment_run() {
 
     // ---- E2E cycle times ----
     let worker_pids: Vec<Pid> = (0..num_workers).map(worker_pid).collect();
-    let reader_pids: Vec<Pid> = (0..num_readers).map(|i| reader_pid(i, num_workers)).collect();
-    let _writer_pids: Vec<Pid> = (0..num_writers).map(|i| writer_pid(i, num_workers, num_readers)).collect();
+    let reader_pids: Vec<Pid> = (0..num_readers)
+        .map(|i| reader_pid(i, num_workers))
+        .collect();
+    let _writer_pids: Vec<Pid> = (0..num_writers)
+        .map(|i| writer_pid(i, num_workers, num_readers))
+        .collect();
 
     let worker_cycles = compute_cycle_times(&trace, &worker_pids, warmup_ns);
     let reader_cycles = compute_cycle_times(&trace, &reader_pids, warmup_ns);
@@ -620,8 +641,10 @@ fn csv_experiment_run() {
     );
 
     // ---- IRQ exposure ----
-    let (worker_irq_ns, worker_total_ns) = compute_irq_exposure(&trace, &worker_pids, warmup_ns, &irq_cpu_list);
-    let (reader_irq_ns, reader_total_ns) = compute_irq_exposure(&trace, &reader_pids, warmup_ns, &irq_cpu_list);
+    let (worker_irq_ns, worker_total_ns) =
+        compute_irq_exposure(&trace, &worker_pids, warmup_ns, &irq_cpu_list);
+    let (reader_irq_ns, reader_total_ns) =
+        compute_irq_exposure(&trace, &reader_pids, warmup_ns, &irq_cpu_list);
 
     if worker_total_ns > 0 {
         let pct = 100.0 * worker_irq_ns as f64 / worker_total_ns as f64;
