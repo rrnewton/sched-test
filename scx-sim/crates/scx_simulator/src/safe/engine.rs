@@ -2835,6 +2835,10 @@ impl<S: Scheduler> Simulator<S> {
             return;
         }
 
+        // Extract values from task before dropping the borrow.
+        let prev_cpu = task.prev_cpu;
+        let raw = task.raw();
+
         // Set waker context: in the kernel, runnable/select_cpu/enqueue all
         // run in the waker's context, so bpf_get_current_task_btf() and
         // bpf_get_smp_processor_id() return the waker's state.
@@ -2843,15 +2847,18 @@ impl<S: Scheduler> Simulator<S> {
             .and_then(|w| s.sim.task_pid_to_raw.get(&w.pid).copied());
 
         // CPU where the wakeup originates (waker's CPU or prev_cpu as fallback)
-        let prev_cpu = task.prev_cpu;
         let wake_cpu = waker.as_ref().map_or(prev_cpu, |w| w.cpu);
 
         s.sim
             .trace
             .record(s.sim.clock, wake_cpu, TraceKind::TaskWoke { pid });
 
+        // Track wakeup time for wakeup latency floor enforcement.
+        // Set here (before select_cpu/enqueue) to capture the full kernel
+        // wake→schedule path, including direct dispatch via select_cpu.
+        s.tasks.get_mut(&pid).unwrap().enqueued_at_ns = Some(s.sim.clock);
+
         // Call runnable callback
-        let raw = task.raw();
         // Sync wakeup: kernel sets WF_SYNC when the waker explicitly
         // requests it (e.g. pipe write, futex unlock). In the simulator,
         // a waker-driven wake (Phase::Wake) models this pattern.
@@ -3871,6 +3878,24 @@ impl<S: Scheduler> Simulator<S> {
             task_raw: raw,
             trace: &s.sim.trace,
         });
+
+        // Enforce wakeup latency floor: ensure at least `wakeup_latency_floor_ns`
+        // has elapsed between enqueue and TaskScheduled. This models kernel
+        // overhead (IPI, context switch, cache warming) that exists even with
+        // zero queuing delay.
+        let floor = s.sim.overhead.wakeup_latency_floor_ns;
+        if floor > 0 {
+            if let Some(enq_t) = s.tasks.get(&pid).and_then(|t| t.enqueued_at_ns) {
+                let min_scheduled_at = enq_t + floor;
+                if s.sim.cpus[cpu.0 as usize].local_clock < min_scheduled_at {
+                    s.sim.cpus[cpu.0 as usize].local_clock = min_scheduled_at;
+                }
+            }
+        }
+        // Clear enqueued_at_ns now that the floor has been applied.
+        if let Some(task) = s.tasks.get_mut(&pid) {
+            task.enqueued_at_ns = None;
+        }
 
         let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
         s.sim
