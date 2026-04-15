@@ -737,15 +737,17 @@ impl SimulatorState {
         let log_normal_multiplier = (sigma * z).exp(); // e^(σz), centered around 1.0
         let base = (floor_ns as f64 * log_normal_multiplier).max(1.0) as u64;
 
-        // Heavy-tail spike: ~3% probability of a large outlier.
-        // Models: runqueue lock contention, cache line storms, TLB shootdown batches.
-        // Spike magnitude follows Pareto-like distribution: floor * U^(-1/alpha)
-        // with alpha=1.0, calibrated to match production LAVD p99/p50 ≈ 9x.
+        // Heavy-tail spike: ~4% probability of a large outlier.
+        // Models: runqueue lock contention, cache line storms, TLB shootdown
+        // batches, and bursty multi-thread wakeup contention.
+        // Spike magnitude follows Pareto distribution: floor * U^(-1/α)
+        // with α=0.6, calibrated to match production LAVD:
+        //   p99/p50 ≈ 9x, p999/p50 ≈ 47x
         let spike_roll = self.next_prng() % 1000;
-        if spike_roll < 30 {
-            // 3% chance of heavy-tail spike
+        if spike_roll < 35 {
+            // 3.5% chance of heavy-tail spike
             let u = (self.next_prng() % 900 + 100) as f64 / 1000.0; // uniform(0.1, 1.0)
-            let alpha = 0.8_f64;
+            let alpha = 0.55_f64;
             let pareto_multiplier = u.powf(-1.0 / alpha); // 1.0 to ~4.6 at p99
             let spike = (floor_ns as f64 * pareto_multiplier) as u64;
             base + spike
