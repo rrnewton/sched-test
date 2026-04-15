@@ -476,6 +476,7 @@ pub fn load_rtapp(json_str: &str, nr_cpus: u32) -> Result<Scenario, RtAppError> 
     Ok(Scenario {
         nr_cpus,
         smt_threads_per_core: 1,
+        cpus_per_llc: 0,
         tasks: all_tasks,
         cgroups: Vec::new(), // rt-app doesn't use cgroups
         duration_ns,
