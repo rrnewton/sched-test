@@ -28,11 +28,11 @@
 use std::collections::HashMap;
 
 use serde_json::{Map, Value};
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::scenario::{
-    sched_overhead_rbc_ns_from_env, seed_from_env, NoiseConfig, OverheadConfig, Scenario,
-    DEFAULT_WATCHDOG_TIMEOUT_NS,
+    sched_overhead_rbc_ns_from_env, seed_from_env, IrqEvent, IrqType, NoiseConfig, OverheadConfig,
+    Scenario, DEFAULT_WATCHDOG_TIMEOUT_NS,
 };
 use crate::task::{Phase, RepeatMode, TaskBehavior, TaskDef};
 use crate::types::{CpuId, Pid};
@@ -378,6 +378,56 @@ fn parse_task(
     Ok(defs)
 }
 
+/// Extract run and sleep durations (in ns) from an irq_gen task definition.
+///
+/// Supports both flat (`"run": N, "sleep": M`) and phased layouts
+/// (`"phases": { "irq_work": { "run": N }, "idle": { "sleep": M } }`).
+fn extract_irq_gen_timing(obj: &Map<String, Value>) -> Result<(u64, u64), RtAppError> {
+    // Try phased layout first (the v09 config uses this).
+    if let Some(phases_val) = obj.get("phases") {
+        if let Some(phases_obj) = phases_val.as_object() {
+            let mut run_ns: Option<u64> = None;
+            let mut sleep_ns: Option<u64> = None;
+
+            for (_phase_name, phase_val) in phases_obj.iter() {
+                if let Some(phase_obj) = phase_val.as_object() {
+                    if let Some(r) = phase_obj
+                        .get("run")
+                        .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|i| i as u64)))
+                    {
+                        run_ns = Some(r * 1_000); // usec → ns
+                    }
+                    if let Some(s) = phase_obj
+                        .get("sleep")
+                        .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|i| i as u64)))
+                    {
+                        sleep_ns = Some(s * 1_000);
+                    }
+                }
+            }
+
+            if let (Some(r), Some(s)) = (run_ns, sleep_ns) {
+                return Ok((r, s));
+            }
+        }
+    }
+
+    // Try flat layout.
+    let run_us = obj
+        .get("run")
+        .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|i| i as u64)));
+    let sleep_us = obj
+        .get("sleep")
+        .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|i| i as u64)));
+
+    match (run_us, sleep_us) {
+        (Some(r), Some(s)) => Ok((r * 1_000, s * 1_000)),
+        _ => Err(RtAppError::InvalidValue(
+            "irq_gen task missing run/sleep durations".into(),
+        )),
+    }
+}
+
 /// Load an rt-app JSON workload and convert it to a simulator [`Scenario`].
 ///
 /// # Arguments
@@ -455,13 +505,77 @@ pub fn load_rtapp(json_str: &str, nr_cpus: u32) -> Result<Scenario, RtAppError> 
         }
     }
 
-    // Second pass: parse tasks with name→pid resolution
+    // Second pass: parse tasks with name→pid resolution.
+    // Detect irq_gen_* tasks and convert them to IrqEvent entries instead
+    // of regular tasks.  In production, IRQs fire outside the scheduler's
+    // control; the irq_gen tasks in rt-app specs are only meaningful for
+    // VM/pinned modes where they generate real softirqs.  In simulation we
+    // must model them as simulator-level IRQ injection so that
+    // bpf_in_serving_softirq(), rq->clock_task, etc. behave correctly.
     let mut all_tasks: Vec<TaskDef> = Vec::new();
+    let mut irq_events: Vec<IrqEvent> = Vec::new();
     let mut pid_counter: i32 = 1;
     for (task_name, task_val) in tasks_obj.iter() {
         let task_obj = task_val.as_object().ok_or_else(|| {
             RtAppError::InvalidValue(format!("task {task_name}: expected object"))
         })?;
+
+        if task_name.starts_with("irq_gen") {
+            // Convert to periodic IrqEvents instead of a scheduled task.
+            // Still consume a PID slot to keep PID numbering stable.
+            let _pid = pid_counter;
+            pid_counter += 1;
+
+            // Extract the pinned CPU from the affinity mask.
+            let cpu = if let Some(cpus_val) = task_obj.get("cpus") {
+                let cpus = parse_cpus(cpus_val)?;
+                match cpus {
+                    Some(ref c) if c.len() == 1 => c[0],
+                    _ => {
+                        warn!(
+                            task = task_name.as_str(),
+                            "irq_gen task without single-CPU pinning; using CPU 0"
+                        );
+                        CpuId(0)
+                    }
+                }
+            } else {
+                warn!(
+                    task = task_name.as_str(),
+                    "irq_gen task without cpus field; using CPU 0"
+                );
+                CpuId(0)
+            };
+
+            // Extract run and sleep durations from phases (or top-level).
+            let (run_ns, sleep_ns) = extract_irq_gen_timing(task_obj)?;
+            let period_ns = run_ns + sleep_ns;
+
+            // Generate periodic softirq events for the full duration.
+            let events_before = irq_events.len();
+            let mut t: u64 = 0;
+            while t <= duration_ns {
+                irq_events.push(IrqEvent {
+                    cpu,
+                    at_ns: t,
+                    duration_ns: run_ns,
+                    irq_type: IrqType::SoftIrq,
+                    wake_pids: Vec::new(),
+                });
+                t += period_ns;
+            }
+            let events_added = irq_events.len() - events_before;
+
+            info!(
+                task = task_name.as_str(),
+                cpu = cpu.0,
+                run_us = run_ns / 1_000,
+                period_us = period_ns / 1_000,
+                events = events_added,
+                "converted irq_gen task to periodic softirq events"
+            );
+            continue;
+        }
 
         let defs = parse_task(task_name, task_obj, &mut pid_counter, &name_to_pid)?;
         all_tasks.extend(defs);
@@ -498,7 +612,7 @@ pub fn load_rtapp(json_str: &str, nr_cpus: u32) -> Result<Scenario, RtAppError> 
         replay_trace: None,
         no_pmu_signal: false,
         max_cgroups: crate::cgroup::DEFAULT_MAX_CGROUPS,
-        irq_events: Vec::new(),
+        irq_events,
         native_concurrent: None,
         wait_debugger: false,
         warmup_ns: 0,
