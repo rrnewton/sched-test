@@ -3809,6 +3809,8 @@ impl<S: Scheduler> Simulator<S> {
         }
 
         task.state = TaskState::Running { cpu };
+        // Track whether this is a migration (for migration penalty).
+        let migrated = task.prev_cpu != cpu;
         task.prev_cpu = cpu;
         // Clear runnable_at_ns: task is now running (watchdog reset).
         task.runnable_at_ns = None;
@@ -3879,14 +3881,31 @@ impl<S: Scheduler> Simulator<S> {
             trace: &s.sim.trace,
         });
 
-        // Enforce wakeup latency floor: ensure at least `wakeup_latency_floor_ns`
-        // has elapsed between enqueue and TaskScheduled. This models kernel
-        // overhead (IPI, context switch, cache warming) that exists even with
-        // zero queuing delay.
-        let floor = s.sim.overhead.wakeup_latency_floor_ns;
-        if floor > 0 {
+        // Enforce wakeup latency floor + jitter + migration penalty.
+        // Models kernel overhead (IPI, context switch, cache warming) that
+        // exists even with zero queuing delay.
+        if s.sim.overhead.enabled {
+            let floor = s.sim.overhead.wakeup_latency_floor_ns;
+            let jitter_stddev = s.sim.overhead.wakeup_jitter_stddev_ns;
+            let mig_penalty = s.sim.overhead.migration_penalty_ns;
+
             if let Some(enq_t) = s.tasks.get(&pid).and_then(|t| t.enqueued_at_ns) {
-                let min_scheduled_at = enq_t + floor;
+                // Base floor + normally-distributed jitter
+                let jitter = if jitter_stddev > 0 {
+                    s.sim.sample_normal_ns(jitter_stddev)
+                } else {
+                    0
+                };
+                let effective_floor = (floor as i64 + jitter).max(0) as u64;
+
+                // Migration penalty: extra cache/TLB warming cost
+                let effective_floor = if migrated && mig_penalty > 0 {
+                    effective_floor + mig_penalty
+                } else {
+                    effective_floor
+                };
+
+                let min_scheduled_at = enq_t + effective_floor;
                 if s.sim.cpus[cpu.0 as usize].local_clock < min_scheduled_at {
                     s.sim.cpus[cpu.0 as usize].local_clock = min_scheduled_at;
                 }
