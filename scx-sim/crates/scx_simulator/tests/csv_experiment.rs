@@ -127,12 +127,21 @@ fn build_scenario(
     });
 
     for i in 0..num_workers {
+        // Hub-spoke wake pattern: each worker wakes a reader after compute,
+        // modeling ucache's NVM read dispatch. Worker i wakes reader (i % num_readers).
+        // This gives workers non-zero wake_freq, matching production where
+        // worker wake_freq=719 (workers wake readers on NVM cache misses).
+        let target_reader = reader_pid(i % num_readers, num_workers);
         builder = builder.task(TaskDef {
             name: format!("ucache_worker_{i}"),
             pid: worker_pid(i),
             nice: worker_nice,
             behavior: TaskBehavior {
-                phases: vec![Phase::Run(WORKER_RUN_NS), Phase::Sleep(WORKER_SLEEP_NS)],
+                phases: vec![
+                    Phase::Run(WORKER_RUN_NS),
+                    Phase::Wake(target_reader),
+                    Phase::Sleep(WORKER_SLEEP_NS),
+                ],
                 repeat: RepeatMode::Forever,
             },
             start_time_ns: i as u64 * 10_000,
