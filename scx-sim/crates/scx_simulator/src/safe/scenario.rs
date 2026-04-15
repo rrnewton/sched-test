@@ -365,6 +365,13 @@ pub struct OverheadConfig {
     /// from where it last ran. Production traces show significant migration
     /// counts (e.g., 26k migrations for 252 threads in 191ms). Default: 10000ns (10μs).
     pub migration_penalty_ns: TimeNs,
+    /// Extra latency (ns) for cross-LLC migrations (on top of migration_penalty_ns).
+    ///
+    /// When a task migrates to a CPU in a different LLC domain, the entire
+    /// working set must be fetched from remote LLC or DRAM instead of the
+    /// local LLC. This adds ~20-50μs on AMD Zen3/4 (cross-CCX) or ~10-20μs
+    /// on Intel (cross-ring-stop). Default: 25000ns (25μs).
+    pub cross_llc_migration_penalty_ns: TimeNs,
 }
 
 impl Default for OverheadConfig {
@@ -384,6 +391,7 @@ impl Default for OverheadConfig {
             wakeup_latency_floor_ns: 3_000,
             wakeup_jitter_stddev_ns: 2_000,
             migration_penalty_ns: 10_000,
+            cross_llc_migration_penalty_ns: 25_000,
         }
     }
 }
@@ -434,6 +442,9 @@ impl OverheadConfig {
         }
         if let Some(v) = env_u64("SCX_SIM_MIGRATION_PENALTY_NS") {
             config.migration_penalty_ns = v;
+        }
+        if let Some(v) = env_u64("SCX_SIM_CROSS_LLC_PENALTY_NS") {
+            config.cross_llc_migration_penalty_ns = v;
         }
 
         config
@@ -601,6 +612,8 @@ pub struct Scenario {
     /// CPUs are grouped sequentially: with 4 CPUs and smt=2, CPUs 0,1
     /// share core 0 and CPUs 2,3 share core 1.
     pub smt_threads_per_core: u32,
+    /// CPUs per LLC domain. 0 = single domain. Used to assign `llc_id` to CPUs.
+    pub cpus_per_llc: u32,
     pub tasks: Vec<TaskDef>,
     /// Cgroup definitions (excluding root, which always exists).
     pub cgroups: Vec<CgroupDef>,
@@ -704,6 +717,9 @@ pub struct Scenario {
 pub struct ScenarioBuilder {
     nr_cpus: u32,
     smt_threads_per_core: u32,
+    /// CPUs per LLC domain. 0 = all CPUs in one domain (default).
+    /// E.g., cpus_per_llc=12 with nr_cpus=48 creates 4 LLC domains.
+    cpus_per_llc: u32,
     tasks: Vec<TaskDef>,
     cgroups: Vec<CgroupDef>,
     duration_ns: TimeNs,
@@ -737,6 +753,7 @@ impl Scenario {
         ScenarioBuilder {
             nr_cpus: 1,
             smt_threads_per_core: 1,
+            cpus_per_llc: 0,
             tasks: Vec::new(),
             cgroups: Vec::new(),
             duration_ns: 100_000_000, // 100ms default
@@ -779,6 +796,18 @@ impl ScenarioBuilder {
     /// `nr_cpus` must be divisible by this value.
     pub fn smt(mut self, threads_per_core: u32) -> Self {
         self.smt_threads_per_core = threads_per_core;
+        self
+    }
+
+    /// Set the number of CPUs per LLC domain (CCX).
+    ///
+    /// E.g., `cpus_per_llc(12)` with 48 CPUs creates 4 LLC domains (CCXs),
+    /// each containing CPUs 0-11, 12-23, 24-35, 36-47. LAVD uses LLC domains
+    /// for DSQ routing and migration decisions.
+    ///
+    /// Default: 0 (all CPUs in a single LLC domain).
+    pub fn cpus_per_llc(mut self, cpus: u32) -> Self {
+        self.cpus_per_llc = cpus;
         self
     }
 
@@ -1289,9 +1318,18 @@ impl ScenarioBuilder {
             "--native-concurrent and --preemptive are mutually exclusive: \
              native concurrent mode runs workers freely without PMU or token ring"
         );
+        if self.cpus_per_llc > 0 {
+            assert!(
+                self.nr_cpus.is_multiple_of(self.cpus_per_llc),
+                "nr_cpus ({}) must be divisible by cpus_per_llc ({})",
+                self.nr_cpus,
+                self.cpus_per_llc
+            );
+        }
         Scenario {
             nr_cpus: self.nr_cpus,
             smt_threads_per_core: self.smt_threads_per_core,
+            cpus_per_llc: self.cpus_per_llc,
             tasks: self.tasks,
             cgroups: self.cgroups,
             duration_ns: self.duration_ns,
