@@ -156,6 +156,19 @@ pub struct NoiseConfig {
     pub tick_jitter: bool,
     /// Standard deviation for tick jitter (ns). Default: 2000 (2μs).
     pub tick_jitter_stddev_ns: TimeNs,
+    /// Enable run-time jitter (normally-distributed variation on Phase::Run duration).
+    ///
+    /// Models real compute-time variability from cache misses, branch mispredictions,
+    /// TLB misses, and memory bandwidth contention. Without this, Phase::Run(250μs)
+    /// executes for exactly 250μs every time, producing unrealistically tight e2e
+    /// latency distributions (p50≈p99). Default: true.
+    pub run_jitter: bool,
+    /// Coefficient of variation for run-time jitter (millionths, i.e., ppm).
+    ///
+    /// Applied as: `duration * (1 + normal(0, cv/1e6))`. A cv_ppm of 200_000
+    /// means 20% CV — so Phase::Run(250μs) becomes ~250μs ± 50μs.
+    /// Default: 200_000 (20% CV).
+    pub run_jitter_cv_ppm: u64,
 }
 
 impl Default for NoiseConfig {
@@ -164,6 +177,8 @@ impl Default for NoiseConfig {
             enabled: true,
             tick_jitter: true,
             tick_jitter_stddev_ns: 2_000,
+            run_jitter: true,
+            run_jitter_cv_ppm: 200_000,
         }
     }
 }
@@ -185,6 +200,11 @@ impl NoiseConfig {
             Some("0") => config.enabled = false,
             Some("1") => config.enabled = true,
             _ => {}
+        }
+        if let Ok(v) = std::env::var("SCX_SIM_RUN_JITTER_CV_PPM") {
+            if let Ok(ppm) = v.parse::<u64>() {
+                config.run_jitter_cv_ppm = ppm;
+            }
         }
         config
     }

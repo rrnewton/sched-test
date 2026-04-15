@@ -3928,7 +3928,23 @@ impl<S: Scheduler> Simulator<S> {
             .trace
             .record(local_t, cpu, TraceKind::TaskScheduled { pid });
 
-        // Determine how long this task will run
+        // Determine how long this task will run.
+        // Apply run-time jitter: models compute variability from cache misses,
+        // branch mispredictions, TLB misses, and memory bandwidth contention.
+        {
+            let task = s.tasks.get_mut(&pid).unwrap();
+            if task.run_remaining_ns > 0
+                && s.sim.noise.enabled
+                && s.sim.noise.run_jitter
+                && s.sim.noise.run_jitter_cv_ppm > 0
+            {
+                let base = task.run_remaining_ns;
+                let stddev =
+                    (base as u128 * s.sim.noise.run_jitter_cv_ppm as u128 / 1_000_000) as u64;
+                let noise = s.sim.sample_normal_ns(stddev);
+                task.run_remaining_ns = (base as i64 + noise).max(1) as u64;
+            }
+        }
         let task = s.tasks.get(&pid).unwrap();
         let slice = task.get_slice();
         let remaining = task.run_remaining_ns;
