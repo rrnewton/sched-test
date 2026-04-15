@@ -137,14 +137,28 @@ fn build_scenario(
             pid: worker_pid(i),
             nice: worker_nice,
             behavior: TaskBehavior {
-                // 4-cycle pattern: 25% NVM miss rate → one Wake per 4 cycles.
-                // Inter-wake interval = 4 × 360μs = 1440μs > LAVD_LC_WAKE_INTERVAL_MIN (500μs).
-                // Matches production where ~25% of requests trigger an NVM read.
+                // Worker phases model lock contention micro-sleeps.
+                // Production worker wait_freq=7568 → 3 sleeps per 360μs cycle.
+                // Run(80μs) + Sleep(5μs) + Run(80μs) + Sleep(5μs) + Run(80μs) + Sleep(110μs)
+                // = 3 sleeps per cycle, total run=240μs + sleep=120μs = 360μs
+                // Wake(reader) every other cycle.
+                // Worker phases: 4 micro-sleeps per half-cycle + peer wake + reader wake.
+                // Targets: wait_freq ~15000 (production 7568×2 accounting for sim overhead),
+                //          wake_freq ~1000 (reader wake + peer wake).
+                // Product wait*wake must exceed reader's to flip lat_cri ranking.
                 phases: vec![
-                    Phase::Run(WORKER_RUN_NS), Phase::Sleep(WORKER_SLEEP_NS),
-                    Phase::Run(WORKER_RUN_NS), Phase::Sleep(WORKER_SLEEP_NS),
-                    Phase::Run(WORKER_RUN_NS), Phase::Sleep(WORKER_SLEEP_NS),
-                    Phase::Run(WORKER_RUN_NS), Phase::Wake(target_reader), Phase::Sleep(WORKER_SLEEP_NS),
+                    Phase::Run(75_000), Phase::Sleep(3_000),
+                    Phase::Run(75_000), Phase::Sleep(3_000),
+                    Phase::Run(75_000), Phase::Sleep(3_000),
+                    Phase::Run(16_000),
+                    Phase::Wake(target_reader),
+                    Phase::Wake(worker_pid((i + 1) % num_workers)),
+                    Phase::Sleep(WORKER_SLEEP_NS),
+                    Phase::Run(75_000), Phase::Sleep(3_000),
+                    Phase::Run(75_000), Phase::Sleep(3_000),
+                    Phase::Run(75_000), Phase::Sleep(3_000),
+                    Phase::Run(16_000),
+                    Phase::Sleep(WORKER_SLEEP_NS),
                 ],
                 repeat: RepeatMode::Forever,
             },
@@ -159,12 +173,27 @@ fn build_scenario(
     }
 
     for i in 0..num_readers {
+        // Reader→Worker: 15% of worker wakes come from readers (completion signal).
+        // Model as 1 wake per 7 cycles (14.3%).
+        let target_worker = worker_pid(i % num_workers);
         builder = builder.task(TaskDef {
             name: format!("navy_reader_{i}"),
             pid: reader_pid(i, num_workers),
             nice: reader_nice,
             behavior: TaskBehavior {
-                phases: vec![Phase::Run(READER_RUN_NS), Phase::Sleep(READER_SLEEP_NS)],
+                // Reader→Worker: ~12.5% (every 8th cycle).
+                phases: vec![
+                    Phase::Run(READER_RUN_NS), Phase::Sleep(READER_SLEEP_NS),
+                    Phase::Run(READER_RUN_NS), Phase::Sleep(READER_SLEEP_NS),
+                    Phase::Run(READER_RUN_NS), Phase::Sleep(READER_SLEEP_NS),
+                    Phase::Run(READER_RUN_NS), Phase::Sleep(READER_SLEEP_NS),
+                    Phase::Run(READER_RUN_NS), Phase::Sleep(READER_SLEEP_NS),
+                    Phase::Run(READER_RUN_NS), Phase::Sleep(READER_SLEEP_NS),
+                    Phase::Run(READER_RUN_NS), Phase::Sleep(READER_SLEEP_NS),
+                    Phase::Run(READER_RUN_NS), Phase::Sleep(READER_SLEEP_NS),
+                    Phase::Run(READER_RUN_NS), Phase::Sleep(READER_SLEEP_NS),
+                    Phase::Run(READER_RUN_NS), Phase::Wake(target_worker), Phase::Sleep(READER_SLEEP_NS),
+                ],
                 repeat: RepeatMode::Forever,
             },
             start_time_ns: 0,
