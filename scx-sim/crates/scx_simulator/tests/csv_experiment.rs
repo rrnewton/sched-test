@@ -23,9 +23,9 @@ mod common;
 // ---- Constants (same as ucache_cartoon_scxsim_direct.rs) ----
 
 const PARENT_PID: Pid = Pid(100);
-const NUM_WORKERS: i32 = 8;
-const NUM_READERS: i32 = 1;
-const NUM_WRITERS: i32 = 1;
+const NUM_WORKERS: i32 = 16;
+const NUM_READERS: i32 = 2;
+const NUM_WRITERS: i32 = 2;
 const NUM_HOGS: i32 = 4;
 
 const WORKER_RUN_NS: u64 = 250_000;
@@ -34,10 +34,11 @@ const READER_RUN_NS: u64 = 35_000;
 const READER_SLEEP_NS: u64 = 250_000;
 const WRITER_RUN_NS: u64 = 22_000;
 const WRITER_SLEEP_NS: u64 = 198_000;
-const HOG_RUN_NS: u64 = 5_000_000;
+const HOG_RUN_NS: u64 = 200_000;
+const HOG_SLEEP_NS: u64 = 750_000;
 
 const IRQ_INTERVAL_NS: u64 = 10_000_000; // 10ms period (matching rt-app)
-const IRQ_DURATION_NS: u64 = 5_000_000; // 5ms burst (50% duty cycle)
+const IRQ_DURATION_NS: u64 = 3_300_000; // 3.3ms burst (33% duty cycle, matching VM BROAD profile)
 const IRQ_CPUS: [u32; 4] = [0, 2, 4, 6]; // even-numbered workload CPUs
 
 fn worker_pid(i: i32) -> Pid {
@@ -141,7 +142,7 @@ fn build_scenario(nr_cpus: u32, with_nice_hints: bool, duration_ms: u64) -> Scen
             pid: hog_pid(i),
             nice: 10,
             behavior: TaskBehavior {
-                phases: vec![Phase::Run(HOG_RUN_NS)],
+                phases: vec![Phase::Run(HOG_RUN_NS), Phase::Sleep(HOG_SLEEP_NS)],
                 repeat: RepeatMode::Forever,
             },
             start_time_ns: 0,
@@ -154,7 +155,7 @@ fn build_scenario(nr_cpus: u32, with_nice_hints: bool, duration_ms: u64) -> Scen
         });
     }
 
-    // IRQ pressure on even-numbered CPUs (50% duty, matching rt-app)
+    // IRQ pressure on even-numbered CPUs (33% duty, matching VM BROAD profile)
     for &cpu in IRQ_CPUS.iter() {
         builder = builder.periodic_irq(
             CpuId(cpu),
@@ -439,6 +440,9 @@ fn csv_experiment_run() {
 
     let trace = if use_lavd {
         let sched = DynamicScheduler::lavd(nr_cpus);
+        // Match production LAVD config: pinned_slice_ns=3ms, mig_delta_pct=15%
+        // Production cmd: --pinned-slice-us 3000 --slice-min-us 3000 --slice-max-us 10000 --mig-delta-pct 15
+        sched.lavd_configure(false, 3_000_000, 15);
         let probes = LavdProbes::new(&sched);
         let mut monitor = LavdMonitor::new(probes);
         let result = Simulator::new(sched).run_monitored(scenario, &mut monitor);
