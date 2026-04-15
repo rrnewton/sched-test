@@ -23,9 +23,10 @@ mod common;
 // ---- Constants (same as ucache_cartoon_scxsim_direct.rs) ----
 
 const PARENT_PID: Pid = Pid(100);
-// Thread counts are now computed from nr_cpus in build_scenario().
-// At 16 CPUs: 16 workers, 2 readers, 2 writers, 4 hogs (= 24 threads, 1.5/CPU)
-// At 48 CPUs: 48 workers, 6 readers, 6 writers, 12 hogs (= 72 threads, 1.5/CPU)
+// Thread counts computed from nr_cpus in thread_counts().
+// Target: 0.9 threads/CPU matching production (284 threads on 316 CPUs).
+// At 16 CPUs: 10 workers, 1 reader, 1 writer, 2 hogs (= 14 threads, 0.88/CPU)
+// At 48 CPUs: 32 workers, 4 readers, 4 writers, 3 hogs (= 43 threads, 0.90/CPU)
 
 const WORKER_RUN_NS: u64 = 250_000;
 const WORKER_SLEEP_NS: u64 = 110_000;
@@ -40,12 +41,23 @@ const IRQ_INTERVAL_NS: u64 = 10_000_000; // 10ms period (matching rt-app)
 const IRQ_DURATION_NS: u64 = 3_300_000; // 3.3ms burst (33% duty cycle, matching VM BROAD profile)
 
 /// Compute thread counts scaled to nr_cpus (ratio: 1.5 threads/CPU total).
-/// Workers = nr_cpus, readers = nr_cpus/8, writers = nr_cpus/8, hogs = nr_cpus/4.
+/// Thread counts: 0.9 threads/CPU default, or explicit override via env vars
+/// (SCX_SIM_WORKERS, SCX_SIM_READERS, SCX_SIM_WRITERS, SCX_SIM_HOGS).
 fn thread_counts(nr_cpus: u32) -> (i32, i32, i32, i32) {
-    let workers = nr_cpus as i32;
-    let readers = (nr_cpus / 8).max(1) as i32;
-    let writers = (nr_cpus / 8).max(1) as i32;
-    let hogs = (nr_cpus / 4).max(1) as i32;
+    fn env_i32(name: &str) -> Option<i32> {
+        std::env::var(name).ok()?.parse().ok()
+    }
+    if let Some(w) = env_i32("SCX_SIM_WORKERS") {
+        let r = env_i32("SCX_SIM_READERS").unwrap_or(2);
+        let wr = env_i32("SCX_SIM_WRITERS").unwrap_or(2);
+        let h = env_i32("SCX_SIM_HOGS").unwrap_or(4);
+        return (w, r, wr, h);
+    }
+    let workers = ((nr_cpus * 2 / 3) as i32).max(4);
+    let readers = ((nr_cpus / 12) as i32).max(1);
+    let writers = ((nr_cpus / 12) as i32).max(1);
+    let target_total = (nr_cpus as f64 * 0.9) as i32;
+    let hogs = (target_total - workers - readers - writers).max(1);
     (workers, readers, writers, hogs)
 }
 
@@ -86,7 +98,14 @@ fn build_scenario(
     let reader_nice: i8 = if with_nice_hints { -10 } else { 0 };
     let writer_nice: i8 = if with_nice_hints { 5 } else { 0 };
 
-    let (num_workers, num_readers, num_writers, num_hogs) = thread_counts(nr_cpus);
+    let (num_workers, num_readers, num_writers, num_hogs) =
+        if std::env::var("SCX_SIM_FIXED_THREADS").ok().as_deref() == Some("1") {
+            // Fixed 16-CPU thread counts regardless of nr_cpus.
+            // Use for isolation experiments that vary CPUs while holding threads constant.
+            (16_i32, 2, 2, 4)
+        } else {
+            thread_counts(nr_cpus)
+        };
     let irq_cpu_list = irq_cpus(nr_cpus);
 
     // Shared parent task
@@ -468,7 +487,12 @@ fn csv_experiment_run() {
     let mut scenario = build_scenario(nr_cpus, cpus_per_llc, with_nice_hints, duration_ms);
     scenario.seed = seed;
 
-    let (num_workers, num_readers, num_writers, _num_hogs) = thread_counts(nr_cpus);
+    let (num_workers, num_readers, num_writers, _num_hogs) =
+        if std::env::var("SCX_SIM_FIXED_THREADS").ok().as_deref() == Some("1") {
+            (16_i32, 2, 2, 4)
+        } else {
+            thread_counts(nr_cpus)
+        };
     let irq_cpu_list = irq_cpus(nr_cpus);
 
     // Create scheduler and optionally attach LAVD monitor
