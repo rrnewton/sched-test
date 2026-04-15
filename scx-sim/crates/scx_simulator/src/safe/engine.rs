@@ -1174,6 +1174,14 @@ impl<S: Scheduler> Simulator<S> {
             }
         }
 
+        // Assign LLC domain IDs (CCX topology)
+        let cpus_per_llc = scenario.cpus_per_llc;
+        if cpus_per_llc > 0 {
+            for i in 0..nr_cpus {
+                cpus[i as usize].llc_id = i / cpus_per_llc;
+            }
+        }
+
         // Initialize all CPUs as idle in the C cpumasks
         for i in 0..nr_cpus {
             ffi::cpumask_set_all(i as i32);
@@ -3811,6 +3819,8 @@ impl<S: Scheduler> Simulator<S> {
         task.state = TaskState::Running { cpu };
         // Track whether this is a migration (for migration penalty).
         let migrated = task.prev_cpu != cpu;
+        let cross_llc = migrated
+            && s.sim.cpus[task.prev_cpu.0 as usize].llc_id != s.sim.cpus[cpu.0 as usize].llc_id;
         task.prev_cpu = cpu;
         // Clear runnable_at_ns: task is now running (watchdog reset).
         task.runnable_at_ns = None;
@@ -3897,9 +3907,16 @@ impl<S: Scheduler> Simulator<S> {
                     0
                 };
 
-                // Migration penalty: extra cache/TLB warming cost
+                // Migration penalty: extra cache/TLB warming cost.
+                // Cross-LLC migrations incur additional penalty for remote
+                // LLC fetch and full TLB flush.
                 let effective_floor = if migrated && mig_penalty > 0 {
-                    effective_floor + mig_penalty
+                    let cross_llc_extra = if cross_llc {
+                        s.sim.overhead.cross_llc_migration_penalty_ns
+                    } else {
+                        0
+                    };
+                    effective_floor + mig_penalty + cross_llc_extra
                 } else {
                     effective_floor
                 };

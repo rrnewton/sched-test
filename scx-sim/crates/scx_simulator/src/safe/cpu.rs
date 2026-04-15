@@ -65,6 +65,12 @@ pub struct SimCpu {
     /// Cumulative IRQ time on this CPU since simulation start (ns).
     /// Never reset. Used by `sim_scx_clock_task` to compute task-only clock.
     pub irq_cumulative_ns: TimeNs,
+    /// LLC (last-level cache) domain ID.
+    ///
+    /// CPUs sharing an LLC have the same `llc_id`. Used for LLC-aware
+    /// migration penalty: cross-LLC migrations incur higher cache/TLB
+    /// warming costs than intra-LLC migrations. Default: 0 (single domain).
+    pub llc_id: u32,
 }
 
 impl SimCpu {
@@ -83,6 +89,7 @@ impl SimCpu {
             irq_context: IrqContext::None,
             irq_stolen_ns: 0,
             irq_cumulative_ns: 0,
+            llc_id: 0,
         }
     }
 
