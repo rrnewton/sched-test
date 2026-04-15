@@ -19,6 +19,16 @@
  */
 
 /*
+ * MEMBER_VPTR: In BPF, this uses inline asm for verifier-checked bounds.
+ * In userspace, the BPF asm is invalid. Replace with a plain address
+ * computation.  The bounds check is unnecessary in userspace since we
+ * control array sizes.
+ */
+#undef MEMBER_VPTR
+#define MEMBER_VPTR(base, member) \
+	((typeof((base) member) *)(&((base) member)))
+
+/*
  * __hidden: BPF internal visibility attribute. Defined in libbpf's
  * bpf_helpers.h which may not be available. Provide a fallback.
  */
