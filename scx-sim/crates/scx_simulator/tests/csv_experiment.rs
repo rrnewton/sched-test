@@ -31,8 +31,8 @@ const WORKER_RUN_NS: u64 = 250_000;
 const WORKER_SLEEP_NS: u64 = 110_000;
 const READER_RUN_NS: u64 = 35_000;
 const READER_SLEEP_NS: u64 = 250_000;
-const WRITER_RUN_NS: u64 = 22_000;
-const WRITER_SLEEP_NS: u64 = 198_000;
+const WRITER_RUN_NS: u64 = 5_000_000; // 5ms burst write (coalesced flush)
+const WRITER_SLEEP_NS: u64 = 25_000_000; // 25ms sleep (batching before flush, ~33 wakes/sec)
 const HOG_RUN_NS: u64 = 200_000;
 const HOG_SLEEP_NS: u64 = 750_000;
 
