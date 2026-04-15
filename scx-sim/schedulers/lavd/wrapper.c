@@ -227,6 +227,15 @@ struct cpufreq_policy *cpufreq_cpu_data;
 unsigned long hw_pressure;
 
 /*
+ * CONFIG_NO_HZ_IDLE: __kconfig __weak bool used in sys_stat.bpf.c.
+ * In BPF, this resolves to the kernel config; in simulation it's a
+ * regular weak symbol. Without a definition, the weak symbol resolves
+ * to address 0x0 in the -nostdlib .so, causing a SIGSEGV on access.
+ * Set to false — the simulator doesn't model NO_HZ_IDLE.
+ */
+bool CONFIG_NO_HZ_IDLE;
+
+/*
  * bpf_probe_read_kernel override for LAVD.
  *
  * The generic sim_wrapper.h implementation does memcpy(dst, src, sz) which
