@@ -1,5 +1,6 @@
 mod commands;
 mod config;
+mod workspace;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
