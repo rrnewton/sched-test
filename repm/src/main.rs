@@ -1,5 +1,6 @@
 mod commands;
 mod config;
+mod templates;
 mod workspace;
 
 use anyhow::Result;
