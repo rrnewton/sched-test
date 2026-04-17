@@ -6,6 +6,7 @@ use clap::Args;
 
 use crate::config::validate_project_name;
 use crate::workspace;
+use crate::templates;
 
 /// Scaffold a workspace (git repo + directory structure + config).
 #[derive(Debug, Args)]
@@ -80,7 +81,11 @@ pub fn execute(args: &InitArgs) -> Result<()> {
     workspace::write_gitignore(&workspace_root)?;
     eprintln!("  updated .gitignore");
 
-    // Step 6: Check prerequisites
+    // Step 6: Install CLAUDE.md template and skill files
+    let config = workspace::load_config(&workspace_root)?;
+    templates::install_templates(&workspace_root, &config)?;
+
+    // Step 7: Check prerequisites
     check_prerequisites();
 
     eprintln!();

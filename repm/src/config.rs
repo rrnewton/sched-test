@@ -36,6 +36,10 @@ pub struct RepromagicConfig {
 
     #[serde(default)]
     pub workload: WorkloadConfig,
+
+    /// `[capture]` table — SSH trace collection settings.
+    #[serde(default)]
+    pub capture: CaptureConfig,
 }
 
 // ---------------------------------------------------------------------------
@@ -315,6 +319,107 @@ fn default_thread_count() -> u32 {
 pub enum ThreadRole {
     Foreground,
     Background,
+}
+
+// ---------------------------------------------------------------------------
+// Capture configuration
+// ---------------------------------------------------------------------------
+
+/// `[capture]` table — trace collection settings for `repm capture`.
+///
+/// Controls what data is collected from the target host, SSH connection
+/// parameters, and trace command templates.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CaptureConfig {
+    /// Default remote host (e.g., `root@prod-host`). CLI `--ssh` overrides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_host: Option<String>,
+
+    /// SSH connection timeout in seconds.
+    #[serde(default = "default_ssh_timeout")]
+    pub ssh_timeout: u32,
+
+    /// SSH identity file (private key path). Uses default SSH agent if omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_identity: Option<String>,
+
+    /// Remote working directory for trace collection.
+    #[serde(default = "default_remote_workdir")]
+    pub remote_workdir: String,
+
+    /// Trace commands to run on the target host. Each command is run
+    /// sequentially. Use `{duration}` placeholder for capture duration.
+    #[serde(default = "default_trace_commands")]
+    pub trace_commands: Vec<TraceCommand>,
+
+    /// Whether to sample /proc/interrupts during capture.
+    #[serde(default = "default_true")]
+    pub collect_interrupts: bool,
+
+    /// /proc/interrupts sampling interval in seconds.
+    #[serde(default = "default_interrupts_interval")]
+    pub interrupts_interval: u32,
+
+    /// Whether to collect LAVD stats (requires scx_lavd running).
+    #[serde(default)]
+    pub collect_lavd_stats: bool,
+
+    /// Additional files to SCP back from the remote host after capture.
+    /// Paths are relative to `remote_workdir`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_files: Vec<String>,
+}
+
+impl Default for CaptureConfig {
+    fn default() -> Self {
+        Self {
+            default_host: None,
+            ssh_timeout: default_ssh_timeout(),
+            ssh_identity: None,
+            remote_workdir: default_remote_workdir(),
+            trace_commands: default_trace_commands(),
+            collect_interrupts: true,
+            interrupts_interval: default_interrupts_interval(),
+            collect_lavd_stats: false,
+            extra_files: Vec::new(),
+        }
+    }
+}
+
+fn default_ssh_timeout() -> u32 {
+    30
+}
+
+fn default_remote_workdir() -> String {
+    "/tmp/repm_capture".to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_interrupts_interval() -> u32 {
+    1
+}
+
+fn default_trace_commands() -> Vec<TraceCommand> {
+    vec![TraceCommand {
+        name: "proc_interrupts".to_string(),
+        command: "cat /proc/interrupts".to_string(),
+        background: false,
+    }]
+}
+
+/// A trace command to run during capture.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TraceCommand {
+    /// Human-readable name for this trace step.
+    pub name: String,
+    /// Shell command to execute. Supports `{duration}` placeholder.
+    pub command: String,
+    /// If true, run in background (for duration-based traces like perfetto).
+    #[serde(default)]
+    pub background: bool,
 }
 
 // ---------------------------------------------------------------------------
