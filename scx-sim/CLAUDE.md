@@ -44,7 +44,7 @@ When creating analysis documents, specifications, or other AI-generated document
 
 Cache Reproducer Methodology
 ----------------------------------------
-See `CACHE_REPRODUCER.md` for the authoritative methodology document covering:
+See `../../ucache_reproducer/CACHE_REPRODUCER.md` for the authoritative methodology document covering:
 - Valid mode × scheduler matrix (rtapp_sim × EEVDF is IMPOSSIBLE)
 - Calibration parameters and production reference values
 - Dependent variable metrics (E2E latency, scheduling latency, IRQ exposure)
