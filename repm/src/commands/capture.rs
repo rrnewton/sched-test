@@ -125,7 +125,10 @@ fn execute_ssh_capture(
         let output = run_command(&test_cmd)
             .context("SSH connectivity test failed — check host, key, and network")?;
         if !output.trim().contains("repm_ok") {
-            bail!("SSH connectivity test returned unexpected output: {}", output);
+            bail!(
+                "SSH connectivity test returned unexpected output: {}",
+                output
+            );
         }
         eprintln!("  connected OK");
     }
@@ -134,11 +137,7 @@ fn execute_ssh_capture(
     // Step 2: Create remote working directory
     eprintln!("step 2/6: setting up remote workspace...");
     let remote_capture_dir = format!("{}/{}", remote_workdir, capture_name);
-    let setup_cmd = ssh_command(
-        host,
-        &format!("mkdir -p {}", remote_capture_dir),
-        &ssh_opts,
-    );
+    let setup_cmd = ssh_command(host, &format!("mkdir -p {}", remote_capture_dir), &ssh_opts);
     show_command("ssh-mkdir", &setup_cmd);
     if !args.dry_run {
         run_command(&setup_cmd).context("Failed to create remote capture directory")?;
@@ -168,10 +167,7 @@ fn execute_ssh_capture(
                 cat /proc/interrupts > {}/interrupts_${{i}}.txt; \
                 sleep {}; \
             done",
-            interval,
-            args.duration,
-            remote_capture_dir,
-            interval,
+            interval, args.duration, remote_capture_dir, interval,
         );
         let irq_cmd = ssh_command(host, &format!("nohup sh -c '{}' &", irq_script), &ssh_opts);
         show_command("ssh-interrupts", &irq_cmd);
@@ -281,22 +277,21 @@ fn execute_ssh_capture(
 
     show_command(
         "write-provenance",
-        &["write", provenance_path.to_str().unwrap_or("provenance.json")],
+        &[
+            "write",
+            provenance_path.to_str().unwrap_or("provenance.json"),
+        ],
     );
     if !args.dry_run {
-        let provenance_json = serde_json::to_string_pretty(&provenance)
-            .context("Failed to serialize provenance")?;
+        let provenance_json =
+            serde_json::to_string_pretty(&provenance).context("Failed to serialize provenance")?;
         std::fs::write(&provenance_path, &provenance_json)
             .with_context(|| format!("Failed to write {}", provenance_path.display()))?;
         eprintln!("  wrote {}", provenance_path.display());
     }
 
     // Clean up remote working directory
-    let cleanup_cmd = ssh_command(
-        host,
-        &format!("rm -rf {}", remote_capture_dir),
-        &ssh_opts,
-    );
+    let cleanup_cmd = ssh_command(host, &format!("rm -rf {}", remote_capture_dir), &ssh_opts);
     show_command("ssh-cleanup", &cleanup_cmd);
     if !args.dry_run {
         let _ = run_command(&cleanup_cmd); // Best-effort cleanup
@@ -394,7 +389,10 @@ fn execute_local_capture(
             .replace("{duration}", &args.duration.to_string());
         let output_file = local_data_dir.join(format!("{}_stdout.txt", trace.name));
 
-        show_command(&format!("trace-{}", trace.name), &["sh", "-c", &expanded_cmd]);
+        show_command(
+            &format!("trace-{}", trace.name),
+            &["sh", "-c", &expanded_cmd],
+        );
 
         if !args.dry_run {
             let output = Command::new("sh")
@@ -419,8 +417,8 @@ fn execute_local_capture(
     let provenance_path = local_data_dir.join("provenance.json");
 
     if !args.dry_run {
-        let provenance_json = serde_json::to_string_pretty(&provenance)
-            .context("Failed to serialize provenance")?;
+        let provenance_json =
+            serde_json::to_string_pretty(&provenance).context("Failed to serialize provenance")?;
         std::fs::write(&provenance_path, &provenance_json)?;
         eprintln!("  wrote {}", provenance_path.display());
     }
@@ -564,10 +562,7 @@ fn collect_local_metadata(args: &CaptureArgs) -> BTreeMap<String, serde_json::Va
             .unwrap_or_else(|| "unknown".to_string())
     };
 
-    meta.insert(
-        "hostname".into(),
-        Value::String(get_cmd("hostname", "-f")),
-    );
+    meta.insert("hostname".into(), Value::String(get_cmd("hostname", "-f")));
     meta.insert("kernel".into(), Value::String(get_cmd("uname", "-r")));
     meta.insert("kernel_full".into(), Value::String(get_cmd("uname", "-a")));
     meta.insert("arch".into(), Value::String(get_cmd("uname", "-m")));
@@ -752,10 +747,7 @@ mod tests {
     #[test]
     fn test_resolve_local_data_dir_without_workspace() {
         let dir = resolve_local_data_dir(None, "v1", "capture_20260417T120000Z").unwrap();
-        assert_eq!(
-            dir,
-            PathBuf::from("traces/capture_20260417T120000Z")
-        );
+        assert_eq!(dir, PathBuf::from("traces/capture_20260417T120000Z"));
     }
 
     #[test]

@@ -237,7 +237,10 @@ pub fn execute(args: &RunArgs) -> Result<()> {
     eprintln!("  Results: {}/data/", exp_dir.display());
     eprintln!("  Provenance: {}/provenance.json", exp_dir.display());
     eprintln!();
-    eprintln!("Next step: run `repm analyze --experiment {}`", exp_dir.display());
+    eprintln!(
+        "Next step: run `repm analyze --experiment {}`",
+        exp_dir.display()
+    );
 
     Ok(())
 }
@@ -436,7 +439,7 @@ fn find_latest_experiment(experiments_dir: &Path) -> Result<Option<PathBuf>> {
             let name = entry.file_name();
             let name_str = name.to_string_lossy().to_string();
             if let Some(num) = parse_version_number(&name_str) {
-                if latest.as_ref().map_or(true, |(n, _)| num > *n) {
+                if latest.as_ref().is_none_or(|(n, _)| num > *n) {
                     latest = Some((num, entry.path()));
                 }
             }
@@ -636,9 +639,8 @@ fn num_cpus() -> u32 {
 fn gather_workspace_info(ws_root: &Path) -> Result<WorkspaceInfo> {
     let git_revision = run_command_stdout_in("git", &["rev-parse", "HEAD"], ws_root)
         .unwrap_or_else(|_| "unknown".to_string());
-    let git_branch =
-        run_command_stdout_in("git", &["rev-parse", "--abbrev-ref", "HEAD"], ws_root)
-            .unwrap_or_else(|_| "unknown".to_string());
+    let git_branch = run_command_stdout_in("git", &["rev-parse", "--abbrev-ref", "HEAD"], ws_root)
+        .unwrap_or_else(|_| "unknown".to_string());
     let git_dirty = run_command_stdout_in("git", &["status", "--porcelain"], ws_root)
         .map(|s| !s.trim().is_empty())
         .unwrap_or(false);
@@ -651,10 +653,7 @@ fn gather_workspace_info(ws_root: &Path) -> Result<WorkspaceInfo> {
     })
 }
 
-fn build_scheduler_provenance(
-    sched: &SchedulerDef,
-    ws_root: &Path,
-) -> Result<SchedulerProvenance> {
+fn build_scheduler_provenance(sched: &SchedulerDef, ws_root: &Path) -> Result<SchedulerProvenance> {
     let sched_type = if sched.name.is_builtin() {
         "kernel_builtin".to_string()
     } else {
@@ -672,18 +671,13 @@ fn build_scheduler_provenance(
 
             if abs_path.exists() {
                 let meta = std::fs::metadata(&abs_path)?;
-                let mtime = meta
-                    .modified()
-                    .ok()
-                    .and_then(|t| {
-                        t.duration_since(SystemTime::UNIX_EPOCH)
-                            .ok()
-                            .map(|d| {
-                                chrono::DateTime::from_timestamp(d.as_secs() as i64, 0)
-                                    .map(|dt| dt.to_rfc3339())
-                                    .unwrap_or_else(|| "unknown".to_string())
-                            })
-                    });
+                let mtime = meta.modified().ok().and_then(|t| {
+                    t.duration_since(SystemTime::UNIX_EPOCH).ok().map(|d| {
+                        chrono::DateTime::from_timestamp(d.as_secs() as i64, 0)
+                            .map(|dt| dt.to_rfc3339())
+                            .unwrap_or_else(|| "unknown".to_string())
+                    })
+                });
                 let size = meta.len();
                 (
                     Some(display_path),
@@ -712,13 +706,11 @@ fn build_scheduler_provenance(
 fn write_provenance(exp_dir: &Path, provenance: &ExperimentProvenance) -> Result<()> {
     let prov_path = exp_dir.join("provenance.json");
     if prov_path.exists() {
-        eprintln!(
-            "  provenance.json already exists — experiment is sealed (resume mode)"
-        );
+        eprintln!("  provenance.json already exists — experiment is sealed (resume mode)");
         return Ok(());
     }
-    let json = serde_json::to_string_pretty(provenance)
-        .context("Failed to serialize provenance")?;
+    let json =
+        serde_json::to_string_pretty(provenance).context("Failed to serialize provenance")?;
     std::fs::write(&prov_path, json + "\n")
         .with_context(|| format!("Failed to write {}", prov_path.display()))?;
     eprintln!("  wrote provenance.json (experiment sealed)");
@@ -772,10 +764,7 @@ fn write_experiment_readme(
             .map(|s| s.label.as_str())
             .unwrap_or(key);
         let binary = sp.binary.as_deref().unwrap_or("(kernel)");
-        let revision = sp
-            .provenance_revision
-            .as_deref()
-            .unwrap_or("n/a");
+        let revision = sp.provenance_revision.as_deref().unwrap_or("n/a");
         sched_table.push_str(&format!(
             "| {} | {} | `{}` | {} |\n",
             label, sp.sched_type, binary, revision
@@ -894,22 +883,11 @@ fn execute_matrix(
         // Resume: skip completed reps (those with a .done marker)
         if done_marker.exists() {
             skipped += 1;
-            eprintln!(
-                "  [{:3}/{}] SKIP {} (already complete)",
-                i + 1,
-                total,
-                cell
-            );
+            eprintln!("  [{:3}/{}] SKIP {} (already complete)", i + 1, total, cell);
             continue;
         }
 
-        eprintln!(
-            "  [{:3}/{}] RUN  {} [{}]",
-            i + 1,
-            total,
-            cell,
-            sched.label
-        );
+        eprintln!("  [{:3}/{}] RUN  {} [{}]", i + 1, total, cell, sched.label);
 
         match execute_cell(cell, sched, &csv_path, duration, config, ws_root) {
             Ok(()) => {
@@ -935,7 +913,10 @@ fn execute_matrix(
     );
 
     if failed > 0 {
-        eprintln!("WARNING: {} cells failed. Re-run to retry failed cells.", failed);
+        eprintln!(
+            "WARNING: {} cells failed. Re-run to retry failed cells.",
+            failed
+        );
     }
 
     Ok(())
@@ -950,7 +931,9 @@ fn execute_cell(
     ws_root: &Path,
 ) -> Result<()> {
     match cell.mode {
-        RunMode::RtappPinned => execute_rtapp_pinned(cell, sched, csv_path, duration, config, ws_root),
+        RunMode::RtappPinned => {
+            execute_rtapp_pinned(cell, sched, csv_path, duration, config, ws_root)
+        }
         RunMode::RtappVm => execute_rtapp_vm(cell, sched, csv_path, duration, config, ws_root),
         RunMode::RtappSim => execute_rtapp_sim(cell, sched, csv_path, duration, config, ws_root),
     }
@@ -997,7 +980,11 @@ fn execute_rtapp_pinned(
             .stderr(std::process::Stdio::piped())
             .spawn()
             .with_context(|| format!("Failed to start scheduler: {}", sched.label))?;
-        eprintln!("           started scheduler: {} (pid {})", sched.label, child.id());
+        eprintln!(
+            "           started scheduler: {} (pid {})",
+            sched.label,
+            child.id()
+        );
 
         // Give the scheduler a moment to initialize
         std::thread::sleep(std::time::Duration::from_secs(2));
@@ -1024,10 +1011,7 @@ fn execute_rtapp_pinned(
     std::fs::create_dir_all(&log_dir)?;
 
     let rtapp_result = Command::new("sudo")
-        .args([
-            "rt-app",
-            rtapp_config.to_str().unwrap(),
-        ])
+        .args(["rt-app", rtapp_config.to_str().unwrap()])
         .current_dir(&log_dir)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -1151,12 +1135,18 @@ fn execute_rtapp_sim(
         .args([
             "run",
             sim_workload_path.to_str().unwrap(),
-            "--scheduler", sim_sched_name,
-            "--cpus", &cores.to_string(),
-            "--seed", &seed.to_string(),
-            "--end-time", &format!("{}ms", duration_ms),
-            "--warmup-ms", &warmup_ms.to_string(),
-            "--perfetto", perfetto_path.to_str().unwrap(),
+            "--scheduler",
+            sim_sched_name,
+            "--cpus",
+            &cores.to_string(),
+            "--seed",
+            &seed.to_string(),
+            "--end-time",
+            &format!("{}ms", duration_ms),
+            "--warmup-ms",
+            &warmup_ms.to_string(),
+            "--perfetto",
+            perfetto_path.to_str().unwrap(),
             "--verbose-summary",
         ])
         .stdout(std::process::Stdio::piped())
@@ -1176,14 +1166,7 @@ fn execute_rtapp_sim(
     }
 
     // Parse scxsim summary output and write CSV
-    parse_scxsim_output_to_csv(
-        &stdout,
-        &stderr,
-        csv_path,
-        cell,
-        sim_sched_name,
-        config,
-    )?;
+    parse_scxsim_output_to_csv(&stdout, &stderr, csv_path, cell, sim_sched_name, config)?;
 
     if perfetto_path.exists() {
         eprintln!("           trace: {}", perfetto_path.display());
@@ -1199,16 +1182,15 @@ fn execute_rtapp_sim(
 /// {"global": {"duration": 1}, "tasks": {"fg_0": {"run": 500, "sleep": 1500, "loop": -1}}}
 /// ```
 /// Values are in microseconds.
-fn generate_sim_workload(
-    path: &Path,
-    config: &RepromagicConfig,
-    duration: u32,
-) -> Result<()> {
+fn generate_sim_workload(path: &Path, config: &RepromagicConfig, duration: u32) -> Result<()> {
     let mut workload = serde_json::Map::new();
 
     // Global section
     let mut global = serde_json::Map::new();
-    global.insert("duration".into(), serde_json::Value::Number(duration.into()));
+    global.insert(
+        "duration".into(),
+        serde_json::Value::Number(duration.into()),
+    );
     global.insert(
         "default_policy".into(),
         serde_json::Value::String("SCHED_OTHER".into()),
@@ -1250,10 +1232,7 @@ fn generate_sim_workload(
         task.insert("sleep".into(), serde_json::Value::Number(fg_sleep.into()));
         task.insert("loop".into(), serde_json::Value::Number((-1_i64).into()));
         task.insert("cpus".into(), serde_json::Value::Array(all_cpus.clone()));
-        tasks.insert(
-            format!("fg_thread_{}", i),
-            serde_json::Value::Object(task),
-        );
+        tasks.insert(format!("fg_thread_{}", i), serde_json::Value::Object(task));
     }
 
     // Background threads
@@ -1264,16 +1243,13 @@ fn generate_sim_workload(
         task.insert("loop".into(), serde_json::Value::Number((-1_i64).into()));
         task.insert("priority".into(), serde_json::Value::Number(10.into()));
         task.insert("cpus".into(), serde_json::Value::Array(all_cpus.clone()));
-        tasks.insert(
-            format!("bg_hog_{}", i),
-            serde_json::Value::Object(task),
-        );
+        tasks.insert(format!("bg_hog_{}", i), serde_json::Value::Object(task));
     }
 
     workload.insert("tasks".into(), serde_json::Value::Object(tasks));
 
-    let json = serde_json::to_string_pretty(&workload)
-        .context("Failed to serialize sim workload")?;
+    let json =
+        serde_json::to_string_pretty(&workload).context("Failed to serialize sim workload")?;
     std::fs::write(path, json + "\n")
         .with_context(|| format!("Failed to write {}", path.display()))?;
 
@@ -1379,9 +1355,7 @@ fn parse_scxsim_output_to_csv(
             }
         }
     }
-    let cpu_util_str = cpu_util
-        .map(|v| format!("{:.1}", v))
-        .unwrap_or_default();
+    let cpu_util_str = cpu_util.map(|v| format!("{:.1}", v)).unwrap_or_default();
 
     // Build PID → task name map from workload JSON.
     // scxsim assigns PIDs 1..N in task insertion order.
@@ -1403,7 +1377,10 @@ fn parse_scxsim_output_to_csv(
             let pid_str = pid_str.trim_end_matches(':');
             let pid: u32 = match pid_str.parse() {
                 Ok(v) => v,
-                Err(_) => { i += 1; continue; }
+                Err(_) => {
+                    i += 1;
+                    continue;
+                }
             };
 
             // Collect all indented lines in this task block
@@ -1419,8 +1396,10 @@ fn parse_scxsim_output_to_csv(
             i += 1;
             while i < lines.len() {
                 let block_line = lines[i].trim();
-                if block_line.is_empty() || block_line.starts_with("Task PID=")
-                    || block_line.starts_with("---") || block_line.starts_with("CPU ")
+                if block_line.is_empty()
+                    || block_line.starts_with("Task PID=")
+                    || block_line.starts_with("---")
+                    || block_line.starts_with("CPU ")
                 {
                     break;
                 }
@@ -1433,7 +1412,8 @@ fn parse_scxsim_output_to_csv(
                     // "Run duration:    0.499ms mean, 0.100ms stddev, CV=20.1%"
                     run_mean_ns = extract_duration_after_label(block_line, "Run duration:");
                 } else if block_line.starts_with("Inter-arrival:") {
-                    inter_arrival_mean_ns = extract_duration_after_label(block_line, "Inter-arrival:");
+                    inter_arrival_mean_ns =
+                        extract_duration_after_label(block_line, "Inter-arrival:");
                 } else if block_line.starts_with("Sched latency:") {
                     // "Sched latency:   p50=102.574us p90=102.574us p99=102.574us p999=... max=... (N samples)"
                     sched_lat_p50 = extract_duration_ns(block_line, "p50=");
@@ -1442,10 +1422,15 @@ fn parse_scxsim_output_to_csv(
                     sched_lat_p999 = extract_duration_ns(block_line, "p999=");
                     // Extract sample count: "(N samples)"
                     if let Some(samples_str) = block_line.rfind('(').and_then(|start| {
-                        block_line[start+1..].find("samples").map(|_| &block_line[start+1..])
+                        block_line[start + 1..]
+                            .find("samples")
+                            .map(|_| &block_line[start + 1..])
                     }) {
-                        sched_lat_samples = samples_str.trim().split_whitespace()
-                            .next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                        sched_lat_samples = samples_str
+                            .split_whitespace()
+                            .next()
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(0);
                     }
                 }
 
@@ -1479,37 +1464,72 @@ fn parse_scxsim_output_to_csv(
             if let Some(run_ns) = run_mean_ns {
                 csv_rows.push(format!(
                     "{},{},{},baseline,{},{},run_duration,avg,{:.0},ns,{},{},scxsim_summary,{}",
-                    timestamp, mode, scheduler_name, thread_type, thread_id,
-                    run_ns, schedules, rep, cpu_util_str,
+                    timestamp,
+                    mode,
+                    scheduler_name,
+                    thread_type,
+                    thread_id,
+                    run_ns,
+                    schedules,
+                    rep,
+                    cpu_util_str,
                 ));
             }
 
             if let Some(p50) = sched_lat_p50 {
                 csv_rows.push(format!(
                     "{},{},{},baseline,{},{},sched_latency,p50,{:.0},ns,{},{},scxsim_summary,{}",
-                    timestamp, mode, scheduler_name, thread_type, thread_id,
-                    p50, sched_lat_samples, rep, cpu_util_str,
+                    timestamp,
+                    mode,
+                    scheduler_name,
+                    thread_type,
+                    thread_id,
+                    p50,
+                    sched_lat_samples,
+                    rep,
+                    cpu_util_str,
                 ));
             }
             if let Some(p90) = sched_lat_p90 {
                 csv_rows.push(format!(
                     "{},{},{},baseline,{},{},sched_latency,p90,{:.0},ns,{},{},scxsim_summary,{}",
-                    timestamp, mode, scheduler_name, thread_type, thread_id,
-                    p90, sched_lat_samples, rep, cpu_util_str,
+                    timestamp,
+                    mode,
+                    scheduler_name,
+                    thread_type,
+                    thread_id,
+                    p90,
+                    sched_lat_samples,
+                    rep,
+                    cpu_util_str,
                 ));
             }
             if let Some(p99) = sched_lat_p99 {
                 csv_rows.push(format!(
                     "{},{},{},baseline,{},{},sched_latency,p99,{:.0},ns,{},{},scxsim_summary,{}",
-                    timestamp, mode, scheduler_name, thread_type, thread_id,
-                    p99, sched_lat_samples, rep, cpu_util_str,
+                    timestamp,
+                    mode,
+                    scheduler_name,
+                    thread_type,
+                    thread_id,
+                    p99,
+                    sched_lat_samples,
+                    rep,
+                    cpu_util_str,
                 ));
             }
             if let Some(p999) = sched_lat_p999 {
                 csv_rows.push(format!(
                     "{},{},{},baseline,{},{},sched_latency,p999,{:.0},ns,{},{},scxsim_summary,{}",
-                    timestamp, mode, scheduler_name, thread_type, thread_id,
-                    p999, sched_lat_samples, rep, cpu_util_str,
+                    timestamp,
+                    mode,
+                    scheduler_name,
+                    thread_type,
+                    thread_id,
+                    p999,
+                    sched_lat_samples,
+                    rep,
+                    cpu_util_str,
                 ));
             }
 
@@ -1527,7 +1547,10 @@ fn parse_scxsim_output_to_csv(
             timestamp, mode, scheduler_name, rep, cpu_util_str,
         ));
     } else {
-        eprintln!("           parsed {} task blocks, cpu_util={}", task_count, cpu_util_str);
+        eprintln!(
+            "           parsed {} task blocks, cpu_util={}",
+            task_count, cpu_util_str
+        );
     }
 
     let csv_content = csv_rows.join("\n") + "\n";
@@ -1545,6 +1568,7 @@ fn extract_after<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
 }
 
 /// Extract a quoted string after a prefix: `Task "name"` → `name`
+#[allow(dead_code)]
 fn extract_quoted_after<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
     let idx = line.find(prefix)?;
     let rest = &line[idx + prefix.len()..];
@@ -1640,9 +1664,7 @@ fn collect_rtapp_metrics(
                 "unknown"
             };
 
-            let thread_id = name
-                .trim_end_matches(".log")
-                .to_string();
+            let thread_id = name.trim_end_matches(".log").to_string();
 
             // Parse the log file for latency data
             let content = std::fs::read_to_string(entry.path())?;
@@ -1665,8 +1687,7 @@ fn collect_rtapp_metrics(
             // Warmup samples are the first N entries, which correspond to the
             // initial warmup period before the workload reaches steady state.
             let n = latencies.len();
-            let warmup_samples = (config.defaults.warmup as usize)
-                .min(n / 4); // Cap at 25% of samples
+            let warmup_samples = (config.defaults.warmup as usize).min(n / 4); // Cap at 25% of samples
             let effective_chronological = &latencies[warmup_samples..];
             if effective_chronological.is_empty() {
                 continue;
@@ -1694,8 +1715,7 @@ fn collect_rtapp_metrics(
                 // C2 fix: use 14-column format with condition, notes, avg_cpu_util_pct
                 csv_rows.push(format!(
                     "{},{},{},baseline,{},{},sched_latency,{},{:.2},us,{},{},rtapp_slack,",
-                    timestamp, mode, scheduler, thread_type, thread_id,
-                    pname, value, en, rep
+                    timestamp, mode, scheduler, thread_type, thread_id, pname, value, en, rep
                 ));
             }
         }
@@ -1707,7 +1727,10 @@ fn collect_rtapp_metrics(
             "{},{},{},baseline,unknown,unknown,no_data,n/a,0.0,us,0,{},no_rtapp_logs,",
             timestamp, mode, scheduler, rep
         ));
-        eprintln!("           WARNING: no rt-app log files found in {}", log_dir.display());
+        eprintln!(
+            "           WARNING: no rt-app log files found in {}",
+            log_dir.display()
+        );
     }
 
     // Write CSV
@@ -1830,7 +1853,8 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
 
         // Write a minimal rt-app log: iteration period run start end slack
-        let log_content = "0 2000 500 0 500 100\n1 2000 500 2000 2500 120\n2 2000 500 4000 4500 110\n";
+        let log_content =
+            "0 2000 500 0 500 100\n1 2000 500 2000 2500 120\n2 2000 500 4000 4500 110\n";
         std::fs::write(tmp.join("repromagic-fg_thread_0-1234.log"), log_content).unwrap();
 
         let csv_path = tmp.join("rep_001.csv");
@@ -1840,8 +1864,9 @@ mod tests {
             rep: 1,
         };
         let config = crate::config::RepromagicConfig::from_toml(
-            "[project]\nname = \"test\"\n[schedulers.eevdf]\nname = \"eevdf\"\nlabel = \"EEVDF\"\n"
-        ).unwrap();
+            "[project]\nname = \"test\"\n[schedulers.eevdf]\nname = \"eevdf\"\nlabel = \"EEVDF\"\n",
+        )
+        .unwrap();
 
         collect_rtapp_metrics(&tmp, &csv_path, &cell, &config).unwrap();
 
@@ -1879,8 +1904,9 @@ mod tests {
             rep: 1,
         };
         let config = crate::config::RepromagicConfig::from_toml(
-            "[project]\nname = \"test\"\n[schedulers.eevdf]\nname = \"eevdf\"\nlabel = \"EEVDF\"\n"
-        ).unwrap();
+            "[project]\nname = \"test\"\n[schedulers.eevdf]\nname = \"eevdf\"\nlabel = \"EEVDF\"\n",
+        )
+        .unwrap();
 
         collect_rtapp_metrics(&tmp, &csv_path, &cell, &config).unwrap();
 
@@ -1889,9 +1915,20 @@ mod tests {
 
         // The canonical 14-column header
         let expected_columns = [
-            "timestamp", "mode", "scheduler", "condition", "thread_type",
-            "thread_id", "metric_name", "percentile", "value", "unit",
-            "sample_count", "rep", "notes", "avg_cpu_util_pct",
+            "timestamp",
+            "mode",
+            "scheduler",
+            "condition",
+            "thread_type",
+            "thread_id",
+            "metric_name",
+            "percentile",
+            "value",
+            "unit",
+            "sample_count",
+            "rep",
+            "notes",
+            "avg_cpu_util_pct",
         ];
         let actual_columns: Vec<&str> = header.split(',').collect();
         assert_eq!(
@@ -1937,7 +1974,12 @@ mod tests {
         ];
         // Steady state: 8 samples with slack=100 (low)
         for i in 2..10 {
-            all_lines.push(format!("{} 2000 500 {} {} 100", i, i * 2000, i * 2000 + 500));
+            all_lines.push(format!(
+                "{} 2000 500 {} {} 100",
+                i,
+                i * 2000,
+                i * 2000 + 500
+            ));
         }
         let log_content = all_lines.join("\n") + "\n";
 
@@ -1952,8 +1994,9 @@ mod tests {
         // Set warmup=2 so we skip the first 2 chronological samples
         let config = crate::config::RepromagicConfig::from_toml(
             "[project]\nname = \"test\"\n[defaults]\nwarmup = 2\nduration = 30\n\
-             [schedulers.eevdf]\nname = \"eevdf\"\nlabel = \"EEVDF\"\n"
-        ).unwrap();
+             [schedulers.eevdf]\nname = \"eevdf\"\nlabel = \"EEVDF\"\n",
+        )
+        .unwrap();
 
         collect_rtapp_metrics(&tmp, &csv_path, &cell, &config).unwrap();
 
@@ -1975,7 +2018,10 @@ mod tests {
 
         // Also verify sample_count is 8 (10 total - 2 warmup)
         let sample_count: u32 = avg_line.split(',').nth(10).unwrap().parse().unwrap();
-        assert_eq!(sample_count, 8, "Should have 8 samples after excluding 2 warmup");
+        assert_eq!(
+            sample_count, 8,
+            "Should have 8 samples after excluding 2 warmup"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -2005,8 +2051,9 @@ mod tests {
             rep: 1,
         };
         let config = crate::config::RepromagicConfig::from_toml(
-            "[project]\nname = \"test\"\n[schedulers.eevdf]\nname = \"eevdf\"\nlabel = \"EEVDF\"\n"
-        ).unwrap();
+            "[project]\nname = \"test\"\n[schedulers.eevdf]\nname = \"eevdf\"\nlabel = \"EEVDF\"\n",
+        )
+        .unwrap();
 
         collect_rtapp_metrics(&tmp, &csv_path, &cell, &config).unwrap();
 
@@ -2042,9 +2089,14 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
 
         // Create fake rt-app logs
-        let log_content = "0 2000 500 0 500 100\n1 2000 500 2000 2500 120\n2 2000 500 4000 4500 110\n";
+        let log_content =
+            "0 2000 500 0 500 100\n1 2000 500 2000 2500 120\n2 2000 500 4000 4500 110\n";
         std::fs::write(tmp.join("repromagic-fg_thread_0-1234.log"), log_content).unwrap();
-        std::fs::write(tmp.join("repromagic-bg_hog_0-5678.log"), "0 2000 130 0 130 50\n").unwrap();
+        std::fs::write(
+            tmp.join("repromagic-bg_hog_0-5678.log"),
+            "0 2000 130 0 130 50\n",
+        )
+        .unwrap();
 
         let csv_path = tmp.join("rep_001.csv");
         let cell = MatrixCell {
@@ -2053,8 +2105,9 @@ mod tests {
             rep: 1,
         };
         let config = crate::config::RepromagicConfig::from_toml(
-            "[project]\nname = \"test\"\n[schedulers.eevdf]\nname = \"eevdf\"\nlabel = \"EEVDF\"\n"
-        ).unwrap();
+            "[project]\nname = \"test\"\n[schedulers.eevdf]\nname = \"eevdf\"\nlabel = \"EEVDF\"\n",
+        )
+        .unwrap();
 
         collect_rtapp_metrics(&tmp, &csv_path, &cell, &config).unwrap();
 
@@ -2140,11 +2193,7 @@ mod tests {
 
         // Write a fake config file
         let config_content = "[project]\nname = \"test\"\n";
-        std::fs::write(
-            tmp.join(crate::workspace::CONFIG_FILENAME),
-            config_content,
-        )
-        .unwrap();
+        std::fs::write(tmp.join(crate::workspace::CONFIG_FILENAME), config_content).unwrap();
 
         let hash = hash_config_toml(&tmp).unwrap();
 
@@ -2180,7 +2229,10 @@ mod tests {
         )
         .unwrap();
         let hash3 = hash_config_toml(&tmp).unwrap();
-        assert_ne!(hash, hash3, "Different configs must produce different hashes");
+        assert_ne!(
+            hash, hash3,
+            "Different configs must produce different hashes"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -2224,7 +2276,10 @@ mod tests {
 
         // Serialize and deserialize to verify config_hash round-trips
         let json = serde_json::to_string_pretty(&prov).unwrap();
-        assert!(json.contains("config_hash"), "provenance JSON must contain config_hash");
+        assert!(
+            json.contains("config_hash"),
+            "provenance JSON must contain config_hash"
+        );
         assert!(json.contains("siphash24:abcdef0123456789"));
 
         let parsed: ExperimentProvenance = serde_json::from_str(&json).unwrap();

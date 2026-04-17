@@ -5,8 +5,8 @@ use anyhow::{Context, Result};
 use clap::Args;
 
 use crate::config::validate_project_name;
-use crate::workspace;
 use crate::templates;
+use crate::workspace;
 
 /// Scaffold a workspace (git repo + directory structure + config).
 #[derive(Debug, Args)]
@@ -27,8 +27,7 @@ pub struct InitArgs {
 pub fn execute(args: &InitArgs) -> Result<()> {
     validate_project_name(&args.project_name)?;
 
-    let workspace_root = std::env::current_dir()
-        .context("Failed to get current directory")?;
+    let workspace_root = std::env::current_dir().context("Failed to get current directory")?;
 
     // Check if workspace already exists
     let config_path = workspace_root.join(workspace::CONFIG_FILENAME);
@@ -41,7 +40,10 @@ pub fn execute(args: &InitArgs) -> Result<()> {
         );
     }
 
-    eprintln!("Initializing repromagic workspace: {}", workspace_root.display());
+    eprintln!(
+        "Initializing repromagic workspace: {}",
+        workspace_root.display()
+    );
     eprintln!("  project: {}", args.project_name);
 
     // Step 1: Git setup
@@ -90,7 +92,10 @@ pub fn execute(args: &InitArgs) -> Result<()> {
 
     eprintln!();
     eprintln!("Workspace ready! Next steps:");
-    eprintln!("  1. Edit {} to configure schedulers and workload", workspace::CONFIG_FILENAME);
+    eprintln!(
+        "  1. Edit {} to configure schedulers and workload",
+        workspace::CONFIG_FILENAME
+    );
     eprintln!("  2. Run `repm gen-config` to generate rt-app workload config");
     eprintln!("  3. Run `repm run` to execute experiments");
     eprintln!("  4. Run `repm analyze` to process results");
