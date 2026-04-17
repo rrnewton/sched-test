@@ -42,6 +42,15 @@ Documentation and Analysis
 
 When creating analysis documents, specifications, or other AI-generated documentation, place them in the `ai_docs/` directory. This keeps the top-level clean and makes it clear which documents are AI-generated analysis (and may become outdated) versus core project documentation.
 
+Cache Reproducer Methodology
+----------------------------------------
+See `CACHE_REPRODUCER.md` for the authoritative methodology document covering:
+- Valid mode × scheduler matrix (rtapp_sim × EEVDF is IMPOSSIBLE)
+- Calibration parameters and production reference values
+- Dependent variable metrics (E2E latency, scheduling latency, IRQ exposure)
+- Statistical requirements (N≥3 reps, randomized order, warmup exclusion)
+- Data provenance rules (every number must cite source file and computation)
+
 Workflow: Commits and Version Control
 ================================================================================
 
