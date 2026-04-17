@@ -9,7 +9,7 @@ use crate::workspace;
 ///
 /// Core abstraction: N foreground threads (characteristics + relationships)
 /// + M background threads (CPU pressure). All compute phases use `runtime`
-/// with `clockonly` mode (wall-clock spinning, no CPU calibration needed).
+///   with `clockonly` mode (wall-clock spinning, no CPU calibration needed).
 #[derive(Debug, Args)]
 pub struct GenConfigArgs {
     /// Number of foreground threads (override config default).
@@ -103,16 +103,20 @@ pub fn execute(args: &GenConfigArgs) -> Result<()> {
     };
 
     // Resolve parameters: CLI overrides > workspace config > hardcoded defaults
-    let cores = args.cores
+    let cores = args
+        .cores
         .or_else(|| ws_config.as_ref().map(|c| c.defaults.cores))
         .unwrap_or(8);
-    let duration = args.duration
+    let duration = args
+        .duration
         .or_else(|| ws_config.as_ref().map(|c| c.defaults.duration))
         .unwrap_or(30);
-    let foreground = args.foreground
+    let foreground = args
+        .foreground
         .or_else(|| ws_config.as_ref().map(|c| c.workload.foreground_threads))
         .unwrap_or(4);
-    let background = args.background
+    let background = args
+        .background
         .or_else(|| ws_config.as_ref().map(|c| c.workload.background_threads))
         .unwrap_or(16);
 
@@ -125,7 +129,10 @@ pub fn execute(args: &GenConfigArgs) -> Result<()> {
     let mut global = serde_json::Map::new();
     global.insert("duration".into(), Value::Number(duration.into()));
     global.insert("default_policy".into(), Value::String("SCHED_OTHER".into()));
-    global.insert("log_basename".into(), Value::String(args.log_basename.clone()));
+    global.insert(
+        "log_basename".into(),
+        Value::String(args.log_basename.clone()),
+    );
     global.insert("logdir".into(), Value::String("./".into()));
     global.insert("log_size".into(), Value::Number(100.into()));
 
@@ -162,16 +169,12 @@ pub fn execute(args: &GenConfigArgs) -> Result<()> {
 
     // Optional: IRQ generator threads (pinned to even CPUs)
     if args.with_irq {
-        let irq_cpus: Vec<u32> = all_cpus.iter()
-            .copied()
-            .filter(|c| c % 2 == 0)
-            .collect();
+        let irq_cpus: Vec<u32> = all_cpus.iter().copied().filter(|c| c % 2 == 0).collect();
 
         // Add softirq config to global
         if let Some(Value::Object(ref mut global)) = config.get_mut("global") {
-            let irq_cpu_values: Vec<Value> = irq_cpus.iter()
-                .map(|&c| Value::Number(c.into()))
-                .collect();
+            let irq_cpu_values: Vec<Value> =
+                irq_cpus.iter().map(|&c| Value::Number(c.into())).collect();
             global.insert("softirq_target_cpus".into(), Value::Array(irq_cpu_values));
             global.insert("softirq_packet_size".into(), Value::Number(64.into()));
         }
@@ -186,17 +189,15 @@ pub fn execute(args: &GenConfigArgs) -> Result<()> {
     config.insert("tasks".into(), Value::Object(tasks));
 
     // Serialize to JSON
-    let json_output = serde_json::to_string_pretty(&config)
-        .context("Failed to serialize rt-app config")?;
+    let json_output =
+        serde_json::to_string_pretty(&config).context("Failed to serialize rt-app config")?;
     let json_output = json_output + "\n";
 
     // Determine output destination
     let output_path = if let Some(ref path) = args.output {
         Some(std::path::PathBuf::from(path))
-    } else if let Some(ref root) = ws_root {
-        Some(root.join("configs/rtapp.json"))
     } else {
-        None // stdout
+        ws_root.as_ref().map(|root| root.join("configs/rtapp.json"))
     };
 
     if let Some(ref path) = output_path {
@@ -207,11 +208,16 @@ pub fn execute(args: &GenConfigArgs) -> Result<()> {
         std::fs::write(path, &json_output)
             .with_context(|| format!("Failed to write {}", path.display()))?;
         eprintln!("Wrote {}", path.display());
-        eprintln!("  {} foreground threads, {} background threads, {} cores, {}s duration",
-            foreground, background, cores, duration);
+        eprintln!(
+            "  {} foreground threads, {} background threads, {} cores, {}s duration",
+            foreground, background, cores, duration
+        );
         if args.with_irq {
             let irq_count = (0..cores).filter(|c| c % 2 == 0).count();
-            eprintln!("  {} IRQ generator threads (pinned to even CPUs)", irq_count);
+            eprintln!(
+                "  {} IRQ generator threads (pinned to even CPUs)",
+                irq_count
+            );
         }
         eprintln!();
         eprintln!("Next step: run `repm run` to execute experiments");
@@ -230,9 +236,7 @@ fn build_task(
     priority: Option<i32>,
     phase_name: &str,
 ) -> Value {
-    let cpu_values: Vec<Value> = cpus.iter()
-        .map(|&c| Value::Number(c.into()))
-        .collect();
+    let cpu_values: Vec<Value> = cpus.iter().map(|&c| Value::Number(c.into())).collect();
 
     let runtime = serde_json::to_value(RuntimeSpec::clockonly(run_us)).unwrap();
 

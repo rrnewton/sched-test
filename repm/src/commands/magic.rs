@@ -131,9 +131,17 @@ impl WizardPlan {
         eprintln!("  Pipeline steps:");
         let steps = [
             (self.do_init, "1. repm init", "Scaffold workspace"),
-            (self.do_gen_config, "2. repm gen-config", "Generate rt-app workload config"),
+            (
+                self.do_gen_config,
+                "2. repm gen-config",
+                "Generate rt-app workload config",
+            ),
             (self.do_run, "3. repm run", "Execute experiment matrix"),
-            (self.do_analyze, "4. repm analyze", "Generate results tables"),
+            (
+                self.do_analyze,
+                "4. repm analyze",
+                "Generate results tables",
+            ),
         ];
         for (enabled, name, desc) in &steps {
             let marker = if *enabled { "[*]" } else { "[ ]" };
@@ -168,7 +176,8 @@ pub fn execute(args: &MagicArgs) -> Result<()> {
         eprintln!("=== DRY RUN — no actions taken ===");
         eprintln!();
         if plan.do_run {
-            eprintln!("Estimated experiment time: ~{}s",
+            eprintln!(
+                "Estimated experiment time: ~{}s",
                 plan.reps as usize
                     * plan.modes.len()
                     * plan.schedulers.as_ref().map(|s| s.len()).unwrap_or(1)
@@ -598,18 +607,13 @@ struct StepResults {
     analyze: StepStatus,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 enum StepStatus {
+    #[default]
     Pending,
     Success,
     Skipped,
     Failed(String),
-}
-
-impl Default for StepStatus {
-    fn default() -> Self {
-        Self::Pending
-    }
 }
 
 impl std::fmt::Display for StepStatus {

@@ -90,7 +90,10 @@ impl CitedValue {
                 self.source_lines.last().unwrap_or(&0)
             )
         };
-        format!("[{}:{} ({})]", self.source_file, lines_str, self.computation)
+        format!(
+            "[{}:{} ({})]",
+            self.source_file, lines_str, self.computation
+        )
     }
 
     fn format_us(&self) -> String {
@@ -193,11 +196,7 @@ struct TableRow {
 /// Key: (scheduler, mode, rep_id) → RepData
 type RepMap = HashMap<(String, String, String), RepData>;
 
-fn load_csv_with_provenance(
-    csv_path: &Path,
-    base_dir: &Path,
-    thread_type: &str,
-) -> Result<RepMap> {
+fn load_csv_with_provenance(csv_path: &Path, base_dir: &Path, thread_type: &str) -> Result<RepMap> {
     let rel_path = csv_path
         .strip_prefix(base_dir)
         .unwrap_or(csv_path)
@@ -212,15 +211,10 @@ fn load_csv_with_provenance(
         .flexible(true)
         .from_reader(content.as_bytes());
 
-    let headers = reader
-        .headers()
-        .context("CSV has no headers")?
-        .clone();
+    let headers = reader.headers().context("CSV has no headers")?.clone();
 
     // Build column index map
-    let col = |name: &str| -> Option<usize> {
-        headers.iter().position(|h| h == name)
-    };
+    let col = |name: &str| -> Option<usize> { headers.iter().position(|h| h == name) };
 
     let col_mode = col("mode");
     let col_scheduler = col("scheduler");
@@ -242,16 +236,17 @@ fn load_csv_with_provenance(
 
     for (row_idx, record) in reader.records().enumerate() {
         let record = record.with_context(|| {
-            format!("Failed to parse row {} of {}", row_idx + 2, csv_path.display())
+            format!(
+                "Failed to parse row {} of {}",
+                row_idx + 2,
+                csv_path.display()
+            )
         })?;
         let line_num = row_idx + 2; // 1-based, line 1 = header
 
         // Get field helper
-        let get = |col_opt: Option<usize>| -> &str {
-            col_opt
-                .and_then(|i| record.get(i))
-                .unwrap_or("")
-        };
+        let get =
+            |col_opt: Option<usize>| -> &str { col_opt.and_then(|i| record.get(i)).unwrap_or("") };
 
         // Filter by thread_type if column exists
         if let Some(tt_col) = col_thread_type {
@@ -271,12 +266,10 @@ fn load_csv_with_provenance(
         }
 
         let key = (sched.clone(), mode.clone(), rep_id.clone());
-        let rd = result
-            .entry(key)
-            .or_insert_with(|| RepData {
-                rep_id: rep_id.clone(),
-                ..Default::default()
-            });
+        let rd = result.entry(key).or_insert_with(|| RepData {
+            rep_id: rep_id.clone(),
+            ..Default::default()
+        });
 
         // Parse value
         let val_str = get(col_value);
@@ -318,7 +311,9 @@ fn load_csv_with_provenance(
             if let Some(cpu_str) = record.get(cpu_col) {
                 if let Ok(cpu_val) = cpu_str.parse::<f64>() {
                     // Only record once per rep (avoid duplicates)
-                    if rd.cpu_util.is_empty() || (rd.cpu_util.raw_values[0].0 - cpu_val).abs() > f64::EPSILON {
+                    if rd.cpu_util.is_empty()
+                        || (rd.cpu_util.raw_values[0].0 - cpu_val).abs() > f64::EPSILON
+                    {
                         rd.cpu_util.raw_values = vec![(cpu_val, rel_path.clone(), line_num)];
                     }
                 }
@@ -373,7 +368,7 @@ fn find_csv_files(experiment_dir: &Path) -> Vec<PathBuf> {
                 let path = entry.path();
                 if path.is_dir() {
                     walk(&path, csvs);
-                } else if path.file_name().map_or(false, |f| f == "metrics.csv") {
+                } else if path.file_name().is_some_and(|f| f == "metrics.csv") {
                     csvs.push(path);
                 }
             }
@@ -633,6 +628,7 @@ fn run_cross_checks(rows: &[TableRow]) -> Vec<CrossCheckResult> {
 // ---------------------------------------------------------------------------
 
 /// Compute summary statistics for a set of values.
+#[allow(dead_code)]
 fn compute_stats(values: &[f64]) -> BTreeMap<String, f64> {
     let mut stats = BTreeMap::new();
     if values.is_empty() {
@@ -687,11 +683,26 @@ fn format_markdown_table(rows: &[TableRow], thread_type: &str, show_citations: b
     );
 
     for tr in rows {
-        let e2e_p50 = tr.e2e_p50.as_ref().map_or_else(|| format_no_data().into(), |v| v.format_us());
-        let e2e_p99 = tr.e2e_p99.as_ref().map_or_else(|| format_no_data().into(), |v| v.format_us());
-        let sched_p99 = tr.sched_p99.as_ref().map_or_else(|| format_no_data().into(), |v| v.format_us());
-        let irq = tr.irq_exposure.as_ref().map_or_else(|| format_no_data().into(), |v| v.format_pct());
-        let cpu = tr.cpu_util.as_ref().map_or_else(|| format_no_data().into(), |v| v.format_pct());
+        let e2e_p50 = tr
+            .e2e_p50
+            .as_ref()
+            .map_or_else(|| format_no_data().into(), |v| v.format_us());
+        let e2e_p99 = tr
+            .e2e_p99
+            .as_ref()
+            .map_or_else(|| format_no_data().into(), |v| v.format_us());
+        let sched_p99 = tr
+            .sched_p99
+            .as_ref()
+            .map_or_else(|| format_no_data().into(), |v| v.format_us());
+        let irq = tr
+            .irq_exposure
+            .as_ref()
+            .map_or_else(|| format_no_data().into(), |v| v.format_pct());
+        let cpu = tr
+            .cpu_util
+            .as_ref()
+            .map_or_else(|| format_no_data().into(), |v| v.format_pct());
 
         lines.push(format!(
             "| {:<20} | {:<9} | {:>12} | {:>12} | {:>14} | {:>7} | {:>4} | {:>3} |",
@@ -775,22 +786,28 @@ fn format_csv_output(rows: &[TableRow], thread_type: &str) -> String {
              {},\"{}\",\
              {},\"{}\",\
              {},\"{}\"",
-            tr.experiment, tr.mode, tr.scheduler, thread_type, tr.selected_rep,
-            p50_v, p50_c,
-            p99_v, p99_c,
-            sp99_v, sp99_c,
-            irq_v, irq_c,
-            cpu_v, cpu_c,
+            tr.experiment,
+            tr.mode,
+            tr.scheduler,
+            thread_type,
+            tr.selected_rep,
+            p50_v,
+            p50_c,
+            p99_v,
+            p99_c,
+            sp99_v,
+            sp99_c,
+            irq_v,
+            irq_c,
+            cpu_v,
+            cpu_c,
         ));
     }
 
     lines.join("\n")
 }
 
-fn format_comparison_matrix(
-    tables: &BTreeMap<String, Vec<TableRow>>,
-    thread_type: &str,
-) -> String {
+fn format_comparison_matrix(tables: &BTreeMap<String, Vec<TableRow>>, thread_type: &str) -> String {
     let experiments: Vec<&String> = tables.keys().collect();
     if experiments.len() <= 1 {
         return String::new();
@@ -805,7 +822,7 @@ fn format_comparison_matrix(
     }
 
     let mut lines = Vec::new();
-    lines.push(format!("## Cross-Experiment Comparison (E2E P99, µs)"));
+    lines.push("## Cross-Experiment Comparison (E2E P99, µs)".to_string());
     lines.push(format!(
         "*Thread type: {thread_type}. Values: E2E P99 in µs.*"
     ));
@@ -845,10 +862,7 @@ fn format_data_coverage(tables: &BTreeMap<String, Vec<TableRow>>) -> String {
     lines.push(String::new());
 
     for (exp, rows) in tables {
-        let with_data = rows
-            .iter()
-            .filter(|tr| tr.e2e_p99.is_some())
-            .count();
+        let with_data = rows.iter().filter(|tr| tr.e2e_p99.is_some()).count();
         let total = rows.len();
         lines.push(format!(
             "- **{}**: {}/{} cells with E2E P99 data",
@@ -919,11 +933,7 @@ fn execute_single(ws_root: &Path, version: &str, args: &AnalyzeArgs) -> Result<(
         );
     }
 
-    eprintln!(
-        "repm analyze: {} ({} CSV files)",
-        version,
-        csv_files.len()
-    );
+    eprintln!("repm analyze: {} ({} CSV files)", version, csv_files.len());
 
     // Load all CSVs
     let mut all_data = RepMap::new();
@@ -951,13 +961,15 @@ fn execute_single(ws_root: &Path, version: &str, args: &AnalyzeArgs) -> Result<(
     // Generate output
     let mut output = String::new();
     output.push_str(&format!("# Experiment Results: {}\n\n", version));
-    output.push_str(&format!(
-        "Generated by `repm analyze` — all values traced to source CSVs.\n\n"
-    ));
+    output.push_str("Generated by `repm analyze` — all values traced to source CSVs.\n\n");
 
     match args.format {
         OutputFormat::Markdown => {
-            output.push_str(&format_markdown_table(&rows, &args.thread_type, args.citations));
+            output.push_str(&format_markdown_table(
+                &rows,
+                &args.thread_type,
+                args.citations,
+            ));
         }
         OutputFormat::Csv => {
             output.push_str(&format_csv_output(&rows, &args.thread_type));
@@ -966,7 +978,7 @@ fn execute_single(ws_root: &Path, version: &str, args: &AnalyzeArgs) -> Result<(
 
     if args.cross_check {
         let checks = run_cross_checks(&rows);
-        output.push_str("\n");
+        output.push('\n');
         output.push_str(&format_cross_checks(&checks));
     }
 
@@ -984,10 +996,7 @@ fn execute_single(ws_root: &Path, version: &str, args: &AnalyzeArgs) -> Result<(
 }
 
 fn execute_comparison(ws_root: &Path, versions: &[String], args: &AnalyzeArgs) -> Result<()> {
-    eprintln!(
-        "repm analyze --compare {} {}",
-        versions[0], versions[1]
-    );
+    eprintln!("repm analyze --compare {} {}", versions[0], versions[1]);
 
     let mut all_tables: BTreeMap<String, Vec<TableRow>> = BTreeMap::new();
     for version in versions {
@@ -999,7 +1008,11 @@ fn execute_comparison(ws_root: &Path, versions: &[String], args: &AnalyzeArgs) -
         let csv_files = find_csv_files(&exp_dir);
         let mut data = RepMap::new();
         for csv_path in &csv_files {
-            data.extend(load_csv_with_provenance(csv_path, ws_root, &args.thread_type)?);
+            data.extend(load_csv_with_provenance(
+                csv_path,
+                ws_root,
+                &args.thread_type,
+            )?);
         }
 
         let rows = build_table_rows(&data, version);
@@ -1017,7 +1030,11 @@ fn execute_comparison(ws_root: &Path, versions: &[String], args: &AnalyzeArgs) -
     // Per-experiment tables
     for (version, rows) in &all_tables {
         output.push_str(&format!("## {}\n\n", version));
-        output.push_str(&format_markdown_table(rows, &args.thread_type, args.citations));
+        output.push_str(&format_markdown_table(
+            rows,
+            &args.thread_type,
+            args.citations,
+        ));
         output.push_str("\n\n");
     }
 
@@ -1080,13 +1097,21 @@ fn execute_auto_discover(ws_root: &Path, args: &AnalyzeArgs) -> Result<()> {
 
         if !data.is_empty() {
             let rows = build_table_rows(&data, name);
-            eprintln!("  {}: {} rows from {} CSVs", name, rows.len(), csv_files.len());
+            eprintln!(
+                "  {}: {} rows from {} CSVs",
+                name,
+                rows.len(),
+                csv_files.len()
+            );
             all_tables.insert(name.clone(), rows);
         }
     }
 
     if all_tables.is_empty() {
-        bail!("No experiment data found for thread_type='{}'", args.thread_type);
+        bail!(
+            "No experiment data found for thread_type='{}'",
+            args.thread_type
+        );
     }
 
     let mut output = String::new();
@@ -1095,7 +1120,11 @@ fn execute_auto_discover(ws_root: &Path, args: &AnalyzeArgs) -> Result<()> {
 
     for (name, rows) in &all_tables {
         output.push_str(&format!("## {}\n\n", name));
-        output.push_str(&format_markdown_table(rows, &args.thread_type, args.citations));
+        output.push_str(&format_markdown_table(
+            rows,
+            &args.thread_type,
+            args.citations,
+        ));
         output.push_str("\n\n");
     }
 
@@ -1283,7 +1312,9 @@ mod tests {
             warnings: vec![],
         }];
         let checks = run_cross_checks(&rows);
-        assert!(checks.iter().any(|c| matches!(c.status, CrossCheckStatus::Fail)));
+        assert!(checks
+            .iter()
+            .any(|c| matches!(c.status, CrossCheckStatus::Fail)));
     }
 
     #[test]
@@ -1352,17 +1383,26 @@ mod tests {
         let mut data = RepMap::new();
 
         // Rep 1: P99 = 1000
-        let mut rd1 = RepData { rep_id: "1".into(), ..Default::default() };
+        let mut rd1 = RepData {
+            rep_id: "1".into(),
+            ..Default::default()
+        };
         rd1.e2e_p99.push(1000.0, "t.csv", 2);
         data.insert(("EEVDF".into(), "mode".into(), "1".into()), rd1);
 
         // Rep 2: P99 = 5000 (highest)
-        let mut rd2 = RepData { rep_id: "2".into(), ..Default::default() };
+        let mut rd2 = RepData {
+            rep_id: "2".into(),
+            ..Default::default()
+        };
         rd2.e2e_p99.push(5000.0, "t.csv", 3);
         data.insert(("EEVDF".into(), "mode".into(), "2".into()), rd2);
 
         // Rep 3: P99 = 3000 (median)
-        let mut rd3 = RepData { rep_id: "3".into(), ..Default::default() };
+        let mut rd3 = RepData {
+            rep_id: "3".into(),
+            ..Default::default()
+        };
         rd3.e2e_p99.push(3000.0, "t.csv", 4);
         data.insert(("EEVDF".into(), "mode".into(), "3".into()), rd3);
 
@@ -1402,8 +1442,8 @@ mod tests {
         let md = format_markdown_table(&rows, "foreground", false);
         assert!(md.contains("EEVDF"));
         assert!(md.contains("rtapp_pinned"));
-        assert!(md.contains("50.0"));  // 50_000ns = 50µs
-        assert!(md.contains("200"));   // 200_000ns = 200µs
+        assert!(md.contains("50.0")); // 50_000ns = 50µs
+        assert!(md.contains("200")); // 200_000ns = 200µs
         assert!(md.contains("NO DATA")); // sched_p99 is None
         assert!(!md.contains("Source Citations")); // no citations
     }
@@ -1511,8 +1551,7 @@ timestamp,mode,scheduler,condition,thread_type,thread_id,metric_name,percentile,
 
     /// The canonical 14-column CSV header that both rtapp and scxsim paths
     /// in run.rs must produce. Defined once here as the contract.
-    const CANONICAL_CSV_HEADER: &str =
-        "timestamp,mode,scheduler,condition,thread_type,thread_id,\
+    const CANONICAL_CSV_HEADER: &str = "timestamp,mode,scheduler,condition,thread_type,thread_id,\
          metric_name,percentile,value,unit,sample_count,rep,notes,avg_cpu_util_pct";
 
     /// Integration: rtapp CSV with sched_latency metric is parseable by analyze.
@@ -1601,7 +1640,10 @@ timestamp,mode,scheduler,condition,thread_type,thread_id,metric_name,percentile,
         assert_eq!(rd.sched_p99.raw_values[0].0, 80000.0);
 
         // CPU utilization must be parsed from the row-level field
-        assert!(!rd.cpu_util.is_empty(), "cpu_util must be parsed from avg_cpu_util_pct column");
+        assert!(
+            !rd.cpu_util.is_empty(),
+            "cpu_util must be parsed from avg_cpu_util_pct column"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1792,12 +1834,24 @@ timestamp,mode,scheduler,condition,thread_type,thread_id,metric_name,percentile,
         assert!(md.contains("rtapp_pinned"), "Markdown must contain mode");
         // Must contain formatted values (ns → µs conversion)
         // 50000ns = 50µs → "50.0"
-        assert!(md.contains("50.0"), "Markdown must contain E2E P50 value (50.0µs)");
+        assert!(
+            md.contains("50.0"),
+            "Markdown must contain E2E P50 value (50.0µs)"
+        );
         // 200000ns = 200µs → "200"
-        assert!(md.contains("200"), "Markdown must contain E2E P99 value (200µs)");
+        assert!(
+            md.contains("200"),
+            "Markdown must contain E2E P99 value (200µs)"
+        );
         // Must contain source citations section
-        assert!(md.contains("Source Citations"), "Markdown with citations=true must have citations");
-        assert!(md.contains("metrics.csv"), "Citations must reference source file");
+        assert!(
+            md.contains("Source Citations"),
+            "Markdown with citations=true must have citations"
+        );
+        assert!(
+            md.contains("metrics.csv"),
+            "Citations must reference source file"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

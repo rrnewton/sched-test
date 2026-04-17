@@ -49,15 +49,14 @@ pub fn load_config(workspace_root: &Path) -> Result<RepromagicConfig> {
 /// Returns (workspace_root, config).
 pub fn load_config_from_cwd() -> Result<(PathBuf, RepromagicConfig)> {
     let cwd = std::env::current_dir().context("Failed to get current directory")?;
-    let root = find_workspace_root(&cwd)
-        .with_context(|| {
-            format!(
-                "No {} found in {} or any parent directory.\n\
+    let root = find_workspace_root(&cwd).with_context(|| {
+        format!(
+            "No {} found in {} or any parent directory.\n\
                  Run `repm init --project-name NAME` to create a workspace.",
-                CONFIG_FILENAME,
-                cwd.display()
-            )
-        })?;
+            CONFIG_FILENAME,
+            cwd.display()
+        )
+    })?;
     let config = load_config(&root)?;
     Ok((root, config))
 }
