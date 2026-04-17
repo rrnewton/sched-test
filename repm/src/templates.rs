@@ -55,7 +55,10 @@ fn expand_claude_md(config: &RepromagicConfig) -> String {
 
     // Project fields
     output = output.replace("{{project.name}}", &config.project.name);
-    output = output.replace("{{project.phenomenon}}", &config.project.phenomenon.to_string());
+    output = output.replace(
+        "{{project.phenomenon}}",
+        &config.project.phenomenon.to_string(),
+    );
     output = output.replace(
         "{{project.description}}",
         if config.project.description.is_empty() {
@@ -67,7 +70,10 @@ fn expand_claude_md(config: &RepromagicConfig) -> String {
 
     // Defaults
     output = output.replace("{{defaults.cores}}", &config.defaults.cores.to_string());
-    output = output.replace("{{defaults.duration}}", &config.defaults.duration.to_string());
+    output = output.replace(
+        "{{defaults.duration}}",
+        &config.defaults.duration.to_string(),
+    );
     output = output.replace("{{defaults.reps}}", &config.defaults.reps.to_string());
 
     output

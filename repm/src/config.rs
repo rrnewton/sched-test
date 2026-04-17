@@ -428,6 +428,7 @@ pub struct TraceCommand {
 
 /// Experiment run modes (no PureRust — repromagic goes straight to rtapp).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[allow(clippy::enum_variant_names)]
 pub enum RunMode {
     /// rt-app workload on bare metal with CPU pinning.
     RtappPinned,
@@ -451,6 +452,7 @@ impl std::fmt::Display for RunMode {
 // Config I/O
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 impl RepromagicConfig {
     /// Parse a `repromagic_config.toml` string.
     pub fn from_toml(s: &str) -> Result<Self, toml::de::Error> {
@@ -525,10 +527,7 @@ pub fn validate_project_name(name: &str) -> anyhow::Result<()> {
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
     {
-        anyhow::bail!(
-            "Project name must match [a-zA-Z0-9_-]+, got: {:?}",
-            name
-        );
+        anyhow::bail!("Project name must match [a-zA-Z0-9_-]+, got: {:?}", name);
     }
     Ok(())
 }
@@ -722,7 +721,9 @@ binary = "/usr/bin/something"
 "#;
         let cfg = RepromagicConfig::from_toml(toml).unwrap();
         let issues = cfg.validate();
-        assert!(issues.iter().any(|i| i.contains("should not have a binary")));
+        assert!(issues
+            .iter()
+            .any(|i| i.contains("should not have a binary")));
     }
 
     #[test]
@@ -753,7 +754,9 @@ label = "EEVDF"
 "#;
         let cfg = RepromagicConfig::from_toml(toml).unwrap();
         let issues = cfg.validate();
-        assert!(issues.iter().any(|i| i.contains("must be > defaults.warmup")));
+        assert!(issues
+            .iter()
+            .any(|i| i.contains("must be > defaults.warmup")));
     }
 
     #[test]
