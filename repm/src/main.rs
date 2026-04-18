@@ -1,7 +1,10 @@
 mod commands;
+pub mod compare;
 mod config;
 pub mod score;
+mod synthesis;
 mod templates;
+mod trace;
 mod workspace;
 
 use anyhow::Result;
