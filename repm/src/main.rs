@@ -1,5 +1,6 @@
 mod commands;
 mod config;
+pub mod score;
 mod templates;
 mod workspace;
 

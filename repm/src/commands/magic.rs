@@ -591,6 +591,7 @@ fn execute_analyze() -> Result<()> {
         citations: false,
         write: true,
         cross_check: true,
+        score: None,
     };
     analyze::execute(&args)
 }
