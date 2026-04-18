@@ -90,7 +90,10 @@ Every result claim requires at least 2 independent sources:
 
 ## Skeptic checklist
 
-Before accepting any result, verify:
+Before accepting any result, run a full skeptic review.
+See the **skeptic-review** skill for the comprehensive protocol.
+
+Quick pre-flight:
 
 - [ ] Provenance JSON matches what you think was tested
 - [ ] Sample count (N) is sufficient (>=3 reps, >=100 samples per metric)
@@ -98,3 +101,6 @@ Before accepting any result, verify:
 - [ ] No mode x scheduler constraint violations
 - [ ] Config hash in provenance matches current config (if claiming "same config")
 - [ ] Binary mtimes are plausible (not stale)
+- [ ] No identical values across different configs (fishy number check)
+- [ ] Confirming AND refuting evidence documented
+- [ ] Report uses standard skeptic format with verdict

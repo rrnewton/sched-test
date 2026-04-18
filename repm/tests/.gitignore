@@ -1,0 +1,3 @@
+*.perfetto-trace
+*_trace.json
+trace.json

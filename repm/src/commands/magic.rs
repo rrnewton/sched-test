@@ -561,6 +561,8 @@ fn execute_gen_config(plan: &WizardPlan) -> Result<()> {
         with_irq: false,
         irq_run_us: 5000,
         irq_sleep_us: 5000,
+        verbose: false,
+        format: gen_config::ConfigFormat::Rtapp,
     };
     gen_config::execute(&args)
 }

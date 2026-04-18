@@ -1,0 +1,51 @@
+{
+  "benchmark": "blind_synthesis_e2e",
+  "date": "2026-04-18",
+  "trials": [
+    {
+      "name": "trial1_2thread",
+      "description": "2 threads: fast_waker(100µs/4900µs) + slow_hog(50ms/50ms)",
+      "ground_truth_threads": 2,
+      "synthesized_threads": 2,
+      "thread_count_match": true,
+      "X_geomean": 1.2230,
+      "T_seconds": 14,
+      "tokens": 0,
+      "pass": true,
+      "notes": "slow_hog 1.48x off due to scheduler preemption (43 preemptions → observed run 33ms vs configured 50ms). Pipeline correctly recovers observed behavior."
+    },
+    {
+      "name": "trial2_3thread",
+      "description": "3 threads: fast(100µs/4900µs) + medium(5ms/15ms) + slow(50ms/50ms)",
+      "ground_truth_threads": 3,
+      "synthesized_threads": 3,
+      "thread_count_match": true,
+      "X_geomean": 1.1458,
+      "T_seconds": 1,
+      "tokens": 0,
+      "pass": true,
+      "notes": "All 3 classes detected. Medium thread near-perfect (1.03x). Classifier separates 3 distinct timing profiles."
+    },
+    {
+      "name": "trial3_ucache",
+      "description": "ucache-like: 4fg(500µs/1500µs) + 16bg(130µs/950µs), 8 CPUs",
+      "ground_truth_threads": 20,
+      "synthesized_threads": 20,
+      "thread_count_match": true,
+      "X_geomean": 1.0048,
+      "T_seconds": 66,
+      "tokens": 0,
+      "pass": true,
+      "notes": "Near-perfect: 2/2 classes, 20/20 threads, run durations within 1.5%. Classifier correctly groups 4 fg threads and 16 bg threads."
+    }
+  ],
+  "summary": {
+    "trials_total": 3,
+    "trials_passed": 3,
+    "best_geomean": 1.0048,
+    "worst_geomean": 1.2230,
+    "pass_threshold": 2.0,
+    "total_time_seconds": 81,
+    "total_tokens": 0
+  }
+}
