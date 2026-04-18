@@ -1,0 +1,303 @@
+
+Simulation complete:
+  Logical time elapsed:   10s
+  Total tasks:            20
+  Max concurrent running: 8
+  Total time slices:      166150
+  Tasks at end:           20 alive, 6 runnable
+
+Sched_ext structop summary:
+     cpu   structops         rbc      kfuncs
+  ------  ----------  ----------  ----------
+       0      194643    14649993      653445
+       1      190770    13395716      610369
+       2      169001    11862853      543668
+       3      154635    10853264      500529
+       4      143950    10100041      468271
+       5      127775     8963390      417093
+       6      120682     8464411      395159
+       7       99363     6970126      325825
+  ------  ----------  ----------  ----------
+   total     1200819    85259794     3914359
+
+Preemption stats:
+  longest_structop_rbc:    1501
+  longest_rbc_interval:    420  (between kfuncs)
+  REPLAY_MARGIN:           200
+
+
+=== Trace Statistics ===
+
+Duration: 9000.000ms
+
+--- Per-Task Statistics ---
+  Task PID=1:
+    Schedules:       4469
+    Run duration:    0.504ms mean, 0.102ms stddev, CV=20.2%
+    Inter-arrival:   2.014ms mean, 0.102ms stddev
+    Direct dispatch: 0
+    Enqueue calls:   23
+    Yields:          0
+    Preemptions:     0
+    Sleeps:          4469
+    Sched latency:   p50=23.871us p90=62.189us p99=90.478us p999=90.478us max=90.478us (23 samples)
+  Task PID=2:
+    Schedules:       4466
+    Run duration:    0.505ms mean, 0.101ms stddev, CV=20.0%
+    Inter-arrival:   2.015ms mean, 0.101ms stddev
+    Direct dispatch: 0
+    Enqueue calls:   13
+    Yields:          0
+    Preemptions:     0
+    Sleeps:          4466
+    Sched latency:   p50=17.248us p90=78.414us p99=87.223us p999=87.223us max=87.223us (13 samples)
+  Task PID=3:
+    Schedules:       4461
+    Run duration:    0.508ms mean, 0.101ms stddev, CV=19.8%
+    Inter-arrival:   2.018ms mean, 0.101ms stddev
+    Direct dispatch: 0
+    Enqueue calls:   17
+    Yields:          0
+    Preemptions:     0
+    Sleeps:          4461
+    Sched latency:   p50=24.144us p90=40.877us p99=102.923us p999=102.923us max=102.923us (17 samples)
+  Task PID=4:
+    Schedules:       4465
+    Run duration:    0.506ms mean, 0.101ms stddev, CV=20.0%
+    Inter-arrival:   2.016ms mean, 0.101ms stddev
+    Direct dispatch: 0
+    Enqueue calls:   17
+    Yields:          0
+    Preemptions:     0
+    Sleeps:          4464
+    Sched latency:   p50=24.116us p90=47.082us p99=59.940us p999=59.940us max=59.940us (17 samples)
+  Task PID=5:
+    Schedules:       8223
+    Run duration:    0.134ms mean, 0.027ms stddev, CV=19.8%
+    Inter-arrival:   1.094ms mean, 0.028ms stddev
+    Direct dispatch: 0
+    Enqueue calls:   37
+    Yields:          0
+    Preemptions:     0
+    Sleeps:          8224
+    Sched latency:   p50=21.987us p90=49.111us p99=60.906us p999=60.906us max=60.906us (37 samples)
+  Task PID=6:
+    Schedules:       8231
+    Run duration:    0.133ms mean, 0.027ms stddev, CV=20.2%
+    Inter-arrival:   1.093ms mean, 0.028ms stddev
+    Direct dispatch: 0
+    Enqueue calls:   38
+    Yields:          0
+    Preemptions:     0
+    Sleeps:          8231
+    Sched latency:   p50=20.291us p90=38.725us p99=63.609us p999=63.609us max=63.609us (38 samples)
+  Task PID=7:
+    Schedules:       8227
+    Run duration:    0.134ms mean, 0.026ms stddev, CV=19.7%
+    Inter-arrival:   1.094ms mean, 0.028ms stddev
+    Direct dispatch: 0
+    Enqueue calls:   49
+    Yields:          0
+    Preemptions:     0
+    Sleeps:          8227
+    Sched latency:   p50=19.310us p90=46.662us p99=89.788us p999=89.788us max=89.788us (49 samples)
+  Task PID=8:
+    Schedules:       8230
+    Run duration:    0.134ms mean, 0.027ms stddev, CV=20.0%
+    Inter-arrival:   1.094ms mean, 0.028ms stddev
+    Direct dispatch: 0
+    Enqueue calls:   34
+    Yields:          0
+    Preemptions:     0
+    Sleeps:          8230
+    Sched latency:   p50=14.728us p90=31.944us p99=43.971us p999=43.971us max=43.971us (34 samples)
+  Task PID=9:
+    Schedules:       8228
+    Run duration:    0.134ms mean, 0.026ms stddev, CV=19.7%
+    Inter-arrival:   1.094ms mean, 0.028ms stddev
+    Direct dispatch: 0
+    Enqueue calls:   31
+    Yields:          0
+    Preemptions:     0
+    Sleeps:          8228
+    Sched latency:   p50=17.086us p90=27.506us p99=61.226us p999=61.226us max=61.226us (31 samples)
+  Task PID=10:
+    Schedules:       8228
+    Run duration:    0.134ms mean, 0.026ms stddev, CV=19.7%
+    Inter-arrival:   1.094ms mean, 0.028ms stddev
+    Direct dispatch: 0
+    Enqueue calls:   37
+    Yields:          0
+    Preemptions:     0
+    Sleeps:          8227
+    Sched latency:   p50=18.436us p90=57.275us p99=88.627us p999=88.627us max=88.627us (37 samples)
+  Task PID=11:
+    Schedules:       8231
+    Run duration:    0.133ms mean, 0.027ms stddev, CV=20.0%
+    Inter-arrival:   1.093ms mean, 0.028ms stddev
+    Direct dispatch: 0
+    Enqueue calls:   24
+    Yields:          0
+    Preemptions:     0
+    Sleeps:          8231
+    Sched latency:   p50=19.005us p90=48.552us p99=87.753us p999=87.753us max=87.753us (24 samples)
+  Task PID=12:
+    Schedules:       8232
+    Run duration:    0.133ms mean, 0.026ms stddev, CV=19.8%
+    Inter-arrival:   1.093ms mean, 0.027ms stddev
+    Direct dispatch: 0
+    Enqueue calls:   15
+    Yields:          0
+    Preemptions:     0
+    Sleeps:          8232
+    Sched latency:   p50=19.339us p90=33.947us p99=39.991us p999=39.991us max=39.991us (15 samples)
+  Task PID=13:
+    Schedules:       8230
+    Run duration:    0.134ms mean, 0.026ms stddev, CV=19.7%
+    Inter-arrival:   1.094ms mean, 0.027ms stddev
+    Direct dispatch: 0
+    Enqueue calls:   35
+    Yields:          0
+    Preemptions:     0
+    Sleeps:          8230
+    Sched latency:   p50=15.982us p90=56.285us p99=68.977us p999=68.977us max=68.977us (35 samples)
+  Task PID=14:
+    Schedules:       8229
+    Run duration:    0.134ms mean, 0.026ms stddev, CV=19.7%
+    Inter-arrival:   1.094ms mean, 0.028ms stddev
+    Direct dispatch: 0
+    Enqueue calls:   19
+    Yields:          0
+    Preemptions:     0
+    Sleeps:          8228
+    Sched latency:   p50=20.012us p90=58.397us p99=65.086us p999=65.086us max=65.086us (19 samples)
+  Task PID=15:
+    Schedules:       8231
+    Run duration:    0.133ms mean, 0.026ms stddev, CV=19.8%
+    Inter-arrival:   1.093ms mean, 0.027ms stddev
+    Direct dispatch: 0
+    Enqueue calls:   37
+    Yields:          0
+    Preemptions:     0
+    Sleeps:          8232
+    Sched latency:   p50=15.766us p90=47.852us p99=179.469us p999=179.469us max=179.469us (37 samples)
+  Task PID=16:
+    Schedules:       8224
+    Run duration:    0.134ms mean, 0.027ms stddev, CV=19.8%
+    Inter-arrival:   1.094ms mean, 0.028ms stddev
+    Direct dispatch: 0
+    Enqueue calls:   32
+    Yields:          0
+    Preemptions:     0
+    Sleeps:          8223
+    Sched latency:   p50=21.544us p90=44.878us p99=68.740us p999=68.740us max=68.740us (32 samples)
+  Task PID=17:
+    Schedules:       8232
+    Run duration:    0.133ms mean, 0.026ms stddev, CV=19.8%
+    Inter-arrival:   1.093ms mean, 0.027ms stddev
+    Direct dispatch: 0
+    Enqueue calls:   39
+    Yields:          0
+    Preemptions:     0
+    Sleeps:          8232
+    Sched latency:   p50=24.804us p90=59.166us p99=85.631us p999=85.631us max=85.631us (39 samples)
+  Task PID=18:
+    Schedules:       8227
+    Run duration:    0.134ms mean, 0.027ms stddev, CV=19.8%
+    Inter-arrival:   1.094ms mean, 0.028ms stddev
+    Direct dispatch: 0
+    Enqueue calls:   20
+    Yields:          0
+    Preemptions:     0
+    Sleeps:          8227
+    Sched latency:   p50=17.228us p90=43.973us p99=51.646us p999=51.646us max=51.646us (20 samples)
+  Task PID=19:
+    Schedules:       8229
+    Run duration:    0.134ms mean, 0.027ms stddev, CV=20.0%
+    Inter-arrival:   1.094ms mean, 0.028ms stddev
+    Direct dispatch: 0
+    Enqueue calls:   24
+    Yields:          0
+    Preemptions:     0
+    Sleeps:          8229
+    Sched latency:   p50=19.292us p90=39.460us p99=48.114us p999=48.114us max=48.114us (24 samples)
+  Task PID=20:
+    Schedules:       8230
+    Run duration:    0.134ms mean, 0.026ms stddev, CV=19.6%
+    Inter-arrival:   1.094ms mean, 0.027ms stddev
+    Direct dispatch: 0
+    Enqueue calls:   28
+    Yields:          0
+    Preemptions:     0
+    Sleeps:          8231
+    Sched latency:   p50=19.053us p90=54.916us p99=96.761us p999=96.761us max=96.761us (28 samples)
+
+--- Per-CPU Statistics ---
+  CPU 0:
+    Ticks:         1205
+    Tick interval: 7.476ms mean, 5.949ms stddev
+    Balance calls: 23575
+    Idle events:   23499
+    Idle duration: 4311.194ms
+    Utilization:   52.1%
+  CPU 1:
+    Ticks:         1097
+    Tick interval: 8.204ms mean, 6.854ms stddev
+    Balance calls: 23393
+    Idle events:   23331
+    Idle duration: 4570.230ms
+    Utilization:   49.2%
+  CPU 2:
+    Ticks:         972
+    Tick interval: 9.255ms mean, 8.261ms stddev
+    Balance calls: 21231
+    Idle events:   21139
+    Idle duration: 5129.703ms
+    Utilization:   43.0%
+  CPU 3:
+    Ticks:         829
+    Tick interval: 10.852ms mean, 10.265ms stddev
+    Balance calls: 19142
+    Idle events:   19089
+    Idle duration: 5574.886ms
+    Utilization:   38.1%
+  CPU 4:
+    Ticks:         743
+    Tick interval: 12.162ms mean, 11.960ms stddev
+    Balance calls: 17984
+    Idle events:   17904
+    Idle duration: 5983.312ms
+    Utilization:   33.5%
+  CPU 5:
+    Ticks:         657
+    Tick interval: 13.699ms mean, 13.493ms stddev
+    Balance calls: 16160
+    Idle events:   16085
+    Idle duration: 6318.721ms
+    Utilization:   29.8%
+  CPU 6:
+    Ticks:         618
+    Tick interval: 14.532ms mean, 14.718ms stddev
+    Balance calls: 15548
+    Idle events:   15467
+    Idle duration: 6491.694ms
+    Utilization:   27.9%
+  CPU 7:
+    Ticks:         555
+    Tick interval: 16.216ms mean, 18.725ms stddev
+    Balance calls: 12489
+    Idle events:   12439
+    Idle duration: 6888.426ms
+    Utilization:   23.5%
+
+--- Overall CPU Utilization: 37.1% (8 CPUs, 9000.000ms) ---
+
+--- Global Statistics ---
+  DSQ inserts (FIFO):    148954
+  DSQ inserts (vtime):   569
+  DSQ move_to_local:     149522
+  Kick CPU calls:        0
+  DSQ routing:
+    Local/direct:   148954 (99.6%)
+    Cpdom (shared):    569 (0.4%)
+

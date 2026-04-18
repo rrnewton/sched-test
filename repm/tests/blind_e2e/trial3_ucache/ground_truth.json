@@ -1,0 +1,25 @@
+{
+  "global": {"default_policy": "SCHED_OTHER", "duration": 10},
+  "tasks": {
+    "fg_0": {"run": 500, "sleep": 1500, "loop": -1, "cpus": [0,1,2,3,4,5,6,7]},
+    "fg_1": {"run": 500, "sleep": 1500, "loop": -1, "cpus": [0,1,2,3,4,5,6,7]},
+    "fg_2": {"run": 500, "sleep": 1500, "loop": -1, "cpus": [0,1,2,3,4,5,6,7]},
+    "fg_3": {"run": 500, "sleep": 1500, "loop": -1, "cpus": [0,1,2,3,4,5,6,7]},
+    "bg_0":  {"run": 130, "sleep": 950, "loop": -1, "priority": 10, "cpus": [0,1,2,3,4,5,6,7]},
+    "bg_1":  {"run": 130, "sleep": 950, "loop": -1, "priority": 10, "cpus": [0,1,2,3,4,5,6,7]},
+    "bg_2":  {"run": 130, "sleep": 950, "loop": -1, "priority": 10, "cpus": [0,1,2,3,4,5,6,7]},
+    "bg_3":  {"run": 130, "sleep": 950, "loop": -1, "priority": 10, "cpus": [0,1,2,3,4,5,6,7]},
+    "bg_4":  {"run": 130, "sleep": 950, "loop": -1, "priority": 10, "cpus": [0,1,2,3,4,5,6,7]},
+    "bg_5":  {"run": 130, "sleep": 950, "loop": -1, "priority": 10, "cpus": [0,1,2,3,4,5,6,7]},
+    "bg_6":  {"run": 130, "sleep": 950, "loop": -1, "priority": 10, "cpus": [0,1,2,3,4,5,6,7]},
+    "bg_7":  {"run": 130, "sleep": 950, "loop": -1, "priority": 10, "cpus": [0,1,2,3,4,5,6,7]},
+    "bg_8":  {"run": 130, "sleep": 950, "loop": -1, "priority": 10, "cpus": [0,1,2,3,4,5,6,7]},
+    "bg_9":  {"run": 130, "sleep": 950, "loop": -1, "priority": 10, "cpus": [0,1,2,3,4,5,6,7]},
+    "bg_10": {"run": 130, "sleep": 950, "loop": -1, "priority": 10, "cpus": [0,1,2,3,4,5,6,7]},
+    "bg_11": {"run": 130, "sleep": 950, "loop": -1, "priority": 10, "cpus": [0,1,2,3,4,5,6,7]},
+    "bg_12": {"run": 130, "sleep": 950, "loop": -1, "priority": 10, "cpus": [0,1,2,3,4,5,6,7]},
+    "bg_13": {"run": 130, "sleep": 950, "loop": -1, "priority": 10, "cpus": [0,1,2,3,4,5,6,7]},
+    "bg_14": {"run": 130, "sleep": 950, "loop": -1, "priority": 10, "cpus": [0,1,2,3,4,5,6,7]},
+    "bg_15": {"run": 130, "sleep": 950, "loop": -1, "priority": 10, "cpus": [0,1,2,3,4,5,6,7]}
+  }
+}

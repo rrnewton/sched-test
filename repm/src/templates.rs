@@ -42,6 +42,10 @@ const SKILL_FILES: &[(&str, &str)] = &[
         "capture/SKILL.md",
         include_str!("../templates/skills/capture/SKILL.md"),
     ),
+    (
+        "skeptic-review/SKILL.md",
+        include_str!("../templates/skills/skeptic-review/SKILL.md"),
+    ),
 ];
 
 // ---------------------------------------------------------------------------
@@ -220,7 +224,7 @@ mod tests {
 
     #[test]
     fn test_skill_files_embedded() {
-        assert_eq!(SKILL_FILES.len(), 5);
+        assert_eq!(SKILL_FILES.len(), 6);
         for (path, content) in SKILL_FILES {
             assert!(!content.is_empty(), "Skill file {} is empty", path);
             assert!(
@@ -251,6 +255,7 @@ mod tests {
         assert!(tmp.join(".claude/skills/rtapp-usage/SKILL.md").exists());
         assert!(tmp.join(".claude/skills/experiment-mgmt/SKILL.md").exists());
         assert!(tmp.join(".claude/skills/capture/SKILL.md").exists());
+        assert!(tmp.join(".claude/skills/skeptic-review/SKILL.md").exists());
 
         // Clean up
         let _ = std::fs::remove_dir_all(&tmp);
