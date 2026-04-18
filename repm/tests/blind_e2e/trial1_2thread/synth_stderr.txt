@@ -1,0 +1,10 @@
+repm gen-config --from-trace /home/newton/work/multi_sched-test/sched-test1/repm/tests/blind_e2e/trial1_2thread/gt_summary.txt
+  input type: scxsim verbose-summary
+
+  Classification:
+    slow_0 (slow): run=33224µs sleep=33737µs count=1
+      <- pid_2
+    fast_1 (fast): run=102µs sleep=4905µs count=1
+      <- pid_1
+
+Wrote /home/newton/work/multi_sched-test/sched-test1/repm/tests/blind_e2e/trial1_2thread/synthesized.json (2 classes, 2 threads, 4 cores, 10s)
