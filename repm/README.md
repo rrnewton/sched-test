@@ -10,24 +10,44 @@
 # Build
 cd repm
 cargo build --release
-
-# Scaffold a workspace
-./target/release/repm init --project-name my_experiment --new-git
-
-# Generate an rt-app workload config
-./target/release/repm gen-config --foreground 4 --background 16
-
-# Run experiments (simulator mode — no root needed)
-./target/release/repm run --mode rtapp-sim --reps 3
-
-# Analyze results
-./target/release/repm analyze --citations --cross-check --write
 ```
 
-Or run the full pipeline interactively:
+### Option A: Manual workload design
 
 ```bash
-./target/release/repm magic
+# Scaffold a workspace
+repm init --project-name my_experiment --new-git
+
+# Generate an rt-app workload config
+repm gen-config --foreground 4 --background 16
+
+# Run experiments (simulator mode — no root needed)
+repm run --mode rtapp-sim --reps 3
+
+# Analyze results
+repm analyze --citations --cross-check --write
+```
+
+### Option B: Blind synthesis from trace data
+
+```bash
+# Given rt-app logs from a previous experiment:
+repm gen-config --from-trace /path/to/logs/ --verbose -o workload.json
+
+# Or from scxsim verbose-summary output:
+repm gen-config --from-trace scxsim_output.txt --format sim -o workload.json
+
+# Run the full demo (uses real ucache experiment data):
+bash scripts/demo_blind_synthesis.sh --real
+
+# Or with a simple synthetic test case:
+bash scripts/demo_blind_synthesis.sh --sim
+```
+
+### Option C: Full pipeline wizard
+
+```bash
+repm magic
 ```
 
 ## Installation
