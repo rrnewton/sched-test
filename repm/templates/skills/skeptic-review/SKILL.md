@@ -26,6 +26,24 @@ A result set is incomplete until proven complete:
 
 **Missing modes or schedulers are BLOCKING gaps, not "nice to have".**
 
+### Missing cell enumeration (MANDATORY)
+
+The skeptic MUST construct and print the full expected matrix:
+
+1. List every `mode × scheduler × rep` combination
+2. Mark each cell as PRESENT or MISSING
+3. Classify every missing cell:
+   - **BLOCKING** — must be filled before results are valid
+   - **IMPOSSIBLE** — invalid combination (e.g., `rtapp_sim × EEVDF`),
+     documented with justification
+   - **DEFERRED** — out of scope with documented reason
+
+**Any "—", "NO DATA", or blank cell in a results table is BLOCKING
+unless it has an inline footnote stating IMPOSSIBLE, DEFERRED, or
+FAILED with explanation.**
+
+A table with unexplained empty cells is an automatic FAIL verdict.
+
 ## Fishy number detection
 
 Flag and investigate any of these:

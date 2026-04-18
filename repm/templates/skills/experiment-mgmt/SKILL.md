@@ -95,6 +95,8 @@ See the **skeptic-review** skill for the comprehensive protocol.
 
 Quick pre-flight:
 
+- [ ] **Full matrix enumerated** — every mode×scheduler×rep cell accounted for
+- [ ] **No unexplained gaps** — every missing cell classified as BLOCKING/IMPOSSIBLE/DEFERRED
 - [ ] Provenance JSON matches what you think was tested
 - [ ] Sample count (N) is sufficient (>=3 reps, >=100 samples per metric)
 - [ ] Warmup period was excluded
