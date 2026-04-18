@@ -916,7 +916,13 @@ pub fn execute(args: &AnalyzeArgs) -> Result<()> {
     }
 
     if let Some(ref versions) = args.compare {
-        execute_comparison(&ws_root, versions, args)
+        crate::compare::execute_compare(
+            &ws_root,
+            &versions[0],
+            &versions[1],
+            &args.thread_type,
+            args.write,
+        )
     } else if let Some(ref version) = args.experiment {
         execute_single(&ws_root, version, args)
     } else {
@@ -1009,6 +1015,7 @@ fn execute_single(ws_root: &Path, version: &str, args: &AnalyzeArgs) -> Result<(
     Ok(())
 }
 
+#[allow(dead_code)] // Superseded by compare.rs but kept for fallback
 fn execute_comparison(ws_root: &Path, versions: &[String], args: &AnalyzeArgs) -> Result<()> {
     eprintln!("repm analyze --compare {} {}", versions[0], versions[1]);
 
