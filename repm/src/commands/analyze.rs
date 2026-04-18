@@ -54,6 +54,11 @@ pub struct AnalyzeArgs {
     /// Run cross-check validation on metrics.
     #[arg(long)]
     pub cross_check: bool,
+
+    /// Score accuracy: compare original vs reproduced experiment.
+    /// Provide two experiment names: --score <original> <reproduced>
+    #[arg(long, num_args = 2)]
+    pub score: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, clap::ValueEnum)]
@@ -900,6 +905,15 @@ fn format_cross_checks(checks: &[CrossCheckResult]) -> String {
 pub fn execute(args: &AnalyzeArgs) -> Result<()> {
     let (ws_root, _config) = workspace::load_config_from_cwd()
         .context("repm analyze requires a workspace (run `repm init` first)")?;
+
+    if let Some(ref score_args) = args.score {
+        return crate::score::execute_score(
+            &ws_root,
+            &score_args[0],
+            &score_args[1],
+            &args.thread_type,
+        );
+    }
 
     if let Some(ref versions) = args.compare {
         execute_comparison(&ws_root, versions, args)

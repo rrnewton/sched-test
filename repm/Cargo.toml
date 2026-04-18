@@ -17,6 +17,9 @@ anyhow = "1"
 csv = "1"
 chrono = { version = "0.4", features = ["serde"] }
 
+[dev-dependencies]
+tempfile = "3"
+
 [profile.dev]
 # Use Cranelift for fast dev builds (requires nightly + -Zcodegen-backend)
 # For stable toolchain, this section is ignored gracefully.
