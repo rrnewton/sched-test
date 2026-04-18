@@ -37,15 +37,27 @@
       "tokens": 0,
       "pass": true,
       "notes": "Near-perfect: 2/2 classes, 20/20 threads, run durations within 1.5%. Classifier correctly groups 4 fg threads and 16 bg threads."
+    },
+    {
+      "name": "trial4_real_ucache_0.10_v2",
+      "description": "REAL DATA: 70 threads from 0.10_v2 LAVD baseline (8 cache_worker + 56 bg_hog + 4 irq_gen + 1 ssd_reader + 1 ssd_writer)",
+      "ground_truth_threads": 70,
+      "synthesized_threads": 70,
+      "thread_count_match": true,
+      "X_geomean": 1.0253,
+      "T_seconds": 4,
+      "tokens": 0,
+      "pass": true,
+      "notes": "Real bare-metal rt-app logs from 0.10_v2 experiment. 4/4 thread classes detected with exact thread counts. Run durations: cache_worker 1.004x, bg_hog 1.008x, irq_gen 1.000x, ssd_io 1.207x. Sleep inflated by real scheduling latency (expected)."
     }
   ],
   "summary": {
-    "trials_total": 3,
-    "trials_passed": 3,
+    "trials_total": 4,
+    "trials_passed": 4,
     "best_geomean": 1.0048,
     "worst_geomean": 1.2230,
     "pass_threshold": 2.0,
-    "total_time_seconds": 81,
+    "total_time_seconds": 85,
     "total_tokens": 0
   }
 }
