@@ -103,6 +103,7 @@ fn adaptive_priority() -> Result<()> {
         }
     );
 
+    let percentile = 50;
     let metric = move |iters| {
         ctx.start(iters);
         ctx.wait()?;
@@ -115,31 +116,32 @@ fn adaptive_priority() -> Result<()> {
         slow_sem.collect_wake_stats(&mut d_slow);
         let fast_est = d_fast.estimates();
         let slow_est = d_slow.estimates();
-        eprintln!("Fast semaphore wake estimates:");
+        let percentile_frac = percentile as f64 / 100.0;
+        let pxx_fast = fast_est
+            .percentile(percentile_frac)
+            .ok_or_else(|| anyhow::anyhow!("No p{percentile} for fast semaphore"))?;
+        let pxx_slow = slow_est
+            .percentile(percentile_frac)
+            .ok_or_else(|| anyhow::anyhow!("No p{percentile} for slow semaphore"))?;
+        eprintln!("Fast semaphore wake estimates (p{percentile} = {:.3}ms):", pxx_fast.as_secs_f64() * 1000.0);
         eprintln!("{}", fast_est.visualize(None, None));
-        eprintln!("Slow semaphore wake estimates:");
+        eprintln!("Slow semaphore wake estimates (p{percentile} = {:.3}ms):", pxx_slow.as_secs_f64() * 1000.0);
         eprintln!("{}", slow_est.visualize(None, None));
-        let p90_fast = fast_est
-            .percentile(0.9)
-            .ok_or_else(|| anyhow::anyhow!("No p90 for fast semaphore"))?;
-        let p90_slow = slow_est
-            .percentile(0.9)
-            .ok_or_else(|| anyhow::anyhow!("No p90 for slow semaphore"))?;
-        let ratio = p90_fast.as_secs_f64() / p90_slow.as_secs_f64();
+        let ratio = pxx_slow.as_secs_f64() / pxx_fast.as_secs_f64();
         Ok(ratio)
     };
 
-    // If this converges above 50% after the mininum time, that means that
+    // If this ratio converges below 1.0 after the mininum time, that means that
     // we don't really have a preference for waking the process on the fast
     // semaphore (at the p90), and therefore it fails the test.
-    let target = 0.50; // Slow semaphore is slower than fast semaphore.
+    let target = 1.00; // Slow semaphore is slower than fast semaphore.
     let final_value = converge(
         Some(Duration::from_secs_f64(5.0)),
         Some(Duration::from_secs_f64(10.0)),
         Some(target),
         metric,
     )?;
-    if final_value >= target {
+    if final_value < target {
         Err(anyhow::anyhow!(
             "Failed to achieve target: got {:.2}, expected {:.2}",
             final_value,
