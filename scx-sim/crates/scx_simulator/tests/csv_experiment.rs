@@ -75,10 +75,7 @@ fn thread_counts(nr_cpus: u32) -> (i32, i32, i32, i32) {
 /// domains regardless of domain size.
 fn irq_cpus(nr_cpus: u32) -> Vec<u32> {
     let n_irq = (nr_cpus / 3).max(2);
-    (0..nr_cpus)
-        .step_by(3)
-        .take(n_irq as usize)
-        .collect()
+    (0..nr_cpus).step_by(3).take(n_irq as usize).collect()
 }
 
 fn worker_pid(i: i32) -> Pid {
@@ -158,16 +155,22 @@ fn build_scenario(
                 //          wake_freq ~1000 (reader wake + peer wake).
                 // Product wait*wake must exceed reader's to flip lat_cri ranking.
                 phases: vec![
-                    Phase::Run(75_000), Phase::Sleep(3_000),
-                    Phase::Run(75_000), Phase::Sleep(3_000),
-                    Phase::Run(75_000), Phase::Sleep(3_000),
+                    Phase::Run(75_000),
+                    Phase::Sleep(3_000),
+                    Phase::Run(75_000),
+                    Phase::Sleep(3_000),
+                    Phase::Run(75_000),
+                    Phase::Sleep(3_000),
                     Phase::Run(16_000),
                     Phase::Wake(target_reader),
                     Phase::Wake(worker_pid((i + 1) % num_workers)),
                     Phase::Sleep(WORKER_SLEEP_NS),
-                    Phase::Run(75_000), Phase::Sleep(3_000),
-                    Phase::Run(75_000), Phase::Sleep(3_000),
-                    Phase::Run(75_000), Phase::Sleep(3_000),
+                    Phase::Run(75_000),
+                    Phase::Sleep(3_000),
+                    Phase::Run(75_000),
+                    Phase::Sleep(3_000),
+                    Phase::Run(75_000),
+                    Phase::Sleep(3_000),
                     Phase::Run(16_000),
                     Phase::Sleep(WORKER_SLEEP_NS),
                 ],
@@ -194,16 +197,27 @@ fn build_scenario(
             behavior: TaskBehavior {
                 // Reader→Worker: ~12.5% (every 8th cycle).
                 phases: vec![
-                    Phase::Run(READER_RUN_NS), Phase::Sleep(READER_SLEEP_NS),
-                    Phase::Run(READER_RUN_NS), Phase::Sleep(READER_SLEEP_NS),
-                    Phase::Run(READER_RUN_NS), Phase::Sleep(READER_SLEEP_NS),
-                    Phase::Run(READER_RUN_NS), Phase::Sleep(READER_SLEEP_NS),
-                    Phase::Run(READER_RUN_NS), Phase::Sleep(READER_SLEEP_NS),
-                    Phase::Run(READER_RUN_NS), Phase::Sleep(READER_SLEEP_NS),
-                    Phase::Run(READER_RUN_NS), Phase::Sleep(READER_SLEEP_NS),
-                    Phase::Run(READER_RUN_NS), Phase::Sleep(READER_SLEEP_NS),
-                    Phase::Run(READER_RUN_NS), Phase::Sleep(READER_SLEEP_NS),
-                    Phase::Run(READER_RUN_NS), Phase::Wake(target_worker), Phase::Sleep(READER_SLEEP_NS),
+                    Phase::Run(READER_RUN_NS),
+                    Phase::Sleep(READER_SLEEP_NS),
+                    Phase::Run(READER_RUN_NS),
+                    Phase::Sleep(READER_SLEEP_NS),
+                    Phase::Run(READER_RUN_NS),
+                    Phase::Sleep(READER_SLEEP_NS),
+                    Phase::Run(READER_RUN_NS),
+                    Phase::Sleep(READER_SLEEP_NS),
+                    Phase::Run(READER_RUN_NS),
+                    Phase::Sleep(READER_SLEEP_NS),
+                    Phase::Run(READER_RUN_NS),
+                    Phase::Sleep(READER_SLEEP_NS),
+                    Phase::Run(READER_RUN_NS),
+                    Phase::Sleep(READER_SLEEP_NS),
+                    Phase::Run(READER_RUN_NS),
+                    Phase::Sleep(READER_SLEEP_NS),
+                    Phase::Run(READER_RUN_NS),
+                    Phase::Sleep(READER_SLEEP_NS),
+                    Phase::Run(READER_RUN_NS),
+                    Phase::Wake(target_worker),
+                    Phase::Sleep(READER_SLEEP_NS),
                 ],
                 repeat: RepeatMode::Forever,
             },
