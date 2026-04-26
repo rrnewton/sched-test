@@ -43,6 +43,9 @@
 #undef bpf_core_type_size
 #define bpf_core_type_size(type) sizeof(type)
 
+/* CO-RE type-info builtin — not available in GCC; stub to constant 1 */
+#define __builtin_preserve_type_info(x,y) 1
+
 /*
  * Undo BPF CO-RE enum variable macros from enums.autogen.bpf.h.
  *
