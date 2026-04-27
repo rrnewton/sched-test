@@ -62,6 +62,37 @@
 #define bpf_core_type_size(type) sizeof(type)
 
 /*
+ * bpf_probe_read_kernel_str — userspace stub.
+ *
+ * BPF helper #115 is used by simple_exit() to copy the scheduler name.
+ * Without this stub, the call goes through the raw BPF helper dispatch
+ * table (slot 115), which is NULL in userspace → SIGSEGV.
+ */
+static __always_inline long sim_bpf_probe_read_kernel_str(void *dst, u32 sz,
+							  const void *src)
+{
+	char *out = dst;
+	const char *in = src;
+	u32 i;
+
+	if (!dst || sz == 0)
+		return 0;
+
+	__builtin_memset(dst, 0, sz);
+	if (!src)
+		return -14;
+
+	for (i = 0; i + 1 < sz && in[i]; i++)
+		out[i] = in[i];
+
+	return i + 1;
+}
+
+#undef bpf_probe_read_kernel_str
+#define bpf_probe_read_kernel_str(dst, sz, src) \
+	sim_bpf_probe_read_kernel_str((dst), (sz), (src))
+
+/*
  * Undo BPF CO-RE enum variable macros from enums.autogen.bpf.h.
  *
  * In BPF programs, these constants are resolved at load time via CO-RE
