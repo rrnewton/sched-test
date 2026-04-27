@@ -54,6 +54,18 @@ See `../../ucache_reproducer/CACHE_REPRODUCER.md` for the authoritative methodol
 Workflow: Commits and Version Control
 ================================================================================
 
+Initial Clone Setup
+--------------------------------------------
+
+After cloning the repository, you **must** initialize git submodules before
+building. The project depends on the `scx` submodule (sched_ext kernel headers
+and BPF helpers). Without it, builds will silently fail with missing headers.
+
+    git submodule update --init --recursive
+
+This is a one-time step per clone. If you see build errors about missing
+`<scx/common.bpf.h>` or similar headers, this is almost certainly the cause.
+
 Clean Start: Before beginning work on a task
 --------------------------------------------
 
