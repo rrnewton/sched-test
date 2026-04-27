@@ -37,6 +37,14 @@
 #include <scx/common.bpf.h>
 
 /*
+ * The simulator does not provide the kernel's numeric iterator kfuncs
+ * (bpf_iter_num_new/next/destroy) that back bpf_for(). In userspace we do
+ * not need verifier proofs, so translate bpf_for() into a plain C loop.
+ */
+#undef bpf_for
+#define bpf_for(i, start, end) for ((i) = (start); (i) < (end); ++(i))
+
+/*
  * CO-RE helper overrides for userspace compilation.
  *
  * bpf_core_read.h (included transitively via common.bpf.h) defines these
@@ -127,15 +135,26 @@
  * at dlopen time via -rdynamic.
  */
 extern bool scx_bpf_dsq_move_to_local(u64 dsq_id);
-extern struct cgroup *scx_bpf_task_cgroup(void *p, int subsys_id);
 
 /*
- * Legacy compat alias used by older scheduler snapshots (e.g. mitosis).
- * __COMPAT_scx_bpf_task_cgroup(p) was the old 1-arg compat wrapper;
- * the Rust kfunc takes (task, subsys_id) — default subsys_id=0.
+ * scx_bpf_task_cgroup: upstream compat.bpf.h exposes a 1-arg API
+ * (just the task pointer). The Rust kfunc takes (task, subsys_id).
+ * Provide a 1-arg macro that defaults subsys_id=0, matching the
+ * upstream API that scheduler code expects.
  */
+/*
+ * The Rust kfunc `scx_bpf_task_cgroup` takes 2 args (task, subsys_id),
+ * but upstream compat.bpf.h exposes a 1-arg API. We declare the 2-arg
+ * function under an internal name (linker resolves via asm label to the
+ * Rust symbol), then provide a 1-arg macro that defaults subsys_id=0.
+ */
+extern struct cgroup *scx_bpf_task_cgroup_2(void *p, int subsys_id)
+    __asm__("scx_bpf_task_cgroup");
+#define scx_bpf_task_cgroup(p) scx_bpf_task_cgroup_2((p), 0)
+
+/* Legacy alias used by older scheduler snapshots (e.g. mitosis). */
 #ifndef __COMPAT_scx_bpf_task_cgroup
-#define __COMPAT_scx_bpf_task_cgroup(p) scx_bpf_task_cgroup((p), 0)
+#define __COMPAT_scx_bpf_task_cgroup(p) scx_bpf_task_cgroup_2((p), 0)
 #endif
 
 /*
