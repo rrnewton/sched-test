@@ -315,7 +315,6 @@ void cosmos_setup(unsigned int num_cpus)
 	nr_node_ids = 1;
 	mm_affinity = true;
 	perf_config = 1;  /* Enable PMU tracking (any non-zero value) */
-	deferred_wakeups = true;
 	slice_ns = 20000000;   /* 20ms */
 	slice_lag = 20000000;  /* 20ms */
 	busy_threshold = 1;   /* system "not busy" → flat idle scan path */
