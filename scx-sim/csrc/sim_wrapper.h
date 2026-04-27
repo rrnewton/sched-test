@@ -164,6 +164,72 @@ static __always_inline long sim_bpf_probe_read_kernel_str(void *dst, u32 sz,
 #define bpf_probe_read_kernel_str(dst, sz, src) \
 	sim_bpf_probe_read_kernel_str((dst), (sz), (src))
 
+static __always_inline void *sim_bpf_kptr_xchg(void **kptr, void *new_val)
+{
+	void *old = *kptr;
+	*kptr = new_val;
+	return old;
+}
+
+#undef bpf_kptr_xchg
+#define bpf_kptr_xchg(kptr, val) \
+	sim_bpf_kptr_xchg((void **)(kptr), (void *)(val))
+
+extern void *sim_bpf_get_current_task_btf(void);
+#undef bpf_get_current_task_btf
+#define bpf_get_current_task_btf() sim_bpf_get_current_task_btf()
+
+extern u32 sim_bpf_get_smp_processor_id(void);
+#undef bpf_get_smp_processor_id
+#define bpf_get_smp_processor_id() sim_bpf_get_smp_processor_id()
+
+extern u64 sim_bpf_ktime_get_ns(void);
+#undef bpf_ktime_get_ns
+#define bpf_ktime_get_ns() sim_bpf_ktime_get_ns()
+
+extern void *sim_dsq_iter_begin(u64 dsq_id, u64 flags);
+extern void *sim_dsq_iter_next(void);
+
+static __always_inline int sim_bpf_iter_scx_dsq_new(struct bpf_iter_scx_dsq *it,
+						    u64 dsq_id, u64 flags)
+{
+	u64 *opaque = (u64 *)it;
+
+	opaque[0] = (u64)(unsigned long)sim_dsq_iter_begin(dsq_id, flags);
+	opaque[1] = 1;
+	return 0;
+}
+
+static __always_inline struct task_struct *
+sim_bpf_iter_scx_dsq_next(struct bpf_iter_scx_dsq *it)
+{
+	u64 *opaque = (u64 *)it;
+
+	if (opaque[1]) {
+		opaque[1] = 0;
+		return (struct task_struct *)(unsigned long)opaque[0];
+	}
+
+	return (struct task_struct *)sim_dsq_iter_next();
+}
+
+static __always_inline void
+sim_bpf_iter_scx_dsq_destroy(struct bpf_iter_scx_dsq *it)
+{
+	while (sim_bpf_iter_scx_dsq_next(it))
+		;
+}
+
+#undef bpf_iter_scx_dsq_new
+#define bpf_iter_scx_dsq_new(it, dsq_id, flags) \
+	sim_bpf_iter_scx_dsq_new((it), (dsq_id), (flags))
+
+#undef bpf_iter_scx_dsq_next
+#define bpf_iter_scx_dsq_next(it) sim_bpf_iter_scx_dsq_next((it))
+
+#undef bpf_iter_scx_dsq_destroy
+#define bpf_iter_scx_dsq_destroy(it) sim_bpf_iter_scx_dsq_destroy((it))
+
 /*
  * Undo BPF CO-RE enum variable macros from enums.autogen.bpf.h.
  *
@@ -241,6 +307,21 @@ extern bool __sim_dsq_move_to_local(u64 dsq_id);
 /* v2 compat: upstream now passes (dsq_id, enq_flags); ignore enq_flags in sim */
 #define scx_bpf_dsq_move_to_local(dsq_id, ...) __sim_dsq_move_to_local(dsq_id)
 extern struct cgroup *__sim_task_cgroup(void *p, int subsys_id);
+/*
+ * Newer compat headers route scx_bpf_select_cpu_and() through the
+ * __scx_bpf_select_cpu_and() ABI. The simulator only exports the legacy
+ * 5-argument form, so bridge the new ABI back onto that symbol.
+ */
+extern s32 sim_scx_bpf_select_cpu_and(struct task_struct *p, s32 prev_cpu,
+				      u64 wake_flags,
+				      const struct cpumask *cpus_allowed,
+				      u64 flags)
+    __asm__("scx_bpf_select_cpu_and");
+#undef __scx_bpf_select_cpu_and
+#define __scx_bpf_select_cpu_and(p, cpus_allowed, args) \
+	sim_scx_bpf_select_cpu_and((p), (args)->prev_cpu, (args)->wake_flags, \
+				 (cpus_allowed), (args)->flags)
+
 /*
  * Upstream moved from __COMPAT_scx_bpf_task_cgroup(p) to a 1-arg
  * scx_bpf_task_cgroup(p) compat macro. Our Rust kfunc takes (task,
