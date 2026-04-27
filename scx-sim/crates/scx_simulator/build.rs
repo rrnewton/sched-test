@@ -41,8 +41,7 @@ fn main() {
             .define("SCX_BPF_UNITTEST", None)
             .includes(&include_paths)
             .flag("-Wno-unused-parameter")
-            .flag("-Wno-unknown-attributes")
-            .flag("-Wno-implicit-function-declaration");
+            .flag("-Wno-unknown-attributes");
         if coverage {
             build
                 .flag("-fprofile-instr-generate")

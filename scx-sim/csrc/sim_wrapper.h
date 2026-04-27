@@ -22,6 +22,16 @@
 #undef __kconfig
 #define __kconfig
 
+/*
+ * CO-RE type-info builtin stub — must be defined BEFORE including
+ * common.bpf.h, because bpf_core_read.h and compat.bpf.h use
+ * __builtin_preserve_type_info() in bpf_core_type_exists() macros.
+ * Without this, the builtin is undefined during header parsing,
+ * producing implicit-function-declaration errors (clang 21+ hard
+ * error) and returning an undefined value instead of the intended 1.
+ */
+#define __builtin_preserve_type_info(x,y) 1
+
 /* Include common.bpf.h to get type definitions and set the header guard.
  * When the scheduler .bpf.c re-includes it, it will be skipped. */
 #include <scx/common.bpf.h>
@@ -42,9 +52,6 @@
 #define bpf_core_type_matches(type) 1
 #undef bpf_core_type_size
 #define bpf_core_type_size(type) sizeof(type)
-
-/* CO-RE type-info builtin — not available in GCC; stub to constant 1 */
-#define __builtin_preserve_type_info(x,y) 1
 
 /*
  * Undo BPF CO-RE enum variable macros from enums.autogen.bpf.h.
@@ -110,7 +117,26 @@
 #undef scx_bpf_dsq_insert
 #undef scx_bpf_dsq_insert_vtime
 #undef scx_bpf_dsq_move_to_local
+#undef scx_bpf_task_cgroup
 #undef scx_bpf_now
+
+/*
+ * Forward-declare kfuncs provided by the Rust binary via #[no_mangle].
+ * After the #undef above removes compat macro wrappers, C callers need
+ * plain function declarations; symbols are resolved from the Rust binary
+ * at dlopen time via -rdynamic.
+ */
+extern bool scx_bpf_dsq_move_to_local(u64 dsq_id);
+extern struct cgroup *scx_bpf_task_cgroup(void *p, int subsys_id);
+
+/*
+ * Legacy compat alias used by older scheduler snapshots (e.g. mitosis).
+ * __COMPAT_scx_bpf_task_cgroup(p) was the old 1-arg compat wrapper;
+ * the Rust kfunc takes (task, subsys_id) — default subsys_id=0.
+ */
+#ifndef __COMPAT_scx_bpf_task_cgroup
+#define __COMPAT_scx_bpf_task_cgroup(p) scx_bpf_task_cgroup((p), 0)
+#endif
 
 /*
  * Override BPF_STRUCT_OPS to produce regular C functions.
@@ -129,180 +155,3 @@
 /* SCX_OPS_DEFINE creates a struct_ops registration - not needed in simulator */
 #undef SCX_OPS_DEFINE
 #define SCX_OPS_DEFINE(name, ...)
-
-/*
- * UEI_DEFINE produces global symbols (uei, uei_dump, uei_dump_len) that
- * collide when multiple schedulers are linked into the same binary.
- * Override to produce weak symbols so the linker picks one arbitrarily.
- */
-#undef UEI_DEFINE
-#define UEI_DEFINE(__name) \
-    __attribute__((weak)) char __name##_dump[4096]; \
-    __attribute__((weak)) const volatile u32 __name##_dump_len; \
-    __attribute__((weak)) struct user_exit_info __name
-
-/*
- * Override SEC("license") to produce weak symbols.
- * Multiple schedulers define `char _license[] SEC("license") = "GPL"`.
- * We strip the section attribute (not meaningful in userspace) and add weak.
- */
-#undef SEC
-#define SEC(name) __attribute__((weak))
-
-/*
- * Stub out BPF helpers used by UEI_RECORD and other kernel-only code paths.
- * These are BPF helpers that don't exist in userspace.
- */
-#ifndef bpf_probe_read_kernel_str
-#define bpf_probe_read_kernel_str(dst, sz, src) ((void)(dst), (void)(sz), (void)(src), (long)0)
-#endif
-
-/*
- * bpf_probe_read_kernel -- reads kernel memory. In the simulator, the
- * "kernel" pointer is just a regular userspace pointer, so memcpy is safe.
- * Returns -EFAULT (> 0 test fails) if src is NULL to match BPF semantics.
- */
-#undef bpf_probe_read_kernel
-#define bpf_probe_read_kernel(dst, sz, src) \
-	((src) ? (__builtin_memcpy((dst), (src), (sz)), (long)0) : (long)(-14))
-
-/* __kconfig variables don't exist in userspace */
-#undef __kconfig
-#define __kconfig
-
-/*
- * BPF iterator overrides.
- *
- * bpf_for_each(scx_dsq, p, dsq_id, flags) iterates tasks in a DSQ via
- * kfuncs that snapshot the DSQ and yield task_struct pointers.
- *
- * bpf_for(i, start, end) is a bounded loop helper — maps to a plain for loop.
- */
-extern struct task_struct *sim_dsq_iter_begin(u64 dsq_id, u64 flags);
-extern struct task_struct *sim_dsq_iter_next(void);
-
-#undef bpf_for_each
-#define bpf_for_each(type, cur, args...) \
-    _bpf_for_each_##type(cur, args)
-
-#define _bpf_for_each_scx_dsq(cur, dsq_id, flags) \
-    for (cur = sim_dsq_iter_begin(dsq_id, flags); \
-         cur != NULL; \
-         cur = sim_dsq_iter_next())
-
-/*
- * CSS (cgroup_subsys_state) iterator.
- *
- * bpf_for_each(css, cur, root, flags) iterates cgroup children in pre-order.
- * The Rust side must populate the iteration list via sim_css_iter_*() before
- * the for loop begins. sim_css_next() walks through the pre-order list.
- */
-extern struct cgroup_subsys_state *sim_css_next(
-    struct cgroup_subsys_state *root, struct cgroup_subsys_state *prev);
-
-#define _bpf_for_each_css(cur, root, flags) \
-    for (cur = sim_css_next(root, NULL); cur != NULL; \
-         cur = sim_css_next(root, cur))
-
-/* BPF_FOR_EACH_ITER is referenced in __COMPAT_scx_bpf_dsq_move calls
- * inside for_each loop bodies. Our dsq_move override ignores it. */
-#ifndef BPF_FOR_EACH_ITER
-#define BPF_FOR_EACH_ITER NULL
-#endif
-
-#undef bpf_for
-#define bpf_for(i, start, end) for ((i) = (start); (i) < (end); (i)++)
-
-/*
- * Compat macro overrides — route to simulator kfuncs.
- */
-extern bool sim_scx_bpf_dsq_move(struct task_struct *p, u64 dsq_id, u64 enq_flags);
-
-#undef __COMPAT_scx_bpf_dsq_move
-#define __COMPAT_scx_bpf_dsq_move(it, p, dsq_id, enq_flags) \
-    sim_scx_bpf_dsq_move(p, dsq_id, enq_flags)
-
-#undef __COMPAT_scx_bpf_cpu_curr
-#define __COMPAT_scx_bpf_cpu_curr(cpu) ((struct task_struct *)NULL)
-
-/*
- * BPF timer overrides.
- *
- * In BPF, bpf_timer_* are helper function pointers defined in
- * bpf_helper_defs.h. In the simulator, timers are not modeled,
- * so we stub them out as no-op macros before the BPF headers
- * are included.
- */
-#undef bpf_timer_init
-#define bpf_timer_init(timer, map, flags) (0)
-#undef bpf_timer_set_callback
-#define bpf_timer_set_callback(timer, cb) (0)
-#undef bpf_timer_start
-#define bpf_timer_start(timer, nsecs, flags) (0)
-
-/*
- * bpf_kptr_xchg override.
- *
- * In BPF, bpf_kptr_xchg is a static function pointer set to (void *)194.
- * In the simulator, we route it to our bpf_kptr_xchg_impl stub which
- * does a simple pointer swap.
- */
-extern void *bpf_kptr_xchg_impl(void **kptr, void *new_val);
-#undef bpf_kptr_xchg
-#define bpf_kptr_xchg(kptr, new_val) bpf_kptr_xchg_impl((void **)(kptr), (void *)(new_val))
-
-/*
- * bpf_get_smp_processor_id override.
- *
- * In BPF, this returns the current CPU ID via a helper at (void *)8.
- * In the simulator, we route it to our kfunc that reads current_cpu
- * from the simulator state.
- */
-extern unsigned int sim_bpf_get_smp_processor_id(void);
-#undef bpf_get_smp_processor_id
-#define bpf_get_smp_processor_id() sim_bpf_get_smp_processor_id()
-
-/*
- * bpf_get_current_task_btf override.
- *
- * In BPF, this is a helper at (void *)158. In the simulator, it routes
- * to our Rust kfunc that returns the current CPU's running task.
- */
-extern struct task_struct *sim_bpf_get_current_task_btf(void);
-#undef bpf_get_current_task_btf
-#define bpf_get_current_task_btf() sim_bpf_get_current_task_btf()
-
-/*
- * bpf_ktime_get_ns override.
- *
- * In BPF, this is a helper at (void *)5 returning the current
- * kernel timestamp. In the simulator, it returns the per-CPU
- * local clock from the Rust engine.
- */
-extern unsigned long long sim_bpf_ktime_get_ns(void);
-#undef bpf_ktime_get_ns
-#define bpf_ktime_get_ns() sim_bpf_ktime_get_ns()
-
-/*
- * bpf_get_prandom_u32 override.
- *
- * In BPF, this is a helper returning a pseudo-random u32.
- * overrides.h stubs it to 0, but the simulator has a deterministic
- * PRNG in the Rust engine. Route to it so scheduler code that
- * uses randomness exercises real (deterministic) random paths.
- */
-extern unsigned int sim_bpf_get_prandom_u32(void);
-#undef bpf_get_prandom_u32
-#define bpf_get_prandom_u32() sim_bpf_get_prandom_u32()
-
-/*
- * BPF_PROG override for tracepoint/fentry programs.
- *
- * BPF_PROG from bpf_tracing.h uses ___bpf_ctx_cast and
- * __builtin_preserve_access_index (Clang-only builtins). For userspace
- * compilation with GCC, produce a plain weak function instead. This
- * does NOT affect BPF_STRUCT_OPS which is separately overridden above.
- */
-#undef BPF_PROG
-#define BPF_PROG(name, args...) __attribute__((weak)) name(args)
-
