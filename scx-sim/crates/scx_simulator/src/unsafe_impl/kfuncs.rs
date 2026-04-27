@@ -1700,6 +1700,36 @@ pub extern "C" fn scx_bpf_dsq_insert(p: *mut c_void, dsq_id: u64, slice: u64, en
     })
 }
 
+/// Compat alias: compat.bpf.h v6.19+ inline function checks for this symbol.
+/// Returns bool (true = success) to match the v2 signature.
+#[no_mangle]
+pub extern "C" fn scx_bpf_dsq_insert___v2___compat(
+    p: *mut c_void,
+    dsq_id: u64,
+    slice: u64,
+    enq_flags: u64,
+) -> bool {
+    scx_bpf_dsq_insert(p, dsq_id, slice, enq_flags);
+    true
+}
+
+/// Compat alias for v1 (void return).
+#[no_mangle]
+pub extern "C" fn scx_bpf_dsq_insert___v1(p: *mut c_void, dsq_id: u64, slice: u64, enq_flags: u64) {
+    scx_bpf_dsq_insert(p, dsq_id, slice, enq_flags);
+}
+
+/// Old dispatch compat name (pre-v6.12 rename).
+#[no_mangle]
+pub extern "C" fn scx_bpf_dispatch___compat(
+    p: *mut c_void,
+    dsq_id: u64,
+    slice: u64,
+    enq_flags: u64,
+) {
+    scx_bpf_dsq_insert(p, dsq_id, slice, enq_flags);
+}
+
 /// Insert a task into a DSQ with vtime ordering.
 ///
 /// Deferred like `scx_bpf_dsq_insert` — see its doc comment.
@@ -1795,6 +1825,13 @@ pub extern "C" fn scx_bpf_dsq_move_to_local(dsq_id: u64) -> bool {
 
         result
     })
+}
+
+/// C-side alias: sim_wrapper.h redefines `scx_bpf_dsq_move_to_local` as a
+/// variadic macro that strips the v2 `enq_flags` arg and calls this symbol.
+#[no_mangle]
+pub extern "C" fn __sim_dsq_move_to_local(dsq_id: u64) -> bool {
+    scx_bpf_dsq_move_to_local(dsq_id)
 }
 
 /// Query the number of tasks queued in a DSQ.
@@ -1964,6 +2001,17 @@ pub extern "C" fn scx_bpf_reenqueue_local() -> u32 {
     })
 }
 
+/// Compat aliases for scx_bpf_reenqueue_local (compat.bpf.h inline function).
+#[no_mangle]
+pub extern "C" fn scx_bpf_reenqueue_local___v1() -> u32 {
+    scx_bpf_reenqueue_local()
+}
+
+#[no_mangle]
+pub extern "C" fn scx_bpf_reenqueue_local___v2___compat() {
+    scx_bpf_reenqueue_local();
+}
+
 /// No-op stubs for cpumask ref counting in simulator.
 #[no_mangle]
 pub extern "C" fn scx_bpf_put_cpumask(_cpumask: *const c_void) {}
@@ -2037,6 +2085,12 @@ pub extern "C" fn bpf_get_current_task_btf() -> *mut c_void {
 #[no_mangle]
 pub extern "C" fn sim_bpf_get_current_task_btf() -> *mut c_void {
     // No separate maybe_yield — bpf_get_current_task_btf already yields.
+    bpf_get_current_task_btf()
+}
+
+/// Another alias used by the updated sim_wrapper.h macro.
+#[no_mangle]
+pub extern "C" fn bpf_get_current_task_btf_kfunc() -> *mut c_void {
     bpf_get_current_task_btf()
 }
 
@@ -2280,6 +2334,13 @@ pub extern "C" fn scx_bpf_task_cgroup(p: *mut c_void, _subsys_id: i32) -> *mut c
     }
     // Fallback: return root cgroup (task not assigned to any cgroup)
     unsafe { ffi::sim_get_root_cgroup() }
+}
+
+/// C-side alias: sim_wrapper.h redefines `scx_bpf_task_cgroup` as a macro
+/// that calls this symbol with a default subsys_id=0.
+#[no_mangle]
+pub extern "C" fn __sim_task_cgroup(p: *mut c_void, subsys_id: i32) -> *mut c_void {
+    scx_bpf_task_cgroup(p, subsys_id)
 }
 
 /// Look up a cgroup by its kernfs ID. Returns the cgroup pointer if found,

@@ -30,7 +30,15 @@
  * producing implicit-function-declaration errors (clang 21+ hard
  * error) and returning an undefined value instead of the intended 1.
  */
-#define __builtin_preserve_type_info(x,y) 1
+/*
+ * Return 0 so bpf_core_type_exists() reports types as absent.
+ * This makes compat.bpf.h inline functions fall back to the older
+ * (non-struct-args) kfunc variants that the simulator already supports.
+ * bpf_core_field_exists() also uses this, so it returns 0 too — fine
+ * because the simulator's task_struct fields are accessed differently.
+ */
+#define __builtin_preserve_type_info(x,y) 0
+#define __builtin_preserve_field_info(x,y) 0
 
 /* Include common.bpf.h to get type definitions and set the header guard.
  * When the scheduler .bpf.c re-includes it, it will be skipped. */
@@ -52,6 +60,60 @@
  * we need plain userspace implementations. We #undef after include to
  * avoid redefinition warnings.
  */
+/*
+ * BPF helper overrides: bpf_helper_defs.h defines these as static function
+ * pointers initialized to (void *)HELPER_NUMBER. Calling those addresses
+ * SIGSEGVs. Override with safe userspace equivalents.
+ */
+#undef bpf_probe_read_kernel_str
+#define bpf_probe_read_kernel_str(dst, sz, src) \
+	({ long __ret = 0; if ((src)) __builtin_strncpy((dst), (src), (sz)); \
+	   else __builtin_memset((dst), 0, (sz)); __ret; })
+
+#undef bpf_probe_read_kernel
+#define bpf_probe_read_kernel(dst, sz, src) \
+	({ __builtin_memset((dst), 0, (sz)); (long)(-14); })
+
+extern void *bpf_kptr_xchg_impl(void **kptr, void *new_val);
+#undef bpf_kptr_xchg
+#define bpf_kptr_xchg(kptr, val) \
+	bpf_kptr_xchg_impl((void **)(kptr), (void *)(val))
+
+/*
+ * Time helpers: bpf_ktime_get_ns returns simulated clock (just 0 for now).
+ * These are frequently used by schedulers for time comparisons.
+ */
+extern unsigned long long sim_bpf_ktime_get_ns(void);
+#undef bpf_ktime_get_ns
+#define bpf_ktime_get_ns() sim_bpf_ktime_get_ns()
+
+/*
+ * bpf_get_smp_processor_id: return current CPU id.
+ * Already provided by sim_bpf_get_smp_processor_id in the simulator.
+ */
+extern unsigned int sim_bpf_get_smp_processor_id(void);
+#undef bpf_get_smp_processor_id
+#define bpf_get_smp_processor_id() sim_bpf_get_smp_processor_id()
+
+/*
+ * bpf_this_cpu_ptr / bpf_per_cpu_ptr: per-CPU variable access.
+ * In simulation, return NULL (callers should check).
+ */
+#undef bpf_this_cpu_ptr
+#define bpf_this_cpu_ptr(ptr) (ptr)
+#undef bpf_per_cpu_ptr
+#define bpf_per_cpu_ptr(ptr, cpu) ((typeof(ptr))0)
+
+/*
+ * bpf_get_current_task: return raw current task pointer.
+ * Route through our kfunc implementation.
+ */
+#undef bpf_get_current_task
+#define bpf_get_current_task() ((long)bpf_get_current_task_btf_kfunc())
+
+#undef bpf_repeat
+#define bpf_repeat(n) for (int ___i = 0; ___i < (n); ___i++)
+
 #undef bpf_core_read
 #define bpf_core_read(dst, sz, src) (__builtin_memcpy(dst, src, sz), (int)0)
 #undef bpf_core_cast
@@ -60,6 +122,16 @@
 #define bpf_core_type_matches(type) 1
 #undef bpf_core_type_size
 #define bpf_core_type_size(type) sizeof(type)
+
+/*
+ * bpf_get_current_task_btf: BPF helper returning current task_struct *.
+ * In bpf_helper_defs.h, it's a static function pointer initialized to NULL.
+ * Override to call the Rust kfunc via -rdynamic. The Rust binary exports
+ * bpf_get_current_task_btf as #[no_mangle] extern "C".
+ */
+extern void *bpf_get_current_task_btf_kfunc(void);
+#undef bpf_get_current_task_btf
+#define bpf_get_current_task_btf() ((struct task_struct *)bpf_get_current_task_btf_kfunc())
 
 /*
  * Undo BPF CO-RE enum variable macros from enums.autogen.bpf.h.
@@ -134,28 +206,17 @@
  * plain function declarations; symbols are resolved from the Rust binary
  * at dlopen time via -rdynamic.
  */
-extern bool scx_bpf_dsq_move_to_local(u64 dsq_id);
-
+extern bool __sim_dsq_move_to_local(u64 dsq_id);
+/* v2 compat: upstream now passes (dsq_id, enq_flags); ignore enq_flags in sim */
+#define scx_bpf_dsq_move_to_local(dsq_id, ...) __sim_dsq_move_to_local(dsq_id)
+extern struct cgroup *__sim_task_cgroup(void *p, int subsys_id);
 /*
- * scx_bpf_task_cgroup: upstream compat.bpf.h exposes a 1-arg API
- * (just the task pointer). The Rust kfunc takes (task, subsys_id).
- * Provide a 1-arg macro that defaults subsys_id=0, matching the
- * upstream API that scheduler code expects.
+ * Upstream moved from __COMPAT_scx_bpf_task_cgroup(p) to a 1-arg
+ * scx_bpf_task_cgroup(p) compat macro. Our Rust kfunc takes (task,
+ * subsys_id). Default subsys_id=0 for the 1-arg callers.
  */
-/*
- * The Rust kfunc `scx_bpf_task_cgroup` takes 2 args (task, subsys_id),
- * but upstream compat.bpf.h exposes a 1-arg API. We declare the 2-arg
- * function under an internal name (linker resolves via asm label to the
- * Rust symbol), then provide a 1-arg macro that defaults subsys_id=0.
- */
-extern struct cgroup *scx_bpf_task_cgroup_2(void *p, int subsys_id)
-    __asm__("scx_bpf_task_cgroup");
-#define scx_bpf_task_cgroup(p) scx_bpf_task_cgroup_2((p), 0)
-
-/* Legacy alias used by older scheduler snapshots (e.g. mitosis). */
-#ifndef __COMPAT_scx_bpf_task_cgroup
-#define __COMPAT_scx_bpf_task_cgroup(p) scx_bpf_task_cgroup_2((p), 0)
-#endif
+#define scx_bpf_task_cgroup(p) __sim_task_cgroup((void *)(p), 0)
+#define __COMPAT_scx_bpf_task_cgroup(p) __sim_task_cgroup((void *)(p), 0)
 
 /*
  * Override BPF_STRUCT_OPS to produce regular C functions.

@@ -188,6 +188,16 @@ void bpf_cpumask_or(struct bpf_cpumask *dst, const struct cpumask *src1,
 	sim_rbc_resume();
 }
 
+void bpf_cpumask_xor(struct bpf_cpumask *dst, const struct cpumask *src1,
+		     const struct cpumask *src2)
+{
+	unsigned int i;
+	sim_rbc_pause();
+	for (i = 0; i < 128; i++)
+		dst->bits[i] = src1->bits[i] ^ src2->bits[i];
+	sim_rbc_resume();
+}
+
 void bpf_cpumask_copy(struct bpf_cpumask *dst, const struct cpumask *src)
 {
 	sim_rbc_pause();
@@ -286,3 +296,53 @@ void *bpf_kptr_xchg_impl(void **kptr, void *new_val)
 	sim_rbc_resume();
 	return old;
 }
+
+/*
+ * scx_bpf_cpu_rq / scx_bpf_locked_rq: new kfuncs in common.bpf.h that
+ * return a pointer to the CPU's runqueue. The simulator doesn't have real
+ * runqueues; return NULL. Callers should handle NULL gracefully.
+ */
+struct rq;
+struct rq *scx_bpf_cpu_rq(s32 cpu)
+{
+	(void)cpu;
+	return (struct rq *)0;
+}
+
+struct rq *scx_bpf_locked_rq(void)
+{
+	return (struct rq *)0;
+}
+
+/*
+ * bpf_cgroup_ancestor / bpf_cgroup_from_id: BPF kfuncs for cgroup lookup.
+ * Return NULL in simulation — schedulers check for NULL returns.
+ */
+struct cgroup;
+__attribute__((weak))
+struct cgroup *bpf_cgroup_ancestor(struct cgroup *cgrp, int level)
+{
+	(void)cgrp; (void)level;
+	return (struct cgroup *)0;
+}
+
+__attribute__((weak))
+struct cgroup *bpf_cgroup_from_id(u64 id)
+{
+	(void)id;
+	return (struct cgroup *)0;
+}
+
+/*
+ * LINUX_KERNEL_VERSION: __kconfig global declared in common.bpf.h.
+ * With __kconfig stripped, it becomes a bare extern declaration.
+ * Provide a definition so scheduler .so files link.
+ * Value: 6.18.0 encoded as (major << 16 | minor << 8 | patch).
+ */
+int LINUX_KERNEL_VERSION = 0x061200;
+
+/*
+ * CONFIG_PREEMPT_RCU: __kconfig __weak bool from common.bpf.h.
+ * Set false — simulator doesn't model preempt RCU.
+ */
+bool CONFIG_PREEMPT_RCU = false;
