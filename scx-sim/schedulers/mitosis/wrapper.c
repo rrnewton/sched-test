@@ -40,6 +40,14 @@ extern void *memset(void *s, int c, unsigned long n);
 #define __COMPAT_is_enq_cpu_selected(enq_flags) (true)
 
 /*
+ * __COMPAT_scx_bpf_dsq_peek -- route directly to the simulator's export.
+ * This avoids falling through to bpf_iter_scx_dsq_* weak symbols, which the
+ * userspace wrapper does not implement.
+ */
+extern struct task_struct *scx_bpf_dsq_peek(u64 dsq_id);
+#define __COMPAT_scx_bpf_dsq_peek(dsq_id) scx_bpf_dsq_peek(dsq_id)
+
+/*
  * is_migration_disabled: use the simulator's task_struct accessor.
  *
  * The kernel's is_migration_disabled() checks p->migration_disabled with
@@ -191,6 +199,38 @@ static inline struct cgroup *sim_cgroup_acquire(struct cgroup *cgrp) {
 
 #undef bpf_cgroup_release
 #define bpf_cgroup_release(cgrp) ((void)0)
+
+/*
+ * bpf_iter_css_*: the simulator's compare tests only exercise the root
+ * cgroup, so a single-element iterator is sufficient for userspace init.
+ */
+int bpf_iter_css_new(struct bpf_iter_css *it,
+		     struct cgroup_subsys_state *start,
+		     unsigned int flags)
+{
+	struct bpf_iter_css_kern *iter = (struct bpf_iter_css_kern *)it;
+
+	iter->start = start;
+	iter->pos = NULL;
+	iter->flags = flags;
+	return 0;
+}
+
+struct cgroup_subsys_state *bpf_iter_css_next(struct bpf_iter_css *it)
+{
+	struct bpf_iter_css_kern *iter = (struct bpf_iter_css_kern *)it;
+
+	if (iter->pos)
+		return NULL;
+
+	iter->pos = iter->start;
+	return iter->start;
+}
+
+void bpf_iter_css_destroy(struct bpf_iter_css *it)
+{
+	(void)it;
+}
 
 /*
  * cpumask acquire/release:
