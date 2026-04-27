@@ -180,8 +180,8 @@ struct RunArgs {
     #[arg(short, long, default_value_t = 4, value_parser = clap::value_parser!(u32).range(1..))]
     cpus: u32,
 
-    /// SMT threads per core.
-    #[arg(long, default_value_t = 1)]
+    /// SMT threads per core (minimum 1).
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
     smt: u32,
 
     /// PRNG seed (u32 integer or "entropy" for OS randomness).
@@ -244,7 +244,7 @@ struct RunArgs {
     ///
     /// If a runnable task is not scheduled within this duration (simulated
     /// time), the simulation exits with an error. Accepts durations with
-    /// units: "2s", "500ms", etc. Default: 30s.
+    /// units: "2s", "500ms", etc. Use "0" or "off" to disable. Default: 30s.
     #[arg(long, value_name = "DURATION")]
     watchdog_timeout: Option<String>,
 
@@ -523,8 +523,18 @@ fn run(args: &RunArgs) -> Result<(), String> {
         scenario.sched_overhead_rbc_ns = Some(0);
     }
     if let Some(ref timeout) = args.watchdog_timeout {
-        scenario.watchdog_timeout_ns =
-            Some(parse_duration_ns(timeout).map_err(|e| format!("--watchdog-timeout: {e}"))?);
+        let normalized = timeout.trim().to_lowercase();
+        if normalized == "off" || normalized == "none" || normalized == "0" {
+            scenario.watchdog_timeout_ns = None;
+        } else {
+            let ns =
+                parse_duration_ns(timeout).map_err(|e| format!("--watchdog-timeout: {e}"))?;
+            if ns == 0 {
+                scenario.watchdog_timeout_ns = None;
+            } else {
+                scenario.watchdog_timeout_ns = Some(ns);
+            }
+        }
     }
     if let Some(warmup_ms) = args.warmup_ms {
         scenario.warmup_ns = warmup_ms * 1_000_000;
