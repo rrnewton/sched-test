@@ -35,10 +35,13 @@ SCHEDS := $(patsubst %/wrapper.c,%,$(wildcard */wrapper.c))
 SO_TARGETS := $(foreach s,$(SCHEDS),$(BUILD_DIR)/libscx_$(s).so)
 
 # --- Common flags ---
+# -Wno-implicit-function-declaration: scheduler wrappers call Rust-provided
+# kfuncs (e.g. sim_bpf_get_smp_processor_id) without C declarations.
+# These symbols are resolved at dlopen time via -rdynamic.
+# Clang 21+ treats implicit function declarations as hard errors.
 CFLAGS_BASE := -fPIC -DSCX_BPF_UNITTEST -g -O2 \
                -Wno-unused-parameter -Wno-unknown-attributes \
-               -Wno-implicit-function-declaration \
-               -Wno-int-conversion
+               -Wno-implicit-function-declaration
 
 # --- Coverage support (opt-in via SCX_SIM_COVERAGE=1) ---
 ifeq ($(SCX_SIM_COVERAGE),1)
