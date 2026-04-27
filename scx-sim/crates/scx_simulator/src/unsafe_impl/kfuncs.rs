@@ -2040,7 +2040,9 @@ pub extern "C" fn scx_bpf_reenqueue_local() -> u32 {
     })
 }
 
-/// Compat aliases for scx_bpf_reenqueue_local (compat.bpf.h inline function).
+/// compat.bpf.h may route `scx_bpf_reenqueue_local()` through legacy/new weak
+/// symbol names. Provide both compat entrypoints so scheduler `.so` files never
+/// end up calling an unresolved NULL stub during `cpu_release`.
 #[no_mangle]
 pub extern "C" fn scx_bpf_reenqueue_local___v1() -> u32 {
     scx_bpf_reenqueue_local()
@@ -2048,7 +2050,7 @@ pub extern "C" fn scx_bpf_reenqueue_local___v1() -> u32 {
 
 #[no_mangle]
 pub extern "C" fn scx_bpf_reenqueue_local___v2___compat() {
-    scx_bpf_reenqueue_local();
+    let _ = scx_bpf_reenqueue_local();
 }
 
 /// No-op stubs for cpumask ref counting in simulator.
@@ -2819,6 +2821,24 @@ mod tests {
 
         exit_test_sim();
         free_task(&mut arc.lock().unwrap().sim, Pid(8));
+    }
+
+    #[test]
+    fn test_reenqueue_local_compat_aliases_set_flag() {
+        let _lock = SIM_LOCK.lock().unwrap();
+        let arc = test_sim_arc(test_state(1));
+
+        let cpu = arc.lock().unwrap().sim.current_cpu;
+        enter_test_sim(&arc, cpu);
+
+        assert_eq!(scx_bpf_reenqueue_local___v1(), 0);
+        assert!(arc.lock().unwrap().sim.reenqueue_local_requested);
+        arc.lock().unwrap().sim.reenqueue_local_requested = false;
+
+        scx_bpf_reenqueue_local___v2___compat();
+        assert!(arc.lock().unwrap().sim.reenqueue_local_requested);
+
+        exit_test_sim();
     }
 
     #[test]
