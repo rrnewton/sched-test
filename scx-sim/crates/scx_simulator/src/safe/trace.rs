@@ -193,7 +193,7 @@ pub struct Trace {
 }
 
 impl Trace {
-    #[allow(dead_code)] // Used in kfuncs.rs test infrastructure
+    #[allow(dead_code)]
     pub(crate) fn new(nr_cpus: u32, tasks: &[TaskDef]) -> Self {
         Self::with_warmup(nr_cpus, tasks, 0)
     }
