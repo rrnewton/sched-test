@@ -12,6 +12,12 @@
 #include "sim_wrapper.h"
 #include "sim_task.h"
 
+/*
+ * CONFIG_HZ: __kconfig extern referenced by tickless. In the kernel,
+ * this resolves to the HZ config value. Default to 250 for simulation.
+ */
+unsigned int CONFIG_HZ = 250;
+
 /* Include tickless interface header, then the scheduler source.
  * common.bpf.h is already included (header guard set), so our
  * BPF_STRUCT_OPS and SCX_OPS_DEFINE overrides are in effect. */

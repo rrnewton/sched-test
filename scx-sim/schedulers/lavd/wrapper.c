@@ -264,6 +264,107 @@ bool CONFIG_NO_HZ_IDLE;
 #define bpf_probe_read_kernel(dst, sz, src) \
 	(__builtin_memset((dst), 0, (sz)), (long)(-14))
 /*
+ * struct ravg_data -- running average data structure used in lavd.bpf.h.
+ * Defined in scheds/include/lib/ravg.h inside #ifdef __BPF__, so it's
+ * not available in userspace compilation. Provide the definition here.
+ */
+/*
+ * ravg constants from ravg.h (inside #ifdef __BPF__).
+ */
+enum ravg_consts {
+	RAVG_VAL_BITS = 44,
+	RAVG_FRAC_BITS = 20,
+};
+
+struct ravg_data {
+	u64 val;
+	u64 val_at;
+	u64 old;
+	u64 cur;
+};
+
+/*
+ * ravg helper functions and implementations.
+ * These are defined inside #ifdef __BPF__ in ravg.h and implemented in
+ * scx/lib/ravg.bpf.c. We need them for userspace compilation.
+ */
+#define RAVG_FN_ATTRS __attribute__((unused, always_inline))
+
+static RAVG_FN_ATTRS void ravg_add(u64 *sum, u64 addend)
+{
+	u64 new = *sum + addend;
+	if (new >= *sum)
+		*sum = new;
+	else
+		*sum = -1;
+}
+
+static RAVG_FN_ATTRS inline u64 ravg_decay(u64 v, u32 shift)
+{
+	if (shift >= 64)
+		return 0;
+	else
+		return v >> shift;
+}
+
+static RAVG_FN_ATTRS u32 ravg_normalize_dur(u32 dur, u32 half_life)
+{
+	if (dur < half_life)
+		return (((u64)dur << RAVG_FRAC_BITS) + half_life - 1) /
+			half_life;
+	else
+		return 1 << RAVG_FRAC_BITS;
+}
+
+#ifndef __arena
+#define __arena
+#endif
+
+static RAVG_FN_ATTRS void ravg_transfer(struct ravg_data *base, u64 base_new_val,
+					 struct ravg_data *xfer, u64 xfer_new_val,
+					 u32 half_life, bool is_xfer_in)
+{
+	if ((s64)(base->val_at - xfer->val_at) < 0)
+		ravg_accumulate(base, base_new_val, xfer->val_at, half_life);
+	else if ((s64)(base->val_at - xfer->val_at) > 0)
+		ravg_accumulate(xfer, xfer_new_val, base->val_at, half_life);
+
+	if (is_xfer_in) {
+		base->old += xfer->old;
+		base->cur += xfer->cur;
+	} else {
+		if (base->old > xfer->old)
+			base->old -= xfer->old;
+		else
+			base->old = 0;
+
+		if (base->cur > xfer->cur)
+			base->cur -= xfer->cur;
+		else
+			base->cur = 0;
+	}
+}
+
+static RAVG_FN_ATTRS int ravg_to_arena(struct ravg_data __arena *to, struct ravg_data *from)
+{
+	*to = *from;
+	return 0;
+}
+
+static RAVG_FN_ATTRS int ravg_from_arena(struct ravg_data *to, struct ravg_data __arena *from)
+{
+	*to = *from;
+	return 0;
+}
+
+/*
+ * Include ravg.bpf.c for ravg_accumulate, ravg_read, ravg_scale implementations.
+ * Guard the header include since common.bpf.h is already included.
+ */
+#define __SCX_RAVG_BPF_H__  /* prevent ravg.h re-include */
+#include "../../scx/lib/ravg.bpf.c"
+
+/*
  * =================================================================
  * Include LAVD source files
  * =================================================================
@@ -481,9 +582,10 @@ __attribute__((weak)) int scx_cgroup_bw_set(
 	return 0;
 }
 
-__attribute__((weak)) int scx_cgroup_bw_throttled(struct cgroup *cgrp)
+__attribute__((weak)) int scx_cgroup_bw_throttled(struct cgroup *cgrp,
+						   struct task_struct *p)
 {
-	(void)cgrp;
+	(void)cgrp; (void)p;
 	return 0;
 }
 
@@ -509,6 +611,21 @@ __attribute__((weak)) int scx_cgroup_bw_reenqueue(void)
 __attribute__((weak)) int scx_cgroup_bw_cancel(u64 taskc)
 {
 	(void)taskc;
+	return 0;
+}
+
+__attribute__((weak)) int scx_cgroup_bw_move(
+	struct task_struct *p, u64 taskc,
+	struct cgroup *from, struct cgroup *to)
+{
+	(void)p; (void)taskc; (void)from; (void)to;
+	return 0;
+}
+
+__attribute__((weak)) int scx_cgroup_bw_dump(
+	u64 cgrp_id, bool descendent, bool accurate, bool indent)
+{
+	(void)cgrp_id; (void)descendent; (void)accurate; (void)indent;
 	return 0;
 }
 
