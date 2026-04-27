@@ -176,8 +176,8 @@ struct RunArgs {
     #[arg(short, long, default_value = "simple")]
     scheduler: String,
 
-    /// Number of simulated CPUs.
-    #[arg(short, long, default_value_t = 4)]
+    /// Number of simulated CPUs (minimum 1).
+    #[arg(short, long, default_value_t = 4, value_parser = clap::value_parser!(u32).range(1..))]
     cpus: u32,
 
     /// SMT threads per core.
@@ -759,25 +759,25 @@ fn replay_simulation(args: &ReplayArgs) -> Result<(), String> {
     // Resolve scheduler .so path: CLI --scheduler-file overrides trace metadata.
     let mut scheduler_path = resolve_scheduler_path(args.scheduler_file.as_deref(), metadata)?;
 
-    // Extract required metadata fields, panicking on missing values.
+    // Extract required metadata fields with clear error messages.
     let nr_cpus = metadata
         .nr_cpus
-        .unwrap_or_else(|| panic!("trace file missing required metadata: nr_cpus"));
+        .ok_or("trace file missing required metadata: nr_cpus")?;
     let nr_tasks = metadata
         .nr_tasks
-        .unwrap_or_else(|| panic!("trace file missing required metadata: nr_tasks"));
+        .ok_or("trace file missing required metadata: nr_tasks")?;
     let seed = metadata
         .seed
-        .unwrap_or_else(|| panic!("trace file missing required metadata: seed"));
+        .ok_or("trace file missing required metadata: seed")?;
     let duration_ns = metadata
         .duration_ns
-        .unwrap_or_else(|| panic!("trace file missing required metadata: duration_ns"));
+        .ok_or("trace file missing required metadata: duration_ns")?;
     let timeslice_min = metadata
         .timeslice_min
-        .unwrap_or_else(|| panic!("trace file missing required metadata: timeslice_min"));
+        .ok_or("trace file missing required metadata: timeslice_min")?;
     let timeslice_max = metadata
         .timeslice_max
-        .unwrap_or_else(|| panic!("trace file missing required metadata: timeslice_max"));
+        .ok_or("trace file missing required metadata: timeslice_max")?;
 
     let use_e9_replay = args.preempt_mode == PreemptModeArg::E9patch;
     let use_e9_rip_mode = use_e9_replay && pre_trace.break_on() == PmuEvent::InstructionsRetired;
