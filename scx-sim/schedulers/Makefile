@@ -36,7 +36,9 @@ SO_TARGETS := $(foreach s,$(SCHEDS),$(BUILD_DIR)/libscx_$(s).so)
 
 # --- Common flags ---
 CFLAGS_BASE := -fPIC -DSCX_BPF_UNITTEST -g -O2 \
-               -Wno-unused-parameter -Wno-unknown-attributes
+               -Wno-unused-parameter -Wno-unknown-attributes \
+               -Wno-implicit-function-declaration \
+               -Wno-int-conversion
 
 # --- Coverage support (opt-in via SCX_SIM_COVERAGE=1) ---
 ifeq ($(SCX_SIM_COVERAGE),1)
