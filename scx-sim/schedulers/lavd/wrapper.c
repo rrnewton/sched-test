@@ -623,10 +623,9 @@ __attribute__((weak)) int scx_cgroup_bw_set(
 	return 0;
 }
 
-__attribute__((weak)) int scx_cgroup_bw_throttled(struct cgroup *cgrp,
-						   struct task_struct *p)
+__attribute__((weak)) int scx_cgroup_bw_throttled(struct cgroup *cgrp)
 {
-	(void)cgrp; (void)p;
+	(void)cgrp;
 	return 0;
 }
 
