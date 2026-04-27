@@ -527,8 +527,7 @@ fn run(args: &RunArgs) -> Result<(), String> {
         if normalized == "off" || normalized == "none" || normalized == "0" {
             scenario.watchdog_timeout_ns = None;
         } else {
-            let ns =
-                parse_duration_ns(timeout).map_err(|e| format!("--watchdog-timeout: {e}"))?;
+            let ns = parse_duration_ns(timeout).map_err(|e| format!("--watchdog-timeout: {e}"))?;
             if ns == 0 {
                 scenario.watchdog_timeout_ns = None;
             } else {
