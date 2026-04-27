@@ -454,6 +454,11 @@ fn extract_irq_gen_timing(obj: &Map<String, Value>) -> Result<(u64, u64), RtAppE
 /// let scenario = load_rtapp(json, 4).unwrap();
 /// ```
 pub fn load_rtapp(json_str: &str, nr_cpus: u32) -> Result<Scenario, RtAppError> {
+    if nr_cpus == 0 {
+        return Err(RtAppError::InvalidValue(
+            "nr_cpus must be at least 1".into(),
+        ));
+    }
     let cleaned = strip_comments(json_str);
     let root: Value = serde_json::from_str(&cleaned)?;
     let root_obj = root
@@ -530,7 +535,17 @@ pub fn load_rtapp(json_str: &str, nr_cpus: u32) -> Result<Scenario, RtAppError> 
             let cpu = if let Some(cpus_val) = task_obj.get("cpus") {
                 let cpus = parse_cpus(cpus_val)?;
                 match cpus {
-                    Some(ref c) if c.len() == 1 => c[0],
+                    Some(ref c) if c.len() == 1 => {
+                        if c[0].0 >= nr_cpus {
+                            return Err(RtAppError::InvalidValue(format!(
+                                "irq_gen task {task_name:?} targets CPU {}, but only \
+                                 {nr_cpus} CPUs are configured (valid range: 0..{})",
+                                c[0].0,
+                                nr_cpus - 1,
+                            )));
+                        }
+                        c[0]
+                    }
                     _ => {
                         warn!(
                             task = task_name.as_str(),
@@ -585,6 +600,24 @@ pub fn load_rtapp(json_str: &str, nr_cpus: u32) -> Result<Scenario, RtAppError> 
         return Err(RtAppError::InvalidValue(
             "no tasks with events found".into(),
         ));
+    }
+
+    // Validate CPU affinity entries against available CPUs.
+    for def in &all_tasks {
+        if let Some(ref cpus) = def.allowed_cpus {
+            for cpu in cpus {
+                if cpu.0 >= nr_cpus {
+                    return Err(RtAppError::InvalidValue(format!(
+                        "task {:?} has CPU affinity for CPU {}, but only {} CPUs \
+                         are configured (valid range: 0..{})",
+                        def.name,
+                        cpu.0,
+                        nr_cpus,
+                        nr_cpus - 1,
+                    )));
+                }
+            }
+        }
     }
 
     Ok(Scenario {
@@ -863,5 +896,43 @@ mod tests {
         let scenario = load_rtapp(json, 4).unwrap();
         let task = &scenario.tasks[0];
         assert_eq!(task.allowed_cpus, Some(vec![CpuId(0), CpuId(1)]));
+    }
+
+    #[test]
+    fn test_cpu_affinity_oob_rejected() {
+        let json = r#"{
+            "global": { "duration": 1 },
+            "tasks": {
+                "pinned": {
+                    "loop": -1,
+                    "cpus": [99, 100],
+                    "run": 5000,
+                    "sleep": 5000
+                }
+            }
+        }"#;
+
+        let err = load_rtapp(json, 4).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("CPU 99") && msg.contains("4 CPUs"),
+            "expected clear OOB error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_zero_cpus_rejected() {
+        let json = r#"{
+            "global": { "duration": 1 },
+            "tasks": {
+                "t1": { "loop": -1, "run": 5000 }
+            }
+        }"#;
+
+        let err = load_rtapp(json, 0).unwrap_err();
+        assert!(
+            err.to_string().contains("nr_cpus must be at least 1"),
+            "expected nr_cpus validation error, got: {err}"
+        );
     }
 }
