@@ -44,7 +44,7 @@ When creating analysis documents, specifications, or other AI-generated document
 
 Cache Reproducer Methodology
 ----------------------------------------
-See `../../ucache_reproducer/CACHE_REPRODUCER.md` for the authoritative methodology document covering:
+See `CACHE_REPRODUCER.md` (in this directory) for the authoritative methodology document covering:
 - Valid mode × scheduler matrix (rtapp_sim × EEVDF is IMPOSSIBLE)
 - Calibration parameters and production reference values
 - Dependent variable metrics (E2E latency, scheduling latency, IRQ exposure)
@@ -150,9 +150,11 @@ CPU model name in the CSV directory structure).
 
 ### Dependencies
 
-Set up the Python venv (one-time, requires network via with-proxy):
+Set up the Python venv (one-time, requires network):
 
-    python3 -m venv .venv && with-proxy .venv/bin/pip install plotly pandas
+    python3 -m venv .venv && .venv/bin/pip install plotly pandas
+
+(On Meta corporate machines behind a proxy, prefix pip with `with-proxy`.)
 
 The benchmark scripts auto-detect `.venv/bin/python3` if available.
 
@@ -213,7 +215,7 @@ Common tools already available:
 - **rt-app**: `~/bin/rt-app` (built from `~/playground/rt-app`)
 - **bpftrace**: system-installed
 - **mb** (minibeads): local issue tracker
-- **e9patch**: `make install-e9patch` (requires network; use `with-proxy make install-e9patch` on Meta machines). After install: `make -C schedulers e9` to build instrumented scheduler libraries.
+- **e9patch**: `make install-e9patch` (requires network). After install: `make -C schedulers e9` to build instrumented scheduler libraries. (On Meta corporate machines behind a proxy, prefix with `with-proxy`.)
 
 Every TODO in source code MUST reference an issue: `TODO(sim-XXXXX)`. Do not
 leave TODOs without a tracking issue — file one first, then add the TODO.
@@ -292,6 +294,6 @@ When you find yourself in a `work/` directory containing multiple worktrees of
 the same repository (e.g., `<MULTI_SCX>/work/` with `sched-test1/`, `sched-test2/`,
 `sched-test3/`, `sched-test4/`), switch into orchestrator mode automatically.
 
-Read `.claude/agents/orchestrator.md` for the full orchestrator protocol. The key principle:
+Read `scx-sim/.claude/agents/orchestrator.md` (relative to the repo root) for the full orchestrator protocol. The key principle:
 you coordinate and delegate, you do NOT implement. All code changes, testing,
 and validation are done by sub-agents working in their assigned worktrees.
