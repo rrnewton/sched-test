@@ -10,6 +10,127 @@ repository. The `scx` git submodule tracks upstream scheduler source code. When
 upstream changes, the C wrapper files in `scx-sim/schedulers/` may need updates
 to compile and pass tests.
 
+## Branch & Worktree Protocol
+
+> **This work MUST happen in a separate git worktree.** The caller chooses the
+> worktree path. Do NOT operate on the primary checkout if it has uncommitted
+> work. If the caller did not set up a worktree, stop and ask them to do so
+> before proceeding.
+
+### Step 0: Capture SOURCE branch + SHA
+
+Before doing anything else, record the **SOURCE** branch — the branch you are
+syncing upstream changes *into*. Default: the current working branch at the
+time the skill is invoked.
+
+```bash
+SOURCE_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+SOURCE_SHA=$(git rev-parse HEAD)
+echo "=== SYNC-UPSTREAM: SOURCE CAPTURE ==="
+echo "  SOURCE branch : $SOURCE_BRANCH"
+echo "  SOURCE SHA    : $SOURCE_SHA"
+echo "  Date (UTC)    : $(date -u +%Y%m%d)"
+echo "======================================="
+```
+
+**Print this banner prominently.** Every subsequent decision in this skill
+references the captured SOURCE. If you lose track, re-read the banner from your
+output history.
+
+### Step 1: Create the target branch
+
+All sync work lands on a **target branch** — never directly on SOURCE.
+
+```bash
+TARGET_BRANCH="sync-upstream/$(date -u +%Y%m%d)"
+git checkout -b "$TARGET_BRANCH" "$SOURCE_BRANCH"
+echo "=== TARGET BRANCH ==="
+echo "  Target   : $TARGET_BRANCH"
+echo "  Based on : $SOURCE_BRANCH ($SOURCE_SHA)"
+echo "  PR plan  : $TARGET_BRANCH → $SOURCE_BRANCH (fast-forward only)"
+echo "======================"
+```
+
+If `sync-upstream/YYYYMMDD` already exists (e.g. a second sync attempt on the
+same day), append a counter: `sync-upstream/YYYYMMDD-2`, `-3`, etc.
+
+### Step 2: Sync upstream onto the target branch
+
+Update the `scx` submodule to the latest upstream commit and fix wrappers (see
+the full procedure below). All commits go on `$TARGET_BRANCH`.
+
+### Step 3: Validate on the target branch
+
+Iterate: fix compilation errors, run `validate.sh`, fix test failures, until CI
+is green. Every fix is committed to `$TARGET_BRANCH`.
+
+### Step 4: Open a fast-forward-only PR
+
+When the target branch is green:
+
+```bash
+gh pr create \
+  --base "$SOURCE_BRANCH" \
+  --head "$TARGET_BRANCH" \
+  --title "Sync scx upstream $(date -u +%Y-%m-%d)" \
+  --body "$(cat <<'EOF'
+## Summary
+Fast-forward sync of scx submodule to upstream HEAD.
+
+**SOURCE branch**: $SOURCE_BRANCH @ $SOURCE_SHA
+**Target branch**: $TARGET_BRANCH
+
+## Merge policy
+⚠️ **FAST-FORWARD ONLY** — do NOT squash or create a merge commit.
+Use `git merge --ff-only` or the GitHub "Rebase and merge" button
+(which is FF when there are no conflicts).
+EOF
+)"
+```
+
+### Step 5: Handle SOURCE branch movement
+
+While the sync is in flight, the SOURCE branch may receive new commits. If so:
+
+```bash
+git fetch origin "$SOURCE_BRANCH"
+git rebase "origin/$SOURCE_BRANCH" "$TARGET_BRANCH"
+# Re-run validation after rebase
+cd scx-sim && bash validate.sh
+```
+
+Then force-push the target branch and update the PR.
+
+**The goal is to preserve fast-forward-ability into SOURCE at all times.**
+
+### Merge Policy — FAST-FORWARD ONLY
+
+> **This skill REFUSES to merge or squash.** The only acceptable way to land
+> the sync on SOURCE is a fast-forward merge (`git merge --ff-only`).
+>
+> On GitHub, this means using **"Rebase and merge"** (when the target branch is
+> already a linear extension of SOURCE). Never use "Create a merge commit" or
+> "Squash and merge".
+
+#### What to do if fast-forward is broken
+
+If SOURCE has commits that are not in the target branch's history (i.e.
+`git merge-base --is-ancestor $SOURCE_BRANCH $TARGET_BRANCH` fails):
+
+1. Rebase the target branch onto the new SOURCE head:
+   ```bash
+   git rebase "origin/$SOURCE_BRANCH" "$TARGET_BRANCH"
+   ```
+2. Resolve any conflicts (prefer upstream changes for submodule pointer;
+   prefer our wrapper fixes for `scx-sim/schedulers/` and `scx-sim/csrc/`).
+3. Re-run the full validation suite.
+4. Force-push and update the PR.
+
+This restores fast-forward-ability. If rebase produces intractable conflicts,
+stop and escalate to the user — do NOT force a merge.
+
+---
+
 ## Context
 
 - **scx/**: Git submodule pointing to `sched-ext/scx` upstream
@@ -77,9 +198,10 @@ When upstream changes, these are the typical failures:
 ## Prerequisites
 
 Before starting, verify:
-1. You are on a branch appropriate for this sync
-2. The scx submodule has been updated to the target upstream commit
-3. The working directory is the repository root
+1. You are in a **separate worktree** (not the primary checkout with uncommitted work)
+2. You have captured the SOURCE branch + SHA (Step 0 above)
+3. You have created the target branch (Step 1 above)
+4. The scx submodule has been updated to the target upstream commit
 
 ## Sync Procedure
 
@@ -160,9 +282,12 @@ ALL checks must pass:
 - `cargo test --workspace --doc`
 - `stress.py` smoke tests
 
-### Phase 5: Commit and Report
+### Phase 5: Commit and Open PR
 
-**CRITICAL**: Your final commit message MUST include the status for CI detection.
+**CRITICAL**: All commits go on the TARGET branch (`sync-upstream/YYYYMMDD`).
+Never commit directly to the SOURCE branch.
+
+Your final commit message MUST include the status for CI detection.
 
 #### On Success
 
@@ -174,6 +299,8 @@ Sync scx submodule to upstream <short-hash>
 Status: SUCCESS
 
 ## Summary
+- SOURCE branch: <source-branch> @ <source-sha>
+- Target branch: sync-upstream/YYYYMMDD
 - Upstream commits: N
 - Schedulers updated: list
 - Infrastructure changes: list
@@ -181,6 +308,8 @@ Status: SUCCESS
 EOF
 )"
 ```
+
+Then open the FF-only PR (see Step 4 in the Branch & Worktree Protocol above).
 
 #### On Failure
 
@@ -195,6 +324,7 @@ If you cannot resolve all issues:
 **Date**: YYYY-MM-DD
 **Upstream commit**: <full-hash>
 **Previous commit**: <full-hash>
+**SOURCE branch**: <source-branch> @ <source-sha>
 
 ## Blocking Issues
 
@@ -224,12 +354,16 @@ Status: FAILURE
 Reason: <brief explanation>
 
 ## Summary
+- SOURCE branch: <source-branch> @ <source-sha>
+- Target branch: sync-upstream/YYYYMMDD
 - Upstream commits: N
 - Blocking issues: list
 - See WHY_THIS_BRANCH_IS_BROKEN.md for details
 EOF
 )"
 ```
+
+Still open the PR (even if broken) so the state is visible and reviewable.
 
 ## Error Handling
 
@@ -252,6 +386,8 @@ EOF
   rather than individual wrappers.
 - **Commit incrementally**: Don't accumulate too many changes in one commit.
   Commit after fixing each scheduler.
+- **Never touch SOURCE directly**: All work goes on the target branch. SOURCE
+  is only updated via the fast-forward PR.
 
 ## Output Format
 
@@ -261,6 +397,9 @@ At the end of your work, print a summary to stdout:
 ## Sync Summary
 
 **Status**: SUCCESS | FAILURE | PARTIAL
+
+**SOURCE branch**: <branch> @ <sha>
+**Target branch**: sync-upstream/YYYYMMDD
 
 **Upstream commits processed**: N
 **Previous submodule commit**: <hash>
@@ -281,4 +420,6 @@ At the end of your work, print a summary to stdout:
 **Files modified**:
 - path/to/file1
 - path/to/file2
+
+**PR**: <url> (FF-only into SOURCE)
 ```
