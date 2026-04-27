@@ -1700,8 +1700,10 @@ pub extern "C" fn scx_bpf_dsq_insert(p: *mut c_void, dsq_id: u64, slice: u64, en
     })
 }
 
-/// Compat alias: compat.bpf.h v6.19+ inline function checks for this symbol.
-/// Returns bool (true = success) to match the v2 signature.
+/// compat.bpf.h may inline through legacy/new symbol names before landing on
+/// the simulator's direct `scx_bpf_dsq_insert()` export. Provide the compat
+/// ABI entry points too so userspace schedulers never end up calling a NULL
+/// weak symbol when the header fallback path is compiled in.
 #[no_mangle]
 pub extern "C" fn scx_bpf_dsq_insert___v2___compat(
     p: *mut c_void,
@@ -1713,13 +1715,11 @@ pub extern "C" fn scx_bpf_dsq_insert___v2___compat(
     true
 }
 
-/// Compat alias for v1 (void return).
 #[no_mangle]
 pub extern "C" fn scx_bpf_dsq_insert___v1(p: *mut c_void, dsq_id: u64, slice: u64, enq_flags: u64) {
     scx_bpf_dsq_insert(p, dsq_id, slice, enq_flags);
 }
 
-/// Old dispatch compat name (pre-v6.12 rename).
 #[no_mangle]
 pub extern "C" fn scx_bpf_dispatch___compat(
     p: *mut c_void,
@@ -1730,6 +1730,13 @@ pub extern "C" fn scx_bpf_dispatch___compat(
     scx_bpf_dsq_insert(p, dsq_id, slice, enq_flags);
 }
 
+#[repr(C)]
+pub struct ScxBpfDsqInsertVtimeArgs {
+    dsq_id: u64,
+    slice: u64,
+    vtime: u64,
+    enq_flags: u64,
+}
 /// Insert a task into a DSQ with vtime ordering.
 ///
 /// Deferred like `scx_bpf_dsq_insert` — see its doc comment.
@@ -1778,6 +1785,38 @@ pub extern "C" fn scx_bpf_dsq_insert_vtime(
             },
         );
     })
+}
+
+#[no_mangle]
+pub extern "C" fn __scx_bpf_dsq_insert_vtime(
+    p: *mut c_void,
+    args: *const ScxBpfDsqInsertVtimeArgs,
+) -> bool {
+    let args = unsafe { args.as_ref() }.expect("__scx_bpf_dsq_insert_vtime called with null args");
+    scx_bpf_dsq_insert_vtime(p, args.dsq_id, args.slice, args.vtime, args.enq_flags);
+    true
+}
+
+#[no_mangle]
+pub extern "C" fn scx_bpf_dsq_insert_vtime___compat(
+    p: *mut c_void,
+    dsq_id: u64,
+    slice: u64,
+    vtime: u64,
+    enq_flags: u64,
+) {
+    scx_bpf_dsq_insert_vtime(p, dsq_id, slice, vtime, enq_flags);
+}
+
+#[no_mangle]
+pub extern "C" fn scx_bpf_dispatch_vtime___compat(
+    p: *mut c_void,
+    dsq_id: u64,
+    slice: u64,
+    vtime: u64,
+    enq_flags: u64,
+) {
+    scx_bpf_dsq_insert_vtime(p, dsq_id, slice, vtime, enq_flags);
 }
 
 /// Move the first eligible task from a DSQ to the current CPU's local DSQ.
@@ -2567,6 +2606,18 @@ mod tests {
         clear_sim_arc();
     }
 
+    fn assert_pending_dispatch(arc: &SimArc, pid: Pid, dsq_id: DsqId, vtime: Option<Vtime>) {
+        let guard = arc.lock().unwrap();
+        let pd = guard.sim.pending_dispatch.as_ref().unwrap();
+        assert_eq!(pd.pid, pid);
+        assert_eq!(pd.dsq_id, dsq_id);
+        assert_eq!(pd.vtime, vtime);
+    }
+
+    fn clear_pending_dispatch(arc: &SimArc) {
+        arc.lock().unwrap().sim.pending_dispatch = None;
+    }
+
     /// Allocate a C task_struct and register it in the state's pointer maps.
     ///
     /// Returns the raw pointer. Caller must call `ffi::sim_task_free` when done.
@@ -2704,6 +2755,70 @@ mod tests {
 
         drop(guard);
         free_task(&mut arc.lock().unwrap().sim, Pid(3));
+    }
+
+    #[test]
+    fn test_dsq_insert_compat_aliases_deferred() {
+        let _lock = SIM_LOCK.lock().unwrap();
+        let state = test_state(1);
+        let arc = test_sim_arc(state);
+
+        let p = register_task(&mut arc.lock().unwrap().sim, Pid(7));
+
+        let cpu = arc.lock().unwrap().sim.current_cpu;
+        enter_test_sim(&arc, cpu);
+
+        assert!(scx_bpf_dsq_insert___v2___compat(
+            p,
+            DsqId::GLOBAL.0,
+            5_000_000,
+            0
+        ));
+        assert_pending_dispatch(&arc, Pid(7), DsqId::GLOBAL, None);
+        clear_pending_dispatch(&arc);
+
+        scx_bpf_dsq_insert___v1(p, DsqId::GLOBAL.0, 5_000_000, 0);
+        assert_pending_dispatch(&arc, Pid(7), DsqId::GLOBAL, None);
+        clear_pending_dispatch(&arc);
+
+        scx_bpf_dispatch___compat(p, DsqId::LOCAL.0, 5_000_000, 0);
+        assert_pending_dispatch(&arc, Pid(7), DsqId::LOCAL, None);
+
+        exit_test_sim();
+        free_task(&mut arc.lock().unwrap().sim, Pid(7));
+    }
+
+    #[test]
+    fn test_dsq_insert_vtime_compat_aliases_deferred() {
+        let _lock = SIM_LOCK.lock().unwrap();
+        let mut state = test_state(1);
+        state.dsqs.create(DsqId(50));
+        let arc = test_sim_arc(state);
+
+        let p = register_task(&mut arc.lock().unwrap().sim, Pid(8));
+        let args = ScxBpfDsqInsertVtimeArgs {
+            dsq_id: 50,
+            slice: 5_000_000,
+            vtime: 1234,
+            enq_flags: 0,
+        };
+
+        let cpu = arc.lock().unwrap().sim.current_cpu;
+        enter_test_sim(&arc, cpu);
+
+        assert!(__scx_bpf_dsq_insert_vtime(p, &args));
+        assert_pending_dispatch(&arc, Pid(8), DsqId(50), Some(Vtime(1234)));
+        clear_pending_dispatch(&arc);
+
+        scx_bpf_dsq_insert_vtime___compat(p, 50, 5_000_000, 5678, 0);
+        assert_pending_dispatch(&arc, Pid(8), DsqId(50), Some(Vtime(5678)));
+        clear_pending_dispatch(&arc);
+
+        scx_bpf_dispatch_vtime___compat(p, 50, 5_000_000, 9012, 0);
+        assert_pending_dispatch(&arc, Pid(8), DsqId(50), Some(Vtime(9012)));
+
+        exit_test_sim();
+        free_task(&mut arc.lock().unwrap().sim, Pid(8));
     }
 
     #[test]
