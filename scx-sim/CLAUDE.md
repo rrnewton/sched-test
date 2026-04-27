@@ -159,6 +159,39 @@ The benchmark scripts auto-detect `.venv/bin/python3` if available.
 Dependencies and Missing Software
 ========================================
 
+### Required system packages (Ubuntu/Debian)
+
+The following packages must be installed before building:
+
+    sudo apt-get install -y clang llvm libelf-dev zlib1g-dev \
+        build-essential xxd pkg-config
+
+- **clang / llvm**: Used as the C compiler for BPF scheduler code compiled as
+  userspace C. Set `BPF_CLANG` to override the default `clang`.
+- **libelf-dev**: Required by libbpf-sys (BPF object loading/parsing).
+- **zlib1g-dev**: Required by libbpf-sys (compressed ELF support).
+- **build-essential**: Standard C toolchain (gcc, make, etc.).
+- **xxd**: Hex dump utility used during the build.
+- **pkg-config**: Locates system libraries during `cargo build`.
+
+### Rust toolchain
+
+Install Rust via [rustup](https://rustup.rs/). The project uses Rust edition
+2021; any recent stable toolchain should work.
+
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+### Optional: cargo-nextest (faster test runner)
+
+    curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+
+### Fedora/RHEL equivalents
+
+    sudo dnf install clang llvm elfutils-libelf-devel zlib-devel \
+        gcc make vim-common pkgconf-pkg-config
+
+### Philosophy
+
 Never work around a missing dependency with a compromised fallback. If software
 is needed, install it — build from source, use the package manager, or ask the
 user for help. The `~/bin/` directory is on `$PATH` for locally-built tools.
