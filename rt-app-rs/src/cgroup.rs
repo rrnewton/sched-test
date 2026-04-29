@@ -58,14 +58,18 @@ impl CgroupNode {
     }
 
     /// Move a thread (by TID) into this cgroup.
+    ///
+    /// Tries `cgroup.threads` first; falls back to `cgroup.procs` if the
+    /// cgroup is in domain mode (where `cgroup.threads` is not supported).
     pub fn add_thread(&self, tid: u32) -> Result<()> {
-        let procs_path = self.path.join("cgroup.threads");
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .open(&procs_path)
-            .with_context(|| format!("opening {}", procs_path.display()))?;
-        write!(file, "{}", tid)
-            .with_context(|| format!("writing tid {} to {}", tid, procs_path.display()))
+        let threads_path = self.path.join("cgroup.threads");
+        if let Ok(mut file) = fs::OpenOptions::new().write(true).open(&threads_path) {
+            if write!(file, "{}", tid).is_ok() {
+                return Ok(());
+            }
+        }
+        // Fallback: use cgroup.procs (works for domain-type cgroups)
+        self.add_process(tid)
     }
 
     /// Move a process (by PID) into this cgroup.
@@ -168,6 +172,14 @@ impl CgroupHierarchy {
         let mut sorted_paths: Vec<&String> = spec.cgroups.keys().collect();
         sorted_paths.sort();
 
+        // Identify which paths are internal (have children in the spec).
+        // A path is internal if any other spec path starts with it + "/".
+        let all_paths: Vec<&String> = sorted_paths.clone();
+        let is_internal = |path: &str| -> bool {
+            let prefix = format!("{}/", path);
+            all_paths.iter().any(|other| other.starts_with(&prefix))
+        };
+
         for spec_path in sorted_paths {
             let cgroup_def = &spec.cgroups[spec_path];
 
@@ -179,9 +191,12 @@ impl CgroupHierarchy {
             fs::create_dir_all(&fs_path)
                 .with_context(|| format!("creating cgroup dir {}", fs_path.display()))?;
 
-            // Enable cpu controller in parent's subtree_control if this node has children
-            // (we do this for ALL non-leaf nodes to be safe)
-            Self::try_enable_cpu_controller(&fs_path);
+            // Enable cpu controller in subtree_control ONLY for internal nodes.
+            // Enabling it on leaf cgroups blocks thread placement (cgroup v2 constraint:
+            // no processes in a cgroup that has controllers in subtree_control).
+            if is_internal(spec_path) {
+                Self::try_enable_cpu_controller(&fs_path);
+            }
 
             let node = CgroupNode {
                 path: fs_path,
