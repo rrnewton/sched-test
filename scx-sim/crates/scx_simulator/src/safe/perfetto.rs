@@ -383,6 +383,41 @@ pub(crate) fn write_json(trace: &Trace, writer: &mut impl Write) -> std::io::Res
                     }
                 })
             }
+
+            TraceKind::CgroupBwRefill {
+                cgroup_id,
+                unthrottled_count,
+            } => {
+                json!({
+                    "ph": "i",
+                    "pid": cpu,
+                    "tid": 0,
+                    "ts": ts,
+                    "name": "cgroup_bw_refill",
+                    "cat": "cgroup",
+                    "s": "g",
+                    "args": {
+                        "cgroup_id": cgroup_id,
+                        "unthrottled_count": unthrottled_count
+                    }
+                })
+            }
+
+            TraceKind::CgroupBwThrottled { cgroup_id, pid: throttled_pid } => {
+                json!({
+                    "ph": "i",
+                    "pid": cpu,
+                    "tid": 0,
+                    "ts": ts,
+                    "name": "cgroup_bw_throttled",
+                    "cat": "cgroup",
+                    "s": "g",
+                    "args": {
+                        "cgroup_id": cgroup_id,
+                        "pid": throttled_pid
+                    }
+                })
+            }
         };
         serde_json::to_writer(&mut *writer, &value)?;
     }

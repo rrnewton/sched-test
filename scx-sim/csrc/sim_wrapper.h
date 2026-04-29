@@ -23,6 +23,14 @@
 #define __kconfig
 
 /*
+ * BPF verifier type annotations (__arg_trusted, __arg_arena, etc.)
+ * are meaningless in userspace compilation. Define as empty.
+ */
+#ifndef __arg_trusted
+#define __arg_trusted
+#endif
+
+/*
  * CO-RE type-info builtin stub — must be defined BEFORE including
  * common.bpf.h, because bpf_core_read.h and compat.bpf.h use
  * __builtin_preserve_type_info() in bpf_core_type_exists() macros.

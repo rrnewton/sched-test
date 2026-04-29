@@ -169,6 +169,14 @@ impl SimTask {
         // SAFETY: `self.raw` is non-null and valid (invariant of SimTask).
         Vtime(unsafe { ffi::sim_task_get_dsq_vtime(self.raw) })
     }
+
+    /// Get the raw pointer to this task's cgroup (from C task_struct).
+    ///
+    /// Returns null if the task has no cgroup assigned (root cgroup).
+    pub fn get_cgroup(&self) -> *mut c_void {
+        // SAFETY: `self.raw` is non-null and valid (invariant of SimTask).
+        unsafe { ffi::sim_task_get_cgroup(self.raw) }
+    }
 }
 
 impl Drop for SimTask {

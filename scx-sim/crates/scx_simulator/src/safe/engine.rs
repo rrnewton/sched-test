@@ -643,6 +643,23 @@ pub(crate) enum EventKind {
     /// Consumes logical time (`ipi_delivery_ns`), modeling the
     /// inter-processor interrupt latency between the source and target CPU.
     KickDelivered { cpu: CpuId, flags: KickFlags },
+    /// Cgroup bandwidth period timer: refill quota and unthrottle tasks.
+    ///
+    /// Fires at the end of each cgroup bandwidth period (typically 100ms).
+    /// Restores the cgroup's runtime quota and re-enqueues any tasks that
+    /// were throttled due to quota exhaustion. Processed on CPU 0 (the
+    /// period timer is a global event, not per-CPU).
+    BandwidthRefill {
+        /// The cgroup whose bandwidth period is expiring.
+        cgroup_id: crate::cgroup::CgroupId,
+    },
+    /// A task's cgroup bandwidth budget is exhausted mid-execution.
+    ///
+    /// Fires when a task is running and the remaining bandwidth budget
+    /// for its cgroup drops to zero. The engine stops the task and marks
+    /// the cgroup as throttled (analogous to the kernel's
+    /// `throttle_cfs_rq` path).
+    BandwidthExhausted { cpu: CpuId },
 }
 
 /// Flush staged events from `SimulatorState` into the event queue.
@@ -1314,6 +1331,7 @@ impl<S: Scheduler> Simulator<S> {
                 scenario.nr_cpus as usize
             ],
             native_concurrent: scenario.native_concurrent,
+            cgroup_bw: crate::cgroup_bw::BandwidthManager::new(),
         };
 
         // Build the persistent replay backend once if we have a replay trace.
@@ -1500,6 +1518,33 @@ impl<S: Scheduler> Simulator<S> {
                     );
                 });
                 charge_sched_time(&mut s.sim, CpuId(0), "cgroup_set_bandwidth");
+            }
+        }
+
+        // Initialize cgroup bandwidth tracking and schedule refill timers.
+        {
+            let now = s.sim.clock;
+            for cg_def in &scenario.cgroups {
+                if let Some(ref bw) = cg_def.bandwidth {
+                    if let Some(info) = s.cgroup_registry.get_by_name(&cg_def.name) {
+                        let cgid = info.cgid;
+                        s.sim.cgroup_bw.configure(cgid, bw.period_us, bw.quota_us, now);
+                        // Schedule the first bandwidth refill timer.
+                        let refill_at = now + bw.period_us * 1_000;
+                        s.events.push(
+                            refill_at,
+                            EventKind::BandwidthRefill { cgroup_id: cgid },
+                        );
+                        info!(
+                            cgroup = cg_def.name.as_str(),
+                            cgid = cgid.0,
+                            quota_us = bw.quota_us,
+                            period_us = bw.period_us,
+                            "cgroup bandwidth: tracking initialized, refill at {}ns",
+                            refill_at,
+                        );
+                    }
+                }
             }
         }
 
@@ -1953,6 +1998,7 @@ impl<S: Scheduler> Simulator<S> {
         match &event.kind {
             EventKind::SliceExpired { cpu }
             | EventKind::TaskPhaseComplete { cpu }
+            | EventKind::BandwidthExhausted { cpu }
             | EventKind::Tick { cpu }
             | EventKind::CpuOffline { cpu }
             | EventKind::CpuOnline { cpu }
@@ -1975,6 +2021,11 @@ impl<S: Scheduler> Simulator<S> {
                 s.sim.advance_cpu_clock(*cpu);
                 kfuncs::set_sim_clock(s.sim.cpus[cpu.0 as usize].local_clock, Some(*cpu));
             }
+            EventKind::BandwidthRefill { .. } => {
+                // Global event — advance CPU 0's clock as the processing CPU.
+                s.sim.advance_cpu_clock(CpuId(0));
+                kfuncs::set_sim_clock(s.sim.cpus[0].local_clock, Some(CpuId(0)));
+            }
         }
 
         match event.kind {
@@ -1986,6 +2037,11 @@ impl<S: Scheduler> Simulator<S> {
             EventKind::SliceExpired { cpu } => {
                 drop(guard);
                 self.handle_slice_expired(cpu, sim_arc, monitor);
+                guard = sim_arc.lock().unwrap();
+            }
+            EventKind::BandwidthExhausted { cpu } => {
+                drop(guard);
+                self.handle_bandwidth_exhausted(cpu, sim_arc, monitor);
                 guard = sim_arc.lock().unwrap();
             }
             EventKind::TaskPhaseComplete { cpu } => {
@@ -2085,6 +2141,9 @@ impl<S: Scheduler> Simulator<S> {
                 drop(guard);
                 self.handle_kick_delivered(cpu, flags, sim_arc, monitor);
                 guard = sim_arc.lock().unwrap();
+            }
+            EventKind::BandwidthRefill { cgroup_id } => {
+                self.handle_bandwidth_refill(cgroup_id, &mut guard);
             }
         }
         None
@@ -2701,6 +2760,256 @@ impl<S: Scheduler> Simulator<S> {
     }
 
     /// Handle an interrupt starting on a CPU.
+    /// Handle a cgroup bandwidth period refill timer.
+    ///
+    /// Refills the cgroup's runtime quota to its configured value and
+    /// unthrottles any tasks that were waiting. Schedules the next refill
+    /// timer for the following period.
+    fn handle_bandwidth_refill(
+        &self,
+        cgroup_id: crate::cgroup::CgroupId,
+        guard: &mut std::sync::MutexGuard<'_, kfuncs::SimState>,
+    ) {
+        let s = &mut **guard;
+        let now = s.sim.clock;
+
+        let pids_to_wake = s.sim.cgroup_bw.refill(cgroup_id, now);
+
+        if !pids_to_wake.is_empty() {
+            debug!(
+                cgid = cgroup_id.0,
+                unthrottled = pids_to_wake.len(),
+                "cgroup bandwidth refill: unthrottling tasks"
+            );
+            s.sim.trace.record(
+                now,
+                CpuId(0),
+                TraceKind::CgroupBwRefill {
+                    cgroup_id: cgroup_id.0,
+                    unthrottled_count: pids_to_wake.len() as u32,
+                },
+            );
+
+            // Re-enqueue throttled tasks by generating wake events.
+            // In the kernel, unthrottling triggers enqueue for each
+            // throttled task. We model this as TaskWake events.
+            for pid in pids_to_wake {
+                if let Some(task) = s.tasks.get(&pid) {
+                    if task.state == TaskState::Sleeping {
+                        // Task was parked due to throttling — wake it.
+                        let prev_cpu = s.sim.task_last_cpu.get(&pid).copied().unwrap_or(CpuId(0));
+                        s.events.push(
+                            now,
+                            EventKind::TaskWake {
+                                pid,
+                                waker: None,
+                                cpu: prev_cpu,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+
+        // Schedule the next refill timer.
+        if let Some(bw_state) = s.sim.cgroup_bw.get(cgroup_id) {
+            let next_refill = now + bw_state.period_ns;
+            s.events.push(
+                next_refill,
+                EventKind::BandwidthRefill { cgroup_id },
+            );
+        }
+    }
+
+    /// Charge a task's CPU runtime to its cgroup's bandwidth budget.
+    ///
+    /// Called when a task stops running (slice expired, phase complete,
+    /// or preemption). Walks the task's cgroup and all ancestors, charging
+    /// `delta_ns` to each. If any cgroup's quota is exhausted, returns the
+    /// cgroup ID that should be throttled.
+    ///
+    /// # Arguments
+    /// * `s` - Mutable reference to the full sim state
+    /// * `pid` - PID of the task that consumed CPU time
+    /// * `delta_ns` - CPU time consumed (ns)
+    fn charge_cgroup_bandwidth(
+        s: &mut kfuncs::SimState,
+        pid: Pid,
+        delta_ns: u64,
+    ) {
+        if s.sim.cgroup_bw.is_empty() || delta_ns == 0 {
+            return;
+        }
+
+        // Look up the task's cgroup via the C-side task_struct.
+        let task = match s.tasks.get(&pid) {
+            Some(t) => t,
+            None => return,
+        };
+        let cgroup_raw = task.get_cgroup();
+        if cgroup_raw.is_null() {
+            return;
+        }
+        let cgid = match s.cgroup_registry.find_cgid_by_raw(cgroup_raw) {
+            Some(id) => id,
+            None => return, // Root or unknown cgroup — no bandwidth tracking
+        };
+
+        // Build ancestor lookup closure. We need to capture cgroup_registry
+        // for the ancestor walk, but we also need &mut sim for charging.
+        // Collect the ancestor chain first, then charge.
+        let mut ancestors = Vec::new();
+        {
+            let mut current = Some(cgid);
+            while let Some(cg) = current {
+                ancestors.push(cg);
+                current = s.cgroup_registry.get(cg).and_then(|info| {
+                    if info.parent_cgid.0 == 0 {
+                        None // Root has no parent
+                    } else {
+                        Some(info.parent_cgid)
+                    }
+                });
+            }
+        }
+
+        // Charge all ancestors
+        for &ancestor_cgid in &ancestors {
+            if let Some(bw_state) = s.sim.cgroup_bw.get_mut(ancestor_cgid) {
+                let newly_exhausted = bw_state.charge(delta_ns);
+                if newly_exhausted {
+                    bw_state.throttle(pid);
+                    debug!(
+                        pid = pid.0,
+                        cgid = ancestor_cgid.0,
+                        remaining_ns = bw_state.runtime_remaining_ns,
+                        "cgroup bandwidth exhausted: throttling"
+                    );
+                    s.sim.trace.record(
+                        s.sim.clock,
+                        CpuId(0),
+                        TraceKind::CgroupBwThrottled {
+                            cgroup_id: ancestor_cgid.0,
+                            pid: pid.0 as u32,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    /// Handle a `BandwidthExhausted` event: a task's cgroup ran out of quota.
+    ///
+    /// This is similar to `handle_slice_expired` but instead of re-enqueuing
+    /// the task, it parks the task until the cgroup's next bandwidth refill.
+    /// The task's cgroup is marked as throttled.
+    fn handle_bandwidth_exhausted(
+        &self,
+        cpu: CpuId,
+        sim_arc: &SimArc,
+        monitor: &mut dyn Monitor,
+    ) {
+        let mut guard = sim_arc.lock().unwrap();
+        let s = &mut *guard;
+
+        let pid = match s.sim.cpus[cpu.0 as usize].current_task {
+            Some(pid) => pid,
+            None => return,
+        };
+
+        let task = match s.tasks.get_mut(&pid) {
+            Some(t) => t,
+            None => return,
+        };
+
+        // Compute how much time the task consumed since it started.
+        let local_clock = s.sim.cpus[cpu.0 as usize].local_clock;
+        let started_at = s.sim.cpus[cpu.0 as usize]
+            .task_started_at
+            .unwrap_or(local_clock);
+        let consumed = local_clock.saturating_sub(started_at);
+
+        task.run_remaining_ns = task.run_remaining_ns.saturating_sub(consumed);
+
+        info!(
+            task = task.name.as_str(),
+            pid = pid.0,
+            ran_ns = %FmtN(consumed),
+            "BW_EXHAUSTED (cgroup quota depleted)"
+        );
+
+        let raw = task.raw();
+
+        // Park the task as throttled (sleeping until refill wakes it).
+        task.state = TaskState::Sleeping;
+        task.runnable_at_ns = None;
+
+        // Charge bandwidth and mark cgroup as throttled.
+        Self::charge_cgroup_bandwidth(s, pid, consumed);
+
+        // Record the task in the throttled set for this cgroup.
+        let cgroup_raw = s.tasks.get(&pid).map(|t| t.get_cgroup()).unwrap_or(std::ptr::null_mut());
+        if !cgroup_raw.is_null() {
+            if let Some(cgid) = s.cgroup_registry.find_cgid_by_raw(cgroup_raw) {
+                if let Some(bw_state) = s.sim.cgroup_bw.get_mut(cgid) {
+                    bw_state.throttle(pid);
+                }
+            }
+        }
+
+        // Clear CPU state.
+        s.sim.cpus[cpu.0 as usize].current_task = None;
+        s.sim.cpus[cpu.0 as usize].prev_task = Some(pid);
+        s.sim.cpus[cpu.0 as usize].task_started_at = None;
+        s.sim.cpus[cpu.0 as usize].task_original_slice = None;
+
+        // Apply CSW overhead.
+        let overhead = s.sim.csw_overhead(LastStopReason::Involuntary);
+        s.sim.cpus[cpu.0 as usize].local_clock += overhead;
+        kfuncs::clock_window_check(cpu, s.sim.cpus[cpu.0 as usize].local_clock);
+
+        // Update sum_exec_runtime.
+        {
+            let task = s.tasks.get(&pid).unwrap();
+            update_sum_exec(raw, task.sum_exec_base, consumed);
+        }
+
+        // Call stopping() + quiescent() — task is going to sleep.
+        set_ops_context(&mut s.sim, OpsContext::Stopping);
+        start_rbc(&mut s.sim);
+        sim_callback!(s, guard, sim_arc, cpu, {
+            self.scheduler.stopping(TaskPtr::new(raw), false);
+        });
+        let s = &mut *guard;
+        charge_sched_time(&mut s.sim, cpu, "stopping");
+
+        // Dequeue if queued.
+        let ops_state = s.sim.task_ops_state.get(&pid).copied().unwrap_or_default();
+        if ops_state == OpsTaskState::Queued {
+            set_ops_context(&mut s.sim, OpsContext::Dequeue);
+            start_rbc(&mut s.sim);
+            sim_callback!(s, guard, sim_arc, cpu, {
+                self.scheduler.dequeue(TaskPtr::new(raw), SCX_DEQ_SLEEP);
+            });
+            let s = &mut *guard;
+            charge_sched_time(&mut s.sim, cpu, "dequeue");
+            s.sim.set_task_ops_state(pid, OpsTaskState::None);
+        }
+
+        let s = &mut *guard;
+        set_ops_context(&mut s.sim, OpsContext::Quiescent);
+        start_rbc(&mut s.sim);
+        sim_callback!(s, guard, sim_arc, cpu, {
+            self.scheduler.quiescent(TaskPtr::new(raw), SCX_DEQ_SLEEP);
+        });
+        let s = &mut *guard;
+        charge_sched_time(&mut s.sim, cpu, "quiescent");
+
+        // Dispatch next task on this now-idle CPU.
+        drop(guard);
+        self.try_dispatch_and_run(cpu, sim_arc, monitor);
+    }
+
     ///
     /// Sets the IRQ context, records stolen time, processes wakeups inline
     /// (so `bpf_in_hardirq()` returns true during `select_cpu`), and
@@ -3146,6 +3455,10 @@ impl<S: Scheduler> Simulator<S> {
             let task = s.tasks.get(&pid).unwrap();
             update_sum_exec(raw, task.sum_exec_base, time_consumed);
         }
+
+        // Charge cgroup bandwidth: deduct consumed CPU time from the task's
+        // cgroup quota (and all ancestor cgroups).
+        Self::charge_cgroup_bandwidth(s, pid, time_consumed);
 
         set_ops_context(&mut s.sim, OpsContext::Stopping);
         debug!(pid = pid.0, still_runnable, "enter:structop stopping");
@@ -3756,6 +4069,10 @@ impl<S: Scheduler> Simulator<S> {
             update_sum_exec(raw, task.sum_exec_base, consumed);
         }
 
+        // Charge cgroup bandwidth: deduct consumed CPU time from the task's
+        // cgroup quota (and all ancestor cgroups).
+        Self::charge_cgroup_bandwidth(s, pid, consumed);
+
         // stopping()
         set_ops_context(&mut s.sim, OpsContext::Stopping);
         debug!(pid = pid.0, runnable = true, "enter:structop stopping");
@@ -3815,6 +4132,44 @@ impl<S: Scheduler> Simulator<S> {
             self.try_dispatch_and_run(cpu, sim_arc, monitor);
             return;
         }
+
+        // Cgroup bandwidth gate: if the task's cgroup is throttled, park it
+        // and try dispatching another task. The task will be re-enqueued when
+        // the cgroup's bandwidth period timer fires (BandwidthRefill event).
+        {
+            let cgroup_raw = task.get_cgroup();
+            if !cgroup_raw.is_null() {
+                if let Some(cgid) = s.cgroup_registry.find_cgid_by_raw(cgroup_raw) {
+                    let is_throttled = s.sim.cgroup_bw.is_throttled(cgid, |cg| {
+                        s.cgroup_registry.get(cg).and_then(|info| {
+                            if info.parent_cgid.0 == 0 { None } else { Some(info.parent_cgid) }
+                        })
+                    });
+                    if is_throttled {
+                        debug!(
+                            pid = pid.0,
+                            cgid = cgid.0,
+                            "cgroup bandwidth: task throttled, parking"
+                        );
+                        // Record the PID in the throttled set so refill can wake it.
+                        if let Some(bw_state) = s.sim.cgroup_bw.get_mut(cgid) {
+                            bw_state.throttle(pid);
+                        }
+                        task.state = TaskState::Sleeping;
+                        task.runnable_at_ns = None;
+                        drop(guard);
+                        self.try_dispatch_and_run(cpu, sim_arc, monitor);
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Re-borrow task after the throttle check (borrow was dropped by the block)
+        let task = match s.tasks.get_mut(&pid) {
+            Some(t) => t,
+            None => return,
+        };
 
         task.state = TaskState::Running { cpu };
         // Track whether this is a migration (for migration penalty).
@@ -3976,17 +4331,58 @@ impl<S: Scheduler> Simulator<S> {
             "STARTED"
         );
 
+        // Cgroup bandwidth: compute maximum run time before quota exhaustion.
+        // This clamps the effective run duration to the remaining bandwidth
+        // budget, scheduling a BandwidthExhausted event if the budget runs
+        // out before the slice or phase completes.
+        let bw_limit_ns = {
+            let cgroup_raw = s.tasks.get(&pid).unwrap().get_cgroup();
+            if cgroup_raw.is_null() {
+                None
+            } else if let Some(cgid) = s.cgroup_registry.find_cgid_by_raw(cgroup_raw) {
+                s.sim.cgroup_bw.max_run_ns(cgid, |cg| {
+                    s.cgroup_registry.get(cg).and_then(|info| {
+                        if info.parent_cgid.0 == 0 { None } else { Some(info.parent_cgid) }
+                    })
+                })
+            } else {
+                None
+            }
+        };
+
         if remaining == 0 {
             // Task has no remaining work -- complete immediately
             s.events.push(local_t, EventKind::TaskPhaseComplete { cpu });
-        } else if slice > 0 && slice <= remaining {
-            // Slice expires before the phase completes
-            s.events
-                .push(local_t + slice, EventKind::SliceExpired { cpu });
         } else {
-            // Phase completes before the slice
-            s.events
-                .push(local_t + remaining, EventKind::TaskPhaseComplete { cpu });
+            // Determine which event fires first: slice expiry, phase complete,
+            // or bandwidth exhaustion.
+            let effective_run = if slice > 0 && slice <= remaining {
+                slice
+            } else {
+                remaining
+            };
+
+            let (event_time, event_kind) = if let Some(bw_ns) = bw_limit_ns {
+                if bw_ns == 0 {
+                    // Already exhausted — shouldn't happen (throttle gate
+                    // should have caught it), but handle defensively.
+                    (local_t, EventKind::BandwidthExhausted { cpu })
+                } else if bw_ns < effective_run {
+                    // Bandwidth runs out before slice/phase completes.
+                    (local_t + bw_ns, EventKind::BandwidthExhausted { cpu })
+                } else if slice > 0 && slice <= remaining {
+                    (local_t + slice, EventKind::SliceExpired { cpu })
+                } else {
+                    (local_t + remaining, EventKind::TaskPhaseComplete { cpu })
+                }
+            } else if slice > 0 && slice <= remaining {
+                // No bandwidth limit — normal scheduling.
+                (local_t + slice, EventKind::SliceExpired { cpu })
+            } else {
+                (local_t + remaining, EventKind::TaskPhaseComplete { cpu })
+            };
+
+            s.events.push(event_time, event_kind);
         }
     }
 

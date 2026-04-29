@@ -442,6 +442,13 @@ pub struct SimulatorState {
     /// When set, workers run truly concurrently with real locks and
     /// window-based clock throttling instead of token-ring serialization.
     pub native_concurrent: Option<NativeConcurrentConfig>,
+    /// Cgroup CPU bandwidth manager (cpu.max enforcement).
+    ///
+    /// Tracks per-cgroup runtime budgets, throttle state, and period timing.
+    /// Only cgroups with finite `cpu.max` quotas have entries. The engine
+    /// charges runtime when tasks stop, throttles tasks when quotas are
+    /// exhausted, and refills quotas on periodic timers.
+    pub cgroup_bw: crate::cgroup_bw::BandwidthManager,
 }
 
 /// Bundle of all shared simulator state, protected by a single Mutex.
@@ -2532,6 +2539,89 @@ pub extern "C" fn sim_timer_start(nsecs: u64) {
     });
 }
 
+/// Kfunc: check if a cgroup is bandwidth-throttled.
+///
+/// Called by LAVD's `cgroup_throttled()` helper via `scx_cgroup_bw_throttled()`.
+/// Returns 0 if not throttled, -11 (EAGAIN) if throttled.
+///
+/// In the real kernel, this checks the CFS bandwidth controller's throttle
+/// state. In the simulator, it queries our `BandwidthManager`.
+///
+/// Uses `with_sim` (not a separate accessor) to go through the standard
+/// kfunc infrastructure (RBC accounting, preemption management).
+#[no_mangle]
+pub extern "C" fn sim_scx_cgroup_bw_throttled(cgrp: *mut c_void, _p: *mut c_void) -> i32 {
+    if cgrp.is_null() {
+        return 0; // null cgroup = root = never throttled
+    }
+    // We need both sim.cgroup_bw and cgroup_registry, but with_sim only
+    // gives &mut SimulatorState. Access the full SimState via the Arc.
+    let arc = SIM_ARC
+        .with(|c| c.borrow().clone())
+        .expect("sim_scx_cgroup_bw_throttled called outside simulator context");
+    disable_rbc_counter();
+    let result = {
+        let guard = arc.lock().unwrap();
+        let cgid = match guard.cgroup_registry.find_cgid_by_raw(cgrp) {
+            Some(id) => id,
+            None => {
+                drop(guard);
+                enable_rbc_counter();
+                return 0;
+            }
+        };
+
+        let is_throttled = guard.sim.cgroup_bw.is_throttled(cgid, |cg| {
+            guard.cgroup_registry.get(cg).and_then(|info| {
+                if info.parent_cgid.0 == 0 { None } else { Some(info.parent_cgid) }
+            })
+        });
+
+        if is_throttled {
+            debug!(cgid = cgid.0, "scx_cgroup_bw_throttled: THROTTLED → -EAGAIN");
+            -11i32
+        } else {
+            0i32
+        }
+    };
+    enable_rbc_counter();
+    result
+}
+
+/// Kfunc: consume bandwidth after a task ran.
+///
+/// Called by LAVD via `scx_cgroup_bw_consume()` after a task completes its
+/// timeslice. In the simulator, the engine already charges bandwidth in
+/// `charge_cgroup_bandwidth()`, so this is a no-op to avoid double-charging.
+#[no_mangle]
+pub extern "C" fn sim_scx_cgroup_bw_consume(_cgrp: *mut c_void, _runtime: u64) -> i32 {
+    0 // Engine handles charging
+}
+
+/// Kfunc: put a throttled task aside for later re-enqueue.
+///
+/// Called by LAVD when `scx_cgroup_bw_throttled()` returns -EAGAIN.
+/// LAVD defers the task and will call `scx_cgroup_bw_reenqueue()` later.
+/// In the simulator, the engine handles throttling directly, so this is
+/// a no-op — the task is already in the BandwidthManager's throttled set.
+#[no_mangle]
+pub extern "C" fn sim_scx_cgroup_bw_put_aside(
+    _p: *mut c_void, _taskc: u64, _vtime: u64, _cgrp: *mut c_void,
+) -> i32 {
+    0
+}
+
+/// Kfunc: re-enqueue tasks that were put aside due to throttling.
+///
+/// Called by LAVD (typically from a timer callback) to bring back tasks
+/// that were deferred by `scx_cgroup_bw_put_aside()`. In the simulator,
+/// the engine handles unthrottling via `BandwidthRefill` events, so this
+/// is a no-op.
+#[no_mangle]
+pub extern "C" fn sim_scx_cgroup_bw_reenqueue() -> i32 {
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2593,6 +2683,7 @@ mod tests {
             e9_fns: None,
             structop_accum: vec![crate::preempt::StructopInfo::default(); nr_cpus as usize],
             native_concurrent: None,
+            cgroup_bw: crate::cgroup_bw::BandwidthManager::new(),
         }
     }
 

@@ -294,12 +294,15 @@ fn parse_task(
         None
     };
 
-    if obj.contains_key("taskgroup") {
-        warn!(
-            task = name,
-            "ignoring 'taskgroup' (not modeled in simulator)"
-        );
-    }
+    // Parse cgroup assignment: "cgroup" field (new format) or "taskgroup" (legacy).
+    // Path-style references ("/app/fg") are converted to dotted names ("app.fg")
+    // to match the CgroupDef naming convention.
+    let cgroup_name = obj
+        .get("cgroup")
+        .and_then(|v| v.as_str())
+        .or_else(|| obj.get("taskgroup").and_then(|v| v.as_str()))
+        .map(|s| s.trim_start_matches('/').replace('/', "."))
+        .filter(|s| !s.is_empty());
 
     // Parse phases
     let all_phases = if let Some(phases_val) = obj.get("phases") {
@@ -369,7 +372,7 @@ fn parse_task(
             mm_id: None,
             allowed_cpus: allowed_cpus.clone(),
             parent_pid: None,
-            cgroup_name: None,
+            cgroup_name: cgroup_name.clone(),
             task_flags: 0,
             migration_disabled: 0,
         });
@@ -453,6 +456,98 @@ fn extract_irq_gen_timing(obj: &Map<String, Value>) -> Result<(u64, u64), RtAppE
 ///
 /// let scenario = load_rtapp(json, 4).unwrap();
 /// ```
+/// Parse the `"cgroups"` section from an rt-app JSON spec into `CgroupDef`s.
+///
+/// Supports two formats:
+///
+/// **New format** (rt-app-rs style): path-keyed entries with structured cpu.max.
+/// ```json
+/// "cgroups": {
+///     "/workload": { "cpu.max": { "quota": "max", "period": 100000 } },
+///     "/workload/batch": { "cpu.max": { "quota": 200000, "period": 100000 } }
+/// }
+/// ```
+///
+/// **Legacy format**: `"taskgroup"` field on tasks references a cgroup name.
+/// No explicit cgroup section — cgroups are created implicitly.
+///
+/// Cgroup paths are converted to names by stripping the leading `/` and
+/// replacing `/` with `.` (e.g., `/workload/batch` → `workload.batch`).
+/// Parent-child relationships are inferred from the path hierarchy.
+fn parse_cgroup_section(root_obj: &Map<String, Value>) -> Vec<crate::scenario::CgroupDef> {
+    use crate::scenario::{CgroupBandwidth, CgroupDef};
+
+    let cgroups_obj = match root_obj.get("cgroups").and_then(|v| v.as_object()) {
+        Some(obj) => obj,
+        None => return Vec::new(),
+    };
+
+    // Sort paths by depth (parents before children) to ensure ordering.
+    let mut paths: Vec<&String> = cgroups_obj.keys().collect();
+    paths.sort_by_key(|p| p.matches('/').count());
+
+    let mut defs = Vec::new();
+    for path in paths {
+        let cg_val = &cgroups_obj[path];
+        let cg_obj = match cg_val.as_object() {
+            Some(o) => o,
+            None => continue,
+        };
+
+        // Convert path to cgroup name: "/workload/batch" → "workload.batch"
+        let name = path.trim_start_matches('/').replace('/', ".");
+        if name.is_empty() {
+            continue; // Skip root-only path
+        }
+
+        // Infer parent name from path: "/workload/batch" → parent = "workload"
+        let parent_name = {
+            let trimmed = path.trim_start_matches('/');
+            if let Some(last_slash) = trimmed.rfind('/') {
+                Some(trimmed[..last_slash].replace('/', "."))
+            } else {
+                None // Direct child of root
+            }
+        };
+
+        // Parse cpu.max: { "quota": <int|"max">, "period": <int> }
+        let bandwidth = cg_obj
+            .get("cpu.max")
+            .and_then(|v| v.as_object())
+            .and_then(|cm| {
+                let quota = cm.get("quota")?;
+                let quota_us = match quota {
+                    Value::Number(n) => n.as_u64()?,
+                    Value::String(s) if s == "max" => return None, // unlimited
+                    Value::String(s) => s.parse::<u64>().ok()?,
+                    _ => return None,
+                };
+                let period_us = cm
+                    .get("period")
+                    .and_then(|p| match p {
+                        Value::Number(n) => n.as_u64(),
+                        Value::String(s) => s.parse::<u64>().ok(),
+                        _ => None,
+                    })
+                    .unwrap_or(100_000); // Default 100ms period
+                Some(CgroupBandwidth {
+                    period_us,
+                    quota_us,
+                    burst_us: 0,
+                })
+            });
+
+        defs.push(CgroupDef {
+            name,
+            parent_name,
+            cpuset: None,
+            bandwidth,
+        });
+    }
+
+    defs
+}
+
 pub fn load_rtapp(json_str: &str, nr_cpus: u32) -> Result<Scenario, RtAppError> {
     if nr_cpus == 0 {
         return Err(RtAppError::InvalidValue(
@@ -620,12 +715,35 @@ pub fn load_rtapp(json_str: &str, nr_cpus: u32) -> Result<Scenario, RtAppError> 
         }
     }
 
+    // Parse cgroup definitions from the "cgroups" section (if present).
+    // Each cgroup entry has a path-style key (e.g. "/workload/batch") and
+    // an optional "cpu.max" field with quota/period.
+    let cgroup_defs = parse_cgroup_section(root_obj);
+    if !cgroup_defs.is_empty() {
+        info!(
+            count = cgroup_defs.len(),
+            "parsed cgroup definitions from rt-app spec"
+        );
+        for cg in &cgroup_defs {
+            if let Some(ref bw) = cg.bandwidth {
+                info!(
+                    cgroup = cg.name.as_str(),
+                    quota_us = bw.quota_us,
+                    period_us = bw.period_us,
+                    "  cgroup bandwidth configured"
+                );
+            } else {
+                info!(cgroup = cg.name.as_str(), "  cgroup (no bandwidth limit)");
+            }
+        }
+    }
+
     Ok(Scenario {
         nr_cpus,
         smt_threads_per_core: 1,
         cpus_per_llc: 0,
         tasks: all_tasks,
-        cgroups: Vec::new(), // rt-app doesn't use cgroups
+        cgroups: cgroup_defs,
         duration_ns,
         noise: NoiseConfig::from_env(),
         overhead: OverheadConfig::from_env(),
@@ -934,5 +1052,90 @@ mod tests {
             err.to_string().contains("nr_cpus must be at least 1"),
             "expected nr_cpus validation error, got: {err}"
         );
+    }
+
+    #[test]
+    fn test_cgroup_parsing() {
+        let json = r#"{
+            "global": { "duration": 10 },
+            "cgroups": {
+                "/app": { "cpu.max": { "quota": "max", "period": 100000 } },
+                "/app/fg": { "cpu.max": { "quota": 200000, "period": 100000 } },
+                "/app/bg": { "cpu.max": { "quota": 50000, "period": 100000 } }
+            },
+            "tasks": {
+                "fg_thread": { "cgroup": "/app/fg", "loop": -1, "run": 500, "sleep": 1500 },
+                "bg_worker": { "cgroup": "/app/bg", "loop": -1, "run": 100, "sleep": 900 }
+            }
+        }"#;
+
+        let scenario = load_rtapp(json, 4).unwrap();
+
+        // Should have 3 cgroup definitions
+        assert_eq!(scenario.cgroups.len(), 3, "expected 3 cgroups");
+
+        // Check cgroup names and parents
+        let app = &scenario.cgroups[0];
+        assert_eq!(app.name, "app");
+        assert!(app.parent_name.is_none(), "app should be a root child");
+        assert!(
+            app.bandwidth.is_none(),
+            "app has quota=max, so no bandwidth"
+        );
+
+        let fg = &scenario.cgroups[1];
+        assert_eq!(fg.name, "app.fg");
+        assert_eq!(fg.parent_name.as_deref(), Some("app"));
+        let fg_bw = fg.bandwidth.as_ref().unwrap();
+        assert_eq!(fg_bw.quota_us, 200_000);
+        assert_eq!(fg_bw.period_us, 100_000);
+
+        let bg = &scenario.cgroups[2];
+        assert_eq!(bg.name, "app.bg");
+        assert_eq!(bg.parent_name.as_deref(), Some("app"));
+        let bg_bw = bg.bandwidth.as_ref().unwrap();
+        assert_eq!(bg_bw.quota_us, 50_000);
+        assert_eq!(bg_bw.period_us, 100_000);
+
+        // Check task cgroup assignments
+        let fg_task = scenario.tasks.iter().find(|t| t.name == "fg_thread").unwrap();
+        assert_eq!(fg_task.cgroup_name.as_deref(), Some("app.fg"));
+
+        let bg_task = scenario.tasks.iter().find(|t| t.name == "bg_worker").unwrap();
+        assert_eq!(bg_task.cgroup_name.as_deref(), Some("app.bg"));
+    }
+
+    #[test]
+    fn test_cgroup_no_cgroups_section() {
+        let json = r#"{
+            "global": { "duration": 1 },
+            "tasks": {
+                "t1": { "loop": -1, "run": 5000 }
+            }
+        }"#;
+
+        let scenario = load_rtapp(json, 4).unwrap();
+        assert!(scenario.cgroups.is_empty());
+        assert!(scenario.tasks[0].cgroup_name.is_none());
+    }
+
+    #[test]
+    fn test_cgroup_string_quota() {
+        // Production patterns use string quotas like "200000"
+        let json = r#"{
+            "global": { "duration": 1 },
+            "cgroups": {
+                "/work": { "cpu.max": { "quota": "3800000", "period": "100000" } }
+            },
+            "tasks": {
+                "t1": { "cgroup": "/work", "loop": -1, "run": 500 }
+            }
+        }"#;
+
+        let scenario = load_rtapp(json, 48).unwrap();
+        assert_eq!(scenario.cgroups.len(), 1);
+        let bw = scenario.cgroups[0].bandwidth.as_ref().unwrap();
+        assert_eq!(bw.quota_us, 3_800_000);
+        assert_eq!(bw.period_us, 100_000);
     }
 }
