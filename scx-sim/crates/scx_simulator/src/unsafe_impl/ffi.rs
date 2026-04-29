@@ -1243,3 +1243,34 @@ impl Scheduler for DynamicScheduler {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    type IterNewFn = unsafe extern "C" fn(*mut c_void, u64, u64) -> i32;
+    type IterNextFn = unsafe extern "C" fn(*mut c_void) -> *mut c_void;
+    type IterDestroyFn = unsafe extern "C" fn(*mut c_void);
+
+    #[test]
+    fn mitosis_exports_dsq_iterator_symbols() {
+        let dir = env!("SCHEDULER_SO_DIR");
+        let path = format!("{dir}/libscx_mitosis.so");
+
+        // SAFETY: The test opens a scheduler `.so` built by this crate's
+        // build script and verifies that the expected wrapper exports exist.
+        unsafe {
+            let lib = libloading::Library::new(&path)
+                .unwrap_or_else(|err| panic!("failed to load {path}: {err}"));
+            let _: libloading::Symbol<IterNewFn> = lib
+                .get(b"bpf_iter_scx_dsq_new")
+                .unwrap_or_else(|err| panic!("missing bpf_iter_scx_dsq_new in {path}: {err}"));
+            let _: libloading::Symbol<IterNextFn> = lib
+                .get(b"bpf_iter_scx_dsq_next")
+                .unwrap_or_else(|err| panic!("missing bpf_iter_scx_dsq_next in {path}: {err}"));
+            let _: libloading::Symbol<IterDestroyFn> = lib
+                .get(b"bpf_iter_scx_dsq_destroy")
+                .unwrap_or_else(|err| panic!("missing bpf_iter_scx_dsq_destroy in {path}: {err}"));
+        }
+    }
+}
