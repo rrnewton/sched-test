@@ -1665,6 +1665,20 @@ pub extern "C" fn scx_bpf_select_cpu_and(
     })
 }
 
+/// compat.bpf.h falls back to this weak symbol when CO-RE type detection
+/// is unavailable. Export the compat alias so scheduler wrappers resolve it
+/// to the simulator host binary instead of a NULL weak symbol.
+#[no_mangle]
+pub extern "C" fn scx_bpf_select_cpu_and___compat(
+    p: *mut c_void,
+    prev_cpu: i32,
+    wake_flags: u64,
+    cpus_allowed: *const c_void,
+    flags: u64,
+) -> i32 {
+    scx_bpf_select_cpu_and(p, prev_cpu, wake_flags, cpus_allowed, flags)
+}
+
 /// Insert a task into a DSQ (FIFO ordering).
 ///
 /// Like the kernel, this records intent but does NOT insert immediately.
@@ -2839,6 +2853,24 @@ mod tests {
         assert!(arc.lock().unwrap().sim.reenqueue_local_requested);
 
         exit_test_sim();
+    }
+
+    #[test]
+    fn test_select_cpu_and_compat_alias_prefers_idle_prev() {
+        let _lock = SIM_LOCK.lock().unwrap();
+        let arc = test_sim_arc(test_state(2));
+
+        let p = register_task(&mut arc.lock().unwrap().sim, Pid(9));
+        let prev_cpu = arc.lock().unwrap().sim.current_cpu.0 as i32;
+
+        enter_test_sim(&arc, CpuId(prev_cpu as u32));
+        assert_eq!(
+            scx_bpf_select_cpu_and___compat(p, prev_cpu, 0, std::ptr::null(), 0),
+            prev_cpu
+        );
+        exit_test_sim();
+
+        free_task(&mut arc.lock().unwrap().sim, Pid(9));
     }
 
     #[test]
