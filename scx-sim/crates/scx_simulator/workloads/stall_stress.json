@@ -1,0 +1,29 @@
+{
+    "global": {
+        "duration": 2,
+        "default_policy": "SCHED_OTHER",
+        "calibration": 19
+    },
+    "tasks": {
+        "burst_0": { "loop": -1, "run": 1000, "sleep": 2000 },
+        "burst_1": { "loop": -1, "run": 1000, "sleep": 2000 },
+        "burst_2": { "loop": -1, "run": 1000, "sleep": 2000 },
+        "burst_3": { "loop": -1, "run": 1000, "sleep": 2000 },
+        "burst_4": { "loop": -1, "run": 1000, "sleep": 2000 },
+        "burst_5": { "loop": -1, "run": 1000, "sleep": 2000 },
+        "burst_6": { "loop": -1, "run": 1000, "sleep": 2000 },
+        "burst_7": { "loop": -1, "run": 1000, "sleep": 2000 },
+        "burst_8": { "loop": -1, "run": 1000, "sleep": 2000 },
+        "burst_9": { "loop": -1, "run": 1000, "sleep": 2000 },
+        "burst_10": { "loop": -1, "run": 1000, "sleep": 2000 },
+        "burst_11": { "loop": -1, "run": 1000, "sleep": 2000 },
+        "burst_12": { "loop": -1, "run": 1000, "sleep": 2000 },
+        "burst_13": { "loop": -1, "run": 1000, "sleep": 2000 },
+        "burst_14": { "loop": -1, "run": 1000, "sleep": 2000 },
+        "burst_15": { "loop": -1, "run": 1000, "sleep": 2000 },
+        "hog_0": { "loop": -1, "run": 10000 },
+        "hog_1": { "loop": -1, "run": 10000 },
+        "hog_2": { "loop": -1, "run": 10000 },
+        "hog_3": { "loop": -1, "run": 10000 }
+    }
+}

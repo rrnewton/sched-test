@@ -29,7 +29,15 @@ int LINUX_KERNEL_VERSION = 0;
  * consistent pointers.
  */
 static struct kernfs_node sim_root_kn;
-static struct cgroup sim_root_cgroup;
+/* Root cgroup needs extra space for the flexible array member `ancestors[0]`.
+ * We embed it in a struct with trailing space for 32 pointers (matching
+ * CGROUP_ANCESTOR_MAX defined below). Only ancestors[0] is used for root
+ * (level 0), but we allocate the full array for safety. */
+static struct {
+	struct cgroup cg;
+	struct cgroup *_ancestors_storage[32];
+} sim_root_cgroup_storage;
+#define sim_root_cgroup (sim_root_cgroup_storage.cg)
 static struct css_set sim_root_css_set;
 static int sim_root_cgroup_initialized;
 
@@ -45,6 +53,7 @@ static void sim_init_root_cgroup(void)
 	sim_root_cgroup.kn = &sim_root_kn;
 	sim_root_cgroup.self.cgroup = &sim_root_cgroup;
 	sim_root_cgroup.level = 0;
+	sim_root_cgroup.ancestors[0] = &sim_root_cgroup; /* root is its own ancestor */
 	/* subsys[] is zeroed (no cpuset), percpu_count_ptr is 0 (not dying) */
 
 	memset(&sim_root_css_set, 0, sizeof(sim_root_css_set));
@@ -72,6 +81,15 @@ struct task_struct *sim_task_alloc(void)
 
 void sim_task_free(struct task_struct *p)
 {
+	if (!p)
+		return;
+	/* Free the per-task css_set if it was dynamically allocated (i.e., not
+	 * the static sim_root_css_set). sim_task_set_cgroup() allocates a new
+	 * css_set for each task assignment, creating a leak. Fix that here. */
+	if (p->cgroups && p->cgroups != &sim_root_css_set) {
+		free(p->cgroups);
+		p->cgroups = (void *)0;
+	}
 	free(p);
 }
 
@@ -297,7 +315,11 @@ void *sim_cgroup_alloc(u64 cgid, u32 level, void *parent)
 	struct kernfs_node *kn;
 	struct css_set *css_set;
 
-	cgrp = calloc(1, sizeof(struct cgroup));
+	/* struct cgroup ends with a flexible array member `ancestors[0]`.
+	 * sizeof(struct cgroup) does NOT include space for ancestors[].
+	 * We must allocate extra space for CGROUP_ANCESTOR_MAX pointers. */
+	cgrp = calloc(1, sizeof(struct cgroup)
+		      + CGROUP_ANCESTOR_MAX * sizeof(struct cgroup *));
 	if (!cgrp)
 		return NULL;
 
@@ -346,6 +368,15 @@ void *sim_cgroup_alloc(u64 cgid, u32 level, void *parent)
 
 /*
  * Free a cgroup allocated by sim_cgroup_alloc.
+ *
+ * Also frees the associated css_set that was allocated in sim_cgroup_alloc.
+ * The css_set is found via the cgroup's self.cgroup -> css_set reverse lookup,
+ * but since we don't store that directly, we rely on the task cleanup having
+ * freed per-task css_sets separately (via sim_task_free_cgroup_css).
+ *
+ * The css_set allocated in sim_cgroup_alloc is NOT directly reachable from
+ * the cgroup struct, so we cannot free it here. This is a known memory leak.
+ * TODO: Store the css_set pointer in the cgroup struct for proper cleanup.
  */
 void sim_cgroup_free(void *cgrp_ptr)
 {
