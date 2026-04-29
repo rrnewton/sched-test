@@ -309,19 +309,32 @@ static struct cpu_ctx *cosmos_lookup_percpu_elem(int cpu)
 /*
  * Register the COSMOS BPF maps with the test map infrastructure.
  *
- * Both task_ctx_stor (TASK_STORAGE) and cpu_node_map (HASH) are
- * registered here; cpu_ctx_stor (PERCPU_ARRAY) is handled by the
- * static array above.
+ * task_ctx_stor (TASK_STORAGE), node_ctx_stor (ARRAY), and cpu_node_map (HASH)
+ * are registered here; cpu_ctx_stor (PERCPU_ARRAY) is handled by the static
+ * array above.
  */
 static struct scx_test_map task_ctx_map;
+static struct scx_test_map node_ctx_test_map;
 static struct scx_test_map cpu_node_test_map;
 
 void cosmos_register_maps(void)
 {
+	u32 node;
+	struct node_ctx zero_node = {};
+
 	scx_test_map_clear_all();
 
 	INIT_SCX_TEST_MAP_FROM_TASK_STORAGE(&task_ctx_map, task_ctx_stor);
 	scx_test_map_register(&task_ctx_map, &task_ctx_stor);
+
+	/*
+	 * ARRAY maps are preallocated in the kernel. Seed zeroed entries here so
+	 * init_node() can always look up node_ctx_stor during cosmos_init().
+	 */
+	INIT_SCX_TEST_MAP(&node_ctx_test_map, node_ctx_stor);
+	scx_test_map_register(&node_ctx_test_map, &node_ctx_stor);
+	for (node = 0; node < node_ctx_test_map.max_entries; node++)
+		bpf_map_update_elem(&node_ctx_stor, &node, &zero_node, 0);
 
 	INIT_SCX_TEST_MAP(&cpu_node_test_map, cpu_node_map);
 	scx_test_map_register(&cpu_node_test_map, &cpu_node_map);
