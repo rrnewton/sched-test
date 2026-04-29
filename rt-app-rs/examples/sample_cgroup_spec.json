@@ -1,0 +1,77 @@
+{
+    "global": {
+        "default_policy": "SCHED_OTHER",
+        "duration": 30,
+        "calibration": "CPU0"
+    },
+    "cgroups": {
+        "/workload":                { "cpu.max": { "quota": "max", "period": 100000 } },
+        "/workload/container_a":    { "cpu.max": { "quota": 3800000, "period": 100000 } },
+        "/workload/container_a/fg": { "cpu.max": { "quota": 3600000, "period": 100000 } },
+        "/workload/container_a/bg": { "cpu.max": { "quota": 200000, "period": 100000 } },
+        "/workload/container_b":    { "cpu.max": { "quota": 4400000, "period": 100000 } },
+        "/system":                  { "cpu.max": { "quota": "max", "period": 100000 } },
+        "/system/monitoring":       { "cpu.max": { "quota": 100000, "period": 100000 } },
+        "/system/logging":          { "cpu.max": { "quota": 200000, "period": 100000 } }
+    },
+    "tasks": {
+        "fg_thread_0": {
+            "cgroup": "/workload/container_a/fg",
+            "loop": -1,
+            "phases": {
+                "compute": { "loop": 1, "run": 500 },
+                "idle":    { "loop": 1, "sleep": 1500 }
+            }
+        },
+        "fg_thread_1": {
+            "cgroup": "/workload/container_a/fg",
+            "loop": -1,
+            "phases": {
+                "compute": { "loop": 1, "run": 500 },
+                "idle":    { "loop": 1, "sleep": 1500 }
+            }
+        },
+        "bg_hog_0": {
+            "cgroup": "/workload/container_a/bg",
+            "loop": -1,
+            "priority": 10,
+            "phases": {
+                "work": { "loop": 1, "run": 130 },
+                "idle": { "loop": 1, "sleep": 950 }
+            }
+        },
+        "bg_hog_1": {
+            "cgroup": "/workload/container_a/bg",
+            "loop": -1,
+            "priority": 10,
+            "phases": {
+                "work": { "loop": 1, "run": 130 },
+                "idle": { "loop": 1, "sleep": 950 }
+            }
+        },
+        "container_b_worker": {
+            "cgroup": "/workload/container_b",
+            "loop": -1,
+            "phases": {
+                "burst": { "loop": 1, "run": 2000 },
+                "pause": { "loop": 1, "sleep": 500 }
+            }
+        },
+        "monitor": {
+            "cgroup": "/system/monitoring",
+            "loop": -1,
+            "phases": {
+                "sample": { "loop": 1, "run": 50 },
+                "wait":   { "loop": 1, "sleep": 5000 }
+            }
+        },
+        "logger": {
+            "cgroup": "/system/logging",
+            "loop": -1,
+            "phases": {
+                "write": { "loop": 1, "run": 20 },
+                "wait":  { "loop": 1, "sleep": 1000 }
+            }
+        }
+    }
+}
