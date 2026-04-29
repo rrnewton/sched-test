@@ -167,6 +167,15 @@ pub enum TraceKind {
     IrqStart { cpu: CpuId, irq_type: IrqType },
     /// An interrupt handler completes on a CPU.
     IrqEnd { cpu: CpuId },
+
+    // ----- Cgroup bandwidth events -----
+    /// A cgroup's CPU bandwidth quota was refilled (period timer fired).
+    CgroupBwRefill {
+        cgroup_id: u64,
+        unthrottled_count: u32,
+    },
+    /// A task was throttled because its cgroup exhausted its CPU bandwidth quota.
+    CgroupBwThrottled { cgroup_id: u64, pid: u32 },
 }
 
 /// Reason why a dispatch to a local DSQ was rejected.
@@ -711,6 +720,18 @@ impl Trace {
                     format!("IRQ_START cpu={} type={}", cpu.0, kind_str)
                 }
                 TraceKind::IrqEnd { cpu } => format!("IRQ_END  cpu={}", cpu.0),
+                TraceKind::CgroupBwRefill {
+                    cgroup_id,
+                    unthrottled_count,
+                } => {
+                    format!(
+                        "CGRP_BW_REFILL cgid={} unthrottled={}",
+                        cgroup_id, unthrottled_count
+                    )
+                }
+                TraceKind::CgroupBwThrottled { cgroup_id, pid } => {
+                    format!("CGRP_BW_THROTTLE cgid={} pid={}", cgroup_id, pid)
+                }
             };
             eprintln!(
                 "[{}] cpu={:<3} {}",

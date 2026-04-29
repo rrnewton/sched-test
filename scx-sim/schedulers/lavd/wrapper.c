@@ -623,30 +623,41 @@ __attribute__((weak)) int scx_cgroup_bw_set(
 	return 0;
 }
 
-__attribute__((weak)) int scx_cgroup_bw_throttled(struct cgroup *cgrp,
-					   struct task_struct *p)
+/*
+ * Cgroup bandwidth kfuncs — wired to simulator's BandwidthManager.
+ *
+ * These override the weak stubs to query the simulator's actual cgroup
+ * throttle state instead of always returning 0. When LAVD calls
+ * scx_cgroup_bw_throttled() and the cgroup IS throttled (our engine has
+ * exhausted its quota), we return -EAGAIN so LAVD defers the task via
+ * scx_cgroup_bw_put_aside().
+ */
+
+/* Declared in Rust kfuncs.rs — linked from the simulator library. */
+extern int sim_scx_cgroup_bw_throttled(void *cgrp, void *p);
+extern int sim_scx_cgroup_bw_consume(void *cgrp, u64 runtime);
+extern int sim_scx_cgroup_bw_put_aside(void *p, u64 taskc, u64 vtime, void *cgrp);
+extern int sim_scx_cgroup_bw_reenqueue(void);
+
+int scx_cgroup_bw_throttled(struct cgroup *cgrp, struct task_struct *p)
 {
-	(void)cgrp; (void)p;
-	return 0;
+	return sim_scx_cgroup_bw_throttled((void *)cgrp, (void *)p);
 }
 
-__attribute__((weak)) int scx_cgroup_bw_consume(
-	struct cgroup *cgrp, u64 runtime)
+int scx_cgroup_bw_consume(struct cgroup *cgrp, u64 runtime)
 {
-	(void)cgrp; (void)runtime;
-	return 0;
+	return sim_scx_cgroup_bw_consume((void *)cgrp, runtime);
 }
 
-__attribute__((weak)) int scx_cgroup_bw_put_aside(
+int scx_cgroup_bw_put_aside(
 	struct task_struct *p, u64 taskc, u64 vtime, struct cgroup *cgrp)
 {
-	(void)p; (void)taskc; (void)vtime; (void)cgrp;
-	return 0;
+	return sim_scx_cgroup_bw_put_aside((void *)p, taskc, vtime, (void *)cgrp);
 }
 
-__attribute__((weak)) int scx_cgroup_bw_reenqueue(void)
+int scx_cgroup_bw_reenqueue(void)
 {
-	return 0;
+	return sim_scx_cgroup_bw_reenqueue();
 }
 
 __attribute__((weak)) int scx_cgroup_bw_cancel(u64 taskc)

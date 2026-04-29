@@ -1,0 +1,22 @@
+{
+    "global": {
+        "duration": 1
+    },
+    "cgroups": {
+        "/workload": { "cpu.max": { "quota": "max", "period": 100000 } },
+        "/workload/limited": { "cpu.max": { "quota": 200000, "period": 100000 } }
+    },
+    "tasks": {
+        "fg_thread": {
+            "cgroup": "/workload/limited",
+            "loop": -1,
+            "run": 5000,
+            "sleep": 5000
+        },
+        "bg_hog": {
+            "loop": -1,
+            "run": 5000,
+            "sleep": 5000
+        }
+    }
+}

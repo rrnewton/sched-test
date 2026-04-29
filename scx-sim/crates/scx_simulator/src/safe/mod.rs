@@ -10,6 +10,7 @@
 pub mod atomic_types;
 pub mod bpf_trace;
 pub mod cgroup;
+pub mod cgroup_bw;
 pub mod cpu;
 pub mod det_hashmap;
 pub mod dsq;
