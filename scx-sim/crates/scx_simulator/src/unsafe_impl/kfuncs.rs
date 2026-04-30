@@ -2573,12 +2573,19 @@ pub extern "C" fn sim_scx_cgroup_bw_throttled(cgrp: *mut c_void, _p: *mut c_void
 
         let is_throttled = guard.sim.cgroup_bw.is_throttled(cgid, |cg| {
             guard.cgroup_registry.get(cg).and_then(|info| {
-                if info.parent_cgid.0 == 0 { None } else { Some(info.parent_cgid) }
+                if info.parent_cgid.0 == 0 {
+                    None
+                } else {
+                    Some(info.parent_cgid)
+                }
             })
         });
 
         if is_throttled {
-            debug!(cgid = cgid.0, "scx_cgroup_bw_throttled: THROTTLED → -EAGAIN");
+            debug!(
+                cgid = cgid.0,
+                "scx_cgroup_bw_throttled: THROTTLED → -EAGAIN"
+            );
             -11i32
         } else {
             0i32
@@ -2606,7 +2613,10 @@ pub extern "C" fn sim_scx_cgroup_bw_consume(_cgrp: *mut c_void, _runtime: u64) -
 /// a no-op — the task is already in the BandwidthManager's throttled set.
 #[no_mangle]
 pub extern "C" fn sim_scx_cgroup_bw_put_aside(
-    _p: *mut c_void, _taskc: u64, _vtime: u64, _cgrp: *mut c_void,
+    _p: *mut c_void,
+    _taskc: u64,
+    _vtime: u64,
+    _cgrp: *mut c_void,
 ) -> i32 {
     0
 }

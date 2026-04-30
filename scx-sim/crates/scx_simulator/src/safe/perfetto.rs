@@ -403,7 +403,10 @@ pub(crate) fn write_json(trace: &Trace, writer: &mut impl Write) -> std::io::Res
                 })
             }
 
-            TraceKind::CgroupBwThrottled { cgroup_id, pid: throttled_pid } => {
+            TraceKind::CgroupBwThrottled {
+                cgroup_id,
+                pid: throttled_pid,
+            } => {
                 json!({
                     "ph": "i",
                     "pid": cpu,

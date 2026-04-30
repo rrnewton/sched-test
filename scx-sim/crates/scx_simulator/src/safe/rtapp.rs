@@ -503,11 +503,9 @@ fn parse_cgroup_section(root_obj: &Map<String, Value>) -> Vec<crate::scenario::C
         // Infer parent name from path: "/workload/batch" → parent = "workload"
         let parent_name = {
             let trimmed = path.trim_start_matches('/');
-            if let Some(last_slash) = trimmed.rfind('/') {
-                Some(trimmed[..last_slash].replace('/', "."))
-            } else {
-                None // Direct child of root
-            }
+            trimmed
+                .rfind('/')
+                .map(|last_slash| trimmed[..last_slash].replace('/', "."))
         };
 
         // Parse cpu.max: { "quota": <int|"max">, "period": <int> }
@@ -1098,10 +1096,18 @@ mod tests {
         assert_eq!(bg_bw.period_us, 100_000);
 
         // Check task cgroup assignments
-        let fg_task = scenario.tasks.iter().find(|t| t.name == "fg_thread").unwrap();
+        let fg_task = scenario
+            .tasks
+            .iter()
+            .find(|t| t.name == "fg_thread")
+            .unwrap();
         assert_eq!(fg_task.cgroup_name.as_deref(), Some("app.fg"));
 
-        let bg_task = scenario.tasks.iter().find(|t| t.name == "bg_worker").unwrap();
+        let bg_task = scenario
+            .tasks
+            .iter()
+            .find(|t| t.name == "bg_worker")
+            .unwrap();
         assert_eq!(bg_task.cgroup_name.as_deref(), Some("app.bg"));
     }
 

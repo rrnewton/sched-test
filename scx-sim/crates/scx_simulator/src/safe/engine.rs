@@ -1528,13 +1528,13 @@ impl<S: Scheduler> Simulator<S> {
                 if let Some(ref bw) = cg_def.bandwidth {
                     if let Some(info) = s.cgroup_registry.get_by_name(&cg_def.name) {
                         let cgid = info.cgid;
-                        s.sim.cgroup_bw.configure(cgid, bw.period_us, bw.quota_us, now);
+                        s.sim
+                            .cgroup_bw
+                            .configure(cgid, bw.period_us, bw.quota_us, now);
                         // Schedule the first bandwidth refill timer.
                         let refill_at = now + bw.period_us * 1_000;
-                        s.events.push(
-                            refill_at,
-                            EventKind::BandwidthRefill { cgroup_id: cgid },
-                        );
+                        s.events
+                            .push(refill_at, EventKind::BandwidthRefill { cgroup_id: cgid });
                         info!(
                             cgroup = cg_def.name.as_str(),
                             cgid = cgid.0,
@@ -2814,10 +2814,8 @@ impl<S: Scheduler> Simulator<S> {
         // Schedule the next refill timer.
         if let Some(bw_state) = s.sim.cgroup_bw.get(cgroup_id) {
             let next_refill = now + bw_state.period_ns;
-            s.events.push(
-                next_refill,
-                EventKind::BandwidthRefill { cgroup_id },
-            );
+            s.events
+                .push(next_refill, EventKind::BandwidthRefill { cgroup_id });
         }
     }
 
@@ -2832,11 +2830,7 @@ impl<S: Scheduler> Simulator<S> {
     /// * `s` - Mutable reference to the full sim state
     /// * `pid` - PID of the task that consumed CPU time
     /// * `delta_ns` - CPU time consumed (ns)
-    fn charge_cgroup_bandwidth(
-        s: &mut kfuncs::SimState,
-        pid: Pid,
-        delta_ns: u64,
-    ) {
+    fn charge_cgroup_bandwidth(s: &mut kfuncs::SimState, pid: Pid, delta_ns: u64) {
         if s.sim.cgroup_bw.is_empty() || delta_ns == 0 {
             return;
         }
@@ -2903,12 +2897,7 @@ impl<S: Scheduler> Simulator<S> {
     /// This is similar to `handle_slice_expired` but instead of re-enqueuing
     /// the task, it parks the task until the cgroup's next bandwidth refill.
     /// The task's cgroup is marked as throttled.
-    fn handle_bandwidth_exhausted(
-        &self,
-        cpu: CpuId,
-        sim_arc: &SimArc,
-        monitor: &mut dyn Monitor,
-    ) {
+    fn handle_bandwidth_exhausted(&self, cpu: CpuId, sim_arc: &SimArc, monitor: &mut dyn Monitor) {
         let mut guard = sim_arc.lock().unwrap();
         let s = &mut *guard;
 
@@ -2948,7 +2937,11 @@ impl<S: Scheduler> Simulator<S> {
         Self::charge_cgroup_bandwidth(s, pid, consumed);
 
         // Record the task in the throttled set for this cgroup.
-        let cgroup_raw = s.tasks.get(&pid).map(|t| t.get_cgroup()).unwrap_or(std::ptr::null_mut());
+        let cgroup_raw = s
+            .tasks
+            .get(&pid)
+            .map(|t| t.get_cgroup())
+            .unwrap_or(std::ptr::null_mut());
         if !cgroup_raw.is_null() {
             if let Some(cgid) = s.cgroup_registry.find_cgid_by_raw(cgroup_raw) {
                 if let Some(bw_state) = s.sim.cgroup_bw.get_mut(cgid) {
@@ -4142,7 +4135,11 @@ impl<S: Scheduler> Simulator<S> {
                 if let Some(cgid) = s.cgroup_registry.find_cgid_by_raw(cgroup_raw) {
                     let is_throttled = s.sim.cgroup_bw.is_throttled(cgid, |cg| {
                         s.cgroup_registry.get(cg).and_then(|info| {
-                            if info.parent_cgid.0 == 0 { None } else { Some(info.parent_cgid) }
+                            if info.parent_cgid.0 == 0 {
+                                None
+                            } else {
+                                Some(info.parent_cgid)
+                            }
                         })
                     });
                     if is_throttled {
@@ -4342,7 +4339,11 @@ impl<S: Scheduler> Simulator<S> {
             } else if let Some(cgid) = s.cgroup_registry.find_cgid_by_raw(cgroup_raw) {
                 s.sim.cgroup_bw.max_run_ns(cgid, |cg| {
                     s.cgroup_registry.get(cg).and_then(|info| {
-                        if info.parent_cgid.0 == 0 { None } else { Some(info.parent_cgid) }
+                        if info.parent_cgid.0 == 0 {
+                            None
+                        } else {
+                            Some(info.parent_cgid)
+                        }
                     })
                 })
             } else {

@@ -161,21 +161,14 @@ impl BandwidthManager {
     ///
     /// If `quota_us` is 0 or the period is 0, the entry is removed (unlimited).
     /// Called when the engine processes `cgroup_set_bandwidth`.
-    pub fn configure(
-        &mut self,
-        cgid: CgroupId,
-        period_us: u64,
-        quota_us: u64,
-        now_ns: TimeNs,
-    ) {
+    pub fn configure(&mut self, cgid: CgroupId, period_us: u64, quota_us: u64, now_ns: TimeNs) {
         if quota_us == 0 || period_us == 0 {
             self.states.remove(&cgid);
             return;
         }
         debug!(
             cgid = cgid.0,
-            quota_us, period_us,
-            "cgroup bandwidth: configured"
+            quota_us, period_us, "cgroup bandwidth: configured"
         );
         self.states
             .insert(cgid, CgroupBandwidthState::new(quota_us, period_us, now_ns));
