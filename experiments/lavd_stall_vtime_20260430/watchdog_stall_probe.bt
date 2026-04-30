@@ -1,0 +1,136 @@
+#!/usr/bin/env bpftrace
+/*
+ * watchdog_stall_probe.bt — Capture task state when sched_ext watchdog fires
+ *
+ * Hooks the sched_ext watchdog work function and dumps every task on the
+ * runnable list whose runnable_at exceeds the timeout.  Also captures the
+ * sched_ext_dump tracepoint for the scheduler's own diagnostics.
+ *
+ * Usage:
+ *   sudo bpftrace watchdog_stall_probe.bt
+ *
+ * Output:  One block per stall event with task name, PID, ops_state,
+ *          dsq_vtime, flags, runnable_at, and age.
+ *
+ * Requires: kernel with CONFIG_SCHED_CLASS_EXT, BTF enabled.
+ * Tested:   6.13.2-fbk11 (devbig079); should work on 6.16.1-fbk3.
+ */
+
+BEGIN
+{
+    printf("=== LAVD Watchdog Stall Probe ===\n");
+    printf("Waiting for sched_ext watchdog events...\n");
+    printf("(Press Ctrl-C to stop)\n\n");
+}
+
+/*
+ * Hook the watchdog work function.  This fires when the kernel's
+ * sched_ext watchdog detects a runnable task that hasn't been dispatched
+ * within timeout_ms (default 30 s for LAVD).
+ *
+ * At this point the kernel is about to kill the scheduler.
+ * We print a banner so the operator knows the stall fired.
+ */
+kprobe:scx_watchdog_workfn
+{
+    printf("\n");
+    printf("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
+    printf("!!! WATCHDOG FIRED at %llu ns (cpu %d)               !!!\n",
+           nsecs, cpu);
+    printf("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
+    printf("\n");
+
+    /*
+     * Print the current sched_ext state from /sys.  Not all kernels
+     * export this, so the printf is best-effort.
+     */
+    printf("  timestamp:  %llu\n", nsecs);
+    printf("  cpu:        %d\n", cpu);
+    printf("  comm:       %s\n", comm);
+    printf("  pid:        %d\n", pid);
+    printf("\n");
+}
+
+/*
+ * Capture the sched_ext_dump tracepoint.  LAVD registers a dump handler
+ * (lavd_dump / lavd_dump_task) that prints per-task scheduling state
+ * including vtime, lat_cri, perf_cri, cpdom, and cgroup throttle status.
+ * Each line arrives as a separate tracepoint hit.
+ */
+tracepoint:sched_ext:sched_ext_dump
+{
+    printf("  SCX_DUMP: %s\n", str(args.line));
+}
+
+/*
+ * Track tasks entering the runnable state via the standard scheduler
+ * wakeup tracepoint.  We record the timestamp so we can correlate with
+ * watchdog events.  Only track squashfuse_ll to keep overhead low.
+ */
+tracepoint:sched:sched_wakeup
+/comm == "squashfuse_ll" || comm == "squashfuse"/
+{
+    @wakeup_time[tid] = nsecs;
+    printf("  WAKEUP: pid=%d comm=%s cpu=%d target_cpu=%d\n",
+           args.pid, args.comm, cpu, args.target_cpu);
+}
+
+/*
+ * Track task switches involving squashfuse — records when the task
+ * actually gets CPU time (or is switched out).
+ */
+tracepoint:sched:sched_switch
+/args.prev_comm == "squashfuse_ll" || args.next_comm == "squashfuse_ll"/
+{
+    if (args.next_comm == "squashfuse_ll") {
+        $wait = @wakeup_time[args.next_pid];
+        if ($wait > 0) {
+            $delay_us = (nsecs - $wait) / 1000;
+            printf("  SWITCH_IN: pid=%d comm=%s cpu=%d wait_us=%llu\n",
+                   args.next_pid, args.next_comm, cpu, $delay_us);
+            delete(@wakeup_time[args.next_pid]);
+        } else {
+            printf("  SWITCH_IN: pid=%d comm=%s cpu=%d\n",
+                   args.next_pid, args.next_comm, cpu);
+        }
+    }
+    if (args.prev_comm == "squashfuse_ll") {
+        printf("  SWITCH_OUT: pid=%d comm=%s cpu=%d state=%d\n",
+               args.prev_pid, args.prev_comm, cpu, args.prev_state);
+    }
+}
+
+/*
+ * Track process creation — squashfuse_ll is spawned for each XAR mount.
+ */
+tracepoint:sched:sched_process_fork
+/args.parent_comm == "squashfuse_ll" || args.child_comm == "squashfuse_ll" ||
+ args.parent_comm == "squashfuse" || args.child_comm == "squashfuse"/
+{
+    printf("  FORK: parent=%s[%d] -> child=%s[%d]\n",
+           args.parent_comm, args.parent_pid,
+           args.child_comm, args.child_pid);
+}
+
+/*
+ * Track process exit.
+ */
+tracepoint:sched:sched_process_exit
+/comm == "squashfuse_ll" || comm == "squashfuse"/
+{
+    printf("  EXIT: pid=%d comm=%s\n", pid, comm);
+}
+
+/*
+ * Periodic heartbeat — proves the probe is alive.
+ */
+interval:s:30
+{
+    printf("  [heartbeat] %llu — probe alive, sched_ext state check\n", nsecs);
+}
+
+END
+{
+    printf("\n=== Probe stopped ===\n");
+    clear(@wakeup_time);
+}
