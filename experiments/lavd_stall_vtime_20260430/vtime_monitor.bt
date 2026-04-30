@@ -1,0 +1,114 @@
+#!/usr/bin/env bpftrace
+/*
+ * vtime_monitor.bt — Monitor cur_logical_clk and dsq_vtime distribution
+ *
+ * Samples the dsq_vtime of tasks as they are inserted into DSQs to detect
+ * the cur_logical_clk underflow bug (6f4921a6).  If any task gets a vtime
+ * near UINT64_MAX, this probe will catch it.
+ *
+ * Also tracks the distribution of vtime values and flags tasks with
+ * anomalously high vtimes that could cause starvation.
+ *
+ * Usage:
+ *   sudo bpftrace vtime_monitor.bt
+ *
+ * Output: Periodic histograms of vtime values and alerts for outliers.
+ */
+
+BEGIN
+{
+    printf("=== LAVD Vtime Monitor ===\n");
+    printf("Monitoring dsq_vtime distribution for underflow detection...\n");
+    printf("Alert threshold: vtime > 0xF000000000000000 (near UINT64_MAX)\n\n");
+
+    @min_vtime = (uint64)0xFFFFFFFFFFFFFFFF;
+    @max_vtime = (uint64)0;
+    @alert_count = (uint64)0;
+}
+
+/*
+ * scx_bpf_dsq_insert_vtime — sample every vtime insertion.
+ * arg3 = vtime value being inserted.
+ */
+kprobe:scx_bpf_dsq_insert_vtime
+{
+    $p = (struct task_struct *)arg0;
+    $vtime = arg3;
+    $dsq_id = arg1;
+
+    /* Track min/max */
+    if ($vtime < @min_vtime) {
+        @min_vtime = $vtime;
+    }
+    if ($vtime > @max_vtime) {
+        @max_vtime = $vtime;
+    }
+
+    /* Histogram of vtime magnitude (log2 scale) */
+    @vtime_log2 = lhist($vtime >> 56, 0, 256, 1);
+
+    /* Alert on anomalously high vtime (near UINT64_MAX) */
+    if ($vtime > 0xF000000000000000) {
+        @alert_count = @alert_count + 1;
+        printf("!!! VTIME ALERT: pid=%d comm=%s vtime=0x%llx dsq=0x%llx cpu=%d\n",
+               $p->pid, $p->comm, $vtime, $dsq_id, cpu);
+    }
+
+    /* Per-comm vtime tracking for squashfuse */
+    if ($p->comm == "squashfuse_ll" || $p->comm == "squashfuse") {
+        printf("  SQFS vtime: pid=%d vtime=0x%llx dsq=0x%llx\n",
+               $p->pid, $vtime, $dsq_id);
+        @sqfs_vtimes = hist($vtime);
+    }
+
+    @total_inserts = @total_inserts + 1;
+}
+
+/*
+ * Track LAVD scheduler restarts via the sched_ext enable/disable.
+ * Each restart resets cur_logical_clk (to 0 in buggy builds).
+ */
+tracepoint:sched_ext:sched_ext_dump
+{
+    printf("  SCX_EVENT: %s\n", str(args.line));
+}
+
+/*
+ * Periodic report.
+ */
+interval:s:10
+{
+    printf("\n--- [%llu] Vtime Report ---\n", nsecs / 1000);
+    printf("  total_inserts:  %llu\n", @total_inserts);
+    printf("  min_vtime:      0x%llx\n", @min_vtime);
+    printf("  max_vtime:      0x%llx\n", @max_vtime);
+    printf("  vtime_range:    0x%llx\n", @max_vtime - @min_vtime);
+    printf("  alerts (>0xF0): %llu\n", @alert_count);
+    printf("  vtime top byte distribution:\n");
+    print(@vtime_log2);
+    printf("---\n\n");
+}
+
+END
+{
+    printf("\n=== Final Vtime Report ===\n");
+    printf("  total_inserts:  %llu\n", @total_inserts);
+    printf("  min_vtime:      0x%llx\n", @min_vtime);
+    printf("  max_vtime:      0x%llx\n", @max_vtime);
+    printf("  alerts (>0xF0): %llu\n", @alert_count);
+    printf("\n  Top byte distribution:\n");
+    print(@vtime_log2);
+
+    if (@alert_count > 0) {
+        printf("\n  !!! UNDERFLOW DETECTED: %llu tasks got vtime near UINT64_MAX\n",
+               @alert_count);
+        printf("  This confirms the cur_logical_clk underflow bug (6f4921a6)\n");
+    }
+
+    clear(@vtime_log2);
+    clear(@sqfs_vtimes);
+    clear(@min_vtime);
+    clear(@max_vtime);
+    clear(@alert_count);
+    clear(@total_inserts);
+}
