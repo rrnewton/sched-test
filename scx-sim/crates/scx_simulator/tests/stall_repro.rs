@@ -49,14 +49,10 @@ fn test_stall_moderate_oversubscription() {
         .cgroup_with_bandwidth("generous", &all_cpus, 100_000, 400_000, 0);
 
     for i in 0..10 {
-        builder = builder.add_task_in_cgroup(
-            &format!("tight_{i:02}"), 0, heavy_worker(), "tight",
-        );
+        builder = builder.add_task_in_cgroup(&format!("tight_{i:02}"), 0, heavy_worker(), "tight");
     }
     for i in 0..10 {
-        builder = builder.add_task_in_cgroup(
-            &format!("gen_{i:02}"), 0, heavy_worker(), "generous",
-        );
+        builder = builder.add_task_in_cgroup(&format!("gen_{i:02}"), 0, heavy_worker(), "generous");
     }
 
     let scenario = builder.build();
@@ -73,20 +69,32 @@ fn test_stall_moderate_oversubscription() {
                 let pid = Pid(i + 1);
                 let rt = trace.total_runtime(pid);
                 let sched = trace.schedule_count(pid);
-                eprintln!("  tight_{i:02} (pid {}): runtime={}ms, schedules={sched}",
-                    pid.0, rt / 1_000_000);
+                eprintln!(
+                    "  tight_{i:02} (pid {}): runtime={}ms, schedules={sched}",
+                    pid.0,
+                    rt / 1_000_000
+                );
             }
             for i in 0..10 {
                 let pid = Pid(i + 11);
                 let rt = trace.total_runtime(pid);
                 let sched = trace.schedule_count(pid);
-                eprintln!("  gen_{i:02} (pid {}): runtime={}ms, schedules={sched}",
-                    pid.0, rt / 1_000_000);
+                eprintln!(
+                    "  gen_{i:02} (pid {}): runtime={}ms, schedules={sched}",
+                    pid.0,
+                    rt / 1_000_000
+                );
             }
         }
-        ExitKind::ErrorStall { pid, runnable_for_ns } => {
-            eprintln!("  ⚠️ STALL DETECTED! pid={}, stalled for {}ms",
-                pid.0, runnable_for_ns / 1_000_000);
+        ExitKind::ErrorStall {
+            pid,
+            runnable_for_ns,
+        } => {
+            eprintln!(
+                "  ⚠️ STALL DETECTED! pid={}, stalled for {}ms",
+                pid.0,
+                runnable_for_ns / 1_000_000
+            );
             trace.dump();
         }
         other => {
@@ -114,14 +122,11 @@ fn test_stall_extreme_oversubscription() {
         .cgroup_with_bandwidth("fed", &all_cpus, 100_000, 200_000, 0);
 
     for i in 0..30 {
-        builder = builder.add_task_in_cgroup(
-            &format!("starve_{i:02}"), 0, heavy_worker(), "starving",
-        );
+        builder =
+            builder.add_task_in_cgroup(&format!("starve_{i:02}"), 0, heavy_worker(), "starving");
     }
     for i in 0..10 {
-        builder = builder.add_task_in_cgroup(
-            &format!("fed_{i:02}"), 0, medium_worker(), "fed",
-        );
+        builder = builder.add_task_in_cgroup(&format!("fed_{i:02}"), 0, medium_worker(), "fed");
     }
 
     let scenario = builder.build();
@@ -146,9 +151,15 @@ fn test_stall_extreme_oversubscription() {
             }
             eprintln!("  Least-scheduled starving task: {min_task} with {min_sched} schedules");
         }
-        ExitKind::ErrorStall { pid, runnable_for_ns } => {
-            eprintln!("  ⚠️⚠️⚠️ STALL DETECTED! pid={}, stalled for {}ms ⚠️⚠️⚠️",
-                pid.0, runnable_for_ns / 1_000_000);
+        ExitKind::ErrorStall {
+            pid,
+            runnable_for_ns,
+        } => {
+            eprintln!(
+                "  ⚠️⚠️⚠️ STALL DETECTED! pid={}, stalled for {}ms ⚠️⚠️⚠️",
+                pid.0,
+                runnable_for_ns / 1_000_000
+            );
             trace.dump();
         }
         other => {
@@ -175,14 +186,12 @@ fn test_stall_david_dai_config() {
         .cgroup_with_bandwidth("bw_generous", &all_cpus, 100_000, 800_000, 0);
 
     for i in 0..30 {
-        builder = builder.add_task_in_cgroup(
-            &format!("tight_{i:02}"), 0, heavy_worker(), "bw_tight",
-        );
+        builder =
+            builder.add_task_in_cgroup(&format!("tight_{i:02}"), 0, heavy_worker(), "bw_tight");
     }
     for i in 0..30 {
-        builder = builder.add_task_in_cgroup(
-            &format!("gen_{i:02}"), 0, heavy_worker(), "bw_generous",
-        );
+        builder =
+            builder.add_task_in_cgroup(&format!("gen_{i:02}"), 0, heavy_worker(), "bw_generous");
     }
 
     let scenario = builder.build();
@@ -214,9 +223,15 @@ fn test_stall_david_dai_config() {
             eprintln!("  tight min schedules: {tight_min_sched}");
             eprintln!("  generous min schedules: {gen_min_sched}");
         }
-        ExitKind::ErrorStall { pid, runnable_for_ns } => {
-            eprintln!("  ⚠️⚠️⚠️ STALL DETECTED! pid={}, stalled for {}ms ⚠️⚠️⚠️",
-                pid.0, runnable_for_ns / 1_000_000);
+        ExitKind::ErrorStall {
+            pid,
+            runnable_for_ns,
+        } => {
+            eprintln!(
+                "  ⚠️⚠️⚠️ STALL DETECTED! pid={}, stalled for {}ms ⚠️⚠️⚠️",
+                pid.0,
+                runnable_for_ns / 1_000_000
+            );
             eprintln!("  THIS IS THE PRODUCTION STALL PATTERN");
             trace.dump();
         }
@@ -245,14 +260,12 @@ fn test_stall_interleave_cooperative() {
         .cgroup_with_bandwidth("bw_generous", &all_cpus, 100_000, 800_000, 0);
 
     for i in 0..30 {
-        builder = builder.add_task_in_cgroup(
-            &format!("tight_{i:02}"), 0, heavy_worker(), "bw_tight",
-        );
+        builder =
+            builder.add_task_in_cgroup(&format!("tight_{i:02}"), 0, heavy_worker(), "bw_tight");
     }
     for i in 0..30 {
-        builder = builder.add_task_in_cgroup(
-            &format!("gen_{i:02}"), 0, heavy_worker(), "bw_generous",
-        );
+        builder =
+            builder.add_task_in_cgroup(&format!("gen_{i:02}"), 0, heavy_worker(), "bw_generous");
     }
 
     let scenario = builder.build();
@@ -272,9 +285,15 @@ fn test_stall_interleave_cooperative() {
             eprintln!("  tight min schedules: {tight_min}");
             eprintln!("  generous min schedules: {gen_min}");
         }
-        ExitKind::ErrorStall { pid, runnable_for_ns } => {
-            eprintln!("  ⚠️⚠️⚠️ STALL DETECTED (interleave)! pid={}, stalled for {}ms ⚠️⚠️⚠️",
-                pid.0, runnable_for_ns / 1_000_000);
+        ExitKind::ErrorStall {
+            pid,
+            runnable_for_ns,
+        } => {
+            eprintln!(
+                "  ⚠️⚠️⚠️ STALL DETECTED (interleave)! pid={}, stalled for {}ms ⚠️⚠️⚠️",
+                pid.0,
+                runnable_for_ns / 1_000_000
+            );
             trace.dump();
         }
         other => {
@@ -301,15 +320,13 @@ fn test_stall_long_duration() {
 
     // 50 tight tasks — even more oversubscription
     for i in 0..50 {
-        builder = builder.add_task_in_cgroup(
-            &format!("tight_{i:02}"), 0, heavy_worker(), "bw_tight",
-        );
+        builder =
+            builder.add_task_in_cgroup(&format!("tight_{i:02}"), 0, heavy_worker(), "bw_tight");
     }
     // 30 generous tasks
     for i in 0..30 {
-        builder = builder.add_task_in_cgroup(
-            &format!("gen_{i:02}"), 0, heavy_worker(), "bw_generous",
-        );
+        builder =
+            builder.add_task_in_cgroup(&format!("gen_{i:02}"), 0, heavy_worker(), "bw_generous");
     }
 
     let scenario = builder.build();
@@ -326,9 +343,15 @@ fn test_stall_long_duration() {
             }
             eprintln!("  tight min schedules: {tight_min}");
         }
-        ExitKind::ErrorStall { pid, runnable_for_ns } => {
-            eprintln!("  ⚠️⚠️⚠️ STALL DETECTED (30s run)! pid={}, stalled for {}ms ⚠️⚠️⚠️",
-                pid.0, runnable_for_ns / 1_000_000);
+        ExitKind::ErrorStall {
+            pid,
+            runnable_for_ns,
+        } => {
+            eprintln!(
+                "  ⚠️⚠️⚠️ STALL DETECTED (30s run)! pid={}, stalled for {}ms ⚠️⚠️⚠️",
+                pid.0,
+                runnable_for_ns / 1_000_000
+            );
         }
         other => {
             eprintln!("  Result: {other:?}");
