@@ -1,0 +1,488 @@
+{
+  "global": {
+    "default_policy": "SCHED_OTHER",
+    "duration": 30,
+    "log_basename": "repromagic",
+    "log_size": 100,
+    "logdir": "./",
+    "calibration": "CPU0"
+  },
+  "tasks": {
+    "bg_hog_0": {
+      "cpus": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "loop": -1,
+      "phases": {
+        "idle": {
+          "loop": 1,
+          "sleep": 950
+        },
+        "work": {
+          "loop": 1,
+          "run": 130
+        }
+      },
+      "priority": 10
+    },
+    "bg_hog_1": {
+      "cpus": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "loop": -1,
+      "phases": {
+        "idle": {
+          "loop": 1,
+          "sleep": 950
+        },
+        "work": {
+          "loop": 1,
+          "run": 130
+        }
+      },
+      "priority": 10
+    },
+    "bg_hog_10": {
+      "cpus": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "loop": -1,
+      "phases": {
+        "idle": {
+          "loop": 1,
+          "sleep": 950
+        },
+        "work": {
+          "loop": 1,
+          "run": 130
+        }
+      },
+      "priority": 10
+    },
+    "bg_hog_11": {
+      "cpus": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "loop": -1,
+      "phases": {
+        "idle": {
+          "loop": 1,
+          "sleep": 950
+        },
+        "work": {
+          "loop": 1,
+          "run": 130
+        }
+      },
+      "priority": 10
+    },
+    "bg_hog_12": {
+      "cpus": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "loop": -1,
+      "phases": {
+        "idle": {
+          "loop": 1,
+          "sleep": 950
+        },
+        "work": {
+          "loop": 1,
+          "run": 130
+        }
+      },
+      "priority": 10
+    },
+    "bg_hog_13": {
+      "cpus": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "loop": -1,
+      "phases": {
+        "idle": {
+          "loop": 1,
+          "sleep": 950
+        },
+        "work": {
+          "loop": 1,
+          "run": 130
+        }
+      },
+      "priority": 10
+    },
+    "bg_hog_14": {
+      "cpus": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "loop": -1,
+      "phases": {
+        "idle": {
+          "loop": 1,
+          "sleep": 950
+        },
+        "work": {
+          "loop": 1,
+          "run": 130
+        }
+      },
+      "priority": 10
+    },
+    "bg_hog_15": {
+      "cpus": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "loop": -1,
+      "phases": {
+        "idle": {
+          "loop": 1,
+          "sleep": 950
+        },
+        "work": {
+          "loop": 1,
+          "run": 130
+        }
+      },
+      "priority": 10
+    },
+    "bg_hog_2": {
+      "cpus": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "loop": -1,
+      "phases": {
+        "idle": {
+          "loop": 1,
+          "sleep": 950
+        },
+        "work": {
+          "loop": 1,
+          "run": 130
+        }
+      },
+      "priority": 10
+    },
+    "bg_hog_3": {
+      "cpus": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "loop": -1,
+      "phases": {
+        "idle": {
+          "loop": 1,
+          "sleep": 950
+        },
+        "work": {
+          "loop": 1,
+          "run": 130
+        }
+      },
+      "priority": 10
+    },
+    "bg_hog_4": {
+      "cpus": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "loop": -1,
+      "phases": {
+        "idle": {
+          "loop": 1,
+          "sleep": 950
+        },
+        "work": {
+          "loop": 1,
+          "run": 130
+        }
+      },
+      "priority": 10
+    },
+    "bg_hog_5": {
+      "cpus": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "loop": -1,
+      "phases": {
+        "idle": {
+          "loop": 1,
+          "sleep": 950
+        },
+        "work": {
+          "loop": 1,
+          "run": 130
+        }
+      },
+      "priority": 10
+    },
+    "bg_hog_6": {
+      "cpus": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "loop": -1,
+      "phases": {
+        "idle": {
+          "loop": 1,
+          "sleep": 950
+        },
+        "work": {
+          "loop": 1,
+          "run": 130
+        }
+      },
+      "priority": 10
+    },
+    "bg_hog_7": {
+      "cpus": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "loop": -1,
+      "phases": {
+        "idle": {
+          "loop": 1,
+          "sleep": 950
+        },
+        "work": {
+          "loop": 1,
+          "run": 130
+        }
+      },
+      "priority": 10
+    },
+    "bg_hog_8": {
+      "cpus": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "loop": -1,
+      "phases": {
+        "idle": {
+          "loop": 1,
+          "sleep": 950
+        },
+        "work": {
+          "loop": 1,
+          "run": 130
+        }
+      },
+      "priority": 10
+    },
+    "bg_hog_9": {
+      "cpus": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "loop": -1,
+      "phases": {
+        "idle": {
+          "loop": 1,
+          "sleep": 950
+        },
+        "work": {
+          "loop": 1,
+          "run": 130
+        }
+      },
+      "priority": 10
+    },
+    "fg_thread_0": {
+      "cpus": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "loop": -1,
+      "phases": {
+        "compute": {
+          "loop": 1,
+          "run": 500
+        },
+        "idle": {
+          "loop": 1,
+          "sleep": 1500
+        }
+      }
+    },
+    "fg_thread_1": {
+      "cpus": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "loop": -1,
+      "phases": {
+        "compute": {
+          "loop": 1,
+          "run": 500
+        },
+        "idle": {
+          "loop": 1,
+          "sleep": 1500
+        }
+      }
+    },
+    "fg_thread_2": {
+      "cpus": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "loop": -1,
+      "phases": {
+        "compute": {
+          "loop": 1,
+          "run": 500
+        },
+        "idle": {
+          "loop": 1,
+          "sleep": 1500
+        }
+      }
+    },
+    "fg_thread_3": {
+      "cpus": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "loop": -1,
+      "phases": {
+        "compute": {
+          "loop": 1,
+          "run": 500
+        },
+        "idle": {
+          "loop": 1,
+          "sleep": 1500
+        }
+      }
+    }
+  }
+}
