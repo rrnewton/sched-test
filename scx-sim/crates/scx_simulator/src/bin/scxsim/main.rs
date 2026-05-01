@@ -849,8 +849,8 @@ fn main() {
 
     let result = match &cli.command {
         Command::Run(args) => run(args, cli.config.as_deref()),
-        Command::Replay(args) => replay_simulation(&args),
-        Command::PrintAddresses(args) => print_addresses(&args),
+        Command::Replay(args) => replay_simulation(args),
+        Command::PrintAddresses(args) => print_addresses(args),
     };
 
     if let Err(e) = result {
