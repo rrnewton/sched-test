@@ -30,6 +30,7 @@ use crate::scenario::{
 };
 use crate::scheduler_wrapper::{OptionalPtr, SchedulerWrapper, TaskPtr};
 use crate::sim_task::SimTask;
+use crate::structop_concurrency::print_structop_concurrency_histogram;
 use crate::task::{OpsTaskState, Phase, TaskState};
 use crate::task_wrapper::SimTaskHandle;
 use crate::trace::{DsqSampleTrigger, Trace, TraceKind};
@@ -883,6 +884,8 @@ fn update_sum_exec(raw: *mut c_void, base: TimeNs, elapsed: TimeNs) {
 /// 3. **Fallback** (neither): Uses accumulated kfunc cost with a minimum floor.
 fn charge_sched_time(state: &mut SimulatorState, cpu: CpuId, ops: &str) {
     let idx = cpu.0 as usize;
+    let start_ns = state.cpus[idx].local_clock;
+    let interval = state.active_structop.take().unwrap_or((cpu, start_ns));
 
     // Accumulate per-CPU structop stats for the summary table.
     // Always counted here for consistency across all modes.
@@ -911,6 +914,11 @@ fn charge_sched_time(state: &mut SimulatorState, cpu: CpuId, ops: &str) {
             let kfunc_ns = state.rbc_kfunc_ns;
             let total_ns = rbc_ns + kfunc_ns;
             state.cpus[cpu.0 as usize].local_clock += total_ns;
+            state.structop_concurrency.record_interval(
+                interval.0,
+                interval.1,
+                interval.1 + total_ns,
+            );
             trace!(
                 ops,
                 rbc = count,
@@ -943,6 +951,11 @@ fn charge_sched_time(state: &mut SimulatorState, cpu: CpuId, ops: &str) {
             let kfunc_ns = state.rbc_kfunc_ns;
             let total_ns = rbc_ns + kfunc_ns;
             state.cpus[cpu.0 as usize].local_clock += total_ns;
+            state.structop_concurrency.record_interval(
+                interval.0,
+                interval.1,
+                interval.1 + total_ns,
+            );
             kfuncs::clock_window_check(cpu, state.cpus[cpu.0 as usize].local_clock);
             trace!(
                 ops,
@@ -970,6 +983,9 @@ fn charge_sched_time(state: &mut SimulatorState, cpu: CpuId, ops: &str) {
         let kfunc_ns = state.rbc_kfunc_ns;
         let total_ns = kfunc_ns.max(MIN_CALLBACK_COST_NS);
         state.cpus[cpu.0 as usize].local_clock += total_ns;
+        state
+            .structop_concurrency
+            .record_interval(interval.0, interval.1, interval.1 + total_ns);
         kfuncs::clock_window_check(cpu, state.cpus[cpu.0 as usize].local_clock);
         trace!(
             ops,
@@ -1048,6 +1064,7 @@ macro_rules! sim_callback {
         let __cpu = $cpu;
         $s.sim.current_cpu = __cpu;
         kfuncs::set_sim_clock($s.sim.cpus[__cpu.0 as usize].local_clock, Some(__cpu));
+        $s.sim.active_structop = Some((__cpu, $s.sim.cpus[__cpu.0 as usize].local_clock));
         kfuncs::install_callback_ctx(kfuncs::CallbackContext {
             current_cpu: __cpu,
             ops_context: $s.sim.ops_context,
@@ -1330,6 +1347,9 @@ impl<S: Scheduler> Simulator<S> {
                 crate::preempt::StructopInfo::default();
                 scenario.nr_cpus as usize
             ],
+            active_structop: None,
+            structop_concurrency: crate::structop_concurrency::StructopConcurrencyTracker::default(
+            ),
             native_concurrent: scenario.native_concurrent,
             cgroup_bw: crate::cgroup_bw::BandwidthManager::new(),
         };
@@ -1922,6 +1942,10 @@ impl<S: Scheduler> Simulator<S> {
 
         // Print structop summary (per-CPU ops callbacks, RBC, kfuncs).
         crate::preempt::print_structop_summary(&s.sim.structop_accum);
+        print_structop_concurrency_histogram(
+            &s.sim.structop_concurrency,
+            simulation_logical_end(&s.sim),
+        );
 
         // Print preemption stats (longest structop and interval RBC counts).
         print_preemption_stats(
@@ -4452,6 +4476,16 @@ impl<S: Scheduler> Simulator<S> {
             }
         }
     }
+}
+
+fn simulation_logical_end(state: &SimulatorState) -> TimeNs {
+    let max_local_clock = state
+        .cpus
+        .iter()
+        .map(|cpu| cpu.local_clock)
+        .max()
+        .unwrap_or(0);
+    state.clock.max(max_local_clock)
 }
 
 #[cfg(test)]

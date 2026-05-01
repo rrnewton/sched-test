@@ -436,6 +436,17 @@ pub struct SimulatorState {
     /// Indexed by CpuId.0. Seeded into worker thread-locals at the start
     /// of each dispatch round and drained back at the end.
     pub structop_accum: Vec<crate::preempt::StructopInfo>,
+    /// CPU and logical start time of the callback currently executing.
+    ///
+    /// Set at callback entry by `sim_callback!` and consumed by
+    /// `charge_sched_time()` so concurrency is attributed to the CPU that
+    /// entered the callback rather than any later accounting CPU.
+    pub(crate) active_structop: Option<(CpuId, TimeNs)>,
+    /// Logical-time concurrency tracker for scheduler ops callbacks.
+    ///
+    /// Records one logical interval per structop callback so the final
+    /// histogram is invariant to any internal kfunc yields or preemptions.
+    pub(crate) structop_concurrency: crate::structop_concurrency::StructopConcurrencyTracker,
     /// SHARED-READ: Configuration set at init, never mutated during simulation.
     ///
     /// Native concurrency backend configuration (None = disabled).
@@ -2692,6 +2703,9 @@ mod tests {
             e9_replay_backend: None,
             e9_fns: None,
             structop_accum: vec![crate::preempt::StructopInfo::default(); nr_cpus as usize],
+            active_structop: None,
+            structop_concurrency: crate::structop_concurrency::StructopConcurrencyTracker::default(
+            ),
             native_concurrent: None,
             cgroup_bw: crate::cgroup_bw::BandwidthManager::new(),
         }

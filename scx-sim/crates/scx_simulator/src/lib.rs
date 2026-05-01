@@ -52,6 +52,7 @@ pub(crate) use safe::perfetto;
 pub use safe::rtapp;
 pub use safe::scenario;
 pub use safe::stats;
+pub(crate) use safe::structop_concurrency;
 pub use safe::task;
 pub use safe::trace;
 pub use safe::types;
