@@ -183,33 +183,6 @@ impl Default for NoiseConfig {
     }
 }
 
-impl NoiseConfig {
-    /// Create a NoiseConfig with defaults influenced by environment variables.
-    ///
-    /// Precedence: `SCX_SIM_NOISE` > `SCX_SIM_INSTANT_TIMING` > hardcoded default.
-    ///
-    /// - `SCX_SIM_NOISE=0` disables noise; `SCX_SIM_NOISE=1` enables it.
-    /// - `SCX_SIM_INSTANT_TIMING=1` disables noise (lower priority).
-    /// - If neither is set, defaults to enabled.
-    pub fn from_env() -> Self {
-        let mut config = Self::default();
-        if std::env::var("SCX_SIM_INSTANT_TIMING").ok().as_deref() == Some("1") {
-            config.enabled = false;
-        }
-        match std::env::var("SCX_SIM_NOISE").ok().as_deref() {
-            Some("0") => config.enabled = false,
-            Some("1") => config.enabled = true,
-            _ => {}
-        }
-        if let Ok(v) = std::env::var("SCX_SIM_RUN_JITTER_CV_PPM") {
-            if let Ok(ppm) = v.parse::<u64>() {
-                config.run_jitter_cv_ppm = ppm;
-            }
-        }
-        config
-    }
-}
-
 /// Which preemption mechanism to use for mid-C-code preemption.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PreemptMode {
@@ -397,59 +370,6 @@ impl Default for OverheadConfig {
 }
 
 impl OverheadConfig {
-    /// Create an OverheadConfig with defaults influenced by environment variables.
-    ///
-    /// Precedence: `SCX_SIM_OVERHEAD` > `SCX_SIM_INSTANT_TIMING` > hardcoded default.
-    ///
-    /// - `SCX_SIM_OVERHEAD=0` disables overhead; `SCX_SIM_OVERHEAD=1` enables it.
-    /// - `SCX_SIM_INSTANT_TIMING=1` disables overhead (lower priority).
-    /// - If neither is set, defaults to enabled.
-    pub fn from_env() -> Self {
-        let mut config = Self::default();
-        if std::env::var("SCX_SIM_INSTANT_TIMING").ok().as_deref() == Some("1") {
-            config.enabled = false;
-        }
-        match std::env::var("SCX_SIM_OVERHEAD").ok().as_deref() {
-            Some("0") => config.enabled = false,
-            Some("1") => config.enabled = true,
-            _ => {}
-        }
-
-        // Per-parameter env var overrides for tuning against production traces.
-        fn env_u64(name: &str) -> Option<u64> {
-            std::env::var(name).ok()?.parse().ok()
-        }
-        if let Some(v) = env_u64("SCX_SIM_VOL_CSW_NS") {
-            config.voluntary_csw_ns = v;
-        }
-        if let Some(v) = env_u64("SCX_SIM_INVOL_CSW_NS") {
-            config.involuntary_csw_ns = v;
-        }
-        if let Some(v) = env_u64("SCX_SIM_CSW_JITTER_NS") {
-            config.csw_jitter_stddev_ns = v;
-        }
-        if let Some(v) = env_u64("SCX_SIM_IPI_NS") {
-            config.ipi_delivery_ns = v;
-        }
-        if let Some(v) = env_u64("SCX_SIM_DSQ_CONSUME_NS") {
-            config.dsq_consume_ns = v;
-        }
-        if let Some(v) = env_u64("SCX_SIM_WAKEUP_FLOOR_NS") {
-            config.wakeup_latency_floor_ns = v;
-        }
-        if let Some(v) = env_u64("SCX_SIM_WAKEUP_JITTER_NS") {
-            config.wakeup_jitter_stddev_ns = v;
-        }
-        if let Some(v) = env_u64("SCX_SIM_MIGRATION_PENALTY_NS") {
-            config.migration_penalty_ns = v;
-        }
-        if let Some(v) = env_u64("SCX_SIM_CROSS_LLC_PENALTY_NS") {
-            config.cross_llc_migration_penalty_ns = v;
-        }
-
-        config
-    }
-
     /// Effective IPI delivery latency: 0 when overhead is disabled.
     pub fn effective_ipi_delivery_ns(&self) -> TimeNs {
         if self.enabled {
@@ -528,16 +448,6 @@ pub fn parse_seed(s: Option<&str>) -> u32 {
     }
 }
 
-/// Resolve the PRNG seed from the `SCX_SIM_SEED` environment variable.
-///
-/// - Unset or empty: returns `DEFAULT_SEED` (42).
-/// - `"entropy"` (case-insensitive): seeds from OS randomness and logs the
-///   chosen value so the run can be reproduced later.
-/// - Any decimal integer: parsed as a `u32` seed.
-pub fn seed_from_env() -> u32 {
-    parse_seed(std::env::var("SCX_SIM_SEED").ok().as_deref())
-}
-
 /// Parse a duration string with optional unit suffix into nanoseconds.
 ///
 /// Supported formats:
@@ -587,19 +497,8 @@ pub fn parse_duration_ns(s: &str) -> Result<TimeNs, String> {
     Ok(ns as TimeNs)
 }
 
-/// Resolve `sched_overhead_rbc_ns` from the `SCX_SIM_RBC_NS` environment variable.
-///
-/// - Unset or empty: returns `Some(10)` (default: 10ns per RBC).
-/// - `"0"`: returns `Some(0)` (disabled).
-/// - Any decimal integer: returns `Some(value)`.
-pub fn sched_overhead_rbc_ns_from_env() -> Option<u64> {
-    match std::env::var("SCX_SIM_RBC_NS").ok().as_deref() {
-        None | Some("") => Some(10),
-        Some(s) => Some(s.parse::<u64>().unwrap_or_else(|_| {
-            panic!("SCX_SIM_RBC_NS={s:?}: expected a u64 integer");
-        })),
-    }
-}
+/// Default nanoseconds charged per retired conditional branch in scheduler code.
+pub const DEFAULT_SCHED_OVERHEAD_RBC_NS: u64 = 10;
 
 /// Default watchdog timeout: 30 seconds (matches kernel SCX_WATCHDOG_MAX_TIMEOUT).
 pub const DEFAULT_WATCHDOG_TIMEOUT_NS: TimeNs = 30_000_000_000;
@@ -758,9 +657,9 @@ impl Scenario {
             cgroups: Vec::new(),
             duration_ns: 100_000_000, // 100ms default
             next_pid: Pid(1),
-            noise: NoiseConfig::from_env(),
-            overhead: OverheadConfig::from_env(),
-            seed: seed_from_env(),
+            noise: NoiseConfig::default(),
+            overhead: OverheadConfig::default(),
+            seed: DEFAULT_SEED,
             fixed_priority: false,
             sched_overhead_rbc_ns: None,
             watchdog_timeout_ns: Some(DEFAULT_WATCHDOG_TIMEOUT_NS),

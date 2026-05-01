@@ -31,8 +31,8 @@ use serde_json::{Map, Value};
 use tracing::{info, warn};
 
 use crate::scenario::{
-    sched_overhead_rbc_ns_from_env, seed_from_env, IrqEvent, IrqType, NoiseConfig, OverheadConfig,
-    Scenario, DEFAULT_WATCHDOG_TIMEOUT_NS,
+    IrqEvent, IrqType, NoiseConfig, OverheadConfig, Scenario, DEFAULT_SCHED_OVERHEAD_RBC_NS,
+    DEFAULT_SEED, DEFAULT_WATCHDOG_TIMEOUT_NS,
 };
 use crate::task::{Phase, RepeatMode, TaskBehavior, TaskDef};
 use crate::types::{CpuId, Pid};
@@ -743,11 +743,11 @@ pub fn load_rtapp(json_str: &str, nr_cpus: u32) -> Result<Scenario, RtAppError> 
         tasks: all_tasks,
         cgroups: cgroup_defs,
         duration_ns,
-        noise: NoiseConfig::from_env(),
-        overhead: OverheadConfig::from_env(),
-        seed: seed_from_env(),
+        noise: NoiseConfig::default(),
+        overhead: OverheadConfig::default(),
+        seed: DEFAULT_SEED,
         fixed_priority: false,
-        sched_overhead_rbc_ns: sched_overhead_rbc_ns_from_env(),
+        sched_overhead_rbc_ns: Some(DEFAULT_SCHED_OVERHEAD_RBC_NS),
         watchdog_timeout_ns: Some(DEFAULT_WATCHDOG_TIMEOUT_NS),
         ignore_bpf_errors: true,
         hotplug_events: Vec::new(),

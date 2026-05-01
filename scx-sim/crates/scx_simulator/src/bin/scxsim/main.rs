@@ -152,6 +152,7 @@ struct Cli {
     command: Command,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Command {
     /// Run a simulation from an rt-app workload.
@@ -188,8 +189,8 @@ struct RunArgs {
     ///
     /// Controls deterministic simulation: tick jitter, context-switch
     /// overhead noise, and event tiebreaking all derive from this seed.
-    /// Falls back to SCX_SIM_SEED env var, then default (42).
-    #[arg(long, env = "SCX_SIM_SEED")]
+    /// Defaults to 42.
+    #[arg(long)]
     seed: Option<String>,
 
     /// Use insertion-order event tiebreaking instead of randomized.
@@ -227,9 +228,65 @@ struct RunArgs {
     #[arg(long)]
     no_noise: bool,
 
+    /// Standard deviation for tick jitter (ns).
+    #[arg(long, value_name = "NS")]
+    tick_jitter_stddev_ns: Option<u64>,
+
+    /// Coefficient of variation for run-time jitter (ppm).
+    #[arg(long, value_name = "PPM")]
+    run_jitter_cv_ppm: Option<u64>,
+
     /// Disable context-switch overhead.
     #[arg(long)]
     no_overhead: bool,
+
+    /// Set both voluntary and involuntary context-switch overhead (ns).
+    #[arg(long, value_name = "NS")]
+    context_switch_overhead_ns: Option<u64>,
+
+    /// Voluntary context-switch overhead (ns).
+    #[arg(long, value_name = "NS")]
+    voluntary_context_switch_overhead_ns: Option<u64>,
+
+    /// Involuntary context-switch overhead (ns).
+    #[arg(long, value_name = "NS")]
+    involuntary_context_switch_overhead_ns: Option<u64>,
+
+    /// Standard deviation for context-switch jitter (ns).
+    #[arg(long, value_name = "NS")]
+    context_switch_jitter_stddev_ns: Option<u64>,
+
+    /// Global DSQ consume overhead (ns).
+    #[arg(long, value_name = "NS")]
+    dsq_consume_ns: Option<u64>,
+
+    /// Overhead for `ops.running()` callback dispatch (ns).
+    #[arg(long, value_name = "NS")]
+    running_overhead_ns: Option<u64>,
+
+    /// Overhead for `ops.update_idle()` callback dispatch (ns).
+    #[arg(long, value_name = "NS")]
+    update_idle_overhead_ns: Option<u64>,
+
+    /// IPI delivery latency for `scx_bpf_kick_cpu` (ns).
+    #[arg(long, value_name = "NS")]
+    ipi_delivery_ns: Option<u64>,
+
+    /// Minimum wakeup latency floor for wake→running transitions (ns).
+    #[arg(long, value_name = "NS")]
+    wakeup_latency_floor_ns: Option<u64>,
+
+    /// Standard deviation for wakeup latency jitter (ns).
+    #[arg(long, value_name = "NS")]
+    wakeup_jitter_stddev_ns: Option<u64>,
+
+    /// Extra latency when a task migrates to a different CPU (ns).
+    #[arg(long, value_name = "NS")]
+    migration_overhead_ns: Option<u64>,
+
+    /// Extra latency for cross-LLC migrations (ns).
+    #[arg(long, value_name = "NS")]
+    cross_llc_penalty_ns: Option<u64>,
 
     /// Nanoseconds of logical time per retired conditional branch in scheduler
     /// code. Enables PMU-based scheduler overhead measurement. Default: 10.
@@ -481,14 +538,57 @@ fn run(args: &RunArgs) -> Result<(), String> {
 
     // Override scenario fields from CLI flags.
     scenario.smt_threads_per_core = args.smt;
+    if let Some(ref seed_str) = args.seed {
+        scenario.seed = parse_seed(Some(seed_str));
+    }
     if args.no_noise {
         scenario.noise.enabled = false;
+    }
+    if let Some(ns) = args.tick_jitter_stddev_ns {
+        scenario.noise.tick_jitter_stddev_ns = ns;
+    }
+    if let Some(ppm) = args.run_jitter_cv_ppm {
+        scenario.noise.run_jitter_cv_ppm = ppm;
     }
     if args.no_overhead {
         scenario.overhead.enabled = false;
     }
-    if let Some(ref seed_str) = args.seed {
-        scenario.seed = parse_seed(Some(seed_str));
+    if let Some(ns) = args.context_switch_overhead_ns {
+        scenario.overhead.voluntary_csw_ns = ns;
+        scenario.overhead.involuntary_csw_ns = ns;
+    }
+    if let Some(ns) = args.voluntary_context_switch_overhead_ns {
+        scenario.overhead.voluntary_csw_ns = ns;
+    }
+    if let Some(ns) = args.involuntary_context_switch_overhead_ns {
+        scenario.overhead.involuntary_csw_ns = ns;
+    }
+    if let Some(ns) = args.context_switch_jitter_stddev_ns {
+        scenario.overhead.csw_jitter_stddev_ns = ns;
+    }
+    if let Some(ns) = args.dsq_consume_ns {
+        scenario.overhead.dsq_consume_ns = ns;
+    }
+    if let Some(ns) = args.running_overhead_ns {
+        scenario.overhead.running_overhead_ns = ns;
+    }
+    if let Some(ns) = args.update_idle_overhead_ns {
+        scenario.overhead.update_idle_overhead_ns = ns;
+    }
+    if let Some(ns) = args.ipi_delivery_ns {
+        scenario.overhead.ipi_delivery_ns = ns;
+    }
+    if let Some(ns) = args.wakeup_latency_floor_ns {
+        scenario.overhead.wakeup_latency_floor_ns = ns;
+    }
+    if let Some(ns) = args.wakeup_jitter_stddev_ns {
+        scenario.overhead.wakeup_jitter_stddev_ns = ns;
+    }
+    if let Some(ns) = args.migration_overhead_ns {
+        scenario.overhead.migration_penalty_ns = ns;
+    }
+    if let Some(ns) = args.cross_llc_penalty_ns {
+        scenario.overhead.cross_llc_migration_penalty_ns = ns;
     }
     if args.fixed_priority {
         scenario.fixed_priority = true;
