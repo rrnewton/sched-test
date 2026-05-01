@@ -281,6 +281,13 @@ pub struct PreemptiveConfig {
     pub break_on: PmuEvent,
     /// Which preemption mechanism to use. Default: `Pmu`.
     pub preempt_mode: PreemptMode,
+    /// Optional logical-time lookahead for suppressing short-fuse dispatch
+    /// preemption when other CPUs are far in the future.
+    ///
+    /// When set, `ops.dispatch()` on CPU K skips re-arming the PMU/e9 timer
+    /// if every other online CPU's local logical time is more than this far
+    /// ahead of CPU K. Cooperative kfunc-boundary yields remain enabled.
+    pub dispatch_lookahead_ns: Option<TimeNs>,
 }
 
 impl Default for PreemptiveConfig {
@@ -291,6 +298,7 @@ impl Default for PreemptiveConfig {
             cooperative_only: false,
             break_on: PmuEvent::RetiredBranchConditional,
             preempt_mode: PreemptMode::Pmu,
+            dispatch_lookahead_ns: None,
         }
     }
 }

@@ -1281,6 +1281,43 @@ thread_local! {
     ///
     /// The flag is a `Cell<u32>` (not `bool`) to support nesting.
     static PREEMPT_INHIBIT: Cell<u32> = const { Cell::new(0) };
+    /// When non-zero, PMU/e9 timer re-arm is suppressed on this thread.
+    ///
+    /// Used by the engine to avoid dense dispatch polling preemptions when
+    /// no other CPU is close enough in logical time to provide useful
+    /// concurrency. Cooperative kfunc-boundary yields still occur.
+    static PREEMPT_REARM_SUPPRESS: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Scoped suppression of PMU/e9 timer re-arm on the current thread.
+pub struct TimerRearmSuppressionGuard {
+    active: bool,
+}
+
+impl TimerRearmSuppressionGuard {
+    /// Suppress timer re-arm for the lifetime of the returned guard.
+    pub fn new(active: bool) -> Self {
+        if active {
+            PREEMPT_REARM_SUPPRESS.with(|c| c.set(c.get() + 1));
+        }
+        Self { active }
+    }
+}
+
+impl Drop for TimerRearmSuppressionGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        PREEMPT_REARM_SUPPRESS.with(|c| {
+            let cur = c.get();
+            debug_assert!(
+                cur > 0,
+                "TimerRearmSuppressionGuard dropped without a matching increment"
+            );
+            c.set(cur - 1);
+        });
+    }
 }
 
 /// Install preemptive interleave context on the current worker thread.
@@ -1354,6 +1391,11 @@ pub fn allow_preemption() {
 /// **Async-signal-safe**: reads a `Cell<u32>` thread-local.
 fn is_preemption_inhibited() -> bool {
     PREEMPT_INHIBIT.with(|c| c.get() > 0)
+}
+
+/// Whether timer re-arm is currently suppressed on this thread.
+fn is_timer_rearm_suppressed() -> bool {
+    PREEMPT_REARM_SUPPRESS.with(|c| c.get() > 0)
 }
 
 /// Install preemptive interleave context for replay mode.
@@ -1537,7 +1579,7 @@ fn cooperative_yield_impl(phase: KfuncYieldPhase) {
     // - Pre: stays disabled — with_sim() will re-arm via resume_timer().
     // - Post: re-arm — we're about to return to scheduler C code.
     if phase == KfuncYieldPhase::Post {
-        rearm_timer(ring, &ctx);
+        maybe_rearm_timer(ring, &ctx);
     }
 }
 
@@ -1569,7 +1611,7 @@ pub fn resume_timer() {
     if let Some(ctx) = PREEMPT_CTX.with(|c| c.get()) {
         // SAFETY: `ctx.ring` is a valid pointer set during `install()`.
         let ring = unsafe { &*ctx.ring };
-        rearm_timer(ring, &ctx);
+        maybe_rearm_timer(ring, &ctx);
     }
 }
 
@@ -1947,6 +1989,15 @@ fn rearm_timer(ring: &PreemptRing, ctx: &PreemptCtx) {
         libc::ioctl(fd, scx_perf::PERF_IOC_PERIOD, &mut period as *mut u64);
         libc::ioctl(fd, scx_perf::PERF_IOC_ENABLE, 0 as libc::c_ulong);
     }
+}
+
+/// Conditionally re-arm the PMU/e9 timer while preserving PRNG sequencing.
+fn maybe_rearm_timer(ring: &PreemptRing, ctx: &PreemptCtx) {
+    if is_timer_rearm_suppressed() {
+        let _ = ring.roll_timeslice(ctx.timeslice_min, ctx.timeslice_max);
+        return;
+    }
+    rearm_timer(ring, ctx);
 }
 
 // ---------------------------------------------------------------------------

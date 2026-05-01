@@ -300,6 +300,14 @@ struct RunArgs {
     #[arg(long, value_enum, default_value_t = PreemptModeArg::Pmu, requires = "preemptive")]
     preempt_mode: PreemptModeArg,
 
+    /// Suppress short-fuse dispatch preemption when other CPUs are far ahead.
+    ///
+    /// Accepts durations with units: "5us", "1000ns", "1ms", etc.
+    /// Only affects mid-C-code PMU/e9 timer re-arm during `ops.dispatch()`;
+    /// cooperative kfunc-boundary yields still occur.
+    #[arg(long, value_name = "DURATION", requires = "preemptive")]
+    dispatch_lookahead: Option<String>,
+
     /// Enable native concurrent dispatch via OS threads with clock-window
     /// synchronisation.
     ///
@@ -497,12 +505,19 @@ fn run(args: &RunArgs) -> Result<(), String> {
         scenario.interleave = true;
     }
     if args.preemptive {
+        let dispatch_lookahead_ns = args
+            .dispatch_lookahead
+            .as_deref()
+            .map(parse_duration_ns)
+            .transpose()
+            .map_err(|e| format!("--dispatch-lookahead: {e}"))?;
         scenario.preemptive = Some(PreemptiveConfig {
             timeslice_min: args.timeslice_min,
             timeslice_max: args.timeslice_max,
             cooperative_only: false,
             break_on: args.break_on.to_pmu_event(),
             preempt_mode: args.preempt_mode.to_preempt_mode(),
+            dispatch_lookahead_ns,
         });
         scenario.interleave = true;
     }
@@ -873,6 +888,7 @@ fn replay_simulation(args: &ReplayArgs) -> Result<(), String> {
             cooperative_only: false,
             break_on: trace.break_on(),
             preempt_mode: args.preempt_mode.to_preempt_mode(),
+            dispatch_lookahead_ns: None,
         });
 
     for i in 0..nr_tasks {

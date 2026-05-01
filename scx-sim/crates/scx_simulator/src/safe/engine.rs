@@ -1130,6 +1130,44 @@ macro_rules! sim_callback {
     };
 }
 
+fn other_cpus_far_in_future(
+    current_time: TimeNs,
+    min_other_time: Option<TimeNs>,
+    threshold_ns: TimeNs,
+) -> bool {
+    min_other_time
+        .map(|other_time| other_time.saturating_sub(current_time) > threshold_ns)
+        .unwrap_or(true)
+}
+
+fn should_suppress_dispatch_short_fuse_preemption(sim: &SimulatorState, cpu: CpuId) -> bool {
+    let cfg = match sim.preemptive.as_ref() {
+        Some(cfg) if !cfg.cooperative_only && sim.replay_trace.is_none() => cfg,
+        _ => return false,
+    };
+    let threshold_ns = match cfg.dispatch_lookahead_ns {
+        Some(ns) if ns > 0 => ns,
+        _ => return false,
+    };
+
+    // Cross-CPU kicks can make another CPU runnable at IPI latency, so never
+    // suppress beyond that horizon.
+    let effective_threshold = threshold_ns.min(sim.overhead.effective_ipi_delivery_ns());
+    if effective_threshold == 0 {
+        return false;
+    }
+
+    let current_time = sim.cpus[cpu.0 as usize].local_clock;
+    let min_other_time = sim
+        .cpus
+        .iter()
+        .filter(|other| other.id != cpu && other.is_online)
+        .map(|other| other.local_clock)
+        .min();
+
+    other_cpus_far_in_future(current_time, min_other_time, effective_threshold)
+}
+
 impl<S: Scheduler> Simulator<S> {
     pub fn new(scheduler: S) -> Self {
         Simulator {
@@ -3791,6 +3829,9 @@ impl<S: Scheduler> Simulator<S> {
             let prev_raw = prev_pid
                 .and_then(|pid| s.sim.task_pid_to_raw.get(&pid).copied())
                 .map_or(std::ptr::null_mut(), |raw| raw as *mut c_void);
+            let _dispatch_lookahead_guard = crate::preempt::TimerRearmSuppressionGuard::new(
+                should_suppress_dispatch_short_fuse_preemption(&s.sim, cpu),
+            );
 
             // Call scheduler dispatch to try to fill the local DSQ
             set_ops_context(&mut s.sim, OpsContext::Dispatch);
@@ -4660,5 +4701,16 @@ mod tests {
     fn lldb_signal_handling_contains_sigfpe() {
         let cmds = DebuggerFlavor::Lldb.fmt_signal_handling();
         assert!(cmds.contains("process handle SIGFPE -s false -n false -p true"));
+    }
+
+    #[test]
+    fn other_cpus_far_in_future_when_no_other_cpu_exists() {
+        assert!(other_cpus_far_in_future(10_000, None, 5_000));
+    }
+
+    #[test]
+    fn other_cpus_far_in_future_requires_gap_exceed_threshold() {
+        assert!(!other_cpus_far_in_future(10_000, Some(14_000), 5_000));
+        assert!(other_cpus_far_in_future(10_000, Some(16_000), 5_000));
     }
 }
