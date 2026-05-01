@@ -871,6 +871,25 @@ fn update_sum_exec(raw: *mut c_void, base: TimeNs, elapsed: TimeNs) {
     ffi::task_set_sum_exec_runtime(raw, base + elapsed);
 }
 
+fn record_kernel_interval(state: &mut SimulatorState, cpu: CpuId, start: TimeNs, end: TimeNs) {
+    state
+        .structop_concurrency
+        .record_kernel_interval(cpu, start, end);
+}
+
+fn advance_kernel_time(state: &mut SimulatorState, cpu: CpuId, duration: TimeNs) {
+    if duration == 0 {
+        return;
+    }
+
+    let idx = cpu.0 as usize;
+    let start = state.cpus[idx].local_clock;
+    let end = start + duration;
+    record_kernel_interval(state, cpu, start, end);
+    state.cpus[idx].local_clock = end;
+    kfuncs::clock_window_check(cpu, end);
+}
+
 /// Disable the RBC counter, read the count, and charge scheduler overhead to `cpu`.
 ///
 /// Three modes:
@@ -914,7 +933,7 @@ fn charge_sched_time(state: &mut SimulatorState, cpu: CpuId, ops: &str) {
             let kfunc_ns = state.rbc_kfunc_ns;
             let total_ns = rbc_ns + kfunc_ns;
             state.cpus[cpu.0 as usize].local_clock += total_ns;
-            state.structop_concurrency.record_interval(
+            state.structop_concurrency.record_structop_interval(
                 interval.0,
                 interval.1,
                 interval.1 + total_ns,
@@ -951,7 +970,7 @@ fn charge_sched_time(state: &mut SimulatorState, cpu: CpuId, ops: &str) {
             let kfunc_ns = state.rbc_kfunc_ns;
             let total_ns = rbc_ns + kfunc_ns;
             state.cpus[cpu.0 as usize].local_clock += total_ns;
-            state.structop_concurrency.record_interval(
+            state.structop_concurrency.record_structop_interval(
                 interval.0,
                 interval.1,
                 interval.1 + total_ns,
@@ -983,9 +1002,11 @@ fn charge_sched_time(state: &mut SimulatorState, cpu: CpuId, ops: &str) {
         let kfunc_ns = state.rbc_kfunc_ns;
         let total_ns = kfunc_ns.max(MIN_CALLBACK_COST_NS);
         state.cpus[cpu.0 as usize].local_clock += total_ns;
-        state
-            .structop_concurrency
-            .record_interval(interval.0, interval.1, interval.1 + total_ns);
+        state.structop_concurrency.record_structop_interval(
+            interval.0,
+            interval.1,
+            interval.1 + total_ns,
+        );
         kfuncs::clock_window_check(cpu, state.cpus[cpu.0 as usize].local_clock);
         trace!(
             ops,
@@ -1796,6 +1817,7 @@ impl<S: Scheduler> Simulator<S> {
 
         // Drop the outer guard before entering the event loop.
         // The event loop manages its own guard lifecycle.
+        let mut logical_end_ns: TimeNs = s.sim.clock;
         drop(s);
         'event_loop: loop {
             let mut s = sim_arc.lock().unwrap();
@@ -1804,9 +1826,11 @@ impl<S: Scheduler> Simulator<S> {
                 None => break,
             };
             if t > scenario.duration_ns {
+                logical_end_ns = scenario.duration_ns;
                 break;
             }
             s.sim.clock = t;
+            logical_end_ns = t;
 
             // Pop one event at a time and process it.
             let event = s.events.pop().expect("peek succeeded but pop failed");
@@ -1938,14 +1962,11 @@ impl<S: Scheduler> Simulator<S> {
         s.sim.trace.set_exit_kind(exit_kind);
 
         // Print end-of-simulation summary.
-        print_simulation_summary(&s.sim.trace, &s.tasks, s.sim.clock);
+        print_simulation_summary(&s.sim.trace, &s.tasks, logical_end_ns);
 
         // Print structop summary (per-CPU ops callbacks, RBC, kfuncs).
         crate::preempt::print_structop_summary(&s.sim.structop_accum);
-        print_structop_concurrency_histogram(
-            &s.sim.structop_concurrency,
-            simulation_logical_end(&s.sim),
-        );
+        print_structop_concurrency_histogram(&s.sim.structop_concurrency, logical_end_ns);
 
         // Print preemption stats (longest structop and interval RBC counts).
         print_preemption_stats(
@@ -2982,8 +3003,7 @@ impl<S: Scheduler> Simulator<S> {
 
         // Apply CSW overhead.
         let overhead = s.sim.csw_overhead(LastStopReason::Involuntary);
-        s.sim.cpus[cpu.0 as usize].local_clock += overhead;
-        kfuncs::clock_window_check(cpu, s.sim.cpus[cpu.0 as usize].local_clock);
+        advance_kernel_time(&mut s.sim, cpu, overhead);
 
         // Update sum_exec_runtime.
         {
@@ -3087,7 +3107,9 @@ impl<S: Scheduler> Simulator<S> {
         let s = &mut *guard;
 
         // Schedule IrqEnd
-        let end_time = s.sim.cpus[cpu.0 as usize].local_clock + duration_ns;
+        let irq_start = s.sim.cpus[cpu.0 as usize].local_clock;
+        let end_time = irq_start + duration_ns;
+        record_kernel_interval(&mut s.sim, cpu, irq_start, end_time);
         s.events.push(end_time, EventKind::IrqEnd { cpu });
     }
 
@@ -3460,8 +3482,7 @@ impl<S: Scheduler> Simulator<S> {
 
         // Apply CSW overhead directly to local_clock (see #NOTE TIMING_MODEL)
         let overhead = s.sim.csw_overhead(stop_reason);
-        s.sim.cpus[cpu.0 as usize].local_clock += overhead;
-        kfuncs::clock_window_check(cpu, s.sim.cpus[cpu.0 as usize].local_clock);
+        advance_kernel_time(&mut s.sim, cpu, overhead);
 
         // Set slice to reflect consumed time (used by stopping() for vtime)
         let remaining_slice = original_slice.saturating_sub(time_consumed);
@@ -4074,8 +4095,7 @@ impl<S: Scheduler> Simulator<S> {
 
         // Apply CSW overhead (see #NOTE TIMING_MODEL)
         let overhead = s.sim.csw_overhead(LastStopReason::Involuntary);
-        s.sim.cpus[cpu_idx].local_clock += overhead;
-        kfuncs::clock_window_check(cpu, s.sim.cpus[cpu_idx].local_clock);
+        advance_kernel_time(&mut s.sim, cpu, overhead);
 
         // Set remaining slice on raw task (used by stopping() for vtime)
         crate::ffi::task_set_slice(raw, remaining_slice);
@@ -4299,6 +4319,8 @@ impl<S: Scheduler> Simulator<S> {
 
                 let min_scheduled_at = enq_t + effective_floor;
                 if s.sim.cpus[cpu.0 as usize].local_clock < min_scheduled_at {
+                    let start = s.sim.cpus[cpu.0 as usize].local_clock;
+                    record_kernel_interval(&mut s.sim, cpu, start, min_scheduled_at);
                     s.sim.cpus[cpu.0 as usize].local_clock = min_scheduled_at;
                 }
             }
@@ -4476,16 +4498,6 @@ impl<S: Scheduler> Simulator<S> {
             }
         }
     }
-}
-
-fn simulation_logical_end(state: &SimulatorState) -> TimeNs {
-    let max_local_clock = state
-        .cpus
-        .iter()
-        .map(|cpu| cpu.local_clock)
-        .max()
-        .unwrap_or(0);
-    state.clock.max(max_local_clock)
 }
 
 #[cfg(test)]
