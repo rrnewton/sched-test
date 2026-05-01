@@ -12,6 +12,7 @@ libloading = "0.8"
 perf-event-open-sys = "5"
 rand = { version = "0.8", features = ["small_rng"] }
 scx_perf = { path = "../scx_perf" }
+serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

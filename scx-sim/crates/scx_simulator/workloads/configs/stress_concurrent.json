@@ -1,0 +1,21 @@
+{
+  "cpus": 4,
+  "smt": 1,
+  "seed": 42,
+  "interleave": true,
+  "preemptive": false,
+  "noise_enabled": true,
+  "overhead_enabled": true,
+  "tick_jitter_stddev_ns": 2000,
+  "run_jitter_cv_ppm": 200000,
+  "context_switch_overhead_ns": 2000,
+  "context_switch_jitter_stddev_ns": 500,
+  "wakeup_latency_floor_ns": 3000,
+  "wakeup_jitter_stddev_ns": 1000,
+  "ipi_delivery_ns": 5000,
+  "migration_overhead_ns": 10000,
+  "cross_llc_penalty_ns": 25000,
+  "running_overhead_ns": 50,
+  "update_idle_overhead_ns": 50,
+  "watchdog_timeout": "30s"
+}

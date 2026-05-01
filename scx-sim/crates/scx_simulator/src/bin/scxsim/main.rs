@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
+use serde::Deserialize;
 
 use scx_simulator::scenario::{parse_duration_ns, parse_seed};
 use scx_simulator::{
@@ -17,6 +18,12 @@ mod real_run;
 
 /// Environment variable set after ASLR is disabled to prevent infinite re-exec.
 const ASLR_DISABLED_ENV: &str = "SCX_SIM_ASLR_DISABLED";
+const DEFAULT_SCHEDULER: &str = "simple";
+const DEFAULT_CPUS: u32 = 4;
+const DEFAULT_SMT: u32 = 1;
+const DEFAULT_TIMESLICE_MIN: u64 = 300;
+const DEFAULT_TIMESLICE_MAX: u64 = 1500;
+const DEFAULT_WINDOW_NS: u64 = 10_000_000;
 
 /// Disable ASLR for this process by setting the `ADDR_NO_RANDOMIZE` personality
 /// flag and re-executing. This ensures scheduler .so base addresses are stable
@@ -90,7 +97,8 @@ fn reexec_with_aslr_disabled() -> ! {
 }
 
 /// How to run the workload.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum RealRunMode {
     /// Simulation only (default).
     #[default]
@@ -100,7 +108,8 @@ pub enum RealRunMode {
 }
 
 /// Which PMU event to break on for preemptive interleaving.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum BreakOn {
     /// Retired conditional branches (default, lower frequency).
     #[default]
@@ -120,7 +129,8 @@ impl BreakOn {
 }
 
 /// Which preemption mechanism to use for mid-C-code preemption.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum PreemptModeArg {
     /// PMU hardware timer (default; signal delivery has skid).
     #[default]
@@ -148,8 +158,123 @@ struct Cli {
     #[arg(long, global = true)]
     no_disable_aslr: bool,
 
+    /// Load simulator defaults from a JSON config file.
+    ///
+    /// Precedence is: built-in defaults < config file < explicit CLI flags.
+    #[arg(long, global = true, value_name = "PATH")]
+    config: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct SimConfig {
+    scheduler: Option<String>,
+    cpus: Option<u32>,
+    smt: Option<u32>,
+    seed: Option<ConfigSeed>,
+    fixed_priority: Option<bool>,
+    end_time: Option<String>,
+    warmup_ms: Option<u64>,
+    perfetto: Option<PathBuf>,
+    dump_trace: Option<bool>,
+    noise_enabled: Option<bool>,
+    tick_jitter_stddev_ns: Option<u64>,
+    run_jitter_cv_ppm: Option<u64>,
+    overhead_enabled: Option<bool>,
+    context_switch_overhead_ns: Option<u64>,
+    voluntary_context_switch_overhead_ns: Option<u64>,
+    involuntary_context_switch_overhead_ns: Option<u64>,
+    context_switch_jitter_stddev_ns: Option<u64>,
+    dsq_consume_ns: Option<u64>,
+    running_overhead_ns: Option<u64>,
+    update_idle_overhead_ns: Option<u64>,
+    ipi_delivery_ns: Option<u64>,
+    wakeup_latency_floor_ns: Option<u64>,
+    wakeup_jitter_stddev_ns: Option<u64>,
+    migration_overhead_ns: Option<u64>,
+    cross_llc_penalty_ns: Option<u64>,
+    rbc_ns: Option<u64>,
+    watchdog_timeout: Option<String>,
+    interleave: Option<bool>,
+    preemptive: Option<bool>,
+    timeslice_min: Option<u64>,
+    timeslice_max: Option<u64>,
+    break_on: Option<BreakOn>,
+    preempt_mode: Option<PreemptModeArg>,
+    native_concurrent: Option<bool>,
+    window_ns: Option<u64>,
+    real_run: Option<RealRunMode>,
+    wprof: Option<bool>,
+    bpf_trace: Option<bool>,
+    determinism_check: Option<bool>,
+    record_preemptions: Option<PathBuf>,
+    verbose_summary: Option<bool>,
+    wait_debugger: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum ConfigSeed {
+    Number(u32),
+    String(String),
+}
+
+impl ConfigSeed {
+    fn into_string(self) -> String {
+        match self {
+            ConfigSeed::Number(seed) => seed.to_string(),
+            ConfigSeed::String(seed) => seed,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedRunConfig {
+    scheduler: String,
+    cpus: u32,
+    smt: u32,
+    seed: Option<String>,
+    fixed_priority: bool,
+    end_time: Option<String>,
+    warmup_ms: Option<u64>,
+    perfetto: Option<PathBuf>,
+    dump_trace: bool,
+    noise_enabled: bool,
+    tick_jitter_stddev_ns: Option<u64>,
+    run_jitter_cv_ppm: Option<u64>,
+    overhead_enabled: bool,
+    context_switch_overhead_ns: Option<u64>,
+    voluntary_context_switch_overhead_ns: Option<u64>,
+    involuntary_context_switch_overhead_ns: Option<u64>,
+    context_switch_jitter_stddev_ns: Option<u64>,
+    dsq_consume_ns: Option<u64>,
+    running_overhead_ns: Option<u64>,
+    update_idle_overhead_ns: Option<u64>,
+    ipi_delivery_ns: Option<u64>,
+    wakeup_latency_floor_ns: Option<u64>,
+    wakeup_jitter_stddev_ns: Option<u64>,
+    migration_overhead_ns: Option<u64>,
+    cross_llc_penalty_ns: Option<u64>,
+    rbc_ns: Option<u64>,
+    watchdog_timeout: Option<String>,
+    interleave: bool,
+    preemptive: bool,
+    timeslice_min: u64,
+    timeslice_max: u64,
+    break_on: BreakOn,
+    preempt_mode: PreemptModeArg,
+    native_concurrent: bool,
+    window_ns: u64,
+    real_run: RealRunMode,
+    wprof: bool,
+    bpf_trace: bool,
+    determinism_check: bool,
+    record_preemptions: Option<PathBuf>,
+    verbose_summary: bool,
+    wait_debugger: bool,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -173,17 +298,17 @@ struct RunArgs {
     /// Path to an rt-app JSON workload file.
     workload: Option<PathBuf>,
 
-    /// Scheduler name.
-    #[arg(short, long, default_value = "simple")]
-    scheduler: String,
+    /// Scheduler name. Default: simple.
+    #[arg(short, long)]
+    scheduler: Option<String>,
 
-    /// Number of simulated CPUs (minimum 1).
-    #[arg(short, long, default_value_t = 4, value_parser = clap::value_parser!(u32).range(1..))]
-    cpus: u32,
+    /// Number of simulated CPUs (minimum 1). Default: 4.
+    #[arg(short, long, value_parser = clap::value_parser!(u32).range(1..))]
+    cpus: Option<u32>,
 
-    /// SMT threads per core (minimum 1).
-    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
-    smt: u32,
+    /// SMT threads per core (minimum 1). Default: 1.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    smt: Option<u32>,
 
     /// PRNG seed (u32 integer or "entropy" for OS randomness).
     ///
@@ -324,38 +449,38 @@ struct RunArgs {
     /// Minimum preemptive timeslice in retired conditional branches.
     ///
     /// Controls the lower bound of the random timeslice range used by
-    /// --preemptive mode. Default: 100. With PMU skid (~30-100 branches),
+    /// --preemptive mode. Default: 300. With PMU skid (~30-100 branches),
     /// actual preemption fires at ~130-200 branches after the last kfunc.
     ///
     /// WARNING: Values below 200 can cause livelock with complex schedulers
     /// (e.g. LAVD with structop_rbc up to 2026). Use --timeslice-min 300+ for LAVD.
-    #[arg(long, default_value_t = 300, requires = "preemptive")]
-    timeslice_min: u64,
+    #[arg(long)]
+    timeslice_min: Option<u64>,
 
     /// Maximum preemptive timeslice in retired conditional branches.
     ///
     /// Controls the upper bound of the random timeslice range used by
-    /// --preemptive mode. Default: 500. With PMU skid (~30-100 branches),
+    /// --preemptive mode. Default: 1500. With PMU skid (~30-100 branches),
     /// actual preemption fires at ~130-600 branches after the last kfunc.
     ///
     /// Upper bound of the PRNG-generated timeslice range.
-    #[arg(long, default_value_t = 1500, requires = "preemptive")]
-    timeslice_max: u64,
+    #[arg(long)]
+    timeslice_max: Option<u64>,
 
     /// Which PMU event to break on for preemptive interleaving.
     ///
     /// rbc: Retired conditional branches (default, lower frequency).
     /// insn: Instructions retired (higher frequency — use larger timeslice).
-    #[arg(long, value_enum, default_value_t = BreakOn::Rbc, requires = "preemptive")]
-    break_on: BreakOn,
+    #[arg(long, value_enum)]
+    break_on: Option<BreakOn>,
 
     /// Preemption mechanism for mid-C-code preemption.
     ///
     /// pmu: Hardware PMU timer (default; signal delivery has skid but counter values are exact).
     /// e9patch: Software RBC via e9patch-instrumented .so (deterministic,
     ///          debugger-compatible, requires _e9.so variant).
-    #[arg(long, value_enum, default_value_t = PreemptModeArg::Pmu, requires = "preemptive")]
-    preempt_mode: PreemptModeArg,
+    #[arg(long, value_enum)]
+    preempt_mode: Option<PreemptModeArg>,
 
     /// Enable native concurrent dispatch via OS threads with clock-window
     /// synchronisation.
@@ -371,13 +496,8 @@ struct RunArgs {
     /// Controls the simulated-time window within which concurrent dispatch
     /// threads are allowed to execute. Requires --native-concurrent.
     /// Default: 10_000_000 (10 ms).
-    #[arg(
-        long,
-        default_value_t = 10_000_000,
-        requires = "native_concurrent",
-        hide_default_value = true
-    )]
-    window_ns: u64,
+    #[arg(long)]
+    window_ns: Option<u64>,
 
     /// List available schedulers and exit.
     #[arg(long)]
@@ -387,8 +507,8 @@ struct RunArgs {
     ///
     /// off: simulation only (default)
     /// vm: launch virtme-ng VM with rt-app and scheduler
-    #[arg(long, value_enum, default_value_t = RealRunMode::Off)]
-    real_run: RealRunMode,
+    #[arg(long, value_enum)]
+    real_run: Option<RealRunMode>,
 
     /// Record a Perfetto trace using wprof during VM execution.
     ///
@@ -498,131 +618,204 @@ struct PrintAddressesArgs {
     scheduler: String,
 }
 
-fn main() {
-    // Disable ASLR before anything else so that the scheduler .so is loaded
-    // at a stable base address. This must happen before CLI parsing because
-    // it may re-exec the process.
-    ensure_aslr_disabled();
-
-    let cli = Cli::parse();
-    init_tracing();
-
-    let result = match cli.command {
-        Command::Run(args) => run(&args),
-        Command::Replay(args) => replay_simulation(&args),
-        Command::PrintAddresses(args) => print_addresses(&args),
-    };
-
-    if let Err(e) = result {
-        eprintln!("error: {e}");
-        std::process::exit(1);
-    }
+fn load_sim_config(path: &Path) -> Result<SimConfig, String> {
+    let json = std::fs::read_to_string(path)
+        .map_err(|e| format!("failed to read config {}: {e}", path.display()))?;
+    serde_json::from_str(&json)
+        .map_err(|e| format!("failed to parse config {}: {e}", path.display()))
 }
 
-fn run(args: &RunArgs) -> Result<(), String> {
-    if args.list_schedulers {
-        list_schedulers();
-        return Ok(());
+fn resolve_run_config(args: &RunArgs, config: SimConfig) -> Result<ResolvedRunConfig, String> {
+    let mut noise_enabled = config.noise_enabled.unwrap_or(true);
+    if args.no_noise {
+        noise_enabled = false;
     }
 
-    let workload_path = args
-        .workload
-        .as_ref()
-        .ok_or("missing required argument: <WORKLOAD>")?;
+    let mut overhead_enabled = config.overhead_enabled.unwrap_or(true);
+    if args.no_overhead {
+        overhead_enabled = false;
+    }
 
-    let json = std::fs::read_to_string(workload_path)
-        .map_err(|e| format!("failed to read {}: {e}", workload_path.display()))?;
+    let resolved = ResolvedRunConfig {
+        scheduler: args
+            .scheduler
+            .clone()
+            .or(config.scheduler)
+            .unwrap_or_else(|| DEFAULT_SCHEDULER.to_string()),
+        cpus: args.cpus.or(config.cpus).unwrap_or(DEFAULT_CPUS),
+        smt: args.smt.or(config.smt).unwrap_or(DEFAULT_SMT),
+        seed: args
+            .seed
+            .clone()
+            .or(config.seed.map(ConfigSeed::into_string)),
+        fixed_priority: args.fixed_priority || config.fixed_priority.unwrap_or(false),
+        end_time: args.end_time.clone().or(config.end_time),
+        warmup_ms: args.warmup_ms.or(config.warmup_ms),
+        perfetto: args.perfetto.clone().or(config.perfetto),
+        dump_trace: args.dump_trace || config.dump_trace.unwrap_or(false),
+        noise_enabled,
+        tick_jitter_stddev_ns: args.tick_jitter_stddev_ns.or(config.tick_jitter_stddev_ns),
+        run_jitter_cv_ppm: args.run_jitter_cv_ppm.or(config.run_jitter_cv_ppm),
+        overhead_enabled,
+        context_switch_overhead_ns: args
+            .context_switch_overhead_ns
+            .or(config.context_switch_overhead_ns),
+        voluntary_context_switch_overhead_ns: args
+            .voluntary_context_switch_overhead_ns
+            .or(config.voluntary_context_switch_overhead_ns),
+        involuntary_context_switch_overhead_ns: args
+            .involuntary_context_switch_overhead_ns
+            .or(config.involuntary_context_switch_overhead_ns),
+        context_switch_jitter_stddev_ns: args
+            .context_switch_jitter_stddev_ns
+            .or(config.context_switch_jitter_stddev_ns),
+        dsq_consume_ns: args.dsq_consume_ns.or(config.dsq_consume_ns),
+        running_overhead_ns: args.running_overhead_ns.or(config.running_overhead_ns),
+        update_idle_overhead_ns: args
+            .update_idle_overhead_ns
+            .or(config.update_idle_overhead_ns),
+        ipi_delivery_ns: args.ipi_delivery_ns.or(config.ipi_delivery_ns),
+        wakeup_latency_floor_ns: args
+            .wakeup_latency_floor_ns
+            .or(config.wakeup_latency_floor_ns),
+        wakeup_jitter_stddev_ns: args
+            .wakeup_jitter_stddev_ns
+            .or(config.wakeup_jitter_stddev_ns),
+        migration_overhead_ns: args.migration_overhead_ns.or(config.migration_overhead_ns),
+        cross_llc_penalty_ns: args.cross_llc_penalty_ns.or(config.cross_llc_penalty_ns),
+        rbc_ns: if args.no_rbc {
+            Some(0)
+        } else {
+            args.rbc_ns.or(config.rbc_ns)
+        },
+        watchdog_timeout: args.watchdog_timeout.clone().or(config.watchdog_timeout),
+        interleave: args.interleave || config.interleave.unwrap_or(false),
+        preemptive: args.preemptive || config.preemptive.unwrap_or(false),
+        timeslice_min: args
+            .timeslice_min
+            .or(config.timeslice_min)
+            .unwrap_or(DEFAULT_TIMESLICE_MIN),
+        timeslice_max: args
+            .timeslice_max
+            .or(config.timeslice_max)
+            .unwrap_or(DEFAULT_TIMESLICE_MAX),
+        break_on: args.break_on.or(config.break_on).unwrap_or(BreakOn::Rbc),
+        preempt_mode: args
+            .preempt_mode
+            .or(config.preempt_mode)
+            .unwrap_or(PreemptModeArg::Pmu),
+        native_concurrent: args.native_concurrent || config.native_concurrent.unwrap_or(false),
+        window_ns: args
+            .window_ns
+            .or(config.window_ns)
+            .unwrap_or(DEFAULT_WINDOW_NS),
+        real_run: args
+            .real_run
+            .or(config.real_run)
+            .unwrap_or(RealRunMode::Off),
+        wprof: args.wprof || config.wprof.unwrap_or(false),
+        bpf_trace: args.bpf_trace || config.bpf_trace.unwrap_or(false),
+        determinism_check: args.determinism_check || config.determinism_check.unwrap_or(false),
+        record_preemptions: args
+            .record_preemptions
+            .clone()
+            .or(config.record_preemptions),
+        verbose_summary: args.verbose_summary || config.verbose_summary.unwrap_or(false),
+        wait_debugger: args.wait_debugger || config.wait_debugger.unwrap_or(false),
+    };
 
-    let mut scenario =
-        load_rtapp(&json, args.cpus).map_err(|e| format!("failed to parse workload: {e}"))?;
+    if resolved.cpus == 0 {
+        return Err("cpus must be at least 1".into());
+    }
+    if resolved.smt == 0 {
+        return Err("smt must be at least 1".into());
+    }
+    if resolved.preemptive && resolved.native_concurrent {
+        return Err("--preemptive conflicts with --native-concurrent".into());
+    }
+    if resolved.wprof && resolved.bpf_trace {
+        return Err("--wprof conflicts with --bpf-trace".into());
+    }
 
-    // Override scenario fields from CLI flags.
-    scenario.smt_threads_per_core = args.smt;
-    if let Some(ref seed_str) = args.seed {
+    Ok(resolved)
+}
+
+fn apply_run_config(scenario: &mut Scenario, config: &ResolvedRunConfig) -> Result<(), String> {
+    scenario.smt_threads_per_core = config.smt;
+    if let Some(ref seed_str) = config.seed {
         scenario.seed = parse_seed(Some(seed_str));
     }
-    if args.no_noise {
-        scenario.noise.enabled = false;
-    }
-    if let Some(ns) = args.tick_jitter_stddev_ns {
+    scenario.noise.enabled = config.noise_enabled;
+    if let Some(ns) = config.tick_jitter_stddev_ns {
         scenario.noise.tick_jitter_stddev_ns = ns;
     }
-    if let Some(ppm) = args.run_jitter_cv_ppm {
+    if let Some(ppm) = config.run_jitter_cv_ppm {
         scenario.noise.run_jitter_cv_ppm = ppm;
     }
-    if args.no_overhead {
-        scenario.overhead.enabled = false;
-    }
-    if let Some(ns) = args.context_switch_overhead_ns {
+    scenario.overhead.enabled = config.overhead_enabled;
+    if let Some(ns) = config.context_switch_overhead_ns {
         scenario.overhead.voluntary_csw_ns = ns;
         scenario.overhead.involuntary_csw_ns = ns;
     }
-    if let Some(ns) = args.voluntary_context_switch_overhead_ns {
+    if let Some(ns) = config.voluntary_context_switch_overhead_ns {
         scenario.overhead.voluntary_csw_ns = ns;
     }
-    if let Some(ns) = args.involuntary_context_switch_overhead_ns {
+    if let Some(ns) = config.involuntary_context_switch_overhead_ns {
         scenario.overhead.involuntary_csw_ns = ns;
     }
-    if let Some(ns) = args.context_switch_jitter_stddev_ns {
+    if let Some(ns) = config.context_switch_jitter_stddev_ns {
         scenario.overhead.csw_jitter_stddev_ns = ns;
     }
-    if let Some(ns) = args.dsq_consume_ns {
+    if let Some(ns) = config.dsq_consume_ns {
         scenario.overhead.dsq_consume_ns = ns;
     }
-    if let Some(ns) = args.running_overhead_ns {
+    if let Some(ns) = config.running_overhead_ns {
         scenario.overhead.running_overhead_ns = ns;
     }
-    if let Some(ns) = args.update_idle_overhead_ns {
+    if let Some(ns) = config.update_idle_overhead_ns {
         scenario.overhead.update_idle_overhead_ns = ns;
     }
-    if let Some(ns) = args.ipi_delivery_ns {
+    if let Some(ns) = config.ipi_delivery_ns {
         scenario.overhead.ipi_delivery_ns = ns;
     }
-    if let Some(ns) = args.wakeup_latency_floor_ns {
+    if let Some(ns) = config.wakeup_latency_floor_ns {
         scenario.overhead.wakeup_latency_floor_ns = ns;
     }
-    if let Some(ns) = args.wakeup_jitter_stddev_ns {
+    if let Some(ns) = config.wakeup_jitter_stddev_ns {
         scenario.overhead.wakeup_jitter_stddev_ns = ns;
     }
-    if let Some(ns) = args.migration_overhead_ns {
+    if let Some(ns) = config.migration_overhead_ns {
         scenario.overhead.migration_penalty_ns = ns;
     }
-    if let Some(ns) = args.cross_llc_penalty_ns {
+    if let Some(ns) = config.cross_llc_penalty_ns {
         scenario.overhead.cross_llc_migration_penalty_ns = ns;
     }
-    if args.fixed_priority {
-        scenario.fixed_priority = true;
-    }
-    if args.interleave {
-        scenario.interleave = true;
-    }
-    if args.preemptive {
+    scenario.fixed_priority = config.fixed_priority;
+    scenario.interleave = config.interleave;
+    if config.preemptive {
         scenario.preemptive = Some(PreemptiveConfig {
-            timeslice_min: args.timeslice_min,
-            timeslice_max: args.timeslice_max,
+            timeslice_min: config.timeslice_min,
+            timeslice_max: config.timeslice_max,
             cooperative_only: false,
-            break_on: args.break_on.to_pmu_event(),
-            preempt_mode: args.preempt_mode.to_preempt_mode(),
+            break_on: config.break_on.to_pmu_event(),
+            preempt_mode: config.preempt_mode.to_preempt_mode(),
         });
         scenario.interleave = true;
     }
-    if args.native_concurrent {
+    if config.native_concurrent {
         scenario.native_concurrent = Some(NativeConcurrentConfig {
-            window_ns: args.window_ns,
+            window_ns: config.window_ns,
         });
         scenario.interleave = true;
     }
-    if let Some(ref end_time) = args.end_time {
+    if let Some(ref end_time) = config.end_time {
         scenario.duration_ns =
             parse_duration_ns(end_time).map_err(|e| format!("--end-time: {e}"))?;
     }
-    if let Some(rbc_ns) = args.rbc_ns {
+    if let Some(rbc_ns) = config.rbc_ns {
         scenario.sched_overhead_rbc_ns = Some(rbc_ns);
     }
-    if args.no_rbc {
-        scenario.sched_overhead_rbc_ns = Some(0);
-    }
-    if let Some(ref timeout) = args.watchdog_timeout {
+    if let Some(ref timeout) = config.watchdog_timeout {
         let normalized = timeout.trim().to_lowercase();
         if normalized == "off" || normalized == "none" || normalized == "0" {
             scenario.watchdog_timeout_ns = None;
@@ -635,45 +828,99 @@ fn run(args: &RunArgs) -> Result<(), String> {
             }
         }
     }
-    if let Some(warmup_ms) = args.warmup_ms {
+    if let Some(warmup_ms) = config.warmup_ms {
         scenario.warmup_ns = warmup_ms * 1_000_000;
     }
-    if args.wait_debugger {
+    if config.wait_debugger {
         scenario.wait_debugger = true;
     }
 
+    Ok(())
+}
+
+fn main() {
+    // Disable ASLR before anything else so that the scheduler .so is loaded
+    // at a stable base address. This must happen before CLI parsing because
+    // it may re-exec the process.
+    ensure_aslr_disabled();
+
+    let cli = Cli::parse();
+    init_tracing();
+
+    let result = match &cli.command {
+        Command::Run(args) => run(args, cli.config.as_deref()),
+        Command::Replay(args) => replay_simulation(&args),
+        Command::PrintAddresses(args) => print_addresses(&args),
+    };
+
+    if let Err(e) = result {
+        eprintln!("error: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn run(args: &RunArgs, config_path: Option<&Path>) -> Result<(), String> {
+    if args.list_schedulers {
+        list_schedulers();
+        return Ok(());
+    }
+
+    let config = if let Some(path) = config_path {
+        load_sim_config(path)?
+    } else {
+        SimConfig::default()
+    };
+    let resolved = resolve_run_config(args, config)?;
+
+    let workload_path = args
+        .workload
+        .as_ref()
+        .ok_or("missing required argument: <WORKLOAD>")?;
+
+    let json = std::fs::read_to_string(workload_path)
+        .map_err(|e| format!("failed to read {}: {e}", workload_path.display()))?;
+
+    let mut scenario =
+        load_rtapp(&json, resolved.cpus).map_err(|e| format!("failed to parse workload: {e}"))?;
+    apply_run_config(&mut scenario, &resolved)?;
+
     // Validate --wprof and --bpf-trace require --real-run vm
-    if args.wprof && args.real_run != RealRunMode::Vm {
+    if resolved.wprof && resolved.real_run != RealRunMode::Vm {
         return Err("--wprof requires --real-run vm".into());
     }
-    if args.bpf_trace && args.real_run != RealRunMode::Vm {
+    if resolved.bpf_trace && resolved.real_run != RealRunMode::Vm {
         return Err("--bpf-trace requires --real-run vm".into());
     }
 
     // Determine trace mode
-    let trace_mode = if args.wprof {
+    let trace_mode = if resolved.wprof {
         real_run::TraceMode::Wprof
-    } else if args.bpf_trace {
+    } else if resolved.bpf_trace {
         real_run::TraceMode::BpfTrace
     } else {
         real_run::TraceMode::None
     };
 
     // Handle --determinism-check mode
-    if args.determinism_check {
-        if args.real_run != RealRunMode::Off {
+    if resolved.determinism_check {
+        if resolved.real_run != RealRunMode::Off {
             return Err("--determinism-check conflicts with --real-run".into());
         }
-        return run_determinism_check(args, scenario);
+        return run_determinism_check(&resolved, scenario);
     }
 
     // Handle --real-run mode
-    match args.real_run {
+    match resolved.real_run {
         RealRunMode::Off => {
-            run_simulation(args, scenario)?;
+            run_simulation(&resolved, scenario)?;
         }
         RealRunMode::Vm => {
-            real_run::run_vm(workload_path, &args.scheduler, args.cpus, trace_mode)?;
+            real_run::run_vm(
+                workload_path,
+                &resolved.scheduler,
+                resolved.cpus,
+                trace_mode,
+            )?;
         }
     }
 
@@ -1048,9 +1295,10 @@ fn replay_simulation(args: &ReplayArgs) -> Result<(), String> {
     Ok(())
 }
 
-fn run_determinism_check(args: &RunArgs, scenario: Scenario) -> Result<(), String> {
+fn run_determinism_check(config: &ResolvedRunConfig, scenario: Scenario) -> Result<(), String> {
     let _lock = SIM_LOCK.lock().unwrap();
-    let use_e9 = args.preemptive && args.preempt_mode == PreemptModeArg::E9patch;
+    let use_e9 = config.preemptive && config.preempt_mode == PreemptModeArg::E9patch;
+    let scenario_seed = scenario.seed;
 
     // Map the shared RBC state page BEFORE loading the _e9.so.
     if use_e9 {
@@ -1059,7 +1307,7 @@ fn run_determinism_check(args: &RunArgs, scenario: Scenario) -> Result<(), Strin
 
     // Run 1: collect checkpoints
     enable_determinism_mode();
-    let sched1 = load_scheduler(&args.scheduler, args.cpus, use_e9)?;
+    let sched1 = load_scheduler(&config.scheduler, config.cpus, use_e9)?;
     let trace1 = Simulator::new(sched1).run(scenario.clone());
     let checkpoints1 = drain_determinism_checkpoints();
 
@@ -1072,7 +1320,7 @@ fn run_determinism_check(args: &RunArgs, scenario: Scenario) -> Result<(), Strin
 
     // Run 2: collect checkpoints with same configuration
     enable_determinism_mode();
-    let sched2 = load_scheduler(&args.scheduler, args.cpus, use_e9)?;
+    let sched2 = load_scheduler(&config.scheduler, config.cpus, use_e9)?;
     let trace2 = Simulator::new(sched2).run(scenario);
     let checkpoints2 = drain_determinism_checkpoints();
 
@@ -1085,7 +1333,13 @@ fn run_determinism_check(args: &RunArgs, scenario: Scenario) -> Result<(), Strin
 
     // Compare checkpoints
     if let Some(divergence) = compare_checkpoints(&checkpoints1, &checkpoints2) {
-        print_determinism_failure(args, &divergence, &checkpoints1, &checkpoints2);
+        print_determinism_failure(
+            config,
+            scenario_seed,
+            &divergence,
+            &checkpoints1,
+            &checkpoints2,
+        );
         return Err("determinism check failed".into());
     }
 
@@ -1098,13 +1352,15 @@ fn run_determinism_check(args: &RunArgs, scenario: Scenario) -> Result<(), Strin
 
 /// Print detailed determinism failure report.
 fn print_determinism_failure(
-    args: &RunArgs,
+    config: &ResolvedRunConfig,
+    scenario_seed: u32,
     divergence: &scx_simulator::CheckpointDivergence,
     _checkpoints1: &[scx_simulator::DeterminismCheckpoint],
     _checkpoints2: &[scx_simulator::DeterminismCheckpoint],
 ) {
-    let seed = args.seed.as_deref().unwrap_or("42");
+    let seed = config.seed.as_deref().unwrap_or("42");
     eprintln!("DETERMINISM FAILURE at seed {}:", seed);
+    eprintln!("  Effective scenario seed: {scenario_seed}");
     eprintln!(
         "  Divergence at checkpoint {} ({} event):",
         divergence.checkpoint_index, divergence.expected.event
@@ -1157,8 +1413,8 @@ fn print_determinism_failure(
     }
 }
 
-fn run_simulation(args: &RunArgs, scenario: Scenario) -> Result<(), String> {
-    let use_e9 = args.preemptive && args.preempt_mode == PreemptModeArg::E9patch;
+fn run_simulation(config: &ResolvedRunConfig, scenario: Scenario) -> Result<(), String> {
+    let use_e9 = config.preemptive && config.preempt_mode == PreemptModeArg::E9patch;
 
     // Map the shared RBC state page BEFORE loading the _e9.so — the e9-
     // instrumented .so accesses this address during DT_INIT.
@@ -1166,7 +1422,7 @@ fn run_simulation(args: &RunArgs, scenario: Scenario) -> Result<(), String> {
         scx_simulator::preempt::mmap_shared_rbc();
     }
 
-    let sched = load_scheduler(&args.scheduler, args.cpus, use_e9)?;
+    let sched = load_scheduler(&config.scheduler, config.cpus, use_e9)?;
     let _lock = SIM_LOCK.lock().unwrap();
 
     // Capture .so base address BEFORE the simulation runs. The scheduler
@@ -1175,7 +1431,7 @@ fn run_simulation(args: &RunArgs, scenario: Scenario) -> Result<(), String> {
     let so_base = scheduler_so_base();
 
     // Enable preemption recording if --record-preemptions is set.
-    if args.record_preemptions.is_some() {
+    if config.record_preemptions.is_some() {
         enable_preemption_collection();
     }
 
@@ -1187,7 +1443,7 @@ fn run_simulation(args: &RunArgs, scenario: Scenario) -> Result<(), String> {
         nr_tasks: Some(scenario.tasks.len() as u32),
         seed: Some(scenario.seed),
         duration_ns: Some(scenario.duration_ns),
-        scheduler: Some(args.scheduler.clone()),
+        scheduler: Some(config.scheduler.clone()),
         timeslice_min: scenario.preemptive.as_ref().map(|p| p.timeslice_min),
         timeslice_max: scenario.preemptive.as_ref().map(|p| p.timeslice_max),
         so_hash: if current_so_hash != 0 {
@@ -1200,11 +1456,11 @@ fn run_simulation(args: &RunArgs, scenario: Scenario) -> Result<(), String> {
 
     let trace = Simulator::new(sched).run(scenario);
 
-    if args.dump_trace {
+    if config.dump_trace {
         trace.dump();
     }
 
-    if let Some(path) = &args.perfetto {
+    if let Some(path) = &config.perfetto {
         let mut file = std::fs::File::create(path)
             .map_err(|e| format!("failed to create {}: {e}", path.display()))?;
         trace
@@ -1214,11 +1470,11 @@ fn run_simulation(args: &RunArgs, scenario: Scenario) -> Result<(), String> {
     }
 
     // Record preemption trace if requested.
-    if let Some(path) = &args.record_preemptions {
+    if let Some(path) = &config.record_preemptions {
         let records = drain_preemption_records();
-        let num_workers = args.cpus as usize;
+        let num_workers = config.cpus as usize;
         let mut preemption_trace =
-            PreemptionTrace::from_records(&records, num_workers, args.break_on.to_pmu_event());
+            PreemptionTrace::from_records(&records, num_workers, config.break_on.to_pmu_event());
         preemption_trace.set_metadata(scenario_metadata);
 
         let mut file = std::fs::File::create(path)
@@ -1234,7 +1490,7 @@ fn run_simulation(args: &RunArgs, scenario: Scenario) -> Result<(), String> {
     }
 
     // Print simulation summary.
-    if args.verbose_summary {
+    if config.verbose_summary {
         let stats = TraceStats::from_trace(&trace);
         println!();
         stats.print_summary();
@@ -1303,6 +1559,133 @@ fn list_schedulers() {
         for info in &schedulers {
             println!("{:<16} {}", info.name, info.path.display());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_run_args() -> RunArgs {
+        RunArgs {
+            workload: Some(PathBuf::from("workload.json")),
+            scheduler: None,
+            cpus: None,
+            smt: None,
+            seed: None,
+            fixed_priority: false,
+            end_time: None,
+            warmup_ms: None,
+            perfetto: None,
+            dump_trace: false,
+            no_noise: false,
+            tick_jitter_stddev_ns: None,
+            run_jitter_cv_ppm: None,
+            no_overhead: false,
+            context_switch_overhead_ns: None,
+            voluntary_context_switch_overhead_ns: None,
+            involuntary_context_switch_overhead_ns: None,
+            context_switch_jitter_stddev_ns: None,
+            dsq_consume_ns: None,
+            running_overhead_ns: None,
+            update_idle_overhead_ns: None,
+            ipi_delivery_ns: None,
+            wakeup_latency_floor_ns: None,
+            wakeup_jitter_stddev_ns: None,
+            migration_overhead_ns: None,
+            cross_llc_penalty_ns: None,
+            rbc_ns: None,
+            no_rbc: false,
+            watchdog_timeout: None,
+            interleave: false,
+            preemptive: false,
+            timeslice_min: None,
+            timeslice_max: None,
+            break_on: None,
+            preempt_mode: None,
+            native_concurrent: false,
+            window_ns: None,
+            list_schedulers: false,
+            real_run: None,
+            wprof: false,
+            bpf_trace: false,
+            determinism_check: false,
+            record_preemptions: None,
+            verbose_summary: false,
+            wait_debugger: false,
+        }
+    }
+
+    #[test]
+    fn resolve_run_config_prefers_cli_over_config() {
+        let mut args = base_run_args();
+        args.scheduler = Some("lavd".into());
+        args.cpus = Some(8);
+        args.preemptive = true;
+        args.timeslice_min = Some(777);
+        args.no_noise = true;
+
+        let config = SimConfig {
+            scheduler: Some("simple".into()),
+            cpus: Some(6),
+            preemptive: Some(false),
+            timeslice_min: Some(333),
+            noise_enabled: Some(true),
+            ..SimConfig::default()
+        };
+
+        let resolved = resolve_run_config(&args, config).unwrap();
+        assert_eq!(resolved.scheduler, "lavd");
+        assert_eq!(resolved.cpus, 8);
+        assert!(resolved.preemptive);
+        assert_eq!(resolved.timeslice_min, 777);
+        assert!(!resolved.noise_enabled);
+    }
+
+    #[test]
+    fn resolve_run_config_uses_config_when_cli_absent() {
+        let args = base_run_args();
+        let config = SimConfig {
+            scheduler: Some("lavd".into()),
+            cpus: Some(12),
+            smt: Some(2),
+            interleave: Some(true),
+            real_run: Some(RealRunMode::Vm),
+            break_on: Some(BreakOn::Insn),
+            preempt_mode: Some(PreemptModeArg::E9patch),
+            ..SimConfig::default()
+        };
+
+        let resolved = resolve_run_config(&args, config).unwrap();
+        assert_eq!(resolved.scheduler, "lavd");
+        assert_eq!(resolved.cpus, 12);
+        assert_eq!(resolved.smt, 2);
+        assert!(resolved.interleave);
+        assert_eq!(resolved.real_run, RealRunMode::Vm);
+        assert_eq!(resolved.break_on, BreakOn::Insn);
+        assert_eq!(resolved.preempt_mode, PreemptModeArg::E9patch);
+    }
+
+    #[test]
+    fn resolve_run_config_rejects_conflicting_modes() {
+        let args = base_run_args();
+        let config = SimConfig {
+            preemptive: Some(true),
+            native_concurrent: Some(true),
+            ..SimConfig::default()
+        };
+
+        let err = resolve_run_config(&args, config).unwrap_err();
+        assert!(err.contains("conflicts"));
+    }
+
+    #[test]
+    fn resolve_run_config_accepts_numeric_config_seed() {
+        let args = base_run_args();
+        let config: SimConfig = serde_json::from_str(r#"{"seed": 42}"#).unwrap();
+
+        let resolved = resolve_run_config(&args, config).unwrap();
+        assert_eq!(resolved.seed.as_deref(), Some("42"));
     }
 }
 

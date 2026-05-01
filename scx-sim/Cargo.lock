@@ -649,6 +649,7 @@ dependencies = [
  "perf-event-open-sys",
  "rand",
  "scx_perf",
+ "serde",
  "serde_json",
  "tracing",
  "tracing-subscriber",
