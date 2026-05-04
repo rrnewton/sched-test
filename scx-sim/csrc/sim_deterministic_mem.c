@@ -1,3 +1,6 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: GPL-2.0-only
+
 /*
  * sim_deterministic_mem.c - Deterministic memory ops for PMU determinism.
  *

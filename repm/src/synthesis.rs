@@ -1,3 +1,6 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Blind synthesis — infer workload parameters from scxsim trace data.
 //!
 //! This module implements the trace→config pipeline:

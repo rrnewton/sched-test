@@ -1,3 +1,6 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! FFI export functions for cgroup operations (called from C).
 //!
 //! These `#[no_mangle] extern "C"` functions are entry points invoked by

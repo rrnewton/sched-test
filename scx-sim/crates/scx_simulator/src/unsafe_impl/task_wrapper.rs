@@ -1,3 +1,6 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! RAII wrapper for C `task_struct` pointers.
 //!
 //! `SimTaskHandle` owns a heap-allocated C `task_struct` (obtained via

@@ -1,3 +1,6 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Stress test scenarios for bug finding.
 //!
 //! These tests use randomized parameters to explore the scheduler state space

@@ -1,3 +1,6 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: GPL-2.0-only
+
 /*
  * sim_sdt_stubs.c - Simulator implementations of BPF arena / SDT task storage
  *

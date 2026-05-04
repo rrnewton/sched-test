@@ -1,3 +1,6 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Accuracy scoring: compare original vs reproduced experiment metrics.
 //!
 //! **Formula**: For each metric M, compute

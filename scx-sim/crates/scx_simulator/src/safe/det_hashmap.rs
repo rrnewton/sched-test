@@ -1,3 +1,6 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Deterministic HashMap with sorted iteration.
 //!
 //! Regular HashMap iteration order depends on internal hash state, which can

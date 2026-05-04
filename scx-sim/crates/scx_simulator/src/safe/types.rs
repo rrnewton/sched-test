@@ -1,3 +1,6 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Newtype wrappers and type aliases for domain concepts.
 //!
 //! Newtypes for identifiers (DSQ IDs, PIDs, CPU IDs) and virtual time

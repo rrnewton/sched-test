@@ -1,3 +1,6 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Parser for real kernel BPF traces captured via trace_scx_ops.bt.
 //!
 //! This module parses the bpftrace output format produced by `scripts/trace_scx_ops.bt`

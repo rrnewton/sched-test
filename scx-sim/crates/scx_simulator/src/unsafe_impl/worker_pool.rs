@@ -1,3 +1,6 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Persistent worker thread pool with futex-based park/wake protocol.
 //!
 //! Replaces per-dispatch-round `std::thread::scope` with long-lived threads

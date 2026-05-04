@@ -1,3 +1,6 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Workspace discovery and management.
 //!
 //! A workspace is identified by `repromagic_config.toml` at its root,

@@ -1,3 +1,6 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Production-calibrated ucache cartoon workload for scx-sim.
 //!
 //! Models Meta's ucache service thread interaction at 1/16 scale, with

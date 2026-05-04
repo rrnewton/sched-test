@@ -1,3 +1,6 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Template expansion and skill file installation for `repm init`.
 //!
 //! The CLAUDE.md template uses `{{variable}}` placeholders that are

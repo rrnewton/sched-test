@@ -1,3 +1,6 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Debug test to investigate slice boost behavior in LAVD.
 //!
 //! Run with: cargo test test_slice_boost_debug --test slice_boost_debug -- --nocapture

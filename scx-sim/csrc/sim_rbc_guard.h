@@ -1,3 +1,6 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: GPL-2.0-only
+
 /*
  * sim_rbc_guard.h - PMU RBC counter pause/resume for C kfunc stubs.
  *

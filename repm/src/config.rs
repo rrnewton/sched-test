@@ -1,3 +1,6 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Configuration types for `repromagic_config.toml`.
 //!
 //! These types define the workspace-level configuration schema. A workspace

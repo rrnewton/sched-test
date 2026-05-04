@@ -1,3 +1,6 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Concurrent callback interleaving via engine-mediated token-passing.
 //!
 //! Runs scheduler callbacks on separate OS threads, with only one thread

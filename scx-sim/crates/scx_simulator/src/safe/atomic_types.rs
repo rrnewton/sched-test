@@ -1,3 +1,6 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Typed atomic wrappers for self-documenting concurrent state.
 //!
 //! These types wrap `AtomicU32` / `AtomicU64` behind domain-specific enums

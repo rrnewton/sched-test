@@ -1,3 +1,6 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Dispatch queue (DSQ) simulation.
 //!
 //! Provides both FIFO and vtime-ordered dispatch queues that mirror

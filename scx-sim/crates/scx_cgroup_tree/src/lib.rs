@@ -1,3 +1,6 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Platform-independent cgroup tree types for testing and simulation.
 //!
 //! This crate provides:

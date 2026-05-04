@@ -1,3 +1,6 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Parser for rt-app JSON workload descriptions.
 //!
 //! Converts rt-app JSON files into simulator [`Scenario`] objects, enabling

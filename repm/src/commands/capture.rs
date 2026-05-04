@@ -1,3 +1,6 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! `repm capture` — SSH trace collection from production hosts.
 //!
 //! This is the first step of the repromagic pipeline: getting production data.

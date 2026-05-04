@@ -1,3 +1,6 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! CSV-emitting experiment runner for the ucache cartoon workload.
 //!
 //! Outputs metrics in METRICS_SPECIFICATION.md CSV format to stdout.
