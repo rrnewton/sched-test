@@ -1,3 +1,6 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Cgroup modeling for the simulator.
 //!
 //! This module provides a cgroup registry that tracks a hierarchy of cgroups,

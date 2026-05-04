@@ -1,3 +1,6 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Engine-mediated thread orchestrator using futex + atomics.
 //!
 //! Replaces PRNG-based worker selection with engine-mediated decisions:

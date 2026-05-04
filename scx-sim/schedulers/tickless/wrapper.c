@@ -1,3 +1,6 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: GPL-2.0-only
+
 /*
  * tickless_wrapper.c - Wrapper to compile scx_tickless as userspace C
  *

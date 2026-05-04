@@ -1,3 +1,6 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Chrome Trace Event Format (JSON) export for Perfetto.
 //!
 //! Writes the simulation trace as a JSON file loadable in

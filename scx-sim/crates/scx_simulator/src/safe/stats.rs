@@ -1,3 +1,6 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Trace statistics for comparing real vs simulated scheduler behavior.
 //!
 //! This module provides statistical analysis of simulation traces to help

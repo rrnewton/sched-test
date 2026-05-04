@@ -1,3 +1,6 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! VM-based real run infrastructure for scxsim.
 //!
 //! This module launches a virtme-ng VM to run the same rt-app workload

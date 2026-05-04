@@ -1,3 +1,6 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Pure type definitions for the task model.
 //!
 //! This module contains the safe, pure-Rust types that describe task

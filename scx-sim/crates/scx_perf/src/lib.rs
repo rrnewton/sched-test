@@ -1,3 +1,6 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Minimal PMU-based Retired Branch Conditional (RBC) counter and timer.
 //!
 //! Provides several PMU abstractions:

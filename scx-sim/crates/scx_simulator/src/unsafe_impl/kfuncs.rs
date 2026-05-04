@@ -1,3 +1,6 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Kfunc implementations for the simulator.
 //!
 //! These are `#[no_mangle] extern "C"` functions that the compiled scheduler

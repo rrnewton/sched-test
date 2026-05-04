@@ -1,3 +1,6 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: GPL-2.0-only
+
 /*
  * e9_rbc_trampoline.c — e9patch call trampoline for software RBC counting.
  *

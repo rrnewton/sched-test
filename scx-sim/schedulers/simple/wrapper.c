@@ -1,3 +1,6 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: GPL-2.0-only
+
 /*
  * simple_wrapper.c - Wrapper to compile scx_simple.bpf.c as userspace C
  *

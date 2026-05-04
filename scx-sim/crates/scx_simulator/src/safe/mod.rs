@@ -1,3 +1,6 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Safe modules — all modules in this directory have zero `unsafe` usage.
 //!
 //! These modules are grouped here to make the safety boundary explicit:

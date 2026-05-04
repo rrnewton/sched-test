@@ -1,3 +1,6 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Scheduler-specific probe accessors and LAVD monitor.
 //!
 //! [`LavdProbes`] resolves function pointers from the loaded LAVD `.so`

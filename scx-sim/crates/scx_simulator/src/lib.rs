@@ -1,3 +1,6 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! scx_simulator - Deterministic event-driven simulator for sched_ext schedulers.
 //!
 //! This crate compiles sched_ext BPF scheduler code as regular userspace C and

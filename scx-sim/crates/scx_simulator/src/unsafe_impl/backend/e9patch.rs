@@ -1,3 +1,6 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! e9patch software RBC preemption backend.
 //!
 //! Uses e9patch-instrumented scheduler `.so` files that call a C trampoline

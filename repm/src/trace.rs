@@ -1,3 +1,6 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Trace ingestion — parse scheduling data into structured events and profiles.
 //!
 //! This module is the bridge between raw experiment data (rt-app logs, metrics

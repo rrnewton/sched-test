@@ -1,3 +1,6 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! `repm analyze` — post-processing and comparison table generation.
 //!
 //! Reads experiment CSV files and generates markdown comparison tables with

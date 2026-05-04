@@ -1,3 +1,6 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Preemptive interleaving via PMU RBC timer signals.
 //!
 //! Extends the cooperative kfunc-boundary interleaving (see [`interleave`]) with

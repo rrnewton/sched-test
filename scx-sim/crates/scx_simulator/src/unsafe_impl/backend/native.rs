@@ -1,3 +1,6 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Native concurrent backend — no PMU, no token ring.
 //!
 //! Provides [`NullBackend`] (a [`PreemptionBackend`] with no instrumentation)

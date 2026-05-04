@@ -1,3 +1,6 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Event-driven simulation engine.
 //!
 //! This is the core of the simulator. It maintains the event queue, simulated

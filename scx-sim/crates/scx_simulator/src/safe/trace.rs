@@ -1,3 +1,6 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Trace event recording for the simulator.
 //!
 //! Every scheduling action (task scheduled, preempted, slept, woke, CPU idle)

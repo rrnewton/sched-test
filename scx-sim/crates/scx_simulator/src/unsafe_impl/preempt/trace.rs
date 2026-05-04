@@ -1,3 +1,6 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Preemption trace serialization and deserialization.
 //!
 //! A [`PreemptionTrace`] groups preemption records by worker for replay.

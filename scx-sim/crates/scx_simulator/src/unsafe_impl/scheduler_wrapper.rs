@@ -1,3 +1,6 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Safe wrapper around the `Scheduler` trait.
 //!
 //! The `Scheduler` trait methods are `unsafe fn` because they call into

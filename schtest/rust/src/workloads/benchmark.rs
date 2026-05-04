@@ -1,3 +1,6 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Benchmarking utilities for the scheduler testing framework
 //!
 //! This module provides utilities for benchmarking workloads and measuring

@@ -1,3 +1,6 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Preemption backend trait and generic interleaving drivers.
 //!
 //! Provides a trait-based abstraction for different preemption backends

@@ -1,3 +1,6 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Empirical PMU skid measurement tool.
 //!
 //! Measures the difference between the *requested* overflow point and the

@@ -1,3 +1,6 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Hardware breakpoint replay preemption backend.
 //!
 //! Replays a recorded preemption trace using a hybrid PMU + hardware

@@ -1,3 +1,6 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// SPDX-License-Identifier: GPL-2.0-only
+
 //! Runtime simulated task with FFI-backed C `task_struct`.
 //!
 //! `SimTask` owns a heap-allocated C `task_struct` pointer and uses
