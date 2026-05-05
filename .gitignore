@@ -1,1 +1,31 @@
-/target
+libbpf/
+*.gitignore
+PKGBUILD
+target
+build/
+*.swp
+.cache/
+.vscode/
+tags
+*.o
+*.skel.h
+selftest
+selftest_noasan
+CLAUDE.md
+# Ignore all .claude directories in subdirectories
+**/.claude
+
+# But track the top-level .claude/skills/ for Claude Code skills
+!/.claude/
+/.claude/*
+!/.claude/skills/
+**/*.ll
+**/*.s
+**/*.tmp
+.agent/
+scx-sim/schedulers/cosmos/cosmos_main_patched.c
+mp3-*.log
+rt-app-*.log
+*.profraw
+*.profdata
+coverage-out/

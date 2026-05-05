@@ -1,0 +1,9 @@
+{
+  "trial": "trial2_3thread",
+  "T_seconds": 14,
+  "tokens": 0,
+  "X_geomean": 1.1458,
+  "pass": true,
+  "thread_count_gt": 3,
+  "thread_count_syn": 3
+}
