@@ -348,16 +348,14 @@ impl WorkerPool {
     /// worker is fully parked before the engine writes a new work desc.
     fn wait_idle(&self, worker_id: WorkerId) {
         loop {
-            if self.commands[worker_id.0].load(SeqCst) == WorkerCommand::Idle as u32 {
+            let cmd = self.commands[worker_id.0].load(SeqCst);
+            if cmd == WorkerCommand::Idle as u32 {
                 break;
             }
-            futex_wait(
-                &self.commands[worker_id.0],
-                // We know the worker just had a Dispatch or Batch command.
-                // We wait on the current (non-Idle) value and the worker
-                // will wake us when it stores Idle.
-                self.commands[worker_id.0].load(SeqCst),
-            );
+            // Wait on the same non-Idle value we observed above. A second
+            // load here can race with the worker storing Idle and miss the
+            // only wake for this round.
+            futex_wait(&self.commands[worker_id.0], cmd);
         }
     }
 
