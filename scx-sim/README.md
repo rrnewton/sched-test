@@ -66,13 +66,13 @@ make -C schedulers
 ### 6. Run a simulation
 
 ```bash
-cargo run --release -- run -s simple workloads/two_runners.json
+cargo run --release -- simulate -s simple workloads/two_runners.json
 ```
 
 ## Usage
 
 ```
-scxsim run [OPTIONS] [WORKLOAD]
+scxsim simulate [OPTIONS] [WORKLOAD]
 ```
 
 | Option | Default | Description |
@@ -83,6 +83,17 @@ scxsim run [OPTIONS] [WORKLOAD]
 | `--seed` | `42` | PRNG seed (integer or `"entropy"`) |
 | `--end-time` | — | Simulation duration (e.g., `100ms`, `1s`) |
 | `--fixed-priority` | off | Deterministic insertion-order tiebreaking |
+
+```
+scxsim vm-run [OPTIONS] <WORKLOAD>
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-s, --scheduler` | `simple` | Scheduler binary to run (`scx_simple`, `scx_lavd`, etc.) |
+| `-c, --cpus` | `4` | Number of workload CPUs; tracing adds one VM CPU for the tracer |
+| `--wprof` | off | Record a Perfetto trace using wprof |
+| `--bpf-trace` | off | Record scheduler ops and kfunc calls using bpftrace |
 
 ```
 scxsim replay <TRACE_FILE>

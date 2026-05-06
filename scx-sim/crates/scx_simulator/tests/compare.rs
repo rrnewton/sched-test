@@ -117,7 +117,7 @@ fn test_mitosis_trace_stats() {
 /// for comparison with real kernel traces.
 ///
 /// This test outputs TraceSummary data and per-task metrics that can be
-/// compared against bpftrace output from `--real-run --bpf-trace`.
+/// compared against bpftrace output from `vm-run --bpf-trace`.
 ///
 /// Run with: cargo test test_compare_lavd_trace_stats --test compare -- --nocapture
 #[test]
@@ -328,7 +328,7 @@ Done.
 /// Test loading a real BPF trace file if one exists.
 ///
 /// This test looks for a bpf_trace.log file in the project root
-/// (produced by `--real-run --bpf-trace`) and parses it if found.
+/// (produced by `vm-run --bpf-trace`) and parses it if found.
 ///
 /// Run with: cargo test test_load_real_bpf_trace --test compare -- --nocapture
 ///
@@ -336,7 +336,7 @@ Done.
 ///
 /// To generate a real trace file:
 /// 1. Build the scheduler: `cargo build -p scx_lavd --release`
-/// 2. Run with BPF tracing: `cargo run -p scxsim -- --real-run --bpf-trace -w workloads/two_runners.json`
+/// 2. Run with BPF tracing: `cargo run -p scxsim -- vm-run --bpf-trace workloads/two_runners.json`
 /// 3. This creates bpf_trace.log in the current directory
 /// 4. Re-run this test to parse and analyze the real trace
 #[test]
@@ -350,9 +350,7 @@ fn test_load_real_bpf_trace() {
         eprintln!();
         eprintln!("To generate a real trace file:");
         eprintln!("  1. Build the scheduler: cargo build -p scx_lavd --release");
-        eprintln!(
-            "  2. Run: cargo run -p scxsim -- --real-run --bpf-trace -w workloads/two_runners.json"
-        );
+        eprintln!("  2. Run: cargo run -p scxsim -- vm-run --bpf-trace workloads/two_runners.json");
         eprintln!("  3. Re-run this test to parse the trace.");
         return;
     }
@@ -405,7 +403,7 @@ fn test_load_real_bpf_trace() {
 /// Run with: cargo test test_full_real_vs_sim_comparison --test compare -- --nocapture
 ///
 /// Prerequisites:
-/// - Generate bpf_trace.log using: cargo run -p scxsim -- --real-run --bpf-trace -s lavd -w workloads/two_runners.json
+/// - Generate bpf_trace.log using: cargo run -p scxsim -- vm-run --bpf-trace -s lavd workloads/two_runners.json
 #[test]
 fn test_full_real_vs_sim_comparison() {
     let _lock = common::setup_test();
@@ -414,7 +412,7 @@ fn test_full_real_vs_sim_comparison() {
 
     if !trace_path.exists() {
         eprintln!("\n=== Skipping full comparison test ===");
-        eprintln!("No bpf_trace.log found. Run with --real-run --bpf-trace first.");
+        eprintln!("No bpf_trace.log found. Run with vm-run --bpf-trace first.");
         return;
     }
 

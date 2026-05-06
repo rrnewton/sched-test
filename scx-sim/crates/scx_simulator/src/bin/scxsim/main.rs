@@ -89,16 +89,6 @@ fn reexec_with_aslr_disabled() -> ! {
     std::process::exit(status.code().unwrap_or(1));
 }
 
-/// How to run the workload.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
-pub enum RealRunMode {
-    /// Simulation only (default).
-    #[default]
-    Off,
-    /// Launch virtme-ng VM with rt-app and scheduler.
-    Vm,
-}
-
 /// Which PMU event to break on for preemptive interleaving.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
 pub enum BreakOn {
@@ -155,7 +145,9 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Run a simulation from an rt-app workload.
-    Run(RunArgs),
+    Simulate(SimulateArgs),
+    /// Run workload in a virtme-ng VM with a real scheduler.
+    VmRun(VmRunArgs),
     /// Replay a recorded preemption trace.
     Replay(ReplayArgs),
     /// Print address-space layout for ASLR verification.
@@ -166,9 +158,46 @@ enum Command {
     PrintAddresses(PrintAddressesArgs),
 }
 
-/// Arguments for the `run` subcommand.
+/// Arguments for the `vm-run` subcommand.
 #[derive(Parser)]
-struct RunArgs {
+struct VmRunArgs {
+    /// Path to an rt-app JSON workload file.
+    workload: PathBuf,
+
+    /// Scheduler name.
+    #[arg(short, long, default_value = "simple")]
+    scheduler: String,
+
+    /// Number of workload CPUs to use in the VM.
+    ///
+    /// Tracing modes add one extra VM CPU for the tracer.
+    #[arg(short, long, default_value_t = 4, value_parser = clap::value_parser!(u32).range(1..))]
+    cpus: u32,
+
+    /// Record a Perfetto trace using wprof during VM execution.
+    ///
+    /// When enabled, an extra CPU is added to the VM and isolated using
+    /// isolcpus for running the wprof tracer. The trace file is written
+    /// to the current working directory.
+    #[arg(long, conflicts_with = "bpf_trace")]
+    wprof: bool,
+
+    /// Trace scheduler ops callbacks and kfunc calls using bpftrace.
+    ///
+    /// When enabled, an extra CPU is added to the VM and isolated for
+    /// running bpftrace with trace_scx_ops.bt. This traces sched_class entry
+    /// points, scx_bpf_* kfunc calls with return values, and
+    /// sched_switch/sched_wakeup lifecycle events.
+    ///
+    /// The trace is written to bpf_trace.log in the current working directory.
+    /// This is an alternative to --wprof for comparing simulator vs real runs.
+    #[arg(long, conflicts_with = "wprof")]
+    bpf_trace: bool,
+}
+
+/// Arguments for the `simulate` subcommand.
+#[derive(Parser)]
+struct SimulateArgs {
     /// Path to an rt-app JSON workload file.
     workload: Option<PathBuf>,
 
@@ -326,33 +355,6 @@ struct RunArgs {
     #[arg(long)]
     list_schedulers: bool,
 
-    /// Run workload in real environment.
-    ///
-    /// off: simulation only (default)
-    /// vm: launch virtme-ng VM with rt-app and scheduler
-    #[arg(long, value_enum, default_value_t = RealRunMode::Off)]
-    real_run: RealRunMode,
-
-    /// Record a Perfetto trace using wprof during VM execution.
-    ///
-    /// Requires --real-run vm. When enabled, an extra CPU is added to the VM
-    /// and isolated using isolcpus for running the wprof tracer. The trace
-    /// file is written to the current working directory.
-    #[arg(long, conflicts_with = "bpf_trace")]
-    wprof: bool,
-
-    /// Trace scheduler ops callbacks and kfunc calls using bpftrace.
-    ///
-    /// Requires --real-run vm. When enabled, an extra CPU is added to the VM
-    /// and isolated for running bpftrace with trace_scx_ops.bt. This traces
-    /// sched_class entry points, scx_bpf_* kfunc calls with return values,
-    /// and sched_switch/sched_wakeup lifecycle events.
-    ///
-    /// The trace is written to bpf_trace.log in the current working directory.
-    /// This is an alternative to --wprof for comparing simulator vs real runs.
-    #[arg(long, conflicts_with = "wprof")]
-    bpf_trace: bool,
-
     /// Enable strict determinism checking.
     ///
     /// Runs the simulation twice with the same seed and configuration,
@@ -451,7 +453,8 @@ fn main() {
     init_tracing();
 
     let result = match cli.command {
-        Command::Run(args) => run(&args),
+        Command::Simulate(args) => simulate(&args),
+        Command::VmRun(args) => vm_run(&args),
         Command::Replay(args) => replay_simulation(&args),
         Command::PrintAddresses(args) => print_addresses(&args),
     };
@@ -462,7 +465,20 @@ fn main() {
     }
 }
 
-fn run(args: &RunArgs) -> Result<(), String> {
+fn vm_run(args: &VmRunArgs) -> Result<(), String> {
+    // Determine trace mode
+    let trace_mode = if args.wprof {
+        real_run::TraceMode::Wprof
+    } else if args.bpf_trace {
+        real_run::TraceMode::BpfTrace
+    } else {
+        real_run::TraceMode::None
+    };
+
+    real_run::run_vm(&args.workload, &args.scheduler, args.cpus, trace_mode)
+}
+
+fn simulate(args: &SimulateArgs) -> Result<(), String> {
     if args.list_schedulers {
         list_schedulers();
         return Ok(());
@@ -542,40 +558,12 @@ fn run(args: &RunArgs) -> Result<(), String> {
         scenario.wait_debugger = true;
     }
 
-    // Validate --wprof and --bpf-trace require --real-run vm
-    if args.wprof && args.real_run != RealRunMode::Vm {
-        return Err("--wprof requires --real-run vm".into());
-    }
-    if args.bpf_trace && args.real_run != RealRunMode::Vm {
-        return Err("--bpf-trace requires --real-run vm".into());
-    }
-
-    // Determine trace mode
-    let trace_mode = if args.wprof {
-        real_run::TraceMode::Wprof
-    } else if args.bpf_trace {
-        real_run::TraceMode::BpfTrace
-    } else {
-        real_run::TraceMode::None
-    };
-
     // Handle --determinism-check mode
     if args.determinism_check {
-        if args.real_run != RealRunMode::Off {
-            return Err("--determinism-check conflicts with --real-run".into());
-        }
         return run_determinism_check(args, scenario);
     }
 
-    // Handle --real-run mode
-    match args.real_run {
-        RealRunMode::Off => {
-            run_simulation(args, scenario)?;
-        }
-        RealRunMode::Vm => {
-            real_run::run_vm(workload_path, &args.scheduler, args.cpus, trace_mode)?;
-        }
-    }
+    run_simulation(args, scenario)?;
 
     Ok(())
 }
@@ -948,7 +936,7 @@ fn replay_simulation(args: &ReplayArgs) -> Result<(), String> {
     Ok(())
 }
 
-fn run_determinism_check(args: &RunArgs, scenario: Scenario) -> Result<(), String> {
+fn run_determinism_check(args: &SimulateArgs, scenario: Scenario) -> Result<(), String> {
     let _lock = SIM_LOCK.lock().unwrap();
     let use_e9 = args.preemptive && args.preempt_mode == PreemptModeArg::E9patch;
 
@@ -998,7 +986,7 @@ fn run_determinism_check(args: &RunArgs, scenario: Scenario) -> Result<(), Strin
 
 /// Print detailed determinism failure report.
 fn print_determinism_failure(
-    args: &RunArgs,
+    args: &SimulateArgs,
     divergence: &scx_simulator::CheckpointDivergence,
     _checkpoints1: &[scx_simulator::DeterminismCheckpoint],
     _checkpoints2: &[scx_simulator::DeterminismCheckpoint],
@@ -1057,7 +1045,7 @@ fn print_determinism_failure(
     }
 }
 
-fn run_simulation(args: &RunArgs, scenario: Scenario) -> Result<(), String> {
+fn run_simulation(args: &SimulateArgs, scenario: Scenario) -> Result<(), String> {
     let use_e9 = args.preemptive && args.preempt_mode == PreemptModeArg::E9patch;
 
     // Map the shared RBC state page BEFORE loading the _e9.so — the e9-
@@ -1212,4 +1200,80 @@ fn init_tracing() {
         .with_writer(std::io::stderr)
         .event_format(SimFormat)
         .try_init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vm_run_accepts_real_run_flags() {
+        let cli = Cli::try_parse_from([
+            "scxsim",
+            "vm-run",
+            "--scheduler",
+            "lavd",
+            "--cpus",
+            "2",
+            "--bpf-trace",
+            "workloads/two_runners.json",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Command::VmRun(args) => {
+                assert_eq!(args.scheduler, "lavd");
+                assert_eq!(args.cpus, 2);
+                assert!(args.bpf_trace);
+                assert!(!args.wprof);
+                assert_eq!(args.workload, PathBuf::from("workloads/two_runners.json"));
+            }
+            _ => panic!("expected vm-run subcommand"),
+        }
+    }
+
+    #[test]
+    fn simulate_rejects_vm_only_flags() {
+        assert!(Cli::try_parse_from([
+            "scxsim",
+            "simulate",
+            "--wprof",
+            "workloads/two_runners.json",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "scxsim",
+            "simulate",
+            "--bpf-trace",
+            "workloads/two_runners.json",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "scxsim",
+            "simulate",
+            "--real-run",
+            "vm",
+            "workloads/two_runners.json",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn vm_run_rejects_simulation_only_flags() {
+        assert!(Cli::try_parse_from([
+            "scxsim",
+            "vm-run",
+            "--smt",
+            "2",
+            "workloads/two_runners.json",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "scxsim",
+            "vm-run",
+            "--preemptive",
+            "workloads/two_runners.json",
+        ])
+        .is_err());
+    }
 }
