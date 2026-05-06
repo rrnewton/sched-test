@@ -12,25 +12,38 @@ if [ -z "$PYTHON_FILES" ]; then
     exit 0
 fi
 
-# Find mypy — install if missing
+# Find mypy and its stub dependencies — install if missing
+MYPY_DEPS=(mypy pandas-stubs)
 MYPY_CMD=""
+PIP_CMD=""
 if command -v mypy &>/dev/null; then
     MYPY_CMD="mypy"
 elif [ -x .venv/bin/mypy ]; then
     MYPY_CMD=".venv/bin/mypy"
 fi
+if [ -d .venv ]; then
+    PIP_CMD=".venv/bin/pip"
+elif command -v pip &>/dev/null; then
+    PIP_CMD="pip"
+fi
 
-if [ -z "$MYPY_CMD" ]; then
-    echo "mypy not found — installing..."
-    if [ -d .venv ]; then
-        .venv/bin/pip install mypy >&2
-        MYPY_CMD=".venv/bin/mypy"
-    elif command -v pip &>/dev/null; then
-        pip install mypy >&2
-        MYPY_CMD="mypy"
+HAVE_PANDAS_STUBS=false
+if [ -n "$PIP_CMD" ] && $PIP_CMD show pandas-stubs &>/dev/null; then
+    HAVE_PANDAS_STUBS=true
+fi
+
+if [ -z "$MYPY_CMD" ] || [ "$HAVE_PANDAS_STUBS" = false ]; then
+    echo "mypy or required type stubs not found — installing..."
+    if [ -n "$PIP_CMD" ]; then
+        $PIP_CMD install "${MYPY_DEPS[@]}" >&2
+        if [ -x .venv/bin/mypy ]; then
+            MYPY_CMD=".venv/bin/mypy"
+        else
+            MYPY_CMD="mypy"
+        fi
     else
-        echo "ERROR: mypy not found and no pip available to install it." >&2
-        echo "  Install manually: pip install mypy (or .venv/bin/pip install mypy)" >&2
+        echo "ERROR: mypy/type stubs not found and no pip available to install them." >&2
+        echo "  Install manually: pip install ${MYPY_DEPS[*]} (or .venv/bin/pip install ${MYPY_DEPS[*]})" >&2
         exit 1
     fi
 fi
