@@ -16,6 +16,9 @@ on:
       - 'lib/scxtest/**'
       - 'scheds/**'
 
+permissions:
+  contents: read
+
 jobs:
   simulator:
     runs-on: ubuntu-latest

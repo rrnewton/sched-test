@@ -16,6 +16,9 @@ on:
         default: ''
         type: string
 
+permissions:
+  contents: read
+
 # Default source branch for the sync. Change this when the simulator
 # lands on main (or use the workflow_dispatch input to override).
 env:
