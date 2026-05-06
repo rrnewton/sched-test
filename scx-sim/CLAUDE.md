@@ -112,6 +112,17 @@ Branches and pushing
 
 The `main` branch is protected. Never push directly to main. Only push to feature branches after validation. Don't force push unless you're asked to or ask permission.
 
+For long-lived shared branches that exist on both remotes, such as
+`simulator.vN` or `work/N`, keep the fork and upstream in sync. After
+validation, push the same branch to both remotes:
+
+    with-proxy git push origin <branch>    # facebookexperimental/sched-test
+    with-proxy git push mirror <branch>    # rrnewton/sched-test fork
+
+Do not let `mirror/<branch>` drift from `origin/<branch>` silently. If only the
+fork is writable or upstream auth fails, push to `mirror` only and explicitly
+record the auth gap in the task/PR notes.
+
 Issue Tracking
 ========================================
 
