@@ -764,6 +764,14 @@ impl SimulatorState {
         self.sample_normal_ns(self.noise.tick_jitter_stddev_ns)
     }
 
+    /// Compute a one-time per-CPU phase offset for the first periodic tick.
+    pub fn initial_tick_skew(&mut self) -> TimeNs {
+        if !self.noise.enabled || self.noise.initial_tick_skew_ns == 0 {
+            return 0;
+        }
+        self.next_prng() as TimeNs % (self.noise.initial_tick_skew_ns + 1)
+    }
+
     /// Compute context switch overhead for the given stop reason.
     pub fn csw_overhead(&mut self, reason: LastStopReason) -> TimeNs {
         if !self.overhead.enabled {

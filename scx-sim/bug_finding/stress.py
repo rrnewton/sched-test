@@ -24,6 +24,7 @@ import multiprocessing.sharedctypes
 import multiprocessing.synchronize
 import os
 import random
+import shlex
 import shutil
 import signal
 import subprocess
@@ -47,7 +48,7 @@ OUTPUT_DIR = Path(__file__).parent / "output"
 
 SCHEDULERS = ["simple", "lavd", "cosmos", "tickless", "mitosis"]
 CPU_COUNTS = [1, 2, 4, 8]
-INTERLEAVE_MODES = ["off", "cooperative", "preemptive", "e9patch"]
+INTERLEAVE_MODES = ["off", "cooperative", "preemptive", "native-concurrent", "e9patch"]
 
 
 def get_available_workloads() -> list[Path]:
@@ -61,11 +62,19 @@ def get_available_workloads() -> list[Path]:
 
 # Dimensions for random workload generation
 TASK_COUNTS = [1, 2, 4, 8, 16, 32]
+TASK_MULTIPLIERS = [1]
 PHASE_PATTERNS = ["run_only", "run_sleep", "run_sleep_wake", "mixed"]
 
 # Randomized simulator parameter choices
 RBC_NS_CHOICES = [0, 5, 10, 50]
 WATCHDOG_CHOICES = ["2s", "5s", "30s"]
+WINDOW_NS_CHOICES = [1_000, 10_000, 100_000, 1_000_000, 10_000_000]
+TIMESLICE_RBC_CHOICES = [(300, 750), (300, 1500), (750, 3000), (1500, 6000)]
+TIMESLICE_INSN_CHOICES = [(5_000, 20_000), (20_000, 80_000), (80_000, 250_000)]
+BREAK_ON_CHOICES = ["rbc", "insn"]
+RUN_JITTER_CV_PPM_CHOICES = [0, 100_000, 200_000, 500_000, 1_000_000]
+TICK_JITTER_STDDEV_NS_CHOICES = [0, 2_000, 10_000, 50_000, 250_000]
+INITIAL_TICK_SKEW_NS_CHOICES = [0, 1_000, 10_000, 100_000, 1_000_000]
 
 # Temporary directory for generated workloads (cleaned up at exit)
 _GENERATED_WORKLOADS_DIR: Optional[Path] = None
@@ -156,13 +165,17 @@ def _build_task_phases(
         return {"phases": phases_obj}
 
 
-def generate_random_workload(rng: random.Random) -> Path:
+def generate_random_workload(rng: random.Random, cpus: Optional[int] = None) -> Path:
     """Generate a random rt-app workload JSON file.
 
     Picks random task count, phase pattern per task, and duration spread.
     Returns the path to the generated temporary JSON file.
     """
-    task_count = rng.choice(TASK_COUNTS)
+    if cpus is not None and TASK_MULTIPLIERS and rng.random() < 0.7:
+        task_count = cpus * rng.choice(TASK_MULTIPLIERS)
+    else:
+        task_count = rng.choice(TASK_COUNTS)
+    task_count = max(1, task_count)
     duration_sec = rng.choice([1, 2, 4])
 
     # Pick a dominant pattern but allow per-task variation
@@ -360,6 +373,27 @@ class SimParams:
     watchdog_timeout: Optional[str] = None  # --watchdog-timeout override
     no_noise: bool = False  # --no-noise
     no_overhead: bool = False  # --no-overhead
+    fixed_priority: bool = False  # --fixed-priority control run
+    window_ns: Optional[int] = None  # --window-ns for native-concurrent
+    timeslice_min: Optional[int] = None  # --timeslice-min for preemptive
+    timeslice_max: Optional[int] = None  # --timeslice-max for preemptive
+    break_on: Optional[str] = None  # --break-on for preemptive
+    env: dict[str, str] = field(default_factory=dict)
+
+    def to_record(self) -> dict[str, Any]:
+        """Serialize parameters for JSONL run manifests."""
+        return {
+            "rbc_ns": self.rbc_ns,
+            "watchdog_timeout": self.watchdog_timeout,
+            "no_noise": self.no_noise,
+            "no_overhead": self.no_overhead,
+            "fixed_priority": self.fixed_priority,
+            "window_ns": self.window_ns,
+            "timeslice_min": self.timeslice_min,
+            "timeslice_max": self.timeslice_max,
+            "break_on": self.break_on,
+            "env": dict(sorted(self.env.items())),
+        }
 
 
 @dataclass
@@ -379,10 +413,37 @@ class TestConfig:
     def label(self) -> str:
         wl = self.workload.stem
         prefix = "rand/" if self.is_random_workload else ""
+        suffix = ""
+        if self.sim_params.fixed_priority:
+            suffix += "/fixed"
+        if self.sim_params.env:
+            suffix += "/chaos"
         return (
             f"{prefix}{self.scheduler}/{wl}/c{self.cpus}"
-            f"/s{self.seed}/{self.interleave_mode}"
+            f"/s{self.seed}/{self.interleave_mode}{suffix}"
         )
+
+    def to_record(self) -> dict[str, Any]:
+        """Serialize this config for reproducible run records."""
+        record: dict[str, Any] = {
+            "iteration": self.iteration,
+            "label": self.label,
+            "scheduler": self.scheduler,
+            "workload": str(self.workload),
+            "workload_name": self.workload.stem,
+            "cpus": self.cpus,
+            "seed": self.seed,
+            "interleave_mode": self.interleave_mode,
+            "random_workload": self.is_random_workload,
+            "sim_params": self.sim_params.to_record(),
+            "command": format_command(build_base_cmd(self), self.sim_params.env),
+        }
+        if self.is_random_workload:
+            try:
+                record["workload_json"] = json.loads(self.workload.read_text())
+            except (OSError, json.JSONDecodeError) as exc:
+                record["workload_json_error"] = str(exc)
+        return record
 
 
 @dataclass
@@ -424,6 +485,18 @@ class Finding:
             lines.append("Noise: disabled")
         if params.no_overhead:
             lines.append("Overhead: disabled")
+        if params.fixed_priority:
+            lines.append("Event ordering: fixed priority")
+        if params.window_ns is not None:
+            lines.append(f"Native window-ns: {params.window_ns}")
+        if params.timeslice_min is not None:
+            lines.append(f"Timeslice-min: {params.timeslice_min}")
+        if params.timeslice_max is not None:
+            lines.append(f"Timeslice-max: {params.timeslice_max}")
+        if params.break_on:
+            lines.append(f"Break-on: {params.break_on}")
+        if params.env:
+            lines.append(f"Environment: {json.dumps(params.env, sort_keys=True)}")
         lines.extend([
             "",
             "--- Reproduction command ---",
@@ -457,23 +530,35 @@ class Finding:
             cmd.append("--record-preemptions /tmp/repro.preempt")
         elif self.error_type.startswith(("replay_", "replay2_")):
             # Replay failed during preemptive determinism (record+replay)
-            record_cmd = " ".join(cmd + ["--record-preemptions /tmp/repro.preempt"])
-            replay_cmd = f"{SCXSIM} replay /tmp/repro.preempt"
+            record_cmd = format_command(
+                cmd + ["--record-preemptions", "/tmp/repro.preempt"],
+                self.config.sim_params.env,
+            )
+            replay_cmd = format_command([str(SCXSIM), "replay", "/tmp/repro.preempt"])
             return f"{record_cmd} && {replay_cmd}"
         elif self.error_type == "replay_nondeterminism":
             # Record then replay twice to compare
-            record_cmd = " ".join(cmd + ["--record-preemptions /tmp/repro.preempt"])
-            replay_cmd = f"{SCXSIM} replay /tmp/repro.preempt"
+            record_cmd = format_command(
+                cmd + ["--record-preemptions", "/tmp/repro.preempt"],
+                self.config.sim_params.env,
+            )
+            replay_cmd = format_command([str(SCXSIM), "replay", "/tmp/repro.preempt"])
             return f"{record_cmd} && {replay_cmd} && {replay_cmd}"
-        elif self.error_type in ("e9_replay_", "cross_replay_mismatch"):
+        elif self.error_type.startswith("e9_replay_") or self.error_type == "cross_replay_mismatch":
             # Cross-mechanism: record + e9patch replay + hw replay
-            record_cmd = " ".join(cmd + ["--record-preemptions /tmp/repro.preempt"])
-            e9_replay = f"{SCXSIM} replay /tmp/repro.preempt --preempt-mode e9patch"
-            hw_replay = f"{SCXSIM} replay /tmp/repro.preempt"
+            record_cmd = format_command(
+                cmd + ["--record-preemptions", "/tmp/repro.preempt"],
+                self.config.sim_params.env,
+            )
+            e9_replay = format_command([
+                str(SCXSIM), "replay", "/tmp/repro.preempt",
+                "--preempt-mode", "e9patch",
+            ])
+            hw_replay = format_command([str(SCXSIM), "replay", "/tmp/repro.preempt"])
             return f"{record_cmd} && {e9_replay} && {hw_replay}"
         elif self.error_type == "determinism":
             cmd.append("--determinism-check")
-        return " ".join(cmd)
+        return format_command(cmd, self.config.sim_params.env)
 
 
 # ---------------------------------------------------------------------------
@@ -501,6 +586,8 @@ def build_base_cmd(config: TestConfig) -> list[str]:
         cmd.append("--preemptive")
     elif config.interleave_mode == "e9patch":
         cmd.extend(["--preemptive", "--preempt-mode", "e9patch"])
+    elif config.interleave_mode == "native-concurrent":
+        cmd.append("--native-concurrent")
 
     # Apply extra simulator parameters
     params = config.sim_params
@@ -510,7 +597,33 @@ def build_base_cmd(config: TestConfig) -> list[str]:
         cmd.append("--no-noise")
     if params.no_overhead:
         cmd.append("--no-overhead")
+    if params.fixed_priority:
+        cmd.append("--fixed-priority")
+    if params.window_ns is not None and config.interleave_mode == "native-concurrent":
+        cmd.extend(["--window-ns", str(params.window_ns)])
+    if params.timeslice_min is not None and config.interleave_mode in ("preemptive", "e9patch"):
+        cmd.extend(["--timeslice-min", str(params.timeslice_min)])
+    if params.timeslice_max is not None and config.interleave_mode in ("preemptive", "e9patch"):
+        cmd.extend(["--timeslice-max", str(params.timeslice_max)])
+    if params.break_on and config.interleave_mode in ("preemptive", "e9patch"):
+        cmd.extend(["--break-on", params.break_on])
     return cmd
+
+
+def build_env(config: TestConfig) -> dict[str, str]:
+    """Build subprocess environment for a configuration."""
+    env = os.environ.copy()
+    env.update(config.sim_params.env)
+    return env
+
+
+def format_command(cmd: list[str], extra_env: Optional[dict[str, str]] = None) -> str:
+    """Return a shell-replayable command string."""
+    parts = []
+    for key, value in sorted((extra_env or {}).items()):
+        parts.append(f"{key}={shlex.quote(value)}")
+    parts.extend(shlex.quote(str(arg)) for arg in cmd)
+    return " ".join(parts)
 
 
 def classify_error(returncode: int, stderr: str) -> str:
@@ -613,7 +726,11 @@ def _record_preemptions(
     only on failure."""
     cmd = build_base_cmd(config) + ["--record-preemptions", trace_path]
     result = subprocess.run(
-        cmd, capture_output=True, text=True, timeout=PROCESS_TIMEOUT_SEC
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=PROCESS_TIMEOUT_SEC,
+        env=build_env(config),
     )
     if result.returncode != 0:
         error_type = classify_error(result.returncode, result.stderr)
@@ -832,7 +949,7 @@ def run_determinism_e9patch(config: TestConfig) -> Optional[Finding]:
     """
     start = time.monotonic()
     results = []
-    env = os.environ.copy()
+    env = build_env(config)
     env["RUST_LOG"] = "warn"
 
     try:
@@ -910,6 +1027,8 @@ _WORKER_SCHEDULERS: list[str] = []
 _WORKER_WORKLOADS: list[Path] = []
 _WORKER_MODES: list[str] = []
 _WORKER_USE_RANDOM_WORKLOADS: bool = False
+_WORKER_RANDOM_PARAMS: bool = False
+_WORKER_CHAOS: bool = False
 
 
 def _init_worker(
@@ -920,11 +1039,17 @@ def _init_worker(
     workloads: list[str],
     modes: list[str],
     use_random_workloads: bool,
+    random_params: bool,
+    chaos: bool,
+    cpu_counts: list[int],
+    task_counts: list[int],
+    task_multipliers: list[int],
 ) -> None:
     """Initializer for pool workers: install shared PMU state as globals."""
     global PMU_TOKEN_POOL, PMU_ACQUIRED, PMU_REDIRECTED
     global _WORKER_SCHEDULERS, _WORKER_WORKLOADS, _WORKER_MODES
-    global _WORKER_USE_RANDOM_WORKLOADS
+    global _WORKER_USE_RANDOM_WORKLOADS, _WORKER_RANDOM_PARAMS, _WORKER_CHAOS
+    global CPU_COUNTS, TASK_COUNTS, TASK_MULTIPLIERS
     PMU_TOKEN_POOL = pmu_pool
     PMU_ACQUIRED = pmu_acquired
     PMU_REDIRECTED = pmu_redirected
@@ -932,6 +1057,11 @@ def _init_worker(
     _WORKER_WORKLOADS = [Path(w) for w in workloads]
     _WORKER_MODES = modes
     _WORKER_USE_RANDOM_WORKLOADS = use_random_workloads
+    _WORKER_RANDOM_PARAMS = random_params
+    _WORKER_CHAOS = chaos
+    CPU_COUNTS = cpu_counts
+    TASK_COUNTS = task_counts
+    TASK_MULTIPLIERS = task_multipliers
 
 
 def needs_pmu_token(config: TestConfig) -> bool:
@@ -968,6 +1098,7 @@ def _run_config(config: TestConfig) -> Optional[Finding]:
             capture_output=True,
             text=True,
             timeout=PROCESS_TIMEOUT_SEC,
+            env=build_env(config),
         )
         elapsed = time.monotonic() - start
 
@@ -1053,6 +1184,8 @@ def run_one(config: TestConfig) -> Optional[Finding]:
             _WORKER_WORKLOADS,
             _WORKER_MODES,
             use_random_workloads=_WORKER_USE_RANDOM_WORKLOADS,
+            random_params=_WORKER_RANDOM_PARAMS,
+            chaos=_WORKER_CHAOS,
         )
         alt.iteration = config.iteration
         if not needs_pmu_token(alt):
@@ -1069,9 +1202,17 @@ def run_one(config: TestConfig) -> Optional[Finding]:
         PMU_TOKEN_POOL.release()
 
 
-def _random_sim_params(rng: random.Random) -> SimParams:
+def _random_sim_params(
+    rng: random.Random,
+    mode: str,
+    random_params: bool,
+    chaos: bool,
+) -> SimParams:
     """Generate randomized simulator parameters."""
     params = SimParams()
+    if not random_params and not chaos:
+        return params
+
     # Randomize rbc-ns: 50% chance of non-default
     if rng.random() < 0.5:
         params.rbc_ns = rng.choice(RBC_NS_CHOICES)
@@ -1083,6 +1224,28 @@ def _random_sim_params(rng: random.Random) -> SimParams:
         params.no_noise = True
     if rng.random() < 0.15:
         params.no_overhead = True
+
+    if mode == "native-concurrent":
+        params.window_ns = rng.choice(WINDOW_NS_CHOICES)
+
+    if mode in ("preemptive", "e9patch"):
+        params.break_on = rng.choice(BREAK_ON_CHOICES)
+        if params.break_on == "insn":
+            params.timeslice_min, params.timeslice_max = rng.choice(TIMESLICE_INSN_CHOICES)
+        else:
+            params.timeslice_min, params.timeslice_max = rng.choice(TIMESLICE_RBC_CHOICES)
+
+    # Default scxsim behavior is randomized same-time event ordering. Keep that
+    # for chaos runs and include occasional fixed-priority controls.
+    if rng.random() < (0.05 if chaos else 0.15):
+        params.fixed_priority = True
+
+    if chaos and not params.no_noise:
+        params.env = {
+            "SCX_SIM_RUN_JITTER_CV_PPM": str(rng.choice(RUN_JITTER_CV_PPM_CHOICES)),
+            "SCX_SIM_TICK_JITTER_STDDEV_NS": str(rng.choice(TICK_JITTER_STDDEV_NS_CHOICES)),
+            "SCX_SIM_INITIAL_TICK_SKEW_NS": str(rng.choice(INITIAL_TICK_SKEW_NS_CHOICES)),
+        }
     return params
 
 
@@ -1092,6 +1255,8 @@ def generate_configs(
     workloads: list[Path],
     modes: list[str],
     use_random_workloads: bool = False,
+    random_params: bool = False,
+    chaos: bool = False,
 ) -> TestConfig:
     """Generate a random test configuration.
 
@@ -1105,16 +1270,12 @@ def generate_configs(
     if mode == "e9patch" and cpus == 1:
         cpus = rng.choice([2, 4, 8])
 
-    is_random = use_random_workloads and rng.random() < 0.5
+    is_random = use_random_workloads and rng.random() < (0.8 if chaos else 0.5)
     if is_random:
-        workload = generate_random_workload(rng)
-        sim_params = _random_sim_params(rng)
+        workload = generate_random_workload(rng, cpus)
     else:
         workload = rng.choice(workloads)
-        # Also randomize sim params for fixed workloads when flag is set
-        sim_params = (
-            _random_sim_params(rng) if use_random_workloads else SimParams()
-        )
+    sim_params = _random_sim_params(rng, mode, random_params, chaos)
 
     return TestConfig(
         scheduler=rng.choice(schedulers),
@@ -1137,6 +1298,39 @@ def save_finding(finding: Finding, finding_num: int) -> Path:
     return path
 
 
+def parse_int_list(value: str, flag: str) -> list[int]:
+    """Parse a comma-separated positive integer list."""
+    parsed: list[int] = []
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            number = int(item)
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                f"{flag} entries must be integers: {item!r}"
+            )
+        if number <= 0:
+            raise argparse.ArgumentTypeError(
+                f"{flag} entries must be positive: {item!r}"
+            )
+        parsed.append(number)
+    if not parsed:
+        raise argparse.ArgumentTypeError(f"{flag} must not be empty")
+    return parsed
+
+
+def write_run_record(record_path: Optional[Path], record: dict[str, Any]) -> None:
+    """Append one JSONL run-manifest record."""
+    if record_path is None:
+        return
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+    with record_path.open("a") as f:
+        json.dump(record, f, sort_keys=True)
+        f.write("\n")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -1149,6 +1343,12 @@ def main() -> int:
         type=float,
         default=10,
         help="Duration in minutes (default: 10). Supports fractions like 0.5 for 30s.",
+    )
+    parser.add_argument(
+        "--max-runs",
+        type=int,
+        default=None,
+        help="Stop after submitting this many runs, still bounded by --duration.",
     )
     parser.add_argument(
         "--jobs",
@@ -1214,6 +1414,51 @@ def main() -> int:
              "(rbc-ns, watchdog timeout, noise, overhead).",
     )
     parser.add_argument(
+        "--random-params",
+        action="store_true",
+        help="Randomize simulator knobs even when --random-workloads is disabled.",
+    )
+    parser.add_argument(
+        "--chaos",
+        action="store_true",
+        help="Enable aggressive timing/interleaving chaos knobs and run manifests.",
+    )
+    parser.add_argument(
+        "--high-concurrency",
+        action="store_true",
+        help="Use large default CPU/task matrices for simulator concurrency stress.",
+    )
+    parser.add_argument(
+        "--modes",
+        type=str,
+        default=None,
+        help=f"Comma-separated interleave modes (default: auto from {','.join(INTERLEAVE_MODES)})",
+    )
+    parser.add_argument(
+        "--cpu-counts",
+        type=str,
+        default=None,
+        help="Comma-separated simulated CPU counts for random configs.",
+    )
+    parser.add_argument(
+        "--task-counts",
+        type=str,
+        default=None,
+        help="Comma-separated task counts for random workload generation.",
+    )
+    parser.add_argument(
+        "--task-multipliers",
+        type=str,
+        default=None,
+        help="Comma-separated task_count=cpus*multiplier choices for random workloads.",
+    )
+    parser.add_argument(
+        "--run-record",
+        type=Path,
+        default=None,
+        help="Append submitted/completed run records as JSONL at this path.",
+    )
+    parser.add_argument(
         "--max-pmu",
         type=int,
         default=MAX_PMU_CONCURRENT,
@@ -1229,11 +1474,27 @@ def main() -> int:
             print(f"  {wl.stem}")
         sys.exit(0)
 
+    if args.max_runs is not None and args.max_runs <= 0:
+        print("error: --max-runs must be positive", file=sys.stderr)
+        sys.exit(1)
+
     # Set global config from CLI args
     global WATCHDOG_TIMEOUT, SIM_DURATION, DETERMINISM_MODE
+    global CPU_COUNTS, TASK_COUNTS, TASK_MULTIPLIERS
     WATCHDOG_TIMEOUT = args.watchdog
     SIM_DURATION = args.sim_duration
     DETERMINISM_MODE = args.determinism
+
+    if args.high_concurrency:
+        CPU_COUNTS = [16, 32, 64, 128]
+        TASK_COUNTS = [64, 128, 256, 512]
+        TASK_MULTIPLIERS = [4, 8, 10]
+    if args.cpu_counts:
+        CPU_COUNTS = parse_int_list(args.cpu_counts, "--cpu-counts")
+    if args.task_counts:
+        TASK_COUNTS = parse_int_list(args.task_counts, "--task-counts")
+    if args.task_multipliers:
+        TASK_MULTIPLIERS = parse_int_list(args.task_multipliers, "--task-multipliers")
 
     # Set up logging first
     log_path = setup_logging()
@@ -1273,7 +1534,21 @@ def main() -> int:
 
     # Determine which interleave modes to test
     has_e9 = e9_schedulers_available()
-    if args.e9patch:
+    if args.modes:
+        modes = [m.strip() for m in args.modes.split(",") if m.strip()]
+        unknown_modes = [m for m in modes if m not in INTERLEAVE_MODES]
+        if unknown_modes:
+            print(f"error: unknown mode(s): {', '.join(unknown_modes)}", file=sys.stderr)
+            print(f"available: {', '.join(INTERLEAVE_MODES)}", file=sys.stderr)
+            sys.exit(1)
+        if "e9patch" in modes and not has_e9:
+            print(
+                "error: modes include e9patch but _e9.so variants are missing. "
+                "Build with: make -C schedulers e9",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    elif args.e9patch:
         if not has_e9:
             print(
                 "error: --e9patch requires _e9.so variants. "
@@ -1301,18 +1576,30 @@ def main() -> int:
     print(f"Schedulers: {', '.join(schedulers)}")
     print(f"Workloads: {', '.join(wl.stem for wl in workloads)}")
     if args.random_workloads:
-        print("Random workloads: enabled (50% random, 50% fixed)")
+        mix = "80% random, 20% fixed" if args.chaos else "50% random, 50% fixed"
+        print(f"Random workloads: enabled ({mix})")
         print(f"  Task counts: {TASK_COUNTS}")
+        print(f"  Task multipliers: {TASK_MULTIPLIERS}")
         print(f"  Phase patterns: {PHASE_PATTERNS}")
+    if args.random_params or args.random_workloads or args.chaos:
         print(f"  RBC-ns choices: {RBC_NS_CHOICES}")
         print(f"  Watchdog choices: {WATCHDOG_CHOICES}")
+    if args.chaos:
+        print(f"Chaos env RUN_JITTER_CV_PPM: {RUN_JITTER_CV_PPM_CHOICES}")
+        print(f"Chaos env TICK_JITTER_STDDEV_NS: {TICK_JITTER_STDDEV_NS_CHOICES}")
+        print(f"Chaos env INITIAL_TICK_SKEW_NS: {INITIAL_TICK_SKEW_NS_CHOICES}")
     print(f"Interleave modes: {', '.join(modes)}")
+    print(f"CPU counts: {CPU_COUNTS}")
     print(f"Watchdog: {WATCHDOG_TIMEOUT}, sim duration: {SIM_DURATION}")
+    if args.max_runs is not None:
+        print(f"Max runs: {args.max_runs}")
     print(f"Max PMU concurrent: {args.max_pmu}")
     if "e9patch" in modes:
         print(f"e9patch determinism repeats: {E9_DETERMINISM_REPEATS}")
     print(f"Output: {OUTPUT_DIR}")
     print(f"Log: {log_path}")
+    if args.run_record:
+        print(f"Run record: {args.run_record}")
     print()
 
     log.info("=" * 60)
@@ -1325,9 +1612,14 @@ def main() -> int:
     log.info(f"Schedulers: {', '.join(schedulers)}")
     log.info(f"Workloads: {', '.join(wl.stem for wl in workloads)}")
     log.info(f"Interleave modes: {', '.join(modes)}")
+    log.info(f"CPU counts: {CPU_COUNTS}")
+    log.info(f"Task counts: {TASK_COUNTS}")
+    log.info(f"Task multipliers: {TASK_MULTIPLIERS}")
     log.info(f"Watchdog timeout: {WATCHDOG_TIMEOUT}")
     log.info(f"Sim duration: {SIM_DURATION}")
+    log.info(f"Max runs: {args.max_runs}")
     log.info(f"Max PMU concurrent: {args.max_pmu}")
+    log.info(f"Run record: {args.run_record}")
 
     # Initialize shared PMU token pool and stats counters
     pmu_pool = multiprocessing.Semaphore(args.max_pmu)
@@ -1337,6 +1629,9 @@ def main() -> int:
     findings: list[Finding] = []
     total_runs = 0
     completed_runs = 0
+    record_path: Optional[Path] = args.run_record
+    if record_path is not None and record_path.exists():
+        record_path.unlink()
 
     # Pre-generate a batch of configs
     batch_size = args.jobs * 4
@@ -1352,20 +1647,39 @@ def main() -> int:
                 pmu_pool, pmu_acquired, pmu_redirected,
                 schedulers, workload_strs, modes,
                 args.random_workloads,
+                args.random_params or args.random_workloads,
+                args.chaos,
+                CPU_COUNTS,
+                TASK_COUNTS,
+                TASK_MULTIPLIERS,
             ),
         ) as pool:
             pending: dict[Future[Optional[Finding]], TestConfig] = {}
             iteration = 0
 
-            while time.monotonic() < deadline or pending:
+            def under_run_limit() -> bool:
+                return args.max_runs is None or total_runs < args.max_runs
+
+            while (time.monotonic() < deadline and under_run_limit()) or pending:
                 # Submit new work while under deadline
-                while len(pending) < batch_size and time.monotonic() < deadline:
+                while (
+                    len(pending) < batch_size
+                    and time.monotonic() < deadline
+                    and under_run_limit()
+                ):
                     config = generate_configs(
                         rng, schedulers, workloads, modes,
                         use_random_workloads=args.random_workloads,
+                        random_params=args.random_params or args.random_workloads,
+                        chaos=args.chaos,
                     )
                     config.iteration = iteration
                     iteration += 1
+                    write_run_record(record_path, {
+                        "event": "submitted",
+                        "timestamp": datetime.now().isoformat(),
+                        "config": config.to_record(),
+                    })
                     future = pool.submit(run_one, config)
                     pending[future] = config
                     total_runs += 1
@@ -1405,12 +1719,27 @@ def main() -> int:
                         findings.append(finding)
                         num = len(findings)
                         path = save_finding(finding, num)
+                        write_run_record(record_path, {
+                            "event": "completed",
+                            "timestamp": datetime.now().isoformat(),
+                            "iteration": config.iteration,
+                            "status": "finding",
+                            "finding_number": num,
+                            "error_type": finding.error_type,
+                            "finding_path": str(path),
+                        })
                         log.warning(f"BUG #{num}: {finding.summary()} -> {path.name}")
                         print(
                             f"  BUG #{num}: {finding.summary()}"
                             f"  -> {path.name}"
                         )
                     else:
+                        write_run_record(record_path, {
+                            "event": "completed",
+                            "timestamp": datetime.now().isoformat(),
+                            "iteration": config.iteration,
+                            "status": "pass",
+                        })
                         log.debug(f"PASS: {config.label}")
 
                 # Progress update every batch
