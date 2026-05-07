@@ -15,6 +15,7 @@
 //! - `phases` — multi-phase task definitions
 //! - `instance` — multiple task instances
 //! - `cpus` — CPU affinity mask (parsed into `TaskDef::allowed_cpus`)
+//! - task-level `taskgroup` — mapped to simulator cgroups with all CPUs allowed
 //! - `global.duration` — scenario duration
 //!
 //! # Limitations
@@ -23,16 +24,16 @@
 //!   with rt-app's `workgen` script or use suffixed keys (`"run0"`, `"run1"`).
 //! - Unsupported events (`lock`, `unlock`, `wait`, `signal`, `broad`, `sync`,
 //!   `mem`, `iorun`, `yield`, `barrier`, `fork`) are skipped with a warning.
-//! - Cgroup (`taskgroup`) is not modeled.
+//! - Phase-level `taskgroup` migration is not modeled.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use serde_json::{Map, Value};
 use tracing::{info, warn};
 
 use crate::scenario::{
-    sched_overhead_rbc_ns_from_env, seed_from_env, IrqEvent, IrqType, NoiseConfig, OverheadConfig,
-    Scenario, DEFAULT_WATCHDOG_TIMEOUT_NS,
+    sched_overhead_rbc_ns_from_env, seed_from_env, CgroupDef, IrqEvent, IrqType, NoiseConfig,
+    OverheadConfig, Scenario, DEFAULT_WATCHDOG_TIMEOUT_NS,
 };
 use crate::task::{Phase, RepeatMode, TaskBehavior, TaskDef};
 use crate::types::{CpuId, Pid};
@@ -268,6 +269,61 @@ fn parse_cpus(value: &Value) -> Result<Option<Vec<CpuId>>, RtAppError> {
     }
 }
 
+fn normalize_taskgroup_name(raw: &str) -> Option<String> {
+    let parts: Vec<_> = raw
+        .trim()
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    if parts.is_empty() {
+        None
+    } else {
+        Some(format!("/{}", parts.join("/")))
+    }
+}
+
+fn parse_taskgroup(obj: &Map<String, Value>) -> Result<Option<String>, RtAppError> {
+    match obj.get("taskgroup") {
+        Some(Value::String(name)) => Ok(normalize_taskgroup_name(name)),
+        Some(Value::Null) | None => Ok(None),
+        Some(v) => Err(RtAppError::InvalidValue(format!(
+            "taskgroup: expected string, got {v}"
+        ))),
+    }
+}
+
+fn cgroup_defs_for_tasks(tasks: &[TaskDef], nr_cpus: u32) -> Vec<CgroupDef> {
+    let mut names = BTreeSet::new();
+    for task in tasks {
+        let Some(name) = &task.cgroup_name else {
+            continue;
+        };
+
+        let mut path = String::new();
+        for part in name.split('/').filter(|part| !part.is_empty()) {
+            path.push('/');
+            path.push_str(part);
+            names.insert(path.clone());
+        }
+    }
+
+    let all_cpus: Vec<_> = (0..nr_cpus).map(CpuId).collect();
+    names
+        .into_iter()
+        .map(|name| {
+            let parent_name = name
+                .rsplit_once('/')
+                .and_then(|(parent, _)| (!parent.is_empty()).then(|| parent.to_string()));
+            CgroupDef {
+                name,
+                parent_name,
+                cpuset: Some(all_cpus.clone()),
+                bandwidth: None,
+            }
+        })
+        .collect()
+}
+
 /// Parse a single rt-app task object into one or more `TaskDef`s.
 ///
 /// Multiple `TaskDef`s are produced when `instance > 1`.
@@ -294,12 +350,7 @@ fn parse_task(
         None
     };
 
-    if obj.contains_key("taskgroup") {
-        warn!(
-            task = name,
-            "ignoring 'taskgroup' (not modeled in simulator)"
-        );
-    }
+    let cgroup_name = parse_taskgroup(obj)?;
 
     // Parse phases
     let all_phases = if let Some(phases_val) = obj.get("phases") {
@@ -369,7 +420,7 @@ fn parse_task(
             mm_id: None,
             allowed_cpus: allowed_cpus.clone(),
             parent_pid: None,
-            cgroup_name: None,
+            cgroup_name: cgroup_name.clone(),
             task_flags: 0,
             migration_disabled: 0,
         });
@@ -620,12 +671,14 @@ pub fn load_rtapp(json_str: &str, nr_cpus: u32) -> Result<Scenario, RtAppError> 
         }
     }
 
+    let cgroups = cgroup_defs_for_tasks(&all_tasks, nr_cpus);
+
     Ok(Scenario {
         nr_cpus,
         smt_threads_per_core: 1,
         cpus_per_llc: 0,
         tasks: all_tasks,
-        cgroups: Vec::new(), // rt-app doesn't use cgroups
+        cgroups,
         duration_ns,
         noise: NoiseConfig::from_env(),
         overhead: OverheadConfig::from_env(),
