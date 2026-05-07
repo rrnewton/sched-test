@@ -240,6 +240,14 @@ struct RunArgs {
     #[arg(long, conflicts_with = "rbc_ns")]
     no_rbc: bool,
 
+    /// Treat scx_bpf_error reports as simulator failures.
+    #[arg(long)]
+    detect_bpf_errors: bool,
+
+    /// Enable LAVD cgroup CPU bandwidth handling for cpu.max scenarios.
+    #[arg(long)]
+    lavd_enable_cpu_bw: bool,
+
     /// Watchdog timeout for stall detection.
     ///
     /// If a runnable task is not scheduled within this duration (simulated
@@ -521,6 +529,9 @@ fn run(args: &RunArgs) -> Result<(), String> {
     }
     if args.no_rbc {
         scenario.sched_overhead_rbc_ns = Some(0);
+    }
+    if args.detect_bpf_errors {
+        scenario.ignore_bpf_errors = false;
     }
     if let Some(ref timeout) = args.watchdog_timeout {
         let normalized = timeout.trim().to_lowercase();
@@ -1067,6 +1078,14 @@ fn run_simulation(args: &RunArgs, scenario: Scenario) -> Result<(), String> {
     }
 
     let sched = load_scheduler(&args.scheduler, args.cpus, use_e9)?;
+    if args.scheduler == "lavd" && args.lavd_enable_cpu_bw {
+        enable_lavd_cpu_bw(&sched)?;
+    }
+    let cbw_probes = if args.scheduler == "lavd" && args.lavd_enable_cpu_bw {
+        Some(load_lavd_cbw_probes(&sched))
+    } else {
+        None
+    };
     let _lock = SIM_LOCK.lock().unwrap();
 
     // Capture .so base address BEFORE the simulation runs. The scheduler
@@ -1098,7 +1117,12 @@ fn run_simulation(args: &RunArgs, scenario: Scenario) -> Result<(), String> {
         so_path: so_abs_path,
     };
 
-    let trace = Simulator::new(sched).run(scenario);
+    let sim = Simulator::new(sched);
+    let trace = sim.run(scenario);
+
+    if let Some(probes) = cbw_probes {
+        probes.print();
+    }
 
     if args.dump_trace {
         trace.dump();
@@ -1191,6 +1215,69 @@ fn load_scheduler(name: &str, nr_cpus: u32, e9patch: bool) -> Result<DynamicSche
         Err(format!(
             "unknown scheduler {name:?}; use --list-schedulers to see available schedulers"
         ))
+    }
+}
+
+fn enable_lavd_cpu_bw(sched: &DynamicScheduler) -> Result<(), String> {
+    // SAFETY: libscx_lavd.so exports enable_cpu_bw as a bool global. This is
+    // the same pre-init global override pattern used by LAVD integration tests.
+    unsafe {
+        let sym: libloading::Symbol<'_, *mut bool> = sched
+            .get_symbol(b"enable_cpu_bw\0")
+            .ok_or("LAVD symbol enable_cpu_bw not found")?;
+        std::ptr::write_volatile(*sym, true);
+    }
+    Ok(())
+}
+
+type LavdProbeFn = unsafe extern "C" fn() -> u64;
+
+struct LavdCbwProbes {
+    throttle: LavdProbeFn,
+    refill: LavdProbeFn,
+    put_aside: LavdProbeFn,
+    reenqueue: LavdProbeFn,
+}
+
+fn load_lavd_cbw_probes(sched: &DynamicScheduler) -> LavdCbwProbes {
+    // SAFETY: These probe functions are exported by the LAVD simulator wrapper
+    // and only read simulator-side counters.
+    unsafe {
+        let throttle: libloading::Symbol<'_, LavdProbeFn> = sched
+            .get_symbol(b"lavd_probe_cbw_throttle_count\0")
+            .expect("lavd_probe_cbw_throttle_count not found");
+        let refill: libloading::Symbol<'_, LavdProbeFn> = sched
+            .get_symbol(b"lavd_probe_cbw_refill_count\0")
+            .expect("lavd_probe_cbw_refill_count not found");
+        let put_aside: libloading::Symbol<'_, LavdProbeFn> = sched
+            .get_symbol(b"lavd_probe_cbw_put_aside_count\0")
+            .expect("lavd_probe_cbw_put_aside_count not found");
+        let reenqueue: libloading::Symbol<'_, LavdProbeFn> = sched
+            .get_symbol(b"lavd_probe_cbw_reenqueue_count\0")
+            .expect("lavd_probe_cbw_reenqueue_count not found");
+        LavdCbwProbes {
+            throttle: *throttle,
+            refill: *refill,
+            put_aside: *put_aside,
+            reenqueue: *reenqueue,
+        }
+    }
+}
+
+impl LavdCbwProbes {
+    fn print(&self) {
+        // SAFETY: The function pointers were loaded from the still-live
+        // scheduler library held by `Simulator`.
+        unsafe {
+            let throttle = (self.throttle)();
+            let refill = (self.refill)();
+            let put_aside = (self.put_aside)();
+            let reenqueue = (self.reenqueue)();
+            eprintln!(
+                "lavd_cbw_probes throttles={throttle} refills={refill} \
+                 put_asides={put_aside} reenqueues={reenqueue}",
+            );
+        }
     }
 }
 

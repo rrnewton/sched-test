@@ -161,6 +161,39 @@ fn test_rtapp_taskgroup_lavd() {
     );
 }
 
+/// rt-app-rs cgroup v2 object taskgroups should populate simulator bandwidth.
+#[test]
+fn test_rtapp_taskgroup_cgroup_v2_bandwidth() {
+    let _lock = common::setup_test();
+    let json = r#"{
+        "global": { "duration": 1 },
+        "tasks": {
+            "runner": {
+                "loop": -1,
+                "run": 20000,
+                "taskgroup": {
+                    "path": "/tg1",
+                    "cpu.weight": 250,
+                    "cpu.max": "200000 100000"
+                }
+            }
+        }
+    }"#;
+
+    let scenario = load_rtapp(json, 4).unwrap();
+    assert_eq!(scenario.cgroups.len(), 1);
+    assert_eq!(scenario.cgroups[0].name, "/tg1");
+    assert_eq!(scenario.tasks[0].cgroup_name.as_deref(), Some("/tg1"));
+
+    let bandwidth = scenario.cgroups[0]
+        .bandwidth
+        .as_ref()
+        .expect("expected cpu.max bandwidth");
+    assert_eq!(bandwidth.period_us, 100_000);
+    assert_eq!(bandwidth.quota_us, 200_000);
+    assert_eq!(bandwidth.burst_us, 0);
+}
+
 /// Parse two_runners.json and simulate: two tasks with run+sleep cycles and
 /// different priorities, using only the fully-supported rt-app feature subset.
 #[test]

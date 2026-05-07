@@ -32,8 +32,8 @@ use serde_json::{Map, Value};
 use tracing::{info, warn};
 
 use crate::scenario::{
-    sched_overhead_rbc_ns_from_env, seed_from_env, CgroupDef, IrqEvent, IrqType, NoiseConfig,
-    OverheadConfig, Scenario, DEFAULT_WATCHDOG_TIMEOUT_NS,
+    sched_overhead_rbc_ns_from_env, seed_from_env, CgroupBandwidth, CgroupDef, IrqEvent, IrqType,
+    NoiseConfig, OverheadConfig, Scenario, DEFAULT_WATCHDOG_TIMEOUT_NS,
 };
 use crate::task::{Phase, RepeatMode, TaskBehavior, TaskDef};
 use crate::types::{CpuId, Pid};
@@ -282,17 +282,135 @@ fn normalize_taskgroup_name(raw: &str) -> Option<String> {
     }
 }
 
-fn parse_taskgroup(obj: &Map<String, Value>) -> Result<Option<String>, RtAppError> {
+#[derive(Debug, Clone)]
+struct RtTaskgroupSpec {
+    name: String,
+    bandwidth: Option<CgroupBandwidth>,
+}
+
+fn parse_cpu_max(value: &str) -> Result<Option<CgroupBandwidth>, RtAppError> {
+    let parts: Vec<_> = value.split_whitespace().collect();
+    if parts.len() != 2 {
+        return Err(RtAppError::InvalidValue(format!(
+            "taskgroup.cpu.max: expected 'max PERIOD' or 'QUOTA PERIOD', got {value:?}"
+        )));
+    }
+
+    let period_us = parts[1].parse::<u64>().map_err(|_| {
+        RtAppError::InvalidValue(format!("taskgroup.cpu.max: invalid period in {value:?}"))
+    })?;
+    if period_us == 0 {
+        return Err(RtAppError::InvalidValue(format!(
+            "taskgroup.cpu.max: period must be nonzero in {value:?}"
+        )));
+    }
+
+    if parts[0] == "max" {
+        return Ok(None);
+    }
+
+    let quota_us = parts[0].parse::<u64>().map_err(|_| {
+        RtAppError::InvalidValue(format!("taskgroup.cpu.max: invalid quota in {value:?}"))
+    })?;
+    if quota_us == 0 {
+        return Err(RtAppError::InvalidValue(format!(
+            "taskgroup.cpu.max: quota must be nonzero in {value:?}"
+        )));
+    }
+
+    Ok(Some(CgroupBandwidth {
+        period_us,
+        quota_us,
+        burst_us: 0,
+    }))
+}
+
+fn parse_taskgroup(obj: &Map<String, Value>) -> Result<Option<RtTaskgroupSpec>, RtAppError> {
     match obj.get("taskgroup") {
-        Some(Value::String(name)) => Ok(normalize_taskgroup_name(name)),
+        Some(Value::String(name)) => {
+            Ok(normalize_taskgroup_name(name).map(|name| RtTaskgroupSpec {
+                name,
+                bandwidth: None,
+            }))
+        }
+        Some(Value::Object(spec)) => {
+            let path = spec
+                .get("path")
+                .or_else(|| spec.get("name"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    RtAppError::InvalidValue(
+                        "taskgroup: object requires string path or name".into(),
+                    )
+                })?;
+
+            let Some(name) = normalize_taskgroup_name(path) else {
+                return Ok(None);
+            };
+
+            if let Some(weight) = spec.get("cpu.weight").or_else(|| spec.get("cpu_weight")) {
+                let weight = weight.as_u64().ok_or_else(|| {
+                    RtAppError::InvalidValue(format!(
+                        "taskgroup.cpu.weight: expected integer, got {weight}"
+                    ))
+                })?;
+                if !(1..=10_000).contains(&weight) {
+                    return Err(RtAppError::InvalidValue(format!(
+                        "taskgroup.cpu.weight: expected 1..=10000, got {weight}"
+                    )));
+                }
+            }
+
+            let bandwidth = match spec.get("cpu.max").or_else(|| spec.get("cpu_max")) {
+                Some(Value::String(cpu_max)) => parse_cpu_max(cpu_max)?,
+                Some(v) => {
+                    return Err(RtAppError::InvalidValue(format!(
+                        "taskgroup.cpu.max: expected string, got {v}"
+                    )));
+                }
+                None => None,
+            };
+
+            Ok(Some(RtTaskgroupSpec { name, bandwidth }))
+        }
         Some(Value::Null) | None => Ok(None),
         Some(v) => Err(RtAppError::InvalidValue(format!(
-            "taskgroup: expected string, got {v}"
+            "taskgroup: expected string or object, got {v}"
         ))),
     }
 }
 
-fn cgroup_defs_for_tasks(tasks: &[TaskDef], nr_cpus: u32) -> Vec<CgroupDef> {
+fn same_bandwidth(a: &CgroupBandwidth, b: &CgroupBandwidth) -> bool {
+    a.period_us == b.period_us && a.quota_us == b.quota_us && a.burst_us == b.burst_us
+}
+
+fn record_taskgroup_bandwidth(
+    cgroup_bandwidth: &mut HashMap<String, CgroupBandwidth>,
+    spec: &RtTaskgroupSpec,
+) -> Result<(), RtAppError> {
+    let Some(bandwidth) = &spec.bandwidth else {
+        return Ok(());
+    };
+
+    if let Some(existing) = cgroup_bandwidth.get(&spec.name) {
+        if !same_bandwidth(existing, bandwidth) {
+            return Err(RtAppError::InvalidValue(format!(
+                "taskgroup {:?}: conflicting cpu.max values",
+                spec.name
+            )));
+        }
+        return Ok(());
+    }
+
+    cgroup_bandwidth.insert(spec.name.clone(), bandwidth.clone());
+    Ok(())
+}
+
+fn cgroup_defs_for_tasks(
+    tasks: &[TaskDef],
+    nr_cpus: u32,
+    cgroup_bandwidth: &HashMap<String, CgroupBandwidth>,
+) -> Vec<CgroupDef> {
     let mut names = BTreeSet::new();
     for task in tasks {
         let Some(name) = &task.cgroup_name else {
@@ -315,10 +433,10 @@ fn cgroup_defs_for_tasks(tasks: &[TaskDef], nr_cpus: u32) -> Vec<CgroupDef> {
                 .rsplit_once('/')
                 .and_then(|(parent, _)| (!parent.is_empty()).then(|| parent.to_string()));
             CgroupDef {
+                bandwidth: cgroup_bandwidth.get(&name).cloned(),
                 name,
                 parent_name,
                 cpuset: Some(all_cpus.clone()),
-                bandwidth: None,
             }
         })
         .collect()
@@ -332,6 +450,7 @@ fn parse_task(
     obj: &Map<String, Value>,
     pid_start: &mut i32,
     name_to_pid: &HashMap<String, Pid>,
+    cgroup_bandwidth: &mut HashMap<String, CgroupBandwidth>,
 ) -> Result<Vec<TaskDef>, RtAppError> {
     let instance_count = obj.get("instance").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
 
@@ -350,7 +469,11 @@ fn parse_task(
         None
     };
 
-    let cgroup_name = parse_taskgroup(obj)?;
+    let taskgroup = parse_taskgroup(obj)?;
+    if let Some(spec) = &taskgroup {
+        record_taskgroup_bandwidth(cgroup_bandwidth, spec)?;
+    }
+    let cgroup_name = taskgroup.map(|spec| spec.name);
 
     // Parse phases
     let all_phases = if let Some(phases_val) = obj.get("phases") {
@@ -570,6 +693,7 @@ pub fn load_rtapp(json_str: &str, nr_cpus: u32) -> Result<Scenario, RtAppError> 
     // bpf_in_serving_softirq(), rq->clock_task, etc. behave correctly.
     let mut all_tasks: Vec<TaskDef> = Vec::new();
     let mut irq_events: Vec<IrqEvent> = Vec::new();
+    let mut cgroup_bandwidth: HashMap<String, CgroupBandwidth> = HashMap::new();
     let mut pid_counter: i32 = 1;
     for (task_name, task_val) in tasks_obj.iter() {
         let task_obj = task_val.as_object().ok_or_else(|| {
@@ -643,7 +767,13 @@ pub fn load_rtapp(json_str: &str, nr_cpus: u32) -> Result<Scenario, RtAppError> 
             continue;
         }
 
-        let defs = parse_task(task_name, task_obj, &mut pid_counter, &name_to_pid)?;
+        let defs = parse_task(
+            task_name,
+            task_obj,
+            &mut pid_counter,
+            &name_to_pid,
+            &mut cgroup_bandwidth,
+        )?;
         all_tasks.extend(defs);
     }
 
@@ -671,7 +801,7 @@ pub fn load_rtapp(json_str: &str, nr_cpus: u32) -> Result<Scenario, RtAppError> 
         }
     }
 
-    let cgroups = cgroup_defs_for_tasks(&all_tasks, nr_cpus);
+    let cgroups = cgroup_defs_for_tasks(&all_tasks, nr_cpus, &cgroup_bandwidth);
 
     Ok(Scenario {
         nr_cpus,
