@@ -193,6 +193,27 @@ struct VmRunArgs {
     /// This is an alternative to --wprof for comparing simulator vs real runs.
     #[arg(long, conflicts_with = "wprof")]
     bpf_trace: bool,
+
+    /// Raw shell arguments appended to the scheduler command.
+    ///
+    /// Use `--scheduler-args=--enable-cpu-bw` when the first scheduler
+    /// argument starts with `-`.
+    #[arg(long, value_name = "ARGS", allow_hyphen_values = true)]
+    scheduler_args: Option<String>,
+
+    /// Executable hook run inside the VM after the scheduler starts and before
+    /// rt-app starts.
+    ///
+    /// The hook sees SCXSIM_* environment variables plus SCXSIM_SCHED_PID.
+    #[arg(long, value_name = "PATH")]
+    pre_hook: Option<PathBuf>,
+
+    /// Executable hook run inside the VM after rt-app exits and before the
+    /// scheduler/tracer are stopped.
+    ///
+    /// The hook sees SCXSIM_* environment variables plus SCXSIM_SCHED_PID.
+    #[arg(long, value_name = "PATH")]
+    post_hook: Option<PathBuf>,
 }
 
 /// Arguments for the `run` subcommand.
@@ -475,7 +496,17 @@ fn vm_run(args: &VmRunArgs) -> Result<(), String> {
         real_run::TraceMode::None
     };
 
-    real_run::run_vm(&args.workload, &args.scheduler, args.cpus, trace_mode)
+    real_run::run_vm(
+        &args.workload,
+        &args.scheduler,
+        args.cpus,
+        trace_mode,
+        real_run::VmRunConfig {
+            scheduler_args: args.scheduler_args.clone(),
+            pre_hook: args.pre_hook.clone(),
+            post_hook: args.post_hook.clone(),
+        },
+    )
 }
 
 fn run(args: &RunArgs) -> Result<(), String> {
@@ -1272,5 +1303,35 @@ mod tests {
             "workloads/two_runners.json",
         ])
         .is_err());
+    }
+
+    #[test]
+    fn vm_run_accepts_scheduler_args_and_hooks() {
+        let cli = Cli::try_parse_from([
+            "scxsim",
+            "vm-run",
+            "--scheduler",
+            "lavd",
+            "--scheduler-args=--enable-cpu-bw --foo=bar",
+            "--pre-hook",
+            "/tmp/pre.sh",
+            "--post-hook",
+            "/tmp/post.sh",
+            "workloads/two_runners.json",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Command::VmRun(args) => {
+                assert_eq!(args.scheduler, "lavd");
+                assert_eq!(
+                    args.scheduler_args.as_deref(),
+                    Some("--enable-cpu-bw --foo=bar")
+                );
+                assert_eq!(args.pre_hook, Some(PathBuf::from("/tmp/pre.sh")));
+                assert_eq!(args.post_hook, Some(PathBuf::from("/tmp/post.sh")));
+            }
+            _ => panic!("expected vm-run subcommand"),
+        }
     }
 }

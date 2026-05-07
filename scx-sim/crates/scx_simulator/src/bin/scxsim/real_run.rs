@@ -33,6 +33,17 @@ pub enum TraceMode {
     BpfTrace,
 }
 
+/// Extra orchestration options for `scxsim vm-run`.
+#[derive(Debug, Clone, Default)]
+pub struct VmRunConfig {
+    /// Raw shell arguments appended to the scheduler command.
+    pub scheduler_args: Option<String>,
+    /// Hook run after the scheduler starts and before rt-app starts.
+    pub pre_hook: Option<PathBuf>,
+    /// Hook run after rt-app exits and before cleanup.
+    pub post_hook: Option<PathBuf>,
+}
+
 /// Run the workload in a virtme-ng VM with the specified scheduler.
 ///
 /// This function:
@@ -57,9 +68,10 @@ pub fn run_vm(
     scheduler: &str,
     nr_cpus: u32,
     trace_mode: TraceMode,
+    config: VmRunConfig,
 ) -> Result<(), String> {
     // Validate prerequisites
-    validate_prerequisites(scheduler, trace_mode)?;
+    validate_prerequisites(scheduler, trace_mode, &config)?;
 
     // The workload file path will be accessible inside the VM because vng
     // shares the host filesystem. Just use the absolute path.
@@ -72,16 +84,23 @@ pub fn run_vm(
     // When tracing is enabled, add an extra CPU for the tracer
     let vm_cpus = if tracing { nr_cpus + 1 } else { nr_cpus };
     let isolated_cpu = nr_cpus; // The last CPU (0-indexed)
-    let workload_cpus = if tracing {
-        format!("0-{}", nr_cpus - 1)
-    } else {
-        String::new()
-    };
 
     eprintln!("=== Real VM Run ===");
     eprintln!("  scheduler:  scx_{scheduler}");
     eprintln!("  workload:   {}", workload_abs.display());
     eprintln!("  cpus:       {nr_cpus}");
+    if let Some(args) = normalized_scheduler_args(&config.scheduler_args) {
+        eprintln!("  sched args: {args}");
+    }
+    let pre_hook = canonicalize_hook(config.pre_hook.as_deref())?;
+    let post_hook = canonicalize_hook(config.post_hook.as_deref())?;
+
+    if let Some(path) = &pre_hook {
+        eprintln!("  pre-hook:   {}", path.display());
+    }
+    if let Some(path) = &post_hook {
+        eprintln!("  post-hook:  {}", path.display());
+    }
     match trace_mode {
         TraceMode::None => {}
         TraceMode::Wprof => {
@@ -95,74 +114,16 @@ pub fn run_vm(
 
     // Build the command to run inside the VM.
     let sched_bin = find_scheduler_binary(scheduler)?;
-    let inner_cmd = match trace_mode {
-        TraceMode::Wprof => {
-            // With wprof: pin tracer to isolated CPU, run workload on remaining CPUs.
-            // Use -T for Perfetto trace output, -d60000 for 60s max duration.
-            // Send SIGINT to wprof for clean shutdown and trace flush.
-            // Note: We run as root in the VM when tracing is enabled, so no sudo needed.
-            format!(
-                "taskset -c {isolated_cpu} wprof -d60000 -T {VM_WORKSPACE}/{WPROF_TRACE_FILENAME} &\n\
-                 TRACER_PID=$!\n\
-                 sleep 0.5\n\
-                 {sched_bin} &\n\
-                 SCHED_PID=$!\n\
-                 sleep 1\n\
-                 echo '=== Running rt-app ==='\n\
-                 taskset -c {workload_cpus} {RTAPP_BIN} {workload}\n\
-                 echo '=== rt-app completed ==='\n\
-                 kill -INT $TRACER_PID 2>/dev/null || true\n\
-                 kill $SCHED_PID 2>/dev/null || true\n\
-                 wait $TRACER_PID 2>/dev/null || true\n\
-                 wait $SCHED_PID 2>/dev/null || true",
-                sched_bin = sched_bin.display(),
-                workload = workload_abs.display(),
-            )
-        }
-        TraceMode::BpfTrace => {
-            // With bpftrace: start scheduler first, then attach tracer.
-            // Order matters: the scheduler must attach its struct_ops before
-            // bpftrace attaches fexit probes to scx_bpf_* kfuncs, otherwise
-            // EINVAL occurs on struct_ops attachment.
-            // The script accepts nr_cpus as $1 to filter probes to CPUs 0..nr_cpus-1.
-            // Output goes to a file in the mounted workspace directory.
-            format!(
-                "{sched_bin} &\n\
-                 SCHED_PID=$!\n\
-                 sleep 1\n\
-                 taskset -c {isolated_cpu} bpftrace {BPFTRACE_SCRIPT} {nr_cpus} \
-                 > {VM_WORKSPACE}/{BPF_TRACE_FILENAME} 2>&1 &\n\
-                 TRACER_PID=$!\n\
-                 sleep 1\n\
-                 echo '=== Running rt-app ==='\n\
-                 taskset -c {workload_cpus} {RTAPP_BIN} {workload}\n\
-                 echo '=== rt-app completed ==='\n\
-                 sleep 1\n\
-                 kill $TRACER_PID 2>/dev/null || true\n\
-                 kill $SCHED_PID 2>/dev/null || true\n\
-                 wait $TRACER_PID 2>/dev/null || true\n\
-                 wait $SCHED_PID 2>/dev/null || true",
-                sched_bin = sched_bin.display(),
-                workload = workload_abs.display(),
-            )
-        }
-        TraceMode::None => {
-            // No tracing: standard execution
-            format!(
-                "{sched_bin} &\n\
-                 SCHED_PID=$!\n\
-                 sleep 1\n\
-                 echo '=== Running rt-app ==='\n\
-                 {RTAPP_BIN} {workload}\n\
-                 echo '=== rt-app completed ==='\n\
-                 kill $SCHED_PID 2>/dev/null || true\n\
-                 wait $SCHED_PID 2>/dev/null || true",
-                sched_bin = sched_bin.display(),
-                workload = workload_abs.display(),
-            )
-        }
-    };
-
+    let inner_cmd = build_inner_cmd(
+        scheduler,
+        &sched_bin,
+        &workload_abs,
+        nr_cpus,
+        trace_mode,
+        normalized_scheduler_args(&config.scheduler_args),
+        pre_hook.as_deref(),
+        post_hook.as_deref(),
+    );
     // Launch vng with the host kernel (-r).
     // Use root when tracing is enabled (bpftrace/wprof need CAP_SYS_ADMIN).
     let user = if tracing {
@@ -237,8 +198,119 @@ pub fn run_vm(
     Ok(())
 }
 
+fn build_inner_cmd(
+    scheduler: &str,
+    sched_bin: &Path,
+    workload_abs: &Path,
+    nr_cpus: u32,
+    trace_mode: TraceMode,
+    scheduler_args: Option<&str>,
+    pre_hook_path: Option<&Path>,
+    post_hook_path: Option<&Path>,
+) -> String {
+    let tracing = trace_mode != TraceMode::None;
+    let isolated_cpu = nr_cpus;
+    let workload_cpus = if tracing {
+        format!("0-{}", nr_cpus - 1)
+    } else {
+        String::new()
+    };
+    let scheduler_cmd = scheduler_command(sched_bin, scheduler_args);
+    let workload_arg = shell_escape(&workload_abs.to_string_lossy());
+    let pre_hook = hook_command("pre-hook", pre_hook_path);
+    let post_hook = hook_command("post-hook", post_hook_path);
+    let setup_env = setup_env(
+        scheduler,
+        sched_bin,
+        workload_abs,
+        nr_cpus,
+        trace_mode,
+        scheduler_args,
+    );
+    match trace_mode {
+        TraceMode::Wprof => {
+            // With wprof: pin tracer to isolated CPU, run workload on remaining CPUs.
+            // Use -T for Perfetto trace output, -d60000 for 60s max duration.
+            // Send SIGINT to wprof for clean shutdown and trace flush.
+            // Note: We run as root in the VM when tracing is enabled, so no sudo needed.
+            format!(
+                "{setup_env}\
+                 taskset -c {isolated_cpu} wprof -d60000 -T {VM_WORKSPACE}/{WPROF_TRACE_FILENAME} &\n\
+                 TRACER_PID=$!\n\
+                 export SCXSIM_TRACER_PID=$TRACER_PID\n\
+                 sleep 0.5\n\
+                 {scheduler_cmd} &\n\
+                 SCHED_PID=$!\n\
+                 export SCXSIM_SCHED_PID=$SCHED_PID\n\
+                 sleep 1\n\
+                 {pre_hook}\
+                 echo '=== Running rt-app ==='\n\
+                 taskset -c {workload_cpus} {RTAPP_BIN} {workload_arg}\n\
+                 echo '=== rt-app completed ==='\n\
+                 {post_hook}\
+                 kill -INT $TRACER_PID 2>/dev/null || true\n\
+                kill $SCHED_PID 2>/dev/null || true\n\
+                wait $TRACER_PID 2>/dev/null || true\n\
+                wait $SCHED_PID 2>/dev/null || true",
+            )
+        }
+        TraceMode::BpfTrace => {
+            // With bpftrace: start scheduler first, then attach tracer.
+            // Order matters: the scheduler must attach its struct_ops before
+            // bpftrace attaches fexit probes to scx_bpf_* kfuncs, otherwise
+            // EINVAL occurs on struct_ops attachment.
+            // The script accepts nr_cpus as $1 to filter probes to CPUs 0..nr_cpus-1.
+            // Output goes to a file in the mounted workspace directory.
+            format!(
+                "{setup_env}\
+                 {scheduler_cmd} &\n\
+                 SCHED_PID=$!\n\
+                 export SCXSIM_SCHED_PID=$SCHED_PID\n\
+                 sleep 1\n\
+                 taskset -c {isolated_cpu} bpftrace {bpftrace_script} {nr_cpus} \
+                 > {VM_WORKSPACE}/{BPF_TRACE_FILENAME} 2>&1 &\n\
+                 TRACER_PID=$!\n\
+                 export SCXSIM_TRACER_PID=$TRACER_PID\n\
+                 sleep 1\n\
+                 {pre_hook}\
+                 echo '=== Running rt-app ==='\n\
+                 taskset -c {workload_cpus} {RTAPP_BIN} {workload_arg}\n\
+                 echo '=== rt-app completed ==='\n\
+                 {post_hook}\
+                 sleep 1\n\
+                 kill $TRACER_PID 2>/dev/null || true\n\
+                 kill $SCHED_PID 2>/dev/null || true\n\
+                 wait $TRACER_PID 2>/dev/null || true\n\
+                 wait $SCHED_PID 2>/dev/null || true",
+                bpftrace_script = shell_escape(BPFTRACE_SCRIPT),
+            )
+        }
+        TraceMode::None => {
+            // No tracing: standard execution
+            format!(
+                "{setup_env}\
+                 {scheduler_cmd} &\n\
+                 SCHED_PID=$!\n\
+                 export SCXSIM_SCHED_PID=$SCHED_PID\n\
+                 sleep 1\n\
+                 {pre_hook}\
+                 echo '=== Running rt-app ==='\n\
+                 {RTAPP_BIN} {workload_arg}\n\
+                 echo '=== rt-app completed ==='\n\
+                 {post_hook}\
+                kill $SCHED_PID 2>/dev/null || true\n\
+                wait $SCHED_PID 2>/dev/null || true",
+            )
+        }
+    }
+}
+
 /// Validate that all prerequisites are available.
-fn validate_prerequisites(scheduler: &str, trace_mode: TraceMode) -> Result<(), String> {
+fn validate_prerequisites(
+    scheduler: &str,
+    trace_mode: TraceMode,
+    config: &VmRunConfig,
+) -> Result<(), String> {
     // Check vng
     if !command_exists("vng") {
         return Err("vng (virtme-ng) not found in PATH".into());
@@ -252,6 +324,10 @@ fn validate_prerequisites(scheduler: &str, trace_mode: TraceMode) -> Result<(), 
     // Check scheduler binary
     find_scheduler_binary(scheduler)?;
 
+    // Check hooks
+    validate_hook("pre-hook", config.pre_hook.as_deref())?;
+    validate_hook("post-hook", config.post_hook.as_deref())?;
+
     // Check bpftrace when --bpf-trace is requested
     if trace_mode == TraceMode::BpfTrace {
         if !command_exists("bpftrace") {
@@ -263,6 +339,45 @@ fn validate_prerequisites(scheduler: &str, trace_mode: TraceMode) -> Result<(), 
     }
 
     Ok(())
+}
+
+fn validate_hook(label: &str, hook: Option<&Path>) -> Result<(), String> {
+    let Some(path) = hook else {
+        return Ok(());
+    };
+    if !path.exists() {
+        return Err(format!("{label} not found: {}", path.display()));
+    }
+    if !path.is_file() {
+        return Err(format!("{label} is not a file: {}", path.display()));
+    }
+    if !is_executable(path)? {
+        return Err(format!("{label} is not executable: {}", path.display()));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn is_executable(path: &Path) -> Result<bool, String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = path
+        .metadata()
+        .map_err(|e| format!("failed to inspect hook {}: {e}", path.display()))?;
+    Ok(metadata.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable(_path: &Path) -> Result<bool, String> {
+    Ok(true)
+}
+
+fn canonicalize_hook(hook: Option<&Path>) -> Result<Option<PathBuf>, String> {
+    hook.map(|path| {
+        path.canonicalize()
+            .map_err(|e| format!("failed to canonicalize hook {}: {e}", path.display()))
+    })
+    .transpose()
 }
 
 /// Find the scheduler binary.
@@ -355,6 +470,63 @@ fn find_scheduler_binary(scheduler: &str) -> Result<PathBuf, String> {
 /// Single-quote a string for sh, escaping any embedded single quotes.
 fn shell_escape(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+fn normalized_scheduler_args(args: &Option<String>) -> Option<&str> {
+    args.as_deref().map(str::trim).filter(|s| !s.is_empty())
+}
+
+fn scheduler_command(sched_bin: &Path, scheduler_args: Option<&str>) -> String {
+    let mut cmd = shell_escape(&sched_bin.to_string_lossy());
+    if let Some(args) = scheduler_args {
+        cmd.push(' ');
+        cmd.push_str(args);
+    }
+    cmd
+}
+
+fn setup_env(
+    scheduler: &str,
+    sched_bin: &Path,
+    workload: &Path,
+    nr_cpus: u32,
+    trace_mode: TraceMode,
+    scheduler_args: Option<&str>,
+) -> String {
+    let trace_mode = match trace_mode {
+        TraceMode::None => "none",
+        TraceMode::Wprof => "wprof",
+        TraceMode::BpfTrace => "bpftrace",
+    };
+    let scheduler_args = scheduler_args.unwrap_or("");
+    format!(
+        "export SCXSIM_SCHEDULER={scheduler}\n\
+         export SCXSIM_SCHED_BIN={sched_bin}\n\
+         export SCXSIM_SCHEDULER_ARGS={scheduler_args}\n\
+         export SCXSIM_WORKLOAD={workload}\n\
+         export SCXSIM_RTAPP_BIN={rtapp_bin}\n\
+         export SCXSIM_CPUS={nr_cpus}\n\
+         export SCXSIM_TRACE_MODE={trace_mode}\n",
+        scheduler = shell_escape(scheduler),
+        sched_bin = shell_escape(&sched_bin.to_string_lossy()),
+        scheduler_args = shell_escape(scheduler_args),
+        workload = shell_escape(&workload.to_string_lossy()),
+        rtapp_bin = shell_escape(RTAPP_BIN),
+        trace_mode = shell_escape(trace_mode),
+    )
+}
+
+fn hook_command(label: &str, hook: Option<&Path>) -> String {
+    hook.map(|path| {
+        format!(
+            "echo '=== Running {label} ==='\n\
+             {hook}\n\
+             echo '=== {label} completed ==='\n",
+            label = label,
+            hook = shell_escape(&path.to_string_lossy()),
+        )
+    })
+    .unwrap_or_default()
 }
 
 /// Check if a command exists in PATH.
@@ -533,5 +705,36 @@ mod tests {
         assert!(json.contains("\"pong\""));
         assert!(json.contains("\"resume\""));
         assert!(json.contains("\"suspend\""));
+    }
+
+    #[test]
+    fn vm_inner_command_plumbs_scheduler_args_and_hooks() {
+        let cmd = build_inner_cmd(
+            "lavd",
+            Path::new("/tmp/scx_lavd"),
+            Path::new("/tmp/r3_mimic.json"),
+            4,
+            TraceMode::None,
+            Some("--enable-cpu-bw --verbose"),
+            Some(Path::new("/tmp/pre hook.sh")),
+            Some(Path::new("/tmp/post hook.sh")),
+        );
+
+        assert!(cmd.contains("export SCXSIM_SCHEDULER='lavd'"));
+        assert!(cmd.contains("export SCXSIM_SCHED_BIN='/tmp/scx_lavd'"));
+        assert!(cmd.contains("export SCXSIM_SCHEDULER_ARGS='--enable-cpu-bw --verbose'"));
+        assert!(cmd.contains("export SCXSIM_WORKLOAD='/tmp/r3_mimic.json'"));
+        assert!(cmd.contains("export SCXSIM_TRACE_MODE='none'"));
+        assert!(cmd.contains("'/tmp/scx_lavd' --enable-cpu-bw --verbose &"));
+        assert!(cmd.contains("echo '=== Running pre-hook ==='\n'/tmp/pre hook.sh'"));
+        assert!(cmd.contains("echo '=== Running rt-app ==='"));
+        assert!(cmd.contains("/home/newton/bin/rt-app '/tmp/r3_mimic.json'"));
+        assert!(cmd.contains("echo '=== Running post-hook ==='\n'/tmp/post hook.sh'"));
+
+        let pre_idx = cmd.find("=== Running pre-hook ===").unwrap();
+        let workload_idx = cmd.find("=== Running rt-app ===").unwrap();
+        let post_idx = cmd.find("=== Running post-hook ===").unwrap();
+        assert!(pre_idx < workload_idx);
+        assert!(workload_idx < post_idx);
     }
 }
