@@ -156,6 +156,8 @@ pub struct NoiseConfig {
     pub tick_jitter: bool,
     /// Standard deviation for tick jitter (ns). Default: 2000 (2μs).
     pub tick_jitter_stddev_ns: TimeNs,
+    /// Maximum one-time random offset for each CPU's initial periodic tick.
+    pub initial_tick_skew_ns: TimeNs,
     /// Enable run-time jitter (normally-distributed variation on Phase::Run duration).
     ///
     /// Models real compute-time variability from cache misses, branch mispredictions,
@@ -177,6 +179,7 @@ impl Default for NoiseConfig {
             enabled: true,
             tick_jitter: true,
             tick_jitter_stddev_ns: 2_000,
+            initial_tick_skew_ns: 0,
             run_jitter: true,
             run_jitter_cv_ppm: 200_000,
         }
@@ -204,6 +207,16 @@ impl NoiseConfig {
         if let Ok(v) = std::env::var("SCX_SIM_RUN_JITTER_CV_PPM") {
             if let Ok(ppm) = v.parse::<u64>() {
                 config.run_jitter_cv_ppm = ppm;
+            }
+        }
+        if let Ok(v) = std::env::var("SCX_SIM_TICK_JITTER_STDDEV_NS") {
+            if let Ok(ns) = v.parse::<u64>() {
+                config.tick_jitter_stddev_ns = ns;
+            }
+        }
+        if let Ok(v) = std::env::var("SCX_SIM_INITIAL_TICK_SKEW_NS") {
+            if let Ok(ns) = v.parse::<u64>() {
+                config.initial_tick_skew_ns = ns;
             }
         }
         config

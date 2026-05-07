@@ -1605,8 +1605,11 @@ impl<S: Scheduler> Simulator<S> {
         // chain: tick fires → handle_tick → schedule next tick. This matches
         // the kernel's periodic timer interrupt (HZ=250 → 4ms).
         for cpu_id in 0..nr_cpus {
-            s.events
-                .push(TICK_INTERVAL_NS, EventKind::Tick { cpu: CpuId(cpu_id) });
+            let skew = s.sim.initial_tick_skew();
+            s.events.push(
+                TICK_INTERVAL_NS + skew,
+                EventKind::Tick { cpu: CpuId(cpu_id) },
+            );
         }
 
         // Seed CPU hotplug events from the scenario
