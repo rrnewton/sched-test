@@ -77,6 +77,16 @@ unsafe fn lavd_set_u64(sched: &DynamicScheduler, name: &str, val: u64) {
     std::ptr::write_volatile(*sym, val);
 }
 
+unsafe fn lavd_probe_u64_fn(
+    sched: &DynamicScheduler,
+    name: &[u8],
+) -> unsafe extern "C" fn() -> u64 {
+    let sym: libloading::Symbol<'_, unsafe extern "C" fn() -> u64> = sched
+        .get_symbol(name)
+        .unwrap_or_else(|| panic!("symbol {:?} not found", String::from_utf8_lossy(name)));
+    *sym
+}
+
 /// Monitor that injects high-load sys_stat values after init.
 ///
 /// `init_sys_stat()` resets `sys_stat.nr_active` and `sys_stat.slice`,
@@ -8147,8 +8157,8 @@ fn test_lavd_cpu_acquire_release() {
 /// - `lavd_dequeue()` calls `scx_cgroup_bw_cancel()` (main.bpf.c:864-875)
 /// - `cgroup_set_bandwidth()` calls `scx_cgroup_bw_set()` (main.bpf.c:2112-2121)
 ///
-/// The cgroup bandwidth stubs all return 0 (no actual throttling), so tasks
-/// run normally but the code paths are exercised.
+/// The simulator wrapper models quota depletion, throttling, period refills,
+/// and ATQ-style reenqueue sufficiently for deterministic simulator workloads.
 #[test]
 fn test_lavd_enable_cpu_bw() {
     let _lock = common::setup_test();
@@ -8203,6 +8213,149 @@ fn test_lavd_enable_cpu_bw() {
     assert!(
         trace.schedule_count(Pid(4)) > 0,
         "unbounded was never scheduled"
+    );
+}
+
+#[test]
+fn test_lavd_cpu_bw_throttle_refill_cycles() {
+    let _lock = common::setup_test();
+    let nr_cpus = 2u32;
+    let sched = DynamicScheduler::lavd(nr_cpus);
+
+    unsafe {
+        lavd_set_bool(&sched, "enable_cpu_bw\0", true);
+    }
+
+    let throttle_count = unsafe { lavd_probe_u64_fn(&sched, b"lavd_probe_cbw_throttle_count\0") };
+    let refill_count = unsafe { lavd_probe_u64_fn(&sched, b"lavd_probe_cbw_refill_count\0") };
+    let put_aside_count = unsafe { lavd_probe_u64_fn(&sched, b"lavd_probe_cbw_put_aside_count\0") };
+    let reenqueue_count = unsafe { lavd_probe_u64_fn(&sched, b"lavd_probe_cbw_reenqueue_count\0") };
+
+    let scenario = Scenario::builder()
+        .cpus(nr_cpus)
+        .cgroup_with_bandwidth(
+            "limited",
+            &[CpuId(0), CpuId(1)],
+            10_000, // 10ms period, aligned with LAVD's stats timer
+            2_000,  // 2ms quota, below the 4ms simulator tick interval
+            0,
+        )
+        .add_task_in_cgroup("hog-a", 0, workloads::cpu_bound(100_000_000), "limited")
+        .add_task_in_cgroup("hog-b", 0, workloads::cpu_bound(100_000_000), "limited")
+        .duration_ms(60)
+        .build();
+
+    let sim = Simulator::new(sched);
+    let trace = sim.run(scenario);
+
+    assert!(
+        trace.schedule_count(Pid(1)) > 0,
+        "hog-a was never scheduled"
+    );
+    assert!(
+        trace.schedule_count(Pid(2)) > 0,
+        "hog-b was never scheduled"
+    );
+
+    let throttles = unsafe { throttle_count() };
+    let refills = unsafe { refill_count() };
+    let put_asides = unsafe { put_aside_count() };
+    let reenqueues = unsafe { reenqueue_count() };
+
+    assert!(
+        throttles > 0,
+        "expected bandwidth throttles, got {throttles}"
+    );
+    assert!(refills > 0, "expected bandwidth refills, got {refills}");
+    assert!(
+        put_asides > 0,
+        "expected throttled tasks to be put aside, got {put_asides}"
+    );
+    assert!(
+        reenqueues > 0,
+        "expected refilled tasks to be reenqueued, got {reenqueues}"
+    );
+}
+
+#[test]
+#[ignore = "R3-like cgroup bandwidth stress; run manually for LAVD repro work"]
+fn stress_lavd_cpu_bw_r3_like_100_workers() {
+    let _lock = common::setup_test();
+    let nr_cpus = 16u32;
+    let sched = DynamicScheduler::lavd(nr_cpus);
+
+    unsafe {
+        lavd_set_bool(&sched, "enable_cpu_bw\0", true);
+    }
+
+    let throttle_count = unsafe { lavd_probe_u64_fn(&sched, b"lavd_probe_cbw_throttle_count\0") };
+    let refill_count = unsafe { lavd_probe_u64_fn(&sched, b"lavd_probe_cbw_refill_count\0") };
+    let reenqueue_count = unsafe { lavd_probe_u64_fn(&sched, b"lavd_probe_cbw_reenqueue_count\0") };
+
+    let all_cpus: Vec<CpuId> = (0..nr_cpus).map(CpuId).collect();
+    let mut builder = Scenario::builder()
+        .cpus(nr_cpus)
+        .seed(81)
+        .detect_bpf_errors()
+        .duration_ms(150)
+        .cgroup_with_bandwidth(
+            "limited", &all_cpus, 10_000, // 10ms period
+            3_000,  // 3ms quota shared by all workers
+            0,
+        )
+        .cgroup("unlimited", &all_cpus);
+
+    for worker in 0..100 {
+        builder = builder.add_task_in_cgroup(
+            &format!("yes-like-{worker}"),
+            0,
+            workloads::cpu_bound(150_000_000),
+            "limited",
+        );
+    }
+
+    for pid in 1..=16 {
+        builder = builder
+            .cgroup_migrate(
+                Pid(pid),
+                "limited",
+                "unlimited",
+                25_000_000 + pid as u64 * 50_000,
+            )
+            .cgroup_migrate(
+                Pid(pid),
+                "unlimited",
+                "limited",
+                45_000_000 + pid as u64 * 50_000,
+            );
+    }
+
+    for cpu in 0..4 {
+        builder = builder.periodic_irq(
+            CpuId(cpu),
+            IrqType::SoftIrq,
+            5_000_000 + cpu as u64 * 250_000,
+            2_000_000,
+            25_000,
+            &[],
+        );
+    }
+
+    let sim = Simulator::new(sched);
+    let trace = sim.run(builder.build());
+
+    assert!(!trace.has_error());
+    assert!(trace.schedule_count(Pid(1)) > 0, "worker 1 never ran");
+
+    let throttles = unsafe { throttle_count() };
+    let refills = unsafe { refill_count() };
+    let reenqueues = unsafe { reenqueue_count() };
+
+    assert!(throttles > 0, "expected throttles, got {throttles}");
+    assert!(refills > 0, "expected refills, got {refills}");
+    assert!(reenqueues > 0, "expected reenqueues, got {reenqueues}");
+    eprintln!(
+        "r3-like cgroup-bw stress: throttles={throttles} refills={refills} reenqueues={reenqueues}"
     );
 }
 

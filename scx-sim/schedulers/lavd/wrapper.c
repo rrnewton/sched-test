@@ -187,6 +187,8 @@ static int (*lavd_timer_cb)(void *, int *, struct bpf_timer *);
 static struct bpf_timer *lavd_timer_ptr;
 static void *lavd_timer_map;
 extern void sim_timer_start(unsigned long long nsecs);
+static int sim_cbw_reenqueue_ready(void);
+static void sim_cbw_reset(void);
 
 #undef bpf_timer_init
 #define bpf_timer_init(timer, map, flags) \
@@ -526,17 +528,19 @@ void lavd_register_maps(void)
 void lavd_fire_timer(void)
 {
 	int key = 0;
+	sim_cbw_reenqueue_ready();
 	if (lavd_timer_cb && lavd_timer_ptr)
 		lavd_timer_cb(lavd_timer_map, &key, lavd_timer_ptr);
+	sim_cbw_reenqueue_ready();
 }
 
 /*
- * Cgroup bandwidth control stubs.
- * LAVD calls these when enable_cpu_bw is set (off by default in simulator).
- * Return 0 (not throttled) to satisfy the linker.
+ * Cgroup bandwidth control probes.
  */
-int scx_cgroup_bw_is_cgroup_throttled(u64 cgrp_id) { return 0; }
-int scx_cgroup_bw_is_task_throttled(u64 taskc_ptr) { return 0; }
+u64 lavd_probe_cbw_throttle_count(void);
+u64 lavd_probe_cbw_refill_count(void);
+u64 lavd_probe_cbw_put_aside_count(void);
+u64 lavd_probe_cbw_reenqueue_count(void);
 
 /*
  * =================================================================
@@ -588,6 +592,178 @@ void bpf_cgroup_release(struct cgroup *cgrp)
 extern int sim_cgroup_registry_allocate(void);
 extern void sim_cgroup_registry_free(void);
 
+#define SIM_CBW_MAX_CGROUPS 4096
+#define SIM_CBW_MAX_BACKLOG 8192
+
+struct sim_cbw_cgroup {
+	u64 cgrp_id;
+	u64 period_ns;
+	u64 quota_ns;
+	u64 burst_ns;
+	u64 used_ns;
+	u64 period_start_ns;
+	bool active;
+	bool configured;
+	bool throttled;
+};
+
+struct sim_cbw_backlog {
+	u64 taskc;
+	u64 cgrp_id;
+	bool active;
+};
+
+static struct sim_cbw_cgroup sim_cbw_cgroups[SIM_CBW_MAX_CGROUPS];
+static struct sim_cbw_backlog sim_cbw_backlog[SIM_CBW_MAX_BACKLOG];
+static u64 sim_cbw_throttle_count;
+static u64 sim_cbw_refill_count;
+static u64 sim_cbw_put_aside_count;
+static u64 sim_cbw_reenqueue_count;
+
+static void sim_cbw_reset(void)
+{
+	__builtin_memset(sim_cbw_cgroups, 0, sizeof(sim_cbw_cgroups));
+	__builtin_memset(sim_cbw_backlog, 0, sizeof(sim_cbw_backlog));
+	sim_cbw_throttle_count = 0;
+	sim_cbw_refill_count = 0;
+	sim_cbw_put_aside_count = 0;
+	sim_cbw_reenqueue_count = 0;
+}
+
+static struct sim_cbw_cgroup *sim_cbw_lookup(u64 cgrp_id, bool create)
+{
+	struct sim_cbw_cgroup *empty = NULL;
+	int i;
+
+	for (i = 0; i < SIM_CBW_MAX_CGROUPS; i++) {
+		if (sim_cbw_cgroups[i].active &&
+		    sim_cbw_cgroups[i].cgrp_id == cgrp_id)
+			return &sim_cbw_cgroups[i];
+		if (!sim_cbw_cgroups[i].active && !empty)
+			empty = &sim_cbw_cgroups[i];
+	}
+
+	if (!create || !empty)
+		return NULL;
+
+	empty->active = true;
+	empty->cgrp_id = cgrp_id;
+	return empty;
+}
+
+static bool sim_cbw_is_limited(struct sim_cbw_cgroup *cg)
+{
+	return cg && cg->configured && cg->period_ns && cg->quota_ns &&
+	       cg->quota_ns != (u64)-1;
+}
+
+static void sim_cbw_refill(struct sim_cbw_cgroup *cg, u64 now)
+{
+	u64 elapsed, periods;
+
+	if (!sim_cbw_is_limited(cg))
+		return;
+
+	if (!cg->period_start_ns) {
+		cg->period_start_ns = now;
+		return;
+	}
+
+	elapsed = now - cg->period_start_ns;
+	if (elapsed < cg->period_ns)
+		return;
+
+	periods = elapsed / cg->period_ns;
+	cg->period_start_ns += periods * cg->period_ns;
+	cg->used_ns = 0;
+	if (cg->throttled) {
+		cg->throttled = false;
+		sim_cbw_refill_count++;
+	}
+}
+
+static bool sim_cbw_cgroup_throttled(struct sim_cbw_cgroup *cg, u64 now)
+{
+	if (!sim_cbw_is_limited(cg))
+		return false;
+	sim_cbw_refill(cg, now);
+	return cg->throttled;
+}
+
+static void sim_cbw_remove_task(u64 taskc)
+{
+	int i;
+
+	for (i = 0; i < SIM_CBW_MAX_BACKLOG; i++) {
+		if (sim_cbw_backlog[i].active &&
+		    sim_cbw_backlog[i].taskc == taskc)
+			sim_cbw_backlog[i].active = false;
+	}
+}
+
+static int sim_cbw_reenqueue_ready(void)
+{
+	u64 ready[SIM_CBW_MAX_BACKLOG];
+	u64 now = scx_bpf_now();
+	int nr_ready = 0;
+	int i, ret = 0;
+
+	for (i = 0; i < SIM_CBW_MAX_CGROUPS; i++) {
+		if (sim_cbw_cgroups[i].active)
+			sim_cbw_refill(&sim_cbw_cgroups[i], now);
+	}
+
+	for (i = 0; i < SIM_CBW_MAX_BACKLOG; i++) {
+		struct sim_cbw_cgroup *cg;
+
+		if (!sim_cbw_backlog[i].active)
+			continue;
+		cg = sim_cbw_lookup(sim_cbw_backlog[i].cgrp_id, false);
+		if (sim_cbw_cgroup_throttled(cg, now))
+			continue;
+		ready[nr_ready++] = sim_cbw_backlog[i].taskc;
+		sim_cbw_backlog[i].active = false;
+	}
+
+	for (i = 0; i < nr_ready; i++) {
+		int cb_ret = scx_cgroup_bw_enqueue_cb(ready[i]);
+
+		if (cb_ret && !ret)
+			ret = cb_ret;
+		else if (!cb_ret)
+			sim_cbw_reenqueue_count++;
+	}
+
+	return ret;
+}
+
+int scx_cgroup_bw_is_cgroup_throttled(u64 cgrp_id)
+{
+	return sim_cbw_cgroup_throttled(sim_cbw_lookup(cgrp_id, false),
+					scx_bpf_now());
+}
+
+int scx_cgroup_bw_is_task_throttled(u64 taskc_ptr)
+{
+	task_ctx *taskc = (task_ctx *)taskc_ptr;
+	int i;
+
+	for (i = 0; i < SIM_CBW_MAX_BACKLOG; i++) {
+		if (sim_cbw_backlog[i].active &&
+		    sim_cbw_backlog[i].taskc == taskc_ptr)
+			return 1;
+	}
+
+	if (!taskc)
+		return 0;
+	return scx_cgroup_bw_is_cgroup_throttled(taskc->cgrp_id);
+}
+
+u64 lavd_probe_cbw_throttle_count(void) { return sim_cbw_throttle_count; }
+u64 lavd_probe_cbw_refill_count(void) { return sim_cbw_refill_count; }
+u64 lavd_probe_cbw_put_aside_count(void) { return sim_cbw_put_aside_count; }
+u64 lavd_probe_cbw_reenqueue_count(void) { return sim_cbw_reenqueue_count; }
+
 __attribute__((weak)) int scx_cgroup_bw_lib_init(
 	struct scx_cgroup_bw_config *config)
 {
@@ -619,39 +795,93 @@ __attribute__((weak)) int scx_cgroup_bw_exit(struct cgroup *cgrp)
 __attribute__((weak)) int scx_cgroup_bw_set(
 	struct cgroup *cgrp, u64 period, u64 quota, u64 burst)
 {
-	(void)cgrp; (void)period; (void)quota; (void)burst;
+	struct sim_cbw_cgroup *cg;
+
+	if (!cgrp || !cgrp->kn)
+		return 0;
+
+	cg = sim_cbw_lookup(cgrp->kn->id, true);
+	if (!cg)
+		return -12;
+
+	cg->period_ns = period * 1000;
+	cg->quota_ns = quota == (u64)-1 ? (u64)-1 : quota * 1000;
+	cg->burst_ns = burst * 1000;
+	cg->used_ns = 0;
+	cg->period_start_ns = scx_bpf_now();
+	cg->configured = true;
+	cg->throttled = false;
 	return 0;
 }
 
-__attribute__((weak)) int scx_cgroup_bw_throttled(struct cgroup *cgrp,
-					   struct task_struct *p)
+__attribute__((weak)) int scx_cgroup_bw_throttled(u64 cgrp_id,
+					   struct task_struct *p, u64 taskc)
 {
-	(void)cgrp; (void)p;
-	return 0;
+	(void)p; (void)taskc;
+	return sim_cbw_cgroup_throttled(sim_cbw_lookup(cgrp_id, false),
+					scx_bpf_now()) ? -11 : 0;
 }
 
 __attribute__((weak)) int scx_cgroup_bw_consume(
-	struct cgroup *cgrp, u64 runtime)
+	u64 cgrp_id, u64 runtime, u64 taskc)
 {
-	(void)cgrp; (void)runtime;
+	struct sim_cbw_cgroup *cg;
+	u64 limit_ns;
+
+	(void)taskc;
+
+	cg = sim_cbw_lookup(cgrp_id, false);
+	if (!sim_cbw_is_limited(cg))
+		return 0;
+
+	sim_cbw_refill(cg, scx_bpf_now());
+	if (cg->throttled)
+		return 0;
+
+	cg->used_ns += runtime;
+	limit_ns = cg->quota_ns + cg->burst_ns;
+	if (cg->used_ns >= limit_ns) {
+		cg->throttled = true;
+		sim_cbw_throttle_count++;
+	}
 	return 0;
 }
 
 __attribute__((weak)) int scx_cgroup_bw_put_aside(
-	struct task_struct *p, u64 taskc, u64 vtime, struct cgroup *cgrp)
+	struct task_struct *p, u64 taskc, u64 vtime, u64 cgrp_id)
 {
-	(void)p; (void)taskc; (void)vtime; (void)cgrp;
+	int i, empty = -1;
+
+	(void)p; (void)vtime;
+
+	for (i = 0; i < SIM_CBW_MAX_BACKLOG; i++) {
+		if (sim_cbw_backlog[i].active &&
+		    sim_cbw_backlog[i].taskc == taskc) {
+			sim_cbw_backlog[i].cgrp_id = cgrp_id;
+			return 0;
+		}
+		if (!sim_cbw_backlog[i].active && empty < 0)
+			empty = i;
+	}
+
+	if (empty < 0)
+		return -12;
+
+	sim_cbw_backlog[empty].active = true;
+	sim_cbw_backlog[empty].taskc = taskc;
+	sim_cbw_backlog[empty].cgrp_id = cgrp_id;
+	sim_cbw_put_aside_count++;
 	return 0;
 }
 
 __attribute__((weak)) int scx_cgroup_bw_reenqueue(void)
 {
-	return 0;
+	return sim_cbw_reenqueue_ready();
 }
 
 __attribute__((weak)) int scx_cgroup_bw_cancel(u64 taskc)
 {
-	(void)taskc;
+	sim_cbw_remove_task(taskc);
 	return 0;
 }
 
@@ -659,7 +889,18 @@ __attribute__((weak)) int scx_cgroup_bw_move(
 	struct task_struct *p, u64 taskc,
 	struct cgroup *from, struct cgroup *to)
 {
-	(void)p; (void)taskc; (void)from; (void)to;
+	int i;
+
+	(void)p; (void)from;
+
+	if (!to || !to->kn)
+		return 0;
+
+	for (i = 0; i < SIM_CBW_MAX_BACKLOG; i++) {
+		if (sim_cbw_backlog[i].active &&
+		    sim_cbw_backlog[i].taskc == taskc)
+			sim_cbw_backlog[i].cgrp_id = to->kn->id;
+	}
 	return 0;
 }
 
@@ -690,6 +931,7 @@ void lavd_setup(unsigned int num_cpus)
 
 	/* Register maps */
 	lavd_register_maps();
+	sim_cbw_reset();
 
 	/* Core globals */
 	nr_cpus_onln = num_cpus;
@@ -949,41 +1191,51 @@ void lavd_set_cgroup_bw_max(unsigned int max)
  * simulation. Each returns 0/default if the context is not available.
  */
 
-/* Per-task probes: access task_ctx fields via get_task_ctx(). */
+/*
+ * Per-task probes sample out-of-band from Rust monitor hooks rather than from
+ * within a scheduler callback. Avoid get_task_ctx(), whose current LAVD
+ * implementation consults get_cpu_ctx() and therefore requires a simulator
+ * callback CPU context to be installed.
+ */
+
+static task_ctx *lavd_probe_task_ctx(struct task_struct *p)
+{
+	return p ? (task_ctx *)__get_task_ctx_slowpath(p, NULL) : NULL;
+}
 
 u16 lavd_probe_lat_cri(struct task_struct *p)
 {
-	struct task_ctx *taskc = get_task_ctx(p);
+	struct task_ctx *taskc = lavd_probe_task_ctx(p);
 	return taskc ? taskc->lat_cri : 0;
 }
 
 u64 lavd_probe_wait_freq(struct task_struct *p)
 {
-	struct task_ctx *taskc = get_task_ctx(p);
+	struct task_ctx *taskc = lavd_probe_task_ctx(p);
 	return taskc ? taskc->wait_freq : 0;
 }
 
 u64 lavd_probe_wake_freq(struct task_struct *p)
 {
-	struct task_ctx *taskc = get_task_ctx(p);
+	struct task_ctx *taskc = lavd_probe_task_ctx(p);
 	return taskc ? taskc->wake_freq : 0;
 }
 
 u64 lavd_probe_avg_runtime(struct task_struct *p)
 {
-	struct task_ctx *taskc = get_task_ctx(p);
+	struct task_ctx *taskc = lavd_probe_task_ctx(p);
 	return taskc ? taskc->avg_runtime_wall : 0;
 }
 
 u16 lavd_probe_lat_cri_waker(struct task_struct *p)
 {
-	struct task_ctx *taskc = get_task_ctx(p);
+	struct task_ctx *taskc = lavd_probe_task_ctx(p);
 	return taskc ? taskc->lat_cri_waker : 0;
 }
 
 u16 lavd_probe_lat_cri_wakee(struct task_struct *p)
 {
-	struct task_ctx *taskc = get_task_ctx(p);
+	struct task_ctx *taskc = lavd_probe_task_ctx(p);
 	return taskc ? taskc->lat_cri_wakee : 0;
 }
 
@@ -1050,7 +1302,7 @@ u8 lavd_probe_can_boost_slice(void)
 /* Probe for task's slice_wall from task_ctx. */
 u64 lavd_probe_task_slice_wall(struct task_struct *p)
 {
-	struct task_ctx *taskc = get_task_ctx(p);
+	struct task_ctx *taskc = lavd_probe_task_ctx(p);
 	return taskc ? taskc->slice_wall : 0;
 }
 

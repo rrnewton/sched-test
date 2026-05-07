@@ -131,6 +131,36 @@ fn test_rtapp_single_runner() {
     );
 }
 
+/// Task-level rt-app taskgroups should become simulator cgroups.
+#[test]
+fn test_rtapp_taskgroup_lavd() {
+    let _lock = common::setup_test();
+    let json = r#"{
+        "global": { "duration": 1 },
+        "tasks": {
+            "runner": {
+                "loop": -1,
+                "run": 20000,
+                "sleep": 80000,
+                "taskgroup": "/tg1"
+            }
+        }
+    }"#;
+
+    let scenario = load_rtapp(json, 2).unwrap();
+    assert_eq!(scenario.cgroups.len(), 1);
+    assert_eq!(scenario.cgroups[0].name, "/tg1");
+    assert_eq!(scenario.tasks[0].cgroup_name.as_deref(), Some("/tg1"));
+
+    let trace = Simulator::new(DynamicScheduler::lavd(2)).run(scenario);
+    trace.dump();
+
+    assert!(
+        trace.schedule_count(Pid(1)) > 0,
+        "taskgroup runner was never scheduled"
+    );
+}
+
 /// Parse two_runners.json and simulate: two tasks with run+sleep cycles and
 /// different priorities, using only the fully-supported rt-app feature subset.
 #[test]
