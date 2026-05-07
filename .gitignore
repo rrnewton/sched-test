@@ -29,3 +29,17 @@ rt-app-*.log
 *.profraw
 *.profdata
 coverage-out/
+
+# Local experiment scratch and generated artifacts.
+/bin/
+/rt-app-rs/
+/*.bundle
+/repromagic-*.log
+/repromagic_config.toml
+/configs/
+/experiments/
+/reports/
+/traces/
+/scx.runnable_*
+/scx-sim/vgcore.*
+/scx-sim/schedulers/cosmos/cosmos_sched_backup/
