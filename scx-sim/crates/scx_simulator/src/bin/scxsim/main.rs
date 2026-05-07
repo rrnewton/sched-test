@@ -145,7 +145,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Run a simulation from an rt-app workload.
-    Simulate(SimulateArgs),
+    Run(RunArgs),
     /// Run workload in a virtme-ng VM with a real scheduler.
     VmRun(VmRunArgs),
     /// Replay a recorded preemption trace.
@@ -195,9 +195,9 @@ struct VmRunArgs {
     bpf_trace: bool,
 }
 
-/// Arguments for the `simulate` subcommand.
+/// Arguments for the `run` subcommand.
 #[derive(Parser)]
-struct SimulateArgs {
+struct RunArgs {
     /// Path to an rt-app JSON workload file.
     workload: Option<PathBuf>,
 
@@ -453,7 +453,7 @@ fn main() {
     init_tracing();
 
     let result = match cli.command {
-        Command::Simulate(args) => simulate(&args),
+        Command::Run(args) => run(&args),
         Command::VmRun(args) => vm_run(&args),
         Command::Replay(args) => replay_simulation(&args),
         Command::PrintAddresses(args) => print_addresses(&args),
@@ -478,7 +478,7 @@ fn vm_run(args: &VmRunArgs) -> Result<(), String> {
     real_run::run_vm(&args.workload, &args.scheduler, args.cpus, trace_mode)
 }
 
-fn simulate(args: &SimulateArgs) -> Result<(), String> {
+fn run(args: &RunArgs) -> Result<(), String> {
     if args.list_schedulers {
         list_schedulers();
         return Ok(());
@@ -936,7 +936,7 @@ fn replay_simulation(args: &ReplayArgs) -> Result<(), String> {
     Ok(())
 }
 
-fn run_determinism_check(args: &SimulateArgs, scenario: Scenario) -> Result<(), String> {
+fn run_determinism_check(args: &RunArgs, scenario: Scenario) -> Result<(), String> {
     let _lock = SIM_LOCK.lock().unwrap();
     let use_e9 = args.preemptive && args.preempt_mode == PreemptModeArg::E9patch;
 
@@ -986,7 +986,7 @@ fn run_determinism_check(args: &SimulateArgs, scenario: Scenario) -> Result<(), 
 
 /// Print detailed determinism failure report.
 fn print_determinism_failure(
-    args: &SimulateArgs,
+    args: &RunArgs,
     divergence: &scx_simulator::CheckpointDivergence,
     _checkpoints1: &[scx_simulator::DeterminismCheckpoint],
     _checkpoints2: &[scx_simulator::DeterminismCheckpoint],
@@ -1045,7 +1045,7 @@ fn print_determinism_failure(
     }
 }
 
-fn run_simulation(args: &SimulateArgs, scenario: Scenario) -> Result<(), String> {
+fn run_simulation(args: &RunArgs, scenario: Scenario) -> Result<(), String> {
     let use_e9 = args.preemptive && args.preempt_mode == PreemptModeArg::E9patch;
 
     // Map the shared RBC state page BEFORE loading the _e9.so — the e9-
@@ -1233,24 +1233,21 @@ mod tests {
     }
 
     #[test]
-    fn simulate_rejects_vm_only_flags() {
+    fn run_rejects_vm_only_flags() {
+        assert!(
+            Cli::try_parse_from(["scxsim", "run", "--wprof", "workloads/two_runners.json",])
+                .is_err()
+        );
         assert!(Cli::try_parse_from([
             "scxsim",
-            "simulate",
-            "--wprof",
-            "workloads/two_runners.json",
-        ])
-        .is_err());
-        assert!(Cli::try_parse_from([
-            "scxsim",
-            "simulate",
+            "run",
             "--bpf-trace",
             "workloads/two_runners.json",
         ])
         .is_err());
         assert!(Cli::try_parse_from([
             "scxsim",
-            "simulate",
+            "run",
             "--real-run",
             "vm",
             "workloads/two_runners.json",
