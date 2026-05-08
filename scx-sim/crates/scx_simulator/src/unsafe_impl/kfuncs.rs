@@ -36,7 +36,8 @@ use rand::rngs::SmallRng;
 use rand::RngCore;
 use tracing::debug;
 
-use crate::cgroup::CgroupRegistry;
+use crate::cgroup::{CgroupId, CgroupRegistry};
+use crate::cgroup_bw::BandwidthManager;
 use crate::cpu::{LastStopReason, SimCpu};
 use crate::dsq::DsqManager;
 use crate::engine::EventQueue;
@@ -459,6 +460,21 @@ pub(crate) struct SimState {
     pub events: EventQueue,
     /// The cgroup hierarchy.
     pub cgroup_registry: CgroupRegistry,
+    /// Engine-side `cpu.max` bandwidth state for tracked cgroups (Diff 3 wiring).
+    ///
+    /// Populated at scenario load via
+    /// [`BandwidthManager::configure_from_cgroup_defs`]. Charged on every
+    /// task stop (slice expired / preempt / phase complete), gated at
+    /// DSQ-pop admission, and refilled by [`crate::engine::EventKind::CgroupBwRefill`]
+    /// events. Cgroups without a configured `cpu.max` are not tracked here
+    /// and are unaffected (unlimited).
+    pub bw_manager: BandwidthManager,
+    /// PID → cgroup-id resolution for charging.
+    ///
+    /// Built once at scenario load from `Scenario.tasks` (`cgroup_name`).
+    /// Tasks not present in this map belong to the root cgroup and are
+    /// not charged against any tracked bandwidth state.
+    pub task_to_cgid: HashMap<Pid, CgroupId>,
 }
 
 /// Split-borrowed references to all SimState fields.
@@ -480,6 +496,8 @@ pub(crate) struct SimFields<'a> {
     pub tasks: &'a mut HashMap<Pid, SimTask>,
     pub events: &'a mut EventQueue,
     pub cgroup_registry: &'a mut CgroupRegistry,
+    pub bw_manager: &'a mut BandwidthManager,
+    pub task_to_cgid: &'a mut HashMap<Pid, CgroupId>,
 }
 
 impl SimState {
@@ -491,6 +509,8 @@ impl SimState {
             tasks: &mut self.tasks,
             events: &mut self.events,
             cgroup_registry: &mut self.cgroup_registry,
+            bw_manager: &mut self.bw_manager,
+            task_to_cgid: &mut self.task_to_cgid,
         }
     }
 }
@@ -2604,6 +2624,8 @@ mod tests {
             tasks: HashMap::new(),
             events: EventQueue::new(0, false),
             cgroup_registry: CgroupRegistry::new(nr_cpus, 100),
+            bw_manager: BandwidthManager::new(),
+            task_to_cgid: HashMap::new(),
         }))
     }
 

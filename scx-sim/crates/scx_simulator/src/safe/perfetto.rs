@@ -383,6 +383,62 @@ pub(crate) fn write_json(trace: &Trace, writer: &mut impl Write) -> std::io::Res
                     }
                 })
             }
+
+            // Diff 3 wiring: cgroup bandwidth (cpu.max) trace events.
+            // Emitted as instant events keyed to the CPU lane so they
+            // line up visually with the affected task's slice in Perfetto.
+            TraceKind::CgroupBwCharge {
+                pid,
+                cgid,
+                delta_ns,
+            } => {
+                json!({
+                    "ph": "i",
+                    "pid": cpu,
+                    "tid": 0,
+                    "ts": ts,
+                    "name": "cgroup_bw_charge",
+                    "cat": "cgroup_bw",
+                    "s": "t",
+                    "args": { "pid": pid.0, "cgid": cgid.0, "delta_ns": delta_ns }
+                })
+            }
+            TraceKind::CgroupBwThrottle { cgid } => {
+                json!({
+                    "ph": "i",
+                    "pid": cpu,
+                    "tid": 0,
+                    "ts": ts,
+                    "name": "cgroup_bw_throttle",
+                    "cat": "cgroup_bw",
+                    "s": "g",
+                    "args": { "cgid": cgid.0 }
+                })
+            }
+            TraceKind::CgroupBwDenied { pid, cgid } => {
+                json!({
+                    "ph": "i",
+                    "pid": cpu,
+                    "tid": 0,
+                    "ts": ts,
+                    "name": "cgroup_bw_denied",
+                    "cat": "cgroup_bw",
+                    "s": "t",
+                    "args": { "pid": pid.0, "cgid": cgid.0 }
+                })
+            }
+            TraceKind::CgroupBwRefill { cgid } => {
+                json!({
+                    "ph": "i",
+                    "pid": cpu,
+                    "tid": 0,
+                    "ts": ts,
+                    "name": "cgroup_bw_refill",
+                    "cat": "cgroup_bw",
+                    "s": "g",
+                    "args": { "cgid": cgid.0 }
+                })
+            }
         };
         serde_json::to_writer(&mut *writer, &value)?;
     }

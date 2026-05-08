@@ -167,6 +167,26 @@ pub enum TraceKind {
     IrqStart { cpu: CpuId, irq_type: IrqType },
     /// An interrupt handler completes on a CPU.
     IrqEnd { cpu: CpuId },
+
+    // ----- Cgroup bandwidth (cpu.max) events (Diff 3 wiring) -----
+    /// Engine charged `delta_ns` of CPU time against `cgid`'s `cpu.max` quota
+    /// (and any finite ancestors).
+    CgroupBwCharge {
+        pid: Pid,
+        cgid: crate::cgroup::CgroupId,
+        delta_ns: TimeNs,
+    },
+    /// `cgid`'s quota was exhausted; the cgroup is now throttled until refill.
+    CgroupBwThrottle { cgid: crate::cgroup::CgroupId },
+    /// Engine refused to admit `pid` from a local DSQ because its cgroup
+    /// (or an ancestor) is currently throttled. The task remains queued.
+    CgroupBwDenied {
+        pid: Pid,
+        cgid: crate::cgroup::CgroupId,
+    },
+    /// `cgid` reached a period boundary; quota was refilled and any
+    /// throttled tasks are eligible to run again.
+    CgroupBwRefill { cgid: crate::cgroup::CgroupId },
 }
 
 /// Reason why a dispatch to a local DSQ was rejected.
@@ -711,6 +731,23 @@ impl Trace {
                     format!("IRQ_START cpu={} type={}", cpu.0, kind_str)
                 }
                 TraceKind::IrqEnd { cpu } => format!("IRQ_END  cpu={}", cpu.0),
+                TraceKind::CgroupBwCharge {
+                    pid,
+                    cgid,
+                    delta_ns,
+                } => format!(
+                    "CG_BW_CHRG pid={} cgid={} delta={}",
+                    pid.0, cgid.0, delta_ns
+                ),
+                TraceKind::CgroupBwThrottle { cgid } => {
+                    format!("CG_BW_THR  cgid={}", cgid.0)
+                }
+                TraceKind::CgroupBwDenied { pid, cgid } => {
+                    format!("CG_BW_DENY pid={} cgid={}", pid.0, cgid.0)
+                }
+                TraceKind::CgroupBwRefill { cgid } => {
+                    format!("CG_BW_REF  cgid={}", cgid.0)
+                }
             };
             eprintln!(
                 "[{}] cpu={:<3} {}",

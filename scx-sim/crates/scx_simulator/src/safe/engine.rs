@@ -643,6 +643,19 @@ pub(crate) enum EventKind {
     /// Consumes logical time (`ipi_delivery_ns`), modeling the
     /// inter-processor interrupt latency between the source and target CPU.
     KickDelivered { cpu: CpuId, flags: KickFlags },
+    /// Cgroup `cpu.max` quota refill at a period boundary (Diff 3 wiring).
+    ///
+    /// Scheduled at scenario load (first refill at `period_ns`) and
+    /// re-scheduled by [`Simulator::handle_cgroup_bw_refill`] for each
+    /// subsequent period boundary. `cpu` is bookkeeping for the per-CPU
+    /// event-routing layer; the refill itself is global (it touches
+    /// per-cgroup state, not per-CPU state). We attribute it to CPU 0
+    /// because cpu.max is a global controller and we have no better
+    /// per-CPU anchor.
+    CgroupBwRefill {
+        cgid: crate::cgroup::CgroupId,
+        cpu: CpuId,
+    },
 }
 
 /// Flush staged events from `SimulatorState` into the event queue.
@@ -851,6 +864,117 @@ fn start_rbc(state: &mut SimulatorState) {
 /// base snapshot taken when the task started running.
 fn update_sum_exec(raw: *mut c_void, base: TimeNs, elapsed: TimeNs) {
     ffi::task_set_sum_exec_runtime(raw, base + elapsed);
+}
+
+/// Charge `delta_ns` of CPU time consumed by `pid` against its cgroup's
+/// `cpu.max` quota (and finite ancestors).
+///
+/// This is the canonical kernel-CFS-bw charging hook for the simulator's
+/// engine (Diff 3 wiring). Called from `stop_and_reenqueue` and
+/// `handle_task_phase_complete` — both points where the engine knows
+/// exactly how much on-CPU time the task consumed since it started running.
+/// The pre-existing `update_sum_exec` is left untouched: it is the kernel
+/// `sum_exec_runtime` mirror, not bandwidth accounting, and the design doc
+/// explicitly calls for double-charging only between the kernel CFS layer
+/// and LAVD's BPF layer (Diff 4) — not between two kernel CFS sites.
+///
+/// If the cgroup is not tracked (no `cpu.max` configured), this is a no-op.
+/// If charging causes a fresh quota exhaustion, the cgroup is marked
+/// throttled here; subsequent admission gates will refuse to dispatch its
+/// tasks until the next refill event.
+fn charge_cgroup_bw(
+    fields: &mut crate::kfuncs::SimFields<'_>,
+    pid: Pid,
+    delta_ns: TimeNs,
+    now_ns: TimeNs,
+    cpu: CpuId,
+) {
+    if delta_ns == 0 {
+        return;
+    }
+    let Some(&cgid) = fields.task_to_cgid.get(&pid) else {
+        return;
+    };
+    let cgroup_registry: &CgroupRegistry = &*fields.cgroup_registry;
+    let ancestor = |cg: CgroupId| -> Option<CgroupId> {
+        cgroup_registry.get(cg).and_then(|info| {
+            // Stop walking once we hit the root (parent_cgid == 0 sentinel).
+            if info.parent_cgid.0 == 0 || info.cgid == CgroupId::ROOT {
+                None
+            } else {
+                Some(info.parent_cgid)
+            }
+        })
+    };
+    let newly_exhausted = fields.bw_manager.charge(cgid, delta_ns, ancestor);
+
+    fields.sim.trace.record(
+        now_ns,
+        cpu,
+        TraceKind::CgroupBwCharge {
+            pid,
+            cgid,
+            delta_ns,
+        },
+    );
+
+    if let Some(exhausted_cg) = newly_exhausted {
+        if let Some(state) = fields.bw_manager.get_mut(exhausted_cg) {
+            // Mark throttled so subsequent admission checks deny tasks in
+            // this cgroup; the throttle will be cleared by the next
+            // CgroupBwRefill event for `exhausted_cg`.
+            state.throttle(pid);
+        }
+        fields.sim.trace.record(
+            now_ns,
+            cpu,
+            TraceKind::CgroupBwThrottle { cgid: exhausted_cg },
+        );
+        debug!(
+            cgid = exhausted_cg.0,
+            pid = pid.0,
+            delta_ns,
+            "cgroup bandwidth: newly exhausted, marking throttled"
+        );
+    }
+}
+
+/// Returns `true` if `pid`'s cgroup (or any finite ancestor) is currently
+/// throttled by `cpu.max`. Used by the DSQ-pop admission gate.
+fn pid_is_bw_throttled(fields: &crate::kfuncs::SimFields<'_>, pid: Pid) -> Option<CgroupId> {
+    let cgid = *fields.task_to_cgid.get(&pid)?;
+    let cgroup_registry: &CgroupRegistry = &*fields.cgroup_registry;
+    let ancestor = |cg: CgroupId| -> Option<CgroupId> {
+        cgroup_registry.get(cg).and_then(|info| {
+            if info.parent_cgid.0 == 0 || info.cgid == CgroupId::ROOT {
+                None
+            } else {
+                Some(info.parent_cgid)
+            }
+        })
+    };
+    if fields.bw_manager.is_throttled(cgid, ancestor) {
+        Some(cgid)
+    } else {
+        None
+    }
+}
+
+/// Compute the maximum permitted run-time slice (ns) for `pid` based on its
+/// cgroup's remaining quota. Returns `None` if no bandwidth limit applies.
+fn pid_bw_max_run_ns(fields: &crate::kfuncs::SimFields<'_>, pid: Pid) -> Option<u64> {
+    let cgid = *fields.task_to_cgid.get(&pid)?;
+    let cgroup_registry: &CgroupRegistry = &*fields.cgroup_registry;
+    let ancestor = |cg: CgroupId| -> Option<CgroupId> {
+        cgroup_registry.get(cg).and_then(|info| {
+            if info.parent_cgid.0 == 0 || info.cgid == CgroupId::ROOT {
+                None
+            } else {
+                Some(info.parent_cgid)
+            }
+        })
+    };
+    fields.bw_manager.max_run_ns(cgid, ancestor)
 }
 
 /// Disable the RBC counter, read the count, and charge scheduler overhead to `cpu`.
@@ -1416,6 +1540,8 @@ impl<S: Scheduler> Simulator<S> {
             tasks,
             events,
             cgroup_registry,
+            bw_manager: crate::cgroup_bw::BandwidthManager::new(),
+            task_to_cgid: HashMap::new(),
         }));
         // Install the Arc in ENGINE_SIM_ARC so enter_sim can propagate it
         // to SIM_ARC for kfuncs and cgroup callbacks.
@@ -1501,6 +1627,46 @@ impl<S: Scheduler> Simulator<S> {
                 });
                 charge_sched_time(&mut s.sim, CpuId(0), "cgroup_set_bandwidth");
             }
+
+            // Diff 3 wiring: configure the engine-side BandwidthManager from
+            // the scenario's CgroupDefs. This is a one-shot init at scenario
+            // load — runtime cpu.max writes (later) would funnel through the
+            // same `configure_from_cgroup_defs` bridge.
+            //
+            // We use the registry-backed `name_to_id` resolver so the bw
+            // module stays decoupled from CgroupRegistry layout (mirroring
+            // the `ancestor_lookup` pattern used in is_throttled / charge /
+            // max_run_ns).
+            {
+                let now_ns = s.sim.clock;
+                let f = s.fields();
+                let cgroup_registry = &*f.cgroup_registry;
+                f.bw_manager
+                    .configure_from_cgroup_defs(scenario.cgroups.iter(), now_ns, |name| {
+                        cgroup_registry.get_by_name(name).map(|info| info.cgid)
+                    });
+
+                // Schedule the first refill event for every tracked cgroup.
+                // The next-period boundary is `now_ns + period_ns` (matching
+                // the design doc: "period boundaries at 0, P, 2P, ..." with
+                // the current period started at scenario load).
+                let mut refills: Vec<(TimeNs, CgroupId, TimeNs)> = f
+                    .bw_manager
+                    .iter()
+                    .map(|(cgid, st)| (st.period_start_ns + st.period_ns, *cgid, st.period_ns))
+                    .collect();
+                // Deterministic ordering by (time, cgid).
+                refills.sort_by_key(|(t, c, _)| (*t, c.0));
+                for (when, cgid, _period) in refills {
+                    f.events.push(
+                        when,
+                        EventKind::CgroupBwRefill {
+                            cgid,
+                            cpu: CpuId(0),
+                        },
+                    );
+                }
+            }
         }
 
         // Pre-assign tasks to cgroups before init_task.
@@ -1508,15 +1674,18 @@ impl<S: Scheduler> Simulator<S> {
         let mut task_cgroup_map: HashMap<Pid, *mut c_void> = HashMap::new();
         for def in &scenario.tasks {
             if let Some(ref cg_name) = def.cgroup_name {
-                let cgrp_raw = s
-                    .cgroup_registry
-                    .get_by_name(cg_name)
-                    .unwrap_or_else(|| {
-                        panic!("cgroup '{cg_name}' not found for task {:?}", def.pid)
-                    })
-                    .raw();
+                let info = s.cgroup_registry.get_by_name(cg_name).unwrap_or_else(|| {
+                    panic!("cgroup '{cg_name}' not found for task {:?}", def.pid)
+                });
+                let cgrp_raw = info.raw();
+                let cgid = info.cgid;
                 ffi::task_set_cgroup(s.tasks[&def.pid].raw(), cgrp_raw);
                 task_cgroup_map.insert(def.pid, cgrp_raw);
+                // Diff 3 wiring: record PID → cgroup-id for engine-side
+                // bandwidth charging. Tasks without a cgroup_name belong to
+                // the root cgroup (which has no tracked cpu.max) and are
+                // simply absent from this map.
+                s.task_to_cgid.insert(def.pid, cgid);
             }
         }
 
@@ -1967,7 +2136,8 @@ impl<S: Scheduler> Simulator<S> {
             | EventKind::TimerFired { cpu }
             | EventKind::CgroupMigrate { cpu, .. }
             | EventKind::CgroupCreate { cpu, .. }
-            | EventKind::CgroupDestroy { cpu, .. } => {
+            | EventKind::CgroupDestroy { cpu, .. }
+            | EventKind::CgroupBwRefill { cpu, .. } => {
                 s.sim.advance_cpu_clock(*cpu);
                 kfuncs::set_sim_clock(s.sim.cpus[cpu.0 as usize].local_clock, Some(*cpu));
             }
@@ -2084,6 +2254,11 @@ impl<S: Scheduler> Simulator<S> {
             EventKind::KickDelivered { cpu, flags } => {
                 drop(guard);
                 self.handle_kick_delivered(cpu, flags, sim_arc, monitor);
+                guard = sim_arc.lock().unwrap();
+            }
+            EventKind::CgroupBwRefill { cgid, cpu } => {
+                drop(guard);
+                self.handle_cgroup_bw_refill(cgid, cpu, sim_arc, monitor);
                 guard = sim_arc.lock().unwrap();
             }
         }
@@ -3147,6 +3322,14 @@ impl<S: Scheduler> Simulator<S> {
             update_sum_exec(raw, task.sum_exec_base, time_consumed);
         }
 
+        // Charge consumed CPU time against this task's cgroup cpu.max quota
+        // (Diff 3 wiring). See `charge_cgroup_bw` for layering rationale.
+        {
+            let now_ns = s.sim.cpus[cpu.0 as usize].local_clock;
+            let mut f = s.fields();
+            charge_cgroup_bw(&mut f, pid, time_consumed, now_ns, cpu);
+        }
+
         set_ops_context(&mut s.sim, OpsContext::Stopping);
         debug!(pid = pid.0, still_runnable, "enter:structop stopping");
         start_rbc(&mut s.sim);
@@ -3521,15 +3704,45 @@ impl<S: Scheduler> Simulator<S> {
             }
         }
 
-        // Try to pull a task from the local DSQ
-        if let Some(pid) = s.sim.cpus[cpu.0 as usize].local_dsq.pop_front() {
-            let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
-            s.sim
-                .trace
-                .record(__local_t, cpu, TraceKind::PickTask { pid });
-            drop(guard);
-            self.start_running(cpu, pid, sim_arc, monitor);
+        // Diff 3 wiring: peek the front of the local DSQ. If that task's
+        // cgroup is currently throttled by cpu.max, refuse admission, leave
+        // the task in the DSQ, record a trace event, and let the CPU go
+        // idle (head-of-line blocking is intentional for the single-cgroup
+        // Bug-1 reproducer per the design doc; multi-cgroup fairness is
+        // out of scope for Diff 3).
+        let bw_denied = if let Some(&pid) = s.sim.cpus[cpu.0 as usize].local_dsq.front() {
+            if let Some(cgid) = pid_is_bw_throttled(&s.fields(), pid) {
+                let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
+                s.sim
+                    .trace
+                    .record(__local_t, cpu, TraceKind::CgroupBwDenied { pid, cgid });
+                debug!(
+                    pid = pid.0,
+                    cgid = cgid.0,
+                    cpu = cpu.0,
+                    "cgroup_bw: denying dispatch (post_dispatch_run)"
+                );
+                Some(pid)
+            } else {
+                None
+            }
         } else {
+            None
+        };
+
+        // Try to pull a task from the local DSQ
+        if bw_denied.is_none() {
+            if let Some(pid) = s.sim.cpus[cpu.0 as usize].local_dsq.pop_front() {
+                let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
+                s.sim
+                    .trace
+                    .record(__local_t, cpu, TraceKind::PickTask { pid });
+                drop(guard);
+                self.start_running(cpu, pid, sim_arc, monitor);
+                return;
+            }
+        }
+        {
             // CPU is idle — update the C idle cpumask so
             // scx_bpf_test_and_clear_cpu_idle works correctly
             ffi::cpumask_set_idle(cpu.0 as i32);
@@ -3583,14 +3796,39 @@ impl<S: Scheduler> Simulator<S> {
             }
         }
 
-        if let Some(pid) = s.sim.cpus[cpu_idx].local_dsq.pop_front() {
-            let __local_t = s.sim.cpus[cpu_idx].local_clock;
-            s.sim
-                .trace
-                .record(__local_t, cpu, TraceKind::PickTask { pid });
-            drop(guard);
-            self.start_running(cpu, pid, sim_arc, monitor);
+        // Diff 3 wiring: cgroup-bw admission gate (peek and skip if throttled).
+        let bw_denied = if let Some(&pid) = s.sim.cpus[cpu_idx].local_dsq.front() {
+            if let Some(cgid) = pid_is_bw_throttled(&s.fields(), pid) {
+                let __local_t = s.sim.cpus[cpu_idx].local_clock;
+                s.sim
+                    .trace
+                    .record(__local_t, cpu, TraceKind::CgroupBwDenied { pid, cgid });
+                debug!(
+                    pid = pid.0,
+                    cgid = cgid.0,
+                    cpu = cpu.0,
+                    "cgroup_bw: denying dispatch (handle_dsq_consume)"
+                );
+                true
+            } else {
+                false
+            }
         } else {
+            false
+        };
+
+        if !bw_denied {
+            if let Some(pid) = s.sim.cpus[cpu_idx].local_dsq.pop_front() {
+                let __local_t = s.sim.cpus[cpu_idx].local_clock;
+                s.sim
+                    .trace
+                    .record(__local_t, cpu, TraceKind::PickTask { pid });
+                drop(guard);
+                self.start_running(cpu, pid, sim_arc, monitor);
+                return;
+            }
+        }
+        {
             // CPU is idle
             ffi::cpumask_set_idle(cpu.0 as i32);
             s.sim.update_smt_mask_idle(cpu);
@@ -3648,6 +3886,69 @@ impl<S: Scheduler> Simulator<S> {
         } else {
             drop(guard);
             self.try_dispatch_and_run(cpu, sim_arc, monitor);
+        }
+    }
+
+    /// Handle a `CgroupBwRefill` event: refill the cgroup's quota for the
+    /// next period and re-schedule the next refill.
+    ///
+    /// The kernel CFS bandwidth controller refills `runtime_remaining` at
+    /// every period boundary and unthrottles the cgroup. The simulator
+    /// mirrors that by:
+    ///
+    /// 1. Calling `BandwidthManager::refill(cgid, now)`, which restores
+    ///    `runtime_remaining_ns` and clears the throttled flag (returning
+    ///    the list of PIDs that had been parked, for trace purposes).
+    /// 2. Re-scheduling the next refill at `now + period_ns`. Periods are
+    ///    anchored to scenario time 0 by induction (the first refill was
+    ///    pushed at `period_ns` during scenario load), keeping fixed-seed
+    ///    replay stable.
+    /// 3. Kicking each idle CPU so any tasks that were head-of-line
+    ///    blocked behind a denied admission can be picked up. Without
+    ///    this, a CPU that went idle on `CgroupBwDenied` would stay
+    ///    idle until the next external event.
+    fn handle_cgroup_bw_refill(
+        &self,
+        cgid: CgroupId,
+        cpu: CpuId,
+        sim_arc: &SimArc,
+        monitor: &mut dyn Monitor,
+    ) {
+        let mut guard = sim_arc.lock().unwrap();
+        let s = &mut *guard;
+        let now_ns = s.sim.cpus[cpu.0 as usize].local_clock;
+
+        // Refill (returns previously-throttled PIDs, currently used only for
+        // trace volume; the engine's admission gate re-checks on next pop).
+        let _woken = s.bw_manager.refill(cgid, now_ns);
+
+        // Trace.
+        s.sim
+            .trace
+            .record(now_ns, cpu, TraceKind::CgroupBwRefill { cgid });
+
+        // Re-schedule the next period boundary if this cgroup is still tracked.
+        if let Some(state) = s.bw_manager.get(cgid) {
+            let next = now_ns + state.period_ns;
+            s.events.push(
+                next,
+                EventKind::CgroupBwRefill {
+                    cgid,
+                    cpu: CpuId(0),
+                },
+            );
+        }
+
+        // Kick any idle CPUs so they re-enter dispatch and can pick up
+        // tasks that were denied admission while the cgroup was throttled.
+        let idle_cpus: Vec<CpuId> = (0..s.sim.cpus.len() as u32)
+            .map(CpuId)
+            .filter(|c| s.sim.cpus[c.0 as usize].current_task.is_none())
+            .filter(|c| s.sim.cpus[c.0 as usize].is_online)
+            .collect();
+        drop(guard);
+        for c in idle_cpus {
+            self.try_dispatch_and_run(c, sim_arc, monitor);
         }
     }
 
@@ -3754,6 +4055,15 @@ impl<S: Scheduler> Simulator<S> {
         {
             let task = s.tasks.get(&pid).unwrap();
             update_sum_exec(raw, task.sum_exec_base, consumed);
+        }
+
+        // Charge consumed CPU time against this task's cgroup cpu.max quota
+        // (Diff 3 wiring). Done BEFORE the scheduler's stopping() callback so
+        // any LAVD-side accounting (Diff 4) sees a coherent post-charge view.
+        {
+            let now_ns = s.sim.cpus[cpu_idx].local_clock;
+            let mut f = s.fields();
+            charge_cgroup_bw(&mut f, pid, consumed, now_ns, cpu);
         }
 
         // stopping()
@@ -3961,9 +4271,21 @@ impl<S: Scheduler> Simulator<S> {
                 task.run_remaining_ns = (base as i64 + noise).max(1) as u64;
             }
         }
+        // Diff 3 wiring: cap the slice by the cgroup's remaining `cpu.max`
+        // budget. If the budget is shorter than the scheduler's slice, the
+        // task should preempt at the budget boundary so the cgroup transitions
+        // to throttled (via `charge_cgroup_bw`) rather than blowing past
+        // its quota. Tasks whose cgroup is unlimited (no cpu.max) keep the
+        // scheduler's slice unchanged.
+        let bw_budget = pid_bw_max_run_ns(&s.fields(), pid);
         let task = s.tasks.get(&pid).unwrap();
-        let slice = task.get_slice();
+        let raw_slice = task.get_slice();
         let remaining = task.run_remaining_ns;
+        let slice = match (raw_slice, bw_budget) {
+            (0, Some(budget)) => budget.max(1),
+            (sl, Some(budget)) => sl.min(budget.max(1)),
+            (sl, None) => sl,
+        };
 
         // Track when task started for mid-slice preemption accounting
         s.sim.cpus[cpu.0 as usize].task_started_at = Some(local_t);
