@@ -8,12 +8,13 @@ use scx_simulator::scenario::{parse_duration_ns, parse_seed};
 use scx_simulator::{
     compare_checkpoints, compute_so_hash, discover_schedulers, drain_determinism_checkpoints,
     drain_preemption_records, enable_determinism_mode, enable_preemption_collection, load_rtapp,
-    scheduler_so_base, scheduler_so_path, DynamicScheduler, NativeConcurrentConfig, Phase,
-    PmuEvent, PreemptMode, PreemptionTrace, PreemptiveConfig, RepeatMode, Scenario, SimFormat,
-    Simulator, TaskBehavior, TraceMetadata, TraceStats, SIM_LOCK,
+    scheduler_so_base, scheduler_so_path, DynamicScheduler, ExitKind, NativeConcurrentConfig,
+    Phase, PmuEvent, PreemptMode, PreemptionTrace, PreemptiveConfig, RepeatMode, Scenario,
+    SimFormat, Simulator, TaskBehavior, TraceMetadata, TraceStats, SIM_LOCK,
 };
 
 mod real_run;
+mod sched_config;
 
 /// Environment variable set after ASLR is disabled to prevent infinite re-exec.
 const ASLR_DISABLED_ENV: &str = "SCX_SIM_ASLR_DISABLED";
@@ -204,7 +205,9 @@ struct RunArgs {
     ///
     /// Accepts durations with units: "1s", "0.5s", "500ms", "100us", "1000ns".
     /// A bare number is interpreted as nanoseconds.
-    #[arg(long, value_name = "DURATION")]
+    ///
+    /// Aliases: `--duration` (preferred for new invocations).
+    #[arg(long, alias = "duration", value_name = "DURATION")]
     end_time: Option<String>,
 
     /// Warmup period in milliseconds.
@@ -245,8 +248,21 @@ struct RunArgs {
     /// If a runnable task is not scheduled within this duration (simulated
     /// time), the simulation exits with an error. Accepts durations with
     /// units: "2s", "500ms", etc. Use "0" or "off" to disable. Default: 30s.
-    #[arg(long, value_name = "DURATION")]
+    ///
+    /// Aliases: `--watchdog` (preferred for new invocations).
+    #[arg(long, alias = "watchdog", value_name = "DURATION")]
     watchdog_timeout: Option<String>,
+
+    /// Path to a TOML scheduler-config file.
+    ///
+    /// The config file declares per-symbol BPF-global values to write through
+    /// to the loaded scheduler `.so` after load. Sub-tables segregate symbols
+    /// by primitive type (`bool_globals`, `u8_globals`, `u32_globals`,
+    /// `u64_globals`) because the FFI layer cannot introspect symbol types
+    /// from ELF/DWARF. See `tests/fixtures/h6/bug1_canonical.toml` for a
+    /// minimal example (`enable_cpu_bw = true`).
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
 
     /// Enable concurrent callback interleaving at kfunc yield points.
     ///
@@ -450,19 +466,101 @@ fn main() {
     let cli = Cli::parse();
     init_tracing();
 
-    let result = match cli.command {
+    let result: Result<(), RunError> = match cli.command {
         Command::Run(args) => run(&args),
-        Command::Replay(args) => replay_simulation(&args),
-        Command::PrintAddresses(args) => print_addresses(&args),
+        Command::Replay(args) => replay_simulation(&args).map_err(RunError::from),
+        Command::PrintAddresses(args) => print_addresses(&args).map_err(RunError::from),
     };
 
-    if let Err(e) = result {
-        eprintln!("error: {e}");
-        std::process::exit(1);
+    // Exit code scheme — used by automation (the canonical Bug-1 reproducer
+    // test asserts exit 42, etc.). Stable across releases.
+    //
+    //  * 0  — Normal completion
+    //  * 1  — Generic error (CLI parse, file IO, etc.)
+    //  * 42 — ExitKind::ErrorStall (watchdog fired on a runnable task)
+    //  * 43 — ExitKind::ErrorBpf (scheduler called scx_bpf_error())
+    //  * 44 — ExitKind::ErrorDispatchLoopExhausted
+    //  * 45 — ExitKind::ErrorCgroupExhausted
+    //
+    // For each non-Normal ExitKind we additionally print a stable
+    // single-line stderr marker `scxsim: ExitKind::<Variant> ...` so
+    // grep-based test assertions stay robust to surrounding noise.
+    match result {
+        Ok(()) => {}
+        Err(RunError::Generic(msg)) => {
+            eprintln!("error: {msg}");
+            std::process::exit(1);
+        }
+        Err(RunError::Sim(kind)) => {
+            print_exit_marker(&kind);
+            std::process::exit(exit_code_for(&kind));
+        }
     }
 }
 
-fn run(args: &RunArgs) -> Result<(), String> {
+/// Top-level run errors. Either a generic CLI/IO failure (exit 1) or a
+/// structured `ExitKind` from the simulator (mapped to 42-45 by exit code).
+enum RunError {
+    Generic(String),
+    Sim(ExitKind),
+}
+
+impl From<String> for RunError {
+    fn from(s: String) -> Self {
+        RunError::Generic(s)
+    }
+}
+
+impl From<&str> for RunError {
+    fn from(s: &str) -> Self {
+        RunError::Generic(s.to_string())
+    }
+}
+
+/// Map a simulator `ExitKind` to its stable process exit code.
+fn exit_code_for(kind: &ExitKind) -> i32 {
+    match kind {
+        ExitKind::Normal => 0,
+        ExitKind::ErrorStall { .. } => 42,
+        ExitKind::ErrorBpf(_) => 43,
+        ExitKind::ErrorDispatchLoopExhausted { .. } => 44,
+        ExitKind::ErrorCgroupExhausted { .. } => 45,
+    }
+}
+
+/// Print the stable single-line stderr marker for a given exit kind.
+fn print_exit_marker(kind: &ExitKind) {
+    match kind {
+        ExitKind::Normal => {}
+        ExitKind::ErrorStall {
+            pid,
+            runnable_for_ns,
+        } => {
+            eprintln!(
+                "scxsim: ExitKind::ErrorStall pid={} runnable_for_ns={}",
+                pid.0, runnable_for_ns
+            );
+        }
+        ExitKind::ErrorBpf(msg) => {
+            eprintln!("scxsim: ExitKind::ErrorBpf {msg}");
+        }
+        ExitKind::ErrorDispatchLoopExhausted { cpu } => {
+            eprintln!("scxsim: ExitKind::ErrorDispatchLoopExhausted cpu={}", cpu.0);
+        }
+        ExitKind::ErrorCgroupExhausted {
+            cgroup_name,
+            active_count,
+            max_cgroups,
+        } => {
+            eprintln!(
+                "scxsim: ExitKind::ErrorCgroupExhausted cgroup_name={cgroup_name:?} \
+                 active_count={active_count} max_cgroups={max_cgroups}"
+            );
+        }
+    }
+}
+
+fn run(args: &RunArgs) -> Result<(), RunError> {
     if args.list_schedulers {
         list_schedulers();
         return Ok(());
@@ -948,7 +1046,7 @@ fn replay_simulation(args: &ReplayArgs) -> Result<(), String> {
     Ok(())
 }
 
-fn run_determinism_check(args: &RunArgs, scenario: Scenario) -> Result<(), String> {
+fn run_determinism_check(args: &RunArgs, scenario: Scenario) -> Result<(), RunError> {
     let _lock = SIM_LOCK.lock().unwrap();
     let use_e9 = args.preemptive && args.preempt_mode == PreemptModeArg::E9patch;
 
@@ -960,27 +1058,23 @@ fn run_determinism_check(args: &RunArgs, scenario: Scenario) -> Result<(), Strin
     // Run 1: collect checkpoints
     enable_determinism_mode();
     let sched1 = load_scheduler(&args.scheduler, args.cpus, use_e9)?;
+    apply_config_if_present(args, &sched1)?;
     let trace1 = Simulator::new(sched1).run(scenario.clone());
     let checkpoints1 = drain_determinism_checkpoints();
 
     if trace1.has_error() {
-        return Err(format!(
-            "simulation error in run 1: {:?}",
-            trace1.exit_kind()
-        ));
+        return Err(RunError::Sim(trace1.exit_kind().clone()));
     }
 
     // Run 2: collect checkpoints with same configuration
     enable_determinism_mode();
     let sched2 = load_scheduler(&args.scheduler, args.cpus, use_e9)?;
+    apply_config_if_present(args, &sched2)?;
     let trace2 = Simulator::new(sched2).run(scenario);
     let checkpoints2 = drain_determinism_checkpoints();
 
     if trace2.has_error() {
-        return Err(format!(
-            "simulation error in run 2: {:?}",
-            trace2.exit_kind()
-        ));
+        return Err(RunError::Sim(trace2.exit_kind().clone()));
     }
 
     // Compare checkpoints
@@ -1057,7 +1151,7 @@ fn print_determinism_failure(
     }
 }
 
-fn run_simulation(args: &RunArgs, scenario: Scenario) -> Result<(), String> {
+fn run_simulation(args: &RunArgs, scenario: Scenario) -> Result<(), RunError> {
     let use_e9 = args.preemptive && args.preempt_mode == PreemptModeArg::E9patch;
 
     // Map the shared RBC state page BEFORE loading the _e9.so — the e9-
@@ -1067,6 +1161,7 @@ fn run_simulation(args: &RunArgs, scenario: Scenario) -> Result<(), String> {
     }
 
     let sched = load_scheduler(&args.scheduler, args.cpus, use_e9)?;
+    apply_config_if_present(args, &sched)?;
     let _lock = SIM_LOCK.lock().unwrap();
 
     // Capture .so base address BEFORE the simulation runs. The scheduler
@@ -1144,7 +1239,12 @@ fn run_simulation(args: &RunArgs, scenario: Scenario) -> Result<(), String> {
     }
 
     if trace.has_error() {
-        return Err(format!("simulation error: {:?}", trace.exit_kind()));
+        // Surface the typed ExitKind so the top-level main() can map it to
+        // the stable per-variant exit code (42-45). The Debug-format string
+        // path was the previous behavior; it always became `exit 1` plus a
+        // wall-of-text "error: simulation error: …". The new path emits a
+        // single stable stderr marker and the per-variant exit code.
+        return Err(RunError::Sim(trace.exit_kind().clone()));
     }
 
     Ok(())
@@ -1172,6 +1272,22 @@ fn print_addresses(args: &PrintAddressesArgs) -> Result<(), String> {
     println!("heap=0x{heap_addr:x}");
     println!("stack=0x{stack_addr:x}");
 
+    Ok(())
+}
+
+/// If `--config <PATH>` is set, load it and write each declared global
+/// through to the loaded scheduler `.so`. No-op otherwise.
+///
+/// Called immediately after `load_scheduler` so that BPF-global writes happen
+/// before the scheduler's `ops.init` runs (i.e. before the simulator
+/// constructs `Simulator::new(sched)`, which holds the SIM_LOCK and triggers
+/// `ops.init` on first event).
+fn apply_config_if_present(args: &RunArgs, sched: &DynamicScheduler) -> Result<(), String> {
+    let Some(path) = args.config.as_ref() else {
+        return Ok(());
+    };
+    let cfg = sched_config::load_config(path)?;
+    sched_config::apply_to_scheduler(&cfg, sched)?;
     Ok(())
 }
 

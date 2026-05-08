@@ -81,8 +81,61 @@ scxsim run [OPTIONS] [WORKLOAD]
 | `-c, --cpus` | `4` | Number of simulated CPUs |
 | `--smt` | `1` | SMT threads per core |
 | `--seed` | `42` | PRNG seed (integer or `"entropy"`) |
-| `--end-time` | — | Simulation duration (e.g., `100ms`, `1s`) |
+| `--end-time` *(alias `--duration`)* | — | Simulation duration (e.g., `100ms`, `1s`) |
+| `--watchdog-timeout` *(alias `--watchdog`)* | `30s` | Stall-detection timeout (`0`/`off` to disable) |
+| `--config <PATH>` | — | TOML scheduler-config sidecar (typed BPF-global writes; see below) |
 | `--fixed-priority` | off | Deterministic insertion-order tiebreaking |
+
+### Exit codes
+
+`scxsim run` maps each simulator `ExitKind` to a stable per-variant
+process exit code. Automation should discriminate on these codes plus
+the matching stable single-line stderr marker, NOT on the summary text:
+
+| Variant                              | Exit | Stderr marker                                                     |
+|--------------------------------------|-----:|-------------------------------------------------------------------|
+| `Normal`                             |    0 | (none)                                                            |
+| Generic CLI/IO error                 |    1 | `error: <msg>`                                                    |
+| `ErrorStall { pid, runnable_for_ns}` |   42 | `scxsim: ExitKind::ErrorStall pid=<N> runnable_for_ns=<N>`        |
+| `ErrorBpf(msg)`                      |   43 | `scxsim: ExitKind::ErrorBpf <msg>`                                |
+| `ErrorDispatchLoopExhausted`         |   44 | `scxsim: ExitKind::ErrorDispatchLoopExhausted cpu=<N>`            |
+| `ErrorCgroupExhausted`               |   45 | `scxsim: ExitKind::ErrorCgroupExhausted cgroup_name=… …`          |
+
+### Scheduler-config TOML (`--config`)
+
+A TOML sidecar declares per-symbol BPF-global writes to apply to the
+loaded scheduler `.so` immediately after load. Sub-tables segregate
+symbols by primitive type because the FFI layer cannot introspect ELF
+symbol types — the caller must declare `T`:
+
+```toml
+[scheduler.bool_globals]
+enable_cpu_bw = true
+
+[scheduler.u8_globals]
+# (none for this example)
+
+[scheduler.u32_globals]
+# some_threshold = 1024
+
+[scheduler.u64_globals]
+# period_ns = 1_000_000_000
+```
+
+A missing symbol in the loaded `.so` is a hard error so config typos are
+loud rather than silent no-ops. Type mismatches are undefined behavior
+(the caller is asserting `T` matches the ELF declaration).
+
+Worked example — the Bug-1 canonical reproducer:
+
+```bash
+scxsim run crates/scx_simulator/tests/fixtures/h6/bug1_canonical.json \
+           --config crates/scx_simulator/tests/fixtures/h6/bug1_canonical.toml \
+           --watchdog 80ms -s lavd --cpus 4 --duration 500ms
+```
+
+deterministically exits 42 with
+`scxsim: ExitKind::ErrorStall pid=1 runnable_for_ns=80000793`.
 
 ```
 scxsim replay <TRACE_FILE>

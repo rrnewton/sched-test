@@ -1,0 +1,13 @@
+# Bug-1 canonical reproducer — scheduler-side config sidecar.
+#
+# Loaded by `scxsim run … --config tests/fixtures/h6/bug1_canonical.toml`.
+# Drives the LAVD scheduler's cgroup-bandwidth code path the same way the
+# production `scx_lavd --enable-cpu-bw` flag does. See
+# `experiments/lavd_cpubw_stalls_202604/SCXSIM_CGROUP_BW_DESIGN.md` ("Standalone-binary
+# reproducer") for the full canonical invocation.
+#
+# Sub-tables segregate symbols by primitive type because `DynamicScheduler::get_symbol::<T>()`
+# requires the caller to declare `T`; the binary cannot introspect ELF/DWARF.
+
+[scheduler.bool_globals]
+enable_cpu_bw = true
