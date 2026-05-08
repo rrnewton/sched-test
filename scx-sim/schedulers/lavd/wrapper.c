@@ -531,12 +531,30 @@ void lavd_fire_timer(void)
 }
 
 /*
- * Cgroup bandwidth control stubs.
- * LAVD calls these when enable_cpu_bw is set (off by default in simulator).
- * Return 0 (not throttled) to satisfy the linker.
+ * Cgroup bandwidth control: redirect to engine-owned BandwidthManager.
+ *
+ * Diff 4/5 of the cgroup_bw stack — these wrappers used to return 0
+ * unconditionally, which left LAVD's cgroup-bw view incoherent with the
+ * engine-side enforcement loop wired up by Diff 3 (cf93b57). Now they
+ * forward to sim_cgroup_bw_* shims defined in
+ * crates/scx_simulator/src/unsafe_impl/cgroup_bw_ffi.rs which talk to
+ * the same BandwidthManager the engine uses for admission gating,
+ * charging, and refill. That gives the dual-controller surface (kernel
+ * cpu.max x LAVD cgroup-bw) a single source of truth for the H6
+ * Bug-1 reproducer.
  */
-int scx_cgroup_bw_is_cgroup_throttled(u64 cgrp_id) { return 0; }
-int scx_cgroup_bw_is_task_throttled(u64 taskc_ptr) { return 0; }
+extern int sim_cgroup_bw_is_cgroup_throttled(u64 cgrp_id);
+extern int sim_cgroup_bw_is_task_throttled(u64 taskc_ptr);
+
+int scx_cgroup_bw_is_cgroup_throttled(u64 cgrp_id)
+{
+	return sim_cgroup_bw_is_cgroup_throttled(cgrp_id);
+}
+
+int scx_cgroup_bw_is_task_throttled(u64 taskc_ptr)
+{
+	return sim_cgroup_bw_is_task_throttled(taskc_ptr);
+}
 
 /*
  * =================================================================
@@ -588,27 +606,54 @@ void bpf_cgroup_release(struct cgroup *cgrp)
 extern int sim_cgroup_registry_allocate(void);
 extern void sim_cgroup_registry_free(void);
 
+/*
+ * Diff 4/5: forward declarations of engine-owned BandwidthManager shims.
+ * Implementations live in crates/scx_simulator/src/unsafe_impl/cgroup_bw_ffi.rs.
+ * Each scx_cgroup_bw_* wrapper below delegates to the corresponding
+ * sim_cgroup_bw_* shim, with sim_cgroup_registry_{allocate,free}() retained
+ * for ENOMEM exhaustion simulation in scx_cgroup_bw_{init,exit}.
+ */
+extern int sim_cgroup_bw_lib_init(void);
+extern int sim_cgroup_bw_init(void *cgrp);
+extern int sim_cgroup_bw_exit(void *cgrp);
+extern int sim_cgroup_bw_set(void *cgrp, u64 period_us, u64 quota_us, u64 burst_us);
+extern int sim_cgroup_bw_throttled(void *cgrp);
+extern int sim_cgroup_bw_consume(void *cgrp, u64 runtime_ns);
+extern int sim_cgroup_bw_put_aside(void *p, u64 taskc, u64 vtime, void *cgrp);
+extern int sim_cgroup_bw_reenqueue(void);
+extern int sim_cgroup_bw_cancel(u64 taskc);
+extern int sim_cgroup_bw_move(void *p, u64 taskc, void *from, void *to);
+extern int sim_cgroup_bw_dump(u64 cgrp_id, bool descendant, bool accurate, bool indent);
+
 __attribute__((weak)) int scx_cgroup_bw_lib_init(
 	struct scx_cgroup_bw_config *config)
 {
 	(void)config;
-	return 0;
+	return sim_cgroup_bw_lib_init();
 }
 
 __attribute__((weak)) int scx_cgroup_bw_init(
 	struct cgroup *cgrp, struct scx_cgroup_init_args *args)
 {
-	(void)cgrp; (void)args;
+	int rc;
+	(void)args;
 	/*
 	 * Attempt to allocate a BPF map entry. Returns -ENOMEM if the
-	 * scenario's max_cgroups limit has been reached.
+	 * scenario's max_cgroups limit has been reached. Failing here
+	 * preserves Diff 1's resource-exhaustion semantics; the engine-side
+	 * sim_cgroup_bw_init shim does not touch BandwidthManager state
+	 * because BandwidthManager only tracks cgroups with finite quota
+	 * (configured via _set, not _init).
 	 */
-	return sim_cgroup_registry_allocate();
+	rc = sim_cgroup_registry_allocate();
+	if (rc)
+		return rc;
+	return sim_cgroup_bw_init((void *)cgrp);
 }
 
 __attribute__((weak)) int scx_cgroup_bw_exit(struct cgroup *cgrp)
 {
-	(void)cgrp;
+	(void)sim_cgroup_bw_exit((void *)cgrp);
 	/*
 	 * Free the BPF map entry allocated in scx_cgroup_bw_init.
 	 */
@@ -619,55 +664,49 @@ __attribute__((weak)) int scx_cgroup_bw_exit(struct cgroup *cgrp)
 __attribute__((weak)) int scx_cgroup_bw_set(
 	struct cgroup *cgrp, u64 period, u64 quota, u64 burst)
 {
-	(void)cgrp; (void)period; (void)quota; (void)burst;
-	return 0;
+	return sim_cgroup_bw_set((void *)cgrp, period, quota, burst);
 }
 
 __attribute__((weak)) int scx_cgroup_bw_throttled(struct cgroup *cgrp,
 					   struct task_struct *p)
 {
-	(void)cgrp; (void)p;
-	return 0;
+	(void)p;
+	return sim_cgroup_bw_throttled((void *)cgrp);
 }
 
 __attribute__((weak)) int scx_cgroup_bw_consume(
 	struct cgroup *cgrp, u64 runtime)
 {
-	(void)cgrp; (void)runtime;
-	return 0;
+	return sim_cgroup_bw_consume((void *)cgrp, runtime);
 }
 
 __attribute__((weak)) int scx_cgroup_bw_put_aside(
 	struct task_struct *p, u64 taskc, u64 vtime, struct cgroup *cgrp)
 {
-	(void)p; (void)taskc; (void)vtime; (void)cgrp;
-	return 0;
+	return sim_cgroup_bw_put_aside((void *)p, taskc, vtime, (void *)cgrp);
 }
 
 __attribute__((weak)) int scx_cgroup_bw_reenqueue(void)
 {
-	return 0;
+	return sim_cgroup_bw_reenqueue();
 }
 
 __attribute__((weak)) int scx_cgroup_bw_cancel(u64 taskc)
 {
-	(void)taskc;
-	return 0;
+	return sim_cgroup_bw_cancel(taskc);
 }
 
 __attribute__((weak)) int scx_cgroup_bw_move(
 	struct task_struct *p, u64 taskc,
 	struct cgroup *from, struct cgroup *to)
 {
-	(void)p; (void)taskc; (void)from; (void)to;
-	return 0;
+	return sim_cgroup_bw_move((void *)p, taskc, (void *)from, (void *)to);
 }
 
 __attribute__((weak)) int scx_cgroup_bw_dump(
 	u64 cgrp_id, bool descendent, bool accurate, bool indent)
 {
-	(void)cgrp_id; (void)descendent; (void)accurate; (void)indent;
-	return 0;
+	return sim_cgroup_bw_dump(cgrp_id, descendent, accurate, indent);
 }
 
 /*

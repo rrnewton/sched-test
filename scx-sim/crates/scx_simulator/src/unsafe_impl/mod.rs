@@ -13,6 +13,7 @@
 //! |-------------|------------------------------------------------------|
 //! | `ffi` | `extern "C"` declarations, raw pointer manipulation, `dlopen`/`dlsym` calls |
 //! | `cgroup_ffi`| `#[no_mangle] extern "C"` cgroup lookup/registry entry points called from C |
+//! | `cgroup_bw_ffi` | `#[no_mangle] extern "C"` cgroup-bandwidth shims that redirect LAVD wrapper `scx_cgroup_bw_*` calls into the engine-owned `BandwidthManager` (Diff 4/5) |
 //! | `kfuncs` | `#[no_mangle] extern "C"` kfunc entry points, thread-local raw-pointer state |
 //! | `preempt` | Signal handlers, futex syscalls, atomics, inline assembly |
 //! | `backend` | PMU perf_event ioctls, hardware breakpoints, `/proc` mmap, e9patch binary patching |
@@ -26,6 +27,7 @@
 //! | `worker_pool` | Persistent worker thread pool with futex-based park/wake protocol |
 
 pub mod backend;
+pub mod cgroup_bw_ffi;
 pub mod cgroup_ffi;
 pub mod cgroup_wrapper;
 pub mod dispatch_pool;
