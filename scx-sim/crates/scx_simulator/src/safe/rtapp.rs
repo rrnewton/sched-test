@@ -15,6 +15,10 @@
 //! - `phases` — multi-phase task definitions
 //! - `instance` — multiple task instances
 //! - `cpus` — CPU affinity mask (parsed into `TaskDef::allowed_cpus`)
+//! - task-level `taskgroup` — mapped to simulator cgroups with all CPUs allowed.
+//!   Both the legacy string form (`"taskgroup": "/tg1"`) and the cgroup v2
+//!   object form (`"taskgroup": { "path": "/tg1", "cpu.max": "Q P", ... }`)
+//!   are accepted. Implicit ancestor cgroups along the path are synthesized.
 //! - `global.duration` — scenario duration
 //!
 //! # Limitations
@@ -23,16 +27,16 @@
 //!   with rt-app's `workgen` script or use suffixed keys (`"run0"`, `"run1"`).
 //! - Unsupported events (`lock`, `unlock`, `wait`, `signal`, `broad`, `sync`,
 //!   `mem`, `iorun`, `yield`, `barrier`, `fork`) are skipped with a warning.
-//! - Cgroup (`taskgroup`) is not modeled.
+//! - Phase-level `taskgroup` migration is not modeled.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use serde_json::{Map, Value};
 use tracing::{info, warn};
 
 use crate::scenario::{
-    sched_overhead_rbc_ns_from_env, seed_from_env, IrqEvent, IrqType, NoiseConfig, OverheadConfig,
-    Scenario, DEFAULT_WATCHDOG_TIMEOUT_NS,
+    sched_overhead_rbc_ns_from_env, seed_from_env, CgroupBandwidth, CgroupDef, IrqEvent, IrqType,
+    NoiseConfig, OverheadConfig, Scenario, DEFAULT_WATCHDOG_TIMEOUT_NS,
 };
 use crate::task::{Phase, RepeatMode, TaskBehavior, TaskDef};
 use crate::types::{CpuId, Pid};
@@ -268,6 +272,201 @@ fn parse_cpus(value: &Value) -> Result<Option<Vec<CpuId>>, RtAppError> {
     }
 }
 
+/// Normalize a taskgroup path into a leading-slash form with no trailing/empty
+/// segments. Returns `None` for empty / root-only inputs.
+fn normalize_taskgroup_name(raw: &str) -> Option<String> {
+    let parts: Vec<_> = raw
+        .trim()
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    if parts.is_empty() {
+        None
+    } else {
+        Some(format!("/{}", parts.join("/")))
+    }
+}
+
+/// Parsed taskgroup spec: a normalized path plus optional `cpu.max` bandwidth.
+#[derive(Debug, Clone)]
+struct RtTaskgroupSpec {
+    name: String,
+    bandwidth: Option<CgroupBandwidth>,
+}
+
+/// Parse a `cpu.max`-style string ("`QUOTA PERIOD`" or "`max PERIOD`",
+/// microseconds) into a [`CgroupBandwidth`]. Returns `Ok(None)` for the
+/// unlimited (`max`) form; in that case the cgroup is created without a
+/// bandwidth entry, matching the simulator's "no kernel CFS gate" semantics.
+fn parse_cpu_max(value: &str) -> Result<Option<CgroupBandwidth>, RtAppError> {
+    let parts: Vec<_> = value.split_whitespace().collect();
+    if parts.len() != 2 {
+        return Err(RtAppError::InvalidValue(format!(
+            "taskgroup.cpu.max: expected 'max PERIOD' or 'QUOTA PERIOD', got {value:?}"
+        )));
+    }
+
+    let period_us = parts[1].parse::<u64>().map_err(|_| {
+        RtAppError::InvalidValue(format!("taskgroup.cpu.max: invalid period in {value:?}"))
+    })?;
+    if period_us == 0 {
+        return Err(RtAppError::InvalidValue(format!(
+            "taskgroup.cpu.max: period must be nonzero in {value:?}"
+        )));
+    }
+
+    if parts[0] == "max" {
+        return Ok(None);
+    }
+
+    let quota_us = parts[0].parse::<u64>().map_err(|_| {
+        RtAppError::InvalidValue(format!("taskgroup.cpu.max: invalid quota in {value:?}"))
+    })?;
+    if quota_us == 0 {
+        return Err(RtAppError::InvalidValue(format!(
+            "taskgroup.cpu.max: quota must be nonzero in {value:?}"
+        )));
+    }
+
+    Ok(Some(CgroupBandwidth {
+        period_us,
+        quota_us,
+        burst_us: 0,
+    }))
+}
+
+/// Parse a task's `taskgroup` field. Accepts:
+///
+/// - `"taskgroup": "/path"` (string form)
+/// - `"taskgroup": { "path": "/path", "cpu.max": "QUOTA PERIOD", ... }`
+///   (cgroup v2 object form, optional `cpu.weight` validated but ignored)
+fn parse_taskgroup(obj: &Map<String, Value>) -> Result<Option<RtTaskgroupSpec>, RtAppError> {
+    match obj.get("taskgroup") {
+        Some(Value::String(name)) => {
+            Ok(normalize_taskgroup_name(name).map(|name| RtTaskgroupSpec {
+                name,
+                bandwidth: None,
+            }))
+        }
+        Some(Value::Object(spec)) => {
+            let path = spec
+                .get("path")
+                .or_else(|| spec.get("name"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    RtAppError::InvalidValue(
+                        "taskgroup: object requires string 'path' or 'name'".into(),
+                    )
+                })?;
+
+            let Some(name) = normalize_taskgroup_name(path) else {
+                return Ok(None);
+            };
+
+            if let Some(weight) = spec.get("cpu.weight").or_else(|| spec.get("cpu_weight")) {
+                let weight = weight.as_u64().ok_or_else(|| {
+                    RtAppError::InvalidValue(format!(
+                        "taskgroup.cpu.weight: expected integer, got {weight}"
+                    ))
+                })?;
+                if !(1..=10_000).contains(&weight) {
+                    return Err(RtAppError::InvalidValue(format!(
+                        "taskgroup.cpu.weight: expected 1..=10000, got {weight}"
+                    )));
+                }
+            }
+
+            let bandwidth = match spec.get("cpu.max").or_else(|| spec.get("cpu_max")) {
+                Some(Value::String(cpu_max)) => parse_cpu_max(cpu_max)?,
+                Some(v) => {
+                    return Err(RtAppError::InvalidValue(format!(
+                        "taskgroup.cpu.max: expected string, got {v}"
+                    )));
+                }
+                None => None,
+            };
+
+            Ok(Some(RtTaskgroupSpec { name, bandwidth }))
+        }
+        Some(Value::Null) | None => Ok(None),
+        Some(v) => Err(RtAppError::InvalidValue(format!(
+            "taskgroup: expected string or object, got {v}"
+        ))),
+    }
+}
+
+fn same_bandwidth(a: &CgroupBandwidth, b: &CgroupBandwidth) -> bool {
+    a.period_us == b.period_us && a.quota_us == b.quota_us && a.burst_us == b.burst_us
+}
+
+/// Stash the bandwidth values from a parsed `taskgroup` so they can be
+/// attached to the synthesized `CgroupDef` after all tasks are parsed. If the
+/// same taskgroup is referenced by multiple tasks with conflicting `cpu.max`
+/// values, fail loudly rather than silently picking one.
+fn record_taskgroup_bandwidth(
+    cgroup_bandwidth: &mut HashMap<String, CgroupBandwidth>,
+    spec: &RtTaskgroupSpec,
+) -> Result<(), RtAppError> {
+    let Some(bandwidth) = &spec.bandwidth else {
+        return Ok(());
+    };
+
+    if let Some(existing) = cgroup_bandwidth.get(&spec.name) {
+        if !same_bandwidth(existing, bandwidth) {
+            return Err(RtAppError::InvalidValue(format!(
+                "taskgroup {:?}: conflicting cpu.max values across tasks",
+                spec.name
+            )));
+        }
+        return Ok(());
+    }
+
+    cgroup_bandwidth.insert(spec.name.clone(), bandwidth.clone());
+    Ok(())
+}
+
+/// Synthesize implicit `CgroupDef` entries for every taskgroup path referenced
+/// by a task. Each path component (e.g. `/a/b/c`) materializes one cgroup at
+/// each level (`/a`, `/a/b`, `/a/b/c`), parented to the previous level so the
+/// engine's hierarchy walk finds the correct ancestors. All synthesized
+/// cgroups inherit the full CPU set; bandwidth is attached only to the leaf
+/// path that originally carried `cpu.max` data.
+fn cgroup_defs_for_tasks(
+    tasks: &[TaskDef],
+    nr_cpus: u32,
+    cgroup_bandwidth: &HashMap<String, CgroupBandwidth>,
+) -> Vec<CgroupDef> {
+    let mut names = BTreeSet::new();
+    for task in tasks {
+        let Some(name) = &task.cgroup_name else {
+            continue;
+        };
+
+        let mut path = String::new();
+        for part in name.split('/').filter(|part| !part.is_empty()) {
+            path.push('/');
+            path.push_str(part);
+            names.insert(path.clone());
+        }
+    }
+
+    let all_cpus: Vec<_> = (0..nr_cpus).map(CpuId).collect();
+    names
+        .into_iter()
+        .map(|name| {
+            let parent_name = name
+                .rsplit_once('/')
+                .and_then(|(parent, _)| (!parent.is_empty()).then(|| parent.to_string()));
+            CgroupDef {
+                bandwidth: cgroup_bandwidth.get(&name).cloned(),
+                name,
+                parent_name,
+                cpuset: Some(all_cpus.clone()),
+            }
+        })
+        .collect()
+}
+
 /// Parse a single rt-app task object into one or more `TaskDef`s.
 ///
 /// Multiple `TaskDef`s are produced when `instance > 1`.
@@ -276,6 +475,7 @@ fn parse_task(
     obj: &Map<String, Value>,
     pid_start: &mut i32,
     name_to_pid: &HashMap<String, Pid>,
+    cgroup_bandwidth: &mut HashMap<String, CgroupBandwidth>,
 ) -> Result<Vec<TaskDef>, RtAppError> {
     let instance_count = obj.get("instance").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
 
@@ -294,12 +494,11 @@ fn parse_task(
         None
     };
 
-    if obj.contains_key("taskgroup") {
-        warn!(
-            task = name,
-            "ignoring 'taskgroup' (not modeled in simulator)"
-        );
+    let taskgroup = parse_taskgroup(obj)?;
+    if let Some(spec) = &taskgroup {
+        record_taskgroup_bandwidth(cgroup_bandwidth, spec)?;
     }
+    let cgroup_name = taskgroup.map(|spec| spec.name);
 
     // Parse phases
     let all_phases = if let Some(phases_val) = obj.get("phases") {
@@ -369,7 +568,7 @@ fn parse_task(
             mm_id: None,
             allowed_cpus: allowed_cpus.clone(),
             parent_pid: None,
-            cgroup_name: None,
+            cgroup_name: cgroup_name.clone(),
             task_flags: 0,
             migration_disabled: 0,
         });
@@ -519,6 +718,7 @@ pub fn load_rtapp(json_str: &str, nr_cpus: u32) -> Result<Scenario, RtAppError> 
     // bpf_in_serving_softirq(), rq->clock_task, etc. behave correctly.
     let mut all_tasks: Vec<TaskDef> = Vec::new();
     let mut irq_events: Vec<IrqEvent> = Vec::new();
+    let mut cgroup_bandwidth: HashMap<String, CgroupBandwidth> = HashMap::new();
     let mut pid_counter: i32 = 1;
     for (task_name, task_val) in tasks_obj.iter() {
         let task_obj = task_val.as_object().ok_or_else(|| {
@@ -592,7 +792,13 @@ pub fn load_rtapp(json_str: &str, nr_cpus: u32) -> Result<Scenario, RtAppError> 
             continue;
         }
 
-        let defs = parse_task(task_name, task_obj, &mut pid_counter, &name_to_pid)?;
+        let defs = parse_task(
+            task_name,
+            task_obj,
+            &mut pid_counter,
+            &name_to_pid,
+            &mut cgroup_bandwidth,
+        )?;
         all_tasks.extend(defs);
     }
 
@@ -620,12 +826,14 @@ pub fn load_rtapp(json_str: &str, nr_cpus: u32) -> Result<Scenario, RtAppError> 
         }
     }
 
+    let cgroups = cgroup_defs_for_tasks(&all_tasks, nr_cpus, &cgroup_bandwidth);
+
     Ok(Scenario {
         nr_cpus,
         smt_threads_per_core: 1,
         cpus_per_llc: 0,
         tasks: all_tasks,
-        cgroups: Vec::new(), // rt-app doesn't use cgroups
+        cgroups,
         duration_ns,
         noise: NoiseConfig::from_env(),
         overhead: OverheadConfig::from_env(),
@@ -934,5 +1142,239 @@ mod tests {
             err.to_string().contains("nr_cpus must be at least 1"),
             "expected nr_cpus validation error, got: {err}"
         );
+    }
+
+    // -- taskgroup → implicit cgroup synthesis (Diff 2/5) --
+
+    #[test]
+    fn test_normalize_taskgroup_name_simple() {
+        assert_eq!(normalize_taskgroup_name("/tg1").as_deref(), Some("/tg1"));
+        assert_eq!(normalize_taskgroup_name("tg1").as_deref(), Some("/tg1"));
+        assert_eq!(
+            normalize_taskgroup_name("/a/b/c").as_deref(),
+            Some("/a/b/c")
+        );
+        assert_eq!(
+            normalize_taskgroup_name("//a//b//").as_deref(),
+            Some("/a/b")
+        );
+        assert_eq!(normalize_taskgroup_name("/"), None);
+        assert_eq!(normalize_taskgroup_name(""), None);
+    }
+
+    #[test]
+    fn test_taskgroup_string_form_synthesizes_cgroup() {
+        let json = r#"{
+            "global": { "duration": 1 },
+            "tasks": {
+                "runner": {
+                    "loop": -1,
+                    "run": 20000,
+                    "sleep": 80000,
+                    "taskgroup": "/tg_string"
+                }
+            }
+        }"#;
+
+        let scenario = load_rtapp(json, 4).unwrap();
+
+        // Implicit cgroup synthesized from the taskgroup field.
+        assert_eq!(scenario.cgroups.len(), 1);
+        assert_eq!(scenario.cgroups[0].name, "/tg_string");
+        assert_eq!(scenario.cgroups[0].parent_name, None);
+        // No cpu.max in string form -> no bandwidth.
+        assert!(scenario.cgroups[0].bandwidth.is_none());
+        // All-CPUs cpuset.
+        assert_eq!(
+            scenario.cgroups[0].cpuset,
+            Some(vec![CpuId(0), CpuId(1), CpuId(2), CpuId(3)])
+        );
+        // Task assignment.
+        assert_eq!(scenario.tasks[0].cgroup_name.as_deref(), Some("/tg_string"));
+    }
+
+    #[test]
+    fn test_taskgroup_object_form_with_cpu_max() {
+        let json = r#"{
+            "global": { "duration": 1 },
+            "tasks": {
+                "runner": {
+                    "loop": -1,
+                    "run": 20000,
+                    "taskgroup": {
+                        "path": "/tg_v2",
+                        "cpu.weight": 250,
+                        "cpu.max": "200000 100000"
+                    }
+                }
+            }
+        }"#;
+
+        let scenario = load_rtapp(json, 2).unwrap();
+        assert_eq!(scenario.cgroups.len(), 1);
+        assert_eq!(scenario.cgroups[0].name, "/tg_v2");
+        assert_eq!(scenario.tasks[0].cgroup_name.as_deref(), Some("/tg_v2"));
+
+        let bw = scenario.cgroups[0]
+            .bandwidth
+            .as_ref()
+            .expect("expected cpu.max bandwidth");
+        assert_eq!(bw.period_us, 100_000);
+        assert_eq!(bw.quota_us, 200_000);
+        assert_eq!(bw.burst_us, 0);
+    }
+
+    #[test]
+    fn test_taskgroup_object_form_cpu_max_max_is_unlimited() {
+        let json = r#"{
+            "global": { "duration": 1 },
+            "tasks": {
+                "runner": {
+                    "loop": -1,
+                    "run": 20000,
+                    "taskgroup": {
+                        "path": "/unlimited",
+                        "cpu.max": "max 100000"
+                    }
+                }
+            }
+        }"#;
+
+        let scenario = load_rtapp(json, 2).unwrap();
+        assert_eq!(scenario.cgroups.len(), 1);
+        assert_eq!(scenario.cgroups[0].name, "/unlimited");
+        assert!(scenario.cgroups[0].bandwidth.is_none());
+    }
+
+    #[test]
+    fn test_taskgroup_nested_path_synthesizes_ancestors() {
+        let json = r#"{
+            "global": { "duration": 1 },
+            "tasks": {
+                "leaf": {
+                    "loop": -1,
+                    "run": 20000,
+                    "taskgroup": {
+                        "path": "/a/b/c",
+                        "cpu.max": "10000 100000"
+                    }
+                }
+            }
+        }"#;
+
+        let scenario = load_rtapp(json, 2).unwrap();
+        // /a, /a/b, /a/b/c — three implicit cgroups (BTreeSet -> sorted).
+        let names: Vec<_> = scenario.cgroups.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["/a", "/a/b", "/a/b/c"]);
+
+        // Hierarchy: each level parents the next.
+        assert_eq!(scenario.cgroups[0].parent_name, None);
+        assert_eq!(scenario.cgroups[1].parent_name.as_deref(), Some("/a"));
+        assert_eq!(scenario.cgroups[2].parent_name.as_deref(), Some("/a/b"));
+
+        // Bandwidth attached only to the leaf.
+        assert!(scenario.cgroups[0].bandwidth.is_none());
+        assert!(scenario.cgroups[1].bandwidth.is_none());
+        let leaf_bw = scenario.cgroups[2]
+            .bandwidth
+            .as_ref()
+            .expect("leaf cgroup should carry the cpu.max bandwidth");
+        assert_eq!(leaf_bw.quota_us, 10_000);
+        assert_eq!(leaf_bw.period_us, 100_000);
+    }
+
+    #[test]
+    fn test_taskgroup_conflicting_cpu_max_rejected() {
+        // Two tasks reference the same taskgroup path but with different
+        // cpu.max values — must be rejected, not silently merged.
+        let json = r#"{
+            "global": { "duration": 1 },
+            "tasks": {
+                "a": {
+                    "loop": -1,
+                    "run": 5000,
+                    "taskgroup": { "path": "/shared", "cpu.max": "10000 100000" }
+                },
+                "b": {
+                    "loop": -1,
+                    "run": 5000,
+                    "taskgroup": { "path": "/shared", "cpu.max": "20000 100000" }
+                }
+            }
+        }"#;
+
+        let err = load_rtapp(json, 2).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("conflicting cpu.max"),
+            "expected conflicting-cpu.max error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_taskgroup_invalid_cpu_max_rejected() {
+        let json = r#"{
+            "global": { "duration": 1 },
+            "tasks": {
+                "t": {
+                    "loop": -1,
+                    "run": 5000,
+                    "taskgroup": { "path": "/x", "cpu.max": "10000" }
+                }
+            }
+        }"#;
+        let err = load_rtapp(json, 2).unwrap_err();
+        assert!(err.to_string().contains("expected 'max PERIOD'"));
+    }
+
+    #[test]
+    fn test_taskgroup_only_spec_populates_bandwidth_manager() {
+        // End-to-end Diff 2 wiring: a taskgroup-only rt-app spec (no top-level
+        // `cgroup` block) is parsed into Scenario.cgroups, and the synthesized
+        // cgroups feed BandwidthManager via the engine-side bridge.
+        use crate::cgroup::CgroupId;
+        use crate::cgroup_bw::BandwidthManager;
+
+        let json = r#"{
+            "global": { "duration": 1 },
+            "tasks": {
+                "stop_worker": {
+                    "instance": 4,
+                    "loop": -1,
+                    "run": 100000,
+                    "taskgroup": {
+                        "path": "/test_bw_stop",
+                        "cpu.max": "10000 100000"
+                    }
+                }
+            }
+        }"#;
+
+        let scenario = load_rtapp(json, 4).unwrap();
+
+        // Synthesized cgroup with bandwidth.
+        assert_eq!(scenario.cgroups.len(), 1);
+        assert_eq!(scenario.cgroups[0].name, "/test_bw_stop");
+        assert!(scenario.cgroups[0].bandwidth.is_some());
+
+        // All four task instances assigned.
+        assert_eq!(scenario.tasks.len(), 4);
+        for t in &scenario.tasks {
+            assert_eq!(t.cgroup_name.as_deref(), Some("/test_bw_stop"));
+        }
+
+        // Engine-side bridge: assign CgroupIds and feed BandwidthManager.
+        let cgid = CgroupId(100);
+        let mut mgr = BandwidthManager::new();
+        mgr.configure_from_cgroup_defs(&scenario.cgroups, 0, |name| {
+            (name == "/test_bw_stop").then_some(cgid)
+        });
+
+        // Manager now tracks the synthesized cgroup with the parsed quota.
+        assert_eq!(mgr.len(), 1);
+        let state = mgr.get(cgid).expect("BandwidthManager should track cgid");
+        assert_eq!(state.quota_ns, 10_000 * 1_000); // 10ms in ns
+        assert_eq!(state.period_ns, 100_000 * 1_000); // 100ms in ns
+        assert!(!state.throttled);
     }
 }

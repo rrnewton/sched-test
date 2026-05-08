@@ -284,6 +284,37 @@ impl BandwidthManager {
         min_budget
     }
 
+    /// Configure the manager from `Scenario.cgroups`-style definitions.
+    ///
+    /// For each `CgroupDef` whose `bandwidth` is `Some`, looks up the
+    /// corresponding `CgroupId` via `name_to_id` and calls [`Self::configure`]
+    /// with the parsed quota/period. Cgroups without bandwidth, or whose name
+    /// the resolver does not know, are skipped.
+    ///
+    /// This is the engine-side bridge used to plumb implicit cgroups
+    /// synthesized from rt-app-rs `taskgroup` specs into the bandwidth model.
+    /// The closure decouples the bw module from the cgroup-registry layout
+    /// (mirroring the `ancestor_lookup` pattern used elsewhere in this module).
+    pub fn configure_from_cgroup_defs<'a, I, F>(&mut self, defs: I, now_ns: TimeNs, name_to_id: F)
+    where
+        I: IntoIterator<Item = &'a crate::scenario::CgroupDef>,
+        F: Fn(&str) -> Option<CgroupId>,
+    {
+        for def in defs {
+            let Some(bw) = def.bandwidth.as_ref() else {
+                continue;
+            };
+            let Some(cgid) = name_to_id(&def.name) else {
+                debug!(
+                    name = %def.name,
+                    "configure_from_cgroup_defs: cgroup name not registered, skipping"
+                );
+                continue;
+            };
+            self.configure(cgid, bw.period_us, bw.quota_us, now_ns);
+        }
+    }
+
     /// Iterator over all tracked cgroup IDs and their states.
     pub fn iter(&self) -> impl Iterator<Item = (&CgroupId, &CgroupBandwidthState)> {
         self.states.iter()
