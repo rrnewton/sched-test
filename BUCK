@@ -6,13 +6,13 @@ oncall("sched_ext")
 # Single-crate approach: matches Cargo's structure exactly
 rust_library(
     name = "schtest_lib",
-    srcs = ["src/lib.rs"] + glob([
-        "src/util/**/*.rs",
-        "src/workloads/**/*.rs",
-        "src/cases/**/*.rs",
+    srcs = ["schtest/rust/src/lib.rs"] + glob([
+        "schtest/rust/src/util/**/*.rs",
+        "schtest/rust/src/workloads/**/*.rs",
+        "schtest/rust/src/cases/**/*.rs",
     ]),
     crate = "schtest",
-    crate_root = "src/lib.rs",
+    crate_root = "schtest/rust/src/lib.rs",
     features = ["cargo_build"],
     test_deps = ["fbsource//third-party/rust:more-asserts"],
     deps = [
@@ -30,7 +30,7 @@ rust_library(
 
 rust_binary(
     name = "schtest",
-    srcs = ["src/main.rs"],
+    srcs = ["schtest/rust/src/main.rs"],
     crate = "schtest",
     features = ["cargo_build"],
     deps = [
