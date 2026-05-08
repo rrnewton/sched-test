@@ -427,14 +427,61 @@ mod tests {
         // Both should drop cleanly.
     }
 
-    // NOTE: A nested hierarchy test (child of non-root parent) is
-    // intentionally omitted. The kernel `struct cgroup` has a flexible
-    // array member `ancestors[0]`, but `sim_cgroup_alloc` allocates
-    // `sizeof(struct cgroup)` which provides zero space for ancestors.
-    // Writing ancestors at level >= 2 causes heap corruption. This is a
-    // pre-existing C-side bug (not introduced by this wrapper). The
-    // wrapper is correct — it delegates to the same C function that
-    // `CgroupRegistry::create` uses.
+    /// Regression test for the `sim_cgroup_alloc` heap-overflow bug.
+    ///
+    /// The kernel's `struct cgroup` (vmlinux.h) ends with a flexible
+    /// array member `struct cgroup *ancestors[0]`, so
+    /// `sizeof(struct cgroup)` does NOT include any storage for
+    /// ancestor pointers. The previous `sim_cgroup_alloc` implementation
+    /// only `calloc(1, sizeof(struct cgroup))`'d, so every write to
+    /// `cgrp->ancestors[i]` scribbled past the end of the allocation,
+    /// corrupting whatever heap chunk happened to be adjacent. The
+    /// corruption surfaced later as `malloc(): corrupted top size`,
+    /// `double free or corruption`, or SIGSEGV in unrelated code paths.
+    ///
+    /// Discovered by stress-harness fuzzing 2026-05-08 — random rt-app
+    /// specs that nested taskgroups beyond the root crashed ~53% of
+    /// the time once Diff 2 started synthesizing implicit cgroup
+    /// hierarchies (`/grand/parent/leaf`). Fixed by allocating
+    /// `sizeof(struct cgroup) + CGROUP_ANCESTOR_MAX * sizeof(struct cgroup *)`.
+    ///
+    /// The test builds a deep chain (well past the previous level >= 2
+    /// danger zone), interleaves siblings and per-cgroup cpuset writes
+    /// to maximise the chance of adjacent-chunk corruption, then drops
+    /// everything. With the bug present this aborts under glibc's malloc
+    /// integrity checks; with the fix it completes cleanly.
+    #[test]
+    fn test_deeply_nested_hierarchy_no_heap_corruption() {
+        let _lock = SIM_LOCK.lock().unwrap();
+        let root = SimCgroupHandle::root();
+
+        // Build a 16-level deep chain. Each level also gets two siblings
+        // and a non-trivial cpuset, so malloc churn maximises the chance
+        // that ancestors[] writes would have stomped on the next chunk.
+        let mut chain: Vec<SimCgroupHandle> = Vec::new();
+        let mut parent = root;
+        for level in 1u32..=16 {
+            let main = SimCgroupHandle::new(1000 + level as u64, level, parent);
+            let cpus: Vec<CpuId> = (0..(level % 8 + 1)).map(CpuId).collect();
+            main.set_cpuset(&cpus);
+
+            // Two siblings at this level so the level write is exercised
+            // repeatedly with the same parent.
+            let sib_a = SimCgroupHandle::new(2000 + level as u64, level, parent);
+            sib_a.set_cpuset(&[CpuId(0)]);
+            let sib_b = SimCgroupHandle::new(3000 + level as u64, level, parent);
+            sib_b.set_cpuset(&[CpuId(0), CpuId(1)]);
+            chain.push(sib_a);
+            chain.push(sib_b);
+
+            parent = main.as_ptr();
+            chain.push(main);
+        }
+
+        // Drop in reverse insertion order to give the allocator another
+        // chance to detect any latent corruption.
+        while chain.pop().is_some() {}
+    }
 
     #[test]
     fn test_css_iter_guard_prepare() {

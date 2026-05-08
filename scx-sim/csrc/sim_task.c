@@ -288,6 +288,27 @@ struct scx_exit_task_args *sim_get_exit_task_args(void)
 #endif
 
 /*
+ * The kernel's `struct cgroup` (vmlinux.h) ends with a flexible array
+ * member `struct cgroup *ancestors[0]`, so `sizeof(struct cgroup)` does
+ * NOT include any storage for the ancestor pointers. This block of
+ * trailing storage holds CGROUP_ANCESTOR_MAX entries.
+ *
+ * Forgetting to add this trailing space causes every write to
+ * `cgrp->ancestors[i]` below to scribble past the end of the calloc()
+ * region, corrupting the heap allocator's chunk metadata (or whatever
+ * happens to be adjacent). The corruption is intermittent and depends
+ * on heap layout, surfacing later as `malloc(): corrupted top size`,
+ * `double free or corruption`, or SIGSEGV in unrelated code paths.
+ *
+ * Discovered by stress-harness fuzzing on 2026-05-08:
+ *   experiments/lavd_cpubw_stalls_202604/scxsim_stress_runs/errors/
+ * (~53% crash rate on randomly-generated taskgroup specs that nest
+ * cgroups beyond the root).
+ */
+#define SIM_CGROUP_ALLOC_SIZE \
+	(sizeof(struct cgroup) + (CGROUP_ANCESTOR_MAX) * sizeof(struct cgroup *))
+
+/*
  * Allocate a new cgroup with the given ID and level.
  * parent is the parent cgroup's struct cgroup pointer (or NULL for root).
  */
@@ -297,7 +318,7 @@ void *sim_cgroup_alloc(u64 cgid, u32 level, void *parent)
 	struct kernfs_node *kn;
 	struct css_set *css_set;
 
-	cgrp = calloc(1, sizeof(struct cgroup));
+	cgrp = calloc(1, SIM_CGROUP_ALLOC_SIZE);
 	if (!cgrp)
 		return NULL;
 
