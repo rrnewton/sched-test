@@ -1,0 +1,16 @@
+{
+  "_comment_h6": "H6 Cell C: kernel cpu.max=10ms/100ms AND LAVD enable_cpu_bw=true. Both controllers active — Bug-1 surface. Expected: stall (engine head-of-line block at DSQ). Reference fixture; the test driver uses Scenario::builder directly.",
+  "tasks": {
+    "hog": {
+      "loop": -1,
+      "instr": 200000000,
+      "taskgroup": {
+        "path": "/h6_test",
+        "cpu.max": "10000 100000"
+      }
+    }
+  },
+  "global": {
+    "duration": 0.35
+  }
+}

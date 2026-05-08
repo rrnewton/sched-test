@@ -1,0 +1,16 @@
+{
+  "_comment_h6": "H6 Cell A: kernel cpu.max=max, LAVD enable_cpu_bw=true. Expected: no stall (only one controller active). Reference fixture; the test driver uses Scenario::builder directly.",
+  "tasks": {
+    "hog": {
+      "loop": -1,
+      "instr": 200000000,
+      "taskgroup": {
+        "path": "/h6_test",
+        "cpu.max": "max 100000"
+      }
+    }
+  },
+  "global": {
+    "duration": 0.35
+  }
+}

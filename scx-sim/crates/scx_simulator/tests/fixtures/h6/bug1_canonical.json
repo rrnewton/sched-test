@@ -1,0 +1,24 @@
+{
+  "_comment_h6": "Bug-1 canonical reproducer (David Dai R1 distilled). cpu.max=10000 100000 (10% of one CPU), 16 oversubscribed yes-loop workers (4x nproc with nr_cpus=4), LAVD --enable-cpu-bw, watchdog=80ms. See experiments/lavd_cpubw_stalls_202604/davids-artifacts/lavd_bw_repro_r1_tight.sh. Reference fixture; the test driver uses Scenario::builder.",
+  "tasks": {
+    "yes_0":  { "loop": -1, "instr": 200000000, "taskgroup": { "path": "/test_bw_tight", "cpu.max": "10000 100000" } },
+    "yes_1":  { "loop": -1, "instr": 200000000, "taskgroup": { "path": "/test_bw_tight" } },
+    "yes_2":  { "loop": -1, "instr": 200000000, "taskgroup": { "path": "/test_bw_tight" } },
+    "yes_3":  { "loop": -1, "instr": 200000000, "taskgroup": { "path": "/test_bw_tight" } },
+    "yes_4":  { "loop": -1, "instr": 200000000, "taskgroup": { "path": "/test_bw_tight" } },
+    "yes_5":  { "loop": -1, "instr": 200000000, "taskgroup": { "path": "/test_bw_tight" } },
+    "yes_6":  { "loop": -1, "instr": 200000000, "taskgroup": { "path": "/test_bw_tight" } },
+    "yes_7":  { "loop": -1, "instr": 200000000, "taskgroup": { "path": "/test_bw_tight" } },
+    "yes_8":  { "loop": -1, "instr": 200000000, "taskgroup": { "path": "/test_bw_tight" } },
+    "yes_9":  { "loop": -1, "instr": 200000000, "taskgroup": { "path": "/test_bw_tight" } },
+    "yes_10": { "loop": -1, "instr": 200000000, "taskgroup": { "path": "/test_bw_tight" } },
+    "yes_11": { "loop": -1, "instr": 200000000, "taskgroup": { "path": "/test_bw_tight" } },
+    "yes_12": { "loop": -1, "instr": 200000000, "taskgroup": { "path": "/test_bw_tight" } },
+    "yes_13": { "loop": -1, "instr": 200000000, "taskgroup": { "path": "/test_bw_tight" } },
+    "yes_14": { "loop": -1, "instr": 200000000, "taskgroup": { "path": "/test_bw_tight" } },
+    "yes_15": { "loop": -1, "instr": 200000000, "taskgroup": { "path": "/test_bw_tight" } }
+  },
+  "global": {
+    "duration": 0.5
+  }
+}

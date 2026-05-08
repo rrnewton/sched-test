@@ -1,0 +1,16 @@
+{
+  "_comment_h6": "H6 Cell B: kernel cpu.max=10ms/100ms, LAVD enable_cpu_bw=false. Expected (production): no stall. Expected (scxsim first cut): engine-side throttle loop fires (engine is single source of truth). Reference fixture; the test driver uses Scenario::builder directly.",
+  "tasks": {
+    "hog": {
+      "loop": -1,
+      "instr": 200000000,
+      "taskgroup": {
+        "path": "/h6_test",
+        "cpu.max": "10000 100000"
+      }
+    }
+  },
+  "global": {
+    "duration": 0.35
+  }
+}
