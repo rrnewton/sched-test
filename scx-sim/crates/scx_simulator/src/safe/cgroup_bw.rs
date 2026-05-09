@@ -49,6 +49,14 @@ pub struct CgroupBandwidthState {
     /// PIDs of tasks that were runnable when throttling kicked in.
     /// These tasks need to be re-enqueued when the cgroup is unthrottled.
     pub throttled_pids: Vec<Pid>,
+    /// Cumulative observability counters (Stream C follow-up).
+    ///
+    /// These do not affect enforcement decisions; they exist purely for
+    /// `state_snapshot::CgroupSnapshot` so the analysis script can plot
+    /// "did refill ever fire?" without scanning the full event trace.
+    pub charges_count: u64,
+    pub throttles_count: u64,
+    pub refills_count: u64,
 }
 
 impl CgroupBandwidthState {
@@ -68,6 +76,9 @@ impl CgroupBandwidthState {
             throttled: false,
             period_start_ns: now_ns,
             throttled_pids: Vec::new(),
+            charges_count: 0,
+            throttles_count: 0,
+            refills_count: 0,
         }
     }
 
@@ -76,6 +87,7 @@ impl CgroupBandwidthState {
     /// Returns `true` if the cgroup should be throttled (runtime exhausted).
     pub fn charge(&mut self, delta_ns: u64) -> bool {
         self.runtime_remaining_ns -= delta_ns as i64;
+        self.charges_count += 1;
         self.runtime_remaining_ns <= 0 && !self.throttled
     }
 
@@ -90,6 +102,7 @@ impl CgroupBandwidthState {
     pub fn refill(&mut self, now_ns: TimeNs) -> Vec<Pid> {
         self.period_start_ns = now_ns;
         self.runtime_remaining_ns = self.quota_ns as i64;
+        self.refills_count += 1;
 
         if self.throttled {
             self.throttled = true; // will be cleared by caller after re-enqueue
@@ -106,6 +119,9 @@ impl CgroupBandwidthState {
 
     /// Mark this cgroup as throttled and record a task PID.
     pub fn throttle(&mut self, pid: Pid) {
+        if !self.throttled {
+            self.throttles_count += 1;
+        }
         self.throttled = true;
         if !self.throttled_pids.contains(&pid) {
             self.throttled_pids.push(pid);
