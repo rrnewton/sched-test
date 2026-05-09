@@ -1,0 +1,26 @@
+{
+  "_comment_h6": "Bug-1 reproducer for realistic (multi-second) watchdog values. Same workload structure as bug1_canonical.json (16 oversubscribed yes-loop workers, 4x nproc with nr_cpus=4) but with a stretched cgroup quota window so the bug-1 stall persists past the canonical 100ms throttle period: cpu.max=10000 5000000 (0.2% over 5s period) yields a contiguous throttle window of ~4990ms — large enough to trip watchdogs of 1s, 2s, and 4s with byte-identical determinism.",
+  "_comment_run_units": "rt-app 'run' is microseconds. 10000000us = 10s per task per loop iteration, ensuring the loop iteration outlives any of the {1s,2s,4s} watchdog tiers without rolling over.",
+  "_comment_invocation": "Verified invocations: --watchdog 1s --duration 2000ms (runnable_for_ns=1000003099), --watchdog 2s --duration 3000ms (runnable_for_ns=2000013593), --watchdog 4s --duration 5000ms (runnable_for_ns=4000035190). All exit 42 with byte-identical stderr across 3 reps. Pair with bug1_canonical.toml (enable_cpu_bw=true).",
+  "tasks": {
+    "yes_0":  { "loop": -1, "run": 10000000, "taskgroup": { "path": "/test_bw_realistic", "cpu.max": "10000 5000000" } },
+    "yes_1":  { "loop": -1, "run": 10000000, "taskgroup": { "path": "/test_bw_realistic" } },
+    "yes_2":  { "loop": -1, "run": 10000000, "taskgroup": { "path": "/test_bw_realistic" } },
+    "yes_3":  { "loop": -1, "run": 10000000, "taskgroup": { "path": "/test_bw_realistic" } },
+    "yes_4":  { "loop": -1, "run": 10000000, "taskgroup": { "path": "/test_bw_realistic" } },
+    "yes_5":  { "loop": -1, "run": 10000000, "taskgroup": { "path": "/test_bw_realistic" } },
+    "yes_6":  { "loop": -1, "run": 10000000, "taskgroup": { "path": "/test_bw_realistic" } },
+    "yes_7":  { "loop": -1, "run": 10000000, "taskgroup": { "path": "/test_bw_realistic" } },
+    "yes_8":  { "loop": -1, "run": 10000000, "taskgroup": { "path": "/test_bw_realistic" } },
+    "yes_9":  { "loop": -1, "run": 10000000, "taskgroup": { "path": "/test_bw_realistic" } },
+    "yes_10": { "loop": -1, "run": 10000000, "taskgroup": { "path": "/test_bw_realistic" } },
+    "yes_11": { "loop": -1, "run": 10000000, "taskgroup": { "path": "/test_bw_realistic" } },
+    "yes_12": { "loop": -1, "run": 10000000, "taskgroup": { "path": "/test_bw_realistic" } },
+    "yes_13": { "loop": -1, "run": 10000000, "taskgroup": { "path": "/test_bw_realistic" } },
+    "yes_14": { "loop": -1, "run": 10000000, "taskgroup": { "path": "/test_bw_realistic" } },
+    "yes_15": { "loop": -1, "run": 10000000, "taskgroup": { "path": "/test_bw_realistic" } }
+  },
+  "global": {
+    "duration": 6.0
+  }
+}
