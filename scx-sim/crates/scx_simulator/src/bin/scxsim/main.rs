@@ -458,6 +458,7 @@ impl ChargeGranularityArg {
             ChargeGranularityArg::Tick => ChargeGranularity::Tick,
         }
     }
+}
 
 /// Arguments for the `replay` subcommand.
 #[derive(Parser)]
