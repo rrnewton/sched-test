@@ -165,6 +165,18 @@ $(BUILD_DIR)/$(1)_sim_deterministic_mem.o: $(SIMULATOR_DIR)/csrc/sim_determinist
 		-c -o $$@ $$<
 endef
 
+# Per-scheduler sim_printk.c -> <name>_sim_printk.o
+# Stream B (overnight 2026-05-08): userspace stderr sink for bpf_printk()
+# called from LAVD's debugln/traceln macros. Lives in its own TU so it can
+# include <stdio.h>/<stdarg.h>/<stdlib.h> without vmlinux.h type clashes.
+# NOTE: compiled WITHOUT $(INCLUDES) to avoid vmlinux.h conflicts.
+define PRINTK_RULE
+$(BUILD_DIR)/$(1)_sim_printk.o: $(SIMULATOR_DIR)/csrc/sim_printk.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS_BASE) \
+		-MMD -MF $(BUILD_DIR)/$(1)_sim_printk.d \
+		-c -o $$@ $$<
+endef
+
 # Link .o files into .so
 # NOTE: sim_sdt_stubs.o is NOT linked here — SDT functions resolve from the
 # main binary via -rdynamic. This ensures there's only one copy of the SDT
@@ -172,7 +184,7 @@ endef
 # NOTE: -Wl,--init=e9_so_init creates a DT_INIT entry so e9tool can inject
 # its loader. Without it, -nostdlib .so files have no init section.
 define SO_RULE
-$(BUILD_DIR)/libscx_$(1).so: $(BUILD_DIR)/$(1)_wrapper.o $(BUILD_DIR)/$(1)_sim_bpf_stubs.o $(BUILD_DIR)/$(1)_sim_sigfpe.o $(BUILD_DIR)/$(1)_overrides.o $(BUILD_DIR)/$(1)_sim_rbc_trampoline.o $(BUILD_DIR)/$(1)_sim_deterministic_mem.o
+$(BUILD_DIR)/libscx_$(1).so: $(BUILD_DIR)/$(1)_wrapper.o $(BUILD_DIR)/$(1)_sim_bpf_stubs.o $(BUILD_DIR)/$(1)_sim_sigfpe.o $(BUILD_DIR)/$(1)_overrides.o $(BUILD_DIR)/$(1)_sim_rbc_trampoline.o $(BUILD_DIR)/$(1)_sim_deterministic_mem.o $(BUILD_DIR)/$(1)_sim_printk.o
 	$(CC) $(LDFLAGS_SO) -Wl,--init=e9_so_init -o $$@ $$^
 endef
 
@@ -183,6 +195,7 @@ $(foreach s,$(SCHEDS),$(eval $(call SIGFPE_RULE,$(s))))
 $(foreach s,$(SCHEDS),$(eval $(call OVERRIDES_RULE,$(s))))
 $(foreach s,$(SCHEDS),$(eval $(call RBC_TRAMPOLINE_RULE,$(s))))
 $(foreach s,$(SCHEDS),$(eval $(call DETERMINISTIC_MEM_RULE,$(s))))
+$(foreach s,$(SCHEDS),$(eval $(call PRINTK_RULE,$(s))))
 $(foreach s,$(SCHEDS),$(eval $(call SO_RULE,$(s))))
 
 # --- e9patch post-processing ---

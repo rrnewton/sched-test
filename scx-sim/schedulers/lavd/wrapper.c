@@ -13,6 +13,37 @@
 
 /*
  * =================================================================
+ * Stream B (printk pipeline): bpf_printk -> stderr override
+ * =================================================================
+ *
+ * In production LAVD, bpf_printk(...) lowers to bpf_trace_printk(),
+ * a BPF helper that writes into /sys/kernel/debug/tracing/trace_pipe.
+ * In scxsim the BPF C source is compiled as ordinary userspace C and
+ * bpf_trace_printk resolves to the static function pointer
+ * `(void *)6` from libbpf's bpf_helper_defs.h, which segfaults if
+ * actually called.
+ *
+ * To make LAVD's existing debugln()/traceln() macros (and any new
+ * targeted prints) usable inside scxsim, route bpf_printk to a
+ * stderr sink implemented in csrc/sim_printk.c. That file lives in
+ * its own translation unit so it can include <stdio.h> et al.
+ * without colliding with vmlinux.h types pulled in here.
+ *
+ * Visibility: opt-in via the LAVD_PRINTK env var (1=info, 2=trace).
+ * When unset, output is fully suppressed.
+ *
+ * Output format: every line is prefixed with `[LAVD-PRINTK]` so the
+ * stream is easy to grep/separate from the simulator's normal stderr.
+ */
+extern void sim_lavd_printk(const char *fmt, ...)
+	__attribute__((format(printf, 1, 2)));
+extern int  sim_lavd_printk_level(void);
+
+#undef bpf_printk
+#define bpf_printk(fmt, ...) sim_lavd_printk(fmt, ##__VA_ARGS__)
+
+/*
+ * =================================================================
  * LAVD-specific macro overrides
  * (after sim_wrapper.h, before LAVD source)
  * =================================================================
@@ -752,7 +783,14 @@ void lavd_setup(unsigned int num_cpus)
 	no_wake_sync = false;
 	no_slice_boost = false;
 	no_use_em = true; /* no kernel energy model in the simulator */
-	verbose = 0;
+	/*
+	 * Stream B: respect LAVD_PRINTK env var so existing debugln (>0)
+	 * and traceln (>1) sites in LAVD light up under scxsim. The
+	 * bpf_printk override above re-routes the actual output to stderr.
+	 * sim_lavd_printk_level() lives in csrc/sim_printk.c which has
+	 * access to <stdlib.h>/getenv()/atoi().
+	 */
+	verbose = (unsigned char)sim_lavd_printk_level();
 
 	/* Per-CPU topology: uniform capacity, no big/little, no SMT */
 	for (cpu = 0; cpu < num_cpus && cpu < LAVD_CPU_ID_MAX; cpu++) {
