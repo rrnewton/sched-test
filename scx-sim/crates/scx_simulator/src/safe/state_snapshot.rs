@@ -88,6 +88,20 @@ pub struct SnapshotSummary {
     /// Time of the next event in the queue (or None if empty). Lets the
     /// analysis script see when the next opportunity to act will arise.
     pub next_event_t_ns: Option<TimeNs>,
+    /// **Steady-state investigation:** sum across ALL tasks of
+    /// `repeat_iteration * phases_per_loop + phase_idx`. Cumulative
+    /// count of phase boundaries crossed by the workload. A
+    /// monotonically-increasing value means the workload IS making
+    /// forward progress; a frozen value across many seconds is the
+    /// canonical livelock signature.
+    pub total_phase_completions: u64,
+    /// **Steady-state investigation:** sum across ALL tasks of CPU
+    /// time consumed since simulation start (computed from
+    /// `task_struct.se.sum_exec_runtime`). A frozen value confirms
+    /// tasks aren't running on-CPU; a growing value confirms they
+    /// are getting at least some CPU time even if no individual
+    /// phase finishes.
+    pub total_run_ns_sum: u64,
 }
 
 /// Per-cgroup bandwidth snapshot.
@@ -162,6 +176,18 @@ pub struct TaskSnapshot {
     pub ops_state: &'static str,
     pub last_cpu: Option<u32>,
     pub prev_cpu: u32,
+    /// Progress observability (steady-state investigation):
+    /// the task's current phase index in its scripted behavior.
+    /// Combined with `repeat_iteration` and `phases_per_loop`, this
+    /// gives "completed phases so far" for forward-progress detection.
+    pub phase_idx: u32,
+    /// Number of full phase-loop completions so far. Sum with
+    /// `phase_idx` to compute total phases completed by this task.
+    pub repeat_iteration: u32,
+    /// Nanoseconds remaining in the current Run phase (0 for non-Run
+    /// phases). Decreases as the task accumulates CPU time. A task
+    /// making forward progress shows this counter ticking down.
+    pub run_remaining_ns: u64,
 }
 
 /// Streaming writer that emits one [`StateSnapshot`] per line of output.
@@ -290,6 +316,27 @@ pub struct TaskRow<'a> {
     pub state: &'static str,
     pub runnable_at_ns: Option<TimeNs>,
     pub prev_cpu: CpuId,
+    /// **Steady-state investigation:** the task's current phase index
+    /// in its scripted behavior (0-based).
+    pub phase_idx: u32,
+    /// **Steady-state investigation:** how many times the task has
+    /// completed its full phase loop. Combined with `phase_idx` and
+    /// `phases_per_loop`, this is the per-task forward-progress
+    /// counter.
+    pub repeat_iteration: u32,
+    /// **Steady-state investigation:** number of distinct phases per
+    /// repeat iteration (i.e. `task.behavior.phases.len()`). Used by
+    /// the snapshot to compute "total phases completed by this task".
+    pub phases_per_loop: u32,
+    /// **Steady-state investigation:** ns of CPU time still owed in
+    /// the current Run phase (0 for non-Run phases). Decreases as
+    /// the task accumulates CPU time.
+    pub run_remaining_ns: u64,
+    /// **Steady-state investigation:** total CPU time consumed by
+    /// this task since simulation start (mirrors the kernel's
+    /// `task_struct.se.sum_exec_runtime`). Aggregated across all
+    /// tasks into `SnapshotSummary.total_run_ns_sum`.
+    pub sum_exec_runtime_ns: u64,
 }
 
 /// Build a [`StateSnapshot`] from raw engine state.
@@ -370,6 +417,10 @@ pub fn take_snapshot<T: TaskTable>(inputs: &SnapshotInputs<'_, T>) -> StateSnaps
     let mut nr_runnable: u32 = 0;
     let mut nr_running: u32 = 0;
     let mut nr_sleeping: u32 = 0;
+    // Steady-state investigation roll-ups (computed across ALL tasks,
+    // not just the top-N runnable, so they survive the truncation).
+    let mut total_phase_completions: u64 = 0;
+    let mut total_run_ns_sum: u64 = 0;
     inputs.tasks.for_each_task(&mut |row| {
         match row.state {
             "Runnable" => nr_runnable += 1,
@@ -377,6 +428,12 @@ pub fn take_snapshot<T: TaskTable>(inputs: &SnapshotInputs<'_, T>) -> StateSnaps
             "Sleeping" => nr_sleeping += 1,
             _ => {}
         }
+        // Forward-progress accounting (all states, including Sleeping
+        // and Exited): a task that completed phases and exited still
+        // counts.
+        total_phase_completions +=
+            row.repeat_iteration as u64 * row.phases_per_loop as u64 + row.phase_idx as u64;
+        total_run_ns_sum += row.sum_exec_runtime_ns;
         if row.state != "Runnable" && row.state != "Running" {
             return;
         }
@@ -393,6 +450,9 @@ pub fn take_snapshot<T: TaskTable>(inputs: &SnapshotInputs<'_, T>) -> StateSnaps
             ops_state: inputs.tasks.ops_state(row.pid),
             last_cpu: inputs.tasks.last_cpu(row.pid).map(|c| c.0),
             prev_cpu: row.prev_cpu.0,
+            phase_idx: row.phase_idx,
+            repeat_iteration: row.repeat_iteration,
+            run_remaining_ns: row.run_remaining_ns,
         };
         runnable.push((runnable_for_ns, snap));
     });
@@ -420,6 +480,8 @@ pub fn take_snapshot<T: TaskTable>(inputs: &SnapshotInputs<'_, T>) -> StateSnaps
             total_dsq_depth,
             event_queue_size: inputs.event_queue_size,
             next_event_t_ns: inputs.next_event_t_ns,
+            total_phase_completions,
+            total_run_ns_sum,
         },
         cgroups,
         cpus,
@@ -458,6 +520,11 @@ mod tests {
                     state,
                     runnable_at_ns: *runnable_at_ns,
                     prev_cpu: *prev_cpu,
+                    phase_idx: 0,
+                    repeat_iteration: 0,
+                    phases_per_loop: 1,
+                    run_remaining_ns: 0,
+                    sum_exec_runtime_ns: 0,
                 });
             }
         }

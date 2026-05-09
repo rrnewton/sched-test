@@ -1239,6 +1239,11 @@ impl<'a> crate::state_snapshot::TaskTable for SnapshotTaskView<'a> {
                 state,
                 runnable_at_ns: task.runnable_at_ns,
                 prev_cpu: task.prev_cpu,
+                phase_idx: task.phase_idx as u32,
+                repeat_iteration: task.repeat_iteration,
+                phases_per_loop: task.behavior.phases.len() as u32,
+                run_remaining_ns: task.run_remaining_ns,
+                sum_exec_runtime_ns: task.sum_exec_runtime(),
             });
         }
     }

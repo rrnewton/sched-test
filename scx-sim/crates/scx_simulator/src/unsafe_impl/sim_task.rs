@@ -126,6 +126,19 @@ impl SimTask {
         self.raw
     }
 
+    /// Read the kernel-equivalent `task_struct.se.sum_exec_runtime` for
+    /// this task (in ns). The engine writes this via `update_sum_exec`
+    /// during running task accounting; safe code can read it via this
+    /// FFI shim. Used by the state-snapshot scaffold's
+    /// per-task `sum_exec_runtime_ns` field for forward-progress
+    /// accounting (steady-state investigation).
+    pub fn sum_exec_runtime(&self) -> TimeNs {
+        // SAFETY: `self.raw` is a valid task_struct allocation owned by
+        // this SimTask. `sim_task_get_sum_exec_runtime` performs a
+        // single field read, no mutation, no aliasing concerns.
+        unsafe { crate::ffi::sim_task_get_sum_exec_runtime(self.raw) }
+    }
+
     /// Get the current phase, or None if the task has completed all phases.
     pub fn current_phase(&self) -> Option<&Phase> {
         self.behavior.phases.get(self.phase_idx)
