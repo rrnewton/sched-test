@@ -37,6 +37,34 @@
 //! 80ms is comfortably less than the 90ms throttle wait, so a task waiting
 //! through the throttle window WILL trip an 80ms watchdog while leaving
 //! headroom for short admission re-checks.
+//!
+//! # IMPORTANT: SHAPE-of-stall, NOT mechanism-of-stall
+//!
+//! This test reproduces the *shape* of Bug-1 (oversubscribed cgroup →
+//! throttle → tasks pile up runnable → watchdog fires) but does **NOT**
+//! reproduce production Bug-1's *mechanism*. The chosen invocation
+//! parameters (`--watchdog 80ms` against a 100ms `cpu.max` period) are
+//! a deliberate **test-design choice** — `watchdog < period` guarantees
+//! the watchdog fires before the engine's first refill event at
+//! `t = period_ns = 100ms` is reachable in the event queue. In other
+//! words, the simulator's exit here is by **construction**, not by any
+//! refill bug.
+//!
+//! Evidence: with realistic parameters (`--watchdog 5s --duration 10s`)
+//! against the *same* workload, the simulator does **not** reproduce a
+//! multi-second stall. Max `runnable_for_ns` peaks at ~200ms (≈2
+//! periods) because refill fires at every period boundary and the
+//! engine's `BandwidthManager` unthrottles correctly. See
+//! `experiments/lavd_cpubw_stalls_202604/overnight_2026-05-08/STREAM_C_FOLLOWUP_REFILL_INVESTIGATION.md`
+//! sections 5–6 for the full investigation, with file:line citations
+//! for the engine code paths that were verified.
+//!
+//! This test is therefore best understood as a **shape regression
+//! guard** (the engine still throttles + the watchdog still fires
+//! deterministically with the same `runnable_for_ns` value across
+//! reps). Treat any future "Bug-1 reproduces in scxsim" claim with
+//! skepticism unless it uses a watchdog ≥ period and still produces a
+//! multi-second stall.
 
 use std::path::PathBuf;
 use std::process::Command;
