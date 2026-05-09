@@ -403,6 +403,27 @@ struct RunArgs {
     /// first ops breakpoint.
     #[arg(long)]
     wait_debugger: bool,
+
+    /// Maximum number of cgroups (BPF map capacity simulation).
+    ///
+    /// Production LAVD's cgroup_bw library caps `cbw_cgroup_ids[]` at
+    /// `CBW_NR_CGRP_MAX = 2048`. When the rt-app workload (or scenario API)
+    /// would create more than this many cgroups, the engine exits with
+    /// `ExitKind::ErrorCgroupExhausted` (exit code 45). The LAVD wrapper
+    /// independently propagates -ENOMEM from `sim_cgroup_registry_allocate`
+    /// at the same cap into `scx_cgroup_bw_init`.
+    ///
+    /// Defaults to the rt-app loader's permissive value (10000) so that
+    /// existing fixtures behave unchanged. Set to `2048` to model the
+    /// production hash-map cap, or to a small value (e.g. `10`) to drive
+    /// the ENOMEM exhaustion path quickly.
+    ///
+    /// NOTE: scxsim's engine refill iterates a HashMap with no static cap,
+    /// so it cannot reproduce the production silent-drop semantics for
+    /// cgroups indexed beyond `cbw_cgroup_ids[2048]` in the replenish loop.
+    /// This flag tests the ENOMEM admission gate, not the array overflow.
+    #[arg(long, value_name = "N")]
+    max_cgroups: Option<u32>,
 }
 
 /// Arguments for the `replay` subcommand.
@@ -638,6 +659,9 @@ fn run(args: &RunArgs) -> Result<(), RunError> {
     }
     if args.wait_debugger {
         scenario.wait_debugger = true;
+    }
+    if let Some(max) = args.max_cgroups {
+        scenario.max_cgroups = max;
     }
 
     // Validate --wprof and --bpf-trace require --real-run vm
