@@ -689,6 +689,13 @@ fn flush_staged_events(state: &mut SimulatorState, events: &mut EventQueue) {
 /// The main simulator.
 pub struct Simulator<S: Scheduler> {
     scheduler: SchedulerWrapper<S>,
+    /// Optional periodic state-snapshot writer attached via
+    /// [`Simulator::with_state_snapshot`]. Wrapped in `RefCell` so that
+    /// `&self` callers (`run`, `run_monitored`, `run_internal`) can take
+    /// the writer out and emit through it inside the event loop without
+    /// requiring `&mut self`. The writer is single-threaded by
+    /// construction (only the engine event-loop touches it).
+    state_snapshot_writer: std::cell::RefCell<Option<crate::state_snapshot::SnapshotWriter>>,
 }
 
 /// Result of a simulation, keeping task storage alive for post-simulation
@@ -1199,10 +1206,104 @@ macro_rules! sim_callback {
     };
 }
 
+/// Bridge between the engine's `tasks: HashMap<Pid, SimTask>` table and the
+/// safe `state_snapshot::TaskTable` trait.
+///
+/// `SimTask` carries an unsafe `*mut c_void` (the C `task_struct`); the
+/// snapshot module lives under `safe/` and must not depend on the unsafe
+/// type directly. This view borrows just the read-only fields the
+/// snapshot needs and exposes them through the trait.
+struct SnapshotTaskView<'a> {
+    tasks: &'a HashMap<Pid, SimTask>,
+    task_last_cpu: &'a HashMap<Pid, CpuId>,
+    ops_state: &'a BTreeMap<Pid, OpsTaskState>,
+}
+
+impl<'a> crate::state_snapshot::TaskTable for SnapshotTaskView<'a> {
+    fn for_each_task(&self, f: &mut dyn FnMut(crate::state_snapshot::TaskRow<'_>)) {
+        // Sort by PID for determinism; HashMap iteration order is
+        // platform-dependent.
+        let mut pids: Vec<Pid> = self.tasks.keys().copied().collect();
+        pids.sort_by_key(|p| p.0);
+        for pid in pids {
+            let task = &self.tasks[&pid];
+            let state = match task.state {
+                TaskState::Sleeping => "Sleeping",
+                TaskState::Runnable => "Runnable",
+                TaskState::Running { .. } => "Running",
+                TaskState::Exited => "Exited",
+            };
+            f(crate::state_snapshot::TaskRow {
+                pid: task.pid,
+                name: &task.name,
+                state,
+                runnable_at_ns: task.runnable_at_ns,
+                prev_cpu: task.prev_cpu,
+            });
+        }
+    }
+
+    fn ops_state(&self, pid: Pid) -> &'static str {
+        match self.ops_state.get(&pid).copied().unwrap_or_default() {
+            OpsTaskState::Queued => "queued",
+            OpsTaskState::None => "none",
+        }
+    }
+
+    fn last_cpu(&self, pid: Pid) -> Option<CpuId> {
+        self.task_last_cpu.get(&pid).copied()
+    }
+}
+
 impl<S: Scheduler> Simulator<S> {
     pub fn new(scheduler: S) -> Self {
         Simulator {
             scheduler: SchedulerWrapper::new(scheduler),
+            state_snapshot_writer: std::cell::RefCell::new(None),
+        }
+    }
+
+    /// Attach a periodic state-snapshot writer. The writer is consumed and
+    /// flushed at end of run. See `safe::state_snapshot` for output format.
+    ///
+    /// Builder-style: returns `self` so it composes naturally with
+    /// `Simulator::new(sched).with_state_snapshot(w).run(scenario)`.
+    pub fn with_state_snapshot(self, writer: crate::state_snapshot::SnapshotWriter) -> Self {
+        *self.state_snapshot_writer.borrow_mut() = Some(writer);
+        self
+    }
+
+    /// Emit a periodic state snapshot if one is due at `now_ns`.
+    ///
+    /// Called from the event loop while the SimState lock is held, so we
+    /// can safely read all engine state without further synchronization.
+    /// The writer decides internally whether the sample interval has
+    /// elapsed.
+    fn emit_state_snapshot(&self, s: &SimState, now_ns: TimeNs) {
+        let mut writer_slot = self.state_snapshot_writer.borrow_mut();
+        let Some(writer) = writer_slot.as_mut() else {
+            return;
+        };
+        let task_view = SnapshotTaskView {
+            tasks: &s.tasks,
+            task_last_cpu: &s.sim.task_last_cpu,
+            ops_state: &s.sim.task_ops_state,
+        };
+        let inputs = crate::state_snapshot::SnapshotInputs {
+            now_ns,
+            cpus: &s.sim.cpus,
+            dsqs: &s.sim.dsqs,
+            bw_manager: &s.bw_manager,
+            cgroup_registry: &s.cgroup_registry,
+            task_to_cgid: &s.task_to_cgid,
+            tasks: &task_view,
+        };
+        if let Err(e) = writer.maybe_emit(now_ns, |idx| {
+            let mut snap = crate::state_snapshot::take_snapshot(&inputs);
+            snap.idx = idx;
+            snap
+        }) {
+            warn!("state snapshot emit failed at t={}ns: {}", now_ns, e);
         }
     }
 
@@ -1913,6 +2014,14 @@ impl<S: Scheduler> Simulator<S> {
             }
             s.sim.clock = t;
 
+            // Periodic state-snapshot emission (Stream C).
+            //
+            // Sample-based view of the engine's full state, complementary to
+            // the event traces. Emitted *between* events while we still hold
+            // the SimState lock — non-perturbing (no event staging, no
+            // mutation, no extra locks). See `safe::state_snapshot`.
+            self.emit_state_snapshot(&s, t);
+
             // Pop one event at a time and process it.
             let event = s.events.pop().expect("peek succeeded but pop failed");
             drop(s);
@@ -1952,6 +2061,22 @@ impl<S: Scheduler> Simulator<S> {
                     scenario.duration_ns,
                     CpuId(cpu_idx as u32),
                     TraceKind::SimulationEnd { pid },
+                );
+            }
+        }
+
+        // Final state snapshot at duration_ns + flush. This captures the
+        // post-event state so the analysis script's last sample shows the
+        // moment of stall / completion / error.
+        self.emit_state_snapshot(&s, scenario.duration_ns);
+        if let Some(w) = self.state_snapshot_writer.borrow_mut().as_mut() {
+            if let Err(e) = w.flush() {
+                warn!("state snapshot writer flush failed: {e}");
+            } else {
+                info!(
+                    snapshots = w.count(),
+                    interval_ns = w.interval_ns(),
+                    "state snapshot writer: completed"
                 );
             }
         }

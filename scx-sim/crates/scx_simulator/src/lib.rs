@@ -51,6 +51,7 @@ pub use safe::perf;
 pub(crate) use safe::perfetto;
 pub use safe::rtapp;
 pub use safe::scenario;
+pub use safe::state_snapshot;
 pub use safe::stats;
 pub use safe::task;
 pub use safe::trace;
