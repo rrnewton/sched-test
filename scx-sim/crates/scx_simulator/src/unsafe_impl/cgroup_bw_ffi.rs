@@ -183,6 +183,14 @@ pub extern "C" fn sim_cgroup_bw_set(
 /// must agree with the engine's DSQ-pop admission decision.
 #[no_mangle]
 pub extern "C" fn sim_cgroup_bw_throttled(cgrp_raw: *mut c_void) -> i32 {
+    // POC (concurrent-mode exploration, agent/scxsim-concurrent-mode-poc):
+    // Expose the cgroup-bw throttle-check race surface to scxsim's
+    // existing `--interleave` and `--preemptive` interleaving machinery.
+    // Without this yield point, the existing concurrency modes never
+    // explore interleavings between LAVD's "is the cgroup throttled?"
+    // check and the engine's refill/throttle state mutations.
+    crate::preempt::set_current_kfunc("cgroup_bw_throttled");
+    crate::interleave::maybe_yield();
     let Some(cgid) = cgid_from_raw(cgrp_raw) else {
         return 0;
     };
@@ -252,6 +260,15 @@ pub extern "C" fn sim_cgroup_bw_is_task_throttled(_taskc: u64) -> i32 {
 /// recorded for engine-side charging is sufficient for correlation.
 #[no_mangle]
 pub extern "C" fn sim_cgroup_bw_consume(cgrp_raw: *mut c_void, runtime_ns: u64) -> i32 {
+    // POC (concurrent-mode exploration): expose the LAVD-side
+    // cgroup-bw consume race surface. Specifically races interesting
+    // here include: the gap between LAVD reporting consumed runtime
+    // and the engine's refill firing, which under
+    // `agent/charge-granularity-experiment`'s steady-state
+    // investigation is the source of "phantom 100ms charges per refill"
+    // (see STEADY_STATE_INVESTIGATION.md §5.1).
+    crate::preempt::set_current_kfunc("cgroup_bw_consume");
+    crate::interleave::maybe_yield();
     if runtime_ns == 0 {
         return 0;
     }
@@ -313,6 +330,15 @@ pub extern "C" fn sim_cgroup_bw_put_aside(
     _vtime: u64,
     _cgrp_raw: *mut c_void,
 ) -> i32 {
+    // POC (concurrent-mode exploration): expose put-aside race surface.
+    // The hidden-livelock investigation (STEADY_STATE_INVESTIGATION.md
+    // §5.1) traced the steady-state pathology to put-aside's no-op
+    // shim. Even with a no-op body, exposing this site to
+    // maybe_yield() lets the interleaving machinery explore
+    // orderings between LAVD's "put aside" decision and the engine's
+    // dispatch / refill events.
+    crate::preempt::set_current_kfunc("cgroup_bw_put_aside");
+    crate::interleave::maybe_yield();
     0
 }
 
@@ -326,6 +352,9 @@ pub extern "C" fn sim_cgroup_bw_put_aside(
 /// no-op here. Return 0 to indicate "no tasks reenqueued."
 #[no_mangle]
 pub extern "C" fn sim_cgroup_bw_reenqueue() -> i32 {
+    // POC (concurrent-mode exploration): expose reenqueue race surface.
+    crate::preempt::set_current_kfunc("cgroup_bw_reenqueue");
+    crate::interleave::maybe_yield();
     0
 }
 
