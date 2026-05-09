@@ -26,6 +26,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+/*
+ * Simulator clock accessor lives in Rust (kfuncs.rs) via the
+ * sim_bpf_ktime_get_ns kfunc and is exported with C linkage.
+ * Returns 0 if no clock context is set (e.g., during scheduler
+ * init before the engine has been wired up).
+ */
+extern unsigned long long sim_bpf_ktime_get_ns(void);
+
 int sim_lavd_printk_level(void)
 {
 	static int cached = -1;
@@ -41,9 +49,19 @@ __attribute__((format(printf, 1, 2)))
 void sim_lavd_printk(const char *fmt, ...)
 {
 	va_list ap;
+	unsigned long long now;
 	if (sim_lavd_printk_level() <= 0)
 		return;
-	fputs("[LAVD-PRINTK] ", stderr);
+	now = sim_bpf_ktime_get_ns();
+	/*
+	 * Stream B follow-up: include a [t=...us] simulator-time tag so
+	 * the trace can be correlated with engine-side events
+	 * (CgroupBwRefill etc.) that Stream C is investigating. We use
+	 * microseconds rounded down — production trace_pipe also reports
+	 * us-resolution timestamps, and the Bug-1 surface lives at the
+	 * 10ms / 100ms scale so 1us is more than enough.
+	 */
+	fprintf(stderr, "[LAVD-PRINTK] [t=%lluus] ", now / 1000ULL);
 	va_start(ap, fmt);
 	vfprintf(stderr, fmt, ap);
 	va_end(ap);
