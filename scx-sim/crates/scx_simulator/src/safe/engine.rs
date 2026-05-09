@@ -1289,6 +1289,25 @@ impl<S: Scheduler> Simulator<S> {
             task_last_cpu: &s.sim.task_last_cpu,
             ops_state: &s.sim.task_ops_state,
         };
+        // Stream C follow-up: scan the event queue for the next scheduled
+        // CgroupBwRefill per cgid. The heap is unsorted by cgid so this
+        // is O(N) per snapshot; N is small (typically <100). Done here
+        // (not in state_snapshot.rs) because the queue is engine-private.
+        let mut next_refill_per_cgid: HashMap<CgroupId, TimeNs> = HashMap::new();
+        for Reverse(ev) in s.events.heap.iter() {
+            if let EventKind::CgroupBwRefill { cgid, .. } = ev.kind {
+                next_refill_per_cgid
+                    .entry(cgid)
+                    .and_modify(|t| {
+                        if ev.time_ns < *t {
+                            *t = ev.time_ns;
+                        }
+                    })
+                    .or_insert(ev.time_ns);
+            }
+        }
+        let event_queue_size = s.events.heap.len() as u32;
+        let next_event_t_ns = s.events.peek_time();
         let inputs = crate::state_snapshot::SnapshotInputs {
             now_ns,
             cpus: &s.sim.cpus,
@@ -1297,6 +1316,9 @@ impl<S: Scheduler> Simulator<S> {
             cgroup_registry: &s.cgroup_registry,
             task_to_cgid: &s.task_to_cgid,
             tasks: &task_view,
+            next_refill_per_cgid: &next_refill_per_cgid,
+            event_queue_size,
+            next_event_t_ns,
         };
         if let Err(e) = writer.maybe_emit(now_ns, |idx| {
             let mut snap = crate::state_snapshot::take_snapshot(&inputs);

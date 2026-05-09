@@ -73,12 +73,21 @@ pub struct SnapshotSummary {
     pub nr_runnable: u32,
     pub nr_running: u32,
     pub nr_sleeping: u32,
+    pub nr_idle_cpus: u32,
     pub nr_throttled_cgroups: u32,
     /// Maximum `runnable_for_ns` across all currently-runnable tasks.
     /// This is the value the watchdog ultimately compares against.
     pub max_runnable_for_ns: u64,
     /// Sum of `len()` across all DSQs (including LOCAL).
     pub total_dsq_depth: u64,
+    /// Total number of events sitting in the engine event queue.
+    /// Stream C follow-up: needed to distinguish "queue is empty so the
+    /// engine cannot make progress" from "queue has events but they fire
+    /// after the next stop condition (e.g. watchdog)".
+    pub event_queue_size: u32,
+    /// Time of the next event in the queue (or None if empty). Lets the
+    /// analysis script see when the next opportunity to act will arise.
+    pub next_event_t_ns: Option<TimeNs>,
 }
 
 /// Per-cgroup bandwidth snapshot.
@@ -95,6 +104,21 @@ pub struct CgroupSnapshot {
     pub throttled_pid_count: u32,
     /// Fraction of quota consumed in the current period in [0.0, 1.0+].
     pub utilization: f64,
+    /// Cumulative observability counters (Stream C follow-up).
+    /// `refills_count` was the missing piece for the original Stream C
+    /// finding — `period_start_ns` not advancing was a *symptom*; the
+    /// *mechanism* is `refills_count == 0` because the refill event
+    /// never reached pop time before the watchdog fired.
+    pub charges_count: u64,
+    pub throttles_count: u64,
+    pub refills_count: u64,
+    /// Earliest scheduled CgroupBwRefill event time for this cgid in the
+    /// engine's event queue, if any. `None` means no refill is queued
+    /// (initial-load failure, or the cgroup was unconfigured).
+    /// This is the smoking-gun observable for the follow-up question:
+    /// "is the refill event scheduled but unreached?" vs "was it never
+    /// scheduled at all?".
+    pub next_refill_t_ns: Option<TimeNs>,
 }
 
 /// Per-CPU runtime snapshot.
@@ -227,6 +251,15 @@ pub struct SnapshotInputs<'a, T> {
     /// (`SimState.tasks`); we accept them via this trait so the
     /// snapshot module does not depend on the unsafe-impl `SimTask`.
     pub tasks: &'a T,
+    /// Next scheduled refill time per cgid (queried from the engine
+    /// event queue). `None` for any cgid without a queued refill.
+    /// Stream C follow-up: this is the smoking-gun observable for the
+    /// "is the refill scheduled but unreached?" hypothesis.
+    pub next_refill_per_cgid: &'a HashMap<CgroupId, TimeNs>,
+    /// Total events sitting in the engine event queue.
+    pub event_queue_size: u32,
+    /// Time of the next event in the queue, if any.
+    pub next_event_t_ns: Option<TimeNs>,
 }
 
 /// Trait abstracting over the engine's task table for snapshot purposes.
@@ -281,6 +314,10 @@ pub fn take_snapshot<T: TaskTable>(inputs: &SnapshotInputs<'_, T>) -> StateSnaps
             period_start_ns: st.period_start_ns,
             throttled_pid_count: st.throttled_pids.len() as u32,
             utilization: st.utilization(),
+            charges_count: st.charges_count,
+            throttles_count: st.throttles_count,
+            refills_count: st.refills_count,
+            next_refill_t_ns: inputs.next_refill_per_cgid.get(*cgid).copied(),
         })
         .collect();
     let nr_throttled_cgroups = cgroups.iter().filter(|c| c.throttled).count() as u32;
@@ -368,6 +405,8 @@ pub fn take_snapshot<T: TaskTable>(inputs: &SnapshotInputs<'_, T>) -> StateSnaps
         .map(|(_, s)| s)
         .collect();
 
+    let nr_idle_cpus = inputs.cpus.iter().filter(|c| c.is_idle()).count() as u32;
+
     StateSnapshot {
         t_ns: now_ns,
         idx: 0, // assigned by SnapshotWriter::maybe_emit
@@ -375,9 +414,12 @@ pub fn take_snapshot<T: TaskTable>(inputs: &SnapshotInputs<'_, T>) -> StateSnaps
             nr_runnable,
             nr_running,
             nr_sleeping,
+            nr_idle_cpus,
             nr_throttled_cgroups,
             max_runnable_for_ns,
             total_dsq_depth,
+            event_queue_size: inputs.event_queue_size,
+            next_event_t_ns: inputs.next_event_t_ns,
         },
         cgroups,
         cpus,
@@ -433,18 +475,20 @@ mod tests {
         BandwidthManager,
         CgroupRegistry,
         HashMap<Pid, CgroupId>,
+        HashMap<CgroupId, TimeNs>,
     ) {
         let cpus = vec![SimCpu::new(CpuId(0)), SimCpu::new(CpuId(1))];
         let dsqs = DsqManager::new();
         let bw_manager = BandwidthManager::new();
         let cgroup_registry = CgroupRegistry::new(2, 100);
         let task_to_cgid = HashMap::new();
-        (cpus, dsqs, bw_manager, cgroup_registry, task_to_cgid)
+        let next_refill_per_cgid: HashMap<CgroupId, TimeNs> = HashMap::new();
+        (cpus, dsqs, bw_manager, cgroup_registry, task_to_cgid, next_refill_per_cgid)
     }
 
     #[test]
     fn empty_state_snapshot() {
-        let (cpus, dsqs, bw, reg, t2c) = empty_inputs();
+        let (cpus, dsqs, bw, reg, t2c, refills) = empty_inputs();
         let tasks = ToyTasks(Vec::new());
         let inputs = SnapshotInputs {
             now_ns: 1_000,
@@ -454,6 +498,9 @@ mod tests {
             cgroup_registry: &reg,
             task_to_cgid: &t2c,
             tasks: &tasks,
+            next_refill_per_cgid: &refills,
+            event_queue_size: 0,
+            next_event_t_ns: None,
         };
         let snap = take_snapshot(&inputs);
         assert_eq!(snap.t_ns, 1_000);
@@ -465,7 +512,7 @@ mod tests {
 
     #[test]
     fn runnable_tasks_sorted_desc() {
-        let (cpus, dsqs, bw, reg, t2c) = empty_inputs();
+        let (cpus, dsqs, bw, reg, t2c, refills) = empty_inputs();
         let tasks = ToyTasks(vec![
             (Pid(10), "a".into(), "Runnable", Some(900), CpuId(0)),
             (Pid(11), "b".into(), "Runnable", Some(500), CpuId(0)),
@@ -479,6 +526,9 @@ mod tests {
             cgroup_registry: &reg,
             task_to_cgid: &t2c,
             tasks: &tasks,
+            next_refill_per_cgid: &refills,
+            event_queue_size: 0,
+            next_event_t_ns: None,
         };
         let snap = take_snapshot(&inputs);
         assert_eq!(snap.summary.nr_runnable, 2);
@@ -493,7 +543,7 @@ mod tests {
 
     #[test]
     fn cgroup_throttle_state_captured() {
-        let (cpus, dsqs, mut bw, reg, t2c) = empty_inputs();
+        let (cpus, dsqs, mut bw, reg, t2c, refills) = empty_inputs();
         // 50ms quota / 100ms period at t=0
         bw.configure(CgroupId(7), 100_000, 50_000, 0);
         // Charge 60ms — newly exhausted; mark throttled (matching engine logic)
@@ -511,6 +561,9 @@ mod tests {
             cgroup_registry: &reg,
             task_to_cgid: &t2c,
             tasks: &tasks,
+            next_refill_per_cgid: &refills,
+            event_queue_size: 0,
+            next_event_t_ns: None,
         };
         let snap = take_snapshot(&inputs);
         assert_eq!(snap.cgroups.len(), 1);
@@ -525,7 +578,7 @@ mod tests {
     fn writer_emits_at_interval_boundaries() {
         let tmp = NamedTempFile::new().unwrap();
         let mut w = SnapshotWriter::create(tmp.path(), 100).unwrap(); // 100us = 100_000ns
-        let (cpus, dsqs, bw, reg, t2c) = empty_inputs();
+        let (cpus, dsqs, bw, reg, t2c, refills) = empty_inputs();
         let tasks = ToyTasks(Vec::new());
         let make = |now_ns: TimeNs| {
             let inputs = SnapshotInputs {
@@ -536,6 +589,9 @@ mod tests {
                 cgroup_registry: &reg,
                 task_to_cgid: &t2c,
                 tasks: &tasks,
+            next_refill_per_cgid: &refills,
+            event_queue_size: 0,
+            next_event_t_ns: None,
             };
             take_snapshot(&inputs)
         };
@@ -608,7 +664,7 @@ mod tests {
     fn writer_disabled_when_interval_zero() {
         let tmp = NamedTempFile::new().unwrap();
         let mut w = SnapshotWriter::create(tmp.path(), 0).unwrap();
-        let (cpus, dsqs, bw, reg, t2c) = empty_inputs();
+        let (cpus, dsqs, bw, reg, t2c, refills) = empty_inputs();
         let tasks = ToyTasks(Vec::new());
         w.maybe_emit(1_000_000, |idx| {
             let inputs = SnapshotInputs {
@@ -619,6 +675,9 @@ mod tests {
                 cgroup_registry: &reg,
                 task_to_cgid: &t2c,
                 tasks: &tasks,
+            next_refill_per_cgid: &refills,
+            event_queue_size: 0,
+            next_event_t_ns: None,
             };
             let mut s = take_snapshot(&inputs);
             s.idx = idx;
