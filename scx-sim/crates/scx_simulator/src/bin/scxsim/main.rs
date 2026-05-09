@@ -403,6 +403,31 @@ struct RunArgs {
     /// first ops breakpoint.
     #[arg(long)]
     wait_debugger: bool,
+
+    /// Periodic state-snapshot interval in microseconds (Stream C).
+    ///
+    /// When set together with `--state-snapshot-output`, the engine emits
+    /// a full-state JSON snapshot every N microseconds of simulated time.
+    /// Output is jsonl (one snapshot per line). See
+    /// `safe::state_snapshot` and the analysis script
+    /// `experiments/.../analyze_state_evolution.py`.
+    ///
+    /// Typical values:
+    /// - 100 (10 kHz): default for short runs / Bug-1 narrative tracing
+    /// - 1000 (1 kHz): coarser for multi-second workloads
+    /// - 10 (100 kHz): for fine-grained moment-of-stall analysis
+    ///
+    /// 0 disables emission. Requires `--state-snapshot-output`.
+    #[arg(long, value_name = "US")]
+    state_snapshot_interval_us: Option<u64>,
+
+    /// Output path for periodic state snapshots (jsonl).
+    ///
+    /// Required when `--state-snapshot-interval-us` is set. The file is
+    /// truncated and overwritten. Recommend tmpfs (`/tmp/...`) for
+    /// 10kHz+ rates to avoid disk-write latency dominating run time.
+    #[arg(long, value_name = "PATH")]
+    state_snapshot_output: Option<PathBuf>,
 }
 
 /// Arguments for the `replay` subcommand.
@@ -1193,7 +1218,50 @@ fn run_simulation(args: &RunArgs, scenario: Scenario) -> Result<(), RunError> {
         so_path: so_abs_path,
     };
 
-    let trace = Simulator::new(sched).run(scenario);
+    // Periodic state-snapshot writer (Stream C). Both flags must be set
+    // together; surface the misuse as a hard error rather than silently
+    // dropping snapshots or emitting to a default path.
+    let snapshot_writer = match (
+        args.state_snapshot_interval_us,
+        args.state_snapshot_output.as_ref(),
+    ) {
+        (None, None) | (Some(0), None) => None,
+        (Some(0), Some(_)) => {
+            // Explicit zero interval = disable; treat output as no-op too.
+            None
+        }
+        (Some(interval), Some(path)) => {
+            let w = scx_simulator::state_snapshot::SnapshotWriter::create(path, interval)
+                .map_err(|e| {
+                    format!(
+                        "failed to create state-snapshot output {}: {e}",
+                        path.display()
+                    )
+                })?;
+            eprintln!(
+                "state snapshots: interval={}us, output={}",
+                interval,
+                path.display()
+            );
+            Some(w)
+        }
+        (Some(_), None) => {
+            return Err(
+                "--state-snapshot-interval-us requires --state-snapshot-output".into(),
+            );
+        }
+        (None, Some(_)) => {
+            return Err(
+                "--state-snapshot-output requires --state-snapshot-interval-us".into(),
+            );
+        }
+    };
+
+    let mut sim = Simulator::new(sched);
+    if let Some(w) = snapshot_writer {
+        sim = sim.with_state_snapshot(w);
+    }
+    let trace = sim.run(scenario);
 
     if args.dump_trace {
         trace.dump();

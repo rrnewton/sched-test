@@ -21,6 +21,7 @@ pub mod perf;
 pub(crate) mod perfetto;
 pub mod rtapp;
 pub mod scenario;
+pub mod state_snapshot;
 pub mod stats;
 pub mod task;
 pub mod trace;
