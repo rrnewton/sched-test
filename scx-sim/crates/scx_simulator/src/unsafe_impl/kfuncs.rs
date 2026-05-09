@@ -443,6 +443,14 @@ pub struct SimulatorState {
     /// When set, workers run truly concurrently with real locks and
     /// window-based clock throttling instead of token-ring serialization.
     pub native_concurrent: Option<NativeConcurrentConfig>,
+    /// SHARED-READ: Configuration set at init, never mutated during simulation.
+    ///
+    /// **EXPERIMENTAL** Granularity of cgroup `cpu.max` quota charging.
+    /// Default `Stop` matches current behavior. `Tick` charges per-tick
+    /// inside `handle_tick` AND a residual at task-stop. See
+    /// `scenario::ChargeGranularity` and the Stream C followup
+    /// investigation (`agent/charge-granularity-experiment` branch).
+    pub charge_granularity: crate::scenario::ChargeGranularity,
 }
 
 /// Bundle of all shared simulator state, protected by a single Mutex.
@@ -2613,6 +2621,7 @@ mod tests {
             e9_fns: None,
             structop_accum: vec![crate::preempt::StructopInfo::default(); nr_cpus as usize],
             native_concurrent: None,
+            charge_granularity: crate::scenario::ChargeGranularity::Stop,
         }
     }
 

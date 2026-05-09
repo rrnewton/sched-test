@@ -403,6 +403,41 @@ struct RunArgs {
     /// first ops breakpoint.
     #[arg(long)]
     wait_debugger: bool,
+
+    /// **EXPERIMENTAL** Granularity of cgroup `cpu.max` quota charging
+    /// (Stream C followup, branch `agent/charge-granularity-experiment`).
+    ///
+    /// - `stop` (default): charge at task-stop / phase-complete only.
+    ///   Matches current behavior; preserves existing test exit codes.
+    ///   Allows quota overshoot of up to one task-slice (in the canonical
+    ///   Bug-1 fixture this is ~28 ms vs a 10 ms quota = 3x overshoot).
+    /// - `tick`: charge incrementally at every Tick event (HZ=250 → 4ms)
+    ///   AND at stop for the residual since the last tick. Models
+    ///   production CFS's per-tick `update_curr` accounting; bounds
+    ///   overshoot to ~one tick worth of CPU time.
+    ///
+    /// This flag exists for the Stream C followup investigation into
+    /// whether finer-grained charging changes Bug-1 reproducibility
+    /// under realistic watchdog parameters.
+    #[arg(long, value_enum, default_value_t = ChargeGranularityArg::Stop)]
+    charge_granularity: ChargeGranularityArg,
+}
+
+/// CLI representation of `safe::scenario::ChargeGranularity`.
+#[derive(Copy, Clone, Debug, clap::ValueEnum)]
+enum ChargeGranularityArg {
+    Stop,
+    Tick,
+}
+
+impl ChargeGranularityArg {
+    fn to_scenario(self) -> scx_simulator::scenario::ChargeGranularity {
+        use scx_simulator::scenario::ChargeGranularity;
+        match self {
+            ChargeGranularityArg::Stop => ChargeGranularity::Stop,
+            ChargeGranularityArg::Tick => ChargeGranularity::Tick,
+        }
+    }
 }
 
 /// Arguments for the `replay` subcommand.
@@ -639,6 +674,7 @@ fn run(args: &RunArgs) -> Result<(), RunError> {
     if args.wait_debugger {
         scenario.wait_debugger = true;
     }
+    scenario.charge_granularity = args.charge_granularity.to_scenario();
 
     // Validate --wprof and --bpf-trace require --real-run vm
     if args.wprof && args.real_run != RealRunMode::Vm {

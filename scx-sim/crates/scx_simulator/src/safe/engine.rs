@@ -1438,6 +1438,7 @@ impl<S: Scheduler> Simulator<S> {
                 scenario.nr_cpus as usize
             ],
             native_concurrent: scenario.native_concurrent,
+            charge_granularity: scenario.charge_granularity,
         };
 
         // Build the persistent replay backend once if we have a replay trace.
@@ -2370,6 +2371,27 @@ impl<S: Scheduler> Simulator<S> {
                 .local_clock
                 .saturating_sub(started_at);
             update_sum_exec(raw, task.sum_exec_base, elapsed);
+        }
+
+        // EXPERIMENTAL: per-tick cgroup_bw charging (Stream C followup,
+        // agent/charge-granularity-experiment). When enabled, charge the
+        // CPU time consumed since the last charge (≈ TICK_INTERVAL_NS) so
+        // the scheduler's tick callback sees a coherent post-charge view
+        // — matching production CFS where update_curr runs in
+        // scheduler_tick BEFORE pick_next_task. When disabled (default),
+        // charging happens only at task-stop / phase-complete.
+        if matches!(
+            s.sim.charge_granularity,
+            crate::scenario::ChargeGranularity::Tick
+        ) {
+            let now_ns = s.sim.cpus[cpu.0 as usize].local_clock;
+            let last = s.sim.cpus[cpu.0 as usize].bw_last_charge_at_ns;
+            let delta = now_ns.saturating_sub(last);
+            if delta > 0 {
+                let mut f = s.fields();
+                charge_cgroup_bw(&mut f, pid, delta, now_ns, cpu);
+            }
+            s.sim.cpus[cpu.0 as usize].bw_last_charge_at_ns = now_ns;
         }
 
         set_ops_context(&mut s.sim, OpsContext::Tick);
@@ -3324,10 +3346,24 @@ impl<S: Scheduler> Simulator<S> {
 
         // Charge consumed CPU time against this task's cgroup cpu.max quota
         // (Diff 3 wiring). See `charge_cgroup_bw` for layering rationale.
+        //
+        // EXPERIMENTAL (Stream C followup): in Tick granularity mode,
+        // per-tick charging has already accounted for time up to the last
+        // tick boundary; charge only the residual since
+        // `bw_last_charge_at_ns` to avoid double-charging.
         {
             let now_ns = s.sim.cpus[cpu.0 as usize].local_clock;
+            let to_charge = match s.sim.charge_granularity {
+                crate::scenario::ChargeGranularity::Stop => time_consumed,
+                crate::scenario::ChargeGranularity::Tick => {
+                    let last = s.sim.cpus[cpu.0 as usize].bw_last_charge_at_ns;
+                    now_ns.saturating_sub(last)
+                }
+            };
             let mut f = s.fields();
-            charge_cgroup_bw(&mut f, pid, time_consumed, now_ns, cpu);
+            charge_cgroup_bw(&mut f, pid, to_charge, now_ns, cpu);
+            // Reset for the NEXT task that runs on this CPU.
+            s.sim.cpus[cpu.0 as usize].bw_last_charge_at_ns = now_ns;
         }
 
         set_ops_context(&mut s.sim, OpsContext::Stopping);
@@ -4060,10 +4096,22 @@ impl<S: Scheduler> Simulator<S> {
         // Charge consumed CPU time against this task's cgroup cpu.max quota
         // (Diff 3 wiring). Done BEFORE the scheduler's stopping() callback so
         // any LAVD-side accounting (Diff 4) sees a coherent post-charge view.
+        //
+        // EXPERIMENTAL (Stream C followup): in Tick granularity mode,
+        // per-tick charging has already accounted for time up to the last
+        // tick boundary; charge only the residual.
         {
             let now_ns = s.sim.cpus[cpu_idx].local_clock;
+            let to_charge = match s.sim.charge_granularity {
+                crate::scenario::ChargeGranularity::Stop => consumed,
+                crate::scenario::ChargeGranularity::Tick => {
+                    let last = s.sim.cpus[cpu_idx].bw_last_charge_at_ns;
+                    now_ns.saturating_sub(last)
+                }
+            };
             let mut f = s.fields();
-            charge_cgroup_bw(&mut f, pid, consumed, now_ns, cpu);
+            charge_cgroup_bw(&mut f, pid, to_charge, now_ns, cpu);
+            s.sim.cpus[cpu_idx].bw_last_charge_at_ns = now_ns;
         }
 
         // stopping()
@@ -4290,6 +4338,12 @@ impl<S: Scheduler> Simulator<S> {
         // Track when task started for mid-slice preemption accounting
         s.sim.cpus[cpu.0 as usize].task_started_at = Some(local_t);
         s.sim.cpus[cpu.0 as usize].task_original_slice = Some(slice);
+        // EXPERIMENTAL (Stream C followup): seed the per-tick charge
+        // anchor at the task's start time. The first tick after start
+        // will charge `local_clock - local_t` (≈ TICK_INTERVAL_NS) to
+        // the cgroup. Cheap to update unconditionally; only consulted
+        // when ChargeGranularity::Tick is active.
+        s.sim.cpus[cpu.0 as usize].bw_last_charge_at_ns = local_t;
 
         info!(
             task = task.name.as_str(),

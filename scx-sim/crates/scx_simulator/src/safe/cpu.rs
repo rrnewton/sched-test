@@ -71,6 +71,18 @@ pub struct SimCpu {
     /// migration penalty: cross-LLC migrations incur higher cache/TLB
     /// warming costs than intra-LLC migrations. Default: 0 (single domain).
     pub llc_id: u32,
+    /// **EXPERIMENTAL** Local clock at which we last charged this CPU's
+    /// running task against its cgroup `cpu.max` quota.
+    ///
+    /// Used by `ChargeGranularity::Tick` to compute the per-tick delta:
+    /// at each Tick event, charge `local_clock - bw_last_charge_at_ns`,
+    /// then update this field. At task-stop, charge the residual
+    /// (`local_clock - bw_last_charge_at_ns`) since the last tick.
+    ///
+    /// Reset to the task's start time when a task starts running on
+    /// this CPU. Unused when `ChargeGranularity::Stop` (the default).
+    /// Branch experiment: `agent/charge-granularity-experiment`.
+    pub bw_last_charge_at_ns: TimeNs,
 }
 
 impl SimCpu {
@@ -90,6 +102,7 @@ impl SimCpu {
             irq_stolen_ns: 0,
             irq_cumulative_ns: 0,
             llc_id: 0,
+            bw_last_charge_at_ns: 0,
         }
     }
 

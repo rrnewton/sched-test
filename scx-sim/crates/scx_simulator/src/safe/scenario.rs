@@ -604,6 +604,33 @@ pub fn sched_overhead_rbc_ns_from_env() -> Option<u64> {
 /// Default watchdog timeout: 30 seconds (matches kernel SCX_WATCHDOG_MAX_TIMEOUT).
 pub const DEFAULT_WATCHDOG_TIMEOUT_NS: TimeNs = 30_000_000_000;
 
+/// Granularity of cgroup `cpu.max` quota charging.
+///
+/// **EXPERIMENTAL** — Stream C followup, branch
+/// `agent/charge-granularity-experiment`. NOT yet promoted to default.
+///
+/// Production CFS calls `update_curr` on every `scheduler_tick` (HZ=250
+/// → every 4 ms) and increments `cfs_rq->runtime_remaining` in small
+/// per-tick chunks. scxsim's default behavior charges only at task-stop
+/// / phase-complete, which causes oversubscribed cgroups to overshoot
+/// their quota by up to one full slice (~28 ms vs a 10 ms quota in the
+/// canonical Bug-1 fixture, a 3× overshoot).
+///
+/// This enum lets the engine choose between the two granularities so we
+/// can compare stall behavior under each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChargeGranularity {
+    /// Charge at task-stop / phase-complete only (current default).
+    /// Faster, fewer trace events, but allows quota overshoot up to
+    /// one task-slice.
+    #[default]
+    Stop,
+    /// Charge incrementally at every Tick event (HZ=250) AND at stop
+    /// for the residual since the last tick. Models production CFS's
+    /// per-tick `update_curr` accounting.
+    Tick,
+}
+
 /// A complete simulation scenario: CPUs, tasks, and duration.
 #[derive(Debug, Clone)]
 pub struct Scenario {
@@ -711,6 +738,11 @@ pub struct Scenario {
     /// This allows scheduler internal state (EWMA, vruntime, etc.) to converge
     /// before measurement begins.
     pub warmup_ns: TimeNs,
+    /// **EXPERIMENTAL** Granularity of cgroup `cpu.max` quota charging.
+    /// Default: [`ChargeGranularity::Stop`] (current behavior). See the
+    /// enum docstring and the Stream C followup investigation
+    /// (`agent/charge-granularity-experiment` branch).
+    pub charge_granularity: ChargeGranularity,
 }
 
 /// Builder for constructing scenarios.
@@ -746,6 +778,7 @@ pub struct ScenarioBuilder {
     native_concurrent: Option<NativeConcurrentConfig>,
     wait_debugger: bool,
     warmup_ns: TimeNs,
+    charge_granularity: ChargeGranularity,
 }
 
 impl Scenario {
@@ -780,6 +813,7 @@ impl Scenario {
             native_concurrent: None,
             wait_debugger: false,
             warmup_ns: 0,
+            charge_granularity: ChargeGranularity::default(),
         }
     }
 }
@@ -892,6 +926,13 @@ impl ScenarioBuilder {
     /// Set the warmup period in milliseconds.
     pub fn warmup_ms(mut self, ms: u64) -> Self {
         self.warmup_ns = ms * 1_000_000;
+        self
+    }
+
+    /// **EXPERIMENTAL** Set the cgroup `cpu.max` charge granularity.
+    /// See [`ChargeGranularity`] docs.
+    pub fn charge_granularity(mut self, g: ChargeGranularity) -> Self {
+        self.charge_granularity = g;
         self
     }
 
@@ -1355,6 +1396,7 @@ impl ScenarioBuilder {
             native_concurrent: self.native_concurrent,
             wait_debugger: self.wait_debugger,
             warmup_ns: self.warmup_ns,
+            charge_granularity: self.charge_granularity,
         }
     }
 }

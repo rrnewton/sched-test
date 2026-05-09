@@ -857,6 +857,7 @@ pub fn load_rtapp(json_str: &str, nr_cpus: u32) -> Result<Scenario, RtAppError> 
         native_concurrent: None,
         wait_debugger: false,
         warmup_ns: 0,
+        charge_granularity: crate::scenario::ChargeGranularity::Stop,
     })
 }
 
