@@ -9,7 +9,7 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
 use rand::rngs::SmallRng;
-use rand::{RngCore, SeedableRng};
+use rand::{Rng, RngCore, SeedableRng};
 use tracing::{debug, info, trace, warn};
 
 use crate::backend::e9patch::E9PatchReplayBackend;
@@ -509,6 +509,14 @@ impl EventQueue {
         self.heap.push(Reverse(Event { time_ns, seq, kind }));
     }
 
+    fn local_dsq_resolution_delay(&mut self, min_delay_ns: TimeNs, max_delay_ns: TimeNs) -> TimeNs {
+        if min_delay_ns == max_delay_ns {
+            min_delay_ns
+        } else {
+            self.event_rng.gen_range(min_delay_ns..=max_delay_ns)
+        }
+    }
+
     /// Pop the next event (earliest timestamp, then lowest tiebreaker).
     pub(crate) fn pop(&mut self) -> Option<Event> {
         self.heap.pop().map(|Reverse(e)| e)
@@ -529,6 +537,12 @@ impl EventQueue {
 pub(crate) struct WakerInfo {
     pub(crate) pid: Pid,
     pub(crate) cpu: CpuId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingDispatchResult {
+    consumed: bool,
+    target_cpu: Option<CpuId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -635,6 +649,13 @@ pub(crate) enum EventKind {
     /// transfer and dequeue overhead that is instantaneous in the
     /// sequential post-processing path.
     DsqConsume { cpu: CpuId },
+    /// Resolve a previously deferred `SCX_DSQ_LOCAL` or `SCX_DSQ_LOCAL_ON`
+    /// pending dispatch.
+    ResolveLocalDsqDispatch {
+        dispatch_id: u64,
+        local_cpu: CpuId,
+        cpu: CpuId,
+    },
     /// Per-CPU event: run the picked task (ops.running + start execution).
     ///
     /// Scheduled after a task is picked from the local DSQ (either from
@@ -1263,6 +1284,45 @@ impl<S: Scheduler> Simulator<S> {
         state.resolve_pending_dispatch(cpu);
     }
 
+    fn handle_pending_dispatch(&self, local_cpu: CpuId, s: &mut SimState) -> PendingDispatchResult {
+        let Some(pd) = s.sim.pending_dispatch.as_ref() else {
+            return PendingDispatchResult {
+                consumed: false,
+                target_cpu: None,
+            };
+        };
+        let is_local = pd.dsq_id.is_local() || pd.dsq_id.is_local_on();
+
+        if s.local_dsq_dispatch.defer_resolution && is_local {
+            let dispatch_id = s
+                .sim
+                .defer_pending_local_dispatch()
+                .expect("local pending dispatch should defer");
+            let delay = s.events.local_dsq_resolution_delay(
+                s.local_dsq_dispatch.min_delay_ns,
+                s.local_dsq_dispatch.max_delay_ns,
+            );
+            let fire_at = s.sim.clock.saturating_add(delay);
+            s.events.push(
+                fire_at,
+                EventKind::ResolveLocalDsqDispatch {
+                    dispatch_id,
+                    local_cpu,
+                    cpu: local_cpu,
+                },
+            );
+            PendingDispatchResult {
+                consumed: true,
+                target_cpu: None,
+            }
+        } else {
+            PendingDispatchResult {
+                consumed: is_local,
+                target_cpu: s.sim.resolve_pending_dispatch(local_cpu),
+            }
+        }
+    }
+
     /// Run a scenario and return the trace.
     pub fn run(&self, scenario: Scenario) -> Trace {
         let result = self.run_internal(scenario, &mut NoopMonitor);
@@ -1417,6 +1477,8 @@ impl<S: Scheduler> Simulator<S> {
             rng: SmallRng::seed_from_u64(scenario.seed as u64),
             ops_context: OpsContext::None,
             pending_dispatch: None,
+            pending_local_dispatches: BTreeMap::new(),
+            next_dispatch_id: 0,
             dsq_iter: None,
             staged_events: Vec::new(),
             task_last_cpu: initial_task_cpus.clone(),
@@ -1555,6 +1617,7 @@ impl<S: Scheduler> Simulator<S> {
             cgroup_registry,
             bw_manager: crate::cgroup_bw::BandwidthManager::new(),
             task_to_cgid: HashMap::new(),
+            local_dsq_dispatch: scenario.local_dsq_dispatch,
         }));
         // Install the Arc in ENGINE_SIM_ARC so enter_sim can propagate it
         // to SIM_ARC for kfuncs and cgroup callbacks.
@@ -2163,6 +2226,7 @@ impl<S: Scheduler> Simulator<S> {
             | EventKind::IrqEnd { cpu }
             | EventKind::TaskWake { cpu, .. }
             | EventKind::DsqConsume { cpu }
+            | EventKind::ResolveLocalDsqDispatch { cpu, .. }
             | EventKind::StartRunning { cpu, .. }
             | EventKind::KickDelivered { cpu, .. }
             | EventKind::TimerFired { cpu }
@@ -2282,6 +2346,21 @@ impl<S: Scheduler> Simulator<S> {
             EventKind::DsqConsume { cpu } => {
                 drop(guard);
                 self.handle_dsq_consume(cpu, sim_arc, monitor);
+                guard = sim_arc.lock().unwrap();
+            }
+            EventKind::ResolveLocalDsqDispatch {
+                dispatch_id,
+                local_cpu,
+                cpu,
+            } => {
+                drop(guard);
+                self.handle_resolve_local_dsq_dispatch(
+                    dispatch_id,
+                    local_cpu,
+                    cpu,
+                    sim_arc,
+                    monitor,
+                );
                 guard = sim_arc.lock().unwrap();
             }
             EventKind::StartRunning { cpu, pid } => {
@@ -2481,7 +2560,7 @@ impl<S: Scheduler> Simulator<S> {
                     self.scheduler.enqueue(TaskPtr::new(raw), 0);
                 });
                 let s = &mut *guard;
-                s.sim.resolve_pending_dispatch(cpu);
+                self.handle_pending_dispatch(cpu, s);
             }
         }
 
@@ -2756,7 +2835,7 @@ impl<S: Scheduler> Simulator<S> {
         let s = &mut *guard;
         charge_sched_time(&mut s.sim, cpu, "enqueue");
         maybe_record_checkpoint(&s.sim, CheckpointEvent::Enqueue, cpu);
-        s.sim.resolve_pending_dispatch(cpu);
+        self.handle_pending_dispatch(cpu, s);
     }
 
     /// Handle runtime cgroup creation.
@@ -3175,7 +3254,7 @@ impl<S: Scheduler> Simulator<S> {
 
         // Resolve deferred dispatch: SCX_DSQ_LOCAL -> selected_cpu
         // (kernel semantics: LOCAL resolves to the CPU select_cpu returned)
-        let direct_dispatched = s.sim.resolve_pending_dispatch(selected_cpu);
+        let direct_dispatch = self.handle_pending_dispatch(selected_cpu, s);
 
         s.sim.trace.record(
             s.sim.clock,
@@ -3190,13 +3269,16 @@ impl<S: Scheduler> Simulator<S> {
         let task = s.tasks.get_mut(&pid).unwrap();
         task.prev_cpu = selected_cpu;
 
-        if let Some(dd_cpu) = direct_dispatched {
-            // Task was directly dispatched — skip enqueue (kernel semantics)
-            s.sim.current_cpu = dd_cpu;
-            kfuncs::set_sim_clock(s.sim.cpus[dd_cpu.0 as usize].local_clock, Some(dd_cpu));
-            debug!(pid = pid.0, target_cpu = dd_cpu.0, "direct dispatch");
-            drop(guard);
-            self.try_dispatch_and_run(dd_cpu, sim_arc, monitor);
+        if direct_dispatch.consumed {
+            // Task was directly dispatched or deferred for kernel-side local
+            // DSQ resolution — skip enqueue (kernel semantics).
+            if let Some(dd_cpu) = direct_dispatch.target_cpu {
+                s.sim.current_cpu = dd_cpu;
+                kfuncs::set_sim_clock(s.sim.cpus[dd_cpu.0 as usize].local_clock, Some(dd_cpu));
+                debug!(pid = pid.0, target_cpu = dd_cpu.0, "direct dispatch");
+                drop(guard);
+                self.try_dispatch_and_run(dd_cpu, sim_arc, monitor);
+            }
         } else {
             // Task was not directly dispatched; call enqueue
             debug!(pid = pid.0, enq_flags, "enter:structop enqueue");
@@ -3204,7 +3286,7 @@ impl<S: Scheduler> Simulator<S> {
                 self.scheduler.enqueue(TaskPtr::new(raw), enq_flags);
             });
             let s = &mut *guard;
-            s.sim.resolve_pending_dispatch(selected_cpu);
+            self.handle_pending_dispatch(selected_cpu, s);
 
             s.sim.trace.record(
                 s.sim.clock,
@@ -3510,7 +3592,7 @@ impl<S: Scheduler> Simulator<S> {
                         self.scheduler.enqueue(TaskPtr::new(raw), 0);
                     });
                     let s = &mut *guard;
-                    s.sim.resolve_pending_dispatch(cpu);
+                    self.handle_pending_dispatch(cpu, s);
 
                     let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
                     s.sim.trace.record(
@@ -3582,7 +3664,7 @@ impl<S: Scheduler> Simulator<S> {
                                         self.scheduler.enqueue(TaskPtr::new(raw), 0);
                                     });
                                     let s = &mut *guard;
-                                    s.sim.resolve_pending_dispatch(cpu);
+                                    self.handle_pending_dispatch(cpu, s);
                                     let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
                                     s.sim.trace.record(
                                         __local_t,
@@ -3699,7 +3781,7 @@ impl<S: Scheduler> Simulator<S> {
             maybe_record_checkpoint(&s.sim, CheckpointEvent::Dispatch, cpu);
             // Flush any deferred dispatch from dispatch() callback
             // (SCX_DSQ_LOCAL resolves to the dispatching CPU)
-            s.sim.resolve_pending_dispatch(cpu);
+            self.handle_pending_dispatch(cpu, s);
 
             let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
             s.sim
@@ -3898,6 +3980,44 @@ impl<S: Scheduler> Simulator<S> {
             kfuncs::set_sim_clock(local_t, Some(cpu));
             s.sim.trace.record(local_t, cpu, TraceKind::CpuIdle);
             info!(cpu = cpu.0, "IDLE (dsq_consume)");
+        }
+    }
+
+    /// Handle a deferred kernel-side local-DSQ dispatch resolution.
+    fn handle_resolve_local_dsq_dispatch(
+        &self,
+        dispatch_id: u64,
+        local_cpu: CpuId,
+        cpu: CpuId,
+        sim_arc: &SimArc,
+        monitor: &mut dyn Monitor,
+    ) {
+        let mut guard = sim_arc.lock().unwrap();
+        let s = &mut *guard;
+        let target_cpu = s
+            .sim
+            .resolve_deferred_local_dispatch(dispatch_id, local_cpu);
+        if let Some(target_cpu) = target_cpu {
+            s.sim.current_cpu = target_cpu;
+            kfuncs::set_sim_clock(
+                s.sim.cpus[target_cpu.0 as usize].local_clock,
+                Some(target_cpu),
+            );
+            debug!(
+                dispatch_id,
+                local_cpu = local_cpu.0,
+                target_cpu = target_cpu.0,
+                "resolved deferred local DSQ dispatch"
+            );
+            drop(guard);
+            self.try_dispatch_and_run(target_cpu, sim_arc, monitor);
+        } else {
+            debug!(
+                dispatch_id,
+                local_cpu = local_cpu.0,
+                cpu = cpu.0,
+                "deferred local DSQ dispatch resolved without runnable target"
+            );
         }
     }
 
@@ -4161,7 +4281,7 @@ impl<S: Scheduler> Simulator<S> {
         let s = &mut *guard;
 
         // Resolve deferred dispatch from enqueue callback
-        s.sim.resolve_pending_dispatch(cpu);
+        self.handle_pending_dispatch(cpu, s);
 
         // Caller-specific traces after enqueue
         post_enqueue(&mut s.sim, cpu, pid);
@@ -4645,6 +4765,107 @@ mod tests {
                     TraceKind::MigrationDisabledSet {
                         pid: Pid(1),
                         value: 2
+                    }
+                )
+        }));
+    }
+
+    fn migration_disabled_deferred_dispatch_scenario(defer: bool) -> Scenario {
+        let builder = Scenario::builder()
+            .cpus(2)
+            .instant_timing()
+            .fixed_priority(true)
+            .detect_bpf_errors()
+            .task(crate::task::TaskDef {
+                name: "hog".into(),
+                pid: Pid(1),
+                nice: 0,
+                behavior: crate::task::TaskBehavior {
+                    phases: vec![Phase::Run(10_000_000)],
+                    repeat: crate::task::RepeatMode::Forever,
+                },
+                start_time_ns: 0,
+                mm_id: None,
+                allowed_cpus: Some(vec![CpuId(0)]),
+                parent_pid: None,
+                cgroup_name: None,
+                task_flags: 0,
+                migration_disabled: 0,
+            })
+            .task(crate::task::TaskDef {
+                name: "victim".into(),
+                pid: Pid(2),
+                nice: 0,
+                behavior: crate::task::TaskBehavior {
+                    phases: vec![Phase::Run(1_000_000)],
+                    repeat: crate::task::RepeatMode::Once,
+                },
+                start_time_ns: 1_000_000,
+                mm_id: None,
+                allowed_cpus: None,
+                parent_pid: None,
+                cgroup_name: None,
+                task_flags: 0,
+                migration_disabled: 0,
+            })
+            .migration_disabled_window(Pid(2), 1_000_001, 1_000, 2)
+            .duration_ms(5);
+
+        if defer {
+            builder.deferred_local_dsq_resolution(100, 100).build()
+        } else {
+            builder.build()
+        }
+    }
+
+    #[test]
+    fn deferred_local_dsq_resolution_off_keeps_sync_behavior() {
+        let _lock = crate::SIM_LOCK.lock().unwrap();
+        let scenario = migration_disabled_deferred_dispatch_scenario(false);
+        let trace = Simulator::new(crate::ffi::DynamicScheduler::simple()).run(scenario);
+
+        assert_eq!(trace.exit_kind(), &ExitKind::Normal);
+        assert!(!trace.events().iter().any(|event| {
+            matches!(
+                event.kind,
+                TraceKind::DispatchRejected {
+                    reason: crate::trace::DispatchRejectReason::MigrationDisabled,
+                    ..
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn deferred_local_dsq_resolution_opens_migration_disabled_window() {
+        let _lock = crate::SIM_LOCK.lock().unwrap();
+        let scenario = migration_disabled_deferred_dispatch_scenario(true);
+        let trace = Simulator::new(crate::ffi::DynamicScheduler::simple()).run(scenario);
+
+        match trace.exit_kind() {
+            ExitKind::ErrorBpf(msg) => {
+                assert!(
+                    msg.contains("SCX_DSQ_LOCAL cannot move migration disabled"),
+                    "unexpected ErrorBpf message: {msg}"
+                );
+                assert!(
+                    msg.contains("from CPU 0 to 1"),
+                    "unexpected ErrorBpf message: {msg}"
+                );
+            }
+            other => panic!("expected ErrorBpf, got {other:?}"),
+        }
+
+        assert!(trace.events().iter().any(|event| {
+            event.time_ns == 1_000_100
+                && matches!(
+                    event.kind,
+                    TraceKind::DispatchRejected {
+                        kind: crate::trace::LocalDsqKind::Local,
+                        pid: Pid(2),
+                        from_cpu: CpuId(0),
+                        target_cpu: CpuId(1),
+                        reason: crate::trace::DispatchRejectReason::MigrationDisabled,
                     }
                 )
         }));

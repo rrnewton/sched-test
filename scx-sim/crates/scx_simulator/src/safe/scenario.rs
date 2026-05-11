@@ -106,6 +106,19 @@ pub struct MigrationDisabledEvent {
     pub value: u16,
 }
 
+/// Configuration for deferring kernel-side local-DSQ dispatch resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LocalDsqDispatchConfig {
+    /// Whether `SCX_DSQ_LOCAL` and `SCX_DSQ_LOCAL_ON` pending dispatches are
+    /// resolved by a later engine event instead of immediately after the BPF
+    /// callback returns.
+    pub defer_resolution: bool,
+    /// Minimum delay before local-DSQ resolution.
+    pub min_delay_ns: TimeNs,
+    /// Maximum delay before local-DSQ resolution.
+    pub max_delay_ns: TimeNs,
+}
+
 /// Type of interrupt to simulate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IrqType {
@@ -670,6 +683,8 @@ pub struct Scenario {
     pub cgroup_cpuset_change_events: Vec<CgroupCpusetChangeEvent>,
     /// Task migration-disabled counter changes at runtime.
     pub migration_disabled_events: Vec<MigrationDisabledEvent>,
+    /// Local-DSQ dispatch resolution behavior.
+    pub local_dsq_dispatch: LocalDsqDispatchConfig,
     /// Enable concurrent callback interleaving at kfunc yield points.
     ///
     /// When true, dispatch callbacks for multiple idle CPUs run on
@@ -754,6 +769,7 @@ pub struct ScenarioBuilder {
     cgroup_destroy_events: Vec<CgroupDestroyEvent>,
     cgroup_cpuset_change_events: Vec<CgroupCpusetChangeEvent>,
     migration_disabled_events: Vec<MigrationDisabledEvent>,
+    local_dsq_dispatch: LocalDsqDispatchConfig,
     interleave: bool,
     preemptive: Option<PreemptiveConfig>,
     replay_trace: Option<crate::preempt::trace::PreemptionTrace>,
@@ -789,6 +805,7 @@ impl Scenario {
             cgroup_destroy_events: Vec::new(),
             cgroup_cpuset_change_events: Vec::new(),
             migration_disabled_events: Vec::new(),
+            local_dsq_dispatch: LocalDsqDispatchConfig::default(),
             interleave: false,
             preemptive: None,
             replay_trace: None,
@@ -1205,6 +1222,29 @@ impl ScenarioBuilder {
             .migration_disabled_set(pid, start_ns.saturating_add(duration_ns), 0)
     }
 
+    /// Defer local-DSQ resolution by a deterministic delay range.
+    ///
+    /// `SCX_DSQ_LOCAL` and `SCX_DSQ_LOCAL_ON` inserts are resolved by a later
+    /// engine event after a delay uniformly chosen from
+    /// `[min_delay_ns, max_delay_ns]`. If the two values are equal, the delay
+    /// is fixed. Non-local DSQs keep the existing immediate path.
+    pub fn deferred_local_dsq_resolution(
+        mut self,
+        min_delay_ns: TimeNs,
+        max_delay_ns: TimeNs,
+    ) -> Self {
+        assert!(
+            max_delay_ns >= min_delay_ns,
+            "max_delay_ns must be >= min_delay_ns"
+        );
+        self.local_dsq_dispatch = LocalDsqDispatchConfig {
+            defer_resolution: true,
+            min_delay_ns,
+            max_delay_ns,
+        };
+        self
+    }
+
     /// Enable concurrent callback interleaving at kfunc yield points.
     pub fn interleave(mut self, enabled: bool) -> Self {
         self.interleave = enabled;
@@ -1387,6 +1427,7 @@ impl ScenarioBuilder {
             cgroup_destroy_events: self.cgroup_destroy_events,
             cgroup_cpuset_change_events: self.cgroup_cpuset_change_events,
             migration_disabled_events: self.migration_disabled_events,
+            local_dsq_dispatch: self.local_dsq_dispatch,
             interleave: self.interleave,
             preemptive: self.preemptive,
             replay_trace: self.replay_trace,
@@ -1503,6 +1544,30 @@ mod tests {
                     value: 0,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn test_deferred_local_dsq_resolution_builder() {
+        let scenario = Scenario::builder()
+            .add_task(
+                "worker",
+                0,
+                TaskBehavior {
+                    phases: vec![crate::task::Phase::Run(1_000)],
+                    repeat: crate::task::RepeatMode::Once,
+                },
+            )
+            .deferred_local_dsq_resolution(10, 20)
+            .build();
+
+        assert_eq!(
+            scenario.local_dsq_dispatch,
+            LocalDsqDispatchConfig {
+                defer_resolution: true,
+                min_delay_ns: 10,
+                max_delay_ns: 20,
+            }
         );
     }
 }

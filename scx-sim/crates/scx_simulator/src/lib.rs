@@ -103,8 +103,9 @@ pub use safe::perf::RbcCounter;
 pub use safe::rtapp::load_rtapp;
 pub use safe::scenario::{
     CgroupBandwidth, CgroupCpusetChangeEvent, CgroupCreateEvent, CgroupDef, CgroupDestroyEvent,
-    CgroupMigrateEvent, CpuPreemptEvent, HotplugEvent, IrqEvent, IrqType, MigrationDisabledEvent,
-    NativeConcurrentConfig, NoiseConfig, OverheadConfig, PreemptMode, PreemptiveConfig, Scenario,
+    CgroupMigrateEvent, CpuPreemptEvent, HotplugEvent, IrqEvent, IrqType, LocalDsqDispatchConfig,
+    MigrationDisabledEvent, NativeConcurrentConfig, NoiseConfig, OverheadConfig, PreemptMode,
+    PreemptiveConfig, Scenario,
 };
 pub use safe::stats::{
     percentile, CpuStats, DistributionStats, TaskStats, TraceComparison, TraceStats,

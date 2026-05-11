@@ -44,7 +44,9 @@ use crate::engine::EventQueue;
 use crate::ffi;
 use crate::fmt::FmtN;
 use crate::perf::RbcCounter;
-use crate::scenario::{NativeConcurrentConfig, NoiseConfig, OverheadConfig, PreemptiveConfig};
+use crate::scenario::{
+    LocalDsqDispatchConfig, NativeConcurrentConfig, NoiseConfig, OverheadConfig, PreemptiveConfig,
+};
 use crate::sim_task::SimTask;
 use crate::task::OpsTaskState;
 use crate::trace::{
@@ -268,6 +270,11 @@ pub struct SimulatorState {
     /// Deferred dispatch recorded during `select_cpu` or `enqueue`.
     /// The engine resolves `SCX_DSQ_LOCAL` and executes after the callback.
     pub pending_dispatch: Option<PendingDispatch>,
+    /// Deferred local-DSQ dispatches waiting for a future kernel-side
+    /// resolution event.
+    pub pending_local_dispatches: BTreeMap<u64, PendingDispatch>,
+    /// Monotonic dispatch identifier for entries in pending_local_dispatches.
+    pub next_dispatch_id: u64,
     /// PER-CPU: DSQ iterator state is per-callback, used only by the
     /// worker that started the iteration.
     ///
@@ -487,6 +494,8 @@ pub(crate) struct SimState {
     /// Tasks not present in this map belong to the root cgroup and are
     /// not charged against any tracked bandwidth state.
     pub task_to_cgid: HashMap<Pid, CgroupId>,
+    /// Local-DSQ resolution timing configuration.
+    pub local_dsq_dispatch: LocalDsqDispatchConfig,
 }
 
 /// Split-borrowed references to all SimState fields.
@@ -510,6 +519,7 @@ pub(crate) struct SimFields<'a> {
     pub cgroup_registry: &'a mut CgroupRegistry,
     pub bw_manager: &'a mut BandwidthManager,
     pub task_to_cgid: &'a mut HashMap<Pid, CgroupId>,
+    pub local_dsq_dispatch: &'a mut LocalDsqDispatchConfig,
 }
 
 impl SimState {
@@ -523,6 +533,7 @@ impl SimState {
             cgroup_registry: &mut self.cgroup_registry,
             bw_manager: &mut self.bw_manager,
             task_to_cgid: &mut self.task_to_cgid,
+            local_dsq_dispatch: &mut self.local_dsq_dispatch,
         }
     }
 }
@@ -833,7 +844,37 @@ impl SimulatorState {
     /// should try to run on that CPU), or None.
     pub fn resolve_pending_dispatch(&mut self, local_cpu: CpuId) -> Option<CpuId> {
         let pd = self.pending_dispatch.take()?;
+        self.resolve_dispatch(pd, local_cpu)
+    }
 
+    /// Move a pending local-DSQ dispatch into the deferred map.
+    ///
+    /// Returns the new dispatch ID if a local/local_on dispatch was deferred,
+    /// or `None` if the pending dispatch should stay on the immediate path.
+    pub fn defer_pending_local_dispatch(&mut self) -> Option<u64> {
+        let pd = self.pending_dispatch.take()?;
+        if !(pd.dsq_id.is_local() || pd.dsq_id.is_local_on()) {
+            self.pending_dispatch = Some(pd);
+            return None;
+        }
+
+        let dispatch_id = self.next_dispatch_id;
+        self.next_dispatch_id = self.next_dispatch_id.wrapping_add(1);
+        self.pending_local_dispatches.insert(dispatch_id, pd);
+        Some(dispatch_id)
+    }
+
+    /// Resolve a previously deferred local-DSQ dispatch.
+    pub fn resolve_deferred_local_dispatch(
+        &mut self,
+        dispatch_id: u64,
+        local_cpu: CpuId,
+    ) -> Option<CpuId> {
+        let pd = self.pending_local_dispatches.remove(&dispatch_id)?;
+        self.resolve_dispatch(pd, local_cpu)
+    }
+
+    fn resolve_dispatch(&mut self, pd: PendingDispatch, local_cpu: CpuId) -> Option<CpuId> {
         // Task has been dispatched — no longer in BPF scheduler's queue.
         self.set_task_ops_state(pd.pid, OpsTaskState::None);
 
@@ -2634,6 +2675,8 @@ mod tests {
             rng: SmallRng::seed_from_u64(0xDEAD_BEEF),
             ops_context: OpsContext::None,
             pending_dispatch: None,
+            pending_local_dispatches: BTreeMap::new(),
+            next_dispatch_id: 0,
             dsq_iter: None,
             staged_events: Vec::new(),
             reenqueue_local_requested: false,
@@ -2680,6 +2723,7 @@ mod tests {
             cgroup_registry: CgroupRegistry::new(nr_cpus, 100),
             bw_manager: BandwidthManager::new(),
             task_to_cgid: HashMap::new(),
+            local_dsq_dispatch: LocalDsqDispatchConfig::default(),
         }))
     }
 
