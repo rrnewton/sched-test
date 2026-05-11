@@ -322,7 +322,9 @@ pub(crate) fn write_json(trace: &Trace, writer: &mut impl Write) -> std::io::Res
             }
 
             TraceKind::DispatchRejected {
+                kind,
                 pid,
+                from_cpu,
                 target_cpu,
                 reason,
             } => {
@@ -339,7 +341,9 @@ pub(crate) fn write_json(trace: &Trace, writer: &mut impl Write) -> std::io::Res
                     "cat": "error",
                     "s": "t",
                     "args": {
+                        "kind": kind.label(),
                         "pid": pid.0,
+                        "from_cpu": from_cpu.0,
                         "target_cpu": target_cpu.0,
                         "reason": reason_str
                     }

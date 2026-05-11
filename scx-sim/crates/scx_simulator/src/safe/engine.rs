@@ -1395,6 +1395,12 @@ impl<S: Scheduler> Simulator<S> {
             None
         };
 
+        let initial_task_cpus: HashMap<Pid, CpuId> = scenario
+            .tasks
+            .iter()
+            .map(|task| (task.pid, task.initial_cpu()))
+            .collect();
+
         let mut state = SimulatorState {
             cpus,
             dsqs: DsqManager::new(),
@@ -1408,7 +1414,9 @@ impl<S: Scheduler> Simulator<S> {
             pending_dispatch: None,
             dsq_iter: None,
             staged_events: Vec::new(),
-            task_last_cpu: HashMap::new(),
+            task_last_cpu: initial_task_cpus.clone(),
+            task_selected_cpu: initial_task_cpus.clone(),
+            task_kernel_cpu: initial_task_cpus,
             task_ops_state: BTreeMap::new(),
             reenqueue_local_requested: false,
             pending_timer_ns: None,
@@ -3097,9 +3105,11 @@ impl<S: Scheduler> Simulator<S> {
         maybe_record_checkpoint(&s.sim, CheckpointEvent::SelectCpu, selected_cpu);
         s.sim.waker_task_raw = None;
         s.sim.current_cpu = selected_cpu;
-        // Update task_last_cpu after select_cpu (kernel sets task_cpu
-        // in set_task_cpu after select_task_rq, before enqueue).
+        // Update the scheduler-visible selected CPU after select_cpu, but
+        // keep task_kernel_cpu at the task's current CPU until it actually
+        // starts running. Local-DSQ remote-run validation uses task_kernel_cpu.
         s.sim.task_last_cpu.insert(pid, selected_cpu);
+        s.sim.task_selected_cpu.insert(pid, selected_cpu);
         kfuncs::set_sim_clock(
             s.sim.cpus[selected_cpu.0 as usize].local_clock,
             Some(selected_cpu),
@@ -4139,6 +4149,8 @@ impl<S: Scheduler> Simulator<S> {
         // Reset IRQ stolen time for this new run period.
         s.sim.cpus[cpu.0 as usize].irq_stolen_ns = 0;
         s.sim.task_last_cpu.insert(pid, cpu);
+        s.sim.task_selected_cpu.insert(pid, cpu);
+        s.sim.task_kernel_cpu.insert(pid, cpu);
         // Kernel clears SCX_TASK_QUEUED when a task is picked to run.
         s.sim.clear_task_queued(pid);
         // Clear idle bit in the C cpumask (in case scheduler didn't call

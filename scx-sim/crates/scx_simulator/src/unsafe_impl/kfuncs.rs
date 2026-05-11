@@ -47,7 +47,9 @@ use crate::perf::RbcCounter;
 use crate::scenario::{NativeConcurrentConfig, NoiseConfig, OverheadConfig, PreemptiveConfig};
 use crate::sim_task::SimTask;
 use crate::task::OpsTaskState;
-use crate::trace::{DispatchRejectReason, DsqSampleTrigger, Trace, TraceKind};
+use crate::trace::{
+    DispatchReject, DispatchRejectReason, DsqSampleTrigger, LocalDsqKind, Trace, TraceKind,
+};
 use crate::types::{CpuId, DsqId, KickFlags, Pid, TimeNs, Vtime};
 
 /// Nanosecond cost for each simulated kernel function.
@@ -276,12 +278,22 @@ pub struct SimulatorState {
     /// The engine flushes these to the event queue after each callback
     /// returns. This replaces direct kick processing for timed events.
     pub staged_events: Vec<(TimeNs, StagedEvent)>,
-    /// SHARED-MUTABLE: Updated when any task starts running on any CPU,
-    /// read by `scx_bpf_task_cpu`. Needs Mutex or per-task atomic.
+    /// SHARED-MUTABLE: Updated when select_cpu chooses a task's destination
+    /// and when any task starts running, read by `scx_bpf_task_cpu`. Needs
+    /// Mutex or per-task atomic.
     ///
-    /// Per-task last CPU (set when a task starts running).
-    /// Used by `scx_bpf_task_cpu` to return the correct value.
+    /// Per-task scheduler-visible CPU. This mirrors the CPU the kernel exposes
+    /// to BPF through task_cpu()/scx_bpf_task_cpu(), which can advance to a
+    /// selected destination before the task actually runs there.
     pub task_last_cpu: HashMap<Pid, CpuId>,
+    /// SHARED-MUTABLE: Updated when select_cpu chooses a destination. This is
+    /// retained separately from task_kernel_cpu for diagnostics and future
+    /// deferred-dispatch modeling.
+    pub task_selected_cpu: HashMap<Pid, CpuId>,
+    /// SHARED-MUTABLE: Updated only when a task actually starts running or the
+    /// kernel-current CPU is explicitly changed. This is the CPU used by the
+    /// local-DSQ remote-run invariant for migration-disabled tasks.
+    pub task_kernel_cpu: HashMap<Pid, CpuId>,
     /// SHARED-MUTABLE: Updated by enqueue/dispatch on any CPU, read by
     /// dequeue gating. Needs Mutex or per-task atomic state.
     ///
@@ -827,50 +839,22 @@ impl SimulatorState {
 
         let dsq = pd.dsq_id;
         if dsq.is_local() {
+            if let Err(reject) =
+                self.validate_local_dsq_dispatch(pd.pid, local_cpu, LocalDsqKind::Local)
+            {
+                self.reject_local_dsq_dispatch(reject);
+                return None;
+            }
             self.cpus[local_cpu.0 as usize].local_dsq.push_back(pd.pid);
             debug!(pid = pd.pid.0, "resolved SCX_DSQ_LOCAL");
             Some(local_cpu)
         } else if dsq.is_local_on() {
             let target_cpu = dsq.local_on_cpu();
 
-            // Validate that the task can run on the target CPU (kernel behavior).
-            // The kernel validates in task_can_run_on_remote_rq() and rejects
-            // dispatches to CPUs not in the task's cpumask.
-            if let Some(reason) = self.check_local_on_dispatch(pd.pid, target_cpu) {
-                // Record trace event for rejected dispatch
-                let cpu = self.current_cpu;
-                let local_t = self.cpus[cpu.0 as usize].local_clock;
-                self.trace.record(
-                    local_t,
-                    cpu,
-                    TraceKind::DispatchRejected {
-                        pid: pd.pid,
-                        target_cpu,
-                        reason,
-                    },
-                );
-
-                // Set BPF error (matches kernel's scx_bpf_error behavior)
-                let msg = match reason {
-                    DispatchRejectReason::CpumaskViolation => {
-                        format!(
-                            "SCX_DSQ_LOCAL_ON cannot dispatch task {} to CPU {} \
-                             (not in cpumask)",
-                            pd.pid.0, target_cpu.0
-                        )
-                    }
-                    DispatchRejectReason::MigrationDisabled => {
-                        format!(
-                            "SCX_DSQ_LOCAL_ON cannot move migration disabled {} \
-                             to CPU {}",
-                            pd.pid.0, target_cpu.0
-                        )
-                    }
-                };
-                debug!(pid = pd.pid.0, target_cpu = target_cpu.0, %msg, "dispatch rejected");
-                if self.bpf_error.is_none() {
-                    self.bpf_error = Some(msg);
-                }
+            if let Err(reject) =
+                self.validate_local_dsq_dispatch(pd.pid, target_cpu, LocalDsqKind::LocalOn)
+            {
+                self.reject_local_dsq_dispatch(reject);
                 return None;
             }
 
@@ -895,37 +879,105 @@ impl SimulatorState {
         }
     }
 
-    /// Check if a dispatch to `SCX_DSQ_LOCAL_ON | target_cpu` is valid.
+    /// Validate that a local-DSQ dispatch follows the kernel's
+    /// `task_can_run_on_remote_rq()` invariant.
     ///
-    /// Returns `Some(reason)` if the dispatch should be rejected, `None` if valid.
-    /// Mirrors the kernel's `task_can_run_on_remote_rq()` validation.
-    fn check_local_on_dispatch(&self, pid: Pid, target_cpu: CpuId) -> Option<DispatchRejectReason> {
-        // Get the task's raw pointer to access cpumask
-        let task_raw = self.task_pid_to_raw.get(&pid)?;
+    /// Migration-disabled is checked before cpumask to match the kernel error
+    /// priority for the DSQ-local crash class.
+    fn validate_local_dsq_dispatch(
+        &self,
+        pid: Pid,
+        target_cpu: CpuId,
+        kind: LocalDsqKind,
+    ) -> Result<(), DispatchReject> {
+        let from_cpu = self
+            .current_task_cpu_for_remote_check(pid)
+            .unwrap_or(CpuId(0));
+        let Some(task_raw) = self.task_pid_to_raw.get(&pid) else {
+            return Ok(());
+        };
         let task_ptr = *task_raw as *mut c_void;
+
+        let migration_disabled = unsafe { ffi::sim_task_get_migration_disabled(task_ptr) };
+        if migration_disabled > 0 && target_cpu != from_cpu {
+            return Err(DispatchReject {
+                kind,
+                pid,
+                from_cpu,
+                target_cpu,
+                reason: DispatchRejectReason::MigrationDisabled,
+            });
+        }
 
         // Check cpumask: task must be allowed to run on target CPU
         let cpus_ptr = unsafe { ffi::sim_task_get_cpus_ptr(task_ptr) };
         if !cpus_ptr.is_null() {
             let allowed = unsafe { ffi::bpf_cpumask_test_cpu(target_cpu.0, cpus_ptr) };
             if !allowed {
-                return Some(DispatchRejectReason::CpumaskViolation);
+                return Err(DispatchReject {
+                    kind,
+                    pid,
+                    from_cpu,
+                    target_cpu,
+                    reason: DispatchRejectReason::CpumaskViolation,
+                });
             }
         }
 
-        // Check migration_disabled: task with migration_disabled > 0 cannot be
-        // dispatched to a different CPU than its last known CPU.
-        let migration_disabled = unsafe { ffi::sim_task_get_migration_disabled(task_ptr) };
-        if migration_disabled > 0 {
-            // Migration-disabled task: must dispatch to its last known CPU.
-            if let Some(&last_cpu) = self.task_last_cpu.get(&pid) {
-                if target_cpu != last_cpu {
-                    return Some(DispatchRejectReason::MigrationDisabled);
-                }
-            }
-        }
+        Ok(())
+    }
 
-        None
+    fn current_task_cpu_for_remote_check(&self, pid: Pid) -> Option<CpuId> {
+        self.task_kernel_cpu
+            .get(&pid)
+            .copied()
+            .or_else(|| self.task_last_cpu.get(&pid).copied())
+    }
+
+    fn reject_local_dsq_dispatch(&mut self, reject: DispatchReject) {
+        let cpu = self.current_cpu;
+        let local_t = self.cpus[cpu.0 as usize].local_clock;
+        self.trace.record(
+            local_t,
+            cpu,
+            TraceKind::DispatchRejected {
+                kind: reject.kind,
+                pid: reject.pid,
+                from_cpu: reject.from_cpu,
+                target_cpu: reject.target_cpu,
+                reason: reject.reason,
+            },
+        );
+
+        let task_name = self.trace.task_name(reject.pid).to_string();
+        let msg = match reject.reason {
+            DispatchRejectReason::CpumaskViolation => format!(
+                "{} cannot dispatch {}[{}] from CPU {} to {} (not in cpumask)",
+                reject.kind.label(),
+                task_name,
+                reject.pid.0,
+                reject.from_cpu.0,
+                reject.target_cpu.0
+            ),
+            DispatchRejectReason::MigrationDisabled => format!(
+                "{} cannot move migration disabled {}[{}] from CPU {} to {}",
+                reject.kind.label(),
+                task_name,
+                reject.pid.0,
+                reject.from_cpu.0,
+                reject.target_cpu.0
+            ),
+        };
+        debug!(
+            pid = reject.pid.0,
+            from_cpu = reject.from_cpu.0,
+            target_cpu = reject.target_cpu.0,
+            %msg,
+            "dispatch rejected"
+        );
+        if self.bpf_error.is_none() {
+            self.bpf_error = Some(msg);
+        }
     }
 
     /// Compute a hash of scheduler-visible state for determinism checking.
@@ -2576,6 +2628,8 @@ mod tests {
             task_raw_to_pid: HashMap::new(),
             task_pid_to_raw: HashMap::new(),
             task_last_cpu: HashMap::new(),
+            task_selected_cpu: HashMap::new(),
+            task_kernel_cpu: HashMap::new(),
             task_ops_state: BTreeMap::new(),
             rng: SmallRng::seed_from_u64(0xDEAD_BEEF),
             ops_context: OpsContext::None,
@@ -2665,6 +2719,9 @@ mod tests {
         unsafe { ffi::sim_task_set_pid(raw, pid.0) };
         state.task_raw_to_pid.insert(raw as usize, pid);
         state.task_pid_to_raw.insert(pid, raw as usize);
+        state.task_last_cpu.insert(pid, CpuId(0));
+        state.task_selected_cpu.insert(pid, CpuId(0));
+        state.task_kernel_cpu.insert(pid, CpuId(0));
         raw
     }
 
@@ -2942,6 +2999,115 @@ mod tests {
         free_task(&mut arc.lock().unwrap().sim, Pid(1));
     }
 
+    /// Test SCX_DSQ_LOCAL dispatch to a different CPU for migration-disabled task fails.
+    #[test]
+    fn test_resolve_pending_dispatch_local_migration_disabled_violation() {
+        let _lock = SIM_LOCK.lock().unwrap();
+        let state = test_state(8);
+        let arc = test_sim_arc(state);
+
+        let p = register_task(&mut arc.lock().unwrap().sim, Pid(1));
+
+        // Task is still on CPU 2 from the kernel's point of view.
+        {
+            let mut guard = arc.lock().unwrap();
+            guard.sim.task_last_cpu.insert(Pid(1), CpuId(2));
+            guard.sim.task_selected_cpu.insert(Pid(1), CpuId(2));
+            guard.sim.task_kernel_cpu.insert(Pid(1), CpuId(2));
+        }
+
+        unsafe {
+            ffi::sim_task_set_migration_disabled(p, 2);
+        }
+
+        let cpu = arc.lock().unwrap().sim.current_cpu;
+        enter_test_sim(&arc, cpu);
+        scx_bpf_dsq_insert(p, DsqId::LOCAL.0, 5_000_000, 0);
+        exit_test_sim();
+
+        let mut guard = arc.lock().unwrap();
+        let result = guard.sim.resolve_pending_dispatch(CpuId(5));
+
+        assert_eq!(result, None);
+        assert!(guard.sim.cpus[5].local_dsq.is_empty());
+        assert!(guard.sim.bpf_error.is_some());
+        let error_msg = guard.sim.bpf_error.as_ref().unwrap();
+        assert!(
+            error_msg.contains("SCX_DSQ_LOCAL"),
+            "error should mention SCX_DSQ_LOCAL: {}",
+            error_msg
+        );
+        assert!(
+            error_msg.contains("migration disabled"),
+            "error should mention migration disabled: {}",
+            error_msg
+        );
+        assert!(
+            error_msg.contains("from CPU 2 to 5"),
+            "error should mention source and target CPUs: {}",
+            error_msg
+        );
+
+        let events = guard.sim.trace.events();
+        let dispatch_reject = events.iter().find(|e| {
+            matches!(
+                e.kind,
+                TraceKind::DispatchRejected {
+                    kind: LocalDsqKind::Local,
+                    pid,
+                    from_cpu: CpuId(2),
+                    target_cpu,
+                    reason: DispatchRejectReason::MigrationDisabled
+                } if pid == Pid(1) && target_cpu == CpuId(5)
+            )
+        });
+        assert!(
+            dispatch_reject.is_some(),
+            "DispatchRejected with MigrationDisabled reason should be recorded"
+        );
+
+        drop(guard);
+        free_task(&mut arc.lock().unwrap().sim, Pid(1));
+    }
+
+    /// Test SCX_DSQ_LOCAL dispatch to same CPU for migration-disabled task succeeds.
+    #[test]
+    fn test_resolve_pending_dispatch_local_migration_disabled_same_cpu_ok() {
+        let _lock = SIM_LOCK.lock().unwrap();
+        let state = test_state(8);
+        let arc = test_sim_arc(state);
+
+        let p = register_task(&mut arc.lock().unwrap().sim, Pid(1));
+
+        // Task is still on CPU 5 from the kernel's point of view.
+        {
+            let mut guard = arc.lock().unwrap();
+            guard.sim.task_last_cpu.insert(Pid(1), CpuId(5));
+            guard.sim.task_selected_cpu.insert(Pid(1), CpuId(5));
+            guard.sim.task_kernel_cpu.insert(Pid(1), CpuId(5));
+        }
+
+        unsafe {
+            ffi::sim_task_set_migration_disabled(p, 2);
+        }
+
+        let cpu = arc.lock().unwrap().sim.current_cpu;
+        enter_test_sim(&arc, cpu);
+        scx_bpf_dsq_insert(p, DsqId::LOCAL.0, 5_000_000, 0);
+        exit_test_sim();
+
+        let mut guard = arc.lock().unwrap();
+        let result = guard.sim.resolve_pending_dispatch(CpuId(5));
+
+        assert_eq!(result, Some(CpuId(5)));
+        assert_eq!(guard.sim.cpus[5].local_dsq.len(), 1);
+        assert_eq!(guard.sim.cpus[5].local_dsq[0], Pid(1));
+        assert!(guard.sim.bpf_error.is_none());
+
+        drop(guard);
+        free_task(&mut arc.lock().unwrap().sim, Pid(1));
+    }
+
     /// Test that SCX_DSQ_LOCAL_ON dispatch to valid CPU succeeds.
     #[test]
     fn test_resolve_pending_dispatch_local_on_valid() {
@@ -3023,7 +3189,9 @@ mod tests {
             matches!(
                 e.kind,
                 TraceKind::DispatchRejected {
+                    kind: LocalDsqKind::LocalOn,
                     pid,
+                    from_cpu: _,
                     target_cpu,
                     reason: DispatchRejectReason::CpumaskViolation
                 } if pid == Pid(1) && target_cpu == CpuId(3)
@@ -3095,12 +3263,13 @@ mod tests {
 
         let p = register_task(&mut arc.lock().unwrap().sim, Pid(1));
 
-        // Task was last running on CPU 8
-        arc.lock()
-            .unwrap()
-            .sim
-            .task_last_cpu
-            .insert(Pid(1), CpuId(8));
+        // Task is still on CPU 8 from the kernel's point of view.
+        {
+            let mut guard = arc.lock().unwrap();
+            guard.sim.task_last_cpu.insert(Pid(1), CpuId(8));
+            guard.sim.task_selected_cpu.insert(Pid(1), CpuId(8));
+            guard.sim.task_kernel_cpu.insert(Pid(1), CpuId(8));
+        }
 
         // Task has migration_disabled > 0 (like a kworker in BPF code)
         // In production, migration_disabled > 1 means pre-existing disable
@@ -3144,7 +3313,9 @@ mod tests {
             matches!(
                 e.kind,
                 TraceKind::DispatchRejected {
+                    kind: LocalDsqKind::LocalOn,
                     pid,
+                    from_cpu: CpuId(8),
                     target_cpu,
                     reason: DispatchRejectReason::MigrationDisabled
                 } if pid == Pid(1) && target_cpu == CpuId(31)
@@ -3171,12 +3342,13 @@ mod tests {
 
         let p = register_task(&mut arc.lock().unwrap().sim, Pid(1));
 
-        // Task was last running on CPU 8
-        arc.lock()
-            .unwrap()
-            .sim
-            .task_last_cpu
-            .insert(Pid(1), CpuId(8));
+        // Task is still on CPU 8 from the kernel's point of view.
+        {
+            let mut guard = arc.lock().unwrap();
+            guard.sim.task_last_cpu.insert(Pid(1), CpuId(8));
+            guard.sim.task_selected_cpu.insert(Pid(1), CpuId(8));
+            guard.sim.task_kernel_cpu.insert(Pid(1), CpuId(8));
+        }
 
         // Task has migration_disabled > 0
         unsafe {
@@ -3215,12 +3387,13 @@ mod tests {
 
         let p = register_task(&mut arc.lock().unwrap().sim, Pid(1));
 
-        // Task was last running on CPU 8
-        arc.lock()
-            .unwrap()
-            .sim
-            .task_last_cpu
-            .insert(Pid(1), CpuId(8));
+        // Task is still on CPU 8 from the kernel's point of view.
+        {
+            let mut guard = arc.lock().unwrap();
+            guard.sim.task_last_cpu.insert(Pid(1), CpuId(8));
+            guard.sim.task_selected_cpu.insert(Pid(1), CpuId(8));
+            guard.sim.task_kernel_cpu.insert(Pid(1), CpuId(8));
+        }
 
         // Task has migration_disabled = 0 (migration enabled)
         unsafe {

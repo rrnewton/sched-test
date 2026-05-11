@@ -152,12 +152,15 @@ pub enum TraceKind {
     KickCpu { target_cpu: CpuId },
     /// A periodic scheduler tick fired on this CPU.
     Tick { pid: Pid },
-    /// Dispatch to local DSQ rejected (cpumask violation).
+    /// Dispatch to local DSQ rejected.
     ///
-    /// Emitted when a scheduler dispatches to `SCX_DSQ_LOCAL_ON | cpu` but
-    /// the task cannot run on that CPU (cpumask or migration-disabled).
+    /// Emitted when a scheduler dispatches to `SCX_DSQ_LOCAL` or
+    /// `SCX_DSQ_LOCAL_ON | cpu` but the task cannot run on that CPU
+    /// (cpumask or migration-disabled).
     DispatchRejected {
+        kind: LocalDsqKind,
         pid: Pid,
+        from_cpu: CpuId,
         target_cpu: CpuId,
         reason: DispatchRejectReason,
     },
@@ -189,6 +192,24 @@ pub enum TraceKind {
     CgroupBwRefill { cgid: crate::cgroup::CgroupId },
 }
 
+/// Local DSQ form that produced a dispatch decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalDsqKind {
+    /// `SCX_DSQ_LOCAL`, resolved against the callback's local CPU.
+    Local,
+    /// `SCX_DSQ_LOCAL_ON | cpu`, resolved against an explicit CPU.
+    LocalOn,
+}
+
+impl LocalDsqKind {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            LocalDsqKind::Local => "SCX_DSQ_LOCAL",
+            LocalDsqKind::LocalOn => "SCX_DSQ_LOCAL_ON",
+        }
+    }
+}
+
 /// Reason why a dispatch to a local DSQ was rejected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DispatchRejectReason {
@@ -196,6 +217,16 @@ pub enum DispatchRejectReason {
     CpumaskViolation,
     /// Task is migration-disabled and cannot move to a different CPU.
     MigrationDisabled,
+}
+
+/// Full details of a rejected local-DSQ dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DispatchReject {
+    pub kind: LocalDsqKind,
+    pub pid: Pid,
+    pub from_cpu: CpuId,
+    pub target_cpu: CpuId,
+    pub reason: DispatchRejectReason,
 }
 
 /// A complete simulation trace, containing all events in chronological order.
@@ -710,7 +741,9 @@ impl Trace {
                 }
                 TraceKind::Tick { pid } => format!("TICK     pid={}", pid.0),
                 TraceKind::DispatchRejected {
+                    kind,
                     pid,
+                    from_cpu,
                     target_cpu,
                     reason,
                 } => {
@@ -719,8 +752,12 @@ impl Trace {
                         DispatchRejectReason::MigrationDisabled => "migration_disabled",
                     };
                     format!(
-                        "DISPATCH_REJECT pid={} target_cpu={} reason={}",
-                        pid.0, target_cpu.0, reason_str
+                        "DISPATCH_REJECT kind={} pid={} from_cpu={} target_cpu={} reason={}",
+                        kind.label(),
+                        pid.0,
+                        from_cpu.0,
+                        target_cpu.0,
+                        reason_str
                     )
                 }
                 TraceKind::IrqStart { cpu, irq_type } => {
