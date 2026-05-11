@@ -290,6 +290,24 @@ impl SimTaskHandle {
     }
 }
 
+/// Set `migration_disabled` on an engine-owned task pointer.
+///
+/// This is the non-owning counterpart to [`SimTaskHandle::set_migration_disabled`]
+/// for engine paths that still store raw `SimTask` objects.
+pub(crate) fn set_migration_disabled_raw(raw: *mut c_void, val: u16) {
+    assert!(!raw.is_null(), "task raw pointer must be non-null");
+    // SAFETY: engine callers pass live simulated task_struct pointers.
+    unsafe { ffi::sim_task_set_migration_disabled(raw, val) }
+}
+
+/// Read `migration_disabled` from an engine-owned task pointer.
+#[cfg(test)]
+pub(crate) fn migration_disabled_raw(raw: *mut c_void) -> u16 {
+    assert!(!raw.is_null(), "task raw pointer must be non-null");
+    // SAFETY: engine callers pass live simulated task_struct pointers.
+    unsafe { ffi::sim_task_get_migration_disabled(raw) }
+}
+
 impl Drop for SimTaskHandle {
     fn drop(&mut self) {
         // SAFETY: `self.raw` was obtained from `sim_task_alloc` and has

@@ -164,6 +164,8 @@ pub enum TraceKind {
         target_cpu: CpuId,
         reason: DispatchRejectReason,
     },
+    /// A scenario event changed a task's migration-disabled counter.
+    MigrationDisabledSet { pid: Pid, value: u16 },
 
     // ----- IRQ events -----
     /// An interrupt starts on a CPU (hardirq or softirq).
@@ -759,6 +761,9 @@ impl Trace {
                         target_cpu.0,
                         reason_str
                     )
+                }
+                TraceKind::MigrationDisabledSet { pid, value } => {
+                    format!("MIG_DIS  pid={} value={}", pid.0, value)
                 }
                 TraceKind::IrqStart { cpu, irq_type } => {
                     let kind_str = match irq_type {

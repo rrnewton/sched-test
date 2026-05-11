@@ -350,6 +350,22 @@ pub(crate) fn write_json(trace: &Trace, writer: &mut impl Write) -> std::io::Res
                 })
             }
 
+            TraceKind::MigrationDisabledSet { pid, value } => {
+                json!({
+                    "ph": "i",
+                    "pid": cpu,
+                    "tid": 0,
+                    "ts": ts,
+                    "name": "migration_disabled_set",
+                    "cat": "task",
+                    "s": "t",
+                    "args": {
+                        "pid": pid.0,
+                        "value": value
+                    }
+                })
+            }
+
             TraceKind::IrqStart {
                 cpu: irq_cpu,
                 irq_type,

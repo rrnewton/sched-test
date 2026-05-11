@@ -614,6 +614,11 @@ pub(crate) enum EventKind {
         event: CgroupCpusetChangeEvent,
         cpu: CpuId,
     },
+    /// A task's migration-disabled counter is changed by the scenario.
+    ///
+    /// `cpu` is the CPU where the task is currently considered to live when
+    /// the event is seeded. The value itself is task-global.
+    MigrationDisabledSet { pid: Pid, value: u16, cpu: CpuId },
     /// An interrupt starts on a CPU (hardirq or softirq).
     IrqStart {
         cpu: CpuId,
@@ -1846,6 +1851,25 @@ impl<S: Scheduler> Simulator<S> {
             );
         }
 
+        // Seed migration-disabled runtime state changes. At scenario load,
+        // the task's kernel-current CPU is its initial CPU.
+        for me in &scenario.migration_disabled_events {
+            let cpu = scenario
+                .tasks
+                .iter()
+                .find(|task| task.pid == me.pid)
+                .map(|task| task.initial_cpu())
+                .unwrap_or(CpuId(0));
+            s.events.push(
+                me.at_ns,
+                EventKind::MigrationDisabledSet {
+                    pid: me.pid,
+                    value: me.value,
+                    cpu,
+                },
+            );
+        }
+
         // Seed IRQ events from the scenario
         for irq in &scenario.irq_events {
             s.events.push(
@@ -2145,6 +2169,7 @@ impl<S: Scheduler> Simulator<S> {
             | EventKind::CgroupMigrate { cpu, .. }
             | EventKind::CgroupCreate { cpu, .. }
             | EventKind::CgroupDestroy { cpu, .. }
+            | EventKind::MigrationDisabledSet { cpu, .. }
             | EventKind::CgroupBwRefill { cpu, .. } => {
                 s.sim.advance_cpu_clock(*cpu);
                 kfuncs::set_sim_clock(s.sim.cpus[cpu.0 as usize].local_clock, Some(*cpu));
@@ -2232,6 +2257,11 @@ impl<S: Scheduler> Simulator<S> {
             EventKind::CgroupCpusetChange { event, .. } => {
                 drop(guard);
                 self.handle_cgroup_cpuset_change(&event, sim_arc);
+                guard = sim_arc.lock().unwrap();
+            }
+            EventKind::MigrationDisabledSet { pid, value, cpu } => {
+                drop(guard);
+                self.handle_migration_disabled_set(pid, value, cpu, sim_arc);
                 guard = sim_arc.lock().unwrap();
             }
             EventKind::IrqStart {
@@ -2881,6 +2911,28 @@ impl<S: Scheduler> Simulator<S> {
             let s = &mut *guard;
             charge_sched_time(&mut s.sim, cpu, "cgroup_init");
         }
+    }
+
+    /// Handle a scenario-driven migration-disabled counter update.
+    fn handle_migration_disabled_set(&self, pid: Pid, value: u16, cpu: CpuId, sim_arc: &SimArc) {
+        let mut guard = sim_arc.lock().unwrap();
+        let s = &mut *guard;
+        let Some(task) = s.tasks.get(&pid) else {
+            debug!(
+                pid = pid.0,
+                value, "migration-disabled set for unknown task"
+            );
+            return;
+        };
+
+        crate::task_wrapper::set_migration_disabled_raw(task.raw(), value);
+
+        let local_t = s.sim.cpus[cpu.0 as usize].local_clock;
+        s.sim
+            .trace
+            .record(local_t, cpu, TraceKind::MigrationDisabledSet { pid, value });
+
+        debug!(pid = pid.0, value, cpu = cpu.0, "migration-disabled set");
     }
 
     /// Handle an interrupt starting on a CPU.
@@ -4551,5 +4603,50 @@ mod tests {
     fn lldb_signal_handling_contains_sigfpe() {
         let cmds = DebuggerFlavor::Lldb.fmt_signal_handling();
         assert!(cmds.contains("process handle SIGFPE -s false -n false -p true"));
+    }
+
+    #[test]
+    fn migration_disabled_set_event_updates_task_struct_and_trace() {
+        let _lock = crate::SIM_LOCK.lock().unwrap();
+        let scenario = Scenario::builder()
+            .cpus(1)
+            .instant_timing()
+            .task(crate::task::TaskDef {
+                name: "worker".into(),
+                pid: Pid(1),
+                nice: 0,
+                behavior: crate::task::TaskBehavior {
+                    phases: vec![Phase::Run(10_000_000)],
+                    repeat: crate::task::RepeatMode::Once,
+                },
+                start_time_ns: 0,
+                mm_id: None,
+                allowed_cpus: None,
+                parent_pid: None,
+                cgroup_name: None,
+                task_flags: 0,
+                migration_disabled: 0,
+            })
+            .migration_disabled_set(Pid(1), 1_000_000, 2)
+            .duration_ms(5)
+            .build();
+
+        let result = Simulator::new(crate::ffi::DynamicScheduler::simple())
+            .run_monitored(scenario, &mut NoopMonitor);
+        let raw = result.task_raw(Pid(1)).expect("task should still exist");
+        let migration_disabled = crate::task_wrapper::migration_disabled_raw(raw);
+        assert_eq!(migration_disabled, 2);
+
+        assert!(result.trace.events().iter().any(|event| {
+            event.time_ns == 1_000_000
+                && event.cpu == CpuId(0)
+                && matches!(
+                    event.kind,
+                    TraceKind::MigrationDisabledSet {
+                        pid: Pid(1),
+                        value: 2
+                    }
+                )
+        }));
     }
 }

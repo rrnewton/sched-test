@@ -92,6 +92,20 @@ pub struct CgroupCpusetChangeEvent {
     pub at_ns: TimeNs,
 }
 
+/// Migration-disabled state change for a task at runtime.
+///
+/// This models kernel windows where a task may become migration-disabled after
+/// BPF chose a placement but before the kernel validates a local-DSQ dispatch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationDisabledEvent {
+    /// PID of the task whose migration-disabled counter changes.
+    pub pid: Pid,
+    /// Simulation time at which the value is applied.
+    pub at_ns: TimeNs,
+    /// New migration-disabled counter value.
+    pub value: u16,
+}
+
 /// Type of interrupt to simulate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IrqType {
@@ -654,6 +668,8 @@ pub struct Scenario {
     pub cgroup_destroy_events: Vec<CgroupDestroyEvent>,
     /// Cgroup cpuset change events (cpuset.cpus modifications at runtime).
     pub cgroup_cpuset_change_events: Vec<CgroupCpusetChangeEvent>,
+    /// Task migration-disabled counter changes at runtime.
+    pub migration_disabled_events: Vec<MigrationDisabledEvent>,
     /// Enable concurrent callback interleaving at kfunc yield points.
     ///
     /// When true, dispatch callbacks for multiple idle CPUs run on
@@ -737,6 +753,7 @@ pub struct ScenarioBuilder {
     cgroup_create_events: Vec<CgroupCreateEvent>,
     cgroup_destroy_events: Vec<CgroupDestroyEvent>,
     cgroup_cpuset_change_events: Vec<CgroupCpusetChangeEvent>,
+    migration_disabled_events: Vec<MigrationDisabledEvent>,
     interleave: bool,
     preemptive: Option<PreemptiveConfig>,
     replay_trace: Option<crate::preempt::trace::PreemptionTrace>,
@@ -771,6 +788,7 @@ impl Scenario {
             cgroup_create_events: Vec::new(),
             cgroup_destroy_events: Vec::new(),
             cgroup_cpuset_change_events: Vec::new(),
+            migration_disabled_events: Vec::new(),
             interleave: false,
             preemptive: None,
             replay_trace: None,
@@ -1165,6 +1183,28 @@ impl ScenarioBuilder {
         self
     }
 
+    /// Schedule a task migration-disabled counter value at a specific time.
+    pub fn migration_disabled_set(mut self, pid: Pid, at_ns: TimeNs, value: u16) -> Self {
+        self.migration_disabled_events
+            .push(MigrationDisabledEvent { pid, at_ns, value });
+        self
+    }
+
+    /// Schedule a migration-disabled window for a task.
+    ///
+    /// Applies `value` at `start_ns` and clears the counter back to 0 at
+    /// `start_ns + duration_ns`.
+    pub fn migration_disabled_window(
+        self,
+        pid: Pid,
+        start_ns: TimeNs,
+        duration_ns: TimeNs,
+        value: u16,
+    ) -> Self {
+        self.migration_disabled_set(pid, start_ns, value)
+            .migration_disabled_set(pid, start_ns.saturating_add(duration_ns), 0)
+    }
+
     /// Enable concurrent callback interleaving at kfunc yield points.
     pub fn interleave(mut self, enabled: bool) -> Self {
         self.interleave = enabled;
@@ -1346,6 +1386,7 @@ impl ScenarioBuilder {
             cgroup_create_events: self.cgroup_create_events,
             cgroup_destroy_events: self.cgroup_destroy_events,
             cgroup_cpuset_change_events: self.cgroup_cpuset_change_events,
+            migration_disabled_events: self.migration_disabled_events,
             interleave: self.interleave,
             preemptive: self.preemptive,
             replay_trace: self.replay_trace,
@@ -1408,5 +1449,60 @@ mod tests {
         assert!(parse_duration_ns("abc").is_err());
         assert!(parse_duration_ns("-1s").is_err());
         assert!(parse_duration_ns("xs").is_err());
+    }
+
+    #[test]
+    fn test_migration_disabled_set_builder() {
+        let scenario = Scenario::builder()
+            .add_task(
+                "worker",
+                0,
+                TaskBehavior {
+                    phases: vec![crate::task::Phase::Run(1_000)],
+                    repeat: crate::task::RepeatMode::Once,
+                },
+            )
+            .migration_disabled_set(Pid(1), 25_000, 2)
+            .build();
+
+        assert_eq!(
+            scenario.migration_disabled_events,
+            vec![MigrationDisabledEvent {
+                pid: Pid(1),
+                at_ns: 25_000,
+                value: 2,
+            }]
+        );
+    }
+
+    #[test]
+    fn test_migration_disabled_window_builder_orders_edges() {
+        let scenario = Scenario::builder()
+            .add_task(
+                "worker",
+                0,
+                TaskBehavior {
+                    phases: vec![crate::task::Phase::Run(1_000)],
+                    repeat: crate::task::RepeatMode::Once,
+                },
+            )
+            .migration_disabled_window(Pid(1), 25_000, 200_000, 2)
+            .build();
+
+        assert_eq!(
+            scenario.migration_disabled_events,
+            vec![
+                MigrationDisabledEvent {
+                    pid: Pid(1),
+                    at_ns: 25_000,
+                    value: 2,
+                },
+                MigrationDisabledEvent {
+                    pid: Pid(1),
+                    at_ns: 225_000,
+                    value: 0,
+                },
+            ]
+        );
     }
 }
