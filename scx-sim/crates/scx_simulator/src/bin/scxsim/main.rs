@@ -403,6 +403,24 @@ struct RunArgs {
     /// first ops breakpoint.
     #[arg(long)]
     wait_debugger: bool,
+
+    /// Override the scheduler `.so` path used by `--scheduler`.
+    ///
+    /// When set, `load_scheduler` ignores the compile-time `SCHEDULER_SO_DIR`
+    /// and `--scheduler` name lookup, and dlopens the file at this exact
+    /// path instead. The basename must match the `libscx_<name>.so` pattern
+    /// because downstream code (e.g. `scheduler_prefix_from_path`,
+    /// `derive_e9rip_path`) parses the prefix from the filename.
+    ///
+    /// Use case: per-revision binary cache (e.g. `experiments/bin_cache/<sha>/
+    /// libscx_lavd.so`) for matrix testing where each slot must load a
+    /// .so built from a distinct scx submodule SHA. Without this flag,
+    /// matrix runners that swap the scx submodule SHA between cargo builds
+    /// get a stale .so because cargo's `rerun-if-changed` does not include
+    /// `scheds/rust/scx_lavd/src/bpf` (see
+    /// `experiments/bug1_scx_version_matrix_20260512/README.md` v2 notes).
+    #[arg(long, value_name = "PATH")]
+    scheduler_file: Option<PathBuf>,
 }
 
 /// Arguments for the `replay` subcommand.
@@ -1057,7 +1075,12 @@ fn run_determinism_check(args: &RunArgs, scenario: Scenario) -> Result<(), RunEr
 
     // Run 1: collect checkpoints
     enable_determinism_mode();
-    let sched1 = load_scheduler(&args.scheduler, args.cpus, use_e9)?;
+    let sched1 = load_scheduler(
+        &args.scheduler,
+        args.cpus,
+        use_e9,
+        args.scheduler_file.as_deref(),
+    )?;
     apply_config_if_present(args, &sched1)?;
     let trace1 = Simulator::new(sched1).run(scenario.clone());
     let checkpoints1 = drain_determinism_checkpoints();
@@ -1068,7 +1091,12 @@ fn run_determinism_check(args: &RunArgs, scenario: Scenario) -> Result<(), RunEr
 
     // Run 2: collect checkpoints with same configuration
     enable_determinism_mode();
-    let sched2 = load_scheduler(&args.scheduler, args.cpus, use_e9)?;
+    let sched2 = load_scheduler(
+        &args.scheduler,
+        args.cpus,
+        use_e9,
+        args.scheduler_file.as_deref(),
+    )?;
     apply_config_if_present(args, &sched2)?;
     let trace2 = Simulator::new(sched2).run(scenario);
     let checkpoints2 = drain_determinism_checkpoints();
@@ -1160,7 +1188,12 @@ fn run_simulation(args: &RunArgs, scenario: Scenario) -> Result<(), RunError> {
         scx_simulator::preempt::mmap_shared_rbc();
     }
 
-    let sched = load_scheduler(&args.scheduler, args.cpus, use_e9)?;
+    let sched = load_scheduler(
+        &args.scheduler,
+        args.cpus,
+        use_e9,
+        args.scheduler_file.as_deref(),
+    )?;
     apply_config_if_present(args, &sched)?;
     let _lock = SIM_LOCK.lock().unwrap();
 
@@ -1256,7 +1289,7 @@ fn run_simulation(args: &RunArgs, scenario: Scenario) -> Result<(), RunError> {
 /// addresses (so_base, heap, stack) in a stable machine-readable format.
 /// The caller (ASLR test) runs this twice and compares the output.
 fn print_addresses(args: &PrintAddressesArgs) -> Result<(), String> {
-    let _sched = load_scheduler(&args.scheduler, 4, false)?;
+    let _sched = load_scheduler(&args.scheduler, 4, false, None)?;
     let _lock = SIM_LOCK.lock().unwrap();
     let so_base = scheduler_so_base();
 
@@ -1291,7 +1324,36 @@ fn apply_config_if_present(args: &RunArgs, sched: &DynamicScheduler) -> Result<(
     Ok(())
 }
 
-fn load_scheduler(name: &str, nr_cpus: u32, e9patch: bool) -> Result<DynamicScheduler, String> {
+fn load_scheduler(
+    name: &str,
+    nr_cpus: u32,
+    e9patch: bool,
+    override_path: Option<&Path>,
+) -> Result<DynamicScheduler, String> {
+    if let Some(path) = override_path {
+        if !path.exists() {
+            return Err(format!(
+                "--scheduler-file path does not exist: {}",
+                path.display()
+            ));
+        }
+        let basename = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| format!("--scheduler-file has no filename: {}", path.display()))?;
+        let expected_prefix = format!("libscx_{name}");
+        if !basename.starts_with(&expected_prefix) || !basename.ends_with(".so") {
+            return Err(format!(
+                "--scheduler-file basename must match libscx_{name}*.so (got {basename:?}); \
+                 the filename prefix is parsed by downstream code (scheduler_prefix_from_path, \
+                 derive_e9rip_path). Rename the file or pass a different --scheduler/-s."
+            ));
+        }
+        let so_str = path
+            .to_str()
+            .ok_or_else(|| format!("--scheduler-file path is not valid UTF-8: {path:?}"))?;
+        return Ok(DynamicScheduler::load(so_str, name, nr_cpus));
+    }
     let dir = env!("SCHEDULER_SO_DIR");
     let suffix = if e9patch { "_e9" } else { "" };
     let so_path = format!("{dir}/libscx_{name}{suffix}.so");
