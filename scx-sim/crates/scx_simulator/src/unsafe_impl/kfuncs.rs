@@ -198,6 +198,22 @@ pub enum StagedEvent {
 
 /// The subset of simulator state that kfuncs need access to.
 ///
+/// Maximum number of distinct BPF timers a scheduler / library can arm
+/// concurrently. The C side (each scheduler's `wrapper.c`) keeps a
+/// fixed-size array of `(struct bpf_timer *, callback, map)` triples
+/// indexed by slot id; `bpf_timer_init` allocates the next free slot
+/// for the supplied `bpf_timer *`. The Rust side mirrors that with a
+/// `pending_timers: [Option<(TimeNs, CpuId)>; MAX_BPF_TIMERS]` array on
+/// `SimulatorState` and a `slot: u8` field on `EventKind::TimerFired`.
+///
+/// Phase 1 BPF infra scale-up items 1+2 (tg
+/// `scxsim-bpf-infra-scale-up-phase1`). 8 was picked to comfortably
+/// cover the production stack -- LAVD has 1 timer (`update_timer`),
+/// the cgroup_bw library Phase 2 will compile in adds 1 more
+/// (`cbw_replenish_timer`); future libraries may add a couple more.
+/// Bump if a real workload ever exhausts it.
+pub const MAX_BPF_TIMERS: usize = 8;
+
 /// # Concurrency classification
 ///
 /// Each field is classified for Phase 2 concurrent access:
@@ -297,17 +313,34 @@ pub struct SimulatorState {
     /// The engine drains the local DSQ and re-enqueues tasks after the
     /// callback returns.
     pub reenqueue_local_requested: bool,
-    /// SHARED-MUTABLE: Timer can be set by any callback on any CPU.
-    /// The engine reads and clears it after each callback.
+    /// SHARED-MUTABLE: Per-slot pending BPF timer state.
     ///
-    /// Pending BPF timer: fire at this time (set by `sim_timer_start`).
-    pub pending_timer_ns: Option<TimeNs>,
-    /// SHARED-MUTABLE: The CPU where `bpf_timer_start` was called.
-    /// In the kernel, BPF timers fire in softirq on the CPU that armed
-    /// them (with `BPF_F_TIMER_CPU_PIN`). Set alongside `pending_timer_ns`
-    /// by `sim_timer_start`, drained by the engine when creating the
-    /// `TimerFired` event.
-    pub pending_timer_cpu: Option<CpuId>,
+    /// `pending_timers[slot] = Some((fire_at_ns, armed_on_cpu))` means
+    /// the BPF callback associated with `slot` re-armed itself or armed
+    /// a sibling timer during the most recent dispatch. The engine
+    /// drains ALL slots after each callback and inserts one
+    /// `EventKind::TimerFired { cpu, slot }` per non-empty slot.
+    ///
+    /// Phase 1 BPF infra scale-up items 1+2 (tg
+    /// `scxsim-bpf-infra-scale-up-phase1`, design doc section Phase 1
+    /// items 1+2): bumped from a single `(pending_timer_ns,
+    /// pending_timer_cpu)` pair to an array so that schedulers /
+    /// libraries that arm multiple BPF timers concurrently don't lose
+    /// arms (the production cgroup_bw library has its own
+    /// `cbw_replenish_timer` separate from LAVD's `update_timer`;
+    /// Phase 2 will compile that library in).
+    ///
+    /// Slot allocation is owned C-side per scheduler (see e.g.
+    /// `schedulers/lavd/wrapper.c::lavd_timer_*` array). Slot 0 is
+    /// reserved for the legacy single-timer code path; the
+    /// backward-compat `sim_timer_start(nsecs)` entry point always
+    /// writes slot 0 so existing single-timer schedulers (mitosis,
+    /// cosmos, the pre-Phase-1 LAVD path) continue to work unchanged.
+    ///
+    /// In the kernel, BPF timers fire in softirq on the CPU that
+    /// armed them (with `BPF_F_TIMER_CPU_PIN`). We capture
+    /// `current_cpu` per slot for the same per-slot semantics.
+    pub pending_timers: [Option<(TimeNs, CpuId)>; MAX_BPF_TIMERS],
     /// PER-CPU: Set by the engine before calling `select_cpu` on the
     /// waker's CPU, consumed by `bpf_get_current_task_btf` during that
     /// same callback. Only the owning worker reads/writes it.
@@ -2676,25 +2709,61 @@ pub extern "C" fn scx_bpf_cpuperf_cap(_cpu: i32) -> u32 {
     1024
 }
 
-/// Schedule a BPF timer to fire after `nsecs` nanoseconds.
+/// Schedule a BPF timer to fire after `nsecs` nanoseconds (slot 0 --
+/// backward-compat wrapper for single-timer schedulers).
 ///
 /// Called from C scheduler code when `bpf_timer_start(timer, nsecs, flags)`
-/// is invoked. The engine drains `pending_timer_ns` and `pending_timer_cpu`
-/// after each callback and inserts a `TimerFired` event into the event queue.
+/// is invoked WITHOUT explicit slot tracking (i.e. legacy single-timer
+/// wrappers in mitosis / cosmos / pre-Phase-1 LAVD). Pinned to slot 0.
 ///
 /// In the kernel, BPF timers fire in softirq on the CPU that armed them
 /// (with `BPF_F_TIMER_CPU_PIN`). We capture `current_cpu` here so the
-/// `TimerFired` event is associated with the correct CPU.
+/// resulting `TimerFired` event is associated with the correct CPU.
 #[no_mangle]
 pub extern "C" fn sim_timer_start(nsecs: u64) {
+    sim_timer_start_slot(0, nsecs);
+}
+
+/// Schedule a BPF timer in slot `slot` to fire after `nsecs` nanoseconds.
+///
+/// Phase 1 BPF infra scale-up items 1+2 (tg
+/// `scxsim-bpf-infra-scale-up-phase1`). Replaces the prior single
+/// `pending_timer_*` pair with a per-slot array so multi-timer
+/// wrappers (Phase 1 LAVD; Phase 2 compiled-in cgroup_bw library) can
+/// arm distinct timers without the engine collapsing them.
+///
+/// Slot allocation policy is owned C-side (each scheduler's
+/// wrapper.c keeps its own `bpf_timer *` -> slot table; see
+/// `schedulers/lavd/wrapper.c::lavd_timer_*` for the worked example).
+/// Slot 0 is the legacy single-timer slot.
+///
+/// The engine drains ALL slots after each callback and inserts one
+/// `EventKind::TimerFired { cpu, slot }` per non-empty slot. A timer
+/// re-arming itself overwrites its own slot (matches kernel
+/// `bpf_timer_start` semantics: re-arming an already-armed timer
+/// reschedules it).
+#[no_mangle]
+pub extern "C" fn sim_timer_start_slot(slot: u32, nsecs: u64) {
     with_sim(kfunc_cost::TRIVIAL, |sim| {
-        sim.pending_timer_ns = Some(sim.clock + nsecs);
-        sim.pending_timer_cpu = Some(sim.current_cpu);
+        let idx = slot as usize;
+        if idx >= MAX_BPF_TIMERS {
+            // Out-of-range slot: silently drop. Schedulers that need
+            // > MAX_BPF_TIMERS timers must bump the constant. The drop
+            // is logged below for diagnosability.
+            debug!(
+                slot,
+                MAX_BPF_TIMERS,
+                "timer_start_slot dropped: slot >= MAX_BPF_TIMERS"
+            );
+            return;
+        }
+        sim.pending_timers[idx] = Some((sim.clock + nsecs, sim.current_cpu));
         debug!(
+            slot,
             nsecs,
             fire_at = sim.clock + nsecs,
             cpu = sim.current_cpu.0,
-            "timer_start"
+            "timer_start_slot"
         );
     });
 }
@@ -2730,8 +2799,7 @@ mod tests {
             dsq_iter: None,
             staged_events: Vec::new(),
             reenqueue_local_requested: false,
-            pending_timer_ns: None,
-            pending_timer_cpu: None,
+            pending_timers: [None; MAX_BPF_TIMERS],
             waker_task_raw: None,
             idle_task_raw: ptr::null_mut(),
             noise: NoiseConfig {

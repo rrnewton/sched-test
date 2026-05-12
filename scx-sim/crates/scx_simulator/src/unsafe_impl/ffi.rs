@@ -359,10 +359,11 @@ pub trait Scheduler {
     /// Calls into C code.
     unsafe fn exit(&self) {}
 
-    /// Fire a pending BPF timer callback. Optional.
+    /// Fire a pending BPF timer callback for the given `slot`. Optional.
+    /// `slot` is in the range `0..MAX_BPF_TIMERS` (currently 8).
     /// # Safety
     /// Calls into C code.
-    unsafe fn fire_timer(&self) {}
+    unsafe fn fire_timer(&self, _slot: u32) {}
 
     /// Periodic tick on the current CPU (ops.tick). Optional.
     /// `p` is the currently running task.
@@ -529,7 +530,7 @@ type InitTaskFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32;
 type CpuReleaseFn = unsafe extern "C" fn(i32, *mut c_void);
 type ExitFn = unsafe extern "C" fn(*mut c_void);
 type SetupFn = unsafe extern "C" fn(u32);
-type FireTimerFn = unsafe extern "C" fn();
+type FireTimerFn = unsafe extern "C" fn(u32);
 type QuiescentFn = unsafe extern "C" fn(*mut c_void, u64);
 type DequeueFn = unsafe extern "C" fn(*mut c_void, u64);
 type TickFn = unsafe extern "C" fn(*mut c_void);
@@ -1131,9 +1132,9 @@ impl Scheduler for DynamicScheduler {
         }
     }
 
-    unsafe fn fire_timer(&self) {
+    unsafe fn fire_timer(&self, slot: u32) {
         if let Some(f) = self.ops.fire_timer {
-            f();
+            f(slot);
         }
     }
 

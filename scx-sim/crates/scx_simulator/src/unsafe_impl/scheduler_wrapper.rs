@@ -217,10 +217,19 @@ impl<S: Scheduler> SchedulerWrapper<S> {
     // Optional callbacks — periodic / timer
     // ------------------------------------------------------------------
 
-    /// Fire a pending BPF timer callback (`ops.fire_timer`).
-    pub fn fire_timer(&self) {
-        // SAFETY: No arguments. The scheduler's timer state is internal.
-        unsafe { self.inner.fire_timer() }
+    /// Fire a pending BPF timer callback for `slot` (`ops.fire_timer(slot)`).
+    ///
+    /// `slot` (0..MAX_BPF_TIMERS) selects which of the scheduler's
+    /// per-scheduler timer slots fired. Phase 1 BPF infra scale-up
+    /// items 1+2: schedulers maintain a slot table in their wrapper.c
+    /// keyed by `(struct bpf_timer *)`; the engine routes the slot
+    /// through so the wrapper dispatches to the right callback.
+    /// Single-timer schedulers (mitosis, cosmos, the legacy LAVD path)
+    /// always receive `slot = 0`.
+    pub fn fire_timer(&self, slot: u8) {
+        // SAFETY: `slot` is a small integer; the scheduler's wrapper.c
+        // dispatches based on it.
+        unsafe { self.inner.fire_timer(slot as u32) }
     }
 
     /// Periodic tick (`ops.tick`).
@@ -472,6 +481,7 @@ mod tests {
     fn test_fire_timer_delegates() {
         let stub = StubScheduler::new();
         let wrapper = SchedulerWrapper::new(stub);
-        wrapper.fire_timer();
+        // Phase 1 BPF infra scale-up items 1+2: fire_timer takes a slot id.
+        wrapper.fire_timer(0);
     }
 }

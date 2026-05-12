@@ -561,7 +561,14 @@ pub(crate) enum EventKind {
     /// `BPF_F_TIMER_CPU_PIN`). Assigning a CPU makes this a per-CPU event
     /// eligible for concurrent batch processing (matching kernel behavior
     /// where timers on different CPUs fire independently).
-    TimerFired { cpu: CpuId },
+    ///
+    /// `slot` selects which of the scheduler's `MAX_BPF_TIMERS` (currently
+    /// 8) per-scheduler timer slots fired. Phase 1 BPF infra scale-up
+    /// items 1+2 (tg `scxsim-bpf-infra-scale-up-phase1`): the slot is
+    /// passed through to `<scheduler>_fire_timer(slot)` so wrappers can
+    /// dispatch to the right callback. Single-timer schedulers (mitosis,
+    /// cosmos, the legacy LAVD path) all use `slot = 0`.
+    TimerFired { cpu: CpuId, slot: u8 },
     /// Periodic scheduler tick on a CPU.
     Tick { cpu: CpuId },
     /// A CPU goes offline (hotplug remove).
@@ -1411,8 +1418,7 @@ impl<S: Scheduler> Simulator<S> {
             task_last_cpu: HashMap::new(),
             task_ops_state: BTreeMap::new(),
             reenqueue_local_requested: false,
-            pending_timer_ns: None,
-            pending_timer_cpu: None,
+            pending_timers: [None; crate::kfuncs::MAX_BPF_TIMERS],
             waker_task_raw: None,
             idle_task_raw,
             noise: scenario.noise.clone(),
@@ -1747,13 +1753,34 @@ impl<S: Scheduler> Simulator<S> {
             s.sim.cpus[cpu.0 as usize].local_clock = 0;
         }
 
-        // Drain any pending timer from scheduler init (e.g., deferred wakeup timer).
-        // The CPU is captured by `sim_timer_start` during the init callback.
-        if let Some(fire_at) = s.sim.pending_timer_ns.take() {
-            let cpu = s.sim.pending_timer_cpu.take().unwrap_or(CpuId(0));
-            s.events.push(fire_at, EventKind::TimerFired { cpu });
-        } else {
-            s.sim.pending_timer_cpu.take();
+        // Drain any pending timers from scheduler init (e.g. deferred
+        // wakeup timer). The CPU is captured by `sim_timer_start_slot`
+        // during the init callback. Phase 1 BPF infra scale-up items
+        // 1+2: drain ALL slots in ascending slot order so multi-timer
+        // schedulers (Phase 2's compiled-in cgroup_bw library) don't
+        // lose arms even if init fires multiple slots.
+        //
+        // Two-step: first snapshot + clear the slot array (mut-borrow
+        // of `s.sim`), then push events (mut-borrow of `s.events`).
+        // Avoids the `s` re-borrow conflict that the single-step
+        // iter_mut + s.events.push form triggers. Stack array sized
+        // to MAX_BPF_TIMERS keeps this allocation-free.
+        let mut drained: [Option<(crate::types::TimeNs, CpuId)>;
+            crate::kfuncs::MAX_BPF_TIMERS] =
+            [None; crate::kfuncs::MAX_BPF_TIMERS];
+        for (slot, entry) in s.sim.pending_timers.iter_mut().enumerate() {
+            drained[slot] = entry.take();
+        }
+        for (slot, entry) in drained.iter().enumerate() {
+            if let Some((fire_at, cpu)) = *entry {
+                s.events.push(
+                    fire_at,
+                    EventKind::TimerFired {
+                        cpu,
+                        slot: slot as u8,
+                    },
+                );
+            }
         }
 
         // Schedule initial TaskWake events for all tasks
@@ -2133,7 +2160,7 @@ impl<S: Scheduler> Simulator<S> {
             | EventKind::DsqConsume { cpu }
             | EventKind::StartRunning { cpu, .. }
             | EventKind::KickDelivered { cpu, .. }
-            | EventKind::TimerFired { cpu }
+            | EventKind::TimerFired { cpu, .. }
             | EventKind::CgroupMigrate { cpu, .. }
             | EventKind::CgroupCreate { cpu, .. }
             | EventKind::CgroupDestroy { cpu, .. }
@@ -2163,9 +2190,9 @@ impl<S: Scheduler> Simulator<S> {
                 self.handle_task_phase_complete(cpu, sim_arc, duration_ns, monitor);
                 guard = sim_arc.lock().unwrap();
             }
-            EventKind::TimerFired { cpu } => {
+            EventKind::TimerFired { cpu, slot } => {
                 drop(guard);
-                self.handle_timer_fired(cpu, sim_arc, monitor);
+                self.handle_timer_fired(cpu, slot, sim_arc, monitor);
                 guard = sim_arc.lock().unwrap();
             }
             EventKind::Tick { cpu } => {
@@ -2271,10 +2298,19 @@ impl<S: Scheduler> Simulator<S> {
     /// CPU that armed the timer (with `BPF_F_TIMER_CPU_PIN`). The `cpu`
     /// parameter carries the CPU where `bpf_timer_start()` was called.
     ///
-    /// Calls the scheduler's `fire_timer()` callback, which invokes the
-    /// stored BPF timer callback (e.g., `wakeup_timerfn` in COSMOS).
-    /// The callback may kick CPUs and re-arm the timer via `bpf_timer_start`.
-    fn handle_timer_fired(&self, cpu: CpuId, sim_arc: &SimArc, _monitor: &mut dyn Monitor) {
+    /// Calls the scheduler's `fire_timer(slot)` callback, which invokes the
+    /// stored BPF timer callback for the given slot (e.g., `wakeup_timerfn`
+    /// in COSMOS at slot 0; `cbw_replenish_timerfn` at a Phase-2 slot).
+    /// The callback may kick CPUs and re-arm any number of timers via
+    /// `bpf_timer_start_slot`. Phase 1 BPF infra scale-up items 1+2 (tg
+    /// `scxsim-bpf-infra-scale-up-phase1`).
+    fn handle_timer_fired(
+        &self,
+        cpu: CpuId,
+        slot: u8,
+        sim_arc: &SimArc,
+        _monitor: &mut dyn Monitor,
+    ) {
         let mut guard = sim_arc.lock().unwrap();
         let s = &mut *guard;
         // Advance the per-CPU clock so scx_bpf_now() inside the callback
@@ -2287,21 +2323,41 @@ impl<S: Scheduler> Simulator<S> {
         s.cgroup_registry.prepare_css_iter_from_root();
         start_rbc(&mut s.sim);
         sim_callback!(s, guard, sim_arc, cpu, {
-            self.scheduler.fire_timer();
+            self.scheduler.fire_timer(slot);
         });
         let s = &mut *guard;
         charge_sched_time(&mut s.sim, cpu, "fire_timer");
 
-        // Drain re-armed timer. The CPU is captured by `sim_timer_start`
-        // inside the callback (which may differ from `cpu` if the callback
-        // re-arms the timer in a different CPU context, though typically it
-        // stays on the same CPU).
-        if let Some(fire_at) = s.sim.pending_timer_ns.take() {
-            let timer_cpu = s.sim.pending_timer_cpu.take().unwrap_or(cpu);
-            s.events
-                .push(fire_at, EventKind::TimerFired { cpu: timer_cpu });
-        } else {
-            s.sim.pending_timer_cpu.take();
+        // Drain ALL re-armed timer slots in ascending slot order. Each
+        // slot's CPU is captured by `sim_timer_start_slot` inside the
+        // callback (which may differ from `cpu` if the callback re-arms
+        // a timer in a different CPU context, though typically it stays
+        // on the same CPU). A timer re-arming itself overwrites its own
+        // slot's pending entry -- matches kernel `bpf_timer_start`
+        // semantics. Single-slot draining preserves byte-for-byte the
+        // pre-Phase-1 single-timer behavior because slot 0 is the only
+        // one ever populated for legacy schedulers.
+        //
+        // Two-step pattern (snapshot then push) sidesteps the
+        // borrow-checker conflict between `s.sim.pending_timers` (the
+        // source) and `s.events` (the sink) that share an ancestor
+        // mut-borrow on `s`.
+        let mut drained: [Option<(crate::types::TimeNs, CpuId)>;
+            crate::kfuncs::MAX_BPF_TIMERS] =
+            [None; crate::kfuncs::MAX_BPF_TIMERS];
+        for (s_idx, entry) in s.sim.pending_timers.iter_mut().enumerate() {
+            drained[s_idx] = entry.take();
+        }
+        for (s_idx, entry) in drained.iter().enumerate() {
+            if let Some((fire_at, timer_cpu)) = *entry {
+                s.events.push(
+                    fire_at,
+                    EventKind::TimerFired {
+                        cpu: timer_cpu,
+                        slot: s_idx as u8,
+                    },
+                );
+            }
         }
 
         // Flush staged events (e.g. KickDelivered) from the timer callback

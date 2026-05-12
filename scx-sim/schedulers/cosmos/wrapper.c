@@ -346,10 +346,20 @@ void cosmos_register_maps(void)
 /*
  * Fire the stored BPF timer callback.
  * Called from the Rust engine when a TimerFired event is processed.
+ *
+ * Phase 1 BPF infra scale-up items 1+2 (tg
+ * `scxsim-bpf-infra-scale-up-phase1`): the engine now passes a `slot`
+ * id so multi-timer schedulers (LAVD post-Phase-1, Phase-2 compiled-in
+ * cgroup_bw library) can dispatch to the right callback. COSMOS is a
+ * single-timer scheduler (only `wakeup_timer`); it ignores `slot` and
+ * always fires its only timer. The single arg is required by the new
+ * FFI signature `FireTimerFn = unsafe extern "C" fn(u32)` so the
+ * symbol resolves.
  */
-void cosmos_fire_timer(void)
+void cosmos_fire_timer(unsigned int slot)
 {
 	int key = 0;
+	(void)slot;
 	if (cosmos_timer_cb && cosmos_timer_ptr)
 		cosmos_timer_cb(cosmos_timer_map, &key, cosmos_timer_ptr);
 }

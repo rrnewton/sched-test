@@ -461,10 +461,20 @@ static void *mitosis_cgrp_storage_get(void *map, void *cgrp, void *value,
 
 /* ---------------------------------------------------------------------------
  * fire_timer: called from the Rust engine when a TimerFired event fires.
+ *
+ * Phase 1 BPF infra scale-up items 1+2 (tg
+ * `scxsim-bpf-infra-scale-up-phase1`): the engine now passes a `slot`
+ * id so multi-timer schedulers (LAVD post-Phase-1, Phase-2 compiled-in
+ * cgroup_bw library) can dispatch to the right callback. Mitosis is a
+ * single-timer scheduler; it ignores `slot` and always fires its only
+ * timer (whatever was last installed via mitosis_timer_set_callback).
+ * The single arg is required by the new FFI signature
+ * `FireTimerFn = unsafe extern "C" fn(u32)` so the symbol resolves.
  * ---------------------------------------------------------------------------*/
-void mitosis_fire_timer(void)
+void mitosis_fire_timer(unsigned int slot)
 {
 	int key = 0;
+	(void)slot;
 	if (mitosis_timer_cb && mitosis_timer_ptr)
 		mitosis_timer_cb(mitosis_timer_map, &key, mitosis_timer_ptr);
 }
