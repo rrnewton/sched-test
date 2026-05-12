@@ -6,6 +6,75 @@ This document contains the development guidelines and instructions for the proje
 
 If you become stuck with an issue you cannot debug, you can file an issue for it and leave it to work on other topics. Of course, the tests should be always passing before each commit and achieve reasonably good code coverage as described below.
 
+CRITICAL: No-Stub Rule (scxsim runs 100% of scheduler logic)
+================================================================================
+
+**scxsim MUST execute 100% of the same scheduler logic that runs on the BPF
+side. NEVER stub out, no-op, elide, or otherwise replace any part of a BPF
+scheduler with a fake implementation.** A scheduler is NOT considered
+"supported" in scxsim until the entirety of its BPF logic is actually being
+executed during simulation.
+
+This rule applies to:
+
+- BPF scheduler `.bpf.c` files compiled into the scheduler library (e.g.
+  `scx_lavd`, including all of its helper translation units).
+- BPF helper / library code that the scheduler calls into (e.g.
+  `cgroup_bw.bpf.c` and friends).
+- Any state machine, accounting, or decision logic implemented on the BPF
+  side. The Rust-side scxsim runtime models the *kernel/BPF substrate* — it
+  does NOT replace the scheduler's own logic.
+
+Concretely, the following are FORBIDDEN as ways to "support" a scheduler in
+scxsim:
+
+- **No-op shim functions.** `sim_*_*()` wrappers that return success
+  without doing the work, "to be filled in later."
+- **Elided libraries.** Quietly omitting a translation unit (e.g. dropping
+  `cgroup_bw.bpf.c` from the scheduler library build) so the scheduler
+  appears to compile and run while a chunk of its logic is missing.
+- **Interface-only Rust reimplementations.** Re-implementing a BPF
+  subsystem in Rust on the scxsim side, providing the same *interface*
+  the scheduler calls into, but only *approximating* the BPF semantics
+  rather than executing the BPF code itself. The Rust replacement is
+  not the scheduler — it is a guess at what the scheduler does.
+- **Silent fallbacks** that swap real logic for a simplified path
+  (covered also by `No Silent Failures` below; doubly forbidden when the
+  silent fallback replaces scheduler code).
+
+If a BPF feature genuinely cannot run under scxsim today (e.g. it depends
+on a kernel facility we have not yet modeled in the scxsim BPF substrate),
+that is a **scxsim infrastructure task** — file an issue, build the
+substrate. It is NOT a license to stub the scheduler. Until the substrate
+exists, the affected scheduler is "not yet supported," not "supported with
+a shim."
+
+When a temporary deviation from real scheduler logic is unavoidable during
+development, mark it with `DANGER TODO(<issue>)` in the code (see
+`Kernel Fidelity` below) and treat the scheduler as unsupported until the
+TODO is resolved. `DANGER TODO` is for transient development state — it is
+NOT a way to permanently legitimize a stub.
+
+Worked-example failure mode (cpu-bw-stall-bug):
+The cpu-bw-stall-bug investigation was derailed for weeks by exactly this
+antipattern: `sim_cgroup_bw_*` wrappers written as no-op shims, and a
+Rust `BandwidthManager` state machine standing in as a fake interface
+that *approximated* `cgroup_bw.bpf.c` without preserving its semantics.
+The scheduler under test was effectively not running its bandwidth logic
+at all under scxsim, so the stall reproducer was diagnosing the shim, not
+the scheduler. A cold fresh-agent reproduction, an independent
+sev-reader hypothesis comparison, and the `cgroup-bw-audit` (audit
+`audit-cgroup-bw-real-shim-state-202605`) all converged on the same
+diagnosis. See:
+
+- Design doc:
+  `experiments/lavd_cpubw_stalls_202604/SCXSIM_REAL_CGROUP_BW_LIBRARY_DESIGN.md`
+- Audit: `audit-cgroup-bw-real-shim-state-202605`
+
+This rule exists so that recurrence is impossible. Reviewers MUST refuse
+to land scxsim integrations that stub, no-op, or elide BPF scheduler
+logic, regardless of how convenient the shortcut looks.
+
 Coding conventions
 ========================================
 
