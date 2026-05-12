@@ -126,6 +126,16 @@ fn main() {
     if coverage {
         make.arg("SCX_SIM_COVERAGE=1");
     }
+    // Phase 2 (tg `compile-scx-cgroup-bw-library-into-scxsim-phase2`):
+    // forward the env var into the Make invocation so
+    // `schedulers/Makefile` can `ifeq ($(SCXSIM_PHASE2_REAL_CGROUP_BW),1)`
+    // and inject `-DSCXSIM_PHASE2_REAL_CGROUP_BW=1` into the LAVD wrapper
+    // compile. The `cargo:rerun-if-env-changed=...` below ensures
+    // build.rs re-runs when the env var flips.
+    if let Ok(v) = env::var("SCXSIM_PHASE2_REAL_CGROUP_BW") {
+        make.arg(format!("SCXSIM_PHASE2_REAL_CGROUP_BW={}", v));
+    }
+    println!("cargo:rerun-if-env-changed=SCXSIM_PHASE2_REAL_CGROUP_BW");
     let status = make.status().expect("failed to run make");
 
     assert!(status.success(), "scheduler Makefile failed: exit {status}");

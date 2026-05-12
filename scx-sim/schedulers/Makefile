@@ -91,6 +91,29 @@ endif
 $(info scx-sim/schedulers: detected cgroup_bw API = $(SCX_CGROUP_BW_API))
 CFLAGS += $(CFLAGS_BPF_API)
 
+# Phase 2 (tg `compile-scx-cgroup-bw-library-into-scxsim-phase2`):
+# build-time gate that flips the LAVD wrapper from the pre-Phase-2 weak
+# `scx_cgroup_bw_*` shims (delegating to the engine `BandwidthManager`)
+# to the real `scx/lib/cgroup_bw.bpf.c` library compiled into the .so.
+#
+# Set `SCXSIM_PHASE2_REAL_CGROUP_BW=1` in the environment to opt in:
+#   SCXSIM_PHASE2_REAL_CGROUP_BW=1 cargo build --release -p scx_simulator --bin scxsim
+#
+# Or set it just for the schedulers/Makefile invocation:
+#   make -C scx-sim/schedulers SCXSIM_PHASE2_REAL_CGROUP_BW=1 ...
+#
+# Default (unset / empty): Phase 2 path is OFF; the pre-Phase-2 weak
+# shims are emitted and the canonical Bug-1 reproducer passes
+# regression at byte-identical runnable_for_ns. Set to 1 to opt in to
+# the compiled-in library; this currently lands the .so build cleanly
+# but exposes a runtime issue past lavd_init -- see tg
+# `compile-scx-cgroup-bw-library-into-scxsim-phase2` notes for the
+# debugging breadcrumbs.
+ifeq ($(SCXSIM_PHASE2_REAL_CGROUP_BW),1)
+CFLAGS += -DSCXSIM_PHASE2_REAL_CGROUP_BW=1
+$(info scx-sim/schedulers: SCXSIM_PHASE2_REAL_CGROUP_BW=1 -- compiling cgroup_bw.bpf.c into LAVD .so)
+endif
+
 INCLUDES := -I$(SIMULATOR_DIR)/csrc \
             -I$(ROOT_DIR)/lib/scxtest \
             -I$(ROOT_DIR)/scheds/include \

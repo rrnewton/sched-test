@@ -547,6 +547,19 @@ extern unsigned int sim_bpf_in_interrupt(void);
  */
 static struct cpu_ctx percpu_ctx[MAX_SIM_CPUS];
 
+#ifdef SCXSIM_PHASE2_REAL_CGROUP_BW
+/*
+ * Phase 2: forward decls for cgroup_bw library timer-map short-circuit
+ * (full backing storage is below; the actual map_ptr values are
+ * populated by lavd_register_cbw_maps after cgroup_bw.bpf.c is
+ * included). Declared here so lavd_map_lookup can reference them.
+ */
+extern char cbw_replenish_timer_storage[256];
+extern char cbw_accounting_timer_storage[256];
+extern void *cbw_replenish_timer_map_ptr;
+extern void *cbw_accounting_timer_map_ptr;
+#endif
+
 static void *lavd_map_lookup(void *map, const void *key)
 {
 	if (map == lavd_cpu_ctx_stor_ptr && lavd_cpu_ctx_stor_ptr) {
@@ -557,6 +570,17 @@ static void *lavd_map_lookup(void *map, const void *key)
 	}
 	if (map == lavd_update_timer_map_ptr && lavd_update_timer_map_ptr)
 		return lavd_update_timer_buf;
+#ifdef SCXSIM_PHASE2_REAL_CGROUP_BW
+	/* Phase 2: cgroup_bw library timer maps short-circuit to static
+	 * single-entry storage so `bpf_map_lookup_elem(&replenish_timer,
+	 * &key=0)` and similarly for accounting_timer return real
+	 * `struct {bpf_timer}` slots that the library can hand to
+	 * bpf_timer_init/set_callback/start. */
+	if (map == cbw_replenish_timer_map_ptr && cbw_replenish_timer_map_ptr)
+		return &cbw_replenish_timer_storage[0];
+	if (map == cbw_accounting_timer_map_ptr && cbw_accounting_timer_map_ptr)
+		return &cbw_accounting_timer_storage[0];
+#endif
 	return scx_test_map_lookup_elem(map, key);
 }
 
@@ -574,6 +598,51 @@ static struct cpu_ctx *lavd_lookup_percpu_elem(int cpu)
  * Register BPF maps with the test map infrastructure.
  */
 static struct scx_test_map cpu_ctx_test_map;
+
+#ifdef SCXSIM_PHASE2_REAL_CGROUP_BW
+/*
+ * Phase 2 BPF map glue: register cgroup_bw's 5 maps so that
+ * `bpf_map_lookup_elem(&replenish_timer, &key)`,
+ * `bpf_map_lookup_elem(&accounting_timer, &key)`, and the per-CPU
+ * `tree_levels_map` lookup return real backing storage. Without
+ * registration, scx_cgroup_bw_lib_init bails out at the first
+ * `bpf_map_lookup_elem` call with a "Failed to lookup ..." cbw_err.
+ *
+ * - replenish_timer / accounting_timer: BPF_MAP_TYPE_ARRAY with
+ *   max_entries=1, value=struct {bpf_timer}. Single entry suffices.
+ * - tree_levels_map: BPF_MAP_TYPE_PERCPU_ARRAY with max_entries=1.
+ *   Phase 1 item 6 wired bpf_map_lookup_percpu_elem to scxsim's
+ *   percpu test map registry; we just need to register the map.
+ * - cbw_cgrp_map (CGRP_STORAGE) and cbw_cgrp_llc_map (HASH): wired
+ *   via scx_test_map registration so scx_test_cgrp_storage_get and
+ *   scx_test_map_update_elem find their value-sizes.
+ */
+static struct scx_test_map cbw_cgrp_test_map;
+static struct scx_test_map cbw_cgrp_llc_test_map;
+static struct scx_test_map cbw_replenish_timer_test_map;
+static struct scx_test_map cbw_accounting_timer_test_map;
+static struct scx_percpu_test_map *cbw_tree_levels_test_map;
+
+/* Static backing for the single-entry ARRAY maps so
+ * `bpf_map_lookup_elem(&replenish_timer, &key=0)` returns a real
+ * `struct {bpf_timer}` slot the library can write into. char[256]
+ * is generous: `struct bpf_timer` is ~64 bytes; the library's
+ * `struct replenish_timer { struct bpf_timer timer; }` and
+ * `struct accounting_timer { struct bpf_timer timer; }` fit easily.
+ * Using char[] sidesteps the forward-declaration problem (the structs
+ * live inside cgroup_bw.bpf.c which is included LATER in this TU). */
+char cbw_replenish_timer_storage[256] __attribute__((aligned(16)));
+char cbw_accounting_timer_storage[256] __attribute__((aligned(16)));
+
+/* Pointers used by lavd_map_lookup() to short-circuit the cgroup_bw
+ * timer maps to the static backing arrays above (mirrors how
+ * `lavd_update_timer_map_ptr` short-circuits LAVD's own update_timer).
+ * Defined here for visibility to lavd_map_lookup; populated by
+ * lavd_register_maps which runs AFTER cgroup_bw.bpf.c is included
+ * (so `&replenish_timer` / `&accounting_timer` are in scope). */
+void *cbw_replenish_timer_map_ptr;
+void *cbw_accounting_timer_map_ptr;
+#endif /* SCXSIM_PHASE2_REAL_CGROUP_BW */
 
 void lavd_register_maps(void)
 {
@@ -593,7 +662,20 @@ void lavd_register_maps(void)
 	 * destroying determinism.
 	 */
 	__builtin_memset(lavd_timer_table, 0, sizeof(lavd_timer_table));
+
+	/*
+	 * Phase 2: cgroup_bw's BPF maps live in cgroup_bw.bpf.c which is
+	 * included later in this TU. Their registration is split out into
+	 * `lavd_register_cbw_maps()` (defined post-include) and called
+	 * from lavd_setup after lavd_register_maps. Whole path is
+	 * gated on `SCXSIM_PHASE2_REAL_CGROUP_BW`.
+	 */
 }
+
+#ifdef SCXSIM_PHASE2_REAL_CGROUP_BW
+/* Forward declaration; full def lives after the cgroup_bw.bpf.c include. */
+static void lavd_register_cbw_maps(void);
+#endif
 
 /*
  * Fire the stored BPF timer callback for the given `slot`.
@@ -631,6 +713,23 @@ void lavd_fire_timer(unsigned int slot)
  * cpu.max x LAVD cgroup-bw) a single source of truth for the H6
  * Bug-1 reproducer.
  */
+/*
+ * Phase 2 ON  (`-DSCXSIM_PHASE2_REAL_CGROUP_BW=1`): the cgroup_bw
+ *             library compiled in below provides STRONG definitions of
+ *             `scx_cgroup_bw_is_cgroup_throttled` and
+ *             `scx_cgroup_bw_is_task_throttled`; the engine-side
+ *             `sim_cgroup_bw_is_cgroup_throttled` / `_is_task_throttled`
+ *             shims (in `cgroup_bw_ffi.rs`) become unused.
+ *
+ * Phase 2 OFF (default for now): we keep the pre-Phase-2 forwarders
+ *             that delegate into the engine `BandwidthManager`. They
+ *             can't co-exist with the library's strong defs because
+ *             they're non-weak; gating on the build-time switch is
+ *             how Phase 2 lands without breaking the default
+ *             regression baseline (canonical Bug-1 reproducer keeps
+ *             firing the watchdog at runnable_for_ns=80000793).
+ */
+#ifndef SCXSIM_PHASE2_REAL_CGROUP_BW
 extern int sim_cgroup_bw_is_cgroup_throttled(u64 cgrp_id);
 extern int sim_cgroup_bw_is_task_throttled(u64 taskc_ptr);
 
@@ -643,6 +742,7 @@ int scx_cgroup_bw_is_task_throttled(u64 taskc_ptr)
 {
 	return sim_cgroup_bw_is_task_throttled(taskc_ptr);
 }
+#endif /* !SCXSIM_PHASE2_REAL_CGROUP_BW */
 
 /*
  * =================================================================
@@ -695,12 +795,22 @@ extern int sim_cgroup_registry_allocate(void);
 extern void sim_cgroup_registry_free(void);
 
 /*
- * Diff 4/5: forward declarations of engine-owned BandwidthManager shims.
- * Implementations live in crates/scx_simulator/src/unsafe_impl/cgroup_bw_ffi.rs.
- * Each scx_cgroup_bw_* wrapper below delegates to the corresponding
- * sim_cgroup_bw_* shim, with sim_cgroup_registry_{allocate,free}() retained
- * for ENOMEM exhaustion simulation in scx_cgroup_bw_{init,exit}.
+ * Phase 2 (tg `compile-scx-cgroup-bw-library-into-scxsim-phase2`): the
+ * production `scx/lib/cgroup_bw.bpf.c` is compiled into this TU below
+ * (after `main.bpf.c`). It provides STRONG definitions for every
+ * `scx_cgroup_bw_*` entry point, so the weak forwarders previously
+ * defined here -- which delegated into Diff 4/5's
+ * `crates/scx_simulator/src/unsafe_impl/cgroup_bw_ffi.rs` shims
+ * (`sim_cgroup_bw_*`) -- are gone. The engine no longer drives a
+ * second BandwidthManager state machine; the library is the single
+ * source of truth.
+ *
+ * `sim_cgroup_registry_allocate` / `_free` are retained for the
+ * scenario-side ENOMEM exhaustion modeling -- those are wired in
+ * from the engine when allocating implicit cgroups, NOT from
+ * scx_cgroup_bw_init (which now lives in the library).
  */
+#ifndef SCXSIM_PHASE2_REAL_CGROUP_BW  /* Phase 2: replaced by strong defs in cgroup_bw.bpf.c below */
 extern int sim_cgroup_bw_lib_init(void);
 extern int sim_cgroup_bw_init(void *cgrp);
 extern int sim_cgroup_bw_exit(void *cgrp);
@@ -866,6 +976,236 @@ __attribute__((weak)) int scx_cgroup_bw_dump(
 {
 	return sim_cgroup_bw_dump(cgrp_id, descendent, accurate, indent);
 }
+#endif /* Phase 2: weak forwarders deactivated */
+
+#ifdef SCXSIM_PHASE2_REAL_CGROUP_BW
+/*
+ * =================================================================
+ * Phase 2: compile in scx/lib/cgroup_bw.bpf.c
+ * =================================================================
+ *
+ * tg `compile-scx-cgroup-bw-library-into-scxsim-phase2`. The
+ * production cgroup-bandwidth library is compiled as part of this
+ * translation unit AFTER the LAVD source includes (so `scx_cgroup_bw_*`
+ * call sites inside main.bpf.c bind to the real library symbols, not
+ * the weak shims above) and AFTER scxsim's own glue (so the macro
+ * overrides for arena_*, cast_*, BPF map declarations, and topology
+ * stubs are in scope when the library expands).
+ *
+ * Glue provided here:
+ *
+ *   - `arena_spinlock_t` -> `int` and `arena_spin_lock/_unlock` -> no-op.
+ *     The simulator is single-threaded; the BPF arena spinlock has no
+ *     contention to model. Phase 3 (`design-and-implement-stochastic-
+ *     timer-interleaving-mode-for-scxsim-phase3`) is where genuine
+ *     timing-race coverage will live; until then no-op is correct.
+ *
+ *   - `cast_kern(p)` / `cast_user(p)` -> identity. The arena address-
+ *     space casts that LLVM emits in real BPF compilation are
+ *     unnecessary in userspace -- the pointers are plain x86_64.
+ *
+ *   - `nr_topo_nodes[TOPO_LLC-1] = 1` and `topo_cpu_to_llc_id` returning
+ *     0. cgroup_bw walks per-LLC backlogs (`bpf_for(i, 0, TOPO_NR(LLC))`
+ *     at lib/cgroup_bw.bpf.c:656, 727, 1119, 1623, 1886, 2145, 2492);
+ *     scxsim is single-LLC for the cpu-bw-stall-bug reproducer (see
+ *     `experiments/lavd_cpubw_stalls_202604/SCXSIM_REAL_CGROUP_BW_LIBRARY_DESIGN.md`
+ *     section Phase 2 item 3). Multi-LLC is a Phase-2-followup if
+ *     needed.
+ *
+ *   - `scx_bpf_error` -> `bpf_printk` so library-internal "BUG:"
+ *     messages surface in the printk pipeline rather than aborting
+ *     the simulator (which is not a verifier-style failure mode).
+ *
+ *   - `bpf_rcu_read_lock/unlock` -> no-op. Single-threaded sim.
+ *
+ *   - `bpf_core_field_exists(x)` -> 1. CO-RE field existence is a
+ *     compile-time concept in production BPF; in scxsim every field
+ *     declared in vmlinux.h is present.
+ *
+ *   - `bpf_probe_read_kernel_str` -> bounded strncpy. Used by cgroup_bw
+ *     for cgroup-name diagnostics in dump paths only.
+ */
+
+#include <bpf_arena_common.bpf.h>
+
+/* arena_spin_lock semantics: real BPF uses bpf_arena_spin_lock.h's
+ * qspinlock; we override with no-op pre-include since the simulator
+ * is single-threaded. Must come BEFORE lib/cgroup_bw.bpf.c is
+ * included (which #includes <bpf_arena_spin_lock.h>). */
+#define _BPF_ARENA_SPIN_LOCK_H 1  /* prevent the real header inclusion */
+#define arena_spinlock_t int
+#define arena_spin_lock(lock) ({ (void)(lock); 0; })
+#define arena_spin_unlock(lock) ((void)(lock))
+#define arena_spin_trylock(lock) ({ (void)(lock); 0; })
+
+/* scx_atq_lock / scx_atq_unlock: declared as `static __always_inline`
+ * inside `scx/scheds/include/lib/atq.h` BUT only under `#ifdef __BPF__`.
+ * In our userspace compilation those declarations are not visible, so
+ * cgroup_bw.bpf.c's call sites generate external references that fail
+ * to resolve at .so dlopen. Provide function-style macro wrappers that
+ * expand to a no-op (single-threaded simulator -- the spinlock has no
+ * contention to model). Phase 3
+ * (`design-and-implement-stochastic-timer-interleaving-mode-for-scxsim-phase3`)
+ * is the right place to model the CAS race the lock guards. */
+#define scx_atq_lock(atq)   ({ (void)(atq); 0; })
+#define scx_atq_unlock(atq) ((void)(atq))
+
+/* Kernel SMP memory-order barriers: cgroup_bw.bpf.c uses
+ * smp_load_acquire / smp_store_release / READ_ONCE / WRITE_ONCE on
+ * `cbw_backlog_stat` to coordinate timer-vs-dispatch CAS. The
+ * single-threaded simulator has no concurrent observers, so plain
+ * loads / stores are correct under sequential semantics. Phase 3 will
+ * revisit if stochastic-interleaving needs to expose the race. */
+#ifndef smp_load_acquire
+#define smp_load_acquire(p)        (*(volatile typeof(*(p)) *)(p))
+#endif
+#ifndef smp_store_release
+#define smp_store_release(p, v)    do { *(volatile typeof(*(p)) *)(p) = (v); } while (0)
+#endif
+#ifndef READ_ONCE
+#define READ_ONCE(x)               (*(volatile typeof(x) *)&(x))
+#endif
+#ifndef WRITE_ONCE
+#define WRITE_ONCE(x, val)         do { *(volatile typeof(x) *)&(x) = (val); } while (0)
+#endif
+#ifndef smp_mb
+#define smp_mb() __asm__ __volatile__("" ::: "memory")
+#endif
+
+/* `scx_atq_create(fifo)` is a macro inside `lib/atq.h` under
+ * `#ifdef __BPF__`. The function declaration of
+ * `scx_atq_create_internal` lives in `lib/scxtest/overrides.h` (which
+ * is transitively included). We just need to add the macro so
+ * cgroup_bw.bpf.c's `scx_atq_create(false)` (lib/cgroup_bw.bpf.c:610)
+ * expands to a call into csrc/sim_atq.c. */
+#ifndef scx_atq_create
+#define scx_atq_create(fifo) scx_atq_create_internal((fifo), (unsigned long)-1)
+#endif
+
+/* cast_kern / cast_user identity. These macros are no-ops in production
+ * BPF when LLVM has __BPF_FEATURE_ADDR_SPACE_CAST, which is the case
+ * for the toolchain scxsim builds with -- but bpf_arena_common.bpf.h
+ * conditionally redefines them to inline asm if the feature is missing.
+ * Force the no-op definition to keep the userspace path simple. */
+#undef cast_kern
+#define cast_kern(ptr) /* nop */
+#undef cast_user
+#define cast_user(ptr) /* nop */
+
+/* RCU read lock no-ops. */
+#define bpf_rcu_read_lock()   ((void)0)
+#define bpf_rcu_read_unlock() ((void)0)
+
+/* CO-RE field existence: scxsim's task_struct (from vmlinux.h) is the
+ * real kernel layout, so every field cgroup_bw probes via
+ * `bpf_core_field_exists` is in fact present. Override to return 1.
+ *
+ * NOTE: this also flips LAVD's `scx_lib_init` check (probes whether
+ * `task_struct::migration_disabled` exists). With the override -> 1,
+ * scx_lib_init proceeds to dereference
+ * `bpf_get_current_task_btf()->migration_disabled`. scxsim's synthetic
+ * idle task is a zero-filled `struct task_struct`, so reading any
+ * field returns 0 -- safe. Phase 1 multi-timer + Phase 2 stub mode
+ * tests confirm no crash from this path.
+ */
+#undef bpf_core_field_exists
+#define bpf_core_field_exists(...) 1
+
+/* `bpf_probe_read_kernel_str` is already provided by `csrc/sim_wrapper.h`
+ * (included transitively); no override needed here. */
+
+/* scx_bpf_error -> stderr (don't abort sim). */
+extern int dprintf(int fd, const char *fmt, ...);
+#undef scx_bpf_error
+#define scx_bpf_error(fmt, ...) dprintf(2, "scx_bpf_error: " fmt "\n", ##__VA_ARGS__)
+
+/* bpf_printk override.
+ *
+ * Production BPF: `bpf_printk(fmt, args...)` expands (via
+ * `<bpf/bpf_helpers.h>`) to `__bpf_printk` which calls
+ * `bpf_trace_printk(__fmt, sizeof(__fmt), ##args)`. Both
+ * `bpf_trace_printk` and `bpf_trace_vprintk` are kernel BPF helpers
+ * resolved by the verifier; they have NO userspace counterpart in
+ * scxsim, so dlopen leaves them as undefined-weak (resolved to NULL
+ * function pointers). The first cgroup_bw `cbw_err` / `cbw_dbg` call
+ * therefore SIGSEGVs the simulator with `PC ~= 0`.
+ *
+ * Phase 2 fix: short-circuit `bpf_printk` to `dprintf(2, ...)` so the
+ * library's diagnostics surface in the existing `[LAVD-PRINTK]` stderr
+ * stream rather than crashing. The format-string variadic chain is
+ * portable to glibc dprintf -- the BPF-helper wrapping just adds an
+ * unused length argument.
+ */
+#undef bpf_printk
+#define bpf_printk(fmt, ...) dprintf(2, "[LAVD-PRINTK] " fmt "\n", ##__VA_ARGS__)
+
+/* Topology stubs: single-LLC simulator. cgroup_bw uses TOPO_NR(LLC)
+ * to size per-LLC backlog walks. Pull in lib/topology.h for the
+ * TOPO_MAX_LEVEL constant; the stubs must be visible BEFORE
+ * cgroup_bw.bpf.c is included. */
+#include <lib/topology.h>
+int nr_topo_nodes[TOPO_MAX_LEVEL] = {1, 1, 1, 1, 1};
+int topo_cpu_to_llc_id(u32 cpu) { (void)cpu; return 0; }
+
+/* Map registration glue: cgroup_bw declares cbw_cgrp_map (CGRP_STORAGE),
+ * cbw_cgrp_llc_map (HASH), tree_levels_map (PERCPU_ARRAY), and the
+ * two timer maps (replenish_timer, accounting_timer). Forward-declare
+ * the map symbol names so we can register them via INIT_SCX_TEST_MAP
+ * after the library is included. */
+
+/*
+ * The actual library inclusion. Order matters:
+ *   - main.bpf.c (LAVD) is already included above; its scx_cgroup_bw_*
+ *     call sites are still pointing at the weak wrapper.c shims here
+ *     because the strong defs from cgroup_bw.bpf.c haven't been seen
+ *     yet. The linker resolves call sites AFTER the whole TU is
+ *     compiled, so the strong defs win.
+ *   - cgroup_bw.bpf.c declares its own scx_cgroup_bw_* functions
+ *     non-weak, so the linker promotes them and demotes the weak ones.
+ *   - cgroup_bw.bpf.c calls scx_cgroup_bw_enqueue_cb -- defined by
+ *     LAVD's REGISTER_SCX_CGROUP_BW_ENQUEUE_CB macro (main.bpf.c:2302).
+ *   - cgroup_bw.bpf.c calls scx_atq_* -- resolves to csrc/sim_atq.c
+ *     (Phase 1 item 7) at .so dlopen via -rdynamic.
+ */
+#include "../../scx/lib/cgroup_bw.bpf.c"
+
+/*
+ * Phase 2: register cgroup_bw's BPF maps with scx_test_map. Must be
+ * defined AFTER the include so the map symbols (replenish_timer,
+ * accounting_timer, cbw_cgrp_map, cbw_cgrp_llc_map, tree_levels_map)
+ * and value-types (struct replenish_timer, struct accounting_timer,
+ * struct scx_cgroup_ctx, struct scx_cgroup_llc_ctx, struct tree_levels)
+ * are in scope.
+ */
+static void lavd_register_cbw_maps(void)
+{
+	cbw_replenish_timer_map_ptr = (void *)&replenish_timer;
+	cbw_accounting_timer_map_ptr = (void *)&accounting_timer;
+	__builtin_memset(cbw_replenish_timer_storage, 0,
+			 sizeof(cbw_replenish_timer_storage));
+	__builtin_memset(cbw_accounting_timer_storage, 0,
+			 sizeof(cbw_accounting_timer_storage));
+
+	/* CGRP_STORAGE: keyed by struct cgroup *, value = scx_cgroup_ctx.
+	 * BPF_MAP_TYPE_CGRP_STORAGE has no max_entries field; use the
+	 * TASK_STORAGE-style init which hardcodes max_entries = 100 (the
+	 * scxsim cap on simulated cgroups; bumped via Phase-1 SDT scale-up
+	 * if needed). */
+	INIT_SCX_TEST_MAP_FROM_TASK_STORAGE(&cbw_cgrp_test_map, cbw_cgrp_map);
+	scx_test_map_register(&cbw_cgrp_test_map, &cbw_cgrp_map);
+
+	/* HASH: keyed by cgroup_llc_id, value = scx_cgroup_llc_ctx. */
+	INIT_SCX_TEST_MAP(&cbw_cgrp_llc_test_map, cbw_cgrp_llc_map);
+	scx_test_map_register(&cbw_cgrp_llc_test_map, &cbw_cgrp_llc_map);
+
+	/* PERCPU_ARRAY tree_levels_map: keyed by u32, value = struct tree_levels.
+	 * Allocate per-CPU storage; MAX_SIM_CPUS is the simulator ceiling. */
+	cbw_tree_levels_test_map = scx_alloc_percpu_test_map(MAX_SIM_CPUS);
+	INIT_SCX_PERCPU_TEST_MAP(cbw_tree_levels_test_map, tree_levels_map);
+	scx_register_percpu_test_map(cbw_tree_levels_test_map,
+				     &tree_levels_map);
+}
+#endif /* SCXSIM_PHASE2_REAL_CGROUP_BW */
 
 /*
  * =================================================================
@@ -875,18 +1215,26 @@ __attribute__((weak)) int scx_cgroup_bw_dump(
  * Called from Rust before lavd_init() to initialize globals,
  * register maps, and install the SIGFPE handler.
  */
+extern int dprintf(int fd, const char *fmt, ...);
 void lavd_setup(unsigned int num_cpus)
 {
 	unsigned int cpu;
 
+	dprintf(2, "[PHASE2-DBG] lavd_setup enter cpus=%u\n", num_cpus);
 	/* Install SIGFPE handler for BPF div-by-zero semantics */
 	sim_install_sigfpe_handler();
+	dprintf(2, "[PHASE2-DBG] sigfpe installed\n");
 
 	/* Initialize per-task arena storage for task_ctx */
 	scx_task_init(sizeof(struct task_ctx));
+	dprintf(2, "[PHASE2-DBG] scx_task_init done\n");
 
 	/* Register maps */
 	lavd_register_maps();
+#ifdef SCXSIM_PHASE2_REAL_CGROUP_BW
+	lavd_register_cbw_maps();
+#endif
+	dprintf(2, "[PHASE2-DBG] lavd_register_maps done\n");
 
 	/* Core globals */
 	nr_cpus_onln = num_cpus;
@@ -940,6 +1288,7 @@ void lavd_setup(unsigned int num_cpus)
 			cpdomc->__cpumask[cpu / 64] |=
 				(1ULL << (cpu % 64));
 	}
+	dprintf(2, "[PHASE2-DBG] lavd_setup exit\n");
 }
 
 /*
