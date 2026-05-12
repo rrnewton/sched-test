@@ -54,6 +54,43 @@ endif
 
 CFLAGS := $(CFLAGS_BASE) $(CFLAGS_COV)
 
+# --- scx cgroup_bw API version detection ---
+#
+# Between scx commits a08c9e272b (Apr 23 2026, OLD API) and 6f4921a6c6
+# (Apr 30 2026, NEW API), the lib/cgroup_bw.bpf.c API switched some
+# function signatures from `(struct cgroup *cgrp, ...)` to
+# `(u64 cgrp_id, ...)`. Specifically:
+#
+#   - scx_cgroup_bw_throttled
+#   - scx_cgroup_bw_consume
+#   - scx_cgroup_bw_put_aside
+#
+# A new public symbol (`struct scx_task_cgroup_bw`) was added to
+# scheds/include/lib/cgroup.h at the same flag-day. We probe for that
+# symbol to pick the right wrapper signature for this scheduler at
+# build time. See scx-sim/schedulers/lavd/wrapper.c for the matching
+# `#ifdef SCX_CGROUP_BW_NEW_API` branches and tg task
+# `fix-wrapper-c-old-new-cgroup-bw-api-conditional`.
+#
+# Detection is idempotent and runs at every Make invocation; the result
+# is then injected as `-DSCX_CGROUP_BW_NEW_API=1` (NEW) or absent (OLD)
+# via $(CFLAGS_BPF_API).
+SCX_CGROUP_BW_API := $(shell \
+    if test -f $(ROOT_DIR)/scheds/include/lib/cgroup.h && \
+       grep -q '^struct scx_task_cgroup_bw' \
+            $(ROOT_DIR)/scheds/include/lib/cgroup.h ; then \
+        echo NEW ; \
+    else \
+        echo OLD ; \
+    fi)
+ifeq ($(SCX_CGROUP_BW_API),NEW)
+CFLAGS_BPF_API := -DSCX_CGROUP_BW_NEW_API=1
+else
+CFLAGS_BPF_API :=
+endif
+$(info scx-sim/schedulers: detected cgroup_bw API = $(SCX_CGROUP_BW_API))
+CFLAGS += $(CFLAGS_BPF_API)
+
 INCLUDES := -I$(SIMULATOR_DIR)/csrc \
             -I$(ROOT_DIR)/lib/scxtest \
             -I$(ROOT_DIR)/scheds/include \

@@ -667,6 +667,74 @@ __attribute__((weak)) int scx_cgroup_bw_set(
 	return sim_cgroup_bw_set((void *)cgrp, period, quota, burst);
 }
 
+/*
+ * cgroup_bw API version split.
+ *
+ * Between scx commits a08c9e272b (Apr 23 2026, OLD API) and 6f4921a6c6
+ * (Apr 30 2026, NEW API), three of these functions changed signature:
+ *
+ *   OLD:  scx_cgroup_bw_throttled (struct cgroup *cgrp,
+ *                                  struct task_struct *p)
+ *   NEW:  scx_cgroup_bw_throttled (u64 cgrp_id,
+ *                                  struct task_struct *p, u64 taskc)
+ *
+ *   OLD:  scx_cgroup_bw_consume   (struct cgroup *cgrp, u64 runtime)
+ *   NEW:  scx_cgroup_bw_consume   (u64 cgrp_id, u64 consumed_ns,
+ *                                  u64 taskc_raw)
+ *
+ *   OLD:  scx_cgroup_bw_put_aside (struct task_struct *p, u64 taskc,
+ *                                  u64 vtime, struct cgroup *cgrp)
+ *   NEW:  scx_cgroup_bw_put_aside (struct task_struct *p, u64 ctx,
+ *                                  u64 vtime, u64 cgrp_id)
+ *
+ * The remaining scx_cgroup_bw_* entry points (lib_init, init, exit, set,
+ * reenqueue, cancel, move, dump, is_cgroup_throttled, is_task_throttled)
+ * kept their signatures across the flag-day.
+ *
+ * `SCX_CGROUP_BW_NEW_API` is defined to 1 by `schedulers/Makefile` when
+ * the scx submodule's `scheds/include/lib/cgroup.h` defines
+ * `struct scx_task_cgroup_bw` (the NEW-API marker). Without that define,
+ * the OLD-API signatures are emitted (matching scx pre-Apr-30-2026 SHAs).
+ *
+ * Both branches dispatch into the same `sim_cgroup_bw_*` Rust shims that
+ * take `struct cgroup *`; the NEW-API branch resolves cgrp_id back to a
+ * `struct cgroup *` via `sim_cgroup_lookup_by_id` (the registry's
+ * id->ptr lookup). This preserves identical engine-side semantics across
+ * both API versions for the cpu-bw-stall-bug scx-version matrix. See tg
+ * task `fix-wrapper-c-old-new-cgroup-bw-api-conditional` for the full
+ * rationale and the v2-matrix verification recipe.
+ */
+#if defined(SCX_CGROUP_BW_NEW_API) && SCX_CGROUP_BW_NEW_API
+
+__attribute__((weak)) int scx_cgroup_bw_throttled(u64 cgrp_id,
+					   struct task_struct *p, u64 taskc)
+{
+	struct cgroup *cgrp;
+	(void)p;
+	(void)taskc;
+	cgrp = (struct cgroup *)sim_cgroup_lookup_by_id(cgrp_id);
+	return sim_cgroup_bw_throttled((void *)cgrp);
+}
+
+__attribute__((weak)) int scx_cgroup_bw_consume(
+	u64 cgrp_id, u64 consumed_ns, u64 taskc_raw)
+{
+	struct cgroup *cgrp;
+	(void)taskc_raw;
+	cgrp = (struct cgroup *)sim_cgroup_lookup_by_id(cgrp_id);
+	return sim_cgroup_bw_consume((void *)cgrp, consumed_ns);
+}
+
+__attribute__((weak)) int scx_cgroup_bw_put_aside(
+	struct task_struct *p, u64 ctx, u64 vtime, u64 cgrp_id)
+{
+	struct cgroup *cgrp;
+	cgrp = (struct cgroup *)sim_cgroup_lookup_by_id(cgrp_id);
+	return sim_cgroup_bw_put_aside((void *)p, ctx, vtime, (void *)cgrp);
+}
+
+#else /* OLD API: pre-Apr-30-2026 scx SHAs */
+
 __attribute__((weak)) int scx_cgroup_bw_throttled(struct cgroup *cgrp,
 					   struct task_struct *p)
 {
@@ -685,6 +753,8 @@ __attribute__((weak)) int scx_cgroup_bw_put_aside(
 {
 	return sim_cgroup_bw_put_aside((void *)p, taskc, vtime, (void *)cgrp);
 }
+
+#endif /* SCX_CGROUP_BW_NEW_API */
 
 __attribute__((weak)) int scx_cgroup_bw_reenqueue(void)
 {
