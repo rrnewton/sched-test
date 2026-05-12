@@ -2446,36 +2446,183 @@ pub extern "C" fn bpf_cgroup_acquire(_cgrp: *mut c_void) -> *mut c_void {
 #[no_mangle]
 pub extern "C" fn bpf_cgroup_release(_cgrp: *mut c_void) {}
 
-/// Get per-cgroup BPF local storage. Returns NULL (not yet modeled).
+// ---------------------------------------------------------------------------
+// Per-cgroup / per-task local storage + per-CPU array shims.
+//
+// These three kfuncs were previously NULL-returning stubs (a clear
+// no-stub-policy violation). Phase 1 BPF infra scale-up items 5 + 6
+// (tg `scxsim-bpf-infra-scale-up-phase1`) retire them by delegating to
+// the existing scxtest map machinery at `lib/scxtest/scx_test_map.c`,
+// which knows how to look up the registered map's value-size and
+// allocate / fetch / delete a slot keyed by the pointer the caller
+// passed in.
+//
+// The C entry points -- `scx_test_cgrp_storage_get`,
+// `scx_test_task_storage_get`, `scx_test_map_lookup_percpu_elem`,
+// `scx_test_cgrp_storage_delete`, `scx_test_map_delete_elem` -- are
+// the same ones that scheduler wrapper.c files install via macro
+// `#define`; the kfuncs.rs versions below provide the strong symbols
+// resolved at .so load time when a wrapper has NOT installed an
+// override. After Phase 2 wires `cgroup_bw.bpf.c` into the LAVD
+// wrapper, the cgroup-storage call sites inside the library will
+// resolve to these kfuncs (because the library is `#include`d AFTER
+// the macro establishment, but the macro is a compile-time
+// substitution that DOES apply to the included source).
+//
+// Either path runs the same C implementation -- single source of
+// truth for the per-cgroup / per-task / per-CPU storage semantics.
+// ---------------------------------------------------------------------------
+
+extern "C" {
+    fn scx_test_cgrp_storage_get(
+        map: *mut c_void,
+        cgrp_ptr_loc: *const c_void,
+        value: *mut c_void,
+        flags: u64,
+    ) -> *mut c_void;
+    fn scx_test_cgrp_storage_delete(
+        map: *mut c_void,
+        cgrp_ptr_loc: *const c_void,
+    ) -> i32;
+    fn scx_test_task_storage_get(
+        map: *mut c_void,
+        task_ptr_loc: *const c_void,
+        value: *mut c_void,
+        flags: u64,
+    ) -> *mut c_void;
+    fn scx_test_map_delete_elem(map: *mut c_void, key: *const c_void) -> i32;
+    fn scx_test_map_lookup_percpu_elem(
+        map: *mut c_void,
+        key: *const c_void,
+        cpu: i32,
+    ) -> *mut c_void;
+}
+
+/// Get per-cgroup BPF local storage.
+///
+/// Phase 1 BPF infra scale-up item 5: real implementation backed by
+/// `scx_test_cgrp_storage_get` (which itself delegates to the same
+/// machinery as task storage -- both are pointer-keyed open-addressing
+/// over a registered `scx_test_map`). Honors
+/// `BPF_LOCAL_STORAGE_GET_F_CREATE` (flag bit 0); the BPF map must
+/// have been registered via `scx_test_map_register` so that the
+/// per-cgroup value_size is known.
+///
+/// `cgrp` is the `struct cgroup *` cast to `*mut c_void`. We pass its
+/// ADDRESS as the key (`&cgrp`) so the open-addressing layer
+/// memcmps `sizeof(void *)` bytes -- matching how the C-side scxtest
+/// task_storage uses the task pointer as a key.
 #[no_mangle]
 pub extern "C" fn bpf_cgrp_storage_get(
-    _map: *mut c_void,
-    _cgrp: *mut c_void,
-    _value: *mut c_void,
-    _flags: u64,
+    map: *mut c_void,
+    cgrp: *mut c_void,
+    value: *mut c_void,
+    flags: u64,
 ) -> *mut c_void {
-    ptr::null_mut()
+    if map.is_null() {
+        return ptr::null_mut();
+    }
+    // SAFETY: we're handing C three pointers. `&cgrp` is the address of
+    // a local variable holding `cgrp`; the C side memcmps it for
+    // `sizeof(void *)` bytes against stored keys. This is the same
+    // calling convention `bpf_task_storage_get` uses below.
+    unsafe {
+        scx_test_cgrp_storage_get(
+            map,
+            &cgrp as *const _ as *const c_void,
+            value,
+            flags,
+        )
+    }
 }
 
-/// Get per-task BPF local storage. Returns NULL (not yet modeled).
+/// Drop a per-cgroup BPF local-storage slot.
+///
+/// Phase 1 BPF infra scale-up item 5: required by Phase 2's compiled-in
+/// `scx/lib/cgroup_bw.bpf.c::cbw_del_cgroup_ctx` which calls
+/// `bpf_cgrp_storage_delete(&cbw_cgrp_map, cgrp)` to drop a cgroup's
+/// bandwidth-control context on cgroup exit. Returns 0 on success,
+/// `-ENOENT` (-2) if the slot was not present.
+#[no_mangle]
+pub extern "C" fn bpf_cgrp_storage_delete(
+    map: *mut c_void,
+    cgrp: *mut c_void,
+) -> i64 {
+    if map.is_null() {
+        return -2; // -ENOENT
+    }
+    // SAFETY: same key-by-address convention as bpf_cgrp_storage_get.
+    let rc = unsafe {
+        scx_test_cgrp_storage_delete(map, &cgrp as *const _ as *const c_void)
+    };
+    if rc == 0 { 0 } else { -2 } // -ENOENT
+}
+
+/// Get per-task BPF local storage.
+///
+/// Phase 1 BPF infra scale-up item 5: real implementation backed by
+/// `scx_test_task_storage_get`. Same calling convention and storage
+/// semantics as `bpf_cgrp_storage_get` above (pointer-by-address as
+/// the key, value-size from the registered `scx_test_map`).
 #[no_mangle]
 pub extern "C" fn bpf_task_storage_get(
-    _map: *mut c_void,
-    _task: *mut c_void,
-    _value: *mut c_void,
-    _flags: u64,
+    map: *mut c_void,
+    task: *mut c_void,
+    value: *mut c_void,
+    flags: u64,
 ) -> *mut c_void {
-    ptr::null_mut()
+    if map.is_null() {
+        return ptr::null_mut();
+    }
+    // SAFETY: hand C the address of `task` as the key; same convention
+    // as bpf_cgrp_storage_get.
+    unsafe {
+        scx_test_task_storage_get(
+            map,
+            &task as *const _ as *const c_void,
+            value,
+            flags,
+        )
+    }
 }
 
-/// Look up per-CPU array element. Returns NULL (not yet modeled).
+/// Drop a per-task BPF local-storage slot.
+///
+/// Pairs with `bpf_task_storage_get` for completeness (cgroup_bw and
+/// other Phase 2 / Phase 3 libraries call delete on task exit).
+#[no_mangle]
+pub extern "C" fn bpf_task_storage_delete(
+    map: *mut c_void,
+    task: *mut c_void,
+) -> i64 {
+    if map.is_null() {
+        return -2; // -ENOENT
+    }
+    let rc = unsafe {
+        scx_test_map_delete_elem(map, &task as *const _ as *const c_void)
+    };
+    if rc == 0 { 0 } else { -2 }
+}
+
+/// Look up per-CPU array element.
+///
+/// Phase 1 BPF infra scale-up item 6: real implementation backed by
+/// `scx_test_map_lookup_percpu_elem`. Replaces the prior NULL stub.
+/// The map must have been registered via `scx_register_percpu_test_map`
+/// (typically through `INIT_SCX_PERCPU_TEST_MAP` in a wrapper.c
+/// `register_maps()` function); unregistered maps return NULL.
 #[no_mangle]
 pub extern "C" fn bpf_map_lookup_percpu_elem(
-    _map: *mut c_void,
-    _key: *const c_void,
-    _cpu: u32,
+    map: *mut c_void,
+    key: *const c_void,
+    cpu: u32,
 ) -> *mut c_void {
-    ptr::null_mut()
+    if map.is_null() {
+        return ptr::null_mut();
+    }
+    // SAFETY: forward to the C lookup machinery, which handles the
+    // null-map and missing-key cases internally.
+    unsafe { scx_test_map_lookup_percpu_elem(map, key, cpu as i32) }
 }
 
 /// Check if a task is currently running on any CPU.

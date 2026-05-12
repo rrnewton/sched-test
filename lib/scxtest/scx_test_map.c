@@ -232,6 +232,92 @@ int scx_test_map_update_elem(void *map, const void *key, const void *value,
 	RBC_GUARD_RETURN(map_update_elem(test_map, key, value, flags));
 }
 
+/*
+ * Delete a (key) from a scx_test_map.
+ *
+ * Returns 0 on success, -1 if not found. Used to back
+ * `bpf_task_storage_delete` and `bpf_cgrp_storage_delete` in the
+ * simulator -- the kernel API contract is the same: drop the slot
+ * for `key`, return -ENOENT if it wasn't there.
+ *
+ * Phase 1 BPF infra scale-up (tg `scxsim-bpf-infra-scale-up-phase1`,
+ * design doc section Phase 1 item 5): retires the prior NULL-returning
+ * delete stub so Phase 2's compiled-in `cgroup_bw.bpf.c` can call
+ * `bpf_cgrp_storage_delete(&cbw_cgrp_map, cgrp)` and observe the
+ * production semantics (slot dropped, subsequent
+ * `bpf_cgrp_storage_get(... 0)` returns NULL).
+ *
+ * Implementation: linear scan, swap-remove. The map is small
+ * (max_entries bounded by the BPF map declaration) and the simulator
+ * is single-threaded so no locking is needed. Subsequent inserts may
+ * reuse the freed slot index.
+ */
+int scx_test_map_delete_elem(void *map, const void *key)
+{
+	RBC_GUARD_START;
+	struct scx_test_map *test_map = scx_test_map_lookup(map, 0);
+	if (!test_map)
+		RBC_GUARD_RETURN(-1);
+
+	for (int i = 0; i < test_map->nr; i++) {
+		if (memcmp(SCX_MAP_KEY(test_map, i), key,
+			   test_map->key_size) == 0) {
+			int last = test_map->nr - 1;
+			if (i != last) {
+				memcpy(SCX_MAP_KEY(test_map, i),
+				       SCX_MAP_KEY(test_map, last),
+				       test_map->key_size);
+				memcpy(SCX_MAP_VALUE(test_map, i),
+				       SCX_MAP_VALUE(test_map, last),
+				       test_map->value_size);
+			}
+			test_map->nr = last;
+			RBC_GUARD_RETURN(0);
+		}
+	}
+	RBC_GUARD_RETURN(-1);
+}
+
+/*
+ * Per-cgroup local storage shim.
+ *
+ * Mirrors the kernel `bpf_cgrp_storage_get(map, cgrp, value, flags)`
+ * contract. The map is treated as a hash table keyed by the
+ * `struct cgroup *` pointer (the same way `scx_test_task_storage_get`
+ * uses the `struct task_struct *` pointer). The value_size is read
+ * from the registered scx_test_map -- the BPF map's
+ * `BPF_MAP_TYPE_CGRP_STORAGE` declaration provides it via
+ * `INIT_SCX_TEST_MAP_FROM_TASK_STORAGE` (or its CGRP_STORAGE-named
+ * sibling).
+ *
+ * Implementation note: the semantics of TASK_STORAGE and CGRP_STORAGE
+ * are byte-identical at our level of abstraction (key = pointer,
+ * value-size = map declaration, optional create-on-demand). Delegate
+ * to the existing task-storage entry point to avoid duplicating the
+ * insert / create logic.
+ *
+ * Phase 1 BPF infra scale-up item 5: retires the kfuncs.rs:2451
+ * NULL-returning stub of `bpf_cgrp_storage_get`. The replacement
+ * Rust impl in `unsafe_impl::kfuncs` delegates here for any registered
+ * map, falling back to NULL only for unregistered maps (which would
+ * be a usage error -- a real BPF program cannot use an unregistered
+ * map either).
+ */
+void *scx_test_cgrp_storage_get(void *map, const void *cgrp_ptr_loc,
+				void *value, unsigned long flags)
+{
+	return scx_test_task_storage_get(map, cgrp_ptr_loc, value, flags);
+}
+
+/*
+ * Drop a per-cgroup local-storage slot. Same semantics as
+ * `bpf_cgrp_storage_delete(map, cgrp)`.
+ */
+int scx_test_cgrp_storage_delete(void *map, const void *cgrp_ptr_loc)
+{
+	return scx_test_map_delete_elem(map, cgrp_ptr_loc);
+}
+
 int scx_test_map_update_percpu_elem(void *map, const void *key, const void *value,
 				    int cpu, unsigned long flags)
 {

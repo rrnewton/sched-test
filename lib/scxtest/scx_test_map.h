@@ -32,6 +32,31 @@ void *scx_test_task_storage_get(void *map, const void *key, void *value,
 				unsigned long flags);
 
 /*
+ * Phase 1 BPF infra scale-up item 5: real per-cgroup local storage.
+ *
+ * `scx_test_cgrp_storage_get(map, cgrp_ptr_loc, value, flags)` returns
+ * the per-cgroup slot for `cgrp_ptr_loc` (the address of a
+ * `struct cgroup *` value) in `map`, allocating a new zero-initialized
+ * (or `value`-initialized) slot when `flags &
+ * BPF_LOCAL_STORAGE_GET_F_CREATE` is set and the slot did not already
+ * exist. Returns NULL if no slot exists and CREATE was not requested.
+ *
+ * `scx_test_cgrp_storage_delete(map, cgrp_ptr_loc)` drops the slot;
+ * returns 0 on success, -1 if the slot was not present.
+ *
+ * Both functions delegate to the same generic open-addressing-by-key
+ * machinery that backs `scx_test_task_storage_get`. The BPF map must
+ * have been registered via `scx_test_map_register` so that
+ * `value_size` is known; the wrapper.c initializer chain typically
+ * uses `INIT_SCX_TEST_MAP` against the cgroup-storage BPF map
+ * declaration.
+ */
+void *scx_test_cgrp_storage_get(void *map, const void *cgrp_ptr_loc,
+				void *value, unsigned long flags);
+int scx_test_cgrp_storage_delete(void *map, const void *cgrp_ptr_loc);
+int scx_test_map_delete_elem(void *map, const void *key);
+
+/*
  * The kernel doesn't have this, it always does it on it's current CPU, but we
  * need this for unit testing to update a specific cpu's map.
  */
