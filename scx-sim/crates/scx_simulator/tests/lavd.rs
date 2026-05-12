@@ -8982,6 +8982,157 @@ fn test_lavd_migration_disabled_kworker_scenario() {
     // If this test fails with ErrorBpf, it means LAVD has a bug!
 }
 
+const DSQ_LOCAL_REGRESSION_VICTIM: Pid = Pid(1);
+const DSQ_LOCAL_REGRESSION_KERNEL_CPU: CpuId = CpuId(8);
+const DSQ_LOCAL_REGRESSION_MD_START_NS: u64 = 270_000;
+
+fn dsq_local_regression_allowed_cpus() -> Vec<CpuId> {
+    (DSQ_LOCAL_REGRESSION_KERNEL_CPU.0..32).map(CpuId).collect()
+}
+
+fn lavd_dsq_local_migration_disabled_scenario() -> Scenario {
+    const PF_KTHREAD: u32 = 0x00200000;
+    const PF_WQ_WORKER: u32 = 0x00000020;
+
+    Scenario::builder()
+        .cpus(32)
+        .deferred_local_dsq_resolution(50_000, 50_000)
+        .task(TaskDef {
+            name: "ScribePR0".into(),
+            pid: DSQ_LOCAL_REGRESSION_VICTIM,
+            nice: 0,
+            behavior: TaskBehavior {
+                phases: vec![
+                    Phase::Run(20_000),
+                    Phase::Sleep(200_000),
+                    Phase::Run(80_000),
+                ],
+                repeat: RepeatMode::Forever,
+            },
+            start_time_ns: 0,
+            mm_id: None,
+            allowed_cpus: Some(dsq_local_regression_allowed_cpus()),
+            parent_pid: None,
+            cgroup_name: None,
+            task_flags: PF_KTHREAD | PF_WQ_WORKER,
+            migration_disabled: 0,
+        })
+        .task(TaskDef {
+            name: "cpu8_load".into(),
+            pid: Pid(2),
+            nice: 0,
+            behavior: TaskBehavior {
+                phases: vec![Phase::Run(500_000), Phase::Sleep(100_000)],
+                repeat: RepeatMode::Forever,
+            },
+            start_time_ns: 80_000,
+            mm_id: None,
+            allowed_cpus: Some(vec![DSQ_LOCAL_REGRESSION_KERNEL_CPU]),
+            parent_pid: None,
+            cgroup_name: None,
+            task_flags: 0,
+            migration_disabled: 0,
+        })
+        .task(TaskDef {
+            name: "remote_load_31".into(),
+            pid: Pid(3),
+            nice: 0,
+            behavior: TaskBehavior {
+                phases: vec![Phase::Run(400_000), Phase::Sleep(100_000)],
+                repeat: RepeatMode::Forever,
+            },
+            start_time_ns: 100_000,
+            mm_id: None,
+            allowed_cpus: Some(vec![CpuId(31)]),
+            parent_pid: None,
+            cgroup_name: None,
+            task_flags: 0,
+            migration_disabled: 0,
+        })
+        .migration_disabled_window(
+            DSQ_LOCAL_REGRESSION_VICTIM,
+            DSQ_LOCAL_REGRESSION_MD_START_NS,
+            100_000,
+            2,
+        )
+        .detect_bpf_errors()
+        .duration_ms(2)
+        .build()
+}
+
+fn assert_lavd_dsq_local_migration_disabled_reject(trace: &Trace) {
+    if !matches!(trace.exit_kind(), ExitKind::ErrorBpf(_)) {
+        trace.dump();
+    }
+    assert!(matches!(trace.exit_kind(), ExitKind::ErrorBpf(_)));
+
+    let rejected = trace.events().iter().find(|event| {
+        matches!(
+            event.kind,
+            TraceKind::DispatchRejected {
+                kind: scx_simulator::trace::LocalDsqKind::Local,
+                pid: DSQ_LOCAL_REGRESSION_VICTIM,
+                from_cpu: DSQ_LOCAL_REGRESSION_KERNEL_CPU,
+                target_cpu,
+                reason: scx_simulator::trace::DispatchRejectReason::MigrationDisabled,
+            } if target_cpu != DSQ_LOCAL_REGRESSION_KERNEL_CPU
+        )
+    });
+
+    assert!(
+        rejected.is_some(),
+        "expected migration-disabled SCX_DSQ_LOCAL rejection for ScribePR0 from CPU 8"
+    );
+}
+
+#[test]
+fn test_lavd_dsq_local_rejects_migration_disabled_remote_dispatch() {
+    let _lock = common::setup_test();
+    let sched = DynamicScheduler::lavd(32);
+    sched.lavd_set_power_mode(LavdPowerMode::Performance);
+
+    let trace = Simulator::new(sched).run(lavd_dsq_local_migration_disabled_scenario());
+
+    assert_lavd_dsq_local_migration_disabled_reject(&trace);
+}
+
+/// Requires rrnewton/scx `feat/lavd-migration-disabled-guard` at scx commit
+/// 3bc35696 or a descendant with the final local-DSQ migration-disabled guard.
+#[test]
+#[ignore = "requires guarded LAVD submodule: rrnewton/scx feat/lavd-migration-disabled-guard @ 3bc35696"]
+fn test_lavd_migration_disabled_guard_retargets_local_dispatch() {
+    let _lock = common::setup_test();
+    let sched = DynamicScheduler::lavd(32);
+    sched.lavd_set_power_mode(LavdPowerMode::Performance);
+
+    let trace = Simulator::new(sched).run(lavd_dsq_local_migration_disabled_scenario());
+
+    assert!(
+        !matches!(trace.exit_kind(), ExitKind::ErrorBpf(_)),
+        "guarded LAVD should retarget instead of tripping ErrorBpf: {:?}",
+        trace.exit_kind()
+    );
+    assert!(!trace.events().iter().any(|event| {
+        matches!(
+            event.kind,
+            TraceKind::DispatchRejected {
+                reason: scx_simulator::trace::DispatchRejectReason::MigrationDisabled,
+                ..
+            }
+        )
+    }));
+    assert!(trace.events().iter().any(|event| {
+        event.time_ns > DSQ_LOCAL_REGRESSION_MD_START_NS
+            && event.cpu == DSQ_LOCAL_REGRESSION_KERNEL_CPU
+            && matches!(
+                event.kind,
+                TraceKind::TaskScheduled {
+                    pid: DSQ_LOCAL_REGRESSION_VICTIM
+                }
+            )
+    }));
+}
+
 /// Alternative test: Task with restricted cpumask dispatched to wrong CPU.
 ///
 /// This is a simpler variant that tests cpumask validation rather than
