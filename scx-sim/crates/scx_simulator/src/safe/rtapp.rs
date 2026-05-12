@@ -326,9 +326,7 @@ fn parse_task_flags(value: Option<&Value>) -> Result<u32, RtAppError> {
     }
 }
 
-fn scxsim_config<'a>(
-    root_obj: &'a Map<String, Value>,
-) -> Result<Option<&'a Map<String, Value>>, RtAppError> {
+fn scxsim_config(root_obj: &Map<String, Value>) -> Result<Option<&Map<String, Value>>, RtAppError> {
     match (root_obj.get("scxsim"), root_obj.get("simulator")) {
         (Some(_), Some(_)) => Err(RtAppError::InvalidValue(
             "top-level scxsim and simulator blocks are aliases; specify only one".into(),
