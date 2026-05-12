@@ -20,14 +20,30 @@
 #define SIM_ARENA_H
 
 /*
- * Arena capacity: 4 MiB, sufficient for:
- *   - 1024 per-task contexts (up to ~2 KiB each = ~2 MiB)
- *   - 128 cpumasks (1024 bytes each = ~128 KiB)
- *   - Headroom for future allocations
+ * Arena capacity: 32 MiB, bumped from the original 4 MiB as part of the
+ * Phase 1 BPF infra scale-up (tg `scxsim-bpf-infra-scale-up-phase1`,
+ * design doc §Phase 1 item 4). Sized to comfortably host:
+ *   - Up to 8 192 per-task contexts (~16 MiB at ~2 KiB each, matching
+ *     the 16 384-slot SDT hash table in `sim_sdt_stubs.c` at ~50% load)
+ *   - Up to 2 048 per-cgroup contexts allocated by Phase 2's compiled-in
+ *     `scx_cgroup_bw_init` (each `scx_cgroup_ctx_t` ~512 B + per-LLC
+ *     children ~256 B, ~1.5 MiB total)
+ *   - Up to 2 048 atq instances per Phase 1 item 7 (`scx_atq_create`
+ *     allocates an atq head ~256 B, plus per-task `scx_atq_node`
+ *     entries ~64 B; with the cpu-bw-stall-bug stress matrix's worst
+ *     case of ~10 000 backlogged tasks, ~1 MiB total)
+ *   - 128 cpumasks (~128 KiB)
+ *   - Headroom for future BPF-library compile-ins (Phase 2/3)
  *
  * All allocations are 16-byte aligned for SIMD compatibility.
+ *
+ * Memory cost: 32 MiB BSS. Comfortable on the dev host (192 GiB+) and on
+ * VM/baremetal hosts the matrix targets. The previous 4 MiB ceiling
+ * silently capped scxsim at ~2 000 live tasks; Phase 1's whole point is
+ * removing that ceiling so the cpu-bw-stall-bug high-cgroup-count
+ * stress regime (BPF-map-pressure §1) becomes testable in scxsim.
  */
-#define SIM_ARENA_SIZE (4UL * 1024 * 1024)
+#define SIM_ARENA_SIZE (32UL * 1024 * 1024)
 #define SIM_ARENA_ALIGN 16
 
 /* Defined in sim_arena.c */

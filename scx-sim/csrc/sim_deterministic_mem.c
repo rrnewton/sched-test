@@ -27,8 +27,17 @@ typedef unsigned long size_t;
 extern char sim_arena_buf[];
 extern unsigned long sim_arena_offset;
 
-/* Arena size — must match SIM_ARENA_SIZE in sim_arena.h */
-#define SIM_ARENA_SIZE (4UL * 1024 * 1024)
+/*
+ * Arena size — MUST stay in sync with `SIM_ARENA_SIZE` in
+ * `csrc/sim_arena.h`. See that header for the rationale of the 32 MiB
+ * ceiling (Phase 1 BPF infra scale-up: per-task contexts, compiled-in
+ * cgroup_bw cgroup contexts, atq instances, headroom for Phase 2/3).
+ *
+ * This file is compiled into each scheduler .so under `-nostdlib`, so
+ * it cannot include `sim_arena.h` (which depends on the simulator's
+ * full include path). Keep the literal in lockstep manually.
+ */
+#define SIM_ARENA_SIZE (32UL * 1024 * 1024)
 
 void *memset(void *s, int c, size_t n)
 {

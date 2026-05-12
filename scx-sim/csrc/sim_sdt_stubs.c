@@ -33,10 +33,29 @@ extern void sim_rbc_resume(void);
 /*
  * Hash table for mapping task_struct* → allocated per-task context.
  *
- * Open-addressing with linear probing. Sized for up to 1024 tasks
- * with ~50% load factor.
+ * Open-addressing with linear probing. Sized to ~50% load factor at
+ * up to 8 192 concurrent live tasks. Bumped from 2 048 → 16 384 as part
+ * of the Phase 1 BPF infra scale-up (tg
+ * `scxsim-bpf-infra-scale-up-phase1`, design doc §Phase 1 item 4 in
+ * `experiments/lavd_cpubw_stalls_202604/SCXSIM_REAL_CGROUP_BW_LIBRARY_DESIGN.md`).
+ *
+ * Why decoupled from CBW_NR_CGRP_MAX: per-task SDT slots are scaled by
+ * task count, not cgroup count. The previous 2 048 limit happened to
+ * coincide with `CBW_NR_CGRP_MAX = 2048` from the production cgroup_bw
+ * library, but the two ceilings are unrelated. Phase 2 will compile in
+ * the real cgroup_bw.bpf.c which can register up to 2 048 cgroups, each
+ * potentially generating an entire task graph -- the SDT table sees the
+ * sum of per-cgroup task counts, not the cgroup count itself.
+ *
+ * Why 16 384 specifically: gives 1.5x headroom over the BPF-map-pressure
+ * follow-up §1 worst case (~10 000 concurrent tasks across 2 048 cgroups
+ * in the cpu-bw-stall-bug stress matrix). Open-addressing probe distance
+ * stays bounded under 50% load so determinism holds.
+ *
+ * Memory cost: SDT_HASH_SLOTS * sizeof(struct sdt_entry) = 16 384 * 16
+ * bytes = 256 KB BSS. Negligible vs the 32 MB arena.
  */
-#define SDT_HASH_SLOTS 2048
+#define SDT_HASH_SLOTS 16384
 #define SDT_HASH_MASK (SDT_HASH_SLOTS - 1)
 
 struct sdt_entry {
