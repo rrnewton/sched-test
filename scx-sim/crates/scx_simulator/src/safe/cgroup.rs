@@ -290,6 +290,58 @@ impl CgroupRegistry {
         result.into_iter()
     }
 
+    /// Iterate all cgroups in **post-order** (depth-first, children before
+    /// parent), starting from `root_cgid`.
+    ///
+    /// This is the order the production cgroup_bw library walks when it
+    /// charges or replenishes the bandwidth-control tree bottom-up
+    /// (`scx/lib/cgroup_bw.bpf.c` calls
+    /// `bpf_for_each(css, pos, start_css, BPF_CGROUP_ITER_DESCENDANTS_POST)`
+    /// at lines 1186, 1318, 1874).
+    ///
+    /// Phase 1 BPF infra scale-up item 3: pre-populate the C-side
+    /// post-order buffer so Phase 2's compiled-in cgroup_bw.bpf.c can
+    /// iterate POST without surprises. Children are visited in ascending
+    /// `CgroupId` order under each parent for determinism (HashMap
+    /// iteration order is otherwise nondeterministic).
+    pub fn iter_descendants_postorder(
+        &self,
+        root_cgid: CgroupId,
+    ) -> impl Iterator<Item = &CgroupInfo> {
+        let mut result = Vec::new();
+        // Iterative post-order with a single stack: push (cgid, visited_flag).
+        // On first visit (flag = false) we push `(cgid, true)` followed by
+        // each child (flag = false) in REVERSE ascending order, so when we
+        // pop them they come out in ascending order. On second visit
+        // (flag = true) we emit the cgroup itself.
+        let mut stack: Vec<(CgroupId, bool)> = vec![(root_cgid, false)];
+        while let Some((cgid, visited)) = stack.pop() {
+            if visited {
+                if let Some(info) = self.cgroups.get(&cgid) {
+                    result.push(info);
+                }
+                continue;
+            }
+            // Re-push this node as "visited"; it will pop after all of its
+            // descendants have been emitted.
+            stack.push((cgid, true));
+            let mut children: Vec<CgroupId> = self
+                .cgroups
+                .values()
+                .filter(|c| c.parent_cgid == cgid && c.cgid != cgid)
+                .map(|c| c.cgid)
+                .collect();
+            children.sort_by_key(|c| c.0);
+            // Push children in reverse so the LEFTMOST child pops first ->
+            // that subtree gets emitted first -> ascending child order under
+            // each parent.
+            for child_cgid in children.into_iter().rev() {
+                stack.push((child_cgid, false));
+            }
+        }
+        result.into_iter()
+    }
+
     /// Get all cgroup IDs in pre-order starting from the root.
     pub fn all_cgids_preorder(&self) -> Vec<CgroupId> {
         self.iter_descendants(CgroupId::ROOT)
@@ -356,20 +408,35 @@ impl CgroupRegistry {
 
     /// Prepare the CSS iterator for iteration from the given root.
     ///
-    /// This populates the C-side iteration list with all descendants
-    /// in pre-order. Call this before entering a `bpf_for_each(css, ...)`
-    /// loop in scheduler code.
+    /// Populates BOTH C-side iteration lists -- pre-order in
+    /// `sim_css_list_pre[]` and post-order in `sim_css_list_post[]` --
+    /// so that subsequent `bpf_for_each(css, pos, root, flags)` loops
+    /// using either `BPF_CGROUP_ITER_DESCENDANTS_PRE` or
+    /// `BPF_CGROUP_ITER_DESCENDANTS_POST` see the right traversal
+    /// order. Phase 1 BPF infra scale-up item 3 -- the production
+    /// cgroup_bw library walks POST when charging / replenishing the
+    /// bandwidth-control tree (`scx/lib/cgroup_bw.bpf.c:1186, 1318,
+    /// 1874`).
+    ///
+    /// Both lists are bounded by `MAX_CSS_ITER_CGROUPS` (2 048 in
+    /// `csrc/sim_cgroup.c`); cgroups beyond that capacity are silently
+    /// dropped. Bump the constant if the workload ever needs more.
     ///
     /// Must be called from the simulator's single-threaded context
     /// (which is guaranteed by the Arc<Mutex> / token-ring protocol).
     pub fn prepare_css_iter(&self, root_cgid: CgroupId) {
         if let Some(root) = self.cgroups.get(&root_cgid) {
             let root_ptr = root.alloc.as_ptr();
-            let descendants: Vec<CgroupPtr> = self
+            let descendants_pre: Vec<CgroupPtr> = self
                 .iter_descendants(root_cgid)
                 .map(|info| info.alloc.as_ptr())
                 .collect();
-            let _guard = CssIterGuard::prepare(root_ptr, &descendants);
+            let descendants_post: Vec<CgroupPtr> = self
+                .iter_descendants_postorder(root_cgid)
+                .map(|info| info.alloc.as_ptr())
+                .collect();
+            let _guard =
+                CssIterGuard::prepare(root_ptr, &descendants_pre, &descendants_post);
         }
     }
 
@@ -395,6 +462,85 @@ mod tests {
         let registry = CgroupRegistry::new(4, DEFAULT_MAX_CGROUPS);
         assert!(registry.get(CgroupId::ROOT).is_some());
         assert_eq!(registry.get(CgroupId::ROOT).unwrap().level, 0);
+    }
+
+    /// Phase 1 BPF infra scale-up item 3: post-order CSS iter walks
+    /// children before parent and is deterministic across runs (children
+    /// emitted in ascending CgroupId order under each parent).
+    ///
+    /// Tree built (mirrors a multi-level cpu.max hierarchy). `CgroupId`
+    /// numbering starts at ROOT=1 and `next_cgid` begins at 2:
+    ///
+    ///         ROOT (cgid=1)
+    ///         /    |    \
+    ///        a     b     c     (cgid 2, 3, 4)
+    ///       /|          /|
+    ///      d e         f g     (cgid 5, 6, 7, 8)
+    ///
+    /// Pre-order from ROOT  : ROOT, a, d, e, b, c, f, g
+    /// Post-order from ROOT : d, e, a, b, f, g, c, ROOT
+    #[test]
+    fn test_iter_descendants_postorder_matches_design() {
+        let mut registry = CgroupRegistry::new(4, DEFAULT_MAX_CGROUPS);
+        let a = registry.create("a", CgroupId::ROOT, None); // 2
+        let b = registry.create("b", CgroupId::ROOT, None); // 3
+        let c = registry.create("c", CgroupId::ROOT, None); // 4
+        let _d = registry.create("d", a, None); // 5
+        let _e = registry.create("e", a, None); // 6
+        let _f = registry.create("f", c, None); // 7
+        let _g = registry.create("g", c, None); // 8
+
+        let pre: Vec<u64> = registry
+            .iter_descendants(CgroupId::ROOT)
+            .map(|info| info.cgid.0)
+            .collect();
+        assert_eq!(
+            pre,
+            vec![1, 2, 5, 6, 3, 4, 7, 8],
+            "pre-order traversal should be parent-before-children, \
+             children in ascending cgid order"
+        );
+
+        let post: Vec<u64> = registry
+            .iter_descendants_postorder(CgroupId::ROOT)
+            .map(|info| info.cgid.0)
+            .collect();
+        assert_eq!(
+            post,
+            vec![5, 6, 2, 3, 7, 8, 4, 1],
+            "post-order traversal should be children-before-parent, \
+             children in ascending cgid order; this is the order \
+             scx/lib/cgroup_bw.bpf.c walks during charge / replenish \
+             (lib/cgroup_bw.bpf.c:1186, 1318, 1874)"
+        );
+
+        // Sub-tree post-order: from `a` we should see d, e, a (no siblings).
+        let sub: Vec<u64> = registry
+            .iter_descendants_postorder(a)
+            .map(|info| info.cgid.0)
+            .collect();
+        assert_eq!(sub, vec![5, 6, 2]);
+
+        // Determinism across two calls — must be byte-identical.
+        let post2: Vec<u64> = registry
+            .iter_descendants_postorder(CgroupId::ROOT)
+            .map(|info| info.cgid.0)
+            .collect();
+        assert_eq!(post, post2);
+        // Make sure b/c are unused so clippy doesn't complain.
+        let _ = (b, c);
+    }
+
+    /// Single-cgroup post-order (just root) should yield [ROOT] and never
+    /// underflow. Edge case used by `prepare_single`.
+    #[test]
+    fn test_iter_descendants_postorder_single_root() {
+        let registry = CgroupRegistry::new(4, DEFAULT_MAX_CGROUPS);
+        let post: Vec<u64> = registry
+            .iter_descendants_postorder(CgroupId::ROOT)
+            .map(|info| info.cgid.0)
+            .collect();
+        assert_eq!(post, vec![CgroupId::ROOT.0]);
     }
 
     #[test]

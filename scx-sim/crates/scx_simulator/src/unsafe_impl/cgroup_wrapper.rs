@@ -294,24 +294,39 @@ pub struct CssIterGuard {
 }
 
 impl CssIterGuard {
-    /// Prepare the CSS iterator with the given root and descendant list.
+    /// Prepare the CSS iterator with the given root and pre-order +
+    /// post-order descendant lists.
     ///
     /// # Arguments
     /// * `root` - The root cgroup for the iteration.
-    /// * `descendants` - Cgroup pointers in pre-order (including root).
+    /// * `descendants_pre` - Cgroup pointers in pre-order (including root).
+    /// * `descendants_post` - Cgroup pointers in post-order (including root).
+    ///
+    /// Both lists must be supplied so that subsequent
+    /// `bpf_for_each(css, pos, root, flags)` loops can pick the right
+    /// traversal order via the flags bit. Phase 1 BPF infra scale-up
+    /// item 3 -- POST is required by Phase 2's compiled-in
+    /// `cgroup_bw.bpf.c` (charges + replenish walk POST).
     ///
     /// The returned guard is a witness that the iterator has been
     /// populated. It has no runtime cost.
-    pub fn prepare(root: CgroupPtr, descendants: &[CgroupPtr]) -> Self {
-        // SAFETY: These three C functions manipulate a thread-local
-        // iteration list. We call them in the correct order: reset,
-        // set_root, then add each descendant. All pointers are
-        // guaranteed non-null by `CgroupPtr`.
+    pub fn prepare(
+        root: CgroupPtr,
+        descendants_pre: &[CgroupPtr],
+        descendants_post: &[CgroupPtr],
+    ) -> Self {
+        // SAFETY: These C functions manipulate two static iteration
+        // buffers. We call them in the correct order: reset (clears
+        // both), set_root, then append each descendant to the matching
+        // buffer. All pointers are guaranteed non-null by `CgroupPtr`.
         unsafe {
             ffi::sim_css_iter_reset();
             ffi::sim_css_iter_set_root(root.as_raw());
-            for cgrp in descendants {
+            for cgrp in descendants_pre {
                 ffi::sim_css_iter_add(cgrp.as_raw());
+            }
+            for cgrp in descendants_post {
+                ffi::sim_css_iter_add_post(cgrp.as_raw());
             }
         }
         Self { _private: () }
@@ -320,8 +335,10 @@ impl CssIterGuard {
     /// Prepare the CSS iterator from a single root (no descendants).
     ///
     /// Useful when only the root itself should appear in the iteration.
+    /// Both pre-order and post-order buffers are populated identically
+    /// (single-element traversal is the same in either order).
     pub fn prepare_single(root: CgroupPtr) -> Self {
-        Self::prepare(root, &[root])
+        Self::prepare(root, &[root], &[root])
     }
 }
 
@@ -489,9 +506,13 @@ mod tests {
         let root = SimCgroupHandle::root();
         let h1 = SimCgroupHandle::new(30, 1, root);
         let h2 = SimCgroupHandle::new(31, 1, root);
-        let descendants = [root, h1.as_ptr(), h2.as_ptr()];
-        let _guard = CssIterGuard::prepare(root, &descendants);
-        // Guard created successfully — iterator is populated.
+        let descendants_pre = [root, h1.as_ptr(), h2.as_ptr()];
+        // Post-order is just the reverse for this flat root + 2 children
+        // shape (children before parent).
+        let descendants_post = [h1.as_ptr(), h2.as_ptr(), root];
+        let _guard =
+            CssIterGuard::prepare(root, &descendants_pre, &descendants_post);
+        // Guard created successfully — both iterators are populated.
     }
 
     #[test]

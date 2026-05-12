@@ -95,9 +95,17 @@ extern "C" {
     // Root cgroup accessor (implemented in sim_task.c)
     pub fn sim_get_root_cgroup() -> *mut c_void;
 
-    // CSS iterator (implemented in sim_cgroup.c)
+    // CSS iterator (implemented in sim_cgroup.c).
+    //
+    // The Rust side populates BOTH ordering buffers before any BPF
+    // callback fires: `sim_css_iter_add` appends to the pre-order
+    // list and `sim_css_iter_add_post` appends to the post-order
+    // list. C-side `bpf_for_each(css, pos, root, flags)` then walks
+    // whichever list matches the iteration mode (Phase 1 BPF infra
+    // scale-up item 3).
     pub fn sim_css_iter_reset();
     pub fn sim_css_iter_add(cgrp: *mut c_void);
+    pub fn sim_css_iter_add_post(cgrp: *mut c_void);
     pub fn sim_css_iter_set_root(root: *mut c_void);
 
     // Global state reset functions for deterministic re-runs.
