@@ -1038,6 +1038,25 @@ __attribute__((weak)) int scx_cgroup_bw_dump(
 #define arena_spin_unlock(lock) ((void)(lock))
 #define arena_spin_trylock(lock) ({ (void)(lock); 0; })
 
+/* bpf_iter_css_*: route LAVD's `bpf_for_each(css, pos, root, flags)`
+ * to scxsim's Phase 1 item 3 flags-aware iterator (sim_bpf_iter_css_*
+ * in csrc/sim_cgroup.c). Without these overrides, dlopen leaves
+ * bpf_iter_css_new / _next / _destroy as unresolved-weak (= NULL)
+ * because the wrapper.c hasn't otherwise installed them; the
+ * library's first `bpf_for_each(css, ...)` call (e.g. inside
+ * cbw_cgroup_bw_throttled's per-LLC BTQ walk) jumps to NULL. */
+extern int sim_bpf_iter_css_new(struct bpf_iter_css *it,
+				struct cgroup_subsys_state *start,
+				unsigned int flags);
+extern struct cgroup_subsys_state *sim_bpf_iter_css_next(struct bpf_iter_css *it);
+extern void sim_bpf_iter_css_destroy(struct bpf_iter_css *it);
+#undef bpf_iter_css_new
+#define bpf_iter_css_new(it, start, flags) sim_bpf_iter_css_new((it), (start), (flags))
+#undef bpf_iter_css_next
+#define bpf_iter_css_next(it) sim_bpf_iter_css_next(it)
+#undef bpf_iter_css_destroy
+#define bpf_iter_css_destroy(it) sim_bpf_iter_css_destroy(it)
+
 /* scx_atq_lock / scx_atq_unlock: declared as `static __always_inline`
  * inside `scx/scheds/include/lib/atq.h` BUT only under `#ifdef __BPF__`.
  * In our userspace compilation those declarations are not visible, so
