@@ -1,0 +1,27 @@
+# scxsim debug helpers — settings + formatter loader.
+#
+# Use one of:
+#
+#   # Auto-load formatters via LAVD_DBG_DIR env var:
+#   LAVD_DBG_DIR=/abs/path/to/scx-sim/debug \
+#     lldb -b -o "command source $LAVD_DBG_DIR/init.lldb" -- ./scxsim ...
+#
+#   # Or pass the formatters path explicitly:
+#   lldb -b \
+#     -o "command source scx-sim/lldb_debug/init.lldb" \
+#     -o "command script import scx-sim/lldb_debug/lldb_lavd_formatters.py" \
+#     -- ./scxsim ...
+#
+# This script configures stepping defaults but does NOT load the .py
+# (multi-line `script` blocks are awkward in batch mode). The wrapper
+# script in `scx-sim/lldb_debug/run-with-formatters.sh` handles auto-load
+# via the env var.
+
+# Don't trip on BPF div-by-zero semantics replicated in the wrapper.
+process handle SIGFPE -s false -n false -p true
+
+# Keep ASLR settings in sync with `scxsim --no-disable-aslr`.
+settings set target.disable-aslr false
+
+# Skip stepping into low-level Rust std/core/alloc and BPF helper noise.
+settings set target.process.thread.step-avoid-regexp ^(scx_bpf_|bpf_|scx_test_|sim_|_ZN|std::|core::|alloc::)

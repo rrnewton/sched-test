@@ -6,7 +6,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 # Find all Python files (excluding venv and build dirs)
-PYTHON_FILES=$(find . -name "*.py" -not -path "./.venv/*" -not -path "./target/*" -not -path "./debug/*")
+PYTHON_FILES=$(find . -name "*.py" -not -path "./.venv/*" -not -path "./target/*" -not -path "./debug/*" -not -path "./lldb_debug/*")
 if [ -z "$PYTHON_FILES" ]; then
     echo "  No Python files found."
     exit 0
