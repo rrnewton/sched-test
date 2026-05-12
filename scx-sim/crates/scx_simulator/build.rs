@@ -92,6 +92,18 @@ fn main() {
     configure_build(&mut sim_cgroup);
     sim_cgroup.compile("sim_cgroup");
 
+    // Build the userspace scx_atq_* shim for Phase 1 BPF infra scale-up
+    // item 7 (tg `scxsim-bpf-infra-scale-up-phase1`). Provides the
+    // arena-task-queue API surface that Phase 2's compiled-in
+    // `scx/lib/cgroup_bw.bpf.c` calls (insert_vtime, pop, peek,
+    // nr_queued, cancel, etc.). Lives in the main binary and is
+    // exported via -rdynamic so scheduler `.so` files can resolve
+    // `scx_atq_*` references at dlopen time.
+    let mut sim_atq = cc::Build::new();
+    sim_atq.file(workspace_dir.join("csrc/sim_atq.c"));
+    configure_build(&mut sim_atq);
+    sim_atq.compile("sim_atq");
+
     // ---------------------------------------------------------------
     // Shared libraries (.so) for schedulers — built via Makefile
     // ---------------------------------------------------------------
@@ -151,6 +163,19 @@ fn main() {
     // sim_bpf_stubs (.so) — ensure they're exported via -rdynamic.
     println!("cargo:rustc-link-arg=-Wl,--undefined=sim_arena_buf");
     println!("cargo:rustc-link-arg=-Wl,--undefined=sim_arena_offset");
+
+    // sim_atq.c symbols (Phase 1 BPF infra scale-up item 7). No Rust code
+    // references them directly today -- Phase 2's compiled-in
+    // cgroup_bw.bpf.c is the consumer, and it lives in scheduler `.so`
+    // files that resolve via dlopen + -rdynamic. Force the .o into the
+    // binary so the symbols are present at .so load time.
+    //
+    // One `--undefined` forces the whole sim_atq.o translation unit; all
+    // scx_atq_* symbols come along for the ride via static-linker
+    // semantics. We pin scx_atq_create_internal because it's the only
+    // entry point that a consumer can call without already holding an
+    // atq pointer.
+    println!("cargo:rustc-link-arg=-Wl,--undefined=scx_atq_create_internal");
 
     // Link the clang profile runtime when coverage is enabled.
     // This provides __llvm_profile_* symbols for the instrumented .so files.

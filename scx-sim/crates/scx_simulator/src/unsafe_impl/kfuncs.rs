@@ -2768,6 +2768,59 @@ pub extern "C" fn sim_timer_start_slot(slot: u32, nsecs: u64) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// sim_atq.c (Phase 1 BPF infra scale-up item 7) -- userspace impl of
+// the scx_atq_* arena-task-queue API.
+//
+// Phase 2's compiled-in scx/lib/cgroup_bw.bpf.c will resolve scx_atq_*
+// references at .so dlopen time against the strong symbols defined in
+// csrc/sim_atq.c. To keep that path linked into the main scxsim
+// binary (and into integration / lib test binaries) we extern-declare
+// every entry point below and re-export them as #[no_mangle] passthrough
+// wrappers. Without these references, --gc-sections would discard
+// libsim_atq.a from binaries that don't directly reference scx_atq_*
+// from Rust (e.g. integration test executables), and scheduler .so
+// files would fail to resolve scx_atq_* at dlopen.
+//
+// The wrappers also give Rust callers a sanctioned, type-safe entry
+// point in case future engine-side glue needs to inspect / drive the
+// atq directly (Phase 3 concurrent-execution mode might).
+// ---------------------------------------------------------------------------
+
+extern "C" {
+    fn scx_atq_init() -> i32;
+    fn scx_atq_create_internal(fifo: i32, capacity: u64) -> u64;
+    fn scx_atq_destroy(atq: u64) -> i32;
+    fn scx_atq_insert_vtime(atq: u64, taskc: *mut c_void, vtime: u64) -> i32;
+    fn scx_atq_insert_vtime_unlocked(atq: u64, taskc: *mut c_void, vtime: u64) -> i32;
+    fn scx_atq_insert(atq: u64, taskc: *mut c_void) -> i32;
+    fn scx_atq_insert_unlocked(atq: u64, taskc: *mut c_void) -> i32;
+    fn scx_atq_pop(atq: u64) -> u64;
+    fn scx_atq_peek(atq: u64) -> u64;
+    fn scx_atq_nr_queued(atq: u64) -> i32;
+    fn scx_atq_cancel(taskc: *mut c_void) -> i32;
+    fn scx_atq_remove(atq: u64, taskc: *mut c_void) -> i32;
+    fn scx_atq_remove_unlocked(atq: u64, taskc: *mut c_void) -> i32;
+    fn sim_atq_set_taskc_atq_offset(off: u64);
+}
+
+/// Linker keep-alive: a `#[used]` static holding a single function
+/// pointer into `csrc/sim_atq.c` so `--gc-sections` cannot discard
+/// `libsim_atq.a` from binaries that don't otherwise reference
+/// `scx_atq_*` from Rust (integration tests; the main scxsim binary
+/// pulls them in via build.rs `--undefined=scx_atq_create_internal`).
+///
+/// One pointer is enough: the C side compiles `sim_atq.c` into a
+/// single translation unit (`sim_atq.o`); referencing any one symbol
+/// from that .o forces the linker to include the whole object, and
+/// every other `scx_atq_*` symbol comes along for free.
+///
+/// `#[used]` is required because `--gc-sections` is enabled and would
+/// otherwise drop this static (it's not read by any Rust code path).
+/// The cost is one function pointer (8 B) of read-only data per binary.
+#[used]
+static SCX_ATQ_KEEPALIVE: unsafe extern "C" fn() -> i32 = scx_atq_init;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4137,5 +4190,163 @@ mod tests {
         assert!(data.is_null(), "scx_task_data before alloc must be null");
 
         free_task(&mut arc.lock().unwrap().sim, Pid(50));
+    }
+
+    // -----------------------------------------------------------------------
+    // sim_atq.c (Phase 1 BPF infra scale-up item 7)
+    //
+    // Exercise the scx_atq_* userspace impl that Phase 2's compiled-in
+    // cgroup_bw.bpf.c will rely on. We mirror the production
+    // `struct scx_task_common` layout (rbnode prefix at offset 0,
+    // `scx_atq_t *atq` back-pointer at offset 56) by allocating a 80-byte
+    // buffer per "task" -- same offset that sim_atq.c writes through.
+    // -----------------------------------------------------------------------
+
+    const SCX_ATQ_INF_CAPACITY: u64 = u64::MAX;
+    const TASKC_SIZE: usize = 80;
+    const ATQ_OFFSET: usize = 56;
+
+    fn alloc_taskc() -> Box<[u8]> {
+        vec![0u8; TASKC_SIZE].into_boxed_slice()
+    }
+    fn taskc_ptr(b: &mut [u8]) -> *mut c_void {
+        b.as_mut_ptr() as *mut c_void
+    }
+    fn taskc_get_atq(b: &[u8]) -> u64 {
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&b[ATQ_OFFSET..ATQ_OFFSET + 8]);
+        u64::from_ne_bytes(bytes)
+    }
+
+    #[test]
+    fn test_sim_atq_create_destroy_roundtrip() {
+        unsafe {
+            sim_atq_set_taskc_atq_offset(ATQ_OFFSET as u64);
+            let atq = scx_atq_create_internal(0, SCX_ATQ_INF_CAPACITY);
+            assert!(atq != 0, "create_internal returned NULL");
+            assert_eq!(scx_atq_nr_queued(atq), 0);
+            assert_eq!(scx_atq_destroy(atq), 0);
+        }
+    }
+
+    #[test]
+    fn test_sim_atq_insert_vtime_pop_in_ascending_order() {
+        unsafe {
+            sim_atq_set_taskc_atq_offset(ATQ_OFFSET as u64);
+            let atq = scx_atq_create_internal(0, SCX_ATQ_INF_CAPACITY);
+            let mut t1 = alloc_taskc();
+            let mut t2 = alloc_taskc();
+            let mut t3 = alloc_taskc();
+            // Insert non-monotonic: 30, 10, 20.
+            assert_eq!(scx_atq_insert_vtime(atq, taskc_ptr(&mut t1), 30), 0);
+            assert_eq!(scx_atq_insert_vtime(atq, taskc_ptr(&mut t2), 10), 0);
+            assert_eq!(scx_atq_insert_vtime(atq, taskc_ptr(&mut t3), 20), 0);
+            assert_eq!(scx_atq_nr_queued(atq), 3);
+            // Back-pointers set.
+            assert_eq!(taskc_get_atq(&t1), atq);
+            assert_eq!(taskc_get_atq(&t2), atq);
+            assert_eq!(taskc_get_atq(&t3), atq);
+            // peek does NOT remove and returns smallest-vtime taskc (t2).
+            assert_eq!(scx_atq_peek(atq), taskc_ptr(&mut t2) as u64);
+            assert_eq!(scx_atq_nr_queued(atq), 3);
+            // Pop in ascending vtime order: t2 (10), t3 (20), t1 (30).
+            assert_eq!(scx_atq_pop(atq), taskc_ptr(&mut t2) as u64);
+            assert_eq!(scx_atq_pop(atq), taskc_ptr(&mut t3) as u64);
+            assert_eq!(scx_atq_pop(atq), taskc_ptr(&mut t1) as u64);
+            assert_eq!(scx_atq_nr_queued(atq), 0);
+            assert_eq!(scx_atq_pop(atq), 0); // empty -> NULL
+            // Back-pointers cleared.
+            assert_eq!(taskc_get_atq(&t1), 0);
+            assert_eq!(taskc_get_atq(&t2), 0);
+            assert_eq!(taskc_get_atq(&t3), 0);
+            scx_atq_destroy(atq);
+        }
+    }
+
+    #[test]
+    fn test_sim_atq_fifo_pop_in_insertion_order() {
+        unsafe {
+            sim_atq_set_taskc_atq_offset(ATQ_OFFSET as u64);
+            let atq = scx_atq_create_internal(1, SCX_ATQ_INF_CAPACITY);
+            let mut a = alloc_taskc();
+            let mut b = alloc_taskc();
+            let mut c = alloc_taskc();
+            assert_eq!(scx_atq_insert(atq, taskc_ptr(&mut a)), 0);
+            assert_eq!(scx_atq_insert(atq, taskc_ptr(&mut b)), 0);
+            assert_eq!(scx_atq_insert(atq, taskc_ptr(&mut c)), 0);
+            assert_eq!(scx_atq_pop(atq), taskc_ptr(&mut a) as u64);
+            assert_eq!(scx_atq_pop(atq), taskc_ptr(&mut b) as u64);
+            assert_eq!(scx_atq_pop(atq), taskc_ptr(&mut c) as u64);
+            scx_atq_destroy(atq);
+        }
+    }
+
+    #[test]
+    fn test_sim_atq_cancel_removes_from_atq() {
+        unsafe {
+            sim_atq_set_taskc_atq_offset(ATQ_OFFSET as u64);
+            let atq = scx_atq_create_internal(0, SCX_ATQ_INF_CAPACITY);
+            let mut a = alloc_taskc();
+            let mut b = alloc_taskc();
+            let mut c = alloc_taskc();
+            scx_atq_insert_vtime(atq, taskc_ptr(&mut a), 100);
+            scx_atq_insert_vtime(atq, taskc_ptr(&mut b), 200);
+            scx_atq_insert_vtime(atq, taskc_ptr(&mut c), 300);
+            assert_eq!(scx_atq_cancel(taskc_ptr(&mut b)), 0);
+            assert_eq!(taskc_get_atq(&b), 0);
+            assert_eq!(scx_atq_nr_queued(atq), 2);
+            assert_eq!(scx_atq_pop(atq), taskc_ptr(&mut a) as u64);
+            assert_eq!(scx_atq_pop(atq), taskc_ptr(&mut c) as u64);
+            // Cancelling a taskc not in any atq is a no-op.
+            let mut orphan = alloc_taskc();
+            assert_eq!(scx_atq_cancel(taskc_ptr(&mut orphan)), 0);
+            scx_atq_destroy(atq);
+        }
+    }
+
+    #[test]
+    fn test_sim_atq_capacity_enforcement() {
+        unsafe {
+            sim_atq_set_taskc_atq_offset(ATQ_OFFSET as u64);
+            // 2-slot atq: third insert must fail -ENOSPC (-28).
+            let atq = scx_atq_create_internal(0, 2);
+            let mut a = alloc_taskc();
+            let mut b = alloc_taskc();
+            let mut c = alloc_taskc();
+            assert_eq!(scx_atq_insert_vtime(atq, taskc_ptr(&mut a), 1), 0);
+            assert_eq!(scx_atq_insert_vtime(atq, taskc_ptr(&mut b), 2), 0);
+            assert_eq!(scx_atq_insert_vtime(atq, taskc_ptr(&mut c), 3), -28);
+            assert_eq!(scx_atq_nr_queued(atq), 2);
+            assert_eq!(taskc_get_atq(&c), 0);
+            scx_atq_destroy(atq);
+        }
+    }
+
+    #[test]
+    fn test_sim_atq_destroy_clears_back_pointers() {
+        unsafe {
+            sim_atq_set_taskc_atq_offset(ATQ_OFFSET as u64);
+            let atq = scx_atq_create_internal(0, SCX_ATQ_INF_CAPACITY);
+            let mut a = alloc_taskc();
+            let mut b = alloc_taskc();
+            scx_atq_insert_vtime(atq, taskc_ptr(&mut a), 1);
+            scx_atq_insert_vtime(atq, taskc_ptr(&mut b), 2);
+            assert_eq!(taskc_get_atq(&a), atq);
+            assert_eq!(taskc_get_atq(&b), atq);
+            scx_atq_destroy(atq);
+            assert_eq!(taskc_get_atq(&a), 0);
+            assert_eq!(taskc_get_atq(&b), 0);
+        }
+    }
+
+    #[test]
+    fn test_sim_atq_null_safety() {
+        unsafe {
+            assert_eq!(scx_atq_pop(0), 0);
+            assert_eq!(scx_atq_peek(0), 0);
+            assert_eq!(scx_atq_nr_queued(0), 0);
+            assert_eq!(scx_atq_destroy(0), 0);
+            assert_eq!(scx_atq_cancel(ptr::null_mut()), 0);
+        }
     }
 }
