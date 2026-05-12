@@ -7,12 +7,16 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 /// Dispatch queue identifier. Wraps u64 with kernel bit-flag conventions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DsqId(pub u64);
 
 /// Process identifier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord, Serialize, Deserialize,
+)]
 pub struct Pid(pub i32);
 
 /// CPU identifier.

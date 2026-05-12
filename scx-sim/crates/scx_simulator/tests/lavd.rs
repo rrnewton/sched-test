@@ -1,3 +1,5 @@
+use std::process::Command;
+
 use scx_simulator::probes::{LavdMonitor, LavdProbes};
 use scx_simulator::*;
 
@@ -9094,6 +9096,71 @@ fn test_lavd_dsq_local_rejects_migration_disabled_remote_dispatch() {
     let trace = Simulator::new(sched).run(lavd_dsq_local_migration_disabled_scenario());
 
     assert_lavd_dsq_local_migration_disabled_reject(&trace);
+}
+
+const DSQ_LOCAL_REGRESSION_JSON: &str =
+    "tests/fixtures/dsq_local_migration_disabled/lavd_scribepr0.json";
+
+#[test]
+fn test_lavd_dsq_local_json_fixture_rejects_migration_disabled_remote_dispatch() {
+    let _lock = common::setup_test();
+    let json = include_str!("fixtures/dsq_local_migration_disabled/lavd_scribepr0.json");
+    let mut scenario = load_rtapp(json, 32).unwrap();
+    scenario.sched_overhead_rbc_ns = None;
+
+    let sched = DynamicScheduler::lavd(32);
+    sched.lavd_set_power_mode(LavdPowerMode::Performance);
+    let trace = Simulator::new(sched).run(scenario);
+
+    assert_lavd_dsq_local_migration_disabled_reject(&trace);
+}
+
+#[test]
+fn test_lavd_dsq_local_json_fixture_subprocess_reproduces_error_bpf() {
+    let _lock = common::setup_test();
+    let exe = env!("CARGO_BIN_EXE_scxsim");
+    let output = Command::new(exe)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .args([
+            "--no-disable-aslr",
+            "run",
+            DSQ_LOCAL_REGRESSION_JSON,
+            "--dump-trace",
+            "--no-rbc",
+            "-s",
+            "lavd",
+            "--cpus",
+            "32",
+            "--duration",
+            "2ms",
+        ])
+        .output()
+        .expect("failed to spawn scxsim subprocess");
+
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert_eq!(
+        output.status.code(),
+        Some(43),
+        "expected exit 43 (ExitKind::ErrorBpf), got {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        stdout,
+        stderr
+    );
+    assert!(
+        stderr.contains("scxsim: ExitKind::ErrorBpf SCX_DSQ_LOCAL cannot move migration disabled ScribePR0[1] from CPU 8 to"),
+        "missing stable ErrorBpf marker for migration-disabled local-DSQ rejection\nstdout:\n{}\nstderr:\n{}",
+        stdout,
+        stderr
+    );
+    assert!(
+        stderr.contains(
+            "DISPATCH_REJECT kind=SCX_DSQ_LOCAL pid=1 from_cpu=8 target_cpu="
+        ) && stderr.contains("reason=migration_disabled"),
+        "missing matching DispatchRejected trace event in --dump-trace output\nstdout:\n{}\nstderr:\n{}",
+        stdout,
+        stderr
+    );
 }
 
 /// Requires rrnewton/scx `feat/lavd-migration-disabled-guard` at scx commit

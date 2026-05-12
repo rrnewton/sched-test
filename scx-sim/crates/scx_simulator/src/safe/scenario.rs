@@ -1,5 +1,6 @@
 //! Scenario definition and builder API.
 
+use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use crate::cgroup::DEFAULT_MAX_CGROUPS;
@@ -96,7 +97,7 @@ pub struct CgroupCpusetChangeEvent {
 ///
 /// This models kernel windows where a task may become migration-disabled after
 /// BPF chose a placement but before the kernel validates a local-DSQ dispatch.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MigrationDisabledEvent {
     /// PID of the task whose migration-disabled counter changes.
     pub pid: Pid,
@@ -107,7 +108,7 @@ pub struct MigrationDisabledEvent {
 }
 
 /// Configuration for deferring kernel-side local-DSQ dispatch resolution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct LocalDsqDispatchConfig {
     /// Whether `SCX_DSQ_LOCAL` and `SCX_DSQ_LOCAL_ON` pending dispatches are
     /// resolved by a later engine event instead of immediately after the BPF
@@ -1568,6 +1569,34 @@ mod tests {
                 min_delay_ns: 10,
                 max_delay_ns: 20,
             }
+        );
+    }
+
+    #[test]
+    fn test_migration_disabled_event_serde_roundtrip() {
+        let event = MigrationDisabledEvent {
+            pid: Pid(7),
+            at_ns: 123_456,
+            value: 2,
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert_eq!(
+            serde_json::from_str::<MigrationDisabledEvent>(&json).unwrap(),
+            event
+        );
+    }
+
+    #[test]
+    fn test_local_dsq_dispatch_config_serde_roundtrip() {
+        let config = LocalDsqDispatchConfig {
+            defer_resolution: true,
+            min_delay_ns: 50_000,
+            max_delay_ns: 75_000,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert_eq!(
+            serde_json::from_str::<LocalDsqDispatchConfig>(&json).unwrap(),
+            config
         );
     }
 }

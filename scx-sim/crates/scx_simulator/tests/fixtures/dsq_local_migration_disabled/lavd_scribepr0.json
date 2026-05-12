@@ -1,0 +1,46 @@
+{
+  "global": {
+    "duration": 0.002
+  },
+  "scxsim": {
+    "detect_bpf_errors": true,
+    "local_dsq_dispatch": {
+      "defer_resolution": true,
+      "min_delay_ns": 50000,
+      "max_delay_ns": 50000
+    },
+    "migration_disabled_window": {
+      "task": "ScribePR0",
+      "start_ns": 270000,
+      "duration_ns": 100000,
+      "value": 2
+    }
+  },
+  "tasks": {
+    "ScribePR0": {
+      "loop": -1,
+      "cpus": "8-31",
+      "task_flags": [
+        "kthread",
+        "wq_worker"
+      ],
+      "run0": 20,
+      "sleep0": 200,
+      "run1": 80
+    },
+    "cpu8_load": {
+      "loop": -1,
+      "cpus": "8",
+      "start_time_ns": 80000,
+      "run": 500,
+      "sleep": 100
+    },
+    "remote_load_31": {
+      "loop": -1,
+      "cpus": "31",
+      "start_time_ns": 100000,
+      "run": 400,
+      "sleep": 100
+    }
+  }
+}

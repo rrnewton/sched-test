@@ -15,11 +15,16 @@
 //! - `phases` — multi-phase task definitions
 //! - `instance` — multiple task instances
 //! - `cpus` — CPU affinity mask (parsed into `TaskDef::allowed_cpus`)
+//! - `start_time_ns` — simulator-only task start time in nanoseconds
+//! - `task_flags` — simulator-only kernel `PF_*` flags (integer, string, or string array)
+//! - `migration_disabled` — simulator-only initial task migration-disabled counter
 //! - task-level `taskgroup` — mapped to simulator cgroups with all CPUs allowed.
 //!   Both the legacy string form (`"taskgroup": "/tg1"`) and the cgroup v2
 //!   object form (`"taskgroup": { "path": "/tg1", "cpu.max": "Q P", ... }`)
 //!   are accepted. Implicit ancestor cgroups along the path are synthesized.
 //! - `global.duration` — scenario duration
+//! - top-level `scxsim` — simulator-only controls such as deferred local-DSQ
+//!   resolution and runtime migration-disabled events.
 //!
 //! # Limitations
 //!
@@ -31,15 +36,17 @@
 
 use std::collections::{BTreeSet, HashMap};
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tracing::{info, warn};
 
 use crate::scenario::{
     sched_overhead_rbc_ns_from_env, seed_from_env, CgroupBandwidth, CgroupDef, IrqEvent, IrqType,
-    NoiseConfig, OverheadConfig, Scenario, DEFAULT_WATCHDOG_TIMEOUT_NS,
+    LocalDsqDispatchConfig, MigrationDisabledEvent, NoiseConfig, OverheadConfig, Scenario,
+    DEFAULT_WATCHDOG_TIMEOUT_NS,
 };
 use crate::task::{Phase, RepeatMode, TaskBehavior, TaskDef};
-use crate::types::{CpuId, Pid};
+use crate::types::{CpuId, MmId, Pid, TimeNs};
 
 /// Errors from parsing rt-app JSON.
 #[derive(Debug)]
@@ -123,17 +130,356 @@ const TASK_PHASE_KEYS: &[&str] = &[
     "phases",
     "instance",
     "delay",
+    "start_time_ns",
     "policy",
     "priority",
     "cpus",
     "nodes_membind",
     "taskgroup",
+    "task_flags",
+    "migration_disabled",
+    "mm_id",
+    "parent_pid",
+    "parent_task",
     "dl-runtime",
     "dl-period",
     "dl-deadline",
     "util_min",
     "util_max",
 ];
+
+const PF_KTHREAD: u32 = 0x0020_0000;
+const PF_WQ_WORKER: u32 = 0x0000_0020;
+const PF_IO_WORKER: u32 = 0x0000_0010;
+const PF_IDLE: u32 = 0x0000_0002;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct LocalDsqDispatchJson {
+    #[serde(default = "default_true")]
+    defer_resolution: bool,
+    #[serde(default)]
+    min_delay_ns: TimeNs,
+    #[serde(default)]
+    max_delay_ns: TimeNs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct MigrationDisabledSetJson {
+    #[serde(default)]
+    pid: Option<i32>,
+    #[serde(default)]
+    task: Option<String>,
+    at_ns: TimeNs,
+    value: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct MigrationDisabledWindowJson {
+    #[serde(default)]
+    pid: Option<i32>,
+    #[serde(default)]
+    task: Option<String>,
+    start_ns: TimeNs,
+    duration_ns: TimeNs,
+    value: u16,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn json_decode<T>(value: &Value, field: &str) -> Result<T, RtAppError>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    serde_json::from_value(value.clone())
+        .map_err(|e| RtAppError::InvalidValue(format!("scxsim.{field}: {e}")))
+}
+
+fn parse_optional_u16(value: Option<&Value>, field: &str) -> Result<u16, RtAppError> {
+    let Some(value) = value else {
+        return Ok(0);
+    };
+    let n = value
+        .as_u64()
+        .ok_or_else(|| RtAppError::InvalidValue(format!("{field}: expected unsigned integer")))?;
+    u16::try_from(n)
+        .map_err(|_| RtAppError::InvalidValue(format!("{field}: out of u16 range: {n}")))
+}
+
+fn parse_optional_u32(value: Option<&Value>, field: &str) -> Result<Option<u32>, RtAppError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let n = value
+        .as_u64()
+        .ok_or_else(|| RtAppError::InvalidValue(format!("{field}: expected unsigned integer")))?;
+    u32::try_from(n)
+        .map(Some)
+        .map_err(|_| RtAppError::InvalidValue(format!("{field}: out of u32 range: {n}")))
+}
+
+fn parse_task_start_time_ns(obj: &Map<String, Value>) -> Result<TimeNs, RtAppError> {
+    if let Some(value) = obj.get("start_time_ns") {
+        return value
+            .as_u64()
+            .ok_or_else(|| RtAppError::InvalidValue("start_time_ns: expected integer".into()));
+    }
+
+    // rt-app `delay` is expressed in microseconds.
+    Ok(obj.get("delay").and_then(|v| v.as_u64()).unwrap_or(0) * 1_000)
+}
+
+fn parse_task_ref_value(
+    value: &Value,
+    name_to_pid: &HashMap<String, Pid>,
+    field: &str,
+) -> Result<Pid, RtAppError> {
+    if let Some(pid) = value.as_i64() {
+        let pid = i32::try_from(pid)
+            .map_err(|_| RtAppError::InvalidValue(format!("{field}: pid out of i32 range")))?;
+        return Ok(Pid(pid));
+    }
+
+    if let Some(name) = value.as_str() {
+        return name_to_pid
+            .get(name)
+            .copied()
+            .ok_or_else(|| RtAppError::InvalidValue(format!("{field}: unknown task {name:?}")));
+    }
+
+    Err(RtAppError::InvalidValue(format!(
+        "{field}: expected pid integer or task name string"
+    )))
+}
+
+fn resolve_task_ref(
+    pid: Option<i32>,
+    task: Option<&str>,
+    name_to_pid: &HashMap<String, Pid>,
+    field: &str,
+) -> Result<Pid, RtAppError> {
+    match (pid, task) {
+        (Some(pid), None) => Ok(Pid(pid)),
+        (None, Some(task)) => name_to_pid
+            .get(task)
+            .copied()
+            .ok_or_else(|| RtAppError::InvalidValue(format!("{field}: unknown task {task:?}"))),
+        (Some(_), Some(_)) => Err(RtAppError::InvalidValue(format!(
+            "{field}: specify either 'pid' or 'task', not both"
+        ))),
+        (None, None) => Err(RtAppError::InvalidValue(format!(
+            "{field}: missing required 'pid' or 'task'"
+        ))),
+    }
+}
+
+fn task_flag_value(name: &str) -> Result<u32, RtAppError> {
+    let normalized = name.trim().replace(['-', ' '], "_").to_ascii_uppercase();
+    let normalized = normalized.strip_prefix("PF_").unwrap_or(&normalized);
+    match normalized {
+        "KTHREAD" => Ok(PF_KTHREAD),
+        "WQ_WORKER" | "WORKQUEUE_WORKER" | "KWORKER" => Ok(PF_WQ_WORKER),
+        "IO_WORKER" => Ok(PF_IO_WORKER),
+        "IDLE" => Ok(PF_IDLE),
+        other => Err(RtAppError::InvalidValue(format!(
+            "task_flags: unknown flag {other:?}"
+        ))),
+    }
+}
+
+fn parse_task_flags(value: Option<&Value>) -> Result<u32, RtAppError> {
+    let Some(value) = value else {
+        return Ok(0);
+    };
+
+    match value {
+        Value::Number(n) => n
+            .as_u64()
+            .and_then(|v| u32::try_from(v).ok())
+            .ok_or_else(|| RtAppError::InvalidValue("task_flags: expected u32".into())),
+        Value::String(s) => {
+            let mut flags = 0;
+            for part in s.split(['|', ',']) {
+                let part = part.trim();
+                if !part.is_empty() {
+                    flags |= task_flag_value(part)?;
+                }
+            }
+            Ok(flags)
+        }
+        Value::Array(values) => {
+            let mut flags = 0;
+            for value in values {
+                let name = value.as_str().ok_or_else(|| {
+                    RtAppError::InvalidValue(format!(
+                        "task_flags: array entries must be strings, got {value}"
+                    ))
+                })?;
+                flags |= task_flag_value(name)?;
+            }
+            Ok(flags)
+        }
+        _ => Err(RtAppError::InvalidValue(format!(
+            "task_flags: expected u32, string, or string array, got {value}"
+        ))),
+    }
+}
+
+fn scxsim_config<'a>(
+    root_obj: &'a Map<String, Value>,
+) -> Result<Option<&'a Map<String, Value>>, RtAppError> {
+    match (root_obj.get("scxsim"), root_obj.get("simulator")) {
+        (Some(_), Some(_)) => Err(RtAppError::InvalidValue(
+            "top-level scxsim and simulator blocks are aliases; specify only one".into(),
+        )),
+        (Some(Value::Object(obj)), None) | (None, Some(Value::Object(obj))) => Ok(Some(obj)),
+        (Some(v), None) | (None, Some(v)) => Err(RtAppError::InvalidValue(format!(
+            "scxsim: expected object, got {v}"
+        ))),
+        (None, None) => Ok(None),
+    }
+}
+
+fn parse_local_dsq_dispatch(
+    config: Option<&Map<String, Value>>,
+) -> Result<LocalDsqDispatchConfig, RtAppError> {
+    let Some(config) = config else {
+        return Ok(LocalDsqDispatchConfig::default());
+    };
+    let value = config
+        .get("local_dsq_dispatch")
+        .or_else(|| config.get("deferred_local_dsq_resolution"));
+    let Some(value) = value else {
+        return Ok(LocalDsqDispatchConfig::default());
+    };
+
+    let parsed = match value {
+        Value::Bool(enabled) => LocalDsqDispatchJson {
+            defer_resolution: *enabled,
+            min_delay_ns: 0,
+            max_delay_ns: 0,
+        },
+        Value::Object(_) => json_decode::<LocalDsqDispatchJson>(value, "local_dsq_dispatch")?,
+        _ => {
+            return Err(RtAppError::InvalidValue(format!(
+                "scxsim.local_dsq_dispatch: expected bool or object, got {value}"
+            )));
+        }
+    };
+
+    if parsed.max_delay_ns < parsed.min_delay_ns {
+        return Err(RtAppError::InvalidValue(format!(
+            "scxsim.local_dsq_dispatch: max_delay_ns ({}) must be >= min_delay_ns ({})",
+            parsed.max_delay_ns, parsed.min_delay_ns
+        )));
+    }
+
+    Ok(LocalDsqDispatchConfig {
+        defer_resolution: parsed.defer_resolution,
+        min_delay_ns: parsed.min_delay_ns,
+        max_delay_ns: parsed.max_delay_ns,
+    })
+}
+
+fn parse_scxsim_bool(
+    config: Option<&Map<String, Value>>,
+    key: &str,
+) -> Result<Option<bool>, RtAppError> {
+    let Some(config) = config else {
+        return Ok(None);
+    };
+    let Some(value) = config.get(key) else {
+        return Ok(None);
+    };
+    value
+        .as_bool()
+        .ok_or_else(|| RtAppError::InvalidValue(format!("scxsim.{key}: expected boolean")))
+        .map(Some)
+}
+
+fn append_json_items<T>(
+    out: &mut Vec<T>,
+    config: &Map<String, Value>,
+    key: &str,
+) -> Result<(), RtAppError>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let Some(value) = config.get(key) else {
+        return Ok(());
+    };
+
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                out.push(json_decode(item, key)?);
+            }
+        }
+        Value::Object(_) => out.push(json_decode(value, key)?),
+        _ => {
+            return Err(RtAppError::InvalidValue(format!(
+                "scxsim.{key}: expected object or array, got {value}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn parse_migration_disabled_events(
+    config: Option<&Map<String, Value>>,
+    name_to_pid: &HashMap<String, Pid>,
+) -> Result<Vec<MigrationDisabledEvent>, RtAppError> {
+    let Some(config) = config else {
+        return Ok(Vec::new());
+    };
+
+    let mut set_items: Vec<MigrationDisabledSetJson> = Vec::new();
+    append_json_items(&mut set_items, config, "migration_disabled_set")?;
+    append_json_items(&mut set_items, config, "migration_disabled_sets")?;
+    append_json_items(&mut set_items, config, "migration_disabled")?;
+
+    let mut window_items: Vec<MigrationDisabledWindowJson> = Vec::new();
+    append_json_items(&mut window_items, config, "migration_disabled_window")?;
+    append_json_items(&mut window_items, config, "migration_disabled_windows")?;
+
+    let mut events = Vec::new();
+    for item in set_items {
+        let pid = resolve_task_ref(
+            item.pid,
+            item.task.as_deref(),
+            name_to_pid,
+            "scxsim.migration_disabled_set",
+        )?;
+        events.push(MigrationDisabledEvent {
+            pid,
+            at_ns: item.at_ns,
+            value: item.value,
+        });
+    }
+
+    for item in window_items {
+        let pid = resolve_task_ref(
+            item.pid,
+            item.task.as_deref(),
+            name_to_pid,
+            "scxsim.migration_disabled_window",
+        )?;
+        events.push(MigrationDisabledEvent {
+            pid,
+            at_ns: item.start_ns,
+            value: item.value,
+        });
+        events.push(MigrationDisabledEvent {
+            pid,
+            at_ns: item.start_ns.saturating_add(item.duration_ns),
+            value: 0,
+        });
+    }
+
+    events.sort_by_key(|event| event.at_ns);
+    Ok(events)
+}
 
 /// Parse events from a phase/task object's key-value pairs (in insertion order).
 fn parse_events(
@@ -486,6 +832,22 @@ fn parse_task(
         .clamp(-20, 19) as i8;
 
     let loop_count = obj.get("loop").and_then(|v| v.as_i64()).unwrap_or(-1);
+    let start_time_ns = parse_task_start_time_ns(obj)?;
+    let task_flags = parse_task_flags(obj.get("task_flags"))?;
+    let migration_disabled =
+        parse_optional_u16(obj.get("migration_disabled"), "migration_disabled")?;
+    let mm_id = parse_optional_u32(obj.get("mm_id"), "mm_id")?.map(MmId);
+    let parent_pid = match (obj.get("parent_pid"), obj.get("parent_task")) {
+        (Some(_), Some(_)) => {
+            return Err(RtAppError::InvalidValue(
+                "parent_pid and parent_task are aliases; specify only one".into(),
+            ));
+        }
+        (Some(value), None) | (None, Some(value)) => {
+            Some(parse_task_ref_value(value, name_to_pid, "parent_pid")?)
+        }
+        (None, None) => None,
+    };
 
     // Parse CPU affinity
     let allowed_cpus = if let Some(cpus_val) = obj.get("cpus") {
@@ -564,13 +926,13 @@ fn parse_task(
                 phases: final_phases.clone(),
                 repeat,
             },
-            start_time_ns: 0,
-            mm_id: None,
+            start_time_ns,
+            mm_id,
             allowed_cpus: allowed_cpus.clone(),
-            parent_pid: None,
+            parent_pid,
             cgroup_name: cgroup_name.clone(),
-            task_flags: 0,
-            migration_disabled: 0,
+            task_flags,
+            migration_disabled,
         });
     }
 
@@ -663,15 +1025,16 @@ pub fn load_rtapp(json_str: &str, nr_cpus: u32) -> Result<Scenario, RtAppError> 
     let root_obj = root
         .as_object()
         .ok_or(RtAppError::MissingField("root object"))?;
+    let scxsim_config = scxsim_config(root_obj)?;
 
     // Parse global settings
     let duration_ns = if let Some(global) = root_obj.get("global") {
         let dur_secs = global
             .get("duration")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(-1);
-        if dur_secs > 0 {
-            dur_secs as u64 * 1_000_000_000
+            .and_then(|v| v.as_f64())
+            .unwrap_or(-1.0);
+        if dur_secs > 0.0 {
+            (dur_secs * 1_000_000_000.0) as u64
         } else {
             // Default: 10 seconds if not specified or infinite
             10_000_000_000
@@ -827,6 +1190,23 @@ pub fn load_rtapp(json_str: &str, nr_cpus: u32) -> Result<Scenario, RtAppError> 
     }
 
     let cgroups = cgroup_defs_for_tasks(&all_tasks, nr_cpus, &cgroup_bandwidth);
+    let migration_disabled_events = parse_migration_disabled_events(scxsim_config, &name_to_pid)?;
+    let local_dsq_dispatch = parse_local_dsq_dispatch(scxsim_config)?;
+    let fixed_priority = parse_scxsim_bool(scxsim_config, "fixed_priority")?.unwrap_or(false);
+    let ignore_bpf_errors = match (
+        parse_scxsim_bool(scxsim_config, "ignore_bpf_errors")?,
+        parse_scxsim_bool(scxsim_config, "detect_bpf_errors")?,
+    ) {
+        (Some(_), Some(_)) => {
+            return Err(RtAppError::InvalidValue(
+                "scxsim.ignore_bpf_errors and scxsim.detect_bpf_errors are opposites; specify only one"
+                    .into(),
+            ));
+        }
+        (Some(ignore), None) => ignore,
+        (None, Some(detect)) => !detect,
+        (None, None) => true,
+    };
 
     Ok(Scenario {
         nr_cpus,
@@ -838,18 +1218,18 @@ pub fn load_rtapp(json_str: &str, nr_cpus: u32) -> Result<Scenario, RtAppError> 
         noise: NoiseConfig::from_env(),
         overhead: OverheadConfig::from_env(),
         seed: seed_from_env(),
-        fixed_priority: false,
+        fixed_priority,
         sched_overhead_rbc_ns: sched_overhead_rbc_ns_from_env(),
         watchdog_timeout_ns: Some(DEFAULT_WATCHDOG_TIMEOUT_NS),
-        ignore_bpf_errors: true,
+        ignore_bpf_errors,
         hotplug_events: Vec::new(),
         cpu_preempt_events: Vec::new(),
         cgroup_migrate_events: Vec::new(),
         cgroup_create_events: Vec::new(),
         cgroup_destroy_events: Vec::new(),
         cgroup_cpuset_change_events: Vec::new(),
-        migration_disabled_events: Vec::new(),
-        local_dsq_dispatch: crate::scenario::LocalDsqDispatchConfig::default(),
+        migration_disabled_events,
+        local_dsq_dispatch,
         interleave: false,
         preemptive: None,
         replay_trace: None,
@@ -915,6 +1295,115 @@ mod tests {
         assert_eq!(task.behavior.phases.len(), 2);
         assert!(matches!(task.behavior.phases[0], Phase::Run(5_000_000)));
         assert!(matches!(task.behavior.phases[1], Phase::Sleep(5_000_000)));
+    }
+
+    #[test]
+    fn test_simulator_task_fields_and_controls() {
+        let json = r#"{
+            "global": { "duration": 0.002 },
+            "scxsim": {
+                "fixed_priority": true,
+                "detect_bpf_errors": true,
+                "local_dsq_dispatch": {
+                    "defer_resolution": true,
+                    "min_delay_ns": 50000,
+                    "max_delay_ns": 50000
+                },
+                "migration_disabled_window": {
+                    "task": "ScribePR0",
+                    "start_ns": 270000,
+                    "duration_ns": 100000,
+                    "value": 2
+                }
+            },
+            "tasks": {
+                "ScribePR0": {
+                    "loop": -1,
+                    "cpus": "8-31",
+                    "task_flags": ["kthread", "wq_worker"],
+                    "migration_disabled": 1,
+                    "start_time_ns": 12345,
+                    "run0": 20,
+                    "sleep0": 200,
+                    "run1": 80
+                }
+            }
+        }"#;
+
+        let scenario = load_rtapp(json, 32).unwrap();
+        assert_eq!(scenario.duration_ns, 2_000_000);
+        assert!(scenario.fixed_priority);
+        assert!(!scenario.ignore_bpf_errors);
+        assert_eq!(
+            scenario.local_dsq_dispatch,
+            LocalDsqDispatchConfig {
+                defer_resolution: true,
+                min_delay_ns: 50_000,
+                max_delay_ns: 50_000,
+            }
+        );
+        assert_eq!(
+            scenario.migration_disabled_events,
+            vec![
+                MigrationDisabledEvent {
+                    pid: Pid(1),
+                    at_ns: 270_000,
+                    value: 2,
+                },
+                MigrationDisabledEvent {
+                    pid: Pid(1),
+                    at_ns: 370_000,
+                    value: 0,
+                },
+            ]
+        );
+
+        let task = &scenario.tasks[0];
+        assert_eq!(task.name, "ScribePR0");
+        assert_eq!(task.start_time_ns, 12_345);
+        assert_eq!(task.task_flags, PF_KTHREAD | PF_WQ_WORKER);
+        assert_eq!(task.migration_disabled, 1);
+        assert_eq!(task.allowed_cpus.as_ref().unwrap().first(), Some(&CpuId(8)));
+        assert_eq!(task.allowed_cpus.as_ref().unwrap().last(), Some(&CpuId(31)));
+    }
+
+    #[test]
+    fn test_simulator_config_serde_roundtrip() {
+        let local = LocalDsqDispatchJson {
+            defer_resolution: true,
+            min_delay_ns: 10,
+            max_delay_ns: 20,
+        };
+        let text = serde_json::to_string(&local).unwrap();
+        assert_eq!(
+            serde_json::from_str::<LocalDsqDispatchJson>(&text).unwrap(),
+            local
+        );
+
+        let set = MigrationDisabledSetJson {
+            pid: None,
+            task: Some("worker".into()),
+            at_ns: 123,
+            value: 2,
+        };
+        let text = serde_json::to_string(&set).unwrap();
+        assert_eq!(
+            serde_json::from_str::<MigrationDisabledSetJson>(&text).unwrap(),
+            set
+        );
+
+        let window = MigrationDisabledWindowJson {
+            pid: Some(7),
+            task: None,
+            start_ns: 100,
+            duration_ns: 50,
+            value: 1,
+        };
+        let text = serde_json::to_string(&window).unwrap();
+        assert_eq!(
+            serde_json::from_str::<MigrationDisabledWindowJson>(&text).unwrap(),
+            window
+        );
     }
 
     #[test]
