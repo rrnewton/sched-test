@@ -207,6 +207,21 @@ impl<S: Scheduler> SchedulerWrapper<S> {
         unsafe { self.inner.cpu_offline(cpu) }
     }
 
+    /// Phase 2 Stage C (tg `compile-scx-cgroup-bw-library-into-scxsim-phase2`):
+    /// query the scheduler-loaded cgroup_bw library for the throttle
+    /// state of `cgrp_id`. `Some(true)` / `Some(false)` if the
+    /// scheduler models cgroup_bw and answered; `None` if the
+    /// scheduler does not link the library at all.
+    ///
+    /// The engine's DSQ-pop admission gate (`pid_is_bw_throttled`)
+    /// consults this so the library is the single source of truth for
+    /// throttle state -- replacing the engine-side
+    /// `BandwidthManager::is_throttled` direct read.
+    pub fn is_cgroup_throttled(&self, cgrp_id: u64) -> Option<bool> {
+        // No unsafe needed: the trait method handles the FFI call site.
+        self.inner.is_cgroup_throttled(cgrp_id)
+    }
+
     /// CPU idle state changed (`ops.update_idle`).
     pub fn update_idle(&self, cpu: i32, idle: bool) {
         // SAFETY: No pointer arguments; cpu ID is validated by the engine.

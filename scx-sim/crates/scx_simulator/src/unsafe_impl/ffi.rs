@@ -454,6 +454,20 @@ pub trait Scheduler {
     /// Calls into C code.
     unsafe fn cpu_offline(&self, _cpu: i32) {}
 
+    /// Phase 2 Stage C (tg `compile-scx-cgroup-bw-library-into-scxsim-phase2`):
+    /// Ask the scheduler whether `cgrp_id` is throttled by `cpu.max`.
+    /// Returns `Some(true)` / `Some(false)` if the scheduler links the
+    /// cgroup_bw library and answered; `None` if the scheduler does not
+    /// model cgroup_bw at all (e.g. simple, tickless).
+    ///
+    /// The engine's DSQ-pop admission gate (`pid_is_bw_throttled`)
+    /// consults this to make the library the single source of truth
+    /// for throttle state -- replacing the engine-side
+    /// `BandwidthManager::is_throttled` direct read.
+    fn is_cgroup_throttled(&self, _cgrp_id: u64) -> Option<bool> {
+        None
+    }
+
     /// Resolve e9patch C trampoline function pointers from the loaded library.
     ///
     /// Returns `None` by default (no e9patch support). `DynamicScheduler`
@@ -552,6 +566,17 @@ type CgroupInitFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32;
 type CgroupExitFn = unsafe extern "C" fn(*mut c_void);
 type CgroupMoveFn = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void);
 type CpuAcquireFn = unsafe extern "C" fn(i32, *mut c_void);
+/*
+ * Phase 2 Stage C (tg `compile-scx-cgroup-bw-library-into-scxsim-phase2`):
+ * type for `scx_cgroup_bw_is_cgroup_throttled(u64 cgrp_id) -> int`.
+ * NOT prefixed by scheduler name -- the symbol comes from
+ * `scx/lib/cgroup_bw.bpf.c` (when Phase 2 ON) or from wrapper.c's
+ * compatibility forwarder (when Phase 2 OFF -- delegates to
+ * `sim_cgroup_bw_is_cgroup_throttled` which reads the engine
+ * BandwidthManager). Either way the symbol exists in the .so and
+ * returns the right answer.
+ */
+type IsCgroupThrottledFn = unsafe extern "C" fn(u64) -> i32;
 type CgroupSetBandwidthFn = unsafe extern "C" fn(*mut c_void, u64, u64, u64);
 type CpuOnlineFn = unsafe extern "C" fn(i32);
 type CpuOfflineFn = unsafe extern "C" fn(i32);
@@ -585,6 +610,18 @@ struct SchedOps {
     cpu_acquire: Option<CpuAcquireFn>,
     cpu_online: Option<CpuOnlineFn>,
     cpu_offline: Option<CpuOfflineFn>,
+    /*
+     * Phase 2 Stage C: cross-binary call into the .so's
+     * `scx_cgroup_bw_is_cgroup_throttled(u64 cgrp_id) -> int`. Loaded
+     * via dlsym (NOT prefixed with the scheduler name -- it's a
+     * library symbol provided by `scx/lib/cgroup_bw.bpf.c` when
+     * Phase 2 ON, or by wrapper.c's compatibility forwarder when
+     * Phase 2 OFF). Engine `pid_is_bw_throttled` consults this so the
+     * library is the single source of truth for throttle state.
+     * `None` for schedulers (e.g. simple, tickless) that don't link
+     * the cgroup_bw library at all.
+     */
+    is_cgroup_throttled: Option<IsCgroupThrottledFn>,
 }
 
 /// Metadata about a discovered scheduler .so file.
@@ -1011,6 +1048,34 @@ impl DynamicScheduler {
                 .map(|p| std::mem::transmute::<*const (), CpuOnlineFn>(p)),
             cpu_offline: try_get!("cpu_offline")
                 .map(|p| std::mem::transmute::<*const (), CpuOfflineFn>(p)),
+            // Phase 2 Stage C: NOT prefixed -- this is a library symbol
+            // (`scx_cgroup_bw_is_cgroup_throttled`) provided by
+            // `scx/lib/cgroup_bw.bpf.c` when Phase 2 is ON.
+            //
+            // Important: we ONLY install the function pointer when the
+            // .so is built with `SCXSIM_PHASE2_REAL_CGROUP_BW=1`. We
+            // detect that by probing for a library-internal symbol
+            // (`cbw_alloc_llc_ctx`) that only exists when the
+            // production library is compiled in. With Phase 2 OFF,
+            // `scx_cgroup_bw_is_cgroup_throttled` ALSO exists in the
+            // .so -- it's wrapper.c's compatibility forwarder that
+            // delegates to `sim_cgroup_bw_is_cgroup_throttled` Rust
+            // FFI which tries to lock the SimArc -- but the engine
+            // already holds the SimArc lock at the call site, so
+            // try_lock fails (returning 0 = "not throttled") and the
+            // DSQ admission gate breaks. Routing through the dlsym
+            // path only when Phase 2 ON sidesteps that re-entrancy
+            // hazard; Phase 2 OFF stays on the engine-local
+            // `BandwidthManager::is_throttled` direct read.
+            is_cgroup_throttled: if lib.get::<*const ()>(b"cbw_alloc_llc_ctx").is_ok() {
+                lib.get::<*const ()>(b"scx_cgroup_bw_is_cgroup_throttled")
+                    .ok()
+                    .map(|sym| {
+                        std::mem::transmute::<*const (), IsCgroupThrottledFn>(*sym)
+                    })
+            } else {
+                None
+            },
         }
     }
 
@@ -1239,6 +1304,15 @@ impl Scheduler for DynamicScheduler {
         if let Some(f) = self.ops.cpu_offline {
             f(cpu);
         }
+    }
+
+    fn is_cgroup_throttled(&self, cgrp_id: u64) -> Option<bool> {
+        // SAFETY: f is dlsym'd at scheduler load; pointer is valid for
+        // the lifetime of self._lib. The library contract is `int
+        // scx_cgroup_bw_is_cgroup_throttled(u64) -> 0 or 1`.
+        self.ops
+            .is_cgroup_throttled
+            .map(|f| unsafe { f(cgrp_id) != 0 })
     }
 
     fn resolve_e9_fns(&self) -> Option<crate::backend::e9patch::E9PatchFns> {

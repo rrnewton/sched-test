@@ -949,8 +949,45 @@ fn charge_cgroup_bw(
 
 /// Returns `true` if `pid`'s cgroup (or any finite ancestor) is currently
 /// throttled by `cpu.max`. Used by the DSQ-pop admission gate.
-fn pid_is_bw_throttled(fields: &crate::kfuncs::SimFields<'_>, pid: Pid) -> Option<CgroupId> {
+///
+/// Phase 2 Stage C (tg `compile-scx-cgroup-bw-library-into-scxsim-phase2`):
+/// the data source has shifted from the engine-side
+/// `BandwidthManager::is_throttled` to the scheduler's compiled-in
+/// cgroup_bw library via dlsym'd `scx_cgroup_bw_is_cgroup_throttled`.
+/// The library is the single source of truth -- the engine BandwidthManager
+/// is now a SECONDARY mirror used only when the scheduler does not link
+/// the library (e.g. simple, tickless) or when running an older test
+/// that pre-dates Phase 2 ON.
+///
+/// Decision tree:
+///
+///   1. If the scheduler exposes `scx_cgroup_bw_is_cgroup_throttled`,
+///      ask it. The library answers from its real internal state
+///      (`cbw_throttled_cgroup_ids[]` etc.). When Phase 2 ON, this is
+///      the production library; when Phase 2 OFF, this is wrapper.c's
+///      compatibility forwarder that delegates back to the engine
+///      `BandwidthManager` -- so the answer is the same as the
+///      pre-Phase-2 path, just routed via FFI.
+///   2. Else (scheduler does not model cgroup_bw at all), fall back to
+///      the engine `BandwidthManager` directly. This preserves
+///      pre-cgroup_bw behavior for schedulers that never linked the
+///      library.
+fn pid_is_bw_throttled<S: crate::ffi::Scheduler>(
+    scheduler: &crate::scheduler_wrapper::SchedulerWrapper<S>,
+    fields: &crate::kfuncs::SimFields<'_>,
+    pid: Pid,
+) -> Option<CgroupId> {
     let cgid = *fields.task_to_cgid.get(&pid)?;
+
+    // Stage C path: ask the scheduler-loaded library. The library
+    // tracks per-cgroup throttle state in `cbw_throttled_cgroup_ids[]`
+    // and answers in O(1).
+    if let Some(throttled) = scheduler.is_cgroup_throttled(cgid.0) {
+        return if throttled { Some(cgid) } else { None };
+    }
+
+    // Fallback: engine-side BandwidthManager (pre-Stage-C path; only
+    // reached for schedulers that don't link cgroup_bw).
     let cgroup_registry: &CgroupRegistry = &*fields.cgroup_registry;
     let ancestor = |cg: CgroupId| -> Option<CgroupId> {
         cgroup_registry.get(cg).and_then(|info| {
@@ -3785,7 +3822,7 @@ impl<S: Scheduler> Simulator<S> {
         // Bug-1 reproducer per the design doc; multi-cgroup fairness is
         // out of scope for Diff 3).
         let bw_denied = if let Some(&pid) = s.sim.cpus[cpu.0 as usize].local_dsq.front() {
-            if let Some(cgid) = pid_is_bw_throttled(&s.fields(), pid) {
+            if let Some(cgid) = pid_is_bw_throttled(&self.scheduler, &s.fields(), pid) {
                 let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
                 s.sim
                     .trace
@@ -3872,7 +3909,7 @@ impl<S: Scheduler> Simulator<S> {
 
         // Diff 3 wiring: cgroup-bw admission gate (peek and skip if throttled).
         let bw_denied = if let Some(&pid) = s.sim.cpus[cpu_idx].local_dsq.front() {
-            if let Some(cgid) = pid_is_bw_throttled(&s.fields(), pid) {
+            if let Some(cgid) = pid_is_bw_throttled(&self.scheduler, &s.fields(), pid) {
                 let __local_t = s.sim.cpus[cpu_idx].local_clock;
                 s.sim
                     .trace
