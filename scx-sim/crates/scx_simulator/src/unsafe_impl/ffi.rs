@@ -668,7 +668,6 @@ type ProbeCbwStateFn = unsafe extern "C" fn(u64, i32, *mut CbwProbeResult) -> i3
  */
 type CgroupBwBudgetRemainingFn = unsafe extern "C" fn(u64) -> u64;
 
-
 /*
  * tg `wprof-r2-add-cgroup-bw-replenish-tracekind-smoking-gun`: snapshot
  * of every finite-quota cgroup's library-internal cgroup_bw state. Mirrors

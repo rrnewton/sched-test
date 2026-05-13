@@ -616,6 +616,131 @@ fn emit_event(trace: &Trace, ev: &crate::trace::TraceEvent, proto: &mut TracePro
                 anns,
             );
         }
+        // tg `bundle-implement-cpu-bw-critical-tracekind-easy-wins`:
+        // perfetto-pb instants for the 8 new structop hooks. Categories
+        // use the `SCXSIM_STRUCTOP` namespace to match the existing
+        // engine/cgroup-bw category convention.
+        TraceKind::Runnable { pid, enq_flags } => {
+            let anns = vec![
+                ann_int("pid", i64::from(pid.0)),
+                ann_uint("enq_flags", *enq_flags),
+            ];
+            push_instant(
+                proto,
+                ts,
+                cpu_track_uuid(cpu),
+                "SCXSIM_STRUCTOP",
+                "ops.runnable",
+                anns,
+            );
+        }
+        TraceKind::Dequeue { pid, deq_flags } => {
+            let anns = vec![
+                ann_int("pid", i64::from(pid.0)),
+                ann_uint("deq_flags", *deq_flags),
+            ];
+            push_instant(
+                proto,
+                ts,
+                cpu_track_uuid(cpu),
+                "SCXSIM_STRUCTOP",
+                "ops.dequeue",
+                anns,
+            );
+        }
+        TraceKind::Quiescent { pid, deq_flags } => {
+            let anns = vec![
+                ann_int("pid", i64::from(pid.0)),
+                ann_uint("deq_flags", *deq_flags),
+            ];
+            push_instant(
+                proto,
+                ts,
+                cpu_track_uuid(cpu),
+                "SCXSIM_STRUCTOP",
+                "ops.quiescent",
+                anns,
+            );
+        }
+        TraceKind::UpdateIdle {
+            cpu: idle_cpu,
+            idle,
+        } => {
+            let anns = vec![
+                ann_uint("cpu", u64::from(idle_cpu.0)),
+                ann_uint("idle", u64::from(*idle)),
+            ];
+            push_instant(
+                proto,
+                ts,
+                cpu_track_uuid(cpu),
+                "SCXSIM_STRUCTOP",
+                "ops.update_idle",
+                anns,
+            );
+        }
+        TraceKind::CgroupInit { cgid, rc } => {
+            let anns = vec![ann_uint("cgid", cgid.0), ann_int("rc", i64::from(*rc))];
+            push_instant(
+                proto,
+                ts,
+                cpu_track_uuid(cpu),
+                "SCXSIM_STRUCTOP",
+                "ops.cgroup_init",
+                anns,
+            );
+        }
+        TraceKind::CgroupExit { cgid } => {
+            let anns = vec![ann_uint("cgid", cgid.0)];
+            push_instant(
+                proto,
+                ts,
+                cpu_track_uuid(cpu),
+                "SCXSIM_STRUCTOP",
+                "ops.cgroup_exit",
+                anns,
+            );
+        }
+        TraceKind::CgroupSetBandwidth {
+            cgid,
+            period_us,
+            quota_us,
+            burst_us,
+        } => {
+            let anns = vec![
+                ann_uint("cgid", cgid.0),
+                ann_uint("period_us", *period_us),
+                ann_uint("quota_us", *quota_us),
+                ann_uint("burst_us", *burst_us),
+            ];
+            push_instant(
+                proto,
+                ts,
+                cpu_track_uuid(cpu),
+                "SCXSIM_STRUCTOP",
+                "ops.cgroup_set_bandwidth",
+                anns,
+            );
+        }
+        TraceKind::CgroupMove {
+            pid,
+            from_cgid,
+            to_cgid,
+        } => {
+            let anns = vec![
+                ann_int("pid", i64::from(pid.0)),
+                ann_uint("from_cgid", from_cgid.0),
+                ann_uint("to_cgid", to_cgid.0),
+            ];
+            push_instant(
+                proto,
+                ts,
+                cpu_track_uuid(cpu),
+                "SCXSIM_STRUCTOP",
+                "ops.cgroup_move",
+                anns,
+            );
+        }
     }
 }
 
@@ -790,13 +915,21 @@ fn event_pid(kind: &TraceKind) -> Option<Pid> {
         | TraceKind::DispatchRejected { pid, .. }
         | TraceKind::Tick { pid }
         | TraceKind::CgroupBwCharge { pid, .. }
-        | TraceKind::CgroupBwDenied { pid, .. } => Some(*pid),
+        | TraceKind::CgroupBwDenied { pid, .. }
+        | TraceKind::Runnable { pid, .. }
+        | TraceKind::Dequeue { pid, .. }
+        | TraceKind::Quiescent { pid, .. }
+        | TraceKind::CgroupMove { pid, .. } => Some(*pid),
         TraceKind::Balance { prev_pid } => *prev_pid,
         TraceKind::CpuIdle
         | TraceKind::DsqMoveToLocal { .. }
         | TraceKind::KickCpu { .. }
         | TraceKind::IrqStart { .. }
         | TraceKind::IrqEnd { .. }
-        | TraceKind::CgroupBwReplenish { .. } => None,
+        | TraceKind::CgroupBwReplenish { .. }
+        | TraceKind::UpdateIdle { .. }
+        | TraceKind::CgroupInit { .. }
+        | TraceKind::CgroupExit { .. }
+        | TraceKind::CgroupSetBandwidth { .. } => None,
     }
 }

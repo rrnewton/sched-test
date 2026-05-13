@@ -443,6 +443,72 @@ pub(crate) fn write_json(trace: &Trace, writer: &mut impl Write) -> std::io::Res
                     }
                 })
             }
+            // tg `bundle-implement-cpu-bw-critical-tracekind-easy-wins`:
+            // perfetto Chrome-JSON instants for the 8 new structop hooks.
+            // Emitted at the structop call site so timeline viewers (and
+            // scxtop) can show the LAVD callback fire alongside the
+            // CgroupBwReplenish smoking gun.
+            TraceKind::Runnable { pid, enq_flags } => json!({
+                "ph": "i", "pid": cpu, "tid": pid.0, "ts": ts,
+                "name": "ops.runnable", "cat": "structop", "s": "t",
+                "args": { "pid": pid.0, "enq_flags": enq_flags }
+            }),
+            TraceKind::Dequeue { pid, deq_flags } => json!({
+                "ph": "i", "pid": cpu, "tid": pid.0, "ts": ts,
+                "name": "ops.dequeue", "cat": "structop", "s": "t",
+                "args": { "pid": pid.0, "deq_flags": deq_flags }
+            }),
+            TraceKind::Quiescent { pid, deq_flags } => json!({
+                "ph": "i", "pid": cpu, "tid": pid.0, "ts": ts,
+                "name": "ops.quiescent", "cat": "structop", "s": "t",
+                "args": { "pid": pid.0, "deq_flags": deq_flags }
+            }),
+            TraceKind::UpdateIdle {
+                cpu: idle_cpu,
+                idle,
+            } => json!({
+                "ph": "i", "pid": cpu, "tid": 0, "ts": ts,
+                "name": "ops.update_idle", "cat": "structop", "s": "t",
+                "args": { "cpu": idle_cpu.0, "idle": idle }
+            }),
+            TraceKind::CgroupInit { cgid, rc } => json!({
+                "ph": "i", "pid": cpu, "tid": 0, "ts": ts,
+                "name": "ops.cgroup_init", "cat": "structop", "s": "g",
+                "args": { "cgid": cgid.0, "rc": rc }
+            }),
+            TraceKind::CgroupExit { cgid } => json!({
+                "ph": "i", "pid": cpu, "tid": 0, "ts": ts,
+                "name": "ops.cgroup_exit", "cat": "structop", "s": "g",
+                "args": { "cgid": cgid.0 }
+            }),
+            TraceKind::CgroupSetBandwidth {
+                cgid,
+                period_us,
+                quota_us,
+                burst_us,
+            } => json!({
+                "ph": "i", "pid": cpu, "tid": 0, "ts": ts,
+                "name": "ops.cgroup_set_bandwidth", "cat": "structop", "s": "g",
+                "args": {
+                    "cgid": cgid.0,
+                    "period_us": period_us,
+                    "quota_us": quota_us,
+                    "burst_us": burst_us,
+                }
+            }),
+            TraceKind::CgroupMove {
+                pid,
+                from_cgid,
+                to_cgid,
+            } => json!({
+                "ph": "i", "pid": cpu, "tid": pid.0, "ts": ts,
+                "name": "ops.cgroup_move", "cat": "structop", "s": "t",
+                "args": {
+                    "pid": pid.0,
+                    "from_cgid": from_cgid.0,
+                    "to_cgid": to_cgid.0,
+                }
+            }),
         };
         serde_json::to_writer(&mut *writer, &value)?;
     }

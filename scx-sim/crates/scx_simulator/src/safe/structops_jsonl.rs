@@ -72,7 +72,13 @@ fn emit_event(event: &TraceEvent, writer: &mut impl Write) -> io::Result<()> {
         } => {
             // entry record:
             emit_line(
-                writer, ts, cpu, 0, "structop", "select_cpu", "entry",
+                writer,
+                ts,
+                cpu,
+                0,
+                "structop",
+                "select_cpu",
+                "entry",
                 &format!(
                     r#""task_pid":{},"prev_cpu":{},"wake_flags":0"#,
                     pid.0, prev_cpu.0
@@ -81,18 +87,36 @@ fn emit_event(event: &TraceEvent, writer: &mut impl Write) -> io::Result<()> {
             )?;
             // exit record carries the selected cpu in `ret`:
             emit_line(
-                writer, ts, cpu, 0, "structop", "select_cpu", "exit",
+                writer,
+                ts,
+                cpu,
+                0,
+                "structop",
+                "select_cpu",
+                "exit",
                 "",
                 Some(&selected_cpu.0.to_string()),
             )?;
         }
         TraceKind::EnqueueTask { pid, enq_flags } => emit_line(
-            writer, ts, cpu, 0, "structop", "enqueue", "entry",
+            writer,
+            ts,
+            cpu,
+            0,
+            "structop",
+            "enqueue",
+            "entry",
             &format!(r#""task_pid":{},"enq_flags":{}"#, pid.0, enq_flags),
             None,
         )?,
         TraceKind::Balance { prev_pid } => emit_line(
-            writer, ts, cpu, 0, "structop", "dispatch", "entry",
+            writer,
+            ts,
+            cpu,
+            0,
+            "structop",
+            "dispatch",
+            "entry",
             &format!(
                 r#""prev_cpu":{},"prev_pid":{}"#,
                 cpu,
@@ -101,7 +125,13 @@ fn emit_event(event: &TraceEvent, writer: &mut impl Write) -> io::Result<()> {
             None,
         )?,
         TraceKind::SetNextTask { pid } => emit_line(
-            writer, ts, cpu, 0, "structop", "running", "entry",
+            writer,
+            ts,
+            cpu,
+            0,
+            "structop",
+            "running",
+            "entry",
             &format!(r#""task_pid":{}"#, pid.0),
             None,
         )?,
@@ -109,7 +139,13 @@ fn emit_event(event: &TraceEvent, writer: &mut impl Write) -> io::Result<()> {
             pid,
             still_runnable,
         } => emit_line(
-            writer, ts, cpu, 0, "structop", "stopping", "entry",
+            writer,
+            ts,
+            cpu,
+            0,
+            "structop",
+            "stopping",
+            "entry",
             &format!(
                 r#""task_pid":{},"still_runnable":{}"#,
                 pid.0, *still_runnable as u8
@@ -117,14 +153,26 @@ fn emit_event(event: &TraceEvent, writer: &mut impl Write) -> io::Result<()> {
             None,
         )?,
         TraceKind::Tick { pid } => emit_line(
-            writer, ts, cpu, 0, "structop", "tick", "entry",
+            writer,
+            ts,
+            cpu,
+            0,
+            "structop",
+            "tick",
+            "entry",
             &format!(r#""task_pid":{}"#, pid.0),
             None,
         )?,
 
         // ---- helpers: BPF kfuncs the scheduler invokes -----------------
         TraceKind::DsqInsert { pid, dsq_id, slice } => emit_line(
-            writer, ts, cpu, 0, "helper", "dsq_insert", "entry",
+            writer,
+            ts,
+            cpu,
+            0,
+            "helper",
+            "dsq_insert",
+            "entry",
             &format!(
                 r#""task_pid":{},"dsq_id":{},"slice":{},"enq_flags":0"#,
                 pid.0, dsq_id.0, slice
@@ -137,7 +185,13 @@ fn emit_event(event: &TraceEvent, writer: &mut impl Write) -> io::Result<()> {
             slice,
             vtime,
         } => emit_line(
-            writer, ts, cpu, 0, "helper", "dsq_insert_vtime", "entry",
+            writer,
+            ts,
+            cpu,
+            0,
+            "helper",
+            "dsq_insert_vtime",
+            "entry",
             &format!(
                 r#""task_pid":{},"dsq_id":{},"slice":{},"vtime":{},"enq_flags":0"#,
                 pid.0, dsq_id.0, slice, vtime.0
@@ -146,19 +200,168 @@ fn emit_event(event: &TraceEvent, writer: &mut impl Write) -> io::Result<()> {
         )?,
         TraceKind::DsqMoveToLocal { dsq_id, success } => {
             emit_line(
-                writer, ts, cpu, 0, "helper", "dsq_move_to_local", "entry",
+                writer,
+                ts,
+                cpu,
+                0,
+                "helper",
+                "dsq_move_to_local",
+                "entry",
                 &format!(r#""dsq_id":{}"#, dsq_id.0),
                 None,
             )?;
             emit_line(
-                writer, ts, cpu, 0, "helper", "dsq_move_to_local", "exit",
+                writer,
+                ts,
+                cpu,
+                0,
+                "helper",
+                "dsq_move_to_local",
+                "exit",
                 "",
                 Some(&(*success as u8).to_string()),
             )?;
         }
         TraceKind::KickCpu { target_cpu } => emit_line(
-            writer, ts, cpu, 0, "helper", "kick_cpu", "entry",
+            writer,
+            ts,
+            cpu,
+            0,
+            "helper",
+            "kick_cpu",
+            "entry",
             &format!(r#""cpu_arg":{},"flags":0"#, target_cpu.0),
+            None,
+        )?,
+
+        // ---- task-state-transition structops (TOP-4 cluster) ------------
+        TraceKind::Runnable { pid, enq_flags } => emit_line(
+            writer,
+            ts,
+            cpu,
+            pid.0,
+            "structop",
+            "runnable",
+            "entry",
+            &format!(r#""task_pid":{},"enq_flags":{}"#, pid.0, enq_flags),
+            None,
+        )?,
+        TraceKind::Dequeue { pid, deq_flags } => emit_line(
+            writer,
+            ts,
+            cpu,
+            pid.0,
+            "structop",
+            "dequeue",
+            "entry",
+            &format!(r#""task_pid":{},"deq_flags":{}"#, pid.0, deq_flags),
+            None,
+        )?,
+        TraceKind::Quiescent { pid, deq_flags } => emit_line(
+            writer,
+            ts,
+            cpu,
+            pid.0,
+            "structop",
+            "quiescent",
+            "entry",
+            &format!(r#""task_pid":{},"deq_flags":{}"#, pid.0, deq_flags),
+            None,
+        )?,
+
+        // ---- CPU idle-tracking structop (TOP-3) -------------------------
+        TraceKind::UpdateIdle {
+            cpu: idle_cpu,
+            idle,
+        } => emit_line(
+            writer,
+            ts,
+            cpu,
+            0,
+            "structop",
+            "update_idle",
+            "entry",
+            &format!(
+                r#""cpu_arg":{},"idle":{}"#,
+                idle_cpu.0,
+                if *idle { "true" } else { "false" },
+            ),
+            None,
+        )?,
+
+        // ---- cgroup-lifecycle structops (TOP-1 / TOP-2 / TOP-6) ---------
+        TraceKind::CgroupInit { cgid, rc } => {
+            // entry record carries the cgid:
+            emit_line(
+                writer,
+                ts,
+                cpu,
+                0,
+                "structop",
+                "cgroup_init",
+                "entry",
+                &format!(r#""cgid":{}"#, cgid.0),
+                None,
+            )?;
+            // exit record carries rc in `ret`:
+            emit_line(
+                writer,
+                ts,
+                cpu,
+                0,
+                "structop",
+                "cgroup_init",
+                "exit",
+                "",
+                Some(&rc.to_string()),
+            )?;
+        }
+        TraceKind::CgroupExit { cgid } => emit_line(
+            writer,
+            ts,
+            cpu,
+            0,
+            "structop",
+            "cgroup_exit",
+            "entry",
+            &format!(r#""cgid":{}"#, cgid.0),
+            None,
+        )?,
+        TraceKind::CgroupSetBandwidth {
+            cgid,
+            period_us,
+            quota_us,
+            burst_us,
+        } => emit_line(
+            writer,
+            ts,
+            cpu,
+            0,
+            "structop",
+            "cgroup_set_bandwidth",
+            "entry",
+            &format!(
+                r#""cgid":{},"period_us":{},"quota_us":{},"burst_us":{}"#,
+                cgid.0, period_us, quota_us, burst_us
+            ),
+            None,
+        )?,
+        TraceKind::CgroupMove {
+            pid,
+            from_cgid,
+            to_cgid,
+        } => emit_line(
+            writer,
+            ts,
+            cpu,
+            pid.0,
+            "structop",
+            "cgroup_move",
+            "entry",
+            &format!(
+                r#""task_pid":{},"from_cgid":{},"to_cgid":{}"#,
+                pid.0, from_cgid.0, to_cgid.0
+            ),
             None,
         )?,
 
@@ -263,14 +466,10 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 3);
         for line in &lines {
-            assert!(
-                line.starts_with(r#"{"ts_ns":"#),
-                "bad prefix: {line}"
-            );
+            assert!(line.starts_with(r#"{"ts_ns":"#), "bad prefix: {line}");
             assert!(line.ends_with('}'), "bad suffix: {line}");
             // basic JSON validity check via serde_json round-trip
-            let v: serde_json::Value =
-                serde_json::from_str(line).expect("valid JSON");
+            let v: serde_json::Value = serde_json::from_str(line).expect("valid JSON");
             assert!(v.get("ts_ns").is_some());
             assert!(v.get("cpu").is_some());
             assert!(v.get("kind").is_some());
@@ -310,6 +509,153 @@ mod tests {
         let mut buf = Vec::new();
         write_jsonl(&trace, &mut buf).expect("emit");
         assert!(buf.is_empty(), "engine-internal events should not emit");
+    }
+
+    /// tg `bundle-implement-cpu-bw-critical-tracekind-easy-wins`:
+    /// confirm the 8 new TraceKind variants emit the expected JSONL
+    /// `(kind, name, phase)` tuples for the live-vs-sim diff harness.
+    /// One assertion per variant; the schema-validity check is already
+    /// covered by [`emit_basic_events_jsonl`] above.
+    #[test]
+    fn bundle_cpu_bw_easy_wins_emit_jsonl() {
+        use crate::cgroup::CgroupId;
+
+        let mut trace = Trace::with_warmup(2, &[], 0);
+        trace.record(
+            10,
+            CpuId(0),
+            TraceKind::Runnable {
+                pid: Pid(7),
+                enq_flags: 0x1,
+            },
+        );
+        trace.record(
+            20,
+            CpuId(0),
+            TraceKind::Dequeue {
+                pid: Pid(7),
+                deq_flags: 0x2,
+            },
+        );
+        trace.record(
+            30,
+            CpuId(0),
+            TraceKind::Quiescent {
+                pid: Pid(7),
+                deq_flags: 0x2,
+            },
+        );
+        trace.record(
+            40,
+            CpuId(1),
+            TraceKind::UpdateIdle {
+                cpu: CpuId(1),
+                idle: true,
+            },
+        );
+        trace.record(
+            50,
+            CpuId(0),
+            TraceKind::CgroupInit {
+                cgid: CgroupId(11),
+                rc: 0,
+            },
+        );
+        trace.record(60, CpuId(0), TraceKind::CgroupExit { cgid: CgroupId(11) });
+        trace.record(
+            70,
+            CpuId(0),
+            TraceKind::CgroupSetBandwidth {
+                cgid: CgroupId(11),
+                period_us: 100_000,
+                quota_us: 50_000,
+                burst_us: 0,
+            },
+        );
+        trace.record(
+            80,
+            CpuId(0),
+            TraceKind::CgroupMove {
+                pid: Pid(7),
+                from_cgid: CgroupId(1),
+                to_cgid: CgroupId(11),
+            },
+        );
+
+        let mut buf = Vec::new();
+        write_jsonl(&trace, &mut buf).expect("emit");
+        let text = String::from_utf8(buf).expect("utf8");
+        let lines: Vec<&str> = text.lines().collect();
+        // 7 variants emit 1 line; CgroupInit emits 2 (entry + exit).
+        assert_eq!(lines.len(), 9, "lines: {:#?}", lines);
+
+        // Schema sanity per line.
+        for line in &lines {
+            let v: serde_json::Value = serde_json::from_str(line).expect("valid JSON");
+            assert!(v.get("ts_ns").is_some());
+            assert!(v.get("name").is_some());
+            assert!(v.get("phase").is_some());
+            assert!(v.get("args").is_some());
+        }
+
+        // Per-variant (kind, name, phase) assertions:
+        let find = |name: &str, phase: &str| -> Vec<&&str> {
+            lines
+                .iter()
+                .filter(|l| {
+                    l.contains(&format!(r#""name":"{name}""#))
+                        && l.contains(&format!(r#""phase":"{phase}""#))
+                })
+                .collect()
+        };
+
+        // Runnable / Dequeue / Quiescent (TOP-4 cluster):
+        let l = find("runnable", "entry");
+        assert_eq!(l.len(), 1);
+        assert!(l[0].contains(r#""task_pid":7"#));
+        assert!(l[0].contains(r#""enq_flags":1"#));
+        let l = find("dequeue", "entry");
+        assert_eq!(l.len(), 1);
+        assert!(l[0].contains(r#""deq_flags":2"#));
+        let l = find("quiescent", "entry");
+        assert_eq!(l.len(), 1);
+        assert!(l[0].contains(r#""deq_flags":2"#));
+
+        // UpdateIdle (TOP-3):
+        let l = find("update_idle", "entry");
+        assert_eq!(l.len(), 1);
+        assert!(l[0].contains(r#""cpu_arg":1"#));
+        assert!(l[0].contains(r#""idle":true"#));
+
+        // CgroupInit entry+exit (TOP-2). Exit carries `rc` in `ret`.
+        let l = find("cgroup_init", "entry");
+        assert_eq!(l.len(), 1);
+        assert!(l[0].contains(r#""cgid":11"#));
+        let l = find("cgroup_init", "exit");
+        assert_eq!(l.len(), 1);
+        assert!(l[0].contains(r#""ret":0"#));
+
+        // CgroupExit (TOP-2):
+        let l = find("cgroup_exit", "entry");
+        assert_eq!(l.len(), 1);
+        assert!(l[0].contains(r#""cgid":11"#));
+
+        // CgroupSetBandwidth (TOP-1, the headline cpu-bw-stall-bug
+        // critical-path easy-win — must carry all four configurable
+        // fields verbatim, no fake approximation):
+        let l = find("cgroup_set_bandwidth", "entry");
+        assert_eq!(l.len(), 1);
+        assert!(l[0].contains(r#""cgid":11"#));
+        assert!(l[0].contains(r#""period_us":100000"#));
+        assert!(l[0].contains(r#""quota_us":50000"#));
+        assert!(l[0].contains(r#""burst_us":0"#));
+
+        // CgroupMove (TOP-6):
+        let l = find("cgroup_move", "entry");
+        assert_eq!(l.len(), 1);
+        assert!(l[0].contains(r#""task_pid":7"#));
+        assert!(l[0].contains(r#""from_cgid":1"#));
+        assert!(l[0].contains(r#""to_cgid":11"#));
     }
 
     /// SelectTaskRq emits BOTH entry and exit records, with the

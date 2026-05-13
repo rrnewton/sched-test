@@ -162,6 +162,68 @@ pub enum TraceKind {
         reason: DispatchRejectReason,
     },
 
+    // ----- Task-state-transition structops (LAVD per-state cgroup hooks) -----
+    //
+    // tg `bundle-implement-cpu-bw-critical-tracekind-easy-wins` (TOP-4 cluster
+    // from `experiments/bpftrace_gap_classification_20260513/REPORT.md`):
+    // surface the runnable / dequeue / quiescent callbacks the engine
+    // already invokes (engine.rs runnable@~3275, dequeue@~2910/3580,
+    // quiescent@~3592) so the live-vs-sim diff harness can validate
+    // task-lifecycle parity. No fake approximation — args are the exact
+    // values handed to `self.scheduler.<op>(...)`.
+    /// `ops.runnable` — task became runnable (called before enqueue on wake).
+    Runnable { pid: Pid, enq_flags: u64 },
+    /// `ops.dequeue` — task left the runnable state.
+    Dequeue { pid: Pid, deq_flags: u64 },
+    /// `ops.quiescent` — task voluntarily slept; complement of runnable.
+    Quiescent { pid: Pid, deq_flags: u64 },
+
+    // ----- CPU idle-tracking structops (LAVD update_idle hook) -----
+    //
+    // tg `bundle-implement-cpu-bw-critical-tracekind-easy-wins` (TOP-3).
+    // Engine drives this at 5 sites (init / cpu-online / cpu-acquire /
+    // idle-enter / idle-exit) — all are LAVD's hooks for cgroup-bw
+    // replenish triggers; the live-vs-sim diff cannot detect setup-time
+    // idle-state divergence without these.
+    /// `ops.update_idle` — CPU entered (idle=true) or exited (idle=false) idle.
+    UpdateIdle { cpu: CpuId, idle: bool },
+
+    // ----- Cgroup-lifecycle structops (cpu-bw-stall-bug critical path) -----
+    //
+    // tg `bundle-implement-cpu-bw-critical-tracekind-easy-wins`
+    // (TOP-1 / TOP-2 / TOP-6). LAVD's cgroup_init is where it links a
+    // cgroup to the cgroup_bw library; cgroup_set_bandwidth is the
+    // configuration call that sets the bug-triggering cpu.max quota;
+    // cgroup_move changes a task's throttle state mid-flight. Without
+    // these, the live-vs-sim diff harness cannot prove live and sim
+    // agreed on the bug-triggering cpu.max configuration nor on the
+    // cgroup hierarchy populated under LAVD.
+    /// `ops.cgroup_init` — scheduler should track a new cgroup. Emits
+    /// JSONL entry+exit (rc carried in exit `ret`).
+    CgroupInit {
+        cgid: crate::cgroup::CgroupId,
+        rc: i32,
+    },
+    /// `ops.cgroup_exit` — cgroup destroyed; scheduler should drop tracking.
+    CgroupExit { cgid: crate::cgroup::CgroupId },
+    /// `ops.cgroup_set_bandwidth` — cpu.max was written. **Critical for
+    /// cpu-bw-stall-bug** since this is the configuration call that sets
+    /// period/quota/burst on the cgroup. Without emitting it the diff
+    /// cannot prove live and sim agree on the bug-triggering quota.
+    CgroupSetBandwidth {
+        cgid: crate::cgroup::CgroupId,
+        period_us: u64,
+        quota_us: u64,
+        burst_us: u64,
+    },
+    /// `ops.cgroup_move` — task migrated between cgroups. Throttle state
+    /// changes mid-flight; required to validate fixture migrations.
+    CgroupMove {
+        pid: Pid,
+        from_cgid: crate::cgroup::CgroupId,
+        to_cgid: crate::cgroup::CgroupId,
+    },
+
     // ----- IRQ events -----
     /// An interrupt starts on a CPU (hardirq or softirq).
     IrqStart { cpu: CpuId, irq_type: IrqType },
@@ -818,6 +880,43 @@ impl Trace {
                     burst_credit,
                     period_budget_out,
                     *keep_throttled as u8,
+                ),
+                // tg `bundle-implement-cpu-bw-critical-tracekind-easy-wins`:
+                // pretty-printers for the 8 new TraceKinds.
+                TraceKind::Runnable { pid, enq_flags } => {
+                    format!("RUNNABLE pid={} enq=0x{:x}", pid.0, enq_flags)
+                }
+                TraceKind::Dequeue { pid, deq_flags } => {
+                    format!("DEQUEUE  pid={} deq=0x{:x}", pid.0, deq_flags)
+                }
+                TraceKind::Quiescent { pid, deq_flags } => {
+                    format!("QUIESCNT pid={} deq=0x{:x}", pid.0, deq_flags)
+                }
+                TraceKind::UpdateIdle { cpu, idle } => {
+                    format!("UPD_IDLE cpu={} idle={}", cpu.0, idle)
+                }
+                TraceKind::CgroupInit { cgid, rc } => {
+                    format!("CG_INIT  cgid={} rc={}", cgid.0, rc)
+                }
+                TraceKind::CgroupExit { cgid } => {
+                    format!("CG_EXIT  cgid={}", cgid.0)
+                }
+                TraceKind::CgroupSetBandwidth {
+                    cgid,
+                    period_us,
+                    quota_us,
+                    burst_us,
+                } => format!(
+                    "CG_SET_BW cgid={} period_us={} quota_us={} burst_us={}",
+                    cgid.0, period_us, quota_us, burst_us
+                ),
+                TraceKind::CgroupMove {
+                    pid,
+                    from_cgid,
+                    to_cgid,
+                } => format!(
+                    "CG_MOVE  pid={} from_cgid={} to_cgid={}",
+                    pid.0, from_cgid.0, to_cgid.0
                 ),
             };
             eprintln!(

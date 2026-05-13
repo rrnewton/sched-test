@@ -1627,9 +1627,14 @@ impl<S: Scheduler> Simulator<S> {
                 // bandwidth still flows through the separate
                 // `cgroup_set_bandwidth` invocation below.
                 let args_ptr = OptionalPtr::new(default_cgroup_init_args());
+                let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
                 sim_callback!(s, s, sim_arc, cpu, {
                     rc = self.scheduler.cgroup_init(TaskPtr::new(raw), args_ptr);
                 });
+                // TOP-2 of cpu-bw-stall-bug TraceKind easy-win bundle.
+                s.sim
+                    .trace
+                    .record(__local_t, cpu, TraceKind::CgroupInit { cgid, rc });
                 charge_sched_time(&mut s.sim, CpuId(0), "cgroup_init");
                 assert!(rc == 0, "cgroup_init failed for cgid={} rc={rc}", cgid.0);
             }
@@ -1640,19 +1645,30 @@ impl<S: Scheduler> Simulator<S> {
         {
             let cpu = s.sim.current_cpu;
             // Snapshot bandwidth configs before dropping guard.
+            // Capture cgid alongside raw + bw fields so we can emit a
+            // matching `TraceKind::CgroupSetBandwidth` for each call
+            // (TOP-1 of the cpu-bw-stall-bug critical-path TraceKind
+            // easy-win bundle — tg `bundle-implement-cpu-bw-critical-...`).
             let bw_configs: Vec<_> = scenario
                 .cgroups
                 .iter()
                 .filter_map(|cg_def| {
                     cg_def.bandwidth.as_ref().and_then(|bw| {
-                        s.cgroup_registry
-                            .get_by_name(&cg_def.name)
-                            .map(|info| (info.raw(), bw.period_us, bw.quota_us, bw.burst_us))
+                        s.cgroup_registry.get_by_name(&cg_def.name).map(|info| {
+                            (
+                                info.cgid,
+                                info.raw(),
+                                bw.period_us,
+                                bw.quota_us,
+                                bw.burst_us,
+                            )
+                        })
                     })
                 })
                 .collect();
-            for (raw, period_us, quota_us, burst_us) in bw_configs {
+            for (cgid, raw, period_us, quota_us, burst_us) in bw_configs {
                 start_rbc(&mut s.sim);
+                let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
                 sim_callback!(s, s, sim_arc, cpu, {
                     self.scheduler.cgroup_set_bandwidth(
                         TaskPtr::new(raw),
@@ -1661,6 +1677,16 @@ impl<S: Scheduler> Simulator<S> {
                         burst_us,
                     );
                 });
+                s.sim.trace.record(
+                    __local_t,
+                    cpu,
+                    TraceKind::CgroupSetBandwidth {
+                        cgid,
+                        period_us,
+                        quota_us,
+                        burst_us,
+                    },
+                );
                 charge_sched_time(&mut s.sim, CpuId(0), "cgroup_set_bandwidth");
             }
 
@@ -1749,6 +1775,15 @@ impl<S: Scheduler> Simulator<S> {
             sim_callback!(s, s, sim_arc, cpu, {
                 self.scheduler.update_idle(cpu.0 as i32, true);
             });
+            // TOP-3 of cpu-bw-stall-bug TraceKind easy-win bundle: surface
+            // every ops.update_idle invocation in JSONL. ts is the synthetic
+            // local_clock=1 (matches the pre-call local_clock above; matches
+            // the sentinel-avoidance comment 5 lines earlier).
+            s.sim.trace.record(
+                /*ts=*/ 1,
+                cpu,
+                TraceKind::UpdateIdle { cpu, idle: true },
+            );
             s.sim.cpus[cpu.0 as usize].local_clock = 0;
         }
 
@@ -2086,18 +2121,25 @@ impl<S: Scheduler> Simulator<S> {
         // Call cgroup_exit for each cgroup (reverse order: children before root)
         {
             let cpu = s.sim.current_cpu;
-            let cg_exit_list: Vec<(*mut c_void,)> = s
+            // Capture cgid alongside raw so we can emit the matching
+            // `TraceKind::CgroupExit` (TOP-2 of cpu-bw-stall-bug
+            // TraceKind easy-win bundle).
+            let cg_exit_list: Vec<(CgroupId, *mut c_void)> = s
                 .cgroup_registry
                 .all_cgids_preorder()
                 .into_iter()
                 .rev()
-                .filter_map(|cgid| s.cgroup_registry.get_raw(cgid).map(|raw| (raw,)))
+                .filter_map(|cgid| s.cgroup_registry.get_raw(cgid).map(|raw| (cgid, raw)))
                 .collect();
-            for (raw,) in cg_exit_list {
+            for (cgid, raw) in cg_exit_list {
                 start_rbc(&mut s.sim);
+                let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
                 sim_callback!(s, s, sim_arc, cpu, {
                     self.scheduler.cgroup_exit(TaskPtr::new(raw));
                 });
+                s.sim
+                    .trace
+                    .record(__local_t, cpu, TraceKind::CgroupExit { cgid });
                 charge_sched_time(&mut s.sim, CpuId(0), "cgroup_exit");
             }
         }
@@ -2702,10 +2744,14 @@ impl<S: Scheduler> Simulator<S> {
         ffi::cpumask_set_idle(cpu.0 as i32);
         set_ops_context(&mut s.sim, OpsContext::UpdateIdle);
         start_rbc(&mut s.sim);
+        let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
         sim_callback!(s, guard, sim_arc, cpu, {
             self.scheduler.update_idle(cpu.0 as i32, true);
         });
         let s = &mut *guard;
+        s.sim
+            .trace
+            .record(__local_t, cpu, TraceKind::UpdateIdle { cpu, idle: true });
         charge_sched_time(&mut s.sim, cpu, "update_idle");
 
         // Restart tick chain for this CPU
@@ -2780,10 +2826,14 @@ impl<S: Scheduler> Simulator<S> {
         ffi::cpumask_set_idle(cpu.0 as i32);
         set_ops_context(&mut s.sim, OpsContext::UpdateIdle);
         start_rbc(&mut s.sim);
+        let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
         sim_callback!(s, guard, sim_arc, cpu, {
             self.scheduler.update_idle(cpu.0 as i32, true);
         });
         let s = &mut *guard;
+        s.sim
+            .trace
+            .record(__local_t, cpu, TraceKind::UpdateIdle { cpu, idle: true });
         charge_sched_time(&mut s.sim, cpu, "update_idle");
 
         // Restart tick chain
@@ -2821,16 +2871,20 @@ impl<S: Scheduler> Simulator<S> {
             None => return,
         };
 
-        let from_raw = s
-            .cgroup_registry
-            .get_by_name(from_name)
-            .unwrap_or_else(|| panic!("cgroup '{from_name}' not found for migration"))
-            .raw();
-        let to_raw = s
-            .cgroup_registry
-            .get_by_name(to_name)
-            .unwrap_or_else(|| panic!("cgroup '{to_name}' not found for migration"))
-            .raw();
+        let (from_cgid, from_raw) = {
+            let info = s
+                .cgroup_registry
+                .get_by_name(from_name)
+                .unwrap_or_else(|| panic!("cgroup '{from_name}' not found for migration"));
+            (info.cgid, info.raw())
+        };
+        let (to_cgid, to_raw) = {
+            let info = s
+                .cgroup_registry
+                .get_by_name(to_name)
+                .unwrap_or_else(|| panic!("cgroup '{to_name}' not found for migration"));
+            (info.cgid, info.raw())
+        };
 
         info!(
             pid = pid.0,
@@ -2856,6 +2910,7 @@ impl<S: Scheduler> Simulator<S> {
 
         // Call cgroup_move
         start_rbc(&mut s.sim);
+        let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
         sim_callback!(s, guard, sim_arc, cpu, {
             self.scheduler.cgroup_move(
                 TaskPtr::new(raw),
@@ -2864,6 +2919,16 @@ impl<S: Scheduler> Simulator<S> {
             );
         });
         let s = &mut *guard;
+        // TOP-6 of cpu-bw-stall-bug TraceKind easy-win bundle.
+        s.sim.trace.record(
+            __local_t,
+            cpu,
+            TraceKind::CgroupMove {
+                pid,
+                from_cgid,
+                to_cgid,
+            },
+        );
         charge_sched_time(&mut s.sim, cpu, "cgroup_move");
 
         // --- sched_change_end: re-enqueue if was queued ---
@@ -2906,10 +2971,15 @@ impl<S: Scheduler> Simulator<S> {
             debug!(pid = pid.0, "dequeue (cgroup_migrate)");
             start_rbc(&mut s.sim);
             s.sim.set_task_ops_state(pid, OpsTaskState::None);
+            let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
             sim_callback!(s, guard, sim_arc, cpu, {
                 self.scheduler.dequeue(TaskPtr::new(raw), 0);
             });
             let s = &mut *guard;
+            // TOP-4 (Dequeue) of cpu-bw-stall-bug TraceKind easy-win bundle.
+            s.sim
+                .trace
+                .record(__local_t, cpu, TraceKind::Dequeue { pid, deq_flags: 0 });
             charge_sched_time(&mut s.sim, cpu, "dequeue");
         }
     }
@@ -2995,10 +3065,15 @@ impl<S: Scheduler> Simulator<S> {
         // call site near engine.rs:1601) -- compiled-in cgroup_bw library
         // requires non-null args.
         let args_ptr = OptionalPtr::new(default_cgroup_init_args());
+        let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
         sim_callback!(s, guard, sim_arc, cpu, {
             rc = self.scheduler.cgroup_init(TaskPtr::new(raw), args_ptr);
         });
         let s = &mut *guard;
+        // TOP-2 of cpu-bw-stall-bug TraceKind easy-win bundle.
+        s.sim
+            .trace
+            .record(__local_t, cpu, TraceKind::CgroupInit { cgid, rc });
         charge_sched_time(&mut s.sim, cpu, "cgroup_init");
 
         if rc != 0 {
@@ -3024,9 +3099,20 @@ impl<S: Scheduler> Simulator<S> {
     fn handle_cgroup_destroy(&self, event: &CgroupDestroyEvent, sim_arc: &SimArc) {
         let mut guard = sim_arc.lock().unwrap();
         let s = &mut *guard;
+        // Capture cgid BEFORE `destroy_by_name` consumes the registry entry;
+        // we need it for the matching `TraceKind::CgroupExit` emit (TOP-2).
+        let cgid = match s.cgroup_registry.get_by_name(&event.name) {
+            Some(info) => info.cgid,
+            None => {
+                debug!(name = %event.name, "cgroup not found for destruction");
+                return;
+            }
+        };
         let raw = match s.cgroup_registry.destroy_by_name(&event.name) {
             Some(r) => r,
             None => {
+                // Should be unreachable given the get_by_name above, but
+                // bail safely if the registry got mutated between calls.
                 debug!(name = %event.name, "cgroup not found for destruction");
                 return;
             }
@@ -3041,10 +3127,14 @@ impl<S: Scheduler> Simulator<S> {
         // Call cgroup_exit
         let cpu = s.sim.current_cpu;
         start_rbc(&mut s.sim);
+        let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
         sim_callback!(s, guard, sim_arc, cpu, {
             self.scheduler.cgroup_exit(TaskPtr::new(raw));
         });
         let s = &mut *guard;
+        s.sim
+            .trace
+            .record(__local_t, cpu, TraceKind::CgroupExit { cgid });
         charge_sched_time(&mut s.sim, cpu, "cgroup_exit");
         // Free the C-side cgroup struct
         s.cgroup_registry.free_raw(raw);
@@ -3078,16 +3168,24 @@ impl<S: Scheduler> Simulator<S> {
         // Call cgroup_init to notify the scheduler of the cpuset change
         if let Some(cgrp_info) = s.cgroup_registry.get_by_name(&event.cgroup_name) {
             let raw = cgrp_info.raw();
+            let cgid = cgrp_info.cgid;
             let cpu = s.sim.current_cpu;
             s.cgroup_registry.prepare_css_iter_from_root();
             start_rbc(&mut s.sim);
             // Phase 2: pass real default args (see comment at the
             // equivalent call site near engine.rs:1601).
             let args_ptr = OptionalPtr::new(default_cgroup_init_args());
+            #[allow(unused_assignments)]
+            let mut rc = 0i32;
+            let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
             sim_callback!(s, guard, sim_arc, cpu, {
-                self.scheduler.cgroup_init(TaskPtr::new(raw), args_ptr);
+                rc = self.scheduler.cgroup_init(TaskPtr::new(raw), args_ptr);
             });
             let s = &mut *guard;
+            // TOP-2 of cpu-bw-stall-bug TraceKind easy-win bundle.
+            s.sim
+                .trace
+                .record(__local_t, cpu, TraceKind::CgroupInit { cgid, rc });
             charge_sched_time(&mut s.sim, cpu, "cgroup_init");
         }
     }
@@ -3271,10 +3369,15 @@ impl<S: Scheduler> Simulator<S> {
         s.sim.waker_task_raw = waker_raw;
         debug!(pid = pid.0, "enter:structop runnable");
         start_rbc(&mut s.sim);
+        let __local_t = s.sim.cpus[wake_cpu.0 as usize].local_clock;
         sim_callback!(s, guard, sim_arc, wake_cpu, {
             self.scheduler.runnable(TaskPtr::new(raw), enq_flags);
         });
         let s = &mut *guard;
+        // TOP-4 (Runnable) of cpu-bw-stall-bug TraceKind easy-win bundle.
+        s.sim
+            .trace
+            .record(__local_t, wake_cpu, TraceKind::Runnable { pid, enq_flags });
         charge_sched_time(&mut s.sim, wake_cpu, "runnable");
 
         // Call select_cpu
@@ -3576,10 +3679,20 @@ impl<S: Scheduler> Simulator<S> {
                 set_ops_context(&mut s.sim, OpsContext::Dequeue);
                 debug!(pid = pid.0, "enter:structop dequeue");
                 start_rbc(&mut s.sim);
+                let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
                 sim_callback!(s, guard, sim_arc, cpu, {
                     self.scheduler.dequeue(TaskPtr::new(raw), SCX_DEQ_SLEEP);
                 });
                 let s = &mut *guard;
+                // TOP-4 (Dequeue) of cpu-bw-stall-bug TraceKind easy-win bundle.
+                s.sim.trace.record(
+                    __local_t,
+                    cpu,
+                    TraceKind::Dequeue {
+                        pid,
+                        deq_flags: SCX_DEQ_SLEEP,
+                    },
+                );
                 charge_sched_time(&mut s.sim, cpu, "dequeue");
                 s.sim.set_task_ops_state(pid, OpsTaskState::None);
             }
@@ -3588,10 +3701,20 @@ impl<S: Scheduler> Simulator<S> {
             set_ops_context(&mut s.sim, OpsContext::Quiescent);
             debug!(pid = pid.0, "enter:structop quiescent");
             start_rbc(&mut s.sim);
+            let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
             sim_callback!(s, guard, sim_arc, cpu, {
                 self.scheduler.quiescent(TaskPtr::new(raw), SCX_DEQ_SLEEP);
             });
             let s = &mut *guard;
+            // TOP-4 (Quiescent) of cpu-bw-stall-bug TraceKind easy-win bundle.
+            s.sim.trace.record(
+                __local_t,
+                cpu,
+                TraceKind::Quiescent {
+                    pid,
+                    deq_flags: SCX_DEQ_SLEEP,
+                },
+            );
             charge_sched_time(&mut s.sim, cpu, "quiescent");
 
             // Monitor: Quiescent probe
@@ -3973,10 +4096,14 @@ impl<S: Scheduler> Simulator<S> {
                 set_ops_context(&mut s.sim, OpsContext::UpdateIdle);
                 debug!("enter:structop update_idle(idle=true)");
                 start_rbc(&mut s.sim);
+                let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
                 sim_callback!(s, guard, sim_arc, cpu, {
                     self.scheduler.update_idle(cpu.0 as i32, true);
                 });
                 let s = &mut *guard;
+                s.sim
+                    .trace
+                    .record(__local_t, cpu, TraceKind::UpdateIdle { cpu, idle: true });
                 charge_sched_time(&mut s.sim, cpu, "update_idle");
             }
 
@@ -4315,10 +4442,14 @@ impl<S: Scheduler> Simulator<S> {
             set_ops_context(&mut s.sim, OpsContext::UpdateIdle);
             debug!("enter:structop update_idle(idle=false)");
             start_rbc(&mut s.sim);
+            let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
             sim_callback!(s, guard, sim_arc, cpu, {
                 self.scheduler.update_idle(cpu.0 as i32, false);
             });
             let s = &mut *guard;
+            s.sim
+                .trace
+                .record(__local_t, cpu, TraceKind::UpdateIdle { cpu, idle: false });
             charge_sched_time(&mut s.sim, cpu, "update_idle");
         }
         let s = &mut *guard;
