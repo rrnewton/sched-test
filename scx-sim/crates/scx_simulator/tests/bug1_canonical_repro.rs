@@ -1,44 +1,39 @@
 //! Bug-1 canonical reproducer — subprocess form.
 //!
-//! Distills David Dai's R1 reproducer recipe
-//! (`experiments/lavd_cpubw_stalls_202604/davids-artifacts/lavd_bw_repro_r1_tight.sh`)
-//! into a deterministic scxsim integration test that runs the **production
-//! `scxsim` binary** against the canonical workload JSON + scheduler-config
-//! TOML pair stored under `tests/fixtures/h6/`.
+//! Runs the production `scxsim` binary against the canonical workload
+//! JSON + scheduler-config TOML pair under `tests/fixtures/h6/`.
 //!
-//! # Why subprocess form (not Scenario builder)
+//! # What this test asserts (post engine-throttle-attribution fix)
 //!
-//! Earlier iterations of this test built the scenario in Rust via
-//! `Scenario::builder` and poked LAVD globals via libloading FFI. That worked,
-//! but it duplicated the scenario shape between Rust test code and the
-//! reference `bug1_canonical.json` fixture, so the fixture was reference
-//! documentation only — drift between the two could go undetected.
+//! Before the Stage E percpu-array seed fix
+//! (`tg investigate-scxsim-engine-throttles-before-scheduler-cgroup-bw`),
+//! scxsim's engine-side `BandwidthManager` short-circuited the
+//! scheduler-side `cgroup_bw` library entirely. The canonical
+//! reproducer always tripped the engine's watchdog at exactly the
+//! configured timeout, regardless of which scx SHA's library was
+//! loaded — i.e. a wiring smoke test, not a Bug-1 probe.
 //!
-//! This refactor consumes the same fixtures via `--config` + the workload
-//! JSON, exercising:
-//!   * the rt-app-rs JSON loader's `taskgroup` + `cpu.max` parser
-//!   * the `--config` TOML loader and per-symbol BPF-global writer
-//!   * the `scxsim` exit-code mapping (Bug-1 stall = exit 42)
-//!   * the stable single-line stderr marker
-//!     `scxsim: ExitKind::ErrorStall pid=<N> runnable_for_ns=<N>`
+//! Post-fix, the library actually drives throttling. On a non-buggy
+//! scx tip (which the integrated-`simulator.v6` gitlink is, even if
+//! not Bug-1-FIXED), the library correctly throttles the cgroup at
+//! period_budget exhaustion, puts aside its tasks in the BTQ, and
+//! re-enqueues them at refill — so the canonical produces NO
+//! watchdog stall.
 //!
-//! # Determinism contract
+//! The new contract:
 //!
-//! - Fixed scenario, fixed CPU count, fixed cgroup quota, fixed task count,
-//!   fixed run length per task, fixed watchdog timeout.
-//! - 100% reproduction across N reps.
-//! - Each subprocess rep completes well under 5s wall.
-//!
-//! # Why a tight watchdog
-//!
-//! Production uses the kernel sched_ext default (30s). In simulation we
-//! explicitly target a watchdog short enough to fire within a single
-//! simulated throttle window (10ms of run + 90ms of wait per 100ms period).
-//! 80ms is comfortably less than the 90ms throttle wait, so a task waiting
-//! through the throttle window WILL trip an 80ms watchdog while leaving
-//! headroom for short admission re-checks.
+//!   * The library state at end-of-run shows the cgroup hit the
+//!     throttle path: `is_throttled=1`, `nr_throttled_tasks=16`,
+//!     `nr_throttled_periods >= 4` of the 6 100ms periods elapsed.
+//!   * Determinism: across N reps, the
+//!     `(rc, is_throttled, nr_throttled_periods, nr_throttled_tasks)`
+//!     fingerprint is byte-identical.
+//!   * Per-SHA discrimination (env-gated): swapping in a
+//!     pre-`period_budget` scx SHA's `libscx_lavd.so` via
+//!     `--scheduler-file` produces a CLEARLY DIFFERENT fingerprint.
+//!     Skipped silently when `SCXSIM_BIN_CACHE_DIR` is unset.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
@@ -46,68 +41,61 @@ use std::time::Instant;
 mod common;
 
 // ---------------------------------------------------------------------------
-// Canonical invocation constants. The verbatim invocation matches the design
-// doc's "Standalone-binary reproducer" section:
-//
+// Canonical invocation constants. Verbatim:
 //   scxsim run tests/fixtures/h6/bug1_canonical.json \
 //              --config tests/fixtures/h6/bug1_canonical.toml \
-//              --watchdog 80ms -s lavd --cpus 4 --duration 500ms
+//              --watchdog 200ms -s lavd --cpus 4 --duration 600ms
 // ---------------------------------------------------------------------------
 
 const FIXTURE_JSON: &str = "tests/fixtures/h6/bug1_canonical.json";
 const FIXTURE_TOML: &str = "tests/fixtures/h6/bug1_canonical.toml";
-const WATCHDOG: &str = "80ms";
+const WATCHDOG: &str = "200ms";
 const SCHEDULER: &str = "lavd";
 const CPUS: &str = "4";
-const DURATION: &str = "500ms";
+const DURATION: &str = "600ms";
 
-/// Stable stderr marker prefix produced by the binary's exit-code mapping.
-/// The test asserts this prefix is present and the recorded
-/// `runnable_for_ns=<N>` value is identical across repetitions.
-const STALL_MARKER_PREFIX: &str = "scxsim: ExitKind::ErrorStall pid=";
+/// Successful exit (no stall fired). Post-Stage-E the library handles
+/// throttling correctly so the canonical run completes without tripping
+/// the watchdog.
+const EXIT_OK: i32 = 0;
 
-/// Process exit code mapped from `ExitKind::ErrorStall` by `scxsim`'s
-/// top-level main (see `bin/scxsim/main.rs::exit_code_for`).
-const EXIT_STALL: i32 = 42;
+/// LAVD-PRINTK end-of-run fingerprint of the canonical run.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct Fingerprint {
+    exit_code: i32,
+    is_throttled: u32,
+    nr_throttled_periods: String,
+    nr_throttled_tasks: u32,
+}
 
-/// Locate the rt-app workload JSON fixture relative to the integration-test
-/// CWD (which cargo sets to the crate root, i.e. `crates/scx_simulator/`).
 fn fixture(rel: &str) -> PathBuf {
     PathBuf::from(rel)
 }
 
-/// Run the canonical scxsim invocation once and capture
-/// `(exit_code, stderr_string)`.
-fn run_one_rep() -> (i32, String) {
-    // `env!("CARGO_BIN_EXE_scxsim")` resolves to the cargo-managed path of
-    // the freshly built `scxsim` binary, so the test always exercises the
-    // current build (no PATH ambiguity, no separate copy).
+/// Run scxsim once with the canonical args. If `scheduler_file` is
+/// `Some`, pass `--scheduler-file <path>` to override the dlsym lookup.
+fn run_one_rep(scheduler_file: Option<&Path>) -> (i32, String) {
     let exe = env!("CARGO_BIN_EXE_scxsim");
-
-    // Pass `--no-disable-aslr` so scxsim does NOT re-exec itself for ASLR.
-    // The re-exec works in production (and in the prior library-form test),
-    // but inside a subprocess test it adds wall time and complicates exit
-    // code propagation. The Bug-1 reproduction does not depend on ASLR
-    // disabling.
-    let output = Command::new(exe)
-        .args([
-            "--no-disable-aslr",
-            "run",
-            fixture(FIXTURE_JSON).to_str().unwrap(),
-            "--config",
-            fixture(FIXTURE_TOML).to_str().unwrap(),
-            "--watchdog",
-            WATCHDOG,
-            "-s",
-            SCHEDULER,
-            "--cpus",
-            CPUS,
-            "--duration",
-            DURATION,
-        ])
-        .output()
-        .expect("failed to spawn scxsim subprocess");
-
+    let mut cmd = Command::new(exe);
+    cmd.args([
+        "--no-disable-aslr",
+        "run",
+        fixture(FIXTURE_JSON).to_str().unwrap(),
+        "--config",
+        fixture(FIXTURE_TOML).to_str().unwrap(),
+        "--watchdog",
+        WATCHDOG,
+        "-s",
+        SCHEDULER,
+        "--cpus",
+        CPUS,
+        "--duration",
+        DURATION,
+    ]);
+    if let Some(path) = scheduler_file {
+        cmd.args(["--scheduler-file", path.to_str().unwrap()]);
+    }
+    let output = cmd.output().expect("failed to spawn scxsim subprocess");
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     let code = output
         .status
@@ -116,63 +104,102 @@ fn run_one_rep() -> (i32, String) {
     (code, stderr)
 }
 
-/// Extract the `runnable_for_ns=<N>` value from a stall stderr line. Returns
-/// `None` if the marker is not present.
-fn extract_runnable_for_ns(stderr: &str) -> Option<u64> {
-    for line in stderr.lines() {
-        if !line.starts_with(STALL_MARKER_PREFIX) {
-            continue;
-        }
-        // Line shape: `scxsim: ExitKind::ErrorStall pid=<N> runnable_for_ns=<N>`
-        let key = "runnable_for_ns=";
-        let idx = line.find(key)? + key.len();
-        let tail = &line[idx..];
-        let end = tail
-            .find(|c: char| !c.is_ascii_digit())
-            .unwrap_or(tail.len());
-        return tail[..end].parse::<u64>().ok();
+/// Find the leaf cgroup `[LAVD-PRINTK]` block (cgid=2 / level=1 in
+/// the canonical fixture) in the stderr stream and extract the
+/// throttle-state fingerprint.
+fn extract_fingerprint(exit_code: i32, stderr: &str) -> Fingerprint {
+    let line = stderr
+        .lines()
+        .find(|l| l.contains("LAVD-PRINTK") && l.contains("is_throttled:"))
+        .unwrap_or_else(|| {
+            panic!(
+                "expected `[LAVD-PRINTK] ... is_throttled: ...` line in scxsim stderr; \
+                 the cgroup_bw library may not have run. stderr was:\n{stderr}"
+            )
+        });
+
+    let is_throttled = parse_uint_after(line, "is_throttled: ")
+        .unwrap_or_else(|| panic!("could not parse is_throttled from `{line}`"));
+
+    let nr_throttled_periods = parse_token_after(line, "nr_throttled_periods: ")
+        .unwrap_or_else(|| panic!("could not parse nr_throttled_periods from `{line}`"));
+
+    let nr_throttled_tasks = parse_uint_after(line, "nr_throttled_tasks: ")
+        .unwrap_or_else(|| panic!("could not parse nr_throttled_tasks from `{line}`"));
+
+    Fingerprint {
+        exit_code,
+        is_throttled: is_throttled as u32,
+        nr_throttled_periods,
+        nr_throttled_tasks: nr_throttled_tasks as u32,
     }
-    None
+}
+
+fn parse_uint_after(line: &str, key: &str) -> Option<u64> {
+    let idx = line.find(key)? + key.len();
+    let tail = &line[idx..];
+    let end = tail
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(tail.len());
+    tail[..end].parse::<u64>().ok()
+}
+
+fn parse_token_after(line: &str, key: &str) -> Option<String> {
+    let idx = line.find(key)? + key.len();
+    let tail = &line[idx..];
+    let end = tail
+        .find(|c: char| c == ',' || c.is_whitespace())
+        .unwrap_or(tail.len());
+    Some(tail[..end].to_string())
 }
 
 // ---------------------------------------------------------------------------
-// Test 1: single-shot reproduction. The canonical scenario fires the
-// watchdog stall — the same observable shape Bug-1 produces in production
-// sched_ext (a runnable task that fails to run for the watchdog interval).
+// Test 1: single-shot reproduction. The canonical scenario must produce
+// the post-Stage-E fingerprint: rc=0, library-side throttle activated,
+// 16 tasks put aside, multiple throttle periods recorded.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_bug1_canonical_subprocess_reproduces_stall() {
+fn test_bug1_canonical_subprocess_reproduces_throttle() {
     let _lock = common::setup_test();
 
-    let (code, stderr) = run_one_rep();
+    let (code, stderr) = run_one_rep(None);
+    assert_eq!(
+        code, EXIT_OK,
+        "expected EXIT_OK ({EXIT_OK}); got {code}.\nstderr:\n{stderr}"
+    );
+
+    let fp = extract_fingerprint(code, &stderr);
+    eprintln!("[bug1_canonical_subprocess] integrated-v6 fingerprint = {fp:?}");
 
     assert_eq!(
-        code, EXIT_STALL,
-        "expected exit {EXIT_STALL} (ExitKind::ErrorStall); got {code}.\n\
-         stderr was:\n{stderr}"
+        fp.is_throttled, 1,
+        "expected library to report cgroup throttled at end of run; got {fp:?}.\nstderr:\n{stderr}"
     );
-    let runnable = extract_runnable_for_ns(&stderr).unwrap_or_else(|| {
-        panic!(
-            "expected stable stderr marker `{STALL_MARKER_PREFIX}…runnable_for_ns=<N>` in \
-             scxsim stderr, but did not find it.\nstderr was:\n{stderr}"
-        )
-    });
+    assert_eq!(
+        fp.nr_throttled_tasks, 16,
+        "expected all 16 yes-loop workers in the BTQ; got {fp:?}.\nstderr:\n{stderr}"
+    );
+    let throttled = fp
+        .nr_throttled_periods
+        .split('/')
+        .next()
+        .unwrap_or("0")
+        .parse::<u32>()
+        .unwrap_or(0);
     assert!(
-        runnable >= 80_000_000,
-        "watchdog fired with runnable_for_ns={runnable} but the configured \
-         watchdog timeout is 80ms; the engine watchdog logic may be skewed. \
-         Full stderr:\n{stderr}"
-    );
-    eprintln!(
-        "[bug1_canonical_subprocess] reproduced ErrorStall with runnable_for_ns={runnable}ns ({}ms)",
-        runnable / 1_000_000
+        throttled >= 4,
+        "expected nr_throttled_periods numerator >= 4 (out of 6 periods in a 600ms run); \
+         got {fp:?}.\nstderr:\n{stderr}"
     );
 }
 
 // ---------------------------------------------------------------------------
-// Test 2: determinism loop — 10 reps, all must produce identical exit code
-// AND identical `runnable_for_ns` value. Bounded total wall time.
+// Test 2: determinism loop. Across 10 reps with the same in-tree .so the
+// fingerprint MUST be byte-identical (modulo the variable
+// runtime_total_sloppy / _last numbers, which are not part of the
+// fingerprint -- they jitter with timer fire ordering inside a 100ms
+// period).
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -181,42 +208,133 @@ fn test_bug1_canonical_subprocess_deterministic_10_reps() {
 
     const N: usize = 10;
     let start = Instant::now();
-    let mut first: Option<u64> = None;
-
+    let mut first: Option<Fingerprint> = None;
     for rep in 0..N {
-        let (code, stderr) = run_one_rep();
-        assert_eq!(
-            code, EXIT_STALL,
-            "rep {rep}: expected exit {EXIT_STALL}, got {code}.\nstderr:\n{stderr}"
-        );
-        let runnable = extract_runnable_for_ns(&stderr)
-            .unwrap_or_else(|| panic!("rep {rep}: stall marker missing.\nstderr:\n{stderr}"));
-        if let Some(prev) = first {
+        let (code, stderr) = run_one_rep(None);
+        let fp = extract_fingerprint(code, &stderr);
+        if let Some(prev) = &first {
             assert_eq!(
-                runnable, prev,
-                "rep {rep}: nondeterministic stall: expected runnable_for_ns={prev} \
-                 (from rep 0), got {runnable}.\nstderr:\n{stderr}"
+                &fp, prev,
+                "rep {rep}: nondeterministic fingerprint -- got {fp:?}, expected {prev:?}.\n\
+                 stderr:\n{stderr}"
             );
         } else {
-            first = Some(runnable);
+            first = Some(fp);
         }
     }
-
     let total = start.elapsed();
     let per_rep = total / N as u32;
     eprintln!(
-        "[bug1_canonical_subprocess] {N} reps deterministically produced \
-         ExitKind::ErrorStall runnable_for_ns={} (total wall {:.2?}, per_rep {:.2?})",
+        "[bug1_canonical_subprocess] {N} reps deterministic; fingerprint = {:?}; \
+         total wall {:.2?}, per_rep {:.2?}",
         first.unwrap(),
         total,
         per_rep
     );
-
-    // Hard wall budget: subprocess overhead is generous, but 60s total covers
-    // a comfortable per-rep ceiling of 6s on slow CI hardware. A single rep
-    // takes ~150ms on a fast workstation.
+    // Wall budget: post-Stage-E the canonical no longer stalls at
+    // ~200ms, so each rep runs the full 600ms simulated duration with
+    // the library doing real put-aside / reenqueue work every refill.
+    // ~10s wall per rep is typical on this hardware; budget for 180s
+    // total gives 18s/rep slack on slow CI.
     assert!(
-        total < std::time::Duration::from_secs(60),
-        "10 subprocess reps took {total:?}, exceeding the 60s wall budget"
+        total < std::time::Duration::from_secs(180),
+        "10 subprocess reps took {total:?}, exceeding the 180s wall budget"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Test 3: per-SHA discrimination (env-gated).
+//
+// Skipped silently if SCXSIM_BIN_CACHE_DIR is unset. When set, points at
+// a directory laid out as
+//     <BIN_CACHE>/<short_sha>/libscx_lavd.so
+// produced by experiments/bug1_scx_version_matrix_20260512/build_per_hash.sh.
+//
+// Asserts that the canonical reproducer produces DIFFERENT fingerprints
+// across the v3 matrix's three .so-buildable scx SHAs:
+//   - d565180067 (Apr-04, pre-period_budget):     is_throttled=0
+//   - 66d2ef699b (Apr-04, period_budget intro):   is_throttled=1
+//   - a08c9e272b (Apr-23, current v6 gitlink):    is_throttled=1
+//
+// (See experiments/engine_throttle_per_sha_20260513/README.md for the
+// full per-SHA fingerprint matrix and methodology.)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_bug1_canonical_per_sha_discrimination() {
+    let _lock = common::setup_test();
+
+    let cache = match std::env::var("SCXSIM_BIN_CACHE_DIR") {
+        Ok(d) => PathBuf::from(d),
+        Err(_) => {
+            eprintln!(
+                "[bug1_canonical_subprocess] SCXSIM_BIN_CACHE_DIR not set; skipping per-SHA \
+                 discrimination test. Set it to the bin_cache_engine_throttle_fix dir to run."
+            );
+            return;
+        }
+    };
+
+    let cases: &[(&str, u32, &str)] = &[
+        // (short_sha,                expected_is_throttled, label)
+        ("d565180067",                0, "Apr-04 pre-period_budget"),
+        ("66d2ef699b",                1, "Apr-04 period_budget intro"),
+        ("a08c9e272b",                1, "Apr-23 current v6 gitlink"),
+    ];
+
+    let mut fps: Vec<(String, Fingerprint)> = Vec::new();
+    for (sha, expected_is_throttled, label) in cases {
+        let so = cache.join(sha).join("libscx_lavd.so");
+        if !so.exists() {
+            eprintln!(
+                "[bug1_canonical_subprocess] {sha} ({label}): {} missing; skipping",
+                so.display()
+            );
+            continue;
+        }
+        let (code, stderr) = run_one_rep(Some(&so));
+        let fp = extract_fingerprint(code, &stderr);
+        eprintln!(
+            "[bug1_canonical_subprocess] {sha} ({label}): {fp:?}"
+        );
+        assert_eq!(
+            fp.is_throttled, *expected_is_throttled,
+            "{sha} ({label}): expected is_throttled={expected_is_throttled}, got {fp:?}.\n\
+             stderr tail:\n{}",
+            stderr.lines().rev().take(15).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n")
+        );
+        fps.push((sha.to_string(), fp));
+    }
+
+    // The whole point of this test: the matrix produces multiple
+    // distinct fingerprints. If at least 2 SHAs were exercised and they
+    // all produced the SAME fingerprint, the engine-throttle-attribution
+    // fix has regressed and per-SHA discrimination is broken.
+    if fps.len() >= 2 {
+        let first = &fps[0].1;
+        let all_same = fps.iter().all(|(_, fp)| fp == first);
+        assert!(
+            !all_same,
+            "per-SHA discrimination REGRESSED: {} cached SHAs all produced the same \
+             fingerprint {first:?}. The cgroup_bw library is no longer driving \
+             throttling differently per scx SHA.",
+            fps.len()
+        );
+        eprintln!(
+            "[bug1_canonical_subprocess] per-SHA discrimination OK: {} cached SHAs \
+             produced {} distinct fingerprints",
+            fps.len(),
+            fps.iter()
+                .map(|(_, f)| f)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+        );
+    } else {
+        eprintln!(
+            "[bug1_canonical_subprocess] only {} cached SHAs available; \
+             per-SHA discrimination NOT verified (need >= 2). Build the cache via \
+             experiments/bug1_scx_version_matrix_20260512/build_per_hash.sh.",
+            fps.len()
+        );
+    }
 }
