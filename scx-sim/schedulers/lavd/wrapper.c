@@ -584,6 +584,14 @@ extern void scxsim_cgroup_bw_yield_is_task_throttled(void);
 extern void scxsim_cgroup_bw_yield_move(void);
 extern void scxsim_cgroup_bw_yield_dump(void);
 extern int scxsim_cgroup_bw_begin_interleaved_timer(unsigned int *slot);
+extern void scxsim_cbw_yield_site(unsigned int site, unsigned long long cgid,
+				  long long remaining,
+				  unsigned long long time_to_throttle,
+				  unsigned long long min_time_to_throttle);
+extern int scxsim_cgroup_bw_begin_targeted_timer(
+	unsigned int site, unsigned long long cgid, long long remaining,
+	unsigned long long time_to_throttle,
+	unsigned long long min_time_to_throttle, unsigned int *slot);
 extern void scxsim_cgroup_bw_end_interleaved_timer(void);
 void lavd_fire_timer(unsigned int slot);
 
@@ -591,6 +599,18 @@ void lavd_fire_timer(unsigned int slot);
 	unsigned int _scxsim_timer_slot; \
 	fn(); \
 	if (scxsim_cgroup_bw_begin_interleaved_timer(&_scxsim_timer_slot)) { \
+		lavd_fire_timer(_scxsim_timer_slot); \
+		scxsim_cgroup_bw_end_interleaved_timer(); \
+	} \
+} while (0)
+
+#define scxsim_cbw_yield(site, cgid, remaining, time_to_throttle, min_time_to_throttle) do { \
+	unsigned int _scxsim_timer_slot; \
+	scxsim_cbw_yield_site((site), (cgid), (remaining), \
+			      (time_to_throttle), (min_time_to_throttle)); \
+	if (scxsim_cgroup_bw_begin_targeted_timer( \
+		    (site), (cgid), (remaining), (time_to_throttle), \
+		    (min_time_to_throttle), &_scxsim_timer_slot)) { \
 		lavd_fire_timer(_scxsim_timer_slot); \
 		scxsim_cgroup_bw_end_interleaved_timer(); \
 	} \
@@ -1262,6 +1282,7 @@ int topo_cpu_to_llc_id(u32 cpu) { (void)cpu; return 0; }
  *     (Phase 1 item 7) at .so dlopen via -rdynamic.
  */
 #include "../../scx/lib/cgroup_bw.bpf.c"
+#undef scxsim_cbw_yield
 
 /*
  * =================================================================

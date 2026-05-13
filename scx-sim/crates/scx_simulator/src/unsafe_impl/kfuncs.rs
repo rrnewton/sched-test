@@ -435,6 +435,14 @@ pub struct SimulatorState {
     pub stochastic_timer_interleave_window_ns: TimeNs,
     /// SHARED-READ: Approximate rate for pulling eligible timers forward.
     pub stochastic_timer_interleave_one_in: u32,
+    /// SHARED-READ: Force deterministic timer interleavings at targeted cgroup_bw sites.
+    pub targeted_cbw_yield_sites: bool,
+    /// SHARED-READ: Fire-ahead window for targeted cgroup_bw timer pulls.
+    pub targeted_cbw_yield_window_ns: TimeNs,
+    /// SHARED-READ: Maximum number of targeted cgroup_bw timer pulls.
+    pub targeted_cbw_yield_limit: u32,
+    /// SHARED-MUT: Number of targeted cgroup_bw timer pulls already forced.
+    pub targeted_cbw_yield_count: u32,
     /// SHARED-READ: Configuration set at init, never mutated during simulation.
     ///
     /// Preemptive interleaving configuration (None = disabled).
@@ -865,7 +873,6 @@ impl SimulatorState {
         local_cpu: CpuId,
         pd: PendingDispatch,
     ) -> Option<CpuId> {
-
         // Task has been dispatched — no longer in BPF scheduler's queue.
         self.set_task_ops_state(pd.pid, OpsTaskState::None);
 
@@ -1610,6 +1617,130 @@ define_cgroup_bw_yield!(
 );
 define_cgroup_bw_yield!(scxsim_cgroup_bw_yield_move, "cgroup_bw_move");
 define_cgroup_bw_yield!(scxsim_cgroup_bw_yield_dump, "cgroup_bw_dump");
+
+const CBW_YIELD_AFTER_MIN_TTT_SAMPLE: u32 = 1;
+
+fn cbw_yield_site_name(site: u32) -> &'static str {
+    match site {
+        CBW_YIELD_AFTER_MIN_TTT_SAMPLE => "cbw_after_min_ttt_sample",
+        2 => "cbw_after_top_half_begin",
+        3 => "cbw_after_top_half_end_publish",
+        _ => "cbw_unknown_yield_site",
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn scxsim_cbw_yield_site(
+    site: u32,
+    cgid: u64,
+    remaining: i64,
+    time_to_throttle: u64,
+    min_time_to_throttle: u64,
+) {
+    let site_name = cbw_yield_site_name(site);
+    crate::preempt::set_current_kfunc(site_name);
+    if std::env::var_os("SCXSIM_DEBUG_CBW_YIELD").is_some() {
+        eprintln!(
+            "[SCXSIM-CBW-YIELD] site={site_name} cgid={cgid} remaining={remaining} \
+             time_to_throttle={time_to_throttle} min_time_to_throttle={min_time_to_throttle}"
+        );
+    }
+    crate::interleave::maybe_yield();
+}
+
+#[no_mangle]
+pub extern "C" fn scxsim_cgroup_bw_begin_targeted_timer(
+    site: u32,
+    cgid: u64,
+    remaining: i64,
+    time_to_throttle: u64,
+    min_time_to_throttle: u64,
+    slot_out: *mut u32,
+) -> i32 {
+    if slot_out.is_null() || site != CBW_YIELD_AFTER_MIN_TTT_SAMPLE {
+        return 0;
+    }
+    if INTERLEAVED_TIMER_SAVED_CTX.with(|c| c.get().is_some()) {
+        return 0;
+    }
+    let Some(saved_ctx) = get_callback_ctx() else {
+        return 0;
+    };
+    let Some(arc) = SIM_ARC.with(|c| c.borrow().clone()) else {
+        return 0;
+    };
+
+    disable_rbc_counter();
+    crate::preempt::inhibit_preemption();
+    crate::preempt::pause_timer();
+    let selected = {
+        let mut guard = arc.lock().unwrap();
+        let fields = guard.fields();
+        if !fields.sim.targeted_cbw_yield_sites
+            || fields.sim.targeted_cbw_yield_count >= fields.sim.targeted_cbw_yield_limit
+        {
+            None
+        } else {
+            let cpu = saved_ctx.current_cpu;
+            let now = fields.sim.cpus[cpu.0 as usize]
+                .local_clock
+                .max(fields.sim.clock);
+            let horizon = now.saturating_add(fields.sim.targeted_cbw_yield_window_ns);
+            let selected = fields.events.pop_targeted_timer_interleave(horizon);
+            if selected.is_some() {
+                fields.sim.targeted_cbw_yield_count += 1;
+            }
+            selected
+        }
+    };
+
+    let Some(event) = selected else {
+        crate::preempt::allow_preemption();
+        crate::preempt::resume_timer();
+        enable_rbc_counter();
+        return 0;
+    };
+    let EventKind::TimerFired { cpu, slot } = event.kind else {
+        crate::preempt::allow_preemption();
+        crate::preempt::resume_timer();
+        enable_rbc_counter();
+        return 0;
+    };
+
+    if std::env::var_os("SCXSIM_DEBUG_CBW_YIELD").is_some() {
+        eprintln!(
+            "[SCXSIM-CBW-YIELD] forcing timer slot={slot} cpu={} at site={} \
+             cgid={cgid} remaining={remaining} time_to_throttle={time_to_throttle} \
+             min_time_to_throttle={min_time_to_throttle}",
+            cpu.0,
+            cbw_yield_site_name(site)
+        );
+    }
+
+    {
+        let mut guard = arc.lock().unwrap();
+        let sim = &mut guard.sim;
+        sim.current_cpu = cpu;
+        sim.ops_context = OpsContext::FireTimer;
+        sim.cpus[cpu.0 as usize].local_clock =
+            sim.cpus[cpu.0 as usize].local_clock.max(event.time_ns);
+        set_sim_clock(sim.cpus[cpu.0 as usize].local_clock, Some(cpu));
+    }
+
+    INTERLEAVED_TIMER_SAVED_CTX.with(|c| c.set(Some(saved_ctx)));
+    install_callback_ctx(CallbackContext {
+        current_cpu: cpu,
+        ops_context: OpsContext::FireTimer,
+        waker_task_raw: None,
+    });
+    unsafe {
+        *slot_out = slot as u32;
+    }
+    crate::preempt::allow_preemption();
+    crate::preempt::resume_timer();
+    enable_rbc_counter();
+    1
+}
 
 #[no_mangle]
 pub extern "C" fn scxsim_cgroup_bw_begin_interleaved_timer(slot_out: *mut u32) -> i32 {
@@ -3031,6 +3162,10 @@ mod tests {
             stochastic_timer_interleave: false,
             stochastic_timer_interleave_window_ns: 0,
             stochastic_timer_interleave_one_in: 0,
+            targeted_cbw_yield_sites: false,
+            targeted_cbw_yield_window_ns: 0,
+            targeted_cbw_yield_limit: 0,
+            targeted_cbw_yield_count: 0,
         }
     }
 
