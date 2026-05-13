@@ -1253,6 +1253,114 @@ int scxsim_cgroup_bw_throttled(struct cgroup *cgrp, struct task_struct *p)
 	return scx_cgroup_bw_throttled(cgrp, p);
 }
 
+/*
+ * Diagnostic probe (Phase 2 Stage E investigation, tg
+ * `investigate-scxsim-engine-throttles-before-scheduler-cgroup-bw`):
+ * isolate WHERE the consume->accumulate chain breaks. The
+ * scheduler-side scx_cgroup_bw_consume IS being called 252k times per
+ * canonical run with valid args + rc=0, yet the library's
+ * runtime_total_sloppy stays 0. Suspect: cbw_get_llc_ctx returns NULL
+ * because scxsim's bpf_map_lookup_elem on cbw_cgrp_llc_map (HASH,
+ * keyed by struct cgroup_llc_id) fails to find what
+ * cbw_init_llc_ctx populated.
+ *
+ * This probe is callable from the engine end-of-run reporting code
+ * (via dlsym). It exercises BOTH paths against the same key:
+ *   path A: cbw_get_llc_ctx(cgrp, llc_id)         -- the library's
+ *           internal lookup wrapper
+ *   path B: bpf_map_lookup_elem(&cbw_cgrp_llc_map, &key)  -- raw
+ *           direct hash lookup with the same struct key
+ *
+ * If A=NULL and B=non-NULL, the library and direct paths disagree
+ * (key shape / padding bug). If A=NULL and B=NULL, the entry is
+ * genuinely not in the map (cbw_init_llc_ctx populated an unrelated
+ * entry, or scxsim's BPF_NOEXIST insert silently failed). If both
+ * return non-NULL, the wiring works and the bug is elsewhere
+ * downstream (cbw_update_runtime_total_sloppy aggregation, or the
+ * accounting timer not firing).
+ *
+ * Also reports the cgx-level state via cbw_get_cgroup_ctx for
+ * completeness.
+ */
+struct scxsim_cbw_probe_result {
+	void                  *cgx;                  /* cbw_get_cgroup_ctx(cgrp) */
+	void                  *llcx_via_helper;      /* cbw_get_llc_ctx(cgrp, llc_id) */
+	void                  *llcx_via_direct_map;  /* bpf_map_lookup_elem direct */
+	unsigned long long     cgrp_id_seen;         /* cgroup_get_id(cgrp) */
+	int                    has_llcx;             /* cgx->has_llcx */
+	int                    is_throttled;         /* cgx->is_throttled */
+	long long              runtime_total_sloppy;
+	long long              runtime_total_in_llcx;/* llcx->runtime_total */
+	long long              consumed_count_pre;   /* probe counter */
+	void                  *cgrp_ptr;             /* cgrp pointer the probe got */
+	int                    cbw_cgrp_map_nr;      /* number of entries in cbw_cgrp_map */
+	void                  *cbw_cgrp_map_first_key;/* keys[0] (= first stored cgrp ptr) */
+	int                    cbw_cgrp_llc_map_nr;
+};
+
+extern struct scx_test_map cbw_cgrp_test_map;
+extern struct scx_test_map cbw_cgrp_llc_test_map;
+
+__attribute__((visibility("default")))
+int scxsim_probe_cbw_state(unsigned long long cgrp_id, int llc_id,
+			   struct scxsim_cbw_probe_result *out)
+{
+	struct cgroup *cgrp;
+	struct scx_cgroup_ctx *cgx;
+	struct scx_cgroup_llc_ctx *llcx_h, *llcx_d;
+	struct cgroup_llc_id key;
+
+	if (!out)
+		return -EINVAL;
+
+	__builtin_memset(out, 0, sizeof(*out));
+#ifdef SCXSIM_DEBUG_CONSUME_PROBE
+	out->consumed_count_pre = (long long)scxsim_cgroup_bw_consume_count_pre;
+#else
+	out->consumed_count_pre = -1;
+#endif
+
+	cgrp = (struct cgroup *)sim_cgroup_lookup_by_id(cgrp_id);
+	if (!cgrp)
+		return -ESRCH;
+
+	out->cgrp_ptr = cgrp;
+	out->cgrp_id_seen = cgroup_get_id(cgrp);
+
+	cgx = cbw_get_cgroup_ctx(cgrp);
+	out->cgx = cgx;
+	if (cgx) {
+		out->has_llcx = cgx->has_llcx;
+		out->is_throttled = cgx->is_throttled;
+		out->runtime_total_sloppy = cgx->runtime_total_sloppy;
+	}
+
+	llcx_h = cbw_get_llc_ctx(cgrp, llc_id);
+	out->llcx_via_helper = llcx_h;
+
+	__builtin_memset(&key, 0, sizeof(key));
+	key.cgrp_id = cgroup_get_id(cgrp);
+	key.llc_id = llc_id;
+	llcx_d = bpf_map_lookup_elem(&cbw_cgrp_llc_map, &key);
+	out->llcx_via_direct_map = llcx_d;
+
+	if (llcx_h)
+		out->runtime_total_in_llcx = llcx_h->runtime_total;
+	else if (llcx_d)
+		out->runtime_total_in_llcx = llcx_d->runtime_total;
+
+	out->cbw_cgrp_map_nr = cbw_cgrp_test_map.nr;
+	if (cbw_cgrp_test_map.nr > 0 && cbw_cgrp_test_map.keys) {
+		/* Each key is sizeof(struct cgroup *) = 8 bytes -- the
+		 * cgrp pointer that bpf_cgrp_storage_get's caller passed
+		 * (via &cgrp dereference). */
+		out->cbw_cgrp_map_first_key = *(void **)cbw_cgrp_test_map.keys;
+	}
+	out->cbw_cgrp_llc_map_nr = cbw_cgrp_llc_test_map.nr;
+
+	return 0;
+}
+
 #endif /* SCXSIM_PHASE2_REAL_CGROUP_BW */
 
 /*

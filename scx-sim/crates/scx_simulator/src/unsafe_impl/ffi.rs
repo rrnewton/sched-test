@@ -468,6 +468,21 @@ pub trait Scheduler {
         None
     }
 
+    /// Phase 2 Stage E diagnostic probe. Returns `None` when the
+    /// loaded scheduler does not expose `scxsim_probe_cbw_state` (any
+    /// scheduler that does not link cgroup_bw -- e.g. simple,
+    /// tickless). When present, fills `out` with the library's
+    /// internal state for `(cgrp_id, llc_id)` and returns a libc-style
+    /// integer return code (0 success, negative errno).
+    fn probe_cbw_state(
+        &self,
+        _cgrp_id: u64,
+        _llc_id: i32,
+        _out: &mut CbwProbeResult,
+    ) -> Option<i32> {
+        None
+    }
+
     /// Resolve e9patch C trampoline function pointers from the loaded library.
     ///
     /// Returns `None` by default (no e9patch support). `DynamicScheduler`
@@ -577,6 +592,31 @@ type CpuAcquireFn = unsafe extern "C" fn(i32, *mut c_void);
  * returns the right answer.
  */
 type IsCgroupThrottledFn = unsafe extern "C" fn(u64) -> i32;
+/*
+ * Phase 2 Stage E diagnostic probe (tg
+ * `investigate-scxsim-engine-throttles-before-scheduler-cgroup-bw`):
+ * `int scxsim_probe_cbw_state(u64 cgrp_id, int llc_id, struct ProbeResult *out)`
+ * exported by wrapper.c. Callers pass a `ProbeResult` buffer that
+ * mirrors `struct scxsim_cbw_probe_result` in wrapper.c byte-for-byte.
+ */
+#[repr(C)]
+#[derive(Default, Debug, Clone, Copy)]
+pub struct CbwProbeResult {
+    pub cgx: *mut c_void,
+    pub llcx_via_helper: *mut c_void,
+    pub llcx_via_direct_map: *mut c_void,
+    pub cgrp_id_seen: u64,
+    pub has_llcx: i32,
+    pub is_throttled: i32,
+    pub runtime_total_sloppy: i64,
+    pub runtime_total_in_llcx: i64,
+    pub consumed_count_pre: i64,
+    pub cgrp_ptr: *mut c_void,
+    pub cbw_cgrp_map_nr: i32,
+    pub cbw_cgrp_map_first_key: *mut c_void,
+    pub cbw_cgrp_llc_map_nr: i32,
+}
+type ProbeCbwStateFn = unsafe extern "C" fn(u64, i32, *mut CbwProbeResult) -> i32;
 type CgroupSetBandwidthFn = unsafe extern "C" fn(*mut c_void, u64, u64, u64);
 type CpuOnlineFn = unsafe extern "C" fn(i32);
 type CpuOfflineFn = unsafe extern "C" fn(i32);
@@ -622,6 +662,13 @@ struct SchedOps {
      * the cgroup_bw library at all.
      */
     is_cgroup_throttled: Option<IsCgroupThrottledFn>,
+    /*
+     * Phase 2 Stage E diagnostic: `scxsim_probe_cbw_state`.
+     * Optional -- only present when wrapper.c is built with the probe
+     * exported (which is unconditional today, but defensive None for
+     * any future scheduler that does not link cgroup_bw).
+     */
+    probe_cbw_state: Option<ProbeCbwStateFn>,
 }
 
 /// Metadata about a discovered scheduler .so file.
@@ -1072,6 +1119,12 @@ impl DynamicScheduler {
                 .map(|sym| {
                     std::mem::transmute::<*const (), IsCgroupThrottledFn>(*sym)
                 }),
+            probe_cbw_state: lib
+                .get::<*const ()>(b"scxsim_probe_cbw_state")
+                .ok()
+                .map(|sym| {
+                    std::mem::transmute::<*const (), ProbeCbwStateFn>(*sym)
+                }),
         }
     }
 
@@ -1309,6 +1362,19 @@ impl Scheduler for DynamicScheduler {
         self.ops
             .is_cgroup_throttled
             .map(|f| unsafe { f(cgrp_id) != 0 })
+    }
+
+    fn probe_cbw_state(
+        &self,
+        cgrp_id: u64,
+        llc_id: i32,
+        out: &mut CbwProbeResult,
+    ) -> Option<i32> {
+        // SAFETY: f is dlsym'd at scheduler load; out is a valid
+        // mut ref to a #[repr(C)] struct that mirrors the C side.
+        self.ops
+            .probe_cbw_state
+            .map(|f| unsafe { f(cgrp_id, llc_id, out as *mut CbwProbeResult) })
     }
 
     fn resolve_e9_fns(&self) -> Option<crate::backend::e9patch::E9PatchFns> {
