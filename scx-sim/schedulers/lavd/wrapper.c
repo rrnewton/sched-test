@@ -1288,26 +1288,21 @@ static void lavd_register_cbw_maps(void)
  * Called from Rust before lavd_init() to initialize globals,
  * register maps, and install the SIGFPE handler.
  */
-extern int dprintf(int fd, const char *fmt, ...);
 void lavd_setup(unsigned int num_cpus)
 {
 	unsigned int cpu;
 
-	dprintf(2, "[PHASE2-DBG] lavd_setup enter cpus=%u\n", num_cpus);
 	/* Install SIGFPE handler for BPF div-by-zero semantics */
 	sim_install_sigfpe_handler();
-	dprintf(2, "[PHASE2-DBG] sigfpe installed\n");
 
 	/* Initialize per-task arena storage for task_ctx */
 	scx_task_init(sizeof(struct task_ctx));
-	dprintf(2, "[PHASE2-DBG] scx_task_init done\n");
 
 	/* Register maps */
 	lavd_register_maps();
 #ifdef SCXSIM_PHASE2_REAL_CGROUP_BW
 	lavd_register_cbw_maps();
 #endif
-	dprintf(2, "[PHASE2-DBG] lavd_register_maps done\n");
 
 	/* Core globals */
 	nr_cpus_onln = num_cpus;
@@ -1361,7 +1356,6 @@ void lavd_setup(unsigned int num_cpus)
 			cpdomc->__cpumask[cpu / 64] |=
 				(1ULL << (cpu % 64));
 	}
-	dprintf(2, "[PHASE2-DBG] lavd_setup exit\n");
 }
 
 /*
