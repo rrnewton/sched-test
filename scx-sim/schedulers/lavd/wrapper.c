@@ -570,23 +570,114 @@ extern int scxsim_probe_dprintf(int fd, const char *fmt, ...) __asm__("dprintf")
 #include "preempt.bpf.c"
 #include "introspec.bpf.c"
 
-#ifdef SCXSIM_DEBUG_CONSUME_PROBE
-#define scx_cgroup_bw_consume(c, n) ({ \
-    int _rc = scx_cgroup_bw_consume((c), (n)); \
-    scxsim_cgroup_bw_consume_count_pre++; \
-    scxsim_cgroup_bw_consume_sum_ns += (unsigned long long)(n); \
-    if ((scxsim_cgroup_bw_consume_count_pre & 0xfff) == 1) \
-        scxsim_probe_dprintf(2, "[SCXSIM-PROBE] consume cgrp=%p level=%d ns=%llu count=%llu sum_ns=%llu rc=%d\n", \
-            (void *)(c), (c) ? ((int)(c)->level) : -1, \
-            (unsigned long long)(n), scxsim_cgroup_bw_consume_count_pre, \
-            scxsim_cgroup_bw_consume_sum_ns, _rc); \
-    _rc; \
+extern void scxsim_cgroup_bw_yield_lib_init(void);
+extern void scxsim_cgroup_bw_yield_init(void);
+extern void scxsim_cgroup_bw_yield_exit(void);
+extern void scxsim_cgroup_bw_yield_set(void);
+extern void scxsim_cgroup_bw_yield_throttled(void);
+extern void scxsim_cgroup_bw_yield_consume(void);
+extern void scxsim_cgroup_bw_yield_put_aside(void);
+extern void scxsim_cgroup_bw_yield_reenqueue(void);
+extern void scxsim_cgroup_bw_yield_cancel(void);
+extern void scxsim_cgroup_bw_yield_is_cgroup_throttled(void);
+extern void scxsim_cgroup_bw_yield_is_task_throttled(void);
+extern void scxsim_cgroup_bw_yield_move(void);
+extern void scxsim_cgroup_bw_yield_dump(void);
+
+/*
+ * Phase 3: expose LAVD's real cgroup_bw library entry surface to
+ * scxsim's deterministic interleaving modes. These macros apply only
+ * to the scheduler call sites in main.bpf.c; they are undefined before
+ * scx/lib/cgroup_bw.bpf.c is included below, so the real library
+ * definitions remain untouched.
+ */
+#define scx_cgroup_bw_lib_init(config) ({ \
+	scxsim_cgroup_bw_yield_lib_init(); \
+	scx_cgroup_bw_lib_init((config)); \
 })
+#define scx_cgroup_bw_init(cgrp, args) ({ \
+	scxsim_cgroup_bw_yield_init(); \
+	scx_cgroup_bw_init((cgrp), (args)); \
+})
+#define scx_cgroup_bw_exit(cgrp) ({ \
+	scxsim_cgroup_bw_yield_exit(); \
+	scx_cgroup_bw_exit((cgrp)); \
+})
+#define scx_cgroup_bw_set(cgrp, period_us, quota_us, burst_us) ({ \
+	scxsim_cgroup_bw_yield_set(); \
+	scx_cgroup_bw_set((cgrp), (period_us), (quota_us), (burst_us)); \
+})
+#define scx_cgroup_bw_throttled(cgrp, p) ({ \
+	scxsim_cgroup_bw_yield_throttled(); \
+	scx_cgroup_bw_throttled((cgrp), (p)); \
+})
+#define scx_cgroup_bw_consume(c, n) ({ \
+	scxsim_cgroup_bw_yield_consume(); \
+	int _rc = scx_cgroup_bw_consume((c), (n)); \
+	SCXSIM_DEBUG_CONSUME_PROBE_BODY(c, n, _rc); \
+	_rc; \
+})
+#define scx_cgroup_bw_put_aside(p, taskc, vtime, cgrp) ({ \
+	scxsim_cgroup_bw_yield_put_aside(); \
+	scx_cgroup_bw_put_aside((p), (taskc), (vtime), (cgrp)); \
+})
+#define scx_cgroup_bw_reenqueue() ({ \
+	scxsim_cgroup_bw_yield_reenqueue(); \
+	scx_cgroup_bw_reenqueue(); \
+})
+#define scx_cgroup_bw_cancel(taskc) ({ \
+	scxsim_cgroup_bw_yield_cancel(); \
+	scx_cgroup_bw_cancel((taskc)); \
+})
+#define scx_cgroup_bw_is_cgroup_throttled(cgrp_id) ({ \
+	scxsim_cgroup_bw_yield_is_cgroup_throttled(); \
+	scx_cgroup_bw_is_cgroup_throttled((cgrp_id)); \
+})
+#define scx_cgroup_bw_is_task_throttled(taskc) ({ \
+	scxsim_cgroup_bw_yield_is_task_throttled(); \
+	scx_cgroup_bw_is_task_throttled((taskc)); \
+})
+#define scx_cgroup_bw_move(p, taskc, from, to) ({ \
+	scxsim_cgroup_bw_yield_move(); \
+	scx_cgroup_bw_move((p), (taskc), (from), (to)); \
+})
+#define scx_cgroup_bw_dump(cgrp_id, descendent, accurate, indent) ({ \
+	scxsim_cgroup_bw_yield_dump(); \
+	scx_cgroup_bw_dump((cgrp_id), (descendent), (accurate), (indent)); \
+})
+
+#ifdef SCXSIM_DEBUG_CONSUME_PROBE
+#define SCXSIM_DEBUG_CONSUME_PROBE_BODY(c, n, rc) do { \
+	scxsim_cgroup_bw_consume_count_pre++; \
+	scxsim_cgroup_bw_consume_sum_ns += (unsigned long long)(n); \
+	if ((scxsim_cgroup_bw_consume_count_pre & 0xfff) == 1) \
+		scxsim_probe_dprintf(2, "[SCXSIM-PROBE] consume cgrp=%p level=%d ns=%llu count=%llu sum_ns=%llu rc=%d\n", \
+			(void *)(c), (c) ? ((int)(c)->level) : -1, \
+			(unsigned long long)(n), scxsim_cgroup_bw_consume_count_pre, \
+			scxsim_cgroup_bw_consume_sum_ns, (rc)); \
+} while (0)
+#else
+#define SCXSIM_DEBUG_CONSUME_PROBE_BODY(c, n, rc) do { \
+	(void)(c); \
+	(void)(n); \
+	(void)(rc); \
+} while (0)
 #endif
 #include "main.bpf.c"
-#ifdef SCXSIM_DEBUG_CONSUME_PROBE
+#undef scx_cgroup_bw_lib_init
+#undef scx_cgroup_bw_init
+#undef scx_cgroup_bw_exit
+#undef scx_cgroup_bw_set
+#undef scx_cgroup_bw_throttled
 #undef scx_cgroup_bw_consume
-#endif
+#undef scx_cgroup_bw_put_aside
+#undef scx_cgroup_bw_reenqueue
+#undef scx_cgroup_bw_cancel
+#undef scx_cgroup_bw_is_cgroup_throttled
+#undef scx_cgroup_bw_is_task_throttled
+#undef scx_cgroup_bw_move
+#undef scx_cgroup_bw_dump
+#undef SCXSIM_DEBUG_CONSUME_PROBE_BODY
 
 /*
  * =================================================================

@@ -1573,6 +1573,36 @@ pub extern "C" fn sim_rbc_resume() {
 // SCX kfunc implementations
 // ---------------------------------------------------------------------------
 
+macro_rules! define_cgroup_bw_yield {
+    ($fn_name:ident, $site_name:literal) => {
+        #[no_mangle]
+        pub extern "C" fn $fn_name() {
+            crate::preempt::set_current_kfunc($site_name);
+            crate::interleave::maybe_yield();
+        }
+    };
+}
+
+define_cgroup_bw_yield!(scxsim_cgroup_bw_yield_lib_init, "cgroup_bw_lib_init");
+define_cgroup_bw_yield!(scxsim_cgroup_bw_yield_init, "cgroup_bw_init");
+define_cgroup_bw_yield!(scxsim_cgroup_bw_yield_exit, "cgroup_bw_exit");
+define_cgroup_bw_yield!(scxsim_cgroup_bw_yield_set, "cgroup_bw_set");
+define_cgroup_bw_yield!(scxsim_cgroup_bw_yield_throttled, "cgroup_bw_throttled");
+define_cgroup_bw_yield!(scxsim_cgroup_bw_yield_consume, "cgroup_bw_consume");
+define_cgroup_bw_yield!(scxsim_cgroup_bw_yield_put_aside, "cgroup_bw_put_aside");
+define_cgroup_bw_yield!(scxsim_cgroup_bw_yield_reenqueue, "cgroup_bw_reenqueue");
+define_cgroup_bw_yield!(scxsim_cgroup_bw_yield_cancel, "cgroup_bw_cancel");
+define_cgroup_bw_yield!(
+    scxsim_cgroup_bw_yield_is_cgroup_throttled,
+    "cgroup_bw_is_cgroup_throttled"
+);
+define_cgroup_bw_yield!(
+    scxsim_cgroup_bw_yield_is_task_throttled,
+    "cgroup_bw_is_task_throttled"
+);
+define_cgroup_bw_yield!(scxsim_cgroup_bw_yield_move, "cgroup_bw_move");
+define_cgroup_bw_yield!(scxsim_cgroup_bw_yield_dump, "cgroup_bw_dump");
+
 /// Create a dispatch queue.
 #[no_mangle]
 pub extern "C" fn scx_bpf_create_dsq(dsq_id: u64, _node: i32) -> i32 {
