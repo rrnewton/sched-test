@@ -222,6 +222,19 @@ impl<S: Scheduler> SchedulerWrapper<S> {
         self.inner.is_cgroup_throttled(cgrp_id)
     }
 
+    /// Phase 2 Stage E diagnostic: query the library's per-cgroup state
+    /// for `(cgrp_id, llc_id)` via the `scxsim_probe_cbw_state` exported
+    /// forwarder. Returns None if the loaded scheduler does not expose
+    /// the probe.
+    pub fn probe_cbw_state(
+        &self,
+        cgrp_id: u64,
+        llc_id: i32,
+        out: &mut crate::ffi::CbwProbeResult,
+    ) -> Option<i32> {
+        self.inner.probe_cbw_state(cgrp_id, llc_id, out)
+    }
+
     /// CPU idle state changed (`ops.update_idle`).
     pub fn update_idle(&self, cpu: i32, idle: bool) {
         // SAFETY: No pointer arguments; cpu ID is validated by the engine.

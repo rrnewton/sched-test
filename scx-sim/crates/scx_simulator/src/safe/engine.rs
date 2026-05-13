@@ -2078,6 +2078,61 @@ impl<S: Scheduler> Simulator<S> {
             }
         }
 
+        // Phase 2 Stage E diagnostic probe (PRE-cgroup_exit). See full
+        // rationale in the second probe block below; a copy is run here
+        // because lavd_cgroup_exit -> cbw_del_cgroup_ctx clears the
+        // library's cbw_cgrp_map, so any probe AFTER the loop sees
+        // empty maps regardless of what the run produced.
+        if std::env::var_os("SCXSIM_DEBUG_CBW_PROBE").is_some() {
+            eprintln!("[SCXSIM-CBW-PROBE-PRE-EXIT] (before cgroup_exit cleanup)");
+            let cgids: Vec<CgroupId> = s
+                .cgroup_registry
+                .all_cgids_preorder()
+                .into_iter()
+                .filter(|c| *c != CgroupId::ROOT)
+                .collect();
+            for cgid in cgids {
+                let cpu = s.sim.current_cpu;
+                let mut out = crate::ffi::CbwProbeResult::default();
+                start_rbc(&mut s.sim);
+                let mut probed = false;
+                let mut rc_out: i32 = 0;
+                sim_callback!(s, s, sim_arc, cpu, {
+                    if let Some(rc) = self.scheduler.probe_cbw_state(cgid.0, 0, &mut out) {
+                        probed = true;
+                        rc_out = rc;
+                    }
+                });
+                let s = &mut *s;
+                charge_sched_time(&mut s.sim, CpuId(0), "probe_cbw_state");
+                if probed {
+                    eprintln!(
+                        "[SCXSIM-CBW-PROBE-PRE-EXIT] cgid={} llc=0 rc={} cgrp_id_seen={} \
+                         cgrp_ptr={:?} cgx={:?} llcx_helper={:?} llcx_direct={:?} \
+                         has_llcx={} is_throttled={} runtime_total_sloppy={} \
+                         runtime_total_in_llcx={} consume_count_pre={} \
+                         cbw_cgrp_map_nr={} cbw_cgrp_map_first_key={:?} \
+                         cbw_cgrp_llc_map_nr={}",
+                        cgid.0,
+                        rc_out,
+                        out.cgrp_id_seen,
+                        out.cgrp_ptr,
+                        out.cgx,
+                        out.llcx_via_helper,
+                        out.llcx_via_direct_map,
+                        out.has_llcx,
+                        out.is_throttled,
+                        out.runtime_total_sloppy,
+                        out.runtime_total_in_llcx,
+                        out.consumed_count_pre,
+                        out.cbw_cgrp_map_nr,
+                        out.cbw_cgrp_map_first_key,
+                        out.cbw_cgrp_llc_map_nr,
+                    );
+                }
+            }
+        }
+
         // Call cgroup_exit for each cgroup (reverse order: children before root)
         {
             let cpu = s.sim.current_cpu;
@@ -2094,6 +2149,80 @@ impl<S: Scheduler> Simulator<S> {
                     self.scheduler.cgroup_exit(TaskPtr::new(raw));
                 });
                 charge_sched_time(&mut s.sim, CpuId(0), "cgroup_exit");
+            }
+        }
+
+        // Phase 2 Stage E diagnostic (tg
+        // `investigate-scxsim-engine-throttles-before-scheduler-cgroup-bw`):
+        // probe the cgroup_bw library state for every non-root cgroup
+        // BEFORE calling scheduler.exit(). Reports both the library's
+        // internal helper lookup and a direct map lookup for the same
+        // key so the engine can tell whether the breakdown is in the
+        // library wrapper, the map impl, or somewhere downstream.
+        //
+        // The probe is silently skipped when the loaded scheduler does
+        // not export `scxsim_probe_cbw_state` (e.g. simple, tickless).
+        // Output is opt-in: enable with SCXSIM_DEBUG_CBW_PROBE env var.
+        //
+        // The probe MUST run inside `sim_callback!` because the wrapper
+        // calls `bpf_cgroup_from_id` -> `sim_cgroup_lookup_by_id` which
+        // try_lock()s the SimArc. The outer engine code holds that
+        // lock; only sim_callback!'s drop(guard) makes try_lock
+        // succeed. Without the macro the probe gets the root cgroup
+        // back instead of the requested one.
+        //
+        // NOTE: deliberately wired AFTER cgroup_exit too late was the
+        // first cut -- maps get freed there. This block must remain
+        // BEFORE the cgroup_exit loop above. (Earlier checkpoint:
+        // probe at end-of-run reported nr=0 / cgx=NULL because
+        // lavd_cgroup_exit -> cbw_del_cgroup_ctx had already cleared
+        // the cbw_cgrp_map.)
+        if std::env::var_os("SCXSIM_DEBUG_CBW_PROBE").is_some() {
+            let cgids: Vec<CgroupId> = s
+                .cgroup_registry
+                .all_cgids_preorder()
+                .into_iter()
+                .filter(|c| *c != CgroupId::ROOT)
+                .collect();
+            for cgid in cgids {
+                let cpu = s.sim.current_cpu;
+                let mut out = crate::ffi::CbwProbeResult::default();
+                start_rbc(&mut s.sim);
+                let mut probed = false;
+                let mut rc_out: i32 = 0;
+                sim_callback!(s, s, sim_arc, cpu, {
+                    if let Some(rc) = self.scheduler.probe_cbw_state(cgid.0, 0, &mut out) {
+                        probed = true;
+                        rc_out = rc;
+                    }
+                });
+                let s = &mut *s;
+                charge_sched_time(&mut s.sim, CpuId(0), "probe_cbw_state");
+                if probed {
+                    eprintln!(
+                        "[SCXSIM-CBW-PROBE] cgid={} llc=0 rc={} cgrp_id_seen={} \
+                         cgrp_ptr={:?} cgx={:?} llcx_helper={:?} llcx_direct={:?} \
+                         has_llcx={} is_throttled={} runtime_total_sloppy={} \
+                         runtime_total_in_llcx={} consume_count_pre={} \
+                         cbw_cgrp_map_nr={} cbw_cgrp_map_first_key={:?} \
+                         cbw_cgrp_llc_map_nr={}",
+                        cgid.0,
+                        rc_out,
+                        out.cgrp_id_seen,
+                        out.cgrp_ptr,
+                        out.cgx,
+                        out.llcx_via_helper,
+                        out.llcx_via_direct_map,
+                        out.has_llcx,
+                        out.is_throttled,
+                        out.runtime_total_sloppy,
+                        out.runtime_total_in_llcx,
+                        out.consumed_count_pre,
+                        out.cbw_cgrp_map_nr,
+                        out.cbw_cgrp_map_first_key,
+                        out.cbw_cgrp_llc_map_nr,
+                    );
+                }
             }
         }
 

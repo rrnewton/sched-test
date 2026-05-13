@@ -11,6 +11,7 @@
 #include "sim_wrapper.h"
 #include "sim_task.h"
 
+
 /*
  * =================================================================
  * LAVD-specific macro overrides
@@ -525,6 +526,40 @@ extern unsigned int sim_bpf_in_interrupt(void);
 #define bpf_in_serving_softirq() sim_bpf_in_serving_softirq()
 #define bpf_in_interrupt() sim_bpf_in_interrupt()
 
+/*
+ * DIAGNOSTIC INSTRUMENTATION (Phase 2 Stage E investigation, tg
+ * `investigate-scxsim-engine-throttles-before-scheduler-cgroup-bw`):
+ * count and (sparsely) log every scheduler-side scx_cgroup_bw_consume()
+ * call. Macro-redirect happens AFTER lib/cgroup.h is processed (the
+ * declaration in cgroup.h was pulled in by the previous includes that
+ * also include lib/cgroup.h indirectly: lat_cri.bpf.c, balance.bpf.c,
+ * idle.bpf.c -- so cgroup.h's `int scx_cgroup_bw_consume(...)` proto
+ * was already seen). The macro applies only to the call sites in
+ * main.bpf.c; the function definition lives in cgroup_bw.bpf.c which
+ * is included LATER and is wrapped in #undef so its `int
+ * scx_cgroup_bw_consume(...)` definition does NOT macro-expand.
+ *
+ * Confirmed empirically (canonical Bug-1 reproducer, wd=200ms,
+ * dur=600ms, integrated v6 tip): consume IS being called -- 252,774
+ * times in a 600ms run, all returning rc=0 with cgrp non-NULL and
+ * level=1 (non-root). And yet the library's per-cgroup
+ * runtime_total_sloppy stays at 0 and is_throttled stays false. The
+ * function entry is hit; the state never accumulates. Likely
+ * suspects: cbw_get_llc_ctx returning NULL inside the library, or
+ * scxsim's bpf_map_lookup_elem on the per-LLC hash map not finding
+ * the entry that cbw_init_llc_ctx populated. Investigation in flight.
+ *
+ * Gated on SCXSIM_DEBUG_CONSUME_PROBE so a regular release build
+ * stays clean.
+ */
+#ifdef SCXSIM_DEBUG_CONSUME_PROBE
+extern unsigned long long scxsim_cgroup_bw_consume_count_pre;
+unsigned long long scxsim_cgroup_bw_consume_count_pre __attribute__((visibility("default")));
+extern unsigned long long scxsim_cgroup_bw_consume_sum_ns;
+unsigned long long scxsim_cgroup_bw_consume_sum_ns __attribute__((visibility("default")));
+extern int scxsim_probe_dprintf(int fd, const char *fmt, ...) __asm__("dprintf");
+#endif
+
 #include "util.bpf.c"
 #include "power.bpf.c"
 #include "sys_stat.bpf.c"
@@ -534,7 +569,24 @@ extern unsigned int sim_bpf_in_interrupt(void);
 #include "lat_cri.bpf.c"
 #include "preempt.bpf.c"
 #include "introspec.bpf.c"
+
+#ifdef SCXSIM_DEBUG_CONSUME_PROBE
+#define scx_cgroup_bw_consume(c, n) ({ \
+    int _rc = scx_cgroup_bw_consume((c), (n)); \
+    scxsim_cgroup_bw_consume_count_pre++; \
+    scxsim_cgroup_bw_consume_sum_ns += (unsigned long long)(n); \
+    if ((scxsim_cgroup_bw_consume_count_pre & 0xfff) == 1) \
+        scxsim_probe_dprintf(2, "[SCXSIM-PROBE] consume cgrp=%p level=%d ns=%llu count=%llu sum_ns=%llu rc=%d\n", \
+            (void *)(c), (c) ? ((int)(c)->level) : -1, \
+            (unsigned long long)(n), scxsim_cgroup_bw_consume_count_pre, \
+            scxsim_cgroup_bw_consume_sum_ns, _rc); \
+    _rc; \
+})
+#endif
 #include "main.bpf.c"
+#ifdef SCXSIM_DEBUG_CONSUME_PROBE
+#undef scx_cgroup_bw_consume
+#endif
 
 /*
  * =================================================================
@@ -1148,7 +1200,218 @@ static void lavd_register_cbw_maps(void)
 	INIT_SCX_PERCPU_TEST_MAP(cbw_tree_levels_test_map, tree_levels_map);
 	scx_register_percpu_test_map(cbw_tree_levels_test_map,
 				     &tree_levels_map);
+
+	/*
+	 * SEED the PERCPU_ARRAY entry. Phase 2 Stage E (tg
+	 * `investigate-scxsim-engine-throttles-before-scheduler-cgroup-bw`):
+	 * scxsim's scx_test_map storage for PERCPU_ARRAY does not
+	 * pre-allocate slots the way the kernel does -- nr starts at 0
+	 * and only grows via map_update_elem. The cgroup_bw library
+	 * never updates tree_levels_map (it's read-only after init from
+	 * its perspective), so without seeding bpf_map_lookup_elem
+	 * returns NULL for key=0, get_clean_tree_levels() returns NULL,
+	 * cbw_update_runtime_total_sloppy() returns -ENOMEM, and the
+	 * accounting -> throttle chain is severed. The library's per-LLC
+	 * runtime_total accumulator (~tens of µs at probe time) is never
+	 * promoted to cgx->runtime_total_sloppy, so is_throttled never
+	 * flips and per-SHA discrimination is impossible.
+	 *
+	 * Seed entry [key=0, value=zeroed struct tree_levels] for every
+	 * CPU. tree_levels_map has max_entries=1 in the library
+	 * declaration; we only need key=0.
+	 *
+	 * This is the root cause identified in tg note "MAJOR FINDING
+	 * 2026-05-13" -- scxsim's percpu-array-storage seeding gap, not
+	 * a key-padding issue.
+	 */
+	{
+		struct tree_levels zero_tl;
+		const u32 zero_key = 0;
+		int cpu;
+
+		__builtin_memset(&zero_tl, 0, sizeof(zero_tl));
+		for (cpu = 0; cpu < (int)MAX_SIM_CPUS; cpu++) {
+			scx_test_map_update_percpu_elem(&tree_levels_map,
+							&zero_key, &zero_tl,
+							cpu, /*BPF_ANY=*/0);
+		}
+	}
 }
+
+/*
+ * =================================================================
+ * Phase 2 Stage E (tg `investigate-scxsim-engine-throttles-before-
+ * scheduler-cgroup-bw`): default-visibility forwarders into the
+ * cgroup_bw library.
+ * =================================================================
+ *
+ * The library declares its public entry points with `__hidden`
+ * (visibility("hidden")) so they cannot be reached from the engine
+ * via dlsym. Phase 2 Stage D retired the wrapper.c weak shims on the
+ * assumption that the library's STRONG definitions would replace
+ * them, but that is true only for INTRA-.so binding (lavd's main.bpf.c
+ * calls into the library successfully because they are linked into
+ * the same translation unit). For scxsim's engine to QUERY the
+ * library's throttle state -- which is what
+ * `pid_is_bw_throttled` was rewritten to do at Stage C -- the
+ * symbols must have default visibility.
+ *
+ * Solution: trivial forwarders here, with `visibility("default")`,
+ * are visible via dlsym; they internally call the still-`__hidden`
+ * library functions. wrapper.c is in the same translation unit as
+ * lib/cgroup_bw.bpf.c (it `#include`s it above), so the
+ * compiler binds the call locally without going through dlsym.
+ *
+ * The `scxsim_` prefix avoids any chance of name collision with the
+ * library's own symbols and makes the boundary explicit.
+ *
+ * Diagnostic counter `scxsim_cgroup_bw_consume_count` is incremented
+ * on every consume call so the engine can verify that the
+ * scheduler-side `account_task_runtime -> scx_cgroup_bw_consume`
+ * chain is reaching the library at all (Prong B in the root-cause
+ * note).
+ */
+
+__attribute__((visibility("default")))
+unsigned long long scxsim_cgroup_bw_consume_count;
+
+__attribute__((visibility("default")))
+int scxsim_cgroup_bw_is_cgroup_throttled(unsigned long long cgrp_id)
+{
+	return scx_cgroup_bw_is_cgroup_throttled(cgrp_id);
+}
+
+__attribute__((visibility("default")))
+int scxsim_cgroup_bw_consume(struct cgroup *cgrp, unsigned long long consumed_ns)
+{
+	scxsim_cgroup_bw_consume_count++;
+	return scx_cgroup_bw_consume(cgrp, consumed_ns);
+}
+
+__attribute__((visibility("default")))
+int scxsim_cgroup_bw_throttled(struct cgroup *cgrp, struct task_struct *p)
+{
+	return scx_cgroup_bw_throttled(cgrp, p);
+}
+
+/*
+ * Diagnostic probe (Phase 2 Stage E investigation, tg
+ * `investigate-scxsim-engine-throttles-before-scheduler-cgroup-bw`):
+ * isolate WHERE the consume->accumulate chain breaks. The
+ * scheduler-side scx_cgroup_bw_consume IS being called 252k times per
+ * canonical run with valid args + rc=0, yet the library's
+ * runtime_total_sloppy stays 0. Suspect: cbw_get_llc_ctx returns NULL
+ * because scxsim's bpf_map_lookup_elem on cbw_cgrp_llc_map (HASH,
+ * keyed by struct cgroup_llc_id) fails to find what
+ * cbw_init_llc_ctx populated.
+ *
+ * This probe is callable from the engine end-of-run reporting code
+ * (via dlsym). It exercises BOTH paths against the same key:
+ *   path A: cbw_get_llc_ctx(cgrp, llc_id)         -- the library's
+ *           internal lookup wrapper
+ *   path B: bpf_map_lookup_elem(&cbw_cgrp_llc_map, &key)  -- raw
+ *           direct hash lookup with the same struct key
+ *
+ * If A=NULL and B=non-NULL, the library and direct paths disagree
+ * (key shape / padding bug). If A=NULL and B=NULL, the entry is
+ * genuinely not in the map (cbw_init_llc_ctx populated an unrelated
+ * entry, or scxsim's BPF_NOEXIST insert silently failed). If both
+ * return non-NULL, the wiring works and the bug is elsewhere
+ * downstream (cbw_update_runtime_total_sloppy aggregation, or the
+ * accounting timer not firing).
+ *
+ * Also reports the cgx-level state via cbw_get_cgroup_ctx for
+ * completeness.
+ */
+struct scxsim_cbw_probe_result {
+	void                  *cgx;                  /* cbw_get_cgroup_ctx(cgrp) */
+	void                  *llcx_via_helper;      /* cbw_get_llc_ctx(cgrp, llc_id) */
+	void                  *llcx_via_direct_map;  /* bpf_map_lookup_elem direct */
+	unsigned long long     cgrp_id_seen;         /* cgroup_get_id(cgrp) */
+	int                    has_llcx;             /* cgx->has_llcx */
+	int                    is_throttled;         /* cgx->is_throttled */
+	long long              runtime_total_sloppy;
+	long long              runtime_total_in_llcx;/* llcx->runtime_total */
+	long long              consumed_count_pre;   /* probe counter */
+	void                  *cgrp_ptr;             /* cgrp pointer the probe got */
+	int                    cbw_cgrp_map_nr;      /* number of entries in cbw_cgrp_map */
+	void                  *cbw_cgrp_map_first_key;/* keys[0] (= first stored cgrp ptr) */
+	int                    cbw_cgrp_llc_map_nr;
+};
+
+extern struct scx_test_map cbw_cgrp_test_map;
+extern struct scx_test_map cbw_cgrp_llc_test_map;
+
+__attribute__((visibility("default")))
+int scxsim_probe_cbw_state(unsigned long long cgrp_id, int llc_id,
+			   struct scxsim_cbw_probe_result *out)
+{
+	struct cgroup *cgrp;
+	struct scx_cgroup_ctx *cgx;
+	struct scx_cgroup_llc_ctx *llcx_h, *llcx_d;
+	struct cgroup_llc_id key;
+
+	if (!out)
+		return -EINVAL;
+
+	__builtin_memset(out, 0, sizeof(*out));
+#ifdef SCXSIM_DEBUG_CONSUME_PROBE
+	out->consumed_count_pre = (long long)scxsim_cgroup_bw_consume_count_pre;
+#else
+	out->consumed_count_pre = -1;
+#endif
+
+	cgrp = (struct cgroup *)sim_cgroup_lookup_by_id(cgrp_id);
+	if (!cgrp)
+		return -ESRCH;
+
+	out->cgrp_ptr = cgrp;
+	out->cgrp_id_seen = cgroup_get_id(cgrp);
+
+	cgx = cbw_get_cgroup_ctx(cgrp);
+	out->cgx = cgx;
+	if (cgx) {
+		out->has_llcx = cgx->has_llcx;
+		out->is_throttled = cgx->is_throttled;
+		out->runtime_total_sloppy = cgx->runtime_total_sloppy;
+	}
+
+	/* Force the accounting aggregation BEFORE snapshotting cgx state,
+	 * so runtime_total_sloppy reflects the latest llcx->runtime_total
+	 * even at probe-time. The accounting timer normally drives this
+	 * but its firing is event-queue dependent; an explicit invocation
+	 * here is idempotent and cheap. */
+	cbw_update_runtime_total_sloppy((struct cgroup *)sim_get_root_cgroup());
+	if (cgx) {
+		out->runtime_total_sloppy = cgx->runtime_total_sloppy;
+	}
+
+	llcx_h = cbw_get_llc_ctx(cgrp, llc_id);
+	out->llcx_via_helper = llcx_h;
+
+	__builtin_memset(&key, 0, sizeof(key));
+	key.cgrp_id = cgroup_get_id(cgrp);
+	key.llc_id = llc_id;
+	llcx_d = bpf_map_lookup_elem(&cbw_cgrp_llc_map, &key);
+	out->llcx_via_direct_map = llcx_d;
+
+	if (llcx_h)
+		out->runtime_total_in_llcx = llcx_h->runtime_total;
+	else if (llcx_d)
+		out->runtime_total_in_llcx = llcx_d->runtime_total;
+
+	out->cbw_cgrp_map_nr = cbw_cgrp_test_map.nr;
+	if (cbw_cgrp_test_map.nr > 0 && cbw_cgrp_test_map.keys) {
+		/* Each key is sizeof(struct cgroup *) = 8 bytes -- the
+		 * cgrp pointer that bpf_cgrp_storage_get's caller passed
+		 * (via &cgrp dereference). */
+		out->cbw_cgrp_map_first_key = *(void **)cbw_cgrp_test_map.keys;
+	}
+	out->cbw_cgrp_llc_map_nr = cbw_cgrp_llc_test_map.nr;
+
+	return 0;
+}
+
 #endif /* SCXSIM_PHASE2_REAL_CGROUP_BW */
 
 /*
