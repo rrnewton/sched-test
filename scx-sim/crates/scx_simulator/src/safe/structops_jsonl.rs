@@ -72,7 +72,13 @@ fn emit_event(event: &TraceEvent, writer: &mut impl Write) -> io::Result<()> {
         } => {
             // entry record:
             emit_line(
-                writer, ts, cpu, 0, "structop", "select_cpu", "entry",
+                writer,
+                ts,
+                cpu,
+                0,
+                "structop",
+                "select_cpu",
+                "entry",
                 &format!(
                     r#""task_pid":{},"prev_cpu":{},"wake_flags":0"#,
                     pid.0, prev_cpu.0
@@ -81,18 +87,36 @@ fn emit_event(event: &TraceEvent, writer: &mut impl Write) -> io::Result<()> {
             )?;
             // exit record carries the selected cpu in `ret`:
             emit_line(
-                writer, ts, cpu, 0, "structop", "select_cpu", "exit",
+                writer,
+                ts,
+                cpu,
+                0,
+                "structop",
+                "select_cpu",
+                "exit",
                 "",
                 Some(&selected_cpu.0.to_string()),
             )?;
         }
         TraceKind::EnqueueTask { pid, enq_flags } => emit_line(
-            writer, ts, cpu, 0, "structop", "enqueue", "entry",
+            writer,
+            ts,
+            cpu,
+            0,
+            "structop",
+            "enqueue",
+            "entry",
             &format!(r#""task_pid":{},"enq_flags":{}"#, pid.0, enq_flags),
             None,
         )?,
         TraceKind::Balance { prev_pid } => emit_line(
-            writer, ts, cpu, 0, "structop", "dispatch", "entry",
+            writer,
+            ts,
+            cpu,
+            0,
+            "structop",
+            "dispatch",
+            "entry",
             &format!(
                 r#""prev_cpu":{},"prev_pid":{}"#,
                 cpu,
@@ -101,7 +125,13 @@ fn emit_event(event: &TraceEvent, writer: &mut impl Write) -> io::Result<()> {
             None,
         )?,
         TraceKind::SetNextTask { pid } => emit_line(
-            writer, ts, cpu, 0, "structop", "running", "entry",
+            writer,
+            ts,
+            cpu,
+            0,
+            "structop",
+            "running",
+            "entry",
             &format!(r#""task_pid":{}"#, pid.0),
             None,
         )?,
@@ -109,7 +139,13 @@ fn emit_event(event: &TraceEvent, writer: &mut impl Write) -> io::Result<()> {
             pid,
             still_runnable,
         } => emit_line(
-            writer, ts, cpu, 0, "structop", "stopping", "entry",
+            writer,
+            ts,
+            cpu,
+            0,
+            "structop",
+            "stopping",
+            "entry",
             &format!(
                 r#""task_pid":{},"still_runnable":{}"#,
                 pid.0, *still_runnable as u8
@@ -117,14 +153,26 @@ fn emit_event(event: &TraceEvent, writer: &mut impl Write) -> io::Result<()> {
             None,
         )?,
         TraceKind::Tick { pid } => emit_line(
-            writer, ts, cpu, 0, "structop", "tick", "entry",
+            writer,
+            ts,
+            cpu,
+            0,
+            "structop",
+            "tick",
+            "entry",
             &format!(r#""task_pid":{}"#, pid.0),
             None,
         )?,
 
         // ---- helpers: BPF kfuncs the scheduler invokes -----------------
         TraceKind::DsqInsert { pid, dsq_id, slice } => emit_line(
-            writer, ts, cpu, 0, "helper", "dsq_insert", "entry",
+            writer,
+            ts,
+            cpu,
+            0,
+            "helper",
+            "dsq_insert",
+            "entry",
             &format!(
                 r#""task_pid":{},"dsq_id":{},"slice":{},"enq_flags":0"#,
                 pid.0, dsq_id.0, slice
@@ -137,7 +185,13 @@ fn emit_event(event: &TraceEvent, writer: &mut impl Write) -> io::Result<()> {
             slice,
             vtime,
         } => emit_line(
-            writer, ts, cpu, 0, "helper", "dsq_insert_vtime", "entry",
+            writer,
+            ts,
+            cpu,
+            0,
+            "helper",
+            "dsq_insert_vtime",
+            "entry",
             &format!(
                 r#""task_pid":{},"dsq_id":{},"slice":{},"vtime":{},"enq_flags":0"#,
                 pid.0, dsq_id.0, slice, vtime.0
@@ -146,18 +200,36 @@ fn emit_event(event: &TraceEvent, writer: &mut impl Write) -> io::Result<()> {
         )?,
         TraceKind::DsqMoveToLocal { dsq_id, success } => {
             emit_line(
-                writer, ts, cpu, 0, "helper", "dsq_move_to_local", "entry",
+                writer,
+                ts,
+                cpu,
+                0,
+                "helper",
+                "dsq_move_to_local",
+                "entry",
                 &format!(r#""dsq_id":{}"#, dsq_id.0),
                 None,
             )?;
             emit_line(
-                writer, ts, cpu, 0, "helper", "dsq_move_to_local", "exit",
+                writer,
+                ts,
+                cpu,
+                0,
+                "helper",
+                "dsq_move_to_local",
+                "exit",
                 "",
                 Some(&(*success as u8).to_string()),
             )?;
         }
         TraceKind::KickCpu { target_cpu } => emit_line(
-            writer, ts, cpu, 0, "helper", "kick_cpu", "entry",
+            writer,
+            ts,
+            cpu,
+            0,
+            "helper",
+            "kick_cpu",
+            "entry",
             &format!(r#""cpu_arg":{},"flags":0"#, target_cpu.0),
             None,
         )?,
@@ -263,14 +335,10 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 3);
         for line in &lines {
-            assert!(
-                line.starts_with(r#"{"ts_ns":"#),
-                "bad prefix: {line}"
-            );
+            assert!(line.starts_with(r#"{"ts_ns":"#), "bad prefix: {line}");
             assert!(line.ends_with('}'), "bad suffix: {line}");
             // basic JSON validity check via serde_json round-trip
-            let v: serde_json::Value =
-                serde_json::from_str(line).expect("valid JSON");
+            let v: serde_json::Value = serde_json::from_str(line).expect("valid JSON");
             assert!(v.get("ts_ns").is_some());
             assert!(v.get("cpu").is_some());
             assert!(v.get("kind").is_some());

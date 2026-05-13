@@ -865,7 +865,6 @@ impl SimulatorState {
         local_cpu: CpuId,
         pd: PendingDispatch,
     ) -> Option<CpuId> {
-
         // Task has been dispatched — no longer in BPF scheduler's queue.
         self.set_task_ops_state(pd.pid, OpsTaskState::None);
 
