@@ -435,8 +435,7 @@ impl CgroupRegistry {
                 .iter_descendants_postorder(root_cgid)
                 .map(|info| info.alloc.as_ptr())
                 .collect();
-            let _guard =
-                CssIterGuard::prepare(root_ptr, &descendants_pre, &descendants_post);
+            let _guard = CssIterGuard::prepare(root_ptr, &descendants_pre, &descendants_post);
         }
     }
 

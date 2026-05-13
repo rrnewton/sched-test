@@ -483,6 +483,17 @@ pub trait Scheduler {
         None
     }
 
+    /// Library-driven slice-cap budget query. Returns the cgroup's
+    /// remaining cpu.max budget for the current period in
+    /// nanoseconds, or `u64::MAX` (the wrapper.c sentinel for
+    /// unknown / untracked / unlimited) when no cap should apply.
+    /// Returns `None` when the scheduler does not link the cgroup_bw
+    /// library at all (engine treats as "no cap" -- the only honest
+    /// answer for a scheduler that doesn't model cpu.max).
+    fn cgroup_bw_budget_remaining(&self, _cgrp_id: u64) -> Option<u64> {
+        None
+    }
+
     /// Resolve e9patch C trampoline function pointers from the loaded library.
     ///
     /// Returns `None` by default (no e9patch support). `DynamicScheduler`
@@ -617,6 +628,16 @@ pub struct CbwProbeResult {
     pub cbw_cgrp_llc_map_nr: i32,
 }
 type ProbeCbwStateFn = unsafe extern "C" fn(u64, i32, *mut CbwProbeResult) -> i32;
+/*
+ * tg `shrink-rust-bandwidthmanager-518-to-30-lines-no-fake-approximation`:
+ * `unsigned long long scxsim_cgroup_bw_budget_remaining(u64 cgrp_id)`
+ * exported by wrapper.c. Returns the cgroup's remaining cpu.max budget
+ * (period_budget - runtime_total_sloppy) in nanoseconds, or
+ * `(u64)-1 = u64::MAX` when the cgroup is unknown / untracked /
+ * unlimited (no cap should apply). Engine reads it from
+ * `pid_bw_max_run_ns` to cap the scheduler-chosen slice.
+ */
+type CgroupBwBudgetRemainingFn = unsafe extern "C" fn(u64) -> u64;
 type CgroupSetBandwidthFn = unsafe extern "C" fn(*mut c_void, u64, u64, u64);
 type CpuOnlineFn = unsafe extern "C" fn(i32);
 type CpuOfflineFn = unsafe extern "C" fn(i32);
@@ -669,6 +690,15 @@ struct SchedOps {
      * any future scheduler that does not link cgroup_bw).
      */
     probe_cbw_state: Option<ProbeCbwStateFn>,
+    /*
+     * Library-driven slice-cap budget query
+     * (`scxsim_cgroup_bw_budget_remaining`). `None` for schedulers
+     * that do not link the cgroup_bw library (simple, tickless) -- in
+     * that case the engine treats the cgroup as having no bandwidth
+     * cap (the only honest answer when the scheduler does not model
+     * cpu.max).
+     */
+    bw_budget_remaining: Option<CgroupBwBudgetRemainingFn>,
 }
 
 /// Metadata about a discovered scheduler .so file.
@@ -1116,15 +1146,15 @@ impl DynamicScheduler {
             is_cgroup_throttled: lib
                 .get::<*const ()>(b"scxsim_cgroup_bw_is_cgroup_throttled")
                 .ok()
-                .map(|sym| {
-                    std::mem::transmute::<*const (), IsCgroupThrottledFn>(*sym)
-                }),
+                .map(|sym| std::mem::transmute::<*const (), IsCgroupThrottledFn>(*sym)),
             probe_cbw_state: lib
                 .get::<*const ()>(b"scxsim_probe_cbw_state")
                 .ok()
-                .map(|sym| {
-                    std::mem::transmute::<*const (), ProbeCbwStateFn>(*sym)
-                }),
+                .map(|sym| std::mem::transmute::<*const (), ProbeCbwStateFn>(*sym)),
+            bw_budget_remaining: lib
+                .get::<*const ()>(b"scxsim_cgroup_bw_budget_remaining")
+                .ok()
+                .map(|sym| std::mem::transmute::<*const (), CgroupBwBudgetRemainingFn>(*sym)),
         }
     }
 
@@ -1364,17 +1394,20 @@ impl Scheduler for DynamicScheduler {
             .map(|f| unsafe { f(cgrp_id) != 0 })
     }
 
-    fn probe_cbw_state(
-        &self,
-        cgrp_id: u64,
-        llc_id: i32,
-        out: &mut CbwProbeResult,
-    ) -> Option<i32> {
+    fn probe_cbw_state(&self, cgrp_id: u64, llc_id: i32, out: &mut CbwProbeResult) -> Option<i32> {
         // SAFETY: f is dlsym'd at scheduler load; out is a valid
         // mut ref to a #[repr(C)] struct that mirrors the C side.
         self.ops
             .probe_cbw_state
             .map(|f| unsafe { f(cgrp_id, llc_id, out as *mut CbwProbeResult) })
+    }
+
+    fn cgroup_bw_budget_remaining(&self, cgrp_id: u64) -> Option<u64> {
+        // SAFETY: f is dlsym'd at scheduler load; pointer is valid
+        // for the lifetime of self._lib. Library contract:
+        // `u64 scxsim_cgroup_bw_budget_remaining(u64)` returns
+        // remaining-ns or u64::MAX for "no cap".
+        self.ops.bw_budget_remaining.map(|f| unsafe { f(cgrp_id) })
     }
 
     fn resolve_e9_fns(&self) -> Option<crate::backend::e9patch::E9PatchFns> {

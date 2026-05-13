@@ -37,7 +37,6 @@ use rand::RngCore;
 use tracing::debug;
 
 use crate::cgroup::{CgroupId, CgroupRegistry};
-use crate::cgroup_bw::BandwidthManager;
 use crate::cpu::{LastStopReason, SimCpu};
 use crate::dsq::DsqManager;
 use crate::engine::EventQueue;
@@ -493,15 +492,6 @@ pub(crate) struct SimState {
     pub events: EventQueue,
     /// The cgroup hierarchy.
     pub cgroup_registry: CgroupRegistry,
-    /// Engine-side `cpu.max` bandwidth state for tracked cgroups (Diff 3 wiring).
-    ///
-    /// Populated at scenario load via
-    /// [`BandwidthManager::configure_from_cgroup_defs`]. Charged on every
-    /// task stop (slice expired / preempt / phase complete), gated at
-    /// DSQ-pop admission, and refilled by [`crate::engine::EventKind::CgroupBwRefill`]
-    /// events. Cgroups without a configured `cpu.max` are not tracked here
-    /// and are unaffected (unlimited).
-    pub bw_manager: BandwidthManager,
     /// PID → cgroup-id resolution for charging.
     ///
     /// Built once at scenario load from `Scenario.tasks` (`cgroup_name`).
@@ -529,7 +519,6 @@ pub(crate) struct SimFields<'a> {
     pub tasks: &'a mut HashMap<Pid, SimTask>,
     pub events: &'a mut EventQueue,
     pub cgroup_registry: &'a mut CgroupRegistry,
-    pub bw_manager: &'a mut BandwidthManager,
     pub task_to_cgid: &'a mut HashMap<Pid, CgroupId>,
 }
 
@@ -542,7 +531,6 @@ impl SimState {
             tasks: &mut self.tasks,
             events: &mut self.events,
             cgroup_registry: &mut self.cgroup_registry,
-            bw_manager: &mut self.bw_manager,
             task_to_cgid: &mut self.task_to_cgid,
         }
     }
@@ -2513,10 +2501,7 @@ extern "C" {
         value: *mut c_void,
         flags: u64,
     ) -> *mut c_void;
-    fn scx_test_cgrp_storage_delete(
-        map: *mut c_void,
-        cgrp_ptr_loc: *const c_void,
-    ) -> i32;
+    fn scx_test_cgrp_storage_delete(map: *mut c_void, cgrp_ptr_loc: *const c_void) -> i32;
     fn scx_test_task_storage_get(
         map: *mut c_void,
         task_ptr_loc: *const c_void,
@@ -2559,14 +2544,7 @@ pub extern "C" fn bpf_cgrp_storage_get(
     // a local variable holding `cgrp`; the C side memcmps it for
     // `sizeof(void *)` bytes against stored keys. This is the same
     // calling convention `bpf_task_storage_get` uses below.
-    unsafe {
-        scx_test_cgrp_storage_get(
-            map,
-            &cgrp as *const _ as *const c_void,
-            value,
-            flags,
-        )
-    }
+    unsafe { scx_test_cgrp_storage_get(map, &cgrp as *const _ as *const c_void, value, flags) }
 }
 
 /// Drop a per-cgroup BPF local-storage slot.
@@ -2577,18 +2555,17 @@ pub extern "C" fn bpf_cgrp_storage_get(
 /// bandwidth-control context on cgroup exit. Returns 0 on success,
 /// `-ENOENT` (-2) if the slot was not present.
 #[no_mangle]
-pub extern "C" fn bpf_cgrp_storage_delete(
-    map: *mut c_void,
-    cgrp: *mut c_void,
-) -> i64 {
+pub extern "C" fn bpf_cgrp_storage_delete(map: *mut c_void, cgrp: *mut c_void) -> i64 {
     if map.is_null() {
         return -2; // -ENOENT
     }
     // SAFETY: same key-by-address convention as bpf_cgrp_storage_get.
-    let rc = unsafe {
-        scx_test_cgrp_storage_delete(map, &cgrp as *const _ as *const c_void)
-    };
-    if rc == 0 { 0 } else { -2 } // -ENOENT
+    let rc = unsafe { scx_test_cgrp_storage_delete(map, &cgrp as *const _ as *const c_void) };
+    if rc == 0 {
+        0
+    } else {
+        -2
+    } // -ENOENT
 }
 
 /// Get per-task BPF local storage.
@@ -2609,14 +2586,7 @@ pub extern "C" fn bpf_task_storage_get(
     }
     // SAFETY: hand C the address of `task` as the key; same convention
     // as bpf_cgrp_storage_get.
-    unsafe {
-        scx_test_task_storage_get(
-            map,
-            &task as *const _ as *const c_void,
-            value,
-            flags,
-        )
-    }
+    unsafe { scx_test_task_storage_get(map, &task as *const _ as *const c_void, value, flags) }
 }
 
 /// Drop a per-task BPF local-storage slot.
@@ -2624,17 +2594,16 @@ pub extern "C" fn bpf_task_storage_get(
 /// Pairs with `bpf_task_storage_get` for completeness (cgroup_bw and
 /// other Phase 2 / Phase 3 libraries call delete on task exit).
 #[no_mangle]
-pub extern "C" fn bpf_task_storage_delete(
-    map: *mut c_void,
-    task: *mut c_void,
-) -> i64 {
+pub extern "C" fn bpf_task_storage_delete(map: *mut c_void, task: *mut c_void) -> i64 {
     if map.is_null() {
         return -2; // -ENOENT
     }
-    let rc = unsafe {
-        scx_test_map_delete_elem(map, &task as *const _ as *const c_void)
-    };
-    if rc == 0 { 0 } else { -2 }
+    let rc = unsafe { scx_test_map_delete_elem(map, &task as *const _ as *const c_void) };
+    if rc == 0 {
+        0
+    } else {
+        -2
+    }
 }
 
 /// Look up per-CPU array element.
@@ -2752,8 +2721,7 @@ pub extern "C" fn sim_timer_start_slot(slot: u32, nsecs: u64) {
             // is logged below for diagnosability.
             debug!(
                 slot,
-                MAX_BPF_TIMERS,
-                "timer_start_slot dropped: slot >= MAX_BPF_TIMERS"
+                MAX_BPF_TIMERS, "timer_start_slot dropped: slot >= MAX_BPF_TIMERS"
             );
             return;
         }
@@ -2892,7 +2860,6 @@ mod tests {
             tasks: HashMap::new(),
             events: EventQueue::new(0, false),
             cgroup_registry: CgroupRegistry::new(nr_cpus, 100),
-            bw_manager: BandwidthManager::new(),
             task_to_cgid: HashMap::new(),
         }))
     }
@@ -4255,7 +4222,7 @@ mod tests {
             assert_eq!(scx_atq_pop(atq), taskc_ptr(&mut t1) as u64);
             assert_eq!(scx_atq_nr_queued(atq), 0);
             assert_eq!(scx_atq_pop(atq), 0); // empty -> NULL
-            // Back-pointers cleared.
+                                             // Back-pointers cleared.
             assert_eq!(taskc_get_atq(&t1), 0);
             assert_eq!(taskc_get_atq(&t2), 0);
             assert_eq!(taskc_get_atq(&t3), 0);

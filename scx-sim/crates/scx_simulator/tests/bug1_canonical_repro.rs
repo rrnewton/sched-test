@@ -277,9 +277,9 @@ fn test_bug1_canonical_per_sha_discrimination() {
 
     let cases: &[(&str, u32, &str)] = &[
         // (short_sha,                expected_is_throttled, label)
-        ("d565180067",                0, "Apr-04 pre-period_budget"),
-        ("66d2ef699b",                1, "Apr-04 period_budget intro"),
-        ("a08c9e272b",                1, "Apr-23 current v6 gitlink"),
+        ("d565180067", 0, "Apr-04 pre-period_budget"),
+        ("66d2ef699b", 1, "Apr-04 period_budget intro"),
+        ("a08c9e272b", 1, "Apr-23 current v6 gitlink"),
     ];
 
     let mut fps: Vec<(String, Fingerprint)> = Vec::new();
@@ -294,14 +294,21 @@ fn test_bug1_canonical_per_sha_discrimination() {
         }
         let (code, stderr) = run_one_rep(Some(&so));
         let fp = extract_fingerprint(code, &stderr);
-        eprintln!(
-            "[bug1_canonical_subprocess] {sha} ({label}): {fp:?}"
-        );
+        eprintln!("[bug1_canonical_subprocess] {sha} ({label}): {fp:?}");
         assert_eq!(
-            fp.is_throttled, *expected_is_throttled,
+            fp.is_throttled,
+            *expected_is_throttled,
             "{sha} ({label}): expected is_throttled={expected_is_throttled}, got {fp:?}.\n\
              stderr tail:\n{}",
-            stderr.lines().rev().take(15).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n")
+            stderr
+                .lines()
+                .rev()
+                .take(15)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("\n")
         );
         fps.push((sha.to_string(), fp));
     }

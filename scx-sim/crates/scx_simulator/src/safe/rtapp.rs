@@ -1328,12 +1328,17 @@ mod tests {
     }
 
     #[test]
-    fn test_taskgroup_only_spec_populates_bandwidth_manager() {
-        // End-to-end Diff 2 wiring: a taskgroup-only rt-app spec (no top-level
-        // `cgroup` block) is parsed into Scenario.cgroups, and the synthesized
-        // cgroups feed BandwidthManager via the engine-side bridge.
-        use crate::cgroup::CgroupId;
-        use crate::cgroup_bw::BandwidthManager;
+    fn test_taskgroup_only_spec_synthesizes_cgroup_with_bandwidth() {
+        // End-to-end parser test: a taskgroup-only rt-app spec (no top-level
+        // `cgroup` block) is parsed into Scenario.cgroups with the per-cgroup
+        // bandwidth fields populated from the inline `cpu.max` field.
+        //
+        // (Pre-shrink this test also exercised the engine-side
+        // BandwidthManager bridge -- removed in `tg shrink-rust-
+        // bandwidthmanager-518-to-30-lines-no-fake-approximation`. The
+        // library's `scx_cgroup_bw_init` now configures per-cgroup
+        // bandwidth state via the `cgroup_set_bandwidth` callback at
+        // scenario load; the engine no longer maintains a parallel mirror.)
 
         let json = r#"{
             "global": { "duration": 1 },
@@ -1355,26 +1360,17 @@ mod tests {
         // Synthesized cgroup with bandwidth.
         assert_eq!(scenario.cgroups.len(), 1);
         assert_eq!(scenario.cgroups[0].name, "/test_bw_stop");
-        assert!(scenario.cgroups[0].bandwidth.is_some());
+        let bw = scenario.cgroups[0]
+            .bandwidth
+            .as_ref()
+            .expect("expected synthesized bandwidth");
+        assert_eq!(bw.quota_us, 10_000);
+        assert_eq!(bw.period_us, 100_000);
 
         // All four task instances assigned.
         assert_eq!(scenario.tasks.len(), 4);
         for t in &scenario.tasks {
             assert_eq!(t.cgroup_name.as_deref(), Some("/test_bw_stop"));
         }
-
-        // Engine-side bridge: assign CgroupIds and feed BandwidthManager.
-        let cgid = CgroupId(100);
-        let mut mgr = BandwidthManager::new();
-        mgr.configure_from_cgroup_defs(&scenario.cgroups, 0, |name| {
-            (name == "/test_bw_stop").then_some(cgid)
-        });
-
-        // Manager now tracks the synthesized cgroup with the parsed quota.
-        assert_eq!(mgr.len(), 1);
-        let state = mgr.get(cgid).expect("BandwidthManager should track cgid");
-        assert_eq!(state.quota_ns, 10_000 * 1_000); // 10ms in ns
-        assert_eq!(state.period_ns, 100_000 * 1_000); // 100ms in ns
-        assert!(!state.throttled);
     }
 }
