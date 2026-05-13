@@ -2391,12 +2391,49 @@ impl<S: Scheduler> Simulator<S> {
         // timer callback can discover all cgroups (e.g. mitosis
         // update_timer_cb configures cells from the cgroup tree).
         s.cgroup_registry.prepare_css_iter_from_root();
+
+        // Source (cgid, raw cgrp ptr) pairs from cgroup_registry. The
+        // raw ptr is what the lib's CGRP_STORAGE map is keyed by --
+        // we hand it directly to `snapshot_by_raw_cgrp` so we don't
+        // need `bpf_cgroup_from_id` at all (which would deadlock on
+        // SIM_ARC try_lock at this snapshot point).
+        // tg `wprof-r2-add-cgroup-bw-replenish-tracekind-smoking-gun`.
+        let cbw_pairs: Vec<(u64, *mut c_void)> = s
+            .cgroup_registry
+            .all_cgids_preorder()
+            .into_iter()
+            .filter_map(|cid| s.cgroup_registry.get_raw(cid).map(|raw| (cid.0, raw)))
+            .collect();
+        let cbw_before = crate::cgroup_bw_replenish::snapshot_via(&cbw_pairs, |cgid, raw, out| {
+            self.scheduler.snapshot_by_raw_cgrp(cgid, raw, out)
+        });
+        let cbw_observer_active = cbw_before.is_some();
+        let cbw_before = cbw_before.unwrap_or_default();
+
         start_rbc(&mut s.sim);
         sim_callback!(s, guard, sim_arc, cpu, {
             self.scheduler.fire_timer(slot);
         });
         let s = &mut *guard;
         charge_sched_time(&mut s.sim, cpu, "fire_timer");
+
+        // Take the matching AFTER snapshot, diff against BEFORE, and
+        // emit one event per cgroup the lib replenished. Cheap when
+        // the loaded scheduler doesn't link cgroup_bw (the dlsym
+        // symbol is absent so snapshot_via returns None on the first
+        // call and we never even build the cgid list a second time).
+        if cbw_observer_active {
+            let cbw_after =
+                crate::cgroup_bw_replenish::snapshot_via(&cbw_pairs, |cgid, raw, out| {
+                    self.scheduler.snapshot_by_raw_cgrp(cgid, raw, out)
+                })
+                .unwrap_or_default();
+            let now_ns = s.sim.cpus[cpu.0 as usize].local_clock;
+            let events = crate::cgroup_bw_replenish::diff_snapshots(&cbw_before, &cbw_after);
+            for kind in events {
+                s.sim.trace.record(now_ns, cpu, kind);
+            }
+        }
 
         // Drain ALL re-armed timer slots in ascending slot order. Each
         // slot's CPU is captured by `sim_timer_start_slot` inside the

@@ -186,6 +186,51 @@ pub enum TraceKind {
         pid: Pid,
         cgid: crate::cgroup::CgroupId,
     },
+    /// The compiled-in `scx/lib/cgroup_bw.bpf.c` library performed a
+    /// per-cgroup replenishment. Captures the smoking-gun fields the
+    /// library computes inside `cbw_replenish_cgroup` (the bug's CAUSE
+    /// at lib/cgroup_bw.bpf.c:1679).
+    ///
+    /// **Smoking-gun signature for the cpu-bw-stall-bug:**
+    /// `keep_throttled == true && runtime_total_last == 0` for the same
+    /// `cgid` across multiple consecutive replenishments. Means the
+    /// cgroup's debt grew unbounded during a period in which the lib
+    /// did no work to recover from the throttle -- the cgroup never
+    /// escapes throttle.
+    ///
+    /// Fired only under LAVD with `enable_cpu_bw=true` (the only
+    /// scheduler that compiles the cgroup_bw library in today). Skipped
+    /// for unlimited-quota cgroups (`nquota_ub == CBW_RUNTUME_INF`),
+    /// matching the lib's own `out_no_replenish` early-return path.
+    ///
+    /// tg `wprof-r2-add-cgroup-bw-replenish-tracekind-smoking-gun`
+    /// (R2 HIGH from wprof-trace-baseline 2026-05-13).
+    CgroupBwReplenish {
+        cgid: crate::cgroup::CgroupId,
+        /// Total runtime consumed during the just-completed period
+        /// (lib field `cgx->runtime_total_last`, captured before the
+        /// inner call). 0 means the period saw no work.
+        runtime_total_last: i64,
+        /// Effective quota for the period that just ended (lib field
+        /// `cgx->period_budget` before the inner call). Used together
+        /// with runtime_total_last to compute debt.
+        period_budget_in: i64,
+        /// `max(runtime_total_last - period_budget_in, 0)` -- the
+        /// overspend the lib will subtract from the new period's
+        /// budget. Mirrors lib/cgroup_bw.bpf.c:1679.
+        debt: i64,
+        /// `clamp(nquota - runtime_total_last, 0, burst_remaining)` --
+        /// underspend carried forward as burst credit. Mirrors
+        /// lib/cgroup_bw.bpf.c:1680.
+        burst_credit: i64,
+        /// New `period_budget = nquota_ub + burst_credit - debt` after
+        /// the lib's WRITE_ONCE at lib/cgroup_bw.bpf.c:1697.
+        period_budget_out: i64,
+        /// `period_budget_out <= 0`: cgroup stays throttled into the
+        /// next period because debt exceeded quota+burst. Lib field
+        /// `cgx->is_throttled` is set to this value at line 1751.
+        keep_throttled: bool,
+    },
 }
 
 /// Reason why a dispatch to a local DSQ was rejected.
@@ -741,6 +786,24 @@ impl Trace {
                 TraceKind::CgroupBwDenied { pid, cgid } => {
                     format!("CG_BW_DENY pid={} cgid={}", pid.0, cgid.0)
                 }
+                TraceKind::CgroupBwReplenish {
+                    cgid,
+                    runtime_total_last,
+                    period_budget_in,
+                    debt,
+                    burst_credit,
+                    period_budget_out,
+                    keep_throttled,
+                } => format!(
+                    "CG_BW_RPLN cgid={} rtl={} pb_in={} debt={} bc={} pb_out={} kt={}",
+                    cgid.0,
+                    runtime_total_last,
+                    period_budget_in,
+                    debt,
+                    burst_credit,
+                    period_budget_out,
+                    *keep_throttled as u8,
+                ),
             };
             eprintln!(
                 "[{}] cpu={:<3} {}",
