@@ -660,6 +660,12 @@ pub struct Scenario {
     /// separate OS threads with PRNG-driven token passing, enabling
     /// deterministic exploration of different interleavings.
     pub interleave: bool,
+    /// Enable stochastic BPF timer interleaving at cgroup_bw yield sites.
+    pub stochastic_timer_interleave: bool,
+    /// Timer fire-ahead window for stochastic timer interleaving.
+    pub stochastic_timer_interleave_window_ns: TimeNs,
+    /// Approximate rate: one eligible timer is pulled once per N yield sites.
+    pub stochastic_timer_interleave_one_in: u32,
     /// Preemptive interleaving configuration.
     ///
     /// When `Some`, dispatch callbacks are additionally preempted at random
@@ -738,6 +744,9 @@ pub struct ScenarioBuilder {
     cgroup_destroy_events: Vec<CgroupDestroyEvent>,
     cgroup_cpuset_change_events: Vec<CgroupCpusetChangeEvent>,
     interleave: bool,
+    stochastic_timer_interleave: bool,
+    stochastic_timer_interleave_window_ns: TimeNs,
+    stochastic_timer_interleave_one_in: u32,
     preemptive: Option<PreemptiveConfig>,
     replay_trace: Option<crate::preempt::trace::PreemptionTrace>,
     no_pmu_signal: bool,
@@ -772,6 +781,9 @@ impl Scenario {
             cgroup_destroy_events: Vec::new(),
             cgroup_cpuset_change_events: Vec::new(),
             interleave: false,
+            stochastic_timer_interleave: false,
+            stochastic_timer_interleave_window_ns: 20_000_000,
+            stochastic_timer_interleave_one_in: 4,
             preemptive: None,
             replay_trace: None,
             no_pmu_signal: false,
@@ -1171,6 +1183,19 @@ impl ScenarioBuilder {
         self
     }
 
+    /// Enable stochastic BPF timer interleaving at cgroup_bw yield sites.
+    pub fn stochastic_timer_interleave(
+        mut self,
+        enabled: bool,
+        window_ns: TimeNs,
+        one_in: u32,
+    ) -> Self {
+        self.stochastic_timer_interleave = enabled;
+        self.stochastic_timer_interleave_window_ns = window_ns;
+        self.stochastic_timer_interleave_one_in = one_in.max(1);
+        self
+    }
+
     /// Enable preemptive interleaving with the given configuration.
     ///
     /// Implies `interleave(true)`. Each dispatch callback will be
@@ -1347,6 +1372,9 @@ impl ScenarioBuilder {
             cgroup_destroy_events: self.cgroup_destroy_events,
             cgroup_cpuset_change_events: self.cgroup_cpuset_change_events,
             interleave: self.interleave,
+            stochastic_timer_interleave: self.stochastic_timer_interleave,
+            stochastic_timer_interleave_window_ns: self.stochastic_timer_interleave_window_ns,
+            stochastic_timer_interleave_one_in: self.stochastic_timer_interleave_one_in,
             preemptive: self.preemptive,
             replay_trace: self.replay_trace,
             no_pmu_signal: self.no_pmu_signal,

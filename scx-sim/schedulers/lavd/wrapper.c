@@ -583,6 +583,18 @@ extern void scxsim_cgroup_bw_yield_is_cgroup_throttled(void);
 extern void scxsim_cgroup_bw_yield_is_task_throttled(void);
 extern void scxsim_cgroup_bw_yield_move(void);
 extern void scxsim_cgroup_bw_yield_dump(void);
+extern int scxsim_cgroup_bw_begin_interleaved_timer(unsigned int *slot);
+extern void scxsim_cgroup_bw_end_interleaved_timer(void);
+void lavd_fire_timer(unsigned int slot);
+
+#define SCXSIM_CGROUP_BW_YIELD(fn) do { \
+	unsigned int _scxsim_timer_slot; \
+	fn(); \
+	if (scxsim_cgroup_bw_begin_interleaved_timer(&_scxsim_timer_slot)) { \
+		lavd_fire_timer(_scxsim_timer_slot); \
+		scxsim_cgroup_bw_end_interleaved_timer(); \
+	} \
+} while (0)
 
 /*
  * Phase 3: expose LAVD's real cgroup_bw library entry surface to
@@ -592,57 +604,57 @@ extern void scxsim_cgroup_bw_yield_dump(void);
  * definitions remain untouched.
  */
 #define scx_cgroup_bw_lib_init(config) ({ \
-	scxsim_cgroup_bw_yield_lib_init(); \
+	SCXSIM_CGROUP_BW_YIELD(scxsim_cgroup_bw_yield_lib_init); \
 	scx_cgroup_bw_lib_init((config)); \
 })
 #define scx_cgroup_bw_init(cgrp, args) ({ \
-	scxsim_cgroup_bw_yield_init(); \
+	SCXSIM_CGROUP_BW_YIELD(scxsim_cgroup_bw_yield_init); \
 	scx_cgroup_bw_init((cgrp), (args)); \
 })
 #define scx_cgroup_bw_exit(cgrp) ({ \
-	scxsim_cgroup_bw_yield_exit(); \
+	SCXSIM_CGROUP_BW_YIELD(scxsim_cgroup_bw_yield_exit); \
 	scx_cgroup_bw_exit((cgrp)); \
 })
 #define scx_cgroup_bw_set(cgrp, period_us, quota_us, burst_us) ({ \
-	scxsim_cgroup_bw_yield_set(); \
+	SCXSIM_CGROUP_BW_YIELD(scxsim_cgroup_bw_yield_set); \
 	scx_cgroup_bw_set((cgrp), (period_us), (quota_us), (burst_us)); \
 })
 #define scx_cgroup_bw_throttled(cgrp, p) ({ \
-	scxsim_cgroup_bw_yield_throttled(); \
+	SCXSIM_CGROUP_BW_YIELD(scxsim_cgroup_bw_yield_throttled); \
 	scx_cgroup_bw_throttled((cgrp), (p)); \
 })
 #define scx_cgroup_bw_consume(c, n) ({ \
-	scxsim_cgroup_bw_yield_consume(); \
+	SCXSIM_CGROUP_BW_YIELD(scxsim_cgroup_bw_yield_consume); \
 	int _rc = scx_cgroup_bw_consume((c), (n)); \
 	SCXSIM_DEBUG_CONSUME_PROBE_BODY(c, n, _rc); \
 	_rc; \
 })
 #define scx_cgroup_bw_put_aside(p, taskc, vtime, cgrp) ({ \
-	scxsim_cgroup_bw_yield_put_aside(); \
+	SCXSIM_CGROUP_BW_YIELD(scxsim_cgroup_bw_yield_put_aside); \
 	scx_cgroup_bw_put_aside((p), (taskc), (vtime), (cgrp)); \
 })
 #define scx_cgroup_bw_reenqueue() ({ \
-	scxsim_cgroup_bw_yield_reenqueue(); \
+	SCXSIM_CGROUP_BW_YIELD(scxsim_cgroup_bw_yield_reenqueue); \
 	scx_cgroup_bw_reenqueue(); \
 })
 #define scx_cgroup_bw_cancel(taskc) ({ \
-	scxsim_cgroup_bw_yield_cancel(); \
+	SCXSIM_CGROUP_BW_YIELD(scxsim_cgroup_bw_yield_cancel); \
 	scx_cgroup_bw_cancel((taskc)); \
 })
 #define scx_cgroup_bw_is_cgroup_throttled(cgrp_id) ({ \
-	scxsim_cgroup_bw_yield_is_cgroup_throttled(); \
+	SCXSIM_CGROUP_BW_YIELD(scxsim_cgroup_bw_yield_is_cgroup_throttled); \
 	scx_cgroup_bw_is_cgroup_throttled((cgrp_id)); \
 })
 #define scx_cgroup_bw_is_task_throttled(taskc) ({ \
-	scxsim_cgroup_bw_yield_is_task_throttled(); \
+	SCXSIM_CGROUP_BW_YIELD(scxsim_cgroup_bw_yield_is_task_throttled); \
 	scx_cgroup_bw_is_task_throttled((taskc)); \
 })
 #define scx_cgroup_bw_move(p, taskc, from, to) ({ \
-	scxsim_cgroup_bw_yield_move(); \
+	SCXSIM_CGROUP_BW_YIELD(scxsim_cgroup_bw_yield_move); \
 	scx_cgroup_bw_move((p), (taskc), (from), (to)); \
 })
 #define scx_cgroup_bw_dump(cgrp_id, descendent, accurate, indent) ({ \
-	scxsim_cgroup_bw_yield_dump(); \
+	SCXSIM_CGROUP_BW_YIELD(scxsim_cgroup_bw_yield_dump); \
 	scx_cgroup_bw_dump((cgrp_id), (descendent), (accurate), (indent)); \
 })
 
@@ -677,6 +689,7 @@ extern void scxsim_cgroup_bw_yield_dump(void);
 #undef scx_cgroup_bw_is_task_throttled
 #undef scx_cgroup_bw_move
 #undef scx_cgroup_bw_dump
+#undef SCXSIM_CGROUP_BW_YIELD
 #undef SCXSIM_DEBUG_CONSUME_PROBE_BODY
 
 /*
@@ -1399,6 +1412,12 @@ static void lavd_register_cbw_maps(void)
 			 sizeof(cbw_replenish_timer_storage));
 	__builtin_memset(cbw_accounting_timer_storage, 0,
 			 sizeof(cbw_accounting_timer_storage));
+	cbw_nr_cgroups = 0;
+	cbw_last_replenish_at = 0;
+	cbw_backlog_stat.val = 0;
+	__builtin_memset(cbw_cgroup_ids, 0, sizeof(cbw_cgroup_ids));
+	__builtin_memset(cbw_throttled_cgroup_ids, 0,
+			 sizeof(cbw_throttled_cgroup_ids));
 
 	/* CGRP_STORAGE: keyed by struct cgroup *, value = scx_cgroup_ctx.
 	 * BPF_MAP_TYPE_CGRP_STORAGE has no max_entries field; use the
