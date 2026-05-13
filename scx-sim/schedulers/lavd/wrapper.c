@@ -1295,6 +1295,51 @@ int scxsim_cgroup_bw_throttled(struct cgroup *cgrp, struct task_struct *p)
 }
 
 /*
+ * Library-driven slice-cap budget query, called by the engine's
+ * `pid_bw_max_run_ns` to cap the scheduler-chosen slice at the
+ * cgroup's remaining cpu.max budget for the current period.
+ *
+ * Returns the number of nanoseconds remaining in the current period
+ * before the cgroup hits its `period_budget`, or `-1` (cast to u64
+ * via two's complement = 0xFFFFFFFFFFFFFFFF) if the cgroup is unknown
+ * or unlimited (`nquota_ub == CBW_RUNTUME_INF`). The engine reads
+ * the return value and treats `(u64)-1` as "no cap".
+ *
+ * `period_budget` is set at each replenish (carrying debt + burst
+ * forward); `runtime_total_sloppy` is the running accumulator updated
+ * by the accounting timer. `period_budget - runtime_total_sloppy`
+ * is the remaining quota in the current period.
+ *
+ * tg `shrink-rust-bandwidthmanager-518-to-30-lines-no-fake-approximation` —
+ * replaces engine-side BandwidthManager.max_run_ns with a thin FFI
+ * forwarder so the library is the single source of truth for budget
+ * accounting (No-Stub Rule, scx-sim/CLAUDE.md).
+ */
+__attribute__((visibility("default")))
+unsigned long long scxsim_cgroup_bw_budget_remaining(unsigned long long cgrp_id)
+{
+	struct cgroup *cgrp;
+	struct scx_cgroup_ctx *cgx;
+	long long remaining;
+
+	cgrp = (struct cgroup *)sim_cgroup_lookup_by_id(cgrp_id);
+	if (!cgrp)
+		return (unsigned long long)-1; /* unknown -> no cap */
+
+	cgx = cbw_get_cgroup_ctx(cgrp);
+	if (!cgx)
+		return (unsigned long long)-1; /* untracked -> no cap */
+
+	if (cgx->nquota_ub == CBW_RUNTUME_INF)
+		return (unsigned long long)-1; /* unlimited -> no cap */
+
+	remaining = cgx->period_budget - cgx->runtime_total_sloppy;
+	if (remaining <= 0)
+		return 0; /* over-budget -> next dispatch should yield */
+	return (unsigned long long)remaining;
+}
+
+/*
  * Diagnostic probe (Phase 2 Stage E investigation, tg
  * `investigate-scxsim-engine-throttles-before-scheduler-cgroup-bw`):
  * isolate WHERE the consume->accumulate chain breaks. The

@@ -403,18 +403,6 @@ pub(crate) fn write_json(trace: &Trace, writer: &mut impl Write) -> std::io::Res
                     "args": { "pid": pid.0, "cgid": cgid.0, "delta_ns": delta_ns }
                 })
             }
-            TraceKind::CgroupBwThrottle { cgid } => {
-                json!({
-                    "ph": "i",
-                    "pid": cpu,
-                    "tid": 0,
-                    "ts": ts,
-                    "name": "cgroup_bw_throttle",
-                    "cat": "cgroup_bw",
-                    "s": "g",
-                    "args": { "cgid": cgid.0 }
-                })
-            }
             TraceKind::CgroupBwDenied { pid, cgid } => {
                 json!({
                     "ph": "i",
@@ -425,18 +413,6 @@ pub(crate) fn write_json(trace: &Trace, writer: &mut impl Write) -> std::io::Res
                     "cat": "cgroup_bw",
                     "s": "t",
                     "args": { "pid": pid.0, "cgid": cgid.0 }
-                })
-            }
-            TraceKind::CgroupBwRefill { cgid } => {
-                json!({
-                    "ph": "i",
-                    "pid": cpu,
-                    "tid": 0,
-                    "ts": ts,
-                    "name": "cgroup_bw_refill",
-                    "cat": "cgroup_bw",
-                    "s": "g",
-                    "args": { "cgid": cgid.0 }
                 })
             }
         };

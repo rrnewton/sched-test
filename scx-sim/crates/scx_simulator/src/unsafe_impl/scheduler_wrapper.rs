@@ -235,6 +235,16 @@ impl<S: Scheduler> SchedulerWrapper<S> {
         self.inner.probe_cbw_state(cgrp_id, llc_id, out)
     }
 
+    /// Library-driven slice-cap budget query
+    /// (`scxsim_cgroup_bw_budget_remaining`). Returns the cgroup's
+    /// remaining cpu.max budget for the current period in
+    /// nanoseconds, or `u64::MAX` (the wrapper.c sentinel) when no
+    /// cap should apply. Returns `None` when the loaded scheduler
+    /// does not link the cgroup_bw library.
+    pub fn cgroup_bw_budget_remaining(&self, cgrp_id: u64) -> Option<u64> {
+        self.inner.cgroup_bw_budget_remaining(cgrp_id)
+    }
+
     /// CPU idle state changed (`ops.update_idle`).
     pub fn update_idle(&self, cpu: i32, idle: bool) {
         // SAFETY: No pointer arguments; cpu ID is validated by the engine.

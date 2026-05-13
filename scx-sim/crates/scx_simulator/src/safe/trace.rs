@@ -168,25 +168,24 @@ pub enum TraceKind {
     /// An interrupt handler completes on a CPU.
     IrqEnd { cpu: CpuId },
 
-    // ----- Cgroup bandwidth (cpu.max) events (Diff 3 wiring) -----
-    /// Engine charged `delta_ns` of CPU time against `cgid`'s `cpu.max` quota
-    /// (and any finite ancestors).
+    // ----- Cgroup bandwidth (cpu.max) events -----
+    /// Trace marker: `delta_ns` of CPU time consumed by `pid` in `cgid`.
+    /// Recorded by the engine on every task stop; the actual cpu.max
+    /// accounting happens in the scheduler-side cgroup_bw library
+    /// (`scx_cgroup_bw_consume`), not here.
     CgroupBwCharge {
         pid: Pid,
         cgid: crate::cgroup::CgroupId,
         delta_ns: TimeNs,
     },
-    /// `cgid`'s quota was exhausted; the cgroup is now throttled until refill.
-    CgroupBwThrottle { cgid: crate::cgroup::CgroupId },
-    /// Engine refused to admit `pid` from a local DSQ because its cgroup
-    /// (or an ancestor) is currently throttled. The task remains queued.
+    /// Engine refused to admit `pid` from a local DSQ because the
+    /// scheduler-side cgroup_bw library reported its cgroup throttled
+    /// (`scxsim_cgroup_bw_is_cgroup_throttled` returned true). The task
+    /// remains queued and will be re-checked on the next dispatch.
     CgroupBwDenied {
         pid: Pid,
         cgid: crate::cgroup::CgroupId,
     },
-    /// `cgid` reached a period boundary; quota was refilled and any
-    /// throttled tasks are eligible to run again.
-    CgroupBwRefill { cgid: crate::cgroup::CgroupId },
 }
 
 /// Reason why a dispatch to a local DSQ was rejected.
@@ -739,14 +738,8 @@ impl Trace {
                     "CG_BW_CHRG pid={} cgid={} delta={}",
                     pid.0, cgid.0, delta_ns
                 ),
-                TraceKind::CgroupBwThrottle { cgid } => {
-                    format!("CG_BW_THR  cgid={}", cgid.0)
-                }
                 TraceKind::CgroupBwDenied { pid, cgid } => {
                     format!("CG_BW_DENY pid={} cgid={}", pid.0, cgid.0)
-                }
-                TraceKind::CgroupBwRefill { cgid } => {
-                    format!("CG_BW_REF  cgid={}", cgid.0)
                 }
             };
             eprintln!(
