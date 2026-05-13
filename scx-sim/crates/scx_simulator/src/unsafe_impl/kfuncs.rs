@@ -26,7 +26,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ffi::c_void;
 use std::os::unix::io::RawFd;
 use std::ptr;
@@ -274,13 +274,13 @@ pub struct SimulatorState {
     ///
     /// Which ops callback we are currently inside.
     pub ops_context: OpsContext,
-    /// PER-CPU: Each worker records its own pending dispatch during
-    /// `select_cpu`/`enqueue`. Only the owning worker reads it back
-    /// in `resolve_pending_dispatch`.
+    /// PER-CPU: Each worker records its own pending dispatches during
+    /// `select_cpu`/`enqueue`/`dispatch`. Only the owning worker reads them
+    /// back in `resolve_pending_dispatch`.
     ///
-    /// Deferred dispatch recorded during `select_cpu` or `enqueue`.
+    /// Deferred dispatches recorded by `scx_bpf_dsq_insert*()`.
     /// The engine resolves `SCX_DSQ_LOCAL` and executes after the callback.
-    pub pending_dispatch: Option<PendingDispatch>,
+    pub pending_dispatches: VecDeque<PendingDispatch>,
     /// PER-CPU: DSQ iterator state is per-callback, used only by the
     /// worker that started the iteration.
     ///
@@ -831,17 +831,34 @@ impl SimulatorState {
         (base as i64 + jitter).clamp(0, 2 * base as i64) as TimeNs
     }
 
-    /// Execute a pending deferred dispatch, resolving `SCX_DSQ_LOCAL` to
+    /// Execute pending deferred dispatches, resolving `SCX_DSQ_LOCAL` to
     /// the given `local_cpu`.
     ///
     /// This mirrors the kernel's post-callback dispatch resolution:
     /// after `select_cpu`, `local_cpu` is the CPU that `select_cpu` returned;
     /// after `enqueue`, it is the task's assigned CPU.
     ///
-    /// Returns the CPU if a local DSQ dispatch was resolved (the engine
-    /// should try to run on that CPU), or None.
+    /// Returns the first CPU where a local DSQ dispatch was resolved (the
+    /// engine should try to run on that CPU), or None. All queued dispatches
+    /// are processed in FIFO order before returning.
     pub fn resolve_pending_dispatch(&mut self, local_cpu: CpuId) -> Option<CpuId> {
-        let pd = self.pending_dispatch.take()?;
+        let mut first_local_dispatch = None;
+
+        while let Some(pd) = self.pending_dispatches.pop_front() {
+            let local_dispatch = self.resolve_one_pending_dispatch(local_cpu, pd);
+            if first_local_dispatch.is_none() {
+                first_local_dispatch = local_dispatch;
+            }
+        }
+
+        first_local_dispatch
+    }
+
+    fn resolve_one_pending_dispatch(
+        &mut self,
+        local_cpu: CpuId,
+        pd: PendingDispatch,
+    ) -> Option<CpuId> {
 
         // Task has been dispatched — no longer in BPF scheduler's queue.
         self.set_task_ops_state(pd.pid, OpsTaskState::None);
@@ -1734,7 +1751,7 @@ pub extern "C" fn scx_bpf_dsq_insert(p: *mut c_void, dsq_id: u64, slice: u64, en
         unsafe { ffi::sim_task_set_slice(p, slice) };
         debug!(pid = pid.0, dsq_id, slice = %FmtN(slice), "enter:kfunc dsq_insert");
 
-        sim.pending_dispatch = Some(PendingDispatch {
+        sim.pending_dispatches.push_back(PendingDispatch {
             pid,
             dsq_id: DsqId(dsq_id),
             enq_flags,
@@ -1820,7 +1837,7 @@ pub extern "C" fn scx_bpf_dsq_insert_vtime(
         unsafe { ffi::sim_task_set_slice(p, slice) };
         debug!(pid = pid.0, dsq_id, slice = %FmtN(slice), vtime = %Vtime(vtime), "enter:kfunc dsq_insert_vtime");
 
-        sim.pending_dispatch = Some(PendingDispatch {
+        sim.pending_dispatches.push_back(PendingDispatch {
             pid,
             dsq_id: DsqId(dsq_id),
             enq_flags,
@@ -2816,7 +2833,7 @@ mod tests {
             task_ops_state: BTreeMap::new(),
             rng: SmallRng::seed_from_u64(0xDEAD_BEEF),
             ops_context: OpsContext::None,
-            pending_dispatch: None,
+            pending_dispatches: VecDeque::new(),
             dsq_iter: None,
             staged_events: Vec::new(),
             reenqueue_local_requested: false,
@@ -2879,16 +2896,27 @@ mod tests {
         clear_sim_arc();
     }
 
-    fn assert_pending_dispatch(arc: &SimArc, pid: Pid, dsq_id: DsqId, vtime: Option<Vtime>) {
+    fn assert_pending_dispatch_at(
+        arc: &SimArc,
+        idx: usize,
+        pid: Pid,
+        dsq_id: DsqId,
+        vtime: Option<Vtime>,
+    ) {
         let guard = arc.lock().unwrap();
-        let pd = guard.sim.pending_dispatch.as_ref().unwrap();
+        let pd = guard.sim.pending_dispatches.get(idx).unwrap();
         assert_eq!(pd.pid, pid);
         assert_eq!(pd.dsq_id, dsq_id);
         assert_eq!(pd.vtime, vtime);
     }
 
+    fn assert_single_pending_dispatch(arc: &SimArc, pid: Pid, dsq_id: DsqId, vtime: Option<Vtime>) {
+        assert_eq!(arc.lock().unwrap().sim.pending_dispatches.len(), 1);
+        assert_pending_dispatch_at(arc, 0, pid, dsq_id, vtime);
+    }
+
     fn clear_pending_dispatch(arc: &SimArc) {
-        arc.lock().unwrap().sim.pending_dispatch = None;
+        arc.lock().unwrap().sim.pending_dispatches.clear();
     }
 
     /// Allocate a C task_struct and register it in the state's pointer maps.
@@ -2994,8 +3022,8 @@ mod tests {
 
         // Insert is deferred, not immediate
         let guard = arc.lock().unwrap();
-        assert!(guard.sim.pending_dispatch.is_some());
-        let pd = guard.sim.pending_dispatch.as_ref().unwrap();
+        assert_eq!(guard.sim.pending_dispatches.len(), 1);
+        let pd = guard.sim.pending_dispatches.front().unwrap();
         assert_eq!(pd.pid, Pid(1));
         assert_eq!(pd.dsq_id, DsqId::GLOBAL);
         assert!(pd.vtime.is_none());
@@ -3021,7 +3049,7 @@ mod tests {
         exit_test_sim();
 
         let guard = arc.lock().unwrap();
-        let pd = guard.sim.pending_dispatch.as_ref().unwrap();
+        let pd = guard.sim.pending_dispatches.front().unwrap();
         assert_eq!(pd.pid, Pid(3));
         assert_eq!(pd.dsq_id, DsqId(50));
         assert_eq!(pd.vtime, Some(Vtime(1000)));
@@ -3047,15 +3075,15 @@ mod tests {
             5_000_000,
             0
         ));
-        assert_pending_dispatch(&arc, Pid(7), DsqId::GLOBAL, None);
+        assert_single_pending_dispatch(&arc, Pid(7), DsqId::GLOBAL, None);
         clear_pending_dispatch(&arc);
 
         scx_bpf_dsq_insert___v1(p, DsqId::GLOBAL.0, 5_000_000, 0);
-        assert_pending_dispatch(&arc, Pid(7), DsqId::GLOBAL, None);
+        assert_single_pending_dispatch(&arc, Pid(7), DsqId::GLOBAL, None);
         clear_pending_dispatch(&arc);
 
         scx_bpf_dispatch___compat(p, DsqId::LOCAL.0, 5_000_000, 0);
-        assert_pending_dispatch(&arc, Pid(7), DsqId::LOCAL, None);
+        assert_single_pending_dispatch(&arc, Pid(7), DsqId::LOCAL, None);
 
         exit_test_sim();
         free_task(&mut arc.lock().unwrap().sim, Pid(7));
@@ -3080,18 +3108,61 @@ mod tests {
         enter_test_sim(&arc, cpu);
 
         assert!(__scx_bpf_dsq_insert_vtime(p, &args));
-        assert_pending_dispatch(&arc, Pid(8), DsqId(50), Some(Vtime(1234)));
+        assert_single_pending_dispatch(&arc, Pid(8), DsqId(50), Some(Vtime(1234)));
         clear_pending_dispatch(&arc);
 
         scx_bpf_dsq_insert_vtime___compat(p, 50, 5_000_000, 5678, 0);
-        assert_pending_dispatch(&arc, Pid(8), DsqId(50), Some(Vtime(5678)));
+        assert_single_pending_dispatch(&arc, Pid(8), DsqId(50), Some(Vtime(5678)));
         clear_pending_dispatch(&arc);
 
         scx_bpf_dispatch_vtime___compat(p, 50, 5_000_000, 9012, 0);
-        assert_pending_dispatch(&arc, Pid(8), DsqId(50), Some(Vtime(9012)));
+        assert_single_pending_dispatch(&arc, Pid(8), DsqId(50), Some(Vtime(9012)));
 
         exit_test_sim();
         free_task(&mut arc.lock().unwrap().sim, Pid(8));
+    }
+
+    #[test]
+    fn test_resolve_pending_dispatch_multiple_in_order() {
+        let _lock = SIM_LOCK.lock().unwrap();
+        let mut state = test_state(2);
+        state.dsqs.create(DsqId(50));
+        let arc = test_sim_arc(state);
+
+        let p1 = register_task(&mut arc.lock().unwrap().sim, Pid(1));
+        let p2 = register_task(&mut arc.lock().unwrap().sim, Pid(2));
+        let p3 = register_task(&mut arc.lock().unwrap().sim, Pid(3));
+
+        let cpu = arc.lock().unwrap().sim.current_cpu;
+        enter_test_sim(&arc, cpu);
+        scx_bpf_dsq_insert(p1, DsqId::GLOBAL.0, 5_000_000, 0);
+        scx_bpf_dsq_insert(p2, DsqId::LOCAL.0, 5_000_000, 0);
+        scx_bpf_dsq_insert_vtime(p3, 50, 5_000_000, 1234, 0);
+        exit_test_sim();
+
+        assert_pending_dispatch_at(&arc, 0, Pid(1), DsqId::GLOBAL, None);
+        assert_pending_dispatch_at(&arc, 1, Pid(2), DsqId::LOCAL, None);
+        assert_pending_dispatch_at(&arc, 2, Pid(3), DsqId(50), Some(Vtime(1234)));
+
+        let mut guard = arc.lock().unwrap();
+        let result = guard.sim.resolve_pending_dispatch(CpuId(1));
+        assert_eq!(result, Some(CpuId(1)));
+        assert!(guard.sim.pending_dispatches.is_empty());
+        assert_eq!(guard.sim.dsqs.ordered_pids(DsqId::GLOBAL), vec![Pid(1)]);
+        assert_eq!(
+            guard.sim.cpus[1]
+                .local_dsq
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![Pid(2)]
+        );
+        assert_eq!(guard.sim.dsqs.ordered_pids(DsqId(50)), vec![Pid(3)]);
+
+        drop(guard);
+        for pid in [Pid(1), Pid(2), Pid(3)] {
+            free_task(&mut arc.lock().unwrap().sim, pid);
+        }
     }
 
     #[test]
