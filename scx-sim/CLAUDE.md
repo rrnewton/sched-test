@@ -75,6 +75,107 @@ This rule exists so that recurrence is impossible. Reviewers MUST refuse
 to land scxsim integrations that stub, no-op, or elide BPF scheduler
 logic, regardless of how convenient the shortcut looks.
 
+CRITICAL: Don't Model the Scheduler — Model the Kernel
+================================================================================
+
+This rule EXTENDS the No-Stub Rule above. The No-Stub Rule covers the
+obvious antipattern (no-op shims, elided libraries). This rule covers
+the subtler — and historically more damaging — antipattern: a Rust
+reimplementation that *looks correct*, mirrors the scheduler's
+interface, maintains its own parallel state, and produces plausible
+behavior — but is a **fake approximation** of what the scheduler does
+rather than the scheduler itself.
+
+User mandate (web 2026-05-13):
+> *Move towards NOT modeling any fake approximation of schedulers but
+> just modeling what the kernel actually does with the proper
+> relationship to the running SCX scheduler.*
+
+The principle in one line: **scxsim models the kernel; the SCX
+scheduler models the scheduler.** Their relationship inside scxsim must
+mirror the kernel↔BPF-scheduler relationship in production.
+
+What scxsim's Rust runtime DOES model (the kernel's job):
+
+- Delivering scheduler callbacks (`enqueue`, `dispatch`, `runnable`,
+  `quiescent`, `tick`, etc.) at the right times, with the right
+  arguments, in the right order.
+- Owning the run queues, DSQs, and per-CPU dispatch state THAT THE
+  KERNEL OWNS.
+- Advancing simulated time, accounting runtime, raising scheduler
+  ticks, delivering wakeups and IPIs.
+- Providing the kfunc / helper surface that BPF programs see.
+- Faithfully simulating the BPF substrate (maps, timers, iterators,
+  per-CPU storage) the scheduler runs on top of.
+
+What scxsim's Rust runtime MUST NOT model (the scheduler's job):
+
+- Cgroup CPU bandwidth enforcement (throttle / put-aside / refill /
+  unthrottle decisions). These belong to `cgroup_bw.bpf.c` running
+  *inside the linked-in scheduler library*, not to a Rust
+  `BandwidthManager` running alongside it.
+- Dispatch policy (which task to pick next, fairness, vruntime, BTQ
+  ordering, latency-criticality scoring, etc.). These belong to the
+  scheduler's own `.bpf.c`.
+- Any other accounting, decision, or state-machine logic that lives in
+  the BPF scheduler in production.
+
+The test (apply this to every Rust struct/function in the scxsim
+runtime path):
+
+> For this piece of Rust code that maintains state about what the
+> scheduler is doing — or that decides what the scheduler should do —
+> ask: **In production, does the KERNEL maintain that state / make
+> that decision, or does the BPF SCHEDULER?**
+>
+> - If the **kernel** owns it → fine, this is legitimate scxsim engine
+>   code.
+> - If the **BPF scheduler** owns it → DELETE the Rust code. Let the
+>   scheduler's own BPF code execute and own that state. The Rust
+>   replacement, no matter how carefully written, is a guess at what
+>   the scheduler does. The scheduler is the only code that knows what
+>   the scheduler does.
+
+Why this is *stronger* than the No-Stub Rule:
+
+A no-op stub is obviously wrong — it returns success without doing the
+work, and any reviewer can see the lie. A **fake approximation** is
+much more dangerous because it *looks correct*: the Rust code has
+plausible state, plausible transitions, plausible outputs. It will
+match the scheduler's behavior on the easy cases and diverge on the
+exact corner cases that bugs hide in. Worse, the scheduler's real BPF
+logic is typically *not running at all* on the path the approximation
+covers, so production-faithful diagnosis is impossible. The
+cpu-bw-stall-bug investigation lost weeks to exactly this confusion.
+
+Worked example (canonical): `BandwidthManager`.
+The Rust `BandwidthManager` at
+`scx-sim/crates/scx_simulator/src/safe/cgroup_bw.rs` (518 lines, under
+`#![forbid(unsafe_code)]`) was an interface-shaped Rust state machine
+that approximated `cgroup_bw.bpf.c` — the same enforcement library
+linked into the scheduler. It maintained parallel cgroup state,
+parallel quota/refill bookkeeping, and parallel throttle decisions.
+Both the rule above and the audit (`audit-cgroup-bw-real-shim-state-202605`)
+identified it as a textbook fake approximation. The fix is the
+in-flight tg task
+`shrink-rust-bandwidthmanager-518-to-30-lines-no-fake-approximation`:
+delete the fake-approximation code; the scheduler's `cgroup_bw.bpf.c`
+becomes the single source of truth, and the surviving ~30 lines of
+Rust are limited to what the kernel genuinely owns (e.g. delivering
+the BPF timer that drives refill).
+
+When the audit
+`audit-scxsim-for-other-fake-approximation-violations` finds further
+candidates, apply the test above and remove them by the same pattern.
+Every Rust line that models scheduler-side state is a line where
+scxsim and the production kernel can disagree — and disagree
+silently.
+
+Reviewers MUST refuse to land code that re-introduces fake
+approximations under any name (`*Manager`, `*State`, `*Tracker`,
+`*Cache`, `Sim*`) when the production owner of that state is a BPF
+scheduler.
+
 Coding conventions
 ========================================
 
