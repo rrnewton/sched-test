@@ -13,6 +13,8 @@ Usage:
     python3 stress.py --determinism           # Enable determinism checking
     python3 stress.py --e9patch               # Only test e9patch mode
     python3 stress.py --random-workloads      # Enable randomized workloads + params
+    python3 stress.py --random-params         # Sweep simulator timing knobs
+    python3 stress.py --high-concurrency      # Add 16/32/64/128 CPU configs
 """
 from __future__ import annotations
 
@@ -46,8 +48,23 @@ WORKLOADS_DIR = PROJECT_ROOT / "crates" / "scx_simulator" / "workloads"
 OUTPUT_DIR = Path(__file__).parent / "output"
 
 SCHEDULERS = ["simple", "lavd", "cosmos", "tickless", "mitosis"]
-CPU_COUNTS = [1, 2, 4, 8]
-INTERLEAVE_MODES = ["off", "cooperative", "preemptive", "e9patch"]
+DEFAULT_CPU_COUNTS = [1, 2, 4, 8]
+HIGH_CPU_COUNTS = [16, 32, 64, 128]
+CPU_COUNTS = DEFAULT_CPU_COUNTS.copy()
+INTERLEAVE_MODES = [
+    "off", "cooperative", "preemptive", "e9patch",
+]
+# NOTE: scxsim's `--native-concurrent` flag exists in the CLI but is
+# currently a Phase-2 placeholder. Its backend in
+# crates/scx_simulator/src/unsafe_impl/backend/native.rs is entirely
+# `#[allow(dead_code)] // Callers temporarily removed during dispatch
+# refactor`, the `clock_window_check` hook in kfuncs.rs is an empty stub,
+# and `state.native_concurrent` has no read sites. The flag's only
+# effective behavior today is `scenario.interleave = true`, identical to
+# plain `--interleave` (cooperative). Re-add `"native-concurrent"` (and
+# `--window-ns` randomization) once the dispatch refactor lands and the
+# orchestrator + clock_window_check are wired up. See closed audit
+# `review-stress-py-native-concurrent-and-e9-timeslice-units`.
 
 
 def get_available_workloads() -> list[Path]:
@@ -60,12 +77,36 @@ def get_available_workloads() -> list[Path]:
 # ---------------------------------------------------------------------------
 
 # Dimensions for random workload generation
-TASK_COUNTS = [1, 2, 4, 8, 16, 32]
+DEFAULT_TASK_COUNTS = [1, 2, 4, 8, 16, 32]
+TASK_COUNTS = DEFAULT_TASK_COUNTS.copy()
+HIGH_TASK_MULTIPLIERS = [1, 4, 10]
+TASK_MULTIPLIERS: list[int] = []
 PHASE_PATTERNS = ["run_only", "run_sleep", "run_sleep_wake", "mixed"]
 
 # Randomized simulator parameter choices
 RBC_NS_CHOICES = [0, 5, 10, 50]
 WATCHDOG_CHOICES = ["2s", "5s", "30s"]
+# Preemptive-mode timeslice choices (min, max), in PMU events.
+#
+# UNITS: PMU event counts (NOT nanoseconds, NOT microseconds). The default
+# event is RetiredBranchConditional (RBC); switchable to InstructionsRetired
+# via `--break-on insn`. See:
+#   - crates/scx_simulator/src/bin/scxsim/main.rs:333  ("retired conditional
+#     branches")
+#   - crates/scx_simulator/src/safe/scenario.rs:268    ("PMU events")
+#   - crates/scx_simulator/src/unsafe_impl/backend/pmu.rs:115 (consumer)
+#
+# Lower-bound floor: ~200 RBCs. Below this, livelock with complex
+# schedulers like LAVD (longest structop_rbc up to 2026) per main.rs:339.
+# PMU skid (~30-100 branches) means actual fire is timeslice + skid after
+# re-arm.
+#
+# These tiers are biased toward fine-grained interleaving for revealing
+# intra-structop CAS-window race classes (e.g. cgroup_bw cbw_backlog_stat
+# CAS — single-digit RBC race window). The (1000, 5000) tier from the
+# original randomization was DROPPED — too coarse to fire mid-structop on
+# most schedulers, so it mostly devolved to cooperative-only behavior.
+TIMESLICE_CHOICES = [(200, 400), (300, 600), (300, 1000), (500, 2000)]
 
 # Temporary directory for generated workloads (cleaned up at exit)
 _GENERATED_WORKLOADS_DIR: Optional[Path] = None
@@ -156,13 +197,23 @@ def _build_task_phases(
         return {"phases": phases_obj}
 
 
-def generate_random_workload(rng: random.Random) -> Path:
+def _choose_task_count(rng: random.Random, cpus: int) -> int:
+    """Choose task count from explicit counts and CPU multipliers."""
+    candidates = TASK_COUNTS.copy()
+    candidates.extend(cpus * multiplier for multiplier in TASK_MULTIPLIERS)
+    unique_candidates = sorted(set(candidates))
+    if not unique_candidates:
+        raise ValueError("at least one task count or multiplier is required")
+    return rng.choice(unique_candidates)
+
+
+def generate_random_workload(rng: random.Random, cpus: int) -> Path:
     """Generate a random rt-app workload JSON file.
 
     Picks random task count, phase pattern per task, and duration spread.
     Returns the path to the generated temporary JSON file.
     """
-    task_count = rng.choice(TASK_COUNTS)
+    task_count = _choose_task_count(rng, cpus)
     duration_sec = rng.choice([1, 2, 4])
 
     # Pick a dominant pattern but allow per-task variation
@@ -360,6 +411,11 @@ class SimParams:
     watchdog_timeout: Optional[str] = None  # --watchdog-timeout override
     no_noise: bool = False  # --no-noise
     no_overhead: bool = False  # --no-overhead
+    # --timeslice-min / --timeslice-max for preemptive mode. UNITS: PMU
+    # event count (default event = retired conditional branches; switchable
+    # via --break-on insn). NOT time. See TIMESLICE_CHOICES comment above.
+    timeslice_min: Optional[int] = None
+    timeslice_max: Optional[int] = None
 
 
 @dataclass
@@ -379,9 +435,20 @@ class TestConfig:
     def label(self) -> str:
         wl = self.workload.stem
         prefix = "rand/" if self.is_random_workload else ""
+        param_tags: list[str] = []
+        params = self.sim_params
+        if params.timeslice_min is not None and params.timeslice_max is not None:
+            # `tsRBC` prefix flags the unit (PMU retired-branch-conditional
+            # events) so log readers don't mistake the values for time.
+            param_tags.append(
+                f"tsRBC{params.timeslice_min}-{params.timeslice_max}"
+            )
+        mode = self.interleave_mode
+        if param_tags:
+            mode = f"{mode}+{','.join(param_tags)}"
         return (
             f"{prefix}{self.scheduler}/{wl}/c{self.cpus}"
-            f"/s{self.seed}/{self.interleave_mode}"
+            f"/s{self.seed}/{mode}"
         )
 
 
@@ -424,6 +491,10 @@ class Finding:
             lines.append("Noise: disabled")
         if params.no_overhead:
             lines.append("Overhead: disabled")
+        if params.timeslice_min is not None:
+            lines.append(f"Timeslice min (RBCs): {params.timeslice_min}")
+        if params.timeslice_max is not None:
+            lines.append(f"Timeslice max (RBCs): {params.timeslice_max}")
         lines.extend([
             "",
             "--- Reproduction command ---",
@@ -487,6 +558,12 @@ def build_base_cmd(config: TestConfig) -> list[str]:
     watchdog = config.sim_params.watchdog_timeout or WATCHDOG_TIMEOUT
     cmd = [
         str(SCXSIM),
+        # NB: scxsim's simulation subcommand is `run` on simulator.v6 (the
+        # vm-run integration that landed in v6 added a SIBLING `vm-run`
+        # subcommand and kept `run` for in-process simulation). The
+        # vm-run-refactor WIP renamed it to `simulate` ahead of an
+        # alternate plan that did not land — undo that rename here so
+        # stress.py invokes the correct subcommand on v6.
         "run",
         str(config.workload),
         "-s", config.scheduler,
@@ -510,6 +587,10 @@ def build_base_cmd(config: TestConfig) -> list[str]:
         cmd.append("--no-noise")
     if params.no_overhead:
         cmd.append("--no-overhead")
+    if params.timeslice_min is not None:
+        cmd.extend(["--timeslice-min", str(params.timeslice_min)])
+    if params.timeslice_max is not None:
+        cmd.extend(["--timeslice-max", str(params.timeslice_max)])
     return cmd
 
 
@@ -910,6 +991,7 @@ _WORKER_SCHEDULERS: list[str] = []
 _WORKER_WORKLOADS: list[Path] = []
 _WORKER_MODES: list[str] = []
 _WORKER_USE_RANDOM_WORKLOADS: bool = False
+_WORKER_RANDOMIZE_SIM_PARAMS: bool = False
 
 
 def _init_worker(
@@ -920,11 +1002,16 @@ def _init_worker(
     workloads: list[str],
     modes: list[str],
     use_random_workloads: bool,
+    randomize_sim_params: bool,
+    cpu_counts: list[int],
+    task_counts: list[int],
+    task_multipliers: list[int],
 ) -> None:
     """Initializer for pool workers: install shared PMU state as globals."""
     global PMU_TOKEN_POOL, PMU_ACQUIRED, PMU_REDIRECTED
     global _WORKER_SCHEDULERS, _WORKER_WORKLOADS, _WORKER_MODES
-    global _WORKER_USE_RANDOM_WORKLOADS
+    global _WORKER_USE_RANDOM_WORKLOADS, _WORKER_RANDOMIZE_SIM_PARAMS
+    global CPU_COUNTS, TASK_COUNTS, TASK_MULTIPLIERS
     PMU_TOKEN_POOL = pmu_pool
     PMU_ACQUIRED = pmu_acquired
     PMU_REDIRECTED = pmu_redirected
@@ -932,6 +1019,10 @@ def _init_worker(
     _WORKER_WORKLOADS = [Path(w) for w in workloads]
     _WORKER_MODES = modes
     _WORKER_USE_RANDOM_WORKLOADS = use_random_workloads
+    _WORKER_RANDOMIZE_SIM_PARAMS = randomize_sim_params
+    CPU_COUNTS = cpu_counts
+    TASK_COUNTS = task_counts
+    TASK_MULTIPLIERS = task_multipliers
 
 
 def needs_pmu_token(config: TestConfig) -> bool:
@@ -1053,6 +1144,7 @@ def run_one(config: TestConfig) -> Optional[Finding]:
             _WORKER_WORKLOADS,
             _WORKER_MODES,
             use_random_workloads=_WORKER_USE_RANDOM_WORKLOADS,
+            randomize_sim_params=_WORKER_RANDOMIZE_SIM_PARAMS,
         )
         alt.iteration = config.iteration
         if not needs_pmu_token(alt):
@@ -1069,7 +1161,7 @@ def run_one(config: TestConfig) -> Optional[Finding]:
         PMU_TOKEN_POOL.release()
 
 
-def _random_sim_params(rng: random.Random) -> SimParams:
+def _random_sim_params(rng: random.Random, mode: str) -> SimParams:
     """Generate randomized simulator parameters."""
     params = SimParams()
     # Randomize rbc-ns: 50% chance of non-default
@@ -1083,6 +1175,10 @@ def _random_sim_params(rng: random.Random) -> SimParams:
         params.no_noise = True
     if rng.random() < 0.15:
         params.no_overhead = True
+    if mode in ("preemptive", "e9patch") and rng.random() < 0.8:
+        params.timeslice_min, params.timeslice_max = rng.choice(
+            TIMESLICE_CHOICES
+        )
     return params
 
 
@@ -1092,11 +1188,13 @@ def generate_configs(
     workloads: list[Path],
     modes: list[str],
     use_random_workloads: bool = False,
+    randomize_sim_params: bool = False,
 ) -> TestConfig:
     """Generate a random test configuration.
 
     When use_random_workloads is True, 50% of configs use a randomly generated
-    workload and randomized simulator parameters.
+    workload. When randomize_sim_params is True, simulator timing/concurrency
+    parameters are also randomized.
     """
     mode = rng.choice(modes)
     cpus = rng.choice(CPU_COUNTS)
@@ -1107,14 +1205,13 @@ def generate_configs(
 
     is_random = use_random_workloads and rng.random() < 0.5
     if is_random:
-        workload = generate_random_workload(rng)
-        sim_params = _random_sim_params(rng)
+        workload = generate_random_workload(rng, cpus)
     else:
         workload = rng.choice(workloads)
-        # Also randomize sim params for fixed workloads when flag is set
-        sim_params = (
-            _random_sim_params(rng) if use_random_workloads else SimParams()
-        )
+
+    sim_params = (
+        _random_sim_params(rng, mode) if randomize_sim_params else SimParams()
+    )
 
     return TestConfig(
         scheduler=rng.choice(schedulers),
@@ -1135,6 +1232,58 @@ def save_finding(finding: Finding, finding_num: int) -> Path:
     path = OUTPUT_DIR / filename
     path.write_text(finding.report())
     return path
+
+
+def _parse_positive_int_list(value: str, name: str) -> list[int]:
+    """Parse a comma-separated positive integer list."""
+    parsed: list[int] = []
+    for raw_part in value.split(","):
+        part = raw_part.strip()
+        if not part:
+            continue
+        try:
+            item = int(part)
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                f"{name} must contain positive integers: {value!r}"
+            ) from None
+        if item <= 0:
+            raise argparse.ArgumentTypeError(
+                f"{name} values must be positive: {value!r}"
+            )
+        parsed.append(item)
+    if not parsed:
+        raise argparse.ArgumentTypeError(f"{name} cannot be empty")
+    return sorted(set(parsed))
+
+
+def _parse_cpu_counts(value: str) -> list[int]:
+    """Parse --cpu-counts."""
+    return _parse_positive_int_list(value, "--cpu-counts")
+
+
+def _parse_task_counts(value: str) -> list[int]:
+    """Parse --task-counts."""
+    return _parse_positive_int_list(value, "--task-counts")
+
+
+def _parse_task_multipliers(value: str) -> list[int]:
+    """Parse --task-multipliers."""
+    return _parse_positive_int_list(value, "--task-multipliers")
+
+
+def _parse_modes(value: str) -> list[str]:
+    """Parse a comma-separated interleave mode list."""
+    modes = [part.strip() for part in value.split(",") if part.strip()]
+    if not modes:
+        raise argparse.ArgumentTypeError("--modes cannot be empty")
+    unknown = [mode for mode in modes if mode not in INTERLEAVE_MODES]
+    if unknown:
+        raise argparse.ArgumentTypeError(
+            f"unknown mode(s): {', '.join(unknown)}; "
+            f"available: {', '.join(INTERLEAVE_MODES)}"
+        )
+    return modes
 
 
 # ---------------------------------------------------------------------------
@@ -1210,8 +1359,51 @@ def main() -> int:
         "--random-workloads",
         action="store_true",
         help="Enable randomized workload generation: 50%% fixed, 50%% randomly "
-             "generated rt-app JSON. Also randomizes simulator parameters "
-             "(rbc-ns, watchdog timeout, noise, overhead).",
+             "generated rt-app JSON.",
+    )
+    parser.add_argument(
+        "--random-params",
+        action="store_true",
+        help="Randomize simulator parameters on both fixed and generated "
+             "workloads: rbc-ns, watchdog timeout, noise, overhead, and "
+             "preemptive timeslice min/max (PMU retired-branch counts; "
+             "see TIMESLICE_CHOICES for unit details). "
+             "This is implied by --random-workloads.",
+    )
+    parser.add_argument(
+        "--high-concurrency",
+        action="store_true",
+        help="Expand CPU sweep with 16,32,64,128 CPUs and generate random "
+             "workloads from task-count multipliers 1x,4x,10x CPUs. "
+             "Use with --random-workloads to exercise the task matrix.",
+    )
+    parser.add_argument(
+        "--cpu-counts",
+        type=_parse_cpu_counts,
+        default=None,
+        help="Comma-separated simulated CPU counts to sweep. Overrides "
+             "--high-concurrency defaults.",
+    )
+    parser.add_argument(
+        "--task-counts",
+        type=_parse_task_counts,
+        default=None,
+        help="Comma-separated generated workload task counts. Used only with "
+             "--random-workloads.",
+    )
+    parser.add_argument(
+        "--task-multipliers",
+        type=_parse_task_multipliers,
+        default=None,
+        help="Comma-separated generated workload task multipliers, expressed "
+             "as tasks per simulated CPU. Used only with --random-workloads.",
+    )
+    parser.add_argument(
+        "--modes",
+        type=_parse_modes,
+        default=None,
+        help=f"Comma-separated interleave modes to test (available: "
+             f"{','.join(INTERLEAVE_MODES)}).",
     )
     parser.add_argument(
         "--max-pmu",
@@ -1231,9 +1423,29 @@ def main() -> int:
 
     # Set global config from CLI args
     global WATCHDOG_TIMEOUT, SIM_DURATION, DETERMINISM_MODE
+    global CPU_COUNTS, TASK_COUNTS, TASK_MULTIPLIERS
     WATCHDOG_TIMEOUT = args.watchdog
     SIM_DURATION = args.sim_duration
     DETERMINISM_MODE = args.determinism
+    if args.cpu_counts is not None:
+        CPU_COUNTS = args.cpu_counts
+    elif args.high_concurrency:
+        CPU_COUNTS = sorted(set(DEFAULT_CPU_COUNTS + HIGH_CPU_COUNTS))
+    else:
+        CPU_COUNTS = DEFAULT_CPU_COUNTS.copy()
+
+    TASK_COUNTS = (
+        args.task_counts
+        if args.task_counts is not None
+        else DEFAULT_TASK_COUNTS.copy()
+    )
+    if args.task_multipliers is not None:
+        TASK_MULTIPLIERS = args.task_multipliers
+    elif args.high_concurrency:
+        TASK_MULTIPLIERS = HIGH_TASK_MULTIPLIERS.copy()
+    else:
+        TASK_MULTIPLIERS = []
+    randomize_sim_params = args.random_params or args.random_workloads
 
     # Set up logging first
     log_path = setup_logging()
@@ -1273,7 +1485,22 @@ def main() -> int:
 
     # Determine which interleave modes to test
     has_e9 = e9_schedulers_available()
-    if args.e9patch:
+    if args.modes is not None:
+        if args.e9patch or args.no_e9patch:
+            print(
+                "error: use either --modes or --e9patch/--no-e9patch, not both",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if "e9patch" in args.modes and not has_e9:
+            print(
+                "error: e9patch mode requires _e9.so variants. "
+                "Build with: make -C schedulers e9",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        modes = args.modes
+    elif args.e9patch:
         if not has_e9:
             print(
                 "error: --e9patch requires _e9.so variants. "
@@ -1300,12 +1527,20 @@ def main() -> int:
     print(f"Mode: {mode_str}")
     print(f"Schedulers: {', '.join(schedulers)}")
     print(f"Workloads: {', '.join(wl.stem for wl in workloads)}")
+    print(f"CPU counts: {CPU_COUNTS}")
     if args.random_workloads:
         print("Random workloads: enabled (50% random, 50% fixed)")
         print(f"  Task counts: {TASK_COUNTS}")
+        if TASK_MULTIPLIERS:
+            print(f"  Task multipliers: {TASK_MULTIPLIERS}x CPUs")
         print(f"  Phase patterns: {PHASE_PATTERNS}")
+    if randomize_sim_params:
+        print("Random simulator params: enabled")
         print(f"  RBC-ns choices: {RBC_NS_CHOICES}")
         print(f"  Watchdog choices: {WATCHDOG_CHOICES}")
+        print(
+            f"  Preemptive timeslice choices (PMU RBCs): {TIMESLICE_CHOICES}"
+        )
     print(f"Interleave modes: {', '.join(modes)}")
     print(f"Watchdog: {WATCHDOG_TIMEOUT}, sim duration: {SIM_DURATION}")
     print(f"Max PMU concurrent: {args.max_pmu}")
@@ -1324,6 +1559,11 @@ def main() -> int:
     log.info(f"Mode: {mode_str}")
     log.info(f"Schedulers: {', '.join(schedulers)}")
     log.info(f"Workloads: {', '.join(wl.stem for wl in workloads)}")
+    log.info(f"CPU counts: {CPU_COUNTS}")
+    if args.random_workloads:
+        log.info(f"Generated workload task counts: {TASK_COUNTS}")
+        log.info(f"Generated workload task multipliers: {TASK_MULTIPLIERS}")
+    log.info(f"Random simulator params: {randomize_sim_params}")
     log.info(f"Interleave modes: {', '.join(modes)}")
     log.info(f"Watchdog timeout: {WATCHDOG_TIMEOUT}")
     log.info(f"Sim duration: {SIM_DURATION}")
@@ -1351,7 +1591,8 @@ def main() -> int:
             initargs=(
                 pmu_pool, pmu_acquired, pmu_redirected,
                 schedulers, workload_strs, modes,
-                args.random_workloads,
+                args.random_workloads, randomize_sim_params,
+                CPU_COUNTS, TASK_COUNTS, TASK_MULTIPLIERS,
             ),
         ) as pool:
             pending: dict[Future[Optional[Finding]], TestConfig] = {}
@@ -1363,6 +1604,7 @@ def main() -> int:
                     config = generate_configs(
                         rng, schedulers, workloads, modes,
                         use_random_workloads=args.random_workloads,
+                        randomize_sim_params=randomize_sim_params,
                     )
                     config.iteration = iteration
                     iteration += 1
