@@ -355,6 +355,29 @@ struct RunArgs {
     #[arg(long)]
     interleave: bool,
 
+    /// Pull cgroup_bw BPF timer events into cgroup_bw yield sites.
+    ///
+    /// Deterministic per seed. This models timer-vs-dispatch race windows
+    /// that the serial event loop cannot otherwise expose.
+    #[arg(long)]
+    stochastic_timer_interleave: bool,
+
+    /// Fire-ahead window for --stochastic-timer-interleave.
+    ///
+    /// Pending non-slot-0 BPF timers at or before current CPU time + this
+    /// window are eligible to run at cgroup_bw yield sites.
+    #[arg(
+        long,
+        default_value = "20ms",
+        requires = "stochastic_timer_interleave",
+        value_name = "DURATION"
+    )]
+    stochastic_timer_interleave_window: String,
+
+    /// Approximate stochastic timer-interleave rate: one eligible timer per N sites.
+    #[arg(long, default_value_t = 4, requires = "stochastic_timer_interleave")]
+    stochastic_timer_interleave_one_in: u32,
+
     /// Enable preemptive interleaving via PMU retired branch counter signals.
     ///
     /// Like --interleave, but also preempts mid-C-code at random retired
@@ -691,6 +714,14 @@ fn run(args: &RunArgs) -> Result<(), RunError> {
     }
     if args.interleave {
         scenario.interleave = true;
+    }
+    if args.stochastic_timer_interleave {
+        scenario.stochastic_timer_interleave = true;
+        scenario.stochastic_timer_interleave_window_ns =
+            parse_duration_ns(&args.stochastic_timer_interleave_window)
+                .map_err(|e| format!("--stochastic-timer-interleave-window: {e}"))?;
+        scenario.stochastic_timer_interleave_one_in =
+            args.stochastic_timer_interleave_one_in.max(1);
     }
     if args.preemptive {
         scenario.preemptive = Some(PreemptiveConfig {

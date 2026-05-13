@@ -471,6 +471,8 @@ pub(crate) struct EventQueue {
     pub(crate) seq: u64,
     /// Separate PRNG for randomized tiebreaking (independent of simulator PRNG).
     pub(crate) event_rng: SmallRng,
+    /// Separate PRNG for stochastic timer interleaving decisions.
+    pub(crate) timer_interleave_rng: SmallRng,
     /// When true, use insertion-order tiebreaking (monotonic seq).
     pub(crate) fixed_priority: bool,
 }
@@ -482,10 +484,14 @@ impl EventQueue {
         let event_seed = (seed as u64)
             .wrapping_mul(0x9e3779b9)
             .wrapping_add(0xdeadbeef);
+        let timer_seed = (seed as u64)
+            .wrapping_mul(0xd1b54a32d192ed03)
+            .wrapping_add(0xa5a5_51c3);
         EventQueue {
             heap: BinaryHeap::new(),
             seq: 0,
             event_rng: SmallRng::seed_from_u64(event_seed),
+            timer_interleave_rng: SmallRng::seed_from_u64(timer_seed),
             fixed_priority,
         }
     }
@@ -518,6 +524,48 @@ impl EventQueue {
     /// Peek at the next event's timestamp without removing it.
     pub(crate) fn peek_time(&self) -> Option<TimeNs> {
         self.heap.peek().map(|Reverse(e)| e.time_ns)
+    }
+
+    /// Stochastically pull a non-slot-0 BPF timer forward for Phase 3 race modeling.
+    ///
+    /// The event keeps its original timestamp and tiebreaker; callers decide
+    /// how to run it. Slot 0 is the legacy LAVD update timer, while the
+    /// compiled-in cgroup_bw timers occupy later slots.
+    pub(crate) fn pop_stochastic_timer_interleave(
+        &mut self,
+        horizon_ns: TimeNs,
+        one_in: u32,
+    ) -> Option<Event> {
+        let one_in = one_in.max(1);
+        if one_in > 1 && self.timer_interleave_rng.next_u32() % one_in != 0 {
+            return None;
+        }
+
+        let mut events = Vec::with_capacity(self.heap.len());
+        while let Some(event) = self.pop() {
+            events.push(event);
+        }
+        let candidates: Vec<usize> = events
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, event)| match event.kind {
+                EventKind::TimerFired { slot, .. } if slot != 0 && event.time_ns <= horizon_ns => {
+                    Some(idx)
+                }
+                _ => None,
+            })
+            .collect();
+
+        if candidates.is_empty() {
+            self.heap.extend(events.into_iter().map(Reverse));
+            return None;
+        }
+
+        let pick = (self.timer_interleave_rng.next_u32() as usize) % candidates.len();
+        let selected_idx = candidates[pick];
+        let selected = events.remove(selected_idx);
+        self.heap.extend(events.into_iter().map(Reverse));
+        Some(selected)
     }
 }
 
@@ -661,7 +709,7 @@ pub(crate) enum EventKind {
 ///
 /// Staged events are sorted by `(time, cpu)` before flushing to ensure
 /// deterministic insertion order regardless of the order kfuncs staged them.
-fn flush_staged_events(state: &mut SimulatorState, events: &mut EventQueue) {
+pub(crate) fn flush_staged_events(state: &mut SimulatorState, events: &mut EventQueue) {
     if state.staged_events.is_empty() {
         return;
     }
@@ -1406,6 +1454,9 @@ impl<S: Scheduler> Simulator<S> {
             longest_rbc_interval: 0,
             bpf_error: None,
             interleave: scenario.interleave,
+            stochastic_timer_interleave: scenario.stochastic_timer_interleave,
+            stochastic_timer_interleave_window_ns: scenario.stochastic_timer_interleave_window_ns,
+            stochastic_timer_interleave_one_in: scenario.stochastic_timer_interleave_one_in,
             preemptive: scenario.preemptive.clone(),
             replay_trace: scenario.replay_trace.clone(),
             replay_backend: None,    // Initialized below after state is built.

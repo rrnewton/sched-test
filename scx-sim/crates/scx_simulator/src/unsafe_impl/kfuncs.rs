@@ -39,7 +39,7 @@ use tracing::debug;
 use crate::cgroup::{CgroupId, CgroupRegistry};
 use crate::cpu::{LastStopReason, SimCpu};
 use crate::dsq::DsqManager;
-use crate::engine::EventQueue;
+use crate::engine::{flush_staged_events, EventKind, EventQueue};
 use crate::ffi;
 use crate::fmt::FmtN;
 use crate::perf::RbcCounter;
@@ -429,6 +429,12 @@ pub struct SimulatorState {
     ///
     /// Enable concurrent callback interleaving at kfunc yield points.
     pub interleave: bool,
+    /// SHARED-READ: Enable stochastic BPF timer interleaving at cgroup_bw yield sites.
+    pub stochastic_timer_interleave: bool,
+    /// SHARED-READ: Timer fire-ahead window for stochastic timer interleaving.
+    pub stochastic_timer_interleave_window_ns: TimeNs,
+    /// SHARED-READ: Approximate rate for pulling eligible timers forward.
+    pub stochastic_timer_interleave_one_in: u32,
     /// SHARED-READ: Configuration set at init, never mutated during simulation.
     ///
     /// Preemptive interleaving configuration (None = disabled).
@@ -1052,6 +1058,8 @@ thread_local! {
     /// Per-callback identity context saved/restored across yield points.
     /// Async-signal-safe: Cell<Copy> read/write.
     static CALLBACK_CTX: std::cell::Cell<Option<CallbackContext>> = const { std::cell::Cell::new(None) };
+    /// Original callback context while a Phase-3 interleaved timer is running.
+    static INTERLEAVED_TIMER_SAVED_CTX: std::cell::Cell<Option<CallbackContext>> = const { std::cell::Cell::new(None) };
     /// Engine-level SimArc stored so that `enter_sim` can install `SIM_ARC`
     /// for cgroup callbacks and concurrent worker threads.
     static ENGINE_SIM_ARC: RefCell<Option<SimArc>> = const { RefCell::new(None) };
@@ -1572,6 +1580,160 @@ pub extern "C" fn sim_rbc_resume() {
 // ---------------------------------------------------------------------------
 // SCX kfunc implementations
 // ---------------------------------------------------------------------------
+
+macro_rules! define_cgroup_bw_yield {
+    ($fn_name:ident, $site_name:literal) => {
+        #[no_mangle]
+        pub extern "C" fn $fn_name() {
+            crate::preempt::set_current_kfunc($site_name);
+            crate::interleave::maybe_yield();
+        }
+    };
+}
+
+define_cgroup_bw_yield!(scxsim_cgroup_bw_yield_lib_init, "cgroup_bw_lib_init");
+define_cgroup_bw_yield!(scxsim_cgroup_bw_yield_init, "cgroup_bw_init");
+define_cgroup_bw_yield!(scxsim_cgroup_bw_yield_exit, "cgroup_bw_exit");
+define_cgroup_bw_yield!(scxsim_cgroup_bw_yield_set, "cgroup_bw_set");
+define_cgroup_bw_yield!(scxsim_cgroup_bw_yield_throttled, "cgroup_bw_throttled");
+define_cgroup_bw_yield!(scxsim_cgroup_bw_yield_consume, "cgroup_bw_consume");
+define_cgroup_bw_yield!(scxsim_cgroup_bw_yield_put_aside, "cgroup_bw_put_aside");
+define_cgroup_bw_yield!(scxsim_cgroup_bw_yield_reenqueue, "cgroup_bw_reenqueue");
+define_cgroup_bw_yield!(scxsim_cgroup_bw_yield_cancel, "cgroup_bw_cancel");
+define_cgroup_bw_yield!(
+    scxsim_cgroup_bw_yield_is_cgroup_throttled,
+    "cgroup_bw_is_cgroup_throttled"
+);
+define_cgroup_bw_yield!(
+    scxsim_cgroup_bw_yield_is_task_throttled,
+    "cgroup_bw_is_task_throttled"
+);
+define_cgroup_bw_yield!(scxsim_cgroup_bw_yield_move, "cgroup_bw_move");
+define_cgroup_bw_yield!(scxsim_cgroup_bw_yield_dump, "cgroup_bw_dump");
+
+#[no_mangle]
+pub extern "C" fn scxsim_cgroup_bw_begin_interleaved_timer(slot_out: *mut u32) -> i32 {
+    if slot_out.is_null() {
+        return 0;
+    }
+    if INTERLEAVED_TIMER_SAVED_CTX.with(|c| c.get().is_some()) {
+        return 0;
+    }
+    let Some(arc) = SIM_ARC.with(|c| c.borrow().clone()) else {
+        return 0;
+    };
+    let Some(saved_ctx) = get_callback_ctx() else {
+        return 0;
+    };
+
+    disable_rbc_counter();
+    crate::preempt::inhibit_preemption();
+    crate::preempt::pause_timer();
+    let selected = {
+        let mut guard = arc.lock().unwrap();
+        let fields = guard.fields();
+        if !fields.sim.stochastic_timer_interleave {
+            None
+        } else {
+            let cpu = saved_ctx.current_cpu;
+            let now = fields.sim.cpus[cpu.0 as usize]
+                .local_clock
+                .max(fields.sim.clock);
+            let horizon = now.saturating_add(fields.sim.stochastic_timer_interleave_window_ns);
+            fields.events.pop_stochastic_timer_interleave(
+                horizon,
+                fields.sim.stochastic_timer_interleave_one_in,
+            )
+        }
+    };
+
+    let Some(event) = selected else {
+        crate::preempt::allow_preemption();
+        crate::preempt::resume_timer();
+        enable_rbc_counter();
+        return 0;
+    };
+    let EventKind::TimerFired { cpu, slot } = event.kind else {
+        crate::preempt::allow_preemption();
+        crate::preempt::resume_timer();
+        enable_rbc_counter();
+        return 0;
+    };
+
+    {
+        let mut guard = arc.lock().unwrap();
+        let sim = &mut guard.sim;
+        sim.current_cpu = cpu;
+        sim.ops_context = OpsContext::FireTimer;
+        sim.cpus[cpu.0 as usize].local_clock =
+            sim.cpus[cpu.0 as usize].local_clock.max(event.time_ns);
+        set_sim_clock(sim.cpus[cpu.0 as usize].local_clock, Some(cpu));
+    }
+
+    INTERLEAVED_TIMER_SAVED_CTX.with(|c| c.set(Some(saved_ctx)));
+    install_callback_ctx(CallbackContext {
+        current_cpu: cpu,
+        ops_context: OpsContext::FireTimer,
+        waker_task_raw: None,
+    });
+    unsafe {
+        *slot_out = slot as u32;
+    }
+    crate::preempt::allow_preemption();
+    crate::preempt::resume_timer();
+    enable_rbc_counter();
+    1
+}
+
+#[no_mangle]
+pub extern "C" fn scxsim_cgroup_bw_end_interleaved_timer() {
+    let saved_ctx = INTERLEAVED_TIMER_SAVED_CTX.with(|c| {
+        let saved = c.get();
+        c.set(None);
+        saved
+    });
+    let Some(saved_ctx) = saved_ctx else {
+        return;
+    };
+    let Some(arc) = SIM_ARC.with(|c| c.borrow().clone()) else {
+        install_callback_ctx(saved_ctx);
+        return;
+    };
+
+    disable_rbc_counter();
+    crate::preempt::inhibit_preemption();
+    crate::preempt::pause_timer();
+    {
+        let mut guard = arc.lock().unwrap();
+        let fields = guard.fields();
+        let mut drained: [Option<(TimeNs, CpuId)>; MAX_BPF_TIMERS] = [None; MAX_BPF_TIMERS];
+        for (slot, entry) in fields.sim.pending_timers.iter_mut().enumerate() {
+            drained[slot] = entry.take();
+        }
+        for (slot, entry) in drained.iter().enumerate() {
+            if let Some((fire_at, cpu)) = *entry {
+                fields.events.push(
+                    fire_at,
+                    EventKind::TimerFired {
+                        cpu,
+                        slot: slot as u8,
+                    },
+                );
+            }
+        }
+        flush_staged_events(fields.sim, fields.events);
+        fields.sim.current_cpu = saved_ctx.current_cpu;
+        fields.sim.ops_context = saved_ctx.ops_context;
+        fields.sim.waker_task_raw = saved_ctx.waker_task_raw;
+        let local = fields.sim.cpus[saved_ctx.current_cpu.0 as usize].local_clock;
+        set_sim_clock(local, Some(saved_ctx.current_cpu));
+    }
+
+    install_callback_ctx(saved_ctx);
+    crate::preempt::allow_preemption();
+    crate::preempt::resume_timer();
+    enable_rbc_counter();
+}
 
 /// Create a dispatch queue.
 #[no_mangle]
@@ -2866,6 +3028,9 @@ mod tests {
             e9_fns: None,
             structop_accum: vec![crate::preempt::StructopInfo::default(); nr_cpus as usize],
             native_concurrent: None,
+            stochastic_timer_interleave: false,
+            stochastic_timer_interleave_window_ns: 0,
+            stochastic_timer_interleave_one_in: 0,
         }
     }
 
