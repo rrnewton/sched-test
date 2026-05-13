@@ -3027,6 +3027,13 @@ pub extern "C" fn sim_timer_start_slot(slot: u32, nsecs: u64) {
 // atq directly (Phase 3 concurrent-execution mode might).
 // ---------------------------------------------------------------------------
 
+// dead_code: these declarations exist purely so the compiled-in
+// scheduler `.so` files (and the `--undefined=scx_atq_create_internal`
+// linker keep-alive on the main binary) resolve the symbols at
+// dlopen time. Rust callers do not invoke them directly today; the
+// references are intentional and must NOT be removed (see comment block
+// above this `extern` declaration).
+#[allow(dead_code)]
 extern "C" {
     fn scx_atq_init() -> i32;
     fn scx_atq_create_internal(fifo: i32, capacity: u64) -> u64;

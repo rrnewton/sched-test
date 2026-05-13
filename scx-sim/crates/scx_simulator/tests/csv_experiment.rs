@@ -28,6 +28,7 @@ const PARENT_PID: Pid = Pid(100);
 // At 16 CPUs: 10 workers, 1 reader, 1 writer, 2 hogs (= 14 threads, 0.88/CPU)
 // At 48 CPUs: 32 workers, 4 readers, 4 writers, 3 hogs (= 43 threads, 0.90/CPU)
 
+#[allow(dead_code)] // documentation constant; mirror of WORKER_SLEEP_NS for the workload spec
 const WORKER_RUN_NS: u64 = 250_000;
 const WORKER_SLEEP_NS: u64 = 110_000;
 const READER_RUN_NS: u64 = 35_000;
@@ -379,6 +380,7 @@ fn compute_irq_exposure(
     (irq_ns, total_ns)
 }
 
+#[allow(clippy::too_many_arguments)] // wide CSV row; refactoring into a struct would obscure the column order
 fn emit_csv_row(
     timestamp: &str,
     scheduler: &str,
@@ -412,6 +414,7 @@ fn emit_csv_row(
 
 // ---- Percentile metrics ----
 
+#[allow(clippy::too_many_arguments)] // wide CSV row; refactoring into a struct would obscure the column order
 fn emit_latency_percentiles(
     timestamp: &str,
     scheduler: &str,
