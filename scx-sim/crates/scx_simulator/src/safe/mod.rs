@@ -21,6 +21,7 @@ pub(crate) mod perfetto;
 pub mod rtapp;
 pub mod scenario;
 pub mod stats;
+pub mod structops_jsonl;
 pub mod task;
 pub mod trace;
 pub mod types;

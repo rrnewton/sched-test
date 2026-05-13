@@ -1,0 +1,573 @@
+#!/usr/bin/env bpftrace
+/*
+ * helpers_full.bt — comprehensive scx_bpf_* helper tracer (JSONL output).
+ *
+ * GENERATED FILE. Do not edit by hand. Edit gen_structops_helpers.py instead
+ * and regenerate.
+ *
+ * Attaches fentry+fexit on every `scx_bpf_*` helper exposed by the kernel
+ * (40 helpers, cross-checked against scx/scheds/include/scx/common.bpf.h).
+ *
+ * Output: one JSONL record per call, schema:
+ *   {"ts_ns":<u64>,"cpu":<i32>,"pid":<i32>,
+ *    "kind":"helper","name":"<helper>","phase":"<entry|exit>",
+ *    "args":{...},"ret":<val|null>}
+ *
+ * Designed to be byte-compatible with scxsim's matching `--trace-format
+ * structops-jsonl` emitter.
+ *
+ * Usage:
+ *   sudo bpftrace helpers_full.bt           # all PIDs
+ *   sudo bpftrace helpers_full.bt 12345     # filter to PID 12345
+ *
+ * Tested: kernel 6.16.1-fbk2 on devbig176; bpftrace v0.25.0-be6e (May 2026).
+ * Tg:     bpftrace-structops-helpers-trace-for-scxsim-vs-live-comparison
+ */
+
+BEGIN
+{
+    if ($1 != 0) {
+        printf("# helpers_full.bt: PID filter = %d\n", $1);
+    } else {
+        printf("# helpers_full.bt: no PID filter (all tasks)\n");
+    }
+}
+
+fentry:vmlinux:scx_bpf_dsq_insert
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"task_pid\":%d,\"dsq_id\":%llu,\"slice\":%llu,\"enq_flags\":%llu},\"ret\":null}\n", $ts, $c, pid, "helper", "dsq_insert", "entry", args.p->pid, args.dsq_id, args.slice, args.enq_flags);
+}
+
+fentry:vmlinux:scx_bpf_dsq_insert_vtime
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"task_pid\":%d,\"dsq_id\":%llu,\"slice\":%llu,\"vtime\":%llu,\"enq_flags\":%llu},\"ret\":null}\n", $ts, $c, pid, "helper", "dsq_insert_vtime", "entry", args.p->pid, args.dsq_id, args.slice, args.vtime, args.enq_flags);
+}
+
+fentry:vmlinux:scx_bpf_dsq_move
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"task_pid\":%d,\"dsq_id\":%llu,\"enq_flags\":%llu},\"ret\":null}\n", $ts, $c, pid, "helper", "dsq_move", "entry", args.p->pid, args.dsq_id, args.enq_flags);
+}
+
+fexit:vmlinux:scx_bpf_dsq_move
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{},\"ret\":%d}\n", $ts, $c, pid, "helper", "dsq_move", "exit", retval);
+}
+
+fentry:vmlinux:scx_bpf_dsq_move_vtime
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"task_pid\":%d,\"dsq_id\":%llu,\"enq_flags\":%llu},\"ret\":null}\n", $ts, $c, pid, "helper", "dsq_move_vtime", "entry", args.p->pid, args.dsq_id, args.enq_flags);
+}
+
+fexit:vmlinux:scx_bpf_dsq_move_vtime
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{},\"ret\":%d}\n", $ts, $c, pid, "helper", "dsq_move_vtime", "exit", retval);
+}
+
+fentry:vmlinux:scx_bpf_dsq_move_to_local
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"dsq_id\":%llu},\"ret\":null}\n", $ts, $c, pid, "helper", "dsq_move_to_local", "entry", args.dsq_id);
+}
+
+fexit:vmlinux:scx_bpf_dsq_move_to_local
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{},\"ret\":%d}\n", $ts, $c, pid, "helper", "dsq_move_to_local", "exit", retval);
+}
+
+fentry:vmlinux:scx_bpf_dsq_move_set_slice
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"slice\":%llu},\"ret\":null}\n", $ts, $c, pid, "helper", "dsq_move_set_slice", "entry", args.slice);
+}
+
+fentry:vmlinux:scx_bpf_dsq_move_set_vtime
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"vtime\":%llu},\"ret\":null}\n", $ts, $c, pid, "helper", "dsq_move_set_vtime", "entry", args.vtime);
+}
+
+fentry:vmlinux:scx_bpf_consume
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"dsq_id\":%llu},\"ret\":null}\n", $ts, $c, pid, "helper", "consume", "entry", args.dsq_id);
+}
+
+fexit:vmlinux:scx_bpf_consume
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{},\"ret\":%d}\n", $ts, $c, pid, "helper", "consume", "exit", retval);
+}
+
+fentry:vmlinux:scx_bpf_dispatch
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"task_pid\":%d,\"dsq_id\":%llu,\"slice\":%llu,\"enq_flags\":%llu},\"ret\":null}\n", $ts, $c, pid, "helper", "dispatch", "entry", args.p->pid, args.dsq_id, args.slice, args.enq_flags);
+}
+
+fentry:vmlinux:scx_bpf_dispatch_vtime
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"task_pid\":%d,\"dsq_id\":%llu,\"slice\":%llu,\"vtime\":%llu,\"enq_flags\":%llu},\"ret\":null}\n", $ts, $c, pid, "helper", "dispatch_vtime", "entry", args.p->pid, args.dsq_id, args.slice, args.vtime, args.enq_flags);
+}
+
+fentry:vmlinux:scx_bpf_dispatch_from_dsq
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"task_pid\":%d,\"dsq_id\":%llu,\"enq_flags\":%llu},\"ret\":null}\n", $ts, $c, pid, "helper", "dispatch_from_dsq", "entry", args.p->pid, args.dsq_id, args.enq_flags);
+}
+
+fexit:vmlinux:scx_bpf_dispatch_from_dsq
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{},\"ret\":%d}\n", $ts, $c, pid, "helper", "dispatch_from_dsq", "exit", retval);
+}
+
+fentry:vmlinux:scx_bpf_dispatch_from_dsq_set_slice
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"slice\":%llu},\"ret\":null}\n", $ts, $c, pid, "helper", "dispatch_from_dsq_set_slice", "entry", args.slice);
+}
+
+fentry:vmlinux:scx_bpf_dispatch_from_dsq_set_vtime
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"vtime\":%llu},\"ret\":null}\n", $ts, $c, pid, "helper", "dispatch_from_dsq_set_vtime", "entry", args.vtime);
+}
+
+fentry:vmlinux:scx_bpf_dispatch_vtime_from_dsq
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"task_pid\":%d,\"dsq_id\":%llu,\"enq_flags\":%llu},\"ret\":null}\n", $ts, $c, pid, "helper", "dispatch_vtime_from_dsq", "entry", args.p->pid, args.dsq_id, args.enq_flags);
+}
+
+fexit:vmlinux:scx_bpf_dispatch_vtime_from_dsq
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{},\"ret\":%d}\n", $ts, $c, pid, "helper", "dispatch_vtime_from_dsq", "exit", retval);
+}
+
+fentry:vmlinux:scx_bpf_dispatch_cancel
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{},\"ret\":null}\n", $ts, $c, pid, "helper", "dispatch_cancel", "entry");
+}
+
+fentry:vmlinux:scx_bpf_dispatch_nr_slots
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{},\"ret\":null}\n", $ts, $c, pid, "helper", "dispatch_nr_slots", "entry");
+}
+
+fexit:vmlinux:scx_bpf_dispatch_nr_slots
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{},\"ret\":%u}\n", $ts, $c, pid, "helper", "dispatch_nr_slots", "exit", retval);
+}
+
+fentry:vmlinux:scx_bpf_dsq_nr_queued
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"dsq_id\":%llu},\"ret\":null}\n", $ts, $c, pid, "helper", "dsq_nr_queued", "entry", args.dsq_id);
+}
+
+fexit:vmlinux:scx_bpf_dsq_nr_queued
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{},\"ret\":%d}\n", $ts, $c, pid, "helper", "dsq_nr_queued", "exit", retval);
+}
+
+fentry:vmlinux:scx_bpf_dsq_peek
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"dsq_id\":%llu},\"ret\":null}\n", $ts, $c, pid, "helper", "dsq_peek", "entry", args.dsq_id);
+}
+
+fentry:vmlinux:scx_bpf_create_dsq
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"dsq_id\":%llu,\"node\":%d},\"ret\":null}\n", $ts, $c, pid, "helper", "create_dsq", "entry", args.dsq_id, args.node);
+}
+
+fexit:vmlinux:scx_bpf_create_dsq
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{},\"ret\":%d}\n", $ts, $c, pid, "helper", "create_dsq", "exit", retval);
+}
+
+fentry:vmlinux:scx_bpf_destroy_dsq
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"dsq_id\":%llu},\"ret\":null}\n", $ts, $c, pid, "helper", "destroy_dsq", "entry", args.dsq_id);
+}
+
+fentry:vmlinux:scx_bpf_select_cpu_dfl
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"task_pid\":%d,\"prev_cpu\":%d,\"wake_flags\":%llu},\"ret\":null}\n", $ts, $c, pid, "helper", "select_cpu_dfl", "entry", args.p->pid, args.prev_cpu, args.wake_flags);
+}
+
+fexit:vmlinux:scx_bpf_select_cpu_dfl
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{},\"ret\":%d}\n", $ts, $c, pid, "helper", "select_cpu_dfl", "exit", retval);
+}
+
+fentry:vmlinux:scx_bpf_select_cpu_and
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"task_pid\":%d,\"prev_cpu\":%d,\"wake_flags\":%llu},\"ret\":null}\n", $ts, $c, pid, "helper", "select_cpu_and", "entry", args.p->pid, args.prev_cpu, args.wake_flags);
+}
+
+fexit:vmlinux:scx_bpf_select_cpu_and
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{},\"ret\":%d}\n", $ts, $c, pid, "helper", "select_cpu_and", "exit", retval);
+}
+
+fentry:vmlinux:scx_bpf_pick_idle_cpu
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"flags\":%llu},\"ret\":null}\n", $ts, $c, pid, "helper", "pick_idle_cpu", "entry", args.flags);
+}
+
+fexit:vmlinux:scx_bpf_pick_idle_cpu
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{},\"ret\":%d}\n", $ts, $c, pid, "helper", "pick_idle_cpu", "exit", retval);
+}
+
+fentry:vmlinux:scx_bpf_pick_idle_cpu_node
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"node\":%d,\"flags\":%llu},\"ret\":null}\n", $ts, $c, pid, "helper", "pick_idle_cpu_node", "entry", args.node, args.flags);
+}
+
+fexit:vmlinux:scx_bpf_pick_idle_cpu_node
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{},\"ret\":%d}\n", $ts, $c, pid, "helper", "pick_idle_cpu_node", "exit", retval);
+}
+
+fentry:vmlinux:scx_bpf_pick_any_cpu
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"flags\":%llu},\"ret\":null}\n", $ts, $c, pid, "helper", "pick_any_cpu", "entry", args.flags);
+}
+
+fexit:vmlinux:scx_bpf_pick_any_cpu
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{},\"ret\":%d}\n", $ts, $c, pid, "helper", "pick_any_cpu", "exit", retval);
+}
+
+fentry:vmlinux:scx_bpf_pick_any_cpu_node
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"node\":%d,\"flags\":%llu},\"ret\":null}\n", $ts, $c, pid, "helper", "pick_any_cpu_node", "entry", args.node, args.flags);
+}
+
+fexit:vmlinux:scx_bpf_pick_any_cpu_node
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{},\"ret\":%d}\n", $ts, $c, pid, "helper", "pick_any_cpu_node", "exit", retval);
+}
+
+fentry:vmlinux:scx_bpf_test_and_clear_cpu_idle
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"cpu_arg\":%d},\"ret\":null}\n", $ts, $c, pid, "helper", "test_and_clear_cpu_idle", "entry", args.cpu);
+}
+
+fexit:vmlinux:scx_bpf_test_and_clear_cpu_idle
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{},\"ret\":%d}\n", $ts, $c, pid, "helper", "test_and_clear_cpu_idle", "exit", retval);
+}
+
+fentry:vmlinux:scx_bpf_kick_cpu
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"cpu_arg\":%d,\"flags\":%llu},\"ret\":null}\n", $ts, $c, pid, "helper", "kick_cpu", "entry", args.cpu, args.flags);
+}
+
+fentry:vmlinux:scx_bpf_get_idle_cpumask
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{},\"ret\":null}\n", $ts, $c, pid, "helper", "get_idle_cpumask", "entry");
+}
+
+fentry:vmlinux:scx_bpf_get_idle_cpumask_node
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"node\":%d},\"ret\":null}\n", $ts, $c, pid, "helper", "get_idle_cpumask_node", "entry", args.node);
+}
+
+fentry:vmlinux:scx_bpf_get_idle_smtmask
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{},\"ret\":null}\n", $ts, $c, pid, "helper", "get_idle_smtmask", "entry");
+}
+
+fentry:vmlinux:scx_bpf_get_idle_smtmask_node
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"node\":%d},\"ret\":null}\n", $ts, $c, pid, "helper", "get_idle_smtmask_node", "entry", args.node);
+}
+
+fentry:vmlinux:scx_bpf_get_online_cpumask
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{},\"ret\":null}\n", $ts, $c, pid, "helper", "get_online_cpumask", "entry");
+}
+
+fentry:vmlinux:scx_bpf_get_possible_cpumask
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{},\"ret\":null}\n", $ts, $c, pid, "helper", "get_possible_cpumask", "entry");
+}
+
+fentry:vmlinux:scx_bpf_put_cpumask
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{},\"ret\":null}\n", $ts, $c, pid, "helper", "put_cpumask", "entry");
+}
+
+fentry:vmlinux:scx_bpf_put_idle_cpumask
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{},\"ret\":null}\n", $ts, $c, pid, "helper", "put_idle_cpumask", "entry");
+}
+
+fentry:vmlinux:scx_bpf_cpu_node
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"cpu_arg\":%d},\"ret\":null}\n", $ts, $c, pid, "helper", "cpu_node", "entry", args.cpu);
+}
+
+fexit:vmlinux:scx_bpf_cpu_node
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{},\"ret\":%d}\n", $ts, $c, pid, "helper", "cpu_node", "exit", retval);
+}
+
+fentry:vmlinux:scx_bpf_cpu_rq
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"cpu_arg\":%d},\"ret\":null}\n", $ts, $c, pid, "helper", "cpu_rq", "entry", args.cpu);
+}
+
+fentry:vmlinux:scx_bpf_cpuperf_cap
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"cpu_arg\":%d},\"ret\":null}\n", $ts, $c, pid, "helper", "cpuperf_cap", "entry", args.cpu);
+}
+
+fexit:vmlinux:scx_bpf_cpuperf_cap
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{},\"ret\":%u}\n", $ts, $c, pid, "helper", "cpuperf_cap", "exit", retval);
+}
+
+fentry:vmlinux:scx_bpf_cpuperf_cur
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"cpu_arg\":%d},\"ret\":null}\n", $ts, $c, pid, "helper", "cpuperf_cur", "entry", args.cpu);
+}
+
+fexit:vmlinux:scx_bpf_cpuperf_cur
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{},\"ret\":%u}\n", $ts, $c, pid, "helper", "cpuperf_cur", "exit", retval);
+}
+
+fentry:vmlinux:scx_bpf_cpuperf_set
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"cpu_arg\":%d,\"perf\":%u},\"ret\":null}\n", $ts, $c, pid, "helper", "cpuperf_set", "entry", args.cpu, args.perf);
+}
+
+fentry:vmlinux:scx_bpf_now
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{},\"ret\":null}\n", $ts, $c, pid, "helper", "now", "entry");
+}
+
+fexit:vmlinux:scx_bpf_now
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{},\"ret\":%llu}\n", $ts, $c, pid, "helper", "now", "exit", retval);
+}
+
+fentry:vmlinux:scx_bpf_nr_cpu_ids
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{},\"ret\":null}\n", $ts, $c, pid, "helper", "nr_cpu_ids", "entry");
+}
+
+fexit:vmlinux:scx_bpf_nr_cpu_ids
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{},\"ret\":%u}\n", $ts, $c, pid, "helper", "nr_cpu_ids", "exit", retval);
+}
+
+fentry:vmlinux:scx_bpf_nr_node_ids
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{},\"ret\":null}\n", $ts, $c, pid, "helper", "nr_node_ids", "entry");
+}
+
+fexit:vmlinux:scx_bpf_nr_node_ids
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{},\"ret\":%u}\n", $ts, $c, pid, "helper", "nr_node_ids", "exit", retval);
+}
+
+fentry:vmlinux:scx_bpf_task_cpu
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"task_pid\":%d},\"ret\":null}\n", $ts, $c, pid, "helper", "task_cpu", "entry", args.p->pid);
+}
+
+fexit:vmlinux:scx_bpf_task_cpu
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{},\"ret\":%d}\n", $ts, $c, pid, "helper", "task_cpu", "exit", retval);
+}
+
+fentry:vmlinux:scx_bpf_task_running
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"task_pid\":%d},\"ret\":null}\n", $ts, $c, pid, "helper", "task_running", "entry", args.p->pid);
+}
+
+fexit:vmlinux:scx_bpf_task_running
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{},\"ret\":%d}\n", $ts, $c, pid, "helper", "task_running", "exit", retval);
+}
+
+fentry:vmlinux:scx_bpf_task_cgroup
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"task_pid\":%d},\"ret\":null}\n", $ts, $c, pid, "helper", "task_cgroup", "entry", args.p->pid);
+}
+
+fentry:vmlinux:scx_bpf_events
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{},\"ret\":null}\n", $ts, $c, pid, "helper", "events", "entry");
+}
+
+fentry:vmlinux:scx_bpf_reenqueue_local
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{},\"ret\":null}\n", $ts, $c, pid, "helper", "reenqueue_local", "entry");
+}
+
+fexit:vmlinux:scx_bpf_reenqueue_local
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{},\"ret\":%u}\n", $ts, $c, pid, "helper", "reenqueue_local", "exit", retval);
+}
+
+fentry:vmlinux:scx_bpf_dump_bstr
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{},\"ret\":null}\n", $ts, $c, pid, "helper", "dump_bstr", "entry");
+}
+
+fentry:vmlinux:scx_bpf_error_bstr
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{},\"ret\":null}\n", $ts, $c, pid, "helper", "error_bstr", "entry");
+}
+
+fentry:vmlinux:scx_bpf_exit_bstr
+/$1 == 0 || pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{},\"ret\":null}\n", $ts, $c, pid, "helper", "exit_bstr", "entry");
+}

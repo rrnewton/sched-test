@@ -272,6 +272,12 @@ struct RunArgs {
     #[arg(long, value_name = "PATH")]
     perfetto: Option<PathBuf>,
 
+    /// Write a structops/helpers JSONL trace, schema-compatible with
+    /// `scripts/probes/structops_full.bt` + `scripts/probes/helpers_full.bt`,
+    /// for side-by-side diff via `scripts/compare_live_vs_scxsim_calls.sh`.
+    #[arg(long, value_name = "PATH")]
+    structops_jsonl: Option<PathBuf>,
+
     /// Print trace events to stderr.
     #[arg(long)]
     dump_trace: bool,
@@ -1258,6 +1264,14 @@ fn run_simulation(args: &RunArgs, scenario: Scenario) -> Result<(), RunError> {
             .write_perfetto_json(&mut file)
             .map_err(|e| format!("failed to write perfetto trace: {e}"))?;
         eprintln!("wrote perfetto trace to {}", path.display());
+    }
+
+    if let Some(path) = &args.structops_jsonl {
+        let mut file = std::fs::File::create(path)
+            .map_err(|e| format!("failed to create {}: {e}", path.display()))?;
+        scx_simulator::structops_jsonl::write_jsonl(&trace, &mut file)
+            .map_err(|e| format!("failed to write structops jsonl: {e}"))?;
+        eprintln!("wrote structops jsonl trace to {}", path.display());
     }
 
     // Record preemption trace if requested.

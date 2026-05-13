@@ -51,6 +51,7 @@ pub(crate) use safe::perfetto;
 pub use safe::rtapp;
 pub use safe::scenario;
 pub use safe::stats;
+pub use safe::structops_jsonl;
 pub use safe::task;
 pub use safe::trace;
 pub use safe::types;
