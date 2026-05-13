@@ -131,11 +131,19 @@ Worked example — the Bug-1 canonical reproducer:
 ```bash
 scxsim run crates/scx_simulator/tests/fixtures/h6/bug1_canonical.json \
            --config crates/scx_simulator/tests/fixtures/h6/bug1_canonical.toml \
-           --watchdog 80ms -s lavd --cpus 4 --duration 500ms
+           --watchdog 200ms -s lavd --cpus 4 --duration 600ms
 ```
 
 deterministically exits 42 with
-`scxsim: ExitKind::ErrorStall pid=1 runnable_for_ns=80000793`.
+`scxsim: ExitKind::ErrorStall pid=<N> runnable_for_ns=200006162` on the
+integrated `simulator.v6` tip.
+
+The watchdog was extended from the original 80ms to 200ms on 2026-05-12
+so the scheduler-side `cgroup_bw` refill code path at t=100ms actually
+executes before the watchdog fires — see the
+`bug1_canonical_repro.rs` module docs for the v3 build-matrix evidence
+that 80ms turned the test into a wiring smoke test (all scx SHAs
+produced byte-identical fingerprints).
 
 ```
 scxsim replay <TRACE_FILE>

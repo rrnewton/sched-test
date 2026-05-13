@@ -29,14 +29,43 @@
 //! - 100% reproduction across N reps.
 //! - Each subprocess rep completes well under 5s wall.
 //!
-//! # Why a tight watchdog
+//! # Why a 200ms watchdog (and NOT 80ms)
 //!
 //! Production uses the kernel sched_ext default (30s). In simulation we
-//! explicitly target a watchdog short enough to fire within a single
-//! simulated throttle window (10ms of run + 90ms of wait per 100ms period).
-//! 80ms is comfortably less than the 90ms throttle wait, so a task waiting
-//! through the throttle window WILL trip an 80ms watchdog while leaving
-//! headroom for short admission re-checks.
+//! explicitly target a watchdog short enough to fire reliably within the
+//! simulated throttle window (10ms of run + 90ms of wait per 100ms
+//! period), but LONGER than one full refill period so the
+//! scheduler-side `cgroup_bw` refill code path actually executes at
+//! least once before the watchdog fires.
+//!
+//! The original `--watchdog 80ms` choice (history: 2026-04 canonical
+//! recipe) tripped reliably but landed BEFORE the first scheduled
+//! refill at t=100ms — `handle_cgroup_bw_refill` never fired during
+//! the run, so the test was a wiring smoke test that did NOT exercise
+//! the put-aside / reenqueue semantics it claimed to test. The v3
+//! cpu-bw-stall-bug × scx-version build matrix
+//! (`experiments/bug1_scx_version_matrix_20260512/`) confirmed this:
+//! at `--watchdog 80ms`, all 3 cached scx SHAs (Apr-8 clean baseline
+//! through Apr-23 bug-present) produced byte-identical
+//! `runnable_for_ns=80002523`. The fixture wasn't probing the
+//! bug-relevant code path at all.
+//!
+//! 200ms is the largest watchdog that still trips deterministically on
+//! the integrated `simulator.v6` tip (bifurcation point measured
+//! between 200ms and 220ms; at 220ms+, the second refill at t=200ms
+//! unblocks before the watchdog fires). It exercises the refill code
+//! path at least once (the t=100ms refill runs before the watchdog at
+//! t=200ms) while still asserting the same observable Bug-1 shape — a
+//! runnable task that fails to run for the watchdog interval.
+//!
+//! Note: even at 200ms, scxsim does not yet discriminate per-SHA — the
+//! engine-side throttle short-circuits the scheduler-side `cgroup_bw`
+//! throttle path, so bug-introducing scheduler commits have no
+//! observable effect in scxsim today (see tg
+//! `fix-engine-cgroup-bw-refill-discards-woken-vec` and the v3 matrix
+//! follow-ups). The watchdog fix here is a necessary prerequisite for
+//! any future per-SHA discrimination work but is not itself
+//! sufficient.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -51,15 +80,19 @@ mod common;
 //
 //   scxsim run tests/fixtures/h6/bug1_canonical.json \
 //              --config tests/fixtures/h6/bug1_canonical.toml \
-//              --watchdog 80ms -s lavd --cpus 4 --duration 500ms
+//              --watchdog 200ms -s lavd --cpus 4 --duration 600ms
+//
+// Watchdog was extended from 80ms to 200ms (2026-05-12) so the refill code
+// path at t=100ms actually runs before the watchdog fires — see the module
+// docs above for the full rationale and v3 matrix evidence.
 // ---------------------------------------------------------------------------
 
 const FIXTURE_JSON: &str = "tests/fixtures/h6/bug1_canonical.json";
 const FIXTURE_TOML: &str = "tests/fixtures/h6/bug1_canonical.toml";
-const WATCHDOG: &str = "80ms";
+const WATCHDOG: &str = "200ms";
 const SCHEDULER: &str = "lavd";
 const CPUS: &str = "4";
-const DURATION: &str = "500ms";
+const DURATION: &str = "600ms";
 
 /// Stable stderr marker prefix produced by the binary's exit-code mapping.
 /// The test asserts this prefix is present and the recorded
@@ -159,9 +192,9 @@ fn test_bug1_canonical_subprocess_reproduces_stall() {
         )
     });
     assert!(
-        runnable >= 80_000_000,
+        runnable >= 200_000_000,
         "watchdog fired with runnable_for_ns={runnable} but the configured \
-         watchdog timeout is 80ms; the engine watchdog logic may be skewed. \
+         watchdog timeout is 200ms; the engine watchdog logic may be skewed. \
          Full stderr:\n{stderr}"
     );
     eprintln!(
