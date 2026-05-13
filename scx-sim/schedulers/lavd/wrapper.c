@@ -11,6 +11,7 @@
 #include "sim_wrapper.h"
 #include "sim_task.h"
 
+
 /*
  * =================================================================
  * LAVD-specific macro overrides
@@ -554,6 +555,8 @@ extern unsigned int sim_bpf_in_interrupt(void);
 #ifdef SCXSIM_DEBUG_CONSUME_PROBE
 extern unsigned long long scxsim_cgroup_bw_consume_count_pre;
 unsigned long long scxsim_cgroup_bw_consume_count_pre __attribute__((visibility("default")));
+extern unsigned long long scxsim_cgroup_bw_consume_sum_ns;
+unsigned long long scxsim_cgroup_bw_consume_sum_ns __attribute__((visibility("default")));
 extern int scxsim_probe_dprintf(int fd, const char *fmt, ...) __asm__("dprintf");
 #endif
 
@@ -571,10 +574,12 @@ extern int scxsim_probe_dprintf(int fd, const char *fmt, ...) __asm__("dprintf")
 #define scx_cgroup_bw_consume(c, n) ({ \
     int _rc = scx_cgroup_bw_consume((c), (n)); \
     scxsim_cgroup_bw_consume_count_pre++; \
+    scxsim_cgroup_bw_consume_sum_ns += (unsigned long long)(n); \
     if ((scxsim_cgroup_bw_consume_count_pre & 0xfff) == 1) \
-        scxsim_probe_dprintf(2, "[SCXSIM-PROBE] consume cgrp=%p level=%d ns=%llu count=%llu rc=%d\n", \
+        scxsim_probe_dprintf(2, "[SCXSIM-PROBE] consume cgrp=%p level=%d ns=%llu count=%llu sum_ns=%llu rc=%d\n", \
             (void *)(c), (c) ? ((int)(c)->level) : -1, \
-            (unsigned long long)(n), scxsim_cgroup_bw_consume_count_pre, _rc); \
+            (unsigned long long)(n), scxsim_cgroup_bw_consume_count_pre, \
+            scxsim_cgroup_bw_consume_sum_ns, _rc); \
     _rc; \
 })
 #endif
@@ -1195,6 +1200,42 @@ static void lavd_register_cbw_maps(void)
 	INIT_SCX_PERCPU_TEST_MAP(cbw_tree_levels_test_map, tree_levels_map);
 	scx_register_percpu_test_map(cbw_tree_levels_test_map,
 				     &tree_levels_map);
+
+	/*
+	 * SEED the PERCPU_ARRAY entry. Phase 2 Stage E (tg
+	 * `investigate-scxsim-engine-throttles-before-scheduler-cgroup-bw`):
+	 * scxsim's scx_test_map storage for PERCPU_ARRAY does not
+	 * pre-allocate slots the way the kernel does -- nr starts at 0
+	 * and only grows via map_update_elem. The cgroup_bw library
+	 * never updates tree_levels_map (it's read-only after init from
+	 * its perspective), so without seeding bpf_map_lookup_elem
+	 * returns NULL for key=0, get_clean_tree_levels() returns NULL,
+	 * cbw_update_runtime_total_sloppy() returns -ENOMEM, and the
+	 * accounting -> throttle chain is severed. The library's per-LLC
+	 * runtime_total accumulator (~tens of µs at probe time) is never
+	 * promoted to cgx->runtime_total_sloppy, so is_throttled never
+	 * flips and per-SHA discrimination is impossible.
+	 *
+	 * Seed entry [key=0, value=zeroed struct tree_levels] for every
+	 * CPU. tree_levels_map has max_entries=1 in the library
+	 * declaration; we only need key=0.
+	 *
+	 * This is the root cause identified in tg note "MAJOR FINDING
+	 * 2026-05-13" -- scxsim's percpu-array-storage seeding gap, not
+	 * a key-padding issue.
+	 */
+	{
+		struct tree_levels zero_tl;
+		const u32 zero_key = 0;
+		int cpu;
+
+		__builtin_memset(&zero_tl, 0, sizeof(zero_tl));
+		for (cpu = 0; cpu < (int)MAX_SIM_CPUS; cpu++) {
+			scx_test_map_update_percpu_elem(&tree_levels_map,
+							&zero_key, &zero_tl,
+							cpu, /*BPF_ANY=*/0);
+		}
+	}
 }
 
 /*
@@ -1332,6 +1373,16 @@ int scxsim_probe_cbw_state(unsigned long long cgrp_id, int llc_id,
 	if (cgx) {
 		out->has_llcx = cgx->has_llcx;
 		out->is_throttled = cgx->is_throttled;
+		out->runtime_total_sloppy = cgx->runtime_total_sloppy;
+	}
+
+	/* Force the accounting aggregation BEFORE snapshotting cgx state,
+	 * so runtime_total_sloppy reflects the latest llcx->runtime_total
+	 * even at probe-time. The accounting timer normally drives this
+	 * but its firing is event-queue dependent; an explicit invocation
+	 * here is idempotent and cheap. */
+	cbw_update_runtime_total_sloppy((struct cgroup *)sim_get_root_cgroup());
+	if (cgx) {
 		out->runtime_total_sloppy = cgx->runtime_total_sloppy;
 	}
 
