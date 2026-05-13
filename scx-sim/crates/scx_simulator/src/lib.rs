@@ -49,6 +49,7 @@ pub use safe::fmt;
 pub use safe::monitor;
 pub use safe::perf;
 pub(crate) use safe::perfetto;
+pub(crate) use safe::perfetto_pb;
 pub use safe::rtapp;
 pub use safe::scenario;
 pub use safe::stats;
