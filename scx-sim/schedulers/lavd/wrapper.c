@@ -525,6 +525,38 @@ extern unsigned int sim_bpf_in_interrupt(void);
 #define bpf_in_serving_softirq() sim_bpf_in_serving_softirq()
 #define bpf_in_interrupt() sim_bpf_in_interrupt()
 
+/*
+ * DIAGNOSTIC INSTRUMENTATION (Phase 2 Stage E investigation, tg
+ * `investigate-scxsim-engine-throttles-before-scheduler-cgroup-bw`):
+ * count and (sparsely) log every scheduler-side scx_cgroup_bw_consume()
+ * call. Macro-redirect happens AFTER lib/cgroup.h is processed (the
+ * declaration in cgroup.h was pulled in by the previous includes that
+ * also include lib/cgroup.h indirectly: lat_cri.bpf.c, balance.bpf.c,
+ * idle.bpf.c -- so cgroup.h's `int scx_cgroup_bw_consume(...)` proto
+ * was already seen). The macro applies only to the call sites in
+ * main.bpf.c; the function definition lives in cgroup_bw.bpf.c which
+ * is included LATER and is wrapped in #undef so its `int
+ * scx_cgroup_bw_consume(...)` definition does NOT macro-expand.
+ *
+ * Confirmed empirically (canonical Bug-1 reproducer, wd=200ms,
+ * dur=600ms, integrated v6 tip): consume IS being called -- 252,774
+ * times in a 600ms run, all returning rc=0 with cgrp non-NULL and
+ * level=1 (non-root). And yet the library's per-cgroup
+ * runtime_total_sloppy stays at 0 and is_throttled stays false. The
+ * function entry is hit; the state never accumulates. Likely
+ * suspects: cbw_get_llc_ctx returning NULL inside the library, or
+ * scxsim's bpf_map_lookup_elem on the per-LLC hash map not finding
+ * the entry that cbw_init_llc_ctx populated. Investigation in flight.
+ *
+ * Gated on SCXSIM_DEBUG_CONSUME_PROBE so a regular release build
+ * stays clean.
+ */
+#ifdef SCXSIM_DEBUG_CONSUME_PROBE
+extern unsigned long long scxsim_cgroup_bw_consume_count_pre;
+unsigned long long scxsim_cgroup_bw_consume_count_pre __attribute__((visibility("default")));
+extern int scxsim_probe_dprintf(int fd, const char *fmt, ...) __asm__("dprintf");
+#endif
+
 #include "util.bpf.c"
 #include "power.bpf.c"
 #include "sys_stat.bpf.c"
@@ -534,7 +566,22 @@ extern unsigned int sim_bpf_in_interrupt(void);
 #include "lat_cri.bpf.c"
 #include "preempt.bpf.c"
 #include "introspec.bpf.c"
+
+#ifdef SCXSIM_DEBUG_CONSUME_PROBE
+#define scx_cgroup_bw_consume(c, n) ({ \
+    int _rc = scx_cgroup_bw_consume((c), (n)); \
+    scxsim_cgroup_bw_consume_count_pre++; \
+    if ((scxsim_cgroup_bw_consume_count_pre & 0xfff) == 1) \
+        scxsim_probe_dprintf(2, "[SCXSIM-PROBE] consume cgrp=%p level=%d ns=%llu count=%llu rc=%d\n", \
+            (void *)(c), (c) ? ((int)(c)->level) : -1, \
+            (unsigned long long)(n), scxsim_cgroup_bw_consume_count_pre, _rc); \
+    _rc; \
+})
+#endif
 #include "main.bpf.c"
+#ifdef SCXSIM_DEBUG_CONSUME_PROBE
+#undef scx_cgroup_bw_consume
+#endif
 
 /*
  * =================================================================
