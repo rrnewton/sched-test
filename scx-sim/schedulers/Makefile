@@ -92,26 +92,23 @@ $(info scx-sim/schedulers: detected cgroup_bw API = $(SCX_CGROUP_BW_API))
 CFLAGS += $(CFLAGS_BPF_API)
 
 # Phase 2 (tg `compile-scx-cgroup-bw-library-into-scxsim-phase2`):
-# build-time gate that flips the LAVD wrapper from the pre-Phase-2 weak
+# build-time gate that selects between the pre-Phase-2 weak
 # `scx_cgroup_bw_*` shims (delegating to the engine `BandwidthManager`)
-# to the real `scx/lib/cgroup_bw.bpf.c` library compiled into the .so.
+# and the real `scx/lib/cgroup_bw.bpf.c` library compiled into the .so.
 #
-# Set `SCXSIM_PHASE2_REAL_CGROUP_BW=1` in the environment to opt in:
-#   SCXSIM_PHASE2_REAL_CGROUP_BW=1 cargo build --release -p scx_simulator --bin scxsim
-#
-# Or set it just for the schedulers/Makefile invocation:
-#   make -C scx-sim/schedulers SCXSIM_PHASE2_REAL_CGROUP_BW=1 ...
-#
-# Default (unset / empty): Phase 2 path is OFF; the pre-Phase-2 weak
-# shims are emitted and the canonical Bug-1 reproducer passes
-# regression at byte-identical runnable_for_ns. Set to 1 to opt in to
-# the compiled-in library; this currently lands the .so build cleanly
-# but exposes a runtime issue past lavd_init -- see tg
-# `compile-scx-cgroup-bw-library-into-scxsim-phase2` notes for the
-# debugging breadcrumbs.
+# DEFAULT IS NOW ON. Phase 2 has shipped (Stages A-B-C-D landed; Stage
+# E EXIT CRITERION met -- canonical cpu-bw-stall-bug reproduces
+# `ExitKind::ErrorStall` deterministically through the production
+# library at runnable_for_ns=80002523). The gate stays as a build-time
+# off-switch ONLY for emergency rollback during integration; set
+# `SCXSIM_PHASE2_REAL_CGROUP_BW=0` to revert to the engine-side
+# BandwidthManager mirror path.
+SCXSIM_PHASE2_REAL_CGROUP_BW ?= 1
 ifeq ($(SCXSIM_PHASE2_REAL_CGROUP_BW),1)
 CFLAGS += -DSCXSIM_PHASE2_REAL_CGROUP_BW=1
 $(info scx-sim/schedulers: SCXSIM_PHASE2_REAL_CGROUP_BW=1 -- compiling cgroup_bw.bpf.c into LAVD .so)
+else
+$(info scx-sim/schedulers: SCXSIM_PHASE2_REAL_CGROUP_BW=0 -- ROLLBACK MODE: pre-Phase-2 weak shims)
 endif
 
 INCLUDES := -I$(SIMULATOR_DIR)/csrc \

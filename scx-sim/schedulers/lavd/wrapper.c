@@ -1074,12 +1074,62 @@ extern int scx_test_map_delete_elem(void *map, const void *key);
 extern void *scx_test_cgrp_storage_get(void *map, const void *cgrp_ptr_loc,
 				       void *value, unsigned long flags);
 extern int scx_test_cgrp_storage_delete(void *map, const void *cgrp_ptr_loc);
+extern int sim_cgroup_registry_allocate(void);
+extern void sim_cgroup_registry_free(void);
+
+/*
+ * Phase 2 Stage D follow-up: bpf_cgrp_storage_get with the CREATE
+ * flag is the SOLE allocation path for per-cgroup state in the
+ * library (`cbw_init_cgroup` -> `bpf_cgrp_storage_get(F_CREATE)`).
+ * Pre-Phase-2 the wrapper.c weak `scx_cgroup_bw_init` shim called
+ * `sim_cgroup_registry_allocate` FIRST to honor the scenario's
+ * `max_cgroups` cap (used by `test_lavd_cgroup_resource_exhaustion`
+ * to assert -ENOMEM at exhaustion). With the weak shim retired
+ * under Phase 2 ON, that check needs to live somewhere -- the
+ * macro override is the cleanest place, since CREATE is exactly the
+ * "new cgroup state being allocated" event.
+ *
+ * Semantics:
+ *   * BPF_LOCAL_STORAGE_GET_F_CREATE flag (= 1): consult the
+ *     scenario's max_cgroups limit via `sim_cgroup_registry_allocate`.
+ *     On -ENOMEM, return NULL -- the library's caller treats this
+ *     as allocation failure and propagates -ENOMEM up to
+ *     `scx_cgroup_bw_init` -> lavd_cgroup_init.
+ *   * Without CREATE: pure lookup. No allocate side-effect.
+ *   * `bpf_cgrp_storage_delete` calls `sim_cgroup_registry_free` to
+ *     drop the matching slot (so an exit + re-init can succeed
+ *     within the scenario cap).
+ */
 #undef bpf_cgrp_storage_get
-#define bpf_cgrp_storage_get(map, cgrp, value, flags) \
-	scx_test_cgrp_storage_get((map), (const void *)&(cgrp), (value), (flags))
+#define bpf_cgrp_storage_get(map, cgrp, value, flags)			\
+	({								\
+		void *__ret = NULL;					\
+		const unsigned long __f = (flags);			\
+		if (__f & 1 /* BPF_LOCAL_STORAGE_GET_F_CREATE */) {	\
+			if (sim_cgroup_registry_allocate() == 0)	\
+				__ret = scx_test_cgrp_storage_get(	\
+					(map),				\
+					(const void *)&(cgrp),		\
+					(value),			\
+					__f);				\
+		} else {						\
+			__ret = scx_test_cgrp_storage_get(		\
+				(map),					\
+				(const void *)&(cgrp),			\
+				(value),				\
+				__f);					\
+		}							\
+		__ret;							\
+	})
 #undef bpf_cgrp_storage_delete
-#define bpf_cgrp_storage_delete(map, cgrp) \
-	scx_test_cgrp_storage_delete((map), (const void *)&(cgrp))
+#define bpf_cgrp_storage_delete(map, cgrp)				\
+	({								\
+		int __rc = scx_test_cgrp_storage_delete(		\
+			(map), (const void *)&(cgrp));			\
+		if (__rc == 0)						\
+			sim_cgroup_registry_free();			\
+		__rc;							\
+	})
 
 /* bpf_iter_css_*: route LAVD's `bpf_for_each(css, pos, root, flags)`
  * to scxsim's Phase 1 item 3 flags-aware iterator (sim_bpf_iter_css_*
@@ -1261,10 +1311,16 @@ static void lavd_register_cbw_maps(void)
 
 	/* CGRP_STORAGE: keyed by struct cgroup *, value = scx_cgroup_ctx.
 	 * BPF_MAP_TYPE_CGRP_STORAGE has no max_entries field; use the
-	 * TASK_STORAGE-style init which hardcodes max_entries = 100 (the
-	 * scxsim cap on simulated cgroups; bumped via Phase-1 SDT scale-up
-	 * if needed). */
+	 * TASK_STORAGE-style init then explicitly bump max_entries to
+	 * CBW_NR_CGRP_MAX (the production cgroup_bw library's own ceiling
+	 * defined in lib/cgroup_bw.bpf.c). The default 100-slot limit
+	 * baked into INIT_SCX_TEST_MAP_FROM_TASK_STORAGE is too low for
+	 * the cpu-bw-stall-bug stress matrix (test_lavd_cgroup_exhaustion_stress
+	 * creates 100 cgroups + root + helpers > 100 -> -ENOMEM). Matching
+	 * the library's own ceiling makes scxsim's cgroup-storage capacity
+	 * mirror what the kernel allows for cgroup_bw consumers. */
 	INIT_SCX_TEST_MAP_FROM_TASK_STORAGE(&cbw_cgrp_test_map, cbw_cgrp_map);
+	cbw_cgrp_test_map.max_entries = 2048; /* CBW_NR_CGRP_MAX from cgroup_bw.bpf.c */
 	scx_test_map_register(&cbw_cgrp_test_map, &cbw_cgrp_map);
 
 	/* HASH: keyed by cgroup_llc_id, value = scx_cgroup_llc_ctx. */
