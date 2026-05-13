@@ -1149,6 +1149,63 @@ static void lavd_register_cbw_maps(void)
 	scx_register_percpu_test_map(cbw_tree_levels_test_map,
 				     &tree_levels_map);
 }
+
+/*
+ * =================================================================
+ * Phase 2 Stage E (tg `investigate-scxsim-engine-throttles-before-
+ * scheduler-cgroup-bw`): default-visibility forwarders into the
+ * cgroup_bw library.
+ * =================================================================
+ *
+ * The library declares its public entry points with `__hidden`
+ * (visibility("hidden")) so they cannot be reached from the engine
+ * via dlsym. Phase 2 Stage D retired the wrapper.c weak shims on the
+ * assumption that the library's STRONG definitions would replace
+ * them, but that is true only for INTRA-.so binding (lavd's main.bpf.c
+ * calls into the library successfully because they are linked into
+ * the same translation unit). For scxsim's engine to QUERY the
+ * library's throttle state -- which is what
+ * `pid_is_bw_throttled` was rewritten to do at Stage C -- the
+ * symbols must have default visibility.
+ *
+ * Solution: trivial forwarders here, with `visibility("default")`,
+ * are visible via dlsym; they internally call the still-`__hidden`
+ * library functions. wrapper.c is in the same translation unit as
+ * lib/cgroup_bw.bpf.c (it `#include`s it above), so the
+ * compiler binds the call locally without going through dlsym.
+ *
+ * The `scxsim_` prefix avoids any chance of name collision with the
+ * library's own symbols and makes the boundary explicit.
+ *
+ * Diagnostic counter `scxsim_cgroup_bw_consume_count` is incremented
+ * on every consume call so the engine can verify that the
+ * scheduler-side `account_task_runtime -> scx_cgroup_bw_consume`
+ * chain is reaching the library at all (Prong B in the root-cause
+ * note).
+ */
+
+__attribute__((visibility("default")))
+unsigned long long scxsim_cgroup_bw_consume_count;
+
+__attribute__((visibility("default")))
+int scxsim_cgroup_bw_is_cgroup_throttled(unsigned long long cgrp_id)
+{
+	return scx_cgroup_bw_is_cgroup_throttled(cgrp_id);
+}
+
+__attribute__((visibility("default")))
+int scxsim_cgroup_bw_consume(struct cgroup *cgrp, unsigned long long consumed_ns)
+{
+	scxsim_cgroup_bw_consume_count++;
+	return scx_cgroup_bw_consume(cgrp, consumed_ns);
+}
+
+__attribute__((visibility("default")))
+int scxsim_cgroup_bw_throttled(struct cgroup *cgrp, struct task_struct *p)
+{
+	return scx_cgroup_bw_throttled(cgrp, p);
+}
+
 #endif /* SCXSIM_PHASE2_REAL_CGROUP_BW */
 
 /*

@@ -1048,34 +1048,30 @@ impl DynamicScheduler {
                 .map(|p| std::mem::transmute::<*const (), CpuOnlineFn>(p)),
             cpu_offline: try_get!("cpu_offline")
                 .map(|p| std::mem::transmute::<*const (), CpuOfflineFn>(p)),
-            // Phase 2 Stage C: NOT prefixed -- this is a library symbol
-            // (`scx_cgroup_bw_is_cgroup_throttled`) provided by
-            // `scx/lib/cgroup_bw.bpf.c` when Phase 2 is ON.
+            // Phase 2 Stage E (tg `investigate-scxsim-engine-throttles-
+            // before-scheduler-cgroup-bw`): the production cgroup_bw
+            // library declares its public entry points with `__hidden`
+            // (visibility("hidden")), so they are NOT reachable via
+            // dlsym. The cleanest path is to dlsym wrapper.c's
+            // default-visibility forwarder `scxsim_cgroup_bw_is_cgroup_
+            // throttled`, which internally calls the still-`__hidden`
+            // library function from inside the same translation unit.
             //
-            // Important: we ONLY install the function pointer when the
-            // .so is built with `SCXSIM_PHASE2_REAL_CGROUP_BW=1`. We
-            // detect that by probing for a library-internal symbol
-            // (`cbw_alloc_llc_ctx`) that only exists when the
-            // production library is compiled in. With Phase 2 OFF,
-            // `scx_cgroup_bw_is_cgroup_throttled` ALSO exists in the
-            // .so -- it's wrapper.c's compatibility forwarder that
-            // delegates to `sim_cgroup_bw_is_cgroup_throttled` Rust
-            // FFI which tries to lock the SimArc -- but the engine
-            // already holds the SimArc lock at the call site, so
-            // try_lock fails (returning 0 = "not throttled") and the
-            // DSQ admission gate breaks. Routing through the dlsym
-            // path only when Phase 2 ON sidesteps that re-entrancy
-            // hazard; Phase 2 OFF stays on the engine-local
-            // `BandwidthManager::is_throttled` direct read.
-            is_cgroup_throttled: if lib.get::<*const ()>(b"cbw_alloc_llc_ctx").is_ok() {
-                lib.get::<*const ()>(b"scx_cgroup_bw_is_cgroup_throttled")
-                    .ok()
-                    .map(|sym| {
-                        std::mem::transmute::<*const (), IsCgroupThrottledFn>(*sym)
-                    })
-            } else {
-                None
-            },
+            // The historical probe for `cbw_alloc_llc_ctx` (a library
+            // symbol that was supposed to indicate Phase 2 ON) became
+            // unreliable after the library inlined that helper away,
+            // and was redundant once the wrapper provides a stable
+            // `scxsim_*` re-export name we can probe directly: if the
+            // wrapper exports the forwarder, Phase 2 is ON; if not,
+            // Phase 2 is OFF and we fall back to the engine
+            // `BandwidthManager`. See the wrapper.c "Stage E" block
+            // for the full forwarder set + diagnostic counter.
+            is_cgroup_throttled: lib
+                .get::<*const ()>(b"scxsim_cgroup_bw_is_cgroup_throttled")
+                .ok()
+                .map(|sym| {
+                    std::mem::transmute::<*const (), IsCgroupThrottledFn>(*sym)
+                }),
         }
     }
 
