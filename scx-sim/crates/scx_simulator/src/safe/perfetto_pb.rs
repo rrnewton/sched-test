@@ -39,10 +39,15 @@
 //!
 //! - `type_` is `TYPE_SLICE_BEGIN` / `TYPE_SLICE_END` / `TYPE_INSTANT`.
 //! - `categories` carries one of wprof's category strings (`ONCPU`,
-//!   `WAKEE`, `SCX_DSQ`, `TIMER`, `HARDIRQ`, `SOFTIRQ`, `OFFCPU`,
-//!   `IPI_SEND:resched`) or, for events with no wprof counterpart, a
-//!   `SCXSIM_*` category (e.g. `SCXSIM_CGBW_CHARGE`,
-//!   `SCXSIM_DISPATCH_REJECTED`).
+//!   `WAKEE`, `SCX_DSQ`, `SOFTIRQ:timer`, `HARDIRQ`, `SOFTIRQ`,
+//!   `IDLE`, `IPI_SEND:resched`) or one of two coarse SCXSIM_*
+//!   buckets — `SCXSIM_OPS` (all sched_ext ops/kfunc-level events
+//!   that have no wprof counterpart) and `SCXSIM_CGROUP_BW` (the
+//!   cpu-bw-stall causal channel: charge / denied / replenish).
+//!   Per-event identity is preserved in the TrackEvent `name` field
+//!   so SQL queries can pivot either coarsely on `category` or
+//!   precisely on `name`. See the [`cat`] module for the canonical
+//!   string constants.
 //! - `track_uuid` is the per-task or per-CPU track this event belongs
 //!   to (deterministic from PID / CPU index — see [`task_track_uuid`]
 //!   and [`cpu_track_uuid`]).
@@ -70,6 +75,59 @@ use crate::types::{CpuId, DsqId, Pid};
 /// Stable UUID of the synthetic `scxsim` process descriptor that
 /// parents every thread track in the trace.
 const SCXSIM_PROCESS_UUID: u64 = 0x5C50_0000_0000_0001;
+
+/// Single packet-sequence id used for every TracePacket scxsim
+/// emits.
+///
+/// **Why this is required**: per the Perfetto wire-format invariants
+/// (see `scx/tools/scxtop/...` and the Perfetto protobuf spec at
+/// <https://perfetto.dev/docs/concepts/buffers>), every TracePacket
+/// MUST carry a `trusted_packet_sequence_id` so the ingester
+/// (`trace_processor`, `ui.perfetto.dev`, scxtop's
+/// `load_perfetto_trace`) can group packets into a coherent stream
+/// and resolve sequence-scoped state (interned data, defaults, etc.).
+/// Packets without this field are silently dropped by
+/// `trace_processor` — the shipped R3 emitter omitted it and made
+/// 100% of its TrackEvents invisible downstream.
+///
+/// scxsim emits a single linear stream from one logical writer, so
+/// one constant id is sufficient. The value is arbitrary; `1` is
+/// what wprof uses too. See
+/// `experiments/wprof_live_vs_scxsim_perfetto_20260513/REPORT.md`
+/// §6 F1 for the postmortem that motivated this constant.
+const SCXSIM_TRUSTED_SEQ_ID: u32 = 1;
+
+/// Stable category strings used in `TrackEvent.categories`.
+///
+/// The vocabulary is the union of (a) wprof's standard categories
+/// for events that exist on both sides (so a single `SELECT … FROM
+/// slice WHERE category = 'ONCPU'` works against either trace) and
+/// (b) coarse `SCXSIM_*` category buckets for scxsim-only events.
+///
+/// Per the §6 F2 recommendation in the wprof_live_vs_scxsim_perfetto
+/// report, scxsim-only ops/kfunc events collapse into a single
+/// `SCXSIM_OPS` bucket and all cgroup_bw events collapse into a
+/// single `SCXSIM_CGROUP_BW` bucket: the per-event identity is
+/// preserved in the TrackEvent `name` field while the category is
+/// what category-based UI filters and trace_processor SQL queries
+/// pivot on.
+mod cat {
+    pub const ONCPU: &str = "ONCPU";
+    pub const WAKEE: &str = "WAKEE";
+    pub const SCX_DSQ: &str = "SCX_DSQ";
+    pub const IPI_SEND_RESCHED: &str = "IPI_SEND:resched";
+    pub const SOFTIRQ_TIMER: &str = "SOFTIRQ:timer";
+    pub const HARDIRQ: &str = "HARDIRQ";
+    pub const SOFTIRQ: &str = "SOFTIRQ";
+    pub const IDLE: &str = "IDLE";
+    /// All scxsim-only ops/kfunc-level events (PutPrevTask,
+    /// SelectTaskRq, EnqueueTask, Balance, PickTask, SetNextTask,
+    /// DsqMoveToLocal, DispatchRejected).
+    pub const SCXSIM_OPS: &str = "SCXSIM_OPS";
+    /// All scxsim-only cgroup-bandwidth events (Charge, Throttle,
+    /// Denied, Refill, Replenish).
+    pub const SCXSIM_CGROUP_BW: &str = "SCXSIM_CGROUP_BW";
+}
 
 /// Synthetic PID exposed in the `scxsim` ProcessDescriptor. Distinct
 /// from any task pid (scxsim task pids are small positive integers
@@ -189,7 +247,7 @@ fn emit_event(trace: &Trace, ev: &crate::trace::TraceEvent, proto: &mut TracePro
             proto.packet.push(packet_track_event(
                 TrackEvent {
                     type_: Some(track_event::Type::TYPE_SLICE_BEGIN.into()),
-                    categories: vec!["ONCPU".to_string()],
+                    categories: vec![cat::ONCPU.to_string()],
                     track_uuid: Some(task_track_uuid(*pid)),
                     name_field: Some(track_event::Name_field::Name(comm)),
                     debug_annotations: anns,
@@ -233,7 +291,7 @@ fn emit_event(trace: &Trace, ev: &crate::trace::TraceEvent, proto: &mut TracePro
             proto.packet.push(packet_track_event(
                 TrackEvent {
                     type_: Some(track_event::Type::TYPE_INSTANT.into()),
-                    categories: vec!["WAKEE".to_string()],
+                    categories: vec![cat::WAKEE.to_string()],
                     track_uuid: Some(task_track_uuid(*pid)),
                     name_field: Some(track_event::Name_field::Name("WAKEE".to_string())),
                     debug_annotations: anns,
@@ -250,7 +308,7 @@ fn emit_event(trace: &Trace, ev: &crate::trace::TraceEvent, proto: &mut TracePro
             proto.packet.push(packet_track_event(
                 TrackEvent {
                     type_: Some(track_event::Type::TYPE_INSTANT.into()),
-                    categories: vec!["OFFCPU".to_string()],
+                    categories: vec![cat::IDLE.to_string()],
                     track_uuid: Some(cpu_track_uuid(cpu)),
                     name_field: Some(track_event::Name_field::Name("CPU_IDLE".to_string())),
                     debug_annotations: vec![ann_uint("cpu", u64::from(cpu.0))],
@@ -273,7 +331,7 @@ fn emit_event(trace: &Trace, ev: &crate::trace::TraceEvent, proto: &mut TracePro
                 proto,
                 ts,
                 task_track_uuid(*pid),
-                "SCX_DSQ",
+                cat::SCX_DSQ,
                 "dsq_insert",
                 anns,
             );
@@ -296,7 +354,7 @@ fn emit_event(trace: &Trace, ev: &crate::trace::TraceEvent, proto: &mut TracePro
                 proto,
                 ts,
                 task_track_uuid(*pid),
-                "SCX_DSQ",
+                cat::SCX_DSQ,
                 "dsq_insert_vtime",
                 anns,
             );
@@ -312,17 +370,27 @@ fn emit_event(trace: &Trace, ev: &crate::trace::TraceEvent, proto: &mut TracePro
                 proto,
                 ts,
                 cpu_track_uuid(cpu),
-                "IPI_SEND:resched",
+                cat::IPI_SEND_RESCHED,
                 "kick_cpu",
                 anns,
             );
         }
 
-        // ----- Periodic tick (wprof: TIMER) -----
+        // ----- Periodic tick (wprof: SOFTIRQ:timer subtype). The
+        //       per-event NAME stays "tick" so a SQL/UI filter on
+        //       name still distinguishes scxsim ticks from generic
+        //       softirq slices. -----
         TraceKind::Tick { pid } => {
             let mut anns = vec![ann_uint("cpu", u64::from(cpu.0))];
             push_task_anns(&mut anns, *pid, trace.task_name(*pid));
-            push_instant(proto, ts, cpu_track_uuid(cpu), "TIMER", "tick", anns);
+            push_instant(
+                proto,
+                ts,
+                cpu_track_uuid(cpu),
+                cat::SOFTIRQ_TIMER,
+                "tick",
+                anns,
+            );
         }
 
         // ----- IRQ slices (wprof: HARDIRQ / SOFTIRQ).
@@ -332,16 +400,16 @@ fn emit_event(trace: &Trace, ev: &crate::trace::TraceEvent, proto: &mut TracePro
             cpu: irq_cpu,
             irq_type,
         } => {
-            let cat = match irq_type {
-                IrqType::HardIrq => "HARDIRQ",
-                IrqType::SoftIrq => "SOFTIRQ",
+            let category = match irq_type {
+                IrqType::HardIrq => cat::HARDIRQ,
+                IrqType::SoftIrq => cat::SOFTIRQ,
             };
             proto.packet.push(packet_track_event(
                 TrackEvent {
                     type_: Some(track_event::Type::TYPE_SLICE_BEGIN.into()),
-                    categories: vec![cat.to_string()],
+                    categories: vec![category.to_string()],
                     track_uuid: Some(cpu_track_uuid(*irq_cpu)),
-                    name_field: Some(track_event::Name_field::Name(cat.to_string())),
+                    name_field: Some(track_event::Name_field::Name(category.to_string())),
                     debug_annotations: vec![ann_uint("cpu", u64::from(irq_cpu.0))],
                     ..TrackEvent::default()
                 },
@@ -374,7 +442,7 @@ fn emit_event(trace: &Trace, ev: &crate::trace::TraceEvent, proto: &mut TracePro
                 proto,
                 ts,
                 cpu_track_uuid(cpu),
-                "SCXSIM_PUT_PREV_TASK",
+                cat::SCXSIM_OPS,
                 "put_prev_task",
                 anns,
             );
@@ -393,7 +461,7 @@ fn emit_event(trace: &Trace, ev: &crate::trace::TraceEvent, proto: &mut TracePro
                 proto,
                 ts,
                 cpu_track_uuid(cpu),
-                "SCXSIM_SELECT_TASK_RQ",
+                cat::SCXSIM_OPS,
                 "select_task_rq",
                 anns,
             );
@@ -405,7 +473,7 @@ fn emit_event(trace: &Trace, ev: &crate::trace::TraceEvent, proto: &mut TracePro
                 proto,
                 ts,
                 cpu_track_uuid(cpu),
-                "SCXSIM_ENQUEUE_TASK",
+                cat::SCXSIM_OPS,
                 "enqueue_task",
                 anns,
             );
@@ -419,7 +487,7 @@ fn emit_event(trace: &Trace, ev: &crate::trace::TraceEvent, proto: &mut TracePro
                 proto,
                 ts,
                 cpu_track_uuid(cpu),
-                "SCXSIM_BALANCE",
+                cat::SCXSIM_OPS,
                 "balance",
                 anns,
             );
@@ -431,7 +499,7 @@ fn emit_event(trace: &Trace, ev: &crate::trace::TraceEvent, proto: &mut TracePro
                 proto,
                 ts,
                 cpu_track_uuid(cpu),
-                "SCXSIM_PICK_TASK",
+                cat::SCXSIM_OPS,
                 "pick_task",
                 anns,
             );
@@ -443,7 +511,7 @@ fn emit_event(trace: &Trace, ev: &crate::trace::TraceEvent, proto: &mut TracePro
                 proto,
                 ts,
                 cpu_track_uuid(cpu),
-                "SCXSIM_SET_NEXT_TASK",
+                cat::SCXSIM_OPS,
                 "set_next_task",
                 anns,
             );
@@ -458,7 +526,7 @@ fn emit_event(trace: &Trace, ev: &crate::trace::TraceEvent, proto: &mut TracePro
                 proto,
                 ts,
                 cpu_track_uuid(cpu),
-                "SCXSIM_DSQ_MOVE_TO_LOCAL",
+                cat::SCXSIM_OPS,
                 "dsq_move_to_local",
                 anns,
             );
@@ -481,7 +549,7 @@ fn emit_event(trace: &Trace, ev: &crate::trace::TraceEvent, proto: &mut TracePro
                 proto,
                 ts,
                 cpu_track_uuid(cpu),
-                "SCXSIM_DISPATCH_REJECTED",
+                cat::SCXSIM_OPS,
                 "dispatch_rejected",
                 anns,
             );
@@ -504,7 +572,7 @@ fn emit_event(trace: &Trace, ev: &crate::trace::TraceEvent, proto: &mut TracePro
                 proto,
                 ts,
                 cpu_track_uuid(cpu),
-                "SCXSIM_CGBW_CHARGE",
+                cat::SCXSIM_CGROUP_BW,
                 "cgroup_bw_charge",
                 anns,
             );
@@ -516,7 +584,7 @@ fn emit_event(trace: &Trace, ev: &crate::trace::TraceEvent, proto: &mut TracePro
                 proto,
                 ts,
                 cpu_track_uuid(cpu),
-                "SCXSIM_CGBW_DENIED",
+                cat::SCXSIM_CGROUP_BW,
                 "cgroup_bw_denied",
                 anns,
             );
@@ -543,7 +611,7 @@ fn emit_event(trace: &Trace, ev: &crate::trace::TraceEvent, proto: &mut TracePro
                 proto,
                 ts,
                 cpu_track_uuid(cpu),
-                "SCXSIM_CGBW_REPLENISH",
+                cat::SCXSIM_CGROUP_BW,
                 "cgroup_bw_replenish",
                 anns,
             );
@@ -566,7 +634,7 @@ fn push_oncpu_end(proto: &mut TraceProto, ts: u64, cpu: CpuId, pid: Pid, offcpu_
     proto.packet.push(packet_track_event(
         TrackEvent {
             type_: Some(track_event::Type::TYPE_SLICE_END.into()),
-            categories: vec!["ONCPU".to_string()],
+            categories: vec![cat::ONCPU.to_string()],
             track_uuid: Some(task_track_uuid(pid)),
             debug_annotations: anns,
             ..TrackEvent::default()
@@ -598,18 +666,33 @@ fn push_instant(
     ));
 }
 
-/// Wrap a TrackDescriptor in a TracePacket.
+/// Wrap a TrackDescriptor in a TracePacket. Stamps the
+/// [`SCXSIM_TRUSTED_SEQ_ID`] (F1 fix) so `trace_processor` accepts
+/// the descriptor.
 fn packet_track_descriptor(desc: TrackDescriptor) -> TracePacket {
     TracePacket {
+        optional_trusted_packet_sequence_id: Some(
+            trace_packet::Optional_trusted_packet_sequence_id::TrustedPacketSequenceId(
+                SCXSIM_TRUSTED_SEQ_ID,
+            ),
+        ),
         data: Some(trace_packet::Data::TrackDescriptor(desc)),
         ..TracePacket::default()
     }
 }
 
-/// Wrap a TrackEvent in a TracePacket carrying the event timestamp.
+/// Wrap a TrackEvent in a TracePacket carrying the event timestamp
+/// and the [`SCXSIM_TRUSTED_SEQ_ID`] sequence id (F1 fix — without
+/// it `trace_processor` silently drops every TrackEvent and the
+/// trace appears empty to scxtop / Perfetto-UI).
 fn packet_track_event(event: TrackEvent, timestamp_ns: u64) -> TracePacket {
     TracePacket {
         timestamp: Some(timestamp_ns),
+        optional_trusted_packet_sequence_id: Some(
+            trace_packet::Optional_trusted_packet_sequence_id::TrustedPacketSequenceId(
+                SCXSIM_TRUSTED_SEQ_ID,
+            ),
+        ),
         data: Some(trace_packet::Data::TrackEvent(event)),
         ..TracePacket::default()
     }
