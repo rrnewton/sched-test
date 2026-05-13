@@ -92,24 +92,20 @@ $(info scx-sim/schedulers: detected cgroup_bw API = $(SCX_CGROUP_BW_API))
 CFLAGS += $(CFLAGS_BPF_API)
 
 # Phase 2 (tg `compile-scx-cgroup-bw-library-into-scxsim-phase2`):
-# build-time gate that selects between the pre-Phase-2 weak
-# `scx_cgroup_bw_*` shims (delegating to the engine `BandwidthManager`)
-# and the real `scx/lib/cgroup_bw.bpf.c` library compiled into the .so.
+# Phase 2 has shipped (Stages A-B-C-D landed; Stage E EXIT CRITERION
+# met -- canonical cpu-bw-stall-bug reproduces ExitKind::ErrorStall
+# deterministically through the production library at
+# runnable_for_ns=80002523).
 #
-# DEFAULT IS NOW ON. Phase 2 has shipped (Stages A-B-C-D landed; Stage
-# E EXIT CRITERION met -- canonical cpu-bw-stall-bug reproduces
-# `ExitKind::ErrorStall` deterministically through the production
-# library at runnable_for_ns=80002523). The gate stays as a build-time
-# off-switch ONLY for emergency rollback during integration; set
-# `SCXSIM_PHASE2_REAL_CGROUP_BW=0` to revert to the engine-side
-# BandwidthManager mirror path.
-SCXSIM_PHASE2_REAL_CGROUP_BW ?= 1
-ifeq ($(SCXSIM_PHASE2_REAL_CGROUP_BW),1)
+# The build-time gate that USED to select between the pre-Phase-2 weak
+# `scx_cgroup_bw_*` shims and the real `scx/lib/cgroup_bw.bpf.c`
+# library is RETIRED. Stage D deleted the rollback code path entirely
+# (cgroup_bw_ffi.rs, the wrapper.c #ifndef weak forwarders) so there
+# is no other mode to select. The define is unconditionally emitted to
+# keep the wrapper.c #ifdef SCXSIM_PHASE2_REAL_CGROUP_BW conditionals
+# always-true; cleanup of the leftover #ifdefs is a follow-up but they
+# do not change behavior.
 CFLAGS += -DSCXSIM_PHASE2_REAL_CGROUP_BW=1
-$(info scx-sim/schedulers: SCXSIM_PHASE2_REAL_CGROUP_BW=1 -- compiling cgroup_bw.bpf.c into LAVD .so)
-else
-$(info scx-sim/schedulers: SCXSIM_PHASE2_REAL_CGROUP_BW=0 -- ROLLBACK MODE: pre-Phase-2 weak shims)
-endif
 
 INCLUDES := -I$(SIMULATOR_DIR)/csrc \
             -I$(ROOT_DIR)/lib/scxtest \

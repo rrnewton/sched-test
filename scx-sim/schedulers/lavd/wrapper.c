@@ -701,48 +701,14 @@ void lavd_fire_timer(unsigned int slot)
 }
 
 /*
- * Cgroup bandwidth control: redirect to engine-owned BandwidthManager.
- *
- * Diff 4/5 of the cgroup_bw stack — these wrappers used to return 0
- * unconditionally, which left LAVD's cgroup-bw view incoherent with the
- * engine-side enforcement loop wired up by Diff 3 (cf93b57). Now they
- * forward to sim_cgroup_bw_* shims defined in
- * crates/scx_simulator/src/unsafe_impl/cgroup_bw_ffi.rs which talk to
- * the same BandwidthManager the engine uses for admission gating,
- * charging, and refill. That gives the dual-controller surface (kernel
- * cpu.max x LAVD cgroup-bw) a single source of truth for the H6
- * Bug-1 reproducer.
+ * Phase 2 (tg `compile-scx-cgroup-bw-library-into-scxsim-phase2`,
+ * Stage D shim retirement): the production
+ * `scx/lib/cgroup_bw.bpf.c` compiled in below provides STRONG
+ * definitions of every `scx_cgroup_bw_*` entry point. The pre-Phase-2
+ * `cgroup_bw_ffi.rs` shim layer (`sim_cgroup_bw_*`) is retired -- it
+ * was the canonical no-op-shim cited in `scx-sim/CLAUDE.md` and is
+ * now gone from the tree.
  */
-/*
- * Phase 2 ON  (`-DSCXSIM_PHASE2_REAL_CGROUP_BW=1`): the cgroup_bw
- *             library compiled in below provides STRONG definitions of
- *             `scx_cgroup_bw_is_cgroup_throttled` and
- *             `scx_cgroup_bw_is_task_throttled`; the engine-side
- *             `sim_cgroup_bw_is_cgroup_throttled` / `_is_task_throttled`
- *             shims (in `cgroup_bw_ffi.rs`) become unused.
- *
- * Phase 2 OFF (default for now): we keep the pre-Phase-2 forwarders
- *             that delegate into the engine `BandwidthManager`. They
- *             can't co-exist with the library's strong defs because
- *             they're non-weak; gating on the build-time switch is
- *             how Phase 2 lands without breaking the default
- *             regression baseline (canonical Bug-1 reproducer keeps
- *             firing the watchdog at runnable_for_ns=80000793).
- */
-#ifndef SCXSIM_PHASE2_REAL_CGROUP_BW
-extern int sim_cgroup_bw_is_cgroup_throttled(u64 cgrp_id);
-extern int sim_cgroup_bw_is_task_throttled(u64 taskc_ptr);
-
-int scx_cgroup_bw_is_cgroup_throttled(u64 cgrp_id)
-{
-	return sim_cgroup_bw_is_cgroup_throttled(cgrp_id);
-}
-
-int scx_cgroup_bw_is_task_throttled(u64 taskc_ptr)
-{
-	return sim_cgroup_bw_is_task_throttled(taskc_ptr);
-}
-#endif /* !SCXSIM_PHASE2_REAL_CGROUP_BW */
 
 /*
  * =================================================================
@@ -810,173 +776,22 @@ extern void sim_cgroup_registry_free(void);
  * from the engine when allocating implicit cgroups, NOT from
  * scx_cgroup_bw_init (which now lives in the library).
  */
-#ifndef SCXSIM_PHASE2_REAL_CGROUP_BW  /* Phase 2: replaced by strong defs in cgroup_bw.bpf.c below */
-extern int sim_cgroup_bw_lib_init(void);
-extern int sim_cgroup_bw_init(void *cgrp);
-extern int sim_cgroup_bw_exit(void *cgrp);
-extern int sim_cgroup_bw_set(void *cgrp, u64 period_us, u64 quota_us, u64 burst_us);
-extern int sim_cgroup_bw_throttled(void *cgrp);
-extern int sim_cgroup_bw_consume(void *cgrp, u64 runtime_ns);
-extern int sim_cgroup_bw_put_aside(void *p, u64 taskc, u64 vtime, void *cgrp);
-extern int sim_cgroup_bw_reenqueue(void);
-extern int sim_cgroup_bw_cancel(u64 taskc);
-extern int sim_cgroup_bw_move(void *p, u64 taskc, void *from, void *to);
-extern int sim_cgroup_bw_dump(u64 cgrp_id, bool descendant, bool accurate, bool indent);
-
-__attribute__((weak)) int scx_cgroup_bw_lib_init(
-	struct scx_cgroup_bw_config *config)
-{
-	(void)config;
-	return sim_cgroup_bw_lib_init();
-}
-
-__attribute__((weak)) int scx_cgroup_bw_init(
-	struct cgroup *cgrp, struct scx_cgroup_init_args *args)
-{
-	int rc;
-	(void)args;
-	/*
-	 * Attempt to allocate a BPF map entry. Returns -ENOMEM if the
-	 * scenario's max_cgroups limit has been reached. Failing here
-	 * preserves Diff 1's resource-exhaustion semantics; the engine-side
-	 * sim_cgroup_bw_init shim does not touch BandwidthManager state
-	 * because BandwidthManager only tracks cgroups with finite quota
-	 * (configured via _set, not _init).
-	 */
-	rc = sim_cgroup_registry_allocate();
-	if (rc)
-		return rc;
-	return sim_cgroup_bw_init((void *)cgrp);
-}
-
-__attribute__((weak)) int scx_cgroup_bw_exit(struct cgroup *cgrp)
-{
-	(void)sim_cgroup_bw_exit((void *)cgrp);
-	/*
-	 * Free the BPF map entry allocated in scx_cgroup_bw_init.
-	 */
-	sim_cgroup_registry_free();
-	return 0;
-}
-
-__attribute__((weak)) int scx_cgroup_bw_set(
-	struct cgroup *cgrp, u64 period, u64 quota, u64 burst)
-{
-	return sim_cgroup_bw_set((void *)cgrp, period, quota, burst);
-}
-
 /*
- * cgroup_bw API version split.
+ * Phase 2 Stage D shim retirement: the entire pre-Phase-2 weak-shim
+ * block (sim_cgroup_bw_* extern decls + 14 weak `scx_cgroup_bw_*`
+ * forwarders + the OLD/NEW API conditional inside the shim block) is
+ * GONE -- the production cgroup_bw.bpf.c compiled in below provides
+ * STRONG definitions of every entry point at the right API version.
  *
- * Between scx commits a08c9e272b (Apr 23 2026, OLD API) and 6f4921a6c6
- * (Apr 30 2026, NEW API), three of these functions changed signature:
+ * The OLD/NEW API conditional (tg
+ * `fix-wrapper-c-old-new-cgroup-bw-api-conditional`) lives inside the
+ * library now: each historical scx SHA's `cgroup_bw.bpf.c` defines its
+ * own signatures, so wrapper.c does not need to mirror the split.
  *
- *   OLD:  scx_cgroup_bw_throttled (struct cgroup *cgrp,
- *                                  struct task_struct *p)
- *   NEW:  scx_cgroup_bw_throttled (u64 cgrp_id,
- *                                  struct task_struct *p, u64 taskc)
- *
- *   OLD:  scx_cgroup_bw_consume   (struct cgroup *cgrp, u64 runtime)
- *   NEW:  scx_cgroup_bw_consume   (u64 cgrp_id, u64 consumed_ns,
- *                                  u64 taskc_raw)
- *
- *   OLD:  scx_cgroup_bw_put_aside (struct task_struct *p, u64 taskc,
- *                                  u64 vtime, struct cgroup *cgrp)
- *   NEW:  scx_cgroup_bw_put_aside (struct task_struct *p, u64 ctx,
- *                                  u64 vtime, u64 cgrp_id)
- *
- * The remaining scx_cgroup_bw_* entry points (lib_init, init, exit, set,
- * reenqueue, cancel, move, dump, is_cgroup_throttled, is_task_throttled)
- * kept their signatures across the flag-day.
- *
- * `SCX_CGROUP_BW_NEW_API` is defined to 1 by `schedulers/Makefile` when
- * the scx submodule's `scheds/include/lib/cgroup.h` defines
- * `struct scx_task_cgroup_bw` (the NEW-API marker). Without that define,
- * the OLD-API signatures are emitted (matching scx pre-Apr-30-2026 SHAs).
- *
- * Both branches dispatch into the same `sim_cgroup_bw_*` Rust shims that
- * take `struct cgroup *`; the NEW-API branch resolves cgrp_id back to a
- * `struct cgroup *` via `sim_cgroup_lookup_by_id` (the registry's
- * id->ptr lookup). This preserves identical engine-side semantics across
- * both API versions for the cpu-bw-stall-bug scx-version matrix. See tg
- * task `fix-wrapper-c-old-new-cgroup-bw-api-conditional` for the full
- * rationale and the v2-matrix verification recipe.
+ * `SCX_CGROUP_BW_NEW_API` continues to be detected by the Makefile;
+ * any future wrapper.c code that needs to differentiate can still
+ * `#ifdef` on it. Today no wrapper.c code needs to.
  */
-#if defined(SCX_CGROUP_BW_NEW_API) && SCX_CGROUP_BW_NEW_API
-
-__attribute__((weak)) int scx_cgroup_bw_throttled(u64 cgrp_id,
-					   struct task_struct *p, u64 taskc)
-{
-	struct cgroup *cgrp;
-	(void)p;
-	(void)taskc;
-	cgrp = (struct cgroup *)sim_cgroup_lookup_by_id(cgrp_id);
-	return sim_cgroup_bw_throttled((void *)cgrp);
-}
-
-__attribute__((weak)) int scx_cgroup_bw_consume(
-	u64 cgrp_id, u64 consumed_ns, u64 taskc_raw)
-{
-	struct cgroup *cgrp;
-	(void)taskc_raw;
-	cgrp = (struct cgroup *)sim_cgroup_lookup_by_id(cgrp_id);
-	return sim_cgroup_bw_consume((void *)cgrp, consumed_ns);
-}
-
-__attribute__((weak)) int scx_cgroup_bw_put_aside(
-	struct task_struct *p, u64 ctx, u64 vtime, u64 cgrp_id)
-{
-	struct cgroup *cgrp;
-	cgrp = (struct cgroup *)sim_cgroup_lookup_by_id(cgrp_id);
-	return sim_cgroup_bw_put_aside((void *)p, ctx, vtime, (void *)cgrp);
-}
-
-#else /* OLD API: pre-Apr-30-2026 scx SHAs */
-
-__attribute__((weak)) int scx_cgroup_bw_throttled(struct cgroup *cgrp,
-					   struct task_struct *p)
-{
-	(void)p;
-	return sim_cgroup_bw_throttled((void *)cgrp);
-}
-
-__attribute__((weak)) int scx_cgroup_bw_consume(
-	struct cgroup *cgrp, u64 runtime)
-{
-	return sim_cgroup_bw_consume((void *)cgrp, runtime);
-}
-
-__attribute__((weak)) int scx_cgroup_bw_put_aside(
-	struct task_struct *p, u64 taskc, u64 vtime, struct cgroup *cgrp)
-{
-	return sim_cgroup_bw_put_aside((void *)p, taskc, vtime, (void *)cgrp);
-}
-
-#endif /* SCX_CGROUP_BW_NEW_API */
-
-__attribute__((weak)) int scx_cgroup_bw_reenqueue(void)
-{
-	return sim_cgroup_bw_reenqueue();
-}
-
-__attribute__((weak)) int scx_cgroup_bw_cancel(u64 taskc)
-{
-	return sim_cgroup_bw_cancel(taskc);
-}
-
-__attribute__((weak)) int scx_cgroup_bw_move(
-	struct task_struct *p, u64 taskc,
-	struct cgroup *from, struct cgroup *to)
-{
-	return sim_cgroup_bw_move((void *)p, taskc, (void *)from, (void *)to);
-}
-
-__attribute__((weak)) int scx_cgroup_bw_dump(
-	u64 cgrp_id, bool descendent, bool accurate, bool indent)
-{
-	return sim_cgroup_bw_dump(cgrp_id, descendent, accurate, indent);
-}
-#endif /* Phase 2: weak forwarders deactivated */
 
 #ifdef SCXSIM_PHASE2_REAL_CGROUP_BW
 /*

@@ -60,7 +60,6 @@ pub use safe::workloads;
 // Re-export unsafe_impl sub-modules at crate root for backward compatibility.
 // All internal `crate::ffi`, `crate::kfuncs`, etc. paths continue to resolve.
 pub use unsafe_impl::backend;
-pub use unsafe_impl::cgroup_bw_ffi;
 pub use unsafe_impl::cgroup_ffi;
 pub use unsafe_impl::cgroup_wrapper;
 pub use unsafe_impl::engine_ring;
