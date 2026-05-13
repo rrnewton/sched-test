@@ -225,26 +225,54 @@ fn main() {
         workspace_dir.join("scripts/trace_scx_ops.bt").display()
     );
 
-    // Rebuild triggers (relative to workspace root, which is ../../ from crate)
-    println!(
-        "cargo:rerun-if-changed={}",
-        workspace_dir.join("schedulers").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        workspace_dir.join("csrc").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        root_dir.join("lib/scxtest").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        root_dir.join("scheds/rust/scx_tickless/src/bpf").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        root_dir.join("scheds/rust/scx_cosmos/src/bpf").display()
-    );
+    // Rebuild triggers (relative to workspace root, which is ../../ from crate).
+    //
+    // The list MUST cover every directory whose contents the scheduler `.so`
+    // build depends on. If a directory is omitted, swapping the scx submodule
+    // SHA can silently leave a STALE `.so` in place: cargo's incremental
+    // logic skips the build script, the Makefile is never re-invoked, and
+    // the cached `.so` from the previous SHA is reused unchanged.
+    //
+    // Worked example (the bug this list exists to prevent): pre-fix, only
+    // `scx_tickless/src/bpf` and `scx_cosmos/src/bpf` were watched. Swapping
+    // the scx submodule between two SHAs that differed only in
+    // `scheds/rust/scx_lavd/src/bpf/` produced a 0.06s no-op `cargo build`
+    // and the stale `libscx_lavd.so` from the prior SHA was reused. The
+    // workaround was `touch crates/scx_simulator/build.rs`. See:
+    // - tg `official-scheduler-rebuild-action-replace-touch-build-rs-hack`
+    // - experiments/lavd_cpubw_stalls_202604/CPU_BW_STALL_BUG_REPRODUCER_REPORT.md
+    //
+    // When a NEW scheduler is added under `scx-sim/schedulers/`, audit its
+    // `wrapper.c` for `#include "../../scx/...` lines and any
+    // `*_BPF_DIR := $(ROOT_DIR)/...` in its `config.mk`, and add the
+    // corresponding directory to this list. Today's wrappers transitively
+    // depend on the dirs below.
+    let rerun_dirs: &[&str] = &[
+        // scx-sim local source — Makefile + wrapper.c per scheduler
+        "schedulers",
+        "csrc",
+    ];
+    for d in rerun_dirs {
+        println!("cargo:rerun-if-changed={}", workspace_dir.join(d).display());
+    }
+    let scx_rerun_dirs: &[&str] = &[
+        // Test infrastructure (lives at sched-test root, not under scx submodule)
+        "lib/scxtest",
+        // scx submodule subtrees pulled in by wrapper.c per-scheduler #includes
+        // and by the include_paths above. Watching each subtree forces a
+        // rebuild whenever the submodule is swapped to a SHA that touched
+        // those files.
+        "scx/lib",                              // ravg.bpf.c, cgroup_bw.bpf.c, ...
+        "scx/scheds/rust/scx_lavd/src/bpf",     // LAVD wrapper transitive include
+        "scx/scheds/rust/scx_mitosis/src/bpf",  // mitosis wrapper transitive include
+        "scx/scheds/rust/scx_cosmos/src/bpf",   // cosmos wrapper transitive include
+        "scx/scheds/rust/scx_tickless/src/bpf", // tickless wrapper transitive include
+        // scx submodule headers used by ALL schedulers via include_paths above
+        "scx/scheds/include",
+        "scx/scheds/vmlinux",
+    ];
+    for d in scx_rerun_dirs {
+        println!("cargo:rerun-if-changed={}", root_dir.join(d).display());
+    }
     println!("cargo:rerun-if-env-changed=SCX_SIM_COVERAGE");
 }

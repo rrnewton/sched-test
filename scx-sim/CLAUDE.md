@@ -135,6 +135,47 @@ and BPF helpers). Without it, builds will silently fail with missing headers.
 This is a one-time step per clone. If you see build errors about missing
 `<scx/common.bpf.h>` or similar headers, this is almost certainly the cause.
 
+Rebuilding after a scx submodule SHA swap
+--------------------------------------------
+
+Whenever the `scx` submodule's SHA is swapped (matrix testing, bisect,
+checking out a PR ref), the OFFICIAL way to pick up the new scheduler
+source is plain `cargo build`:
+
+    cargo build --release -p scx_simulator --bin scxsim
+
+The build script's `cargo:rerun-if-changed=` list covers the scx
+submodule subtrees that wrappers `#include` from (`scx/lib`,
+`scx/scheds/rust/scx_lavd/src/bpf`, `scx/scheds/rust/scx_mitosis/src/bpf`,
+`scx/scheds/rust/scx_cosmos/src/bpf`,
+`scx/scheds/rust/scx_tickless/src/bpf`, `scx/scheds/include`,
+`scx/scheds/vmlinux`), so cargo correctly re-runs the build script
+and rebuilds the `.so` files when those files change.
+
+For a discoverable single command that combines the SHA swap + rebuild
++ post-build sha256 verification — useful for matrix testing and for
+the canonical reproducer report — use:
+
+    make rebuild-schedulers                  # rebuild against current SHA
+    make rebuild-schedulers SCX_SHA=<sha>    # check out SHA in scx/, then rebuild
+
+Both forms force re-run of the build script (defensive belt-and-
+suspenders for cases where a stale on-disk cache predates the
+build.rs fix) and print the resulting `libscx_*.so` paths and sha256
+sums. Idempotent: re-running with no source changes is a fast no-op.
+
+DO NOT use the legacy workaround `touch crates/scx_simulator/build.rs`
+— that hack predates the build.rs `rerun-if-changed=` extension and is
+no longer needed. If you find a code path where plain `cargo build`
+silently keeps a stale `.so` after a SHA swap, that is a BUG in
+`build.rs`'s rerun-if-changed list (a watched scx subtree is missing).
+File an issue, add the missing path, do not paper over it with `touch`.
+
+For absolute per-SHA isolation (matrix testing where every SHA must
+get a guaranteed-fresh from-scratch build, immune to any cache
+confusion), see `experiments/bug1_scx_version_matrix_20260512/build_per_hash.sh`,
+which uses per-SHA `CARGO_TARGET_DIR` to sidestep the question entirely.
+
 Clean Start: Before beginning work on a task
 --------------------------------------------
 
