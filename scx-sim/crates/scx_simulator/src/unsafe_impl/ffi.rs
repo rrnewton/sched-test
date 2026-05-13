@@ -494,6 +494,35 @@ pub trait Scheduler {
         None
     }
 
+    /// Snapshot the cgroup_bw library state for a single cgroup
+    /// identified by its RAW cgrp pointer (sourced from scxsim's
+    /// `cgroup_registry`, NOT looked up via `bpf_cgroup_from_id`
+    /// inside the lib). The `cgid` argument is purely informational
+    /// (copied into `out->cgid` for downstream identification).
+    ///
+    /// Returns `None` when the loaded scheduler does not link the
+    /// cgroup_bw library; `Some(rc)` otherwise:
+    ///   *  0  → success, `out` filled
+    ///   * -1  → caller error (NULL cgrp_raw or out)
+    ///   * -2  → cgroup not registered with the lib's CGRP_STORAGE
+    ///   * -3  → unlimited-quota cgroup (caller should skip)
+    ///
+    /// Why raw-pointer entry: the engine holds the SIM_ARC mutex at
+    /// the snapshot points and `bpf_cgroup_from_id` -> `try_lock()`
+    /// fails inside that critical section, returning the root cgroup
+    /// for every cgid. Passing the raw cgrp pointer in directly
+    /// bypasses that lookup.
+    ///
+    /// tg `wprof-r2-add-cgroup-bw-replenish-tracekind-smoking-gun`.
+    fn snapshot_by_raw_cgrp(
+        &self,
+        _cgid: u64,
+        _cgrp_raw: *mut c_void,
+        _out: &mut CbwCgroupSnapshot,
+    ) -> Option<i32> {
+        None
+    }
+
     /// Resolve e9patch C trampoline function pointers from the loaded library.
     ///
     /// Returns `None` by default (no e9patch support). `DynamicScheduler`
@@ -638,6 +667,58 @@ type ProbeCbwStateFn = unsafe extern "C" fn(u64, i32, *mut CbwProbeResult) -> i3
  * `pid_bw_max_run_ns` to cap the scheduler-chosen slice.
  */
 type CgroupBwBudgetRemainingFn = unsafe extern "C" fn(u64) -> u64;
+
+
+/*
+ * tg `wprof-r2-add-cgroup-bw-replenish-tracekind-smoking-gun`: snapshot
+ * of every finite-quota cgroup's library-internal cgroup_bw state. Mirrors
+ * `struct scxsim_cbw_cgroup_snapshot` in `schedulers/lavd/wrapper.c`
+ * byte-for-byte. The engine uses BEFORE/AFTER snapshots around each
+ * `fire_timer` invocation to detect per-cgroup replenishments and emit
+ * `TraceKind::CgroupBwReplenish` events with computed debt + burst credit.
+ *
+ * Field layout: 6 * 8 (i64/u64) + 2 * 4 (i32/i32 padding) = 56 bytes,
+ * matching the C struct.
+ */
+#[repr(C)]
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CbwCgroupSnapshot {
+    /// Cgroup id (`cgx->id`).
+    pub cgid: u64,
+    /// `cgx->runtime_total_last`. The lib's input to debt/burst-credit.
+    pub runtime_total_last: i64,
+    /// `cgx->period_budget`. Output of the previous replenishment.
+    pub period_budget: i64,
+    /// `cgx->burst_remaining`. Lib uses this to clamp burst_credit.
+    pub burst_remaining: i64,
+    /// `cgx->nquota`. Static (set at cgroup_set_bandwidth).
+    pub nquota: i64,
+    /// `cgx->nquota_ub`. Effective per-period quota; CBW_RUNTUME_INF
+    /// for unlimited cgroups (those are skipped by the snapshotter).
+    pub nquota_ub: i64,
+    /// `cgx->is_throttled` (0/1). Reflects whether the cgroup is
+    /// currently in a throttled state.
+    pub is_throttled: i32,
+    /// Padding to match C layout.
+    pub _pad: i32,
+}
+/// `int scxsim_cbw_snapshot_by_raw_cgrp(u64 cgid, void *cgrp_raw,
+/// struct *out)`. Returns 0 on success (out filled), -1/-2 if the
+/// cgroup is not registered in the lib, -3 if the cgroup has unlimited
+/// quota (caller skips). The caller (Rust engine) sources both `cgid`
+/// AND `cgrp_raw` from scxsim's `cgroup_registry`. Passing the raw
+/// cgrp pointer in directly sidesteps two issues:
+///
+///   1. `cbw_cgroup_ids[]` (lib-internal) is only populated transiently
+///      inside `replenish_timerfn`, so iterating it from outside the
+///      timer is unreliable.
+///   2. `bpf_cgroup_from_id` -> `sim_cgroup_lookup_by_id` uses
+///      `try_lock()` on the SIM_ARC mutex, which the engine already
+///      holds at the BEFORE/AFTER snapshot points. The lock fails,
+///      lookup returns the root cgroup pointer for every cgid, and
+///      every per-cgid snapshot collapses to the same cgx.
+type SnapshotByRawCgrpFn = unsafe extern "C" fn(u64, *mut c_void, *mut CbwCgroupSnapshot) -> i32;
+
 type CgroupSetBandwidthFn = unsafe extern "C" fn(*mut c_void, u64, u64, u64);
 type CpuOnlineFn = unsafe extern "C" fn(i32);
 type CpuOfflineFn = unsafe extern "C" fn(i32);
@@ -683,6 +764,17 @@ struct SchedOps {
      * the cgroup_bw library at all.
      */
     is_cgroup_throttled: Option<IsCgroupThrottledFn>,
+    /*
+     * tg `wprof-r2-add-cgroup-bw-replenish-tracekind-smoking-gun`:
+     * `scxsim_cbw_snapshot_one_cgroup(cgid, out)` exported by the LAVD
+     * wrapper.c. `None` when the loaded scheduler does not compile the
+     * cgroup_bw library in (e.g. simple, tickless, mitosis, cosmos).
+     * The engine sources cgids from `cgroup_registry` and queries one
+     * at a time so we don't depend on the lib-internal
+     * `cbw_cgroup_ids[]` array (which is only populated transiently
+     * inside replenish_timerfn).
+     */
+    snapshot_by_raw_cgrp: Option<SnapshotByRawCgrpFn>,
     /*
      * Phase 2 Stage E diagnostic: `scxsim_probe_cbw_state`.
      * Optional -- only present when wrapper.c is built with the probe
@@ -1147,6 +1239,10 @@ impl DynamicScheduler {
                 .get::<*const ()>(b"scxsim_cgroup_bw_is_cgroup_throttled")
                 .ok()
                 .map(|sym| std::mem::transmute::<*const (), IsCgroupThrottledFn>(*sym)),
+            snapshot_by_raw_cgrp: lib
+                .get::<*const ()>(b"scxsim_cbw_snapshot_by_raw_cgrp")
+                .ok()
+                .map(|sym| std::mem::transmute::<*const (), SnapshotByRawCgrpFn>(*sym)),
             probe_cbw_state: lib
                 .get::<*const ()>(b"scxsim_probe_cbw_state")
                 .ok()
@@ -1408,6 +1504,33 @@ impl Scheduler for DynamicScheduler {
         // `u64 scxsim_cgroup_bw_budget_remaining(u64)` returns
         // remaining-ns or u64::MAX for "no cap".
         self.ops.bw_budget_remaining.map(|f| unsafe { f(cgrp_id) })
+    }
+
+    // The `cgrp_raw` arg is a cgroup pointer the caller obtained from
+    // `cgroup_registry` (or NULL, which the C side rejects safely with
+    // rc=-1). The C function never deref's it past the lib's
+    // CGRP_STORAGE map lookup keyed by the pointer value. Marking the
+    // method `unsafe` would propagate up to every Scheduler trait
+    // implementer and the engine call site without buying anything --
+    // the constraint is identical to `is_cgroup_throttled` /
+    // `probe_cbw_state` (both take cgrp ids that the trait method
+    // turns into pointers internally), but we expose the raw pointer
+    // here only because the engine already holds the SIM_ARC mutex
+    // and cannot safely call `bpf_cgroup_from_id` to do the lookup
+    // C-side. The lint is acknowledged with allow.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    fn snapshot_by_raw_cgrp(
+        &self,
+        cgid: u64,
+        cgrp_raw: *mut c_void,
+        out: &mut CbwCgroupSnapshot,
+    ) -> Option<i32> {
+        let f = self.ops.snapshot_by_raw_cgrp?;
+        // SAFETY: `out` is a valid mut ref to a #[repr(C)] struct that
+        // mirrors the C side; `cgrp_raw` is a cgroup pointer from
+        // `cgroup_registry` valid for the lifetime of the registry
+        // entry. The C function only writes `out` on rc=0.
+        Some(unsafe { f(cgid, cgrp_raw, out as *mut CbwCgroupSnapshot) })
     }
 
     fn resolve_e9_fns(&self) -> Option<crate::backend::e9patch::E9PatchFns> {

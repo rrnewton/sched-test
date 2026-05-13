@@ -415,6 +415,34 @@ pub(crate) fn write_json(trace: &Trace, writer: &mut impl Write) -> std::io::Res
                     "args": { "pid": pid.0, "cgid": cgid.0 }
                 })
             }
+            TraceKind::CgroupBwReplenish {
+                cgid,
+                runtime_total_last,
+                period_budget_in,
+                debt,
+                burst_credit,
+                period_budget_out,
+                keep_throttled,
+            } => {
+                json!({
+                    "ph": "i",
+                    "pid": cpu,
+                    "tid": 0,
+                    "ts": ts,
+                    "name": "cgroup_bw_replenish",
+                    "cat": "cgroup_bw",
+                    "s": "g",
+                    "args": {
+                        "cgid": cgid.0,
+                        "runtime_total_last": runtime_total_last,
+                        "period_budget_in": period_budget_in,
+                        "debt": debt,
+                        "burst_credit": burst_credit,
+                        "period_budget_out": period_budget_out,
+                        "keep_throttled": keep_throttled,
+                    }
+                })
+            }
         };
         serde_json::to_writer(&mut *writer, &value)?;
     }
