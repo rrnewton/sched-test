@@ -18,6 +18,7 @@ pub mod fmt;
 pub mod monitor;
 pub mod perf;
 pub(crate) mod perfetto;
+pub(crate) mod perfetto_pb;
 pub mod rtapp;
 pub mod scenario;
 pub mod stats;
