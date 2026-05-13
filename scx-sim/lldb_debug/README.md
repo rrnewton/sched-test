@@ -87,36 +87,53 @@ effect automatically.
 
 ## Worked example: what the transcripts prove
 
-`phaseA.transcript.txt` (136 lines) shows four strategic Rust-side
-breakpoints firing under the Bug-1 reproducer. The four hits exercise
-the formatters as follows:
+`phaseA.transcript.txt` shows four strategic Rust-side breakpoints
+firing under the Bug-1 reproducer. The hits exercise the formatters
+as follows (against the current simulator.v6 release build):
 
 ```
 === HIT bp1 at CgroupBandwidthState::charge (cgroup_bw.rs:78) ===
-  delta_ns: 3996510
+  self: ?              # release-build optimization, see Limitations
+  delta_ns: 1
 
 === HIT bp2 at BandwidthManager::charge (cgroup_bw.rs:219) ===
   self: BWMgr{states.children=1}
   cgid: cgid=2
-  delta_ns: 3996510
+  delta_ns: 1
+  ancestor_lookup: ?
 
 === HIT bp3 at hashbrown::HashMap::get_mut (inlined from DsqManager::insert_vtime) ===
   k: dsq=user(8192)
 
-=== HIT bp4 at Simulator::check_watchdog (engine.rs:1222) ===
-  task: SimTask{pid=1 name=None TaskState::$variants$ prev_cpu=0
-                runnable_at=None enabled=false}
+=== HIT bp4 at Simulator::check_watchdog (engine.rs:1266) ===
+  tasks: 0x...
+  current_time: 4000000
+  timeout_ns: 80000000
+  task: ?              # task is a loop-local; release optimizer spills
+                       # it to a register at the breakpoint line.
 ```
 
-Four formatters demonstrably fire end-to-end:
-**BandwidthManager**, **CgroupId**, **DsqId**, **SimTask**.
-The remaining six (Pid, CpuId, Vtime, CgroupBandwidthState,
-TaskState, Dsq) are exercised in different trace conditions:
-Pid/CpuId fire as nested children of SimTask; Vtime and Dsq fire when
-a vtime DSQ is materialized (the Bug-1 path inserts into the global
-DSQ via inlined HashMap access, so Dsq::insert_vtime itself is
-skipped); CgroupBandwidthState rendering is gated on lldb's ability
-to dereference `self` (see Limitations).
+Three formatters demonstrably fire end-to-end here:
+**BandwidthManager**, **CgroupId**, **DsqId**. The remaining seven
+are exercised in different conditions:
+
+- **SimTask**: lldb resolves `task` symbolically when the breakpoint
+  lands at a line that materializes the for-loop binding. The current
+  `engine.rs:1266` stop sees `task: ?` because the optimizer keeps
+  it in a register; an interactive `frame variable -d 1 task` after
+  stepping forward one statement renders the SimTask formatter
+  cleanly. (See Limitation #1.)
+- **Pid / CpuId**: fire as nested children of SimTask once SimTask
+  itself is materialized (e.g. via the manual step-forward above).
+- **Vtime / Dsq**: fire when a vtime DSQ is materialized. The Bug-1
+  path inserts into the global DSQ via inlined HashMap access, so
+  `Dsq::insert_vtime` itself is bypassed.
+- **CgroupBandwidthState**: rendering is gated on lldb's ability to
+  dereference `self`. Visible at `cgroup_bw.rs:78` only when the
+  optimizer hasn't elided `self` — set the breakpoint a few lines
+  into the body to force materialization.
+- **TaskState**: fires as a child of SimTask; lldb stock variant
+  rendering may override the summary on some lldb versions.
 
 `phaseB.transcript.txt` (62 lines) shows `bug1_diagnose` invoked at
 the `check_watchdog` stop. As documented above, it correctly reports
@@ -161,6 +178,56 @@ that SimState is not reachable from that frame's parameters.
    transcript shows `k: dsq=user(8192)` instead of `dsq_id`. Pick
    breakpoints on the OUTER function body (e.g. `dsq.rs:218`) when
    that matters.
+8. **Line numbers in `worked_example.sh` are tip-dependent.** The
+   four breakpoints reference specific line numbers in
+   `cgroup_bw.rs`, `dsq.rs`, and `engine.rs` that were valid for the
+   simulator.v6 tip at the time the worked example last refreshed.
+   Large refactors of those files will silently shift the
+   breakpoints. Re-run `worked_example.sh`, inspect the per-bp
+   `where = ...` lines in the transcript, and update the line
+   numbers if a breakpoint resolves to an unexpected location
+   (e.g. `run_internal::closure` instead of `check_watchdog`).
+
+## Reusing these formatters for other investigations
+
+The 10 type summaries are LAVD-/scxsim-data-model-specific, not
+Bug-1-specific. Anything that walks the same Rust types (`SimTask`,
+`DsqId`, `CgroupId`, `BandwidthManager`, `CgroupBandwidthState`,
+`Vtime`, `Pid`, `CpuId`, `TaskState`, `Dsq`) inherits the
+pretty-printing automatically. To reuse them on a non-Bug-1 issue:
+
+1. **Load them.** From any lldb session attached to a scxsim binary:
+
+   ```
+   (lldb) command source /path/to/scx-sim/lldb_debug/init.lldb
+   (lldb) command script import /path/to/scx-sim/lldb_debug/lldb_lavd_formatters.py
+   ```
+
+   `frame variable` and `expression` will then render the listed types
+   compactly. No further configuration needed.
+
+2. **Add new formatters** by following the existing pattern in
+   `lldb_lavd_formatters.py`: write a `summary_<type>(value, _)`
+   function, register it in `__lldb_init_module` with a regex on the
+   fully-qualified Rust path so both `safe::types::Foo` and the
+   re-exported `types::Foo` paths match. Keep summaries one-liners
+   (lldb truncates multi-line summaries) and tolerant of unavailable
+   children (release-build optimization sometimes hides fields — see
+   Limitations).
+
+3. **Reuse the breakpoint callbacks** (`print_and_continue` /
+   `print_once_and_disable`) and the `bug1_diagnose` command pattern
+   for any "dump-state-at-stop" workflow. `bug1_diagnose` itself is
+   LAVD-cgroup-bw-flavored, but its frame-walking strategy
+   (probe `{self,s,guard,fields}.sim` for the SimulatorState) is
+   generic and a good template for new diagnose commands.
+
+The `worked_example.sh` driver and the two transcripts are specific to
+cpu-bw-stall-bug (canonical reproducer + four LAVD-cgroup-bw
+breakpoints). Treat them as a worked example to imitate, not as a
+required entry point — they are not invoked by `validate.sh`, and
+new investigations should write their own driver scripts that load
+the formatters and set their own breakpoints.
 
 ## What's NOT in this directory
 

@@ -39,11 +39,15 @@ PHASE_A="$(mktemp --suffix=.lldb)"
 PHASE_B="$(mktemp --suffix=.lldb)"
 trap 'rm -f "${PHASE_A}" "${PHASE_B}"' EXIT
 
+# Breakpoint line numbers track the simulator.v6 tip at the time the
+# example was last refreshed. Re-run after large engine.rs / cgroup_bw.rs
+# refactors and update if a breakpoint resolves to an unexpected location
+# (visible in the per-bp `where = ...` line in the transcript).
 cat > "${PHASE_A}" << 'EOF'
 breakpoint set --file cgroup_bw.rs --line 78
 breakpoint set --file cgroup_bw.rs --line 219
 breakpoint set --file dsq.rs --line 217
-breakpoint set --file engine.rs --line 1222
+breakpoint set --file engine.rs --line 1266
 breakpoint command add 1 -F lldb_lavd_formatters.print_once_and_disable
 breakpoint command add 2 -F lldb_lavd_formatters.print_once_and_disable
 breakpoint command add 3 -F lldb_lavd_formatters.print_once_and_disable
@@ -54,7 +58,7 @@ quit
 EOF
 
 cat > "${PHASE_B}" << 'EOF'
-breakpoint set --file engine.rs --line 1222
+breakpoint set --file engine.rs --line 1266
 run
 script print("=== bug1_diagnose at first check_watchdog stop ===")
 bug1_diagnose

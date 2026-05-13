@@ -1,8 +1,8 @@
-(lldb) target create "<REPO_ROOT>/sched-test1/scx-sim/target/release/scxsim"
-Current executable set to '<REPO_ROOT>/sched-test1/scx-sim/target/release/scxsim' (x86_64).
+(lldb) target create "/home/newton/work/multi_sched-test/worktrees/scxsim-tooling-integrator/sched-test/scx-sim/target/release/scxsim"
+Current executable set to '/home/newton/work/multi_sched-test/worktrees/scxsim-tooling-integrator/sched-test/scx-sim/target/release/scxsim' (x86_64).
 (lldb) settings set -- target.run-args  "--no-disable-aslr" "run" "tests/fixtures/h6/bug1_canonical.json" "--config" "tests/fixtures/h6/bug1_canonical.toml" "--watchdog" "80ms" "-s" "lavd" "--cpus" "4" "--duration" "500ms"
-(lldb) command source <REPO_ROOT>/worktrees/dbg-scripts/sched-test/scx-sim/lldb_debug/init.lldb
-Executing commands in '<REPO_ROOT>/worktrees/dbg-scripts/sched-test/scx-sim/lldb_debug/init.lldb'.
+(lldb) command source /home/newton/work/multi_sched-test/worktrees/scxsim-tooling-integrator/sched-test/scx-sim/lldb_debug/init.lldb
+Executing commands in '/home/newton/work/multi_sched-test/worktrees/scxsim-tooling-integrator/sched-test/scx-sim/lldb_debug/init.lldb'.
 (lldb) # scxsim debug helpers — settings + formatter loader.
 (lldb) #
 (lldb) # Use one of:
@@ -30,33 +30,34 @@ SIGFPE       true     false    false
 (lldb) settings set target.disable-aslr false
 (lldb) # Skip stepping into low-level Rust std/core/alloc and BPF helper noise.
 (lldb) settings set target.process.thread.step-avoid-regexp ^(scx_bpf_|bpf_|scx_test_|sim_|_ZN|std::|core::|alloc::)
-(lldb) command script import <REPO_ROOT>/worktrees/dbg-scripts/sched-test/scx-sim/lldb_debug/lldb_lavd_formatters.py
+(lldb) command script import /home/newton/work/multi_sched-test/worktrees/scxsim-tooling-integrator/sched-test/scx-sim/lldb_debug/lldb_lavd_formatters.py
 [lldb_lavd_formatters] registered 10 type summaries + command `bug1_diagnose`
-(lldb) command source -s 0 '/tmp/tmp.KXqqgOwBaI.lldb'
-Executing commands in '/tmp/tmp.KXqqgOwBaI.lldb'.
-(lldb) breakpoint set --file engine.rs --line 1222
-Breakpoint 1: where = scxsim`scx_simulator::safe::engine::Simulator$LT$S$GT$::process_event_inner::h8d0c32c838831790 + 8237 [inlined] scx_simulator::safe::engine::Simulator$LT$S$GT$::check_watchdog::h70ed9b84d53f5344 + 112 at engine.rs:1222:24, address = 0x00000000001aef5d
+(lldb) command source -s 0 '/tmp/tmp.uYFl6NY1lQ.lldb'
+Executing commands in '/tmp/tmp.uYFl6NY1lQ.lldb'.
+(lldb) breakpoint set --file engine.rs --line 1266
+Breakpoint 1: where = scxsim`scx_simulator::safe::engine::Simulator$LT$S$GT$::process_event_inner::h16cef0dcc6d48297 + 9138 [inlined] scx_simulator::safe::engine::Simulator$LT$S$GT$::check_watchdog::h0aa470a0999de16a + 101 at engine.rs:1266:16, address = 0x00000000001a6c42
 (lldb) run
-Process 2722879 launched: '<REPO_ROOT>/sched-test1/scx-sim/target/release/scxsim' (x86_64)
-Process 2722879 stopped
+Process 3992455 launched: '/home/newton/work/multi_sched-test/worktrees/scxsim-tooling-integrator/sched-test/scx-sim/target/release/scxsim' (x86_64)
+Process 3992455 stopped
 * thread #1, name = 'scxsim', stop reason = breakpoint 1.1
-       frame #0: 0x000055ba4bfb1f5d scxsim`scx_simulator::safe::engine::Simulator$LT$S$GT$::check_watchdog::h70ed9b84d53f5344(tasks=0x000055ba4c74e940, current_time=4000000, timeout_ns=80000000) at engine.rs:1222:24
-   1219	        let mut worst: Option<(Pid, TimeNs)> = None;
-   1220	        for task in tasks.values() {
-   1221	            if matches!(task.state, TaskState::Runnable) {
--> 1222	                if let Some(runnable_at) = task.runnable_at_ns {
-    	                       ^
-   1223	                    let runnable_for = current_time.saturating_sub(runnable_at);
-   1224	                    if runnable_for > timeout_ns {
-   1225	                        // Pick the lowest PID for deterministic error reporting.
+       frame #0: 0x000056414ce79c42 scxsim`scx_simulator::safe::engine::Simulator$LT$S$GT$::check_watchdog::h0aa470a0999de16a(tasks=0x000056414f230008, current_time=4000000, timeout_ns=80000000) at engine.rs:1266:16
+   1263	    ) -> Option<ExitKind> {
+   1264	        let mut worst: Option<(Pid, TimeNs)> = None;
+   1265	        for task in tasks.values() {
+-> 1266	            if matches!(task.state, TaskState::Runnable) {
+    	               ^
+   1267	                if let Some(runnable_at) = task.runnable_at_ns {
+   1268	                    let runnable_for = current_time.saturating_sub(runnable_at);
+   1269	                    if runnable_for > timeout_ns {
 (lldb) script print("=== bug1_diagnose at first check_watchdog stop ===")
 === bug1_diagnose at first check_watchdog stop ===
 (lldb) bug1_diagnose
 == bug1_diagnose ==
-frame: scx_simulator::safe::engine::Simulator$LT$S$GT$::check_watchdog::h70ed9b84d53f5344
+frame: scx_simulator::safe::engine::Simulator$LT$S$GT$::check_watchdog::h0aa470a0999de16a
 could not reach SimState via {self,s,guard,fields}.sim — select a frame that holds it (e.g. process_event_inner).
 (lldb) script print("=== frame variable task (SimTask formatter) ===")
 === frame variable task (SimTask formatter) ===
 (lldb) frame variable task
-(scx_simulator::unsafe_impl::sim_task::SimTask *) task = 0x000055ba4c74e380 SimTask{pid=8 name=None TaskState::$variants$ prev_cpu=0 runnable_at=None enabled=false}
+(scx_simulator::unsafe_impl::sim_task::SimTask *) task = <variable not available>
+
 (lldb) quit

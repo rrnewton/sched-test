@@ -1,8 +1,8 @@
-(lldb) target create "<REPO_ROOT>/sched-test1/scx-sim/target/release/scxsim"
-Current executable set to '<REPO_ROOT>/sched-test1/scx-sim/target/release/scxsim' (x86_64).
+(lldb) target create "/home/newton/work/multi_sched-test/worktrees/scxsim-tooling-integrator/sched-test/scx-sim/target/release/scxsim"
+Current executable set to '/home/newton/work/multi_sched-test/worktrees/scxsim-tooling-integrator/sched-test/scx-sim/target/release/scxsim' (x86_64).
 (lldb) settings set -- target.run-args  "--no-disable-aslr" "run" "tests/fixtures/h6/bug1_canonical.json" "--config" "tests/fixtures/h6/bug1_canonical.toml" "--watchdog" "80ms" "-s" "lavd" "--cpus" "4" "--duration" "500ms"
-(lldb) command source <REPO_ROOT>/worktrees/dbg-scripts/sched-test/scx-sim/lldb_debug/init.lldb
-Executing commands in '<REPO_ROOT>/worktrees/dbg-scripts/sched-test/scx-sim/lldb_debug/init.lldb'.
+(lldb) command source /home/newton/work/multi_sched-test/worktrees/scxsim-tooling-integrator/sched-test/scx-sim/lldb_debug/init.lldb
+Executing commands in '/home/newton/work/multi_sched-test/worktrees/scxsim-tooling-integrator/sched-test/scx-sim/lldb_debug/init.lldb'.
 (lldb) # scxsim debug helpers — settings + formatter loader.
 (lldb) #
 (lldb) # Use one of:
@@ -30,107 +30,114 @@ SIGFPE       true     false    false
 (lldb) settings set target.disable-aslr false
 (lldb) # Skip stepping into low-level Rust std/core/alloc and BPF helper noise.
 (lldb) settings set target.process.thread.step-avoid-regexp ^(scx_bpf_|bpf_|scx_test_|sim_|_ZN|std::|core::|alloc::)
-(lldb) command script import <REPO_ROOT>/worktrees/dbg-scripts/sched-test/scx-sim/lldb_debug/lldb_lavd_formatters.py
+(lldb) command script import /home/newton/work/multi_sched-test/worktrees/scxsim-tooling-integrator/sched-test/scx-sim/lldb_debug/lldb_lavd_formatters.py
 [lldb_lavd_formatters] registered 10 type summaries + command `bug1_diagnose`
-(lldb) command source -s 0 '/tmp/tmp.AgAou7jGZX.lldb'
-Executing commands in '/tmp/tmp.AgAou7jGZX.lldb'.
+(lldb) command source -s 0 '/tmp/tmp.PJYgl1va1k.lldb'
+Executing commands in '/tmp/tmp.PJYgl1va1k.lldb'.
 (lldb) breakpoint set --file cgroup_bw.rs --line 78
-Breakpoint 1: where = scxsim`scx_simulator::safe::cgroup_bw::BandwidthManager::charge::habd39dfbf0993b6c + 272 [inlined] scx_simulator::safe::cgroup_bw::CgroupBandwidthState::charge::h4591e96a84ea7285 + 7 at cgroup_bw.rs:78:9, address = 0x00000000002afd80
+Breakpoint 1: where = scxsim`scx_simulator::safe::cgroup_bw::BandwidthManager::charge::haf40737a5b700b6a + 272 [inlined] scx_simulator::safe::cgroup_bw::CgroupBandwidthState::charge::hd3075d931e632eca + 7 at cgroup_bw.rs:78:9, address = 0x00000000002a8f90
 (lldb) breakpoint set --file cgroup_bw.rs --line 219
-Breakpoint 2: where = scxsim`scx_simulator::safe::cgroup_bw::BandwidthManager::charge::habd39dfbf0993b6c + 14 at cgroup_bw.rs:219:12, address = 0x00000000002afc7e
+Breakpoint 2: where = scxsim`scx_simulator::safe::cgroup_bw::BandwidthManager::charge::haf40737a5b700b6a + 14 at cgroup_bw.rs:219:12, address = 0x00000000002a8e8e
 (lldb) breakpoint set --file dsq.rs --line 217
-Breakpoint 3: where = scxsim`scx_simulator::safe::dsq::DsqManager::insert_vtime::h0451862616e75039 + 17 [inlined] hashbrown::map::HashMap$LT$K$C$V$C$S$C$A$GT$::get_mut::hf3531ab33db1768d at map.rs:1457:13, address = 0x0000000000305ea1
-(lldb) breakpoint set --file engine.rs --line 1222
-Breakpoint 4: where = scxsim`scx_simulator::safe::engine::Simulator$LT$S$GT$::process_event_inner::h8d0c32c838831790 + 8237 [inlined] scx_simulator::safe::engine::Simulator$LT$S$GT$::check_watchdog::h70ed9b84d53f5344 + 112 at engine.rs:1222:24, address = 0x00000000001aef5d
+Breakpoint 3: where = scxsim`scx_simulator::safe::dsq::DsqManager::insert_vtime::h483aaba47f268ed5 + 17 [inlined] hashbrown::map::HashMap$LT$K$C$V$C$S$C$A$GT$::get_mut::h0cf06ab5d0e6e3ca at map.rs:1457:13, address = 0x00000000002e3e81
+(lldb) breakpoint set --file engine.rs --line 1266
+Breakpoint 4: where = scxsim`scx_simulator::safe::engine::Simulator$LT$S$GT$::process_event_inner::h16cef0dcc6d48297 + 9138 [inlined] scx_simulator::safe::engine::Simulator$LT$S$GT$::check_watchdog::h0aa470a0999de16a + 101 at engine.rs:1266:16, address = 0x00000000001a6c42
 (lldb) breakpoint command add 1 -F lldb_lavd_formatters.print_once_and_disable
 (lldb) breakpoint command add 2 -F lldb_lavd_formatters.print_once_and_disable
 (lldb) breakpoint command add 3 -F lldb_lavd_formatters.print_once_and_disable
 (lldb) breakpoint command add 4 -F lldb_lavd_formatters.print_once_and_disable
 (lldb) run
-=== HIT bp3 at hashbrown::map::HashMap$LT$K$C$V$C$S$C$A$GT$::get_mut::hf3531ab33db1768d (map.rs:1457) ===
-  self: 0x0000556d6ad6d7a0
+=== HIT bp3 at hashbrown::map::HashMap$LT$K$C$V$C$S$C$A$GT$::get_mut::h0cf06ab5d0e6e3ca (map.rs:1457) ===
+  self: 0x000055e8c7843e68
   k: dsq=user(8192)
   [bp3 disabled after first hit]
-=== HIT bp4 at scx_simulator::safe::engine::Simulator$LT$S$GT$::check_watchdog::h70ed9b84d53f5344 (engine.rs:1222) ===
-  tasks: 0x0000556d6ad6d940
+=== HIT bp4 at scx_simulator::safe::engine::Simulator$LT$S$GT$::check_watchdog::h0aa470a0999de16a (engine.rs:1266) ===
+  tasks: 0x000055e8c7844008
   current_time: 4000000
   timeout_ns: 80000000
   worst: ?
   iter: ?
-  task: SimTask{pid=7 name=None TaskState::$variants$ prev_cpu=0 runnable_at=None enabled=false}
+  task: ?
   [bp4 disabled after first hit]
-=== HIT bp2 at scx_simulator::safe::cgroup_bw::BandwidthManager::charge::habd39dfbf0993b6c (cgroup_bw.rs:219) ===
+=== HIT bp2 at scx_simulator::safe::cgroup_bw::BandwidthManager::charge::haf40737a5b700b6a (cgroup_bw.rs:219) ===
   self: BWMgr{states.children=1}
   cgid: cgid=2
-  delta_ns: 3996510
+  delta_ns: 1
   ancestor_lookup: ?
   [bp2 disabled after first hit]
-=== HIT bp1 at scx_simulator::safe::cgroup_bw::CgroupBandwidthState::charge::h4591e96a84ea7285 (cgroup_bw.rs:78) ===
+=== HIT bp1 at scx_simulator::safe::cgroup_bw::CgroupBandwidthState::charge::hd3075d931e632eca (cgroup_bw.rs:78) ===
   self: ?
-  delta_ns: 3996510
+  delta_ns: 1
   [bp1 disabled after first hit]
+[LAVD-PRINTK]  +--  (id: 1, level: 0)
+[LAVD-PRINTK]    +--  (id: 2, level: 1)
+[LAVD-PRINTK]      \_ quota: 10000000/100000000/0, period: 94458268155664, burst: 139892048452096
+[LAVD-PRINTK]      \_ nquota: 10000000, nquota_ub: 10000000, has_llcx: 1
+[LAVD-PRINTK]      \_ is_throttled: 0, nr_throttled_periods: 0/0, nr_throttled_tasks: 0
+[LAVD-PRINTK]      \_ period_budget: 9223372036854775807, burst_remaining: 0
+[LAVD-PRINTK]      \_ runtime_total_sloppy: 0, runtime_total_last: 0
 
 Simulation complete:
   Logical time elapsed:   80ms
   Total tasks:            16
   Max concurrent running: 4
-  Total time slices:      4
+  Total time slices:      6
   Tasks at end:           16 alive, 16 runnable
 
 Sched_ext structop summary:
      cpu   structops         rbc      kfuncs
   ------  ----------  ----------  ----------
-       0         123       14647         361
-       1          16        1183          38
-       2          16        1183          38
-       3          16        1183          38
+       0         131       20729         392
+       1          17        1059          41
+       2          20        1515          57
+       3          17        1059          41
   ------  ----------  ----------  ----------
-   total         171       18196         475
+   total         185       24362         531
 
 Preemption stats:
-  longest_structop_rbc:    801
-  longest_rbc_interval:    371  (between kfuncs)
+  longest_structop_rbc:    4733
+  longest_rbc_interval:    4733  (between kfuncs)
   REPLAY_MARGIN:           200
 
 Trace Summary:
-  total_events:          205
-  total_ticks:           4
+  total_events:          233
+  total_ticks:           6
   total_yields:          0
-  total_preempts:        4
+  total_preempts:        6
   total_sleeps:          0
   total_wakes:           16
   total_idle_periods:    36
-  total_idle_duration:   0.023ms
-  global_dsq_dispatches: 12
+  total_idle_duration:   0.026ms
+  global_dsq_dispatches: 18
   local_dsq_dispatches:  4
 
-scxsim: ExitKind::ErrorStall pid=1 runnable_for_ns=80000793
-Process 2722400 launched: '<REPO_ROOT>/sched-test1/scx-sim/target/release/scxsim' (x86_64)
-Process 2722400 exited with status = 42 (0x0000002a)
+scxsim: ExitKind::ErrorStall pid=1 runnable_for_ns=80002523
+Process 3992016 launched: '/home/newton/work/multi_sched-test/worktrees/scxsim-tooling-integrator/sched-test/scx-sim/target/release/scxsim' (x86_64)
+Process 3992016 exited with status = 42 (0x0000002a)
 (lldb) breakpoint list
 Current breakpoints:
 1: file = 'cgroup_bw.rs', line = 78, exact_match = 0, locations = 1 Options: disabled 
     Breakpoint commands (Python):
       lldb_lavd_formatters.print_once_and_disable(frame, bp_loc, extra_args, internal_dict)
 
-  1.1: where = scxsim`scx_simulator::safe::cgroup_bw::BandwidthManager::charge::habd39dfbf0993b6c + 272 [inlined] scx_simulator::safe::cgroup_bw::CgroupBandwidthState::charge::h4591e96a84ea7285 + 7 at cgroup_bw.rs:78:9, address = 0x0000556d6a6d1d80, unresolved, hit count = 1 
+  1.1: where = scxsim`scx_simulator::safe::cgroup_bw::BandwidthManager::charge::haf40737a5b700b6a + 272 [inlined] scx_simulator::safe::cgroup_bw::CgroupBandwidthState::charge::hd3075d931e632eca + 7 at cgroup_bw.rs:78:9, address = 0x000055e8c558ff90, unresolved, hit count = 1 
 
 2: file = 'cgroup_bw.rs', line = 219, exact_match = 0, locations = 1 Options: disabled 
     Breakpoint commands (Python):
       lldb_lavd_formatters.print_once_and_disable(frame, bp_loc, extra_args, internal_dict)
 
-  2.1: where = scxsim`scx_simulator::safe::cgroup_bw::BandwidthManager::charge::habd39dfbf0993b6c + 14 at cgroup_bw.rs:219:12, address = 0x0000556d6a6d1c7e, unresolved, hit count = 1 
+  2.1: where = scxsim`scx_simulator::safe::cgroup_bw::BandwidthManager::charge::haf40737a5b700b6a + 14 at cgroup_bw.rs:219:12, address = 0x000055e8c558fe8e, unresolved, hit count = 1 
 
 3: file = 'dsq.rs', line = 217, exact_match = 0, locations = 1 Options: disabled 
     Breakpoint commands (Python):
       lldb_lavd_formatters.print_once_and_disable(frame, bp_loc, extra_args, internal_dict)
 
-  3.1: where = scxsim`scx_simulator::safe::dsq::DsqManager::insert_vtime::h0451862616e75039 + 17 [inlined] hashbrown::map::HashMap$LT$K$C$V$C$S$C$A$GT$::get_mut::hf3531ab33db1768d at map.rs:1457:13, address = 0x0000556d6a727ea1, unresolved, hit count = 1 
+  3.1: where = scxsim`scx_simulator::safe::dsq::DsqManager::insert_vtime::h483aaba47f268ed5 + 17 [inlined] hashbrown::map::HashMap$LT$K$C$V$C$S$C$A$GT$::get_mut::h0cf06ab5d0e6e3ca at map.rs:1457:13, address = 0x000055e8c55cae81, unresolved, hit count = 1 
 
-4: file = 'engine.rs', line = 1222, exact_match = 0, locations = 1 Options: disabled 
+4: file = 'engine.rs', line = 1266, exact_match = 0, locations = 1 Options: disabled 
     Breakpoint commands (Python):
       lldb_lavd_formatters.print_once_and_disable(frame, bp_loc, extra_args, internal_dict)
 
-  4.1: where = scxsim`scx_simulator::safe::engine::Simulator$LT$S$GT$::process_event_inner::h8d0c32c838831790 + 8237 [inlined] scx_simulator::safe::engine::Simulator$LT$S$GT$::check_watchdog::h70ed9b84d53f5344 + 112 at engine.rs:1222:24, address = 0x0000556d6a5d0f5d, unresolved, hit count = 1 
+  4.1: where = scxsim`scx_simulator::safe::engine::Simulator$LT$S$GT$::process_event_inner::h16cef0dcc6d48297 + 9138 [inlined] scx_simulator::safe::engine::Simulator$LT$S$GT$::check_watchdog::h0aa470a0999de16a + 101 at engine.rs:1266:16, address = 0x000055e8c548dc42, unresolved, hit count = 1 
 
 (lldb) quit

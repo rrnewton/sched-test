@@ -165,6 +165,7 @@ scx-sim/
 ├── schedulers/           # Scheduler source and build system
 ├── workloads/            # Example rt-app JSON workload specs
 ├── scripts/              # Benchmarking and utility scripts
+├── lldb_debug/           # lldb data formatters + bug1_diagnose helper (see Debugging)
 ├── CLAUDE.md             # Development guidelines (for contributors and AI agents)
 └── OPTIMIZATION.md       # Performance optimization guide
 ```
@@ -179,12 +180,35 @@ scx-sim/
 cargo nextest run        # or: cargo test
 ```
 
+## Debugging
+
+scxsim runs as a normal userspace process, so any debugger that handles
+Rust release binaries works. We ship a small set of LAVD-focused lldb
+data formatters and a `bug1_diagnose` custom command under
+[`lldb_debug/`](lldb_debug/README.md). They were authored for the
+cgroup-bandwidth runnable-task stall (cpu-bw-stall-bug / H6 path) but
+are reusable for any LAVD investigation that needs pretty-printed
+`SimTask`, `BandwidthManager`, `DsqId`, etc.
+
+End-to-end demo (uses the canonical Bug-1 reproducer):
+
+```bash
+./scx-sim/lldb_debug/worked_example.sh
+```
+
+See [`lldb_debug/README.md`](lldb_debug/README.md) for the full
+formatter inventory, usage in interactive sessions, and known
+limitations.
+
 ## Documentation
 
 - **[CLAUDE.md](CLAUDE.md)** — Development guidelines, coding conventions,
   system dependency details, and workflow instructions.
 - **[OPTIMIZATION.md](OPTIMIZATION.md)** — Performance patterns and
   benchmarking methodology.
+- **[lldb_debug/README.md](lldb_debug/README.md)** — lldb data formatters
+  and `bug1_diagnose` command for debugging LAVD scheduler state inside
+  scxsim.
 
 ## License
 
