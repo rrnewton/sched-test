@@ -1,0 +1,149 @@
+#!/usr/bin/env bpftrace
+/*
+ * structops_kernelside.bt — JSONL tracer for sched_ext structop callbacks,
+ * attached at the KERNEL-SIDE scheduler-class entry points (the
+ * `*_task_scx*` family + a few siblings).
+ *
+ * Why not `kprobe:sched_ext_ops__*` (the original structops_full.bt)?
+ *
+ *   The `sched_ext_ops__*` symbols are listed in /proc/kallsyms and bpftrace
+ *   reports `Attached N probes` cleanly — but THE PROBES NEVER FIRE under
+ *   real load (verified empirically on devbig176 6.16.1-fbk2 + bpftrace
+ *   v0.25 with scx_lavd a08c9e272b: 0 events in 5s of full LAVD load).
+ *   These wrappers are BPF-trampoline trampoline-jump targets for fentry
+ *   tracing — not real kernel call sites the dispatcher routes through.
+ *
+ * The kernel-side `*_task_scx*` family ARE the real call sites where
+ * Linux's scheduler core invokes the BPF scheduler's ops:
+ *
+ *   enqueue_task_scx   → ops.enqueue, ops.runnable
+ *   dequeue_task_scx   → ops.dequeue, ops.quiescent
+ *   pick_task_scx      → ops.dispatch  (called via balance_scx)
+ *   balance_scx        → ops.dispatch  (the kernel side of dispatch)
+ *   put_prev_task_scx  → ops.stopping
+ *   set_next_task_scx  → ops.running
+ *   task_tick_scx      → ops.tick
+ *   select_task_rq_scx → ops.select_cpu
+ *   task_woken_scx     → ops.runnable (when task wakes)
+ *   __scx_update_idle  → ops.update_idle
+ *
+ * Each kernel function fires on every scheduling event. Args are kernel
+ * positional: typically (struct rq *rq, struct task_struct *p, int flags).
+ * We project pid via task_struct->pid; cpu via bpftrace's `cpu` builtin.
+ *
+ * The emitted JSON `name` field uses the LOGICAL STRUCTOP NAME, NOT the
+ * kernel-symbol name, so that scripts/compare_live_vs_scxsim_calls.py can
+ * match each live record to scxsim's `--structops-jsonl` output without
+ * a name-mapping table.
+ *
+ * Schema (one line per kprobe hit):
+ *   {"ts_ns":<u64>,"cpu":<i32>,"pid":<i32>,
+ *    "kind":"structop","name":"<op>","phase":"entry","args":{...},"ret":null}
+ *
+ * Tested: kernel 6.16.1-fbk2 on devbig176; bpftrace v0.25.0-be6e (May 2026).
+ * Tg:     explore-1-live-bpftrace-capture-stall-on-devbig176
+ *
+ * Usage:
+ *   sudo bpftrace structops_kernelside.bt        # all PIDs
+ *   sudo bpftrace structops_kernelside.bt 12345  # filter to PID 12345
+ */
+
+/*
+ * NB: The wildcard suffix `.llvm.<hash>` is appended by LTO; bpftrace
+ * resolves these via wildcard matching. We use trailing `*` so the probe
+ * works across kernel rebuilds with different hash suffixes.
+ */
+
+kprobe:enqueue_task_scx*
+/$1 == 0 || ((struct task_struct *)arg1)->pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    $p = (struct task_struct *)arg1;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"structop\",\"name\":\"enqueue\",\"phase\":\"entry\",\"args\":{\"task_pid\":%d,\"task_comm\":\"%s\",\"enq_flags\":%llu},\"ret\":null}\n",
+           $ts, $c, $p->pid, $p->pid, str($p->comm), (uint64)arg2);
+}
+
+kprobe:dequeue_task_scx*
+/$1 == 0 || ((struct task_struct *)arg1)->pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    $p = (struct task_struct *)arg1;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"structop\",\"name\":\"dequeue\",\"phase\":\"entry\",\"args\":{\"task_pid\":%d,\"task_comm\":\"%s\",\"deq_flags\":%llu},\"ret\":null}\n",
+           $ts, $c, $p->pid, $p->pid, str($p->comm), (uint64)arg2);
+}
+
+kprobe:pick_task_scx*
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":0,\"kind\":\"structop\",\"name\":\"dispatch\",\"phase\":\"entry\",\"args\":{\"prev_cpu\":%d,\"prev_pid\":-1},\"ret\":null}\n",
+           $ts, $c, $c);
+}
+
+kprobe:balance_scx*
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":0,\"kind\":\"structop\",\"name\":\"balance\",\"phase\":\"entry\",\"args\":{\"prev_cpu\":%d},\"ret\":null}\n",
+           $ts, $c, $c);
+}
+
+kprobe:put_prev_task_scx*
+/$1 == 0 || ((struct task_struct *)arg1)->pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    $p = (struct task_struct *)arg1;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"structop\",\"name\":\"stopping\",\"phase\":\"entry\",\"args\":{\"task_pid\":%d,\"task_comm\":\"%s\"},\"ret\":null}\n",
+           $ts, $c, $p->pid, $p->pid, str($p->comm));
+}
+
+kprobe:set_next_task_scx*
+/$1 == 0 || ((struct task_struct *)arg1)->pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    $p = (struct task_struct *)arg1;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"structop\",\"name\":\"running\",\"phase\":\"entry\",\"args\":{\"task_pid\":%d,\"task_comm\":\"%s\"},\"ret\":null}\n",
+           $ts, $c, $p->pid, $p->pid, str($p->comm));
+}
+
+kprobe:task_tick_scx*
+/$1 == 0 || ((struct task_struct *)arg1)->pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    $p = (struct task_struct *)arg1;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"structop\",\"name\":\"tick\",\"phase\":\"entry\",\"args\":{\"task_pid\":%d,\"task_comm\":\"%s\"},\"ret\":null}\n",
+           $ts, $c, $p->pid, $p->pid, str($p->comm));
+}
+
+kprobe:select_task_rq_scx*
+/$1 == 0 || ((struct task_struct *)arg0)->pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    $p = (struct task_struct *)arg0;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"structop\",\"name\":\"select_cpu\",\"phase\":\"entry\",\"args\":{\"task_pid\":%d,\"task_comm\":\"%s\",\"prev_cpu\":%d,\"wake_flags\":%llu},\"ret\":null}\n",
+           $ts, $c, $p->pid, $p->pid, str($p->comm), (int32)arg1, (uint64)arg2);
+}
+
+kprobe:task_woken_scx*
+/$1 == 0 || ((struct task_struct *)arg1)->pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    $p = (struct task_struct *)arg1;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"structop\",\"name\":\"runnable\",\"phase\":\"entry\",\"args\":{\"task_pid\":%d,\"task_comm\":\"%s\",\"enq_flags\":0},\"ret\":null}\n",
+           $ts, $c, $p->pid, $p->pid, str($p->comm));
+}
+
+kprobe:update_curr_scx*
+/$1 == 0 || ((struct rq *)arg0)->curr->pid == $1/
+{
+    $ts = nsecs; $c = cpu;
+    $rq = (struct rq *)arg0;
+    $p = $rq->curr;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"structop\",\"name\":\"update_curr\",\"phase\":\"entry\",\"args\":{\"task_pid\":%d,\"task_comm\":\"%s\"},\"ret\":null}\n",
+           $ts, $c, $p->pid, $p->pid, str($p->comm));
+}
+
+kprobe:__scx_update_idle*
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":0,\"kind\":\"structop\",\"name\":\"update_idle\",\"phase\":\"entry\",\"args\":{\"cpu_arg\":%d,\"idle\":%d},\"ret\":null}\n",
+           $ts, $c, (int32)arg0, (int32)arg1);
+}

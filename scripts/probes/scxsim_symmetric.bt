@@ -1,0 +1,164 @@
+#!/usr/bin/env bpftrace
+/*
+ * scxsim_symmetric.bt — JSONL tracer matched to scxsim's --structops-jsonl
+ * emit set, for direct apples-to-apples diff via
+ * scripts/compare_live_vs_scxsim_calls.py.
+ *
+ * Emits ONLY the structops + helpers that scxsim's
+ * `safe::structops_jsonl::emit_event` actually emits — currently 9 unique
+ * (kind, name) tuples on the simulator side. Capturing only this set on
+ * the live side keeps event volume tractable AND keeps the comparison
+ * meaningful: calls outside this set are scxsim coverage gaps and should
+ * be added to scxsim BEFORE attempting live-vs-sim diff against them, per
+ * the No-Stub / No-Fake-Approximation rule.
+ *
+ * COMM FILTER: hard-coded to "yes" (the cpu-bw-stall-bug Recipe C
+ * workload). Without this filter the probe set generates ~30 MB/s and
+ * loses millions of events to perf ringbuffer overflow on a 176-core
+ * box. Edit per workload (yes → rt-app → ...).
+ *
+ * Live attach points (kernel-side scheduler-class entry points + scx_bpf_*
+ * helpers; the BPF struct_ops trampolines `sched_ext_ops__*` look right but
+ * never fire under load — verified empirically on devbig176 6.16.1-fbk2):
+ *
+ *   structop "select_cpu" ← kprobe:select_task_rq_scx*  (filtered task)
+ *   structop "enqueue"    ← kprobe:enqueue_task_scx*    (filtered task)
+ *   structop "running"    ← kprobe:set_next_task_scx*   (filtered task)
+ *   structop "stopping"   ← kprobe:put_prev_task_scx*   (filtered task)
+ *   structop "tick"       ← kprobe:task_tick_scx*       (filtered task)
+ *   structop "dispatch"   ← kprobe:pick_task_scx*       (PER-CPU; not
+ *                            filtered — but comm-filtered helper fan-out
+ *                            below makes the per-CPU dispatch volume
+ *                            reasonable)
+ *   helper "dsq_insert"        ← fentry:scx_bpf_dsq_insert        (filtered)
+ *   helper "dsq_insert_vtime"  ← fentry:scx_bpf_dsq_insert_vtime  (filtered)
+ *   helper "dsq_move_to_local" ← fentry:scx_bpf_dsq_move_to_local (UNFILT;
+ *                                  no task arg — the fexit pair is what
+ *                                  scxsim emits)
+ *   helper "kick_cpu"          ← fentry:scx_bpf_kick_cpu          (filtered)
+ *
+ * Schema (one line per record):
+ *   {"ts_ns":<u64>,"cpu":<i32>,"pid":<i32>,
+ *    "kind":"<structop|helper>","name":"<op>","phase":"<entry|exit>",
+ *    "args":{...},"ret":<val|null>}
+ *
+ * Schema is byte-compatible with scxsim's --structops-jsonl emitter.
+ *
+ * Tg: explore-1-live-bpftrace-capture-stall-on-devbig176
+ *
+ * Recommended env:
+ *   BPFTRACE_PERF_RB_PAGES=512   (default 64; insufficient for 176 cores)
+ *
+ * Usage:
+ *   sudo BPFTRACE_PERF_RB_PAGES=512 bpftrace scxsim_symmetric.bt
+ */
+
+/* ===================== STRUCTOPS (kernel-side) ====================== */
+
+kprobe:select_task_rq_scx*
+/str(((struct task_struct *)arg0)->comm) == "yes"/
+{
+    $ts = nsecs; $c = cpu;
+    $p = (struct task_struct *)arg0;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"structop\",\"name\":\"select_cpu\",\"phase\":\"entry\",\"args\":{\"task_pid\":%d,\"task_comm\":\"%s\",\"prev_cpu\":%d,\"wake_flags\":%llu},\"ret\":null}\n",
+           $ts, $c, $p->pid, $p->pid, str($p->comm), (int32)arg1, (uint64)arg2);
+}
+
+kprobe:enqueue_task_scx*
+/str(((struct task_struct *)arg1)->comm) == "yes"/
+{
+    $ts = nsecs; $c = cpu;
+    $p = (struct task_struct *)arg1;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"structop\",\"name\":\"enqueue\",\"phase\":\"entry\",\"args\":{\"task_pid\":%d,\"task_comm\":\"%s\",\"enq_flags\":%llu},\"ret\":null}\n",
+           $ts, $c, $p->pid, $p->pid, str($p->comm), (uint64)arg2);
+}
+
+kprobe:set_next_task_scx*
+/str(((struct task_struct *)arg1)->comm) == "yes"/
+{
+    $ts = nsecs; $c = cpu;
+    $p = (struct task_struct *)arg1;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"structop\",\"name\":\"running\",\"phase\":\"entry\",\"args\":{\"task_pid\":%d,\"task_comm\":\"%s\"},\"ret\":null}\n",
+           $ts, $c, $p->pid, $p->pid, str($p->comm));
+}
+
+kprobe:put_prev_task_scx*
+/str(((struct task_struct *)arg1)->comm) == "yes"/
+{
+    $ts = nsecs; $c = cpu;
+    $p = (struct task_struct *)arg1;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"structop\",\"name\":\"stopping\",\"phase\":\"entry\",\"args\":{\"task_pid\":%d,\"task_comm\":\"%s\"},\"ret\":null}\n",
+           $ts, $c, $p->pid, $p->pid, str($p->comm));
+}
+
+kprobe:task_tick_scx*
+/str(((struct task_struct *)arg1)->comm) == "yes"/
+{
+    $ts = nsecs; $c = cpu;
+    $p = (struct task_struct *)arg1;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"structop\",\"name\":\"tick\",\"phase\":\"entry\",\"args\":{\"task_pid\":%d,\"task_comm\":\"%s\"},\"ret\":null}\n",
+           $ts, $c, $p->pid, $p->pid, str($p->comm));
+}
+
+/*
+ * pick_task_scx fires per-CPU per scheduling decision; no task arg to
+ * filter. Filter via the curr task on the rq — when the CPU is about to
+ * pick a new task, the prev (current) task is in rq->curr. If the prev
+ * is one of OUR workers, this dispatch is interesting.
+ */
+kprobe:pick_task_scx*
+/str(((struct rq *)arg0)->curr->comm) == "yes"/
+{
+    $ts = nsecs; $c = cpu;
+    $rq = (struct rq *)arg0;
+    $p = $rq->curr;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"structop\",\"name\":\"dispatch\",\"phase\":\"entry\",\"args\":{\"prev_cpu\":%d,\"prev_pid\":%d,\"prev_comm\":\"%s\"},\"ret\":null}\n",
+           $ts, $c, $p->pid, $c, $p->pid, str($p->comm));
+}
+
+/* ====================== HELPERS (BPF-side, fentry) ===================== */
+
+fentry:vmlinux:scx_bpf_dsq_insert
+/comm == "yes"/
+{
+    $ts = nsecs;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"helper\",\"name\":\"dsq_insert\",\"phase\":\"entry\",\"args\":{\"task_pid\":%d,\"dsq_id\":%llu,\"slice\":%llu,\"enq_flags\":%llu},\"ret\":null}\n",
+           $ts, cpu, pid, args.p->pid, args.dsq_id, args.slice, args.enq_flags);
+}
+
+fentry:vmlinux:scx_bpf_dsq_insert_vtime
+/comm == "yes"/
+{
+    $ts = nsecs;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"helper\",\"name\":\"dsq_insert_vtime\",\"phase\":\"entry\",\"args\":{\"task_pid\":%d,\"dsq_id\":%llu,\"slice\":%llu,\"vtime\":%llu,\"enq_flags\":%llu},\"ret\":null}\n",
+           $ts, cpu, pid, args.p->pid, args.dsq_id, args.slice, args.vtime, args.enq_flags);
+}
+
+/*
+ * dsq_move_to_local has NO task arg; capture entry+exit but don't try to
+ * filter. Reasonable volume: fires once per CPU per scheduling decision
+ * looking for a task to consume.
+ */
+fentry:vmlinux:scx_bpf_dsq_move_to_local
+/comm == "yes" || comm == "swapper" || comm == "kworker"/
+{
+    $ts = nsecs;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"helper\",\"name\":\"dsq_move_to_local\",\"phase\":\"entry\",\"args\":{\"dsq_id\":%llu},\"ret\":null}\n",
+           $ts, cpu, pid, args.dsq_id);
+}
+
+fexit:vmlinux:scx_bpf_dsq_move_to_local
+/comm == "yes" || comm == "swapper" || comm == "kworker"/
+{
+    $ts = nsecs;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"helper\",\"name\":\"dsq_move_to_local\",\"phase\":\"exit\",\"args\":{},\"ret\":%llu}\n",
+           $ts, cpu, pid, (uint64)retval);
+}
+
+fentry:vmlinux:scx_bpf_kick_cpu
+/comm == "yes"/
+{
+    $ts = nsecs;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"helper\",\"name\":\"kick_cpu\",\"phase\":\"entry\",\"args\":{\"cpu_arg\":%d,\"flags\":%llu},\"ret\":null}\n",
+           $ts, cpu, pid, args.cpu, args.flags);
+}

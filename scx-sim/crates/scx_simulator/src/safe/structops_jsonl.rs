@@ -180,9 +180,10 @@ fn emit_event(event: &TraceEvent, writer: &mut impl Write) -> io::Result<()> {
         | TraceKind::IrqStart { .. }
         | TraceKind::IrqEnd { .. }
         | TraceKind::CgroupBwCharge { .. }
-        | TraceKind::CgroupBwThrottle { .. }
-        | TraceKind::CgroupBwDenied { .. }
-        | TraceKind::CgroupBwRefill { .. } => {}
+        | TraceKind::CgroupBwDenied { .. } => {}
+        // CgroupBwThrottle / CgroupBwRefill were removed by simulator.v6
+        // PR #28 (BandwidthManager shrink); the library is now the single
+        // source of truth and these scxsim-side mirrors no longer exist.
     }
 
     // Suppress unused-variable warnings for IrqType / DispatchRejectReason
@@ -297,7 +298,8 @@ mod tests {
         trace.record(
             300,
             CpuId(0),
-            TraceKind::CgroupBwThrottle {
+            TraceKind::CgroupBwDenied {
+                pid: Pid(99),
                 cgid: crate::cgroup::CgroupId(7),
             },
         );
