@@ -129,6 +129,24 @@ impl PreemptModeArg {
     }
 }
 
+/// Selects the on-disk format for `--perfetto`.
+///
+/// `Json` keeps the legacy Chrome Trace Event Format that earlier
+/// scxsim builds always wrote; `Perfetto` writes the newer
+/// wprof-compatible Perfetto protobuf with `TrackEvent` slices and
+/// `debug_annotations`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+pub enum TraceFormat {
+    /// Chrome Trace Event JSON (default; backward-compatible, loadable
+    /// in <https://ui.perfetto.dev>).
+    #[default]
+    Json,
+    /// wprof-compatible Perfetto protobuf (loadable by scxtop's
+    /// `load_perfetto_trace`; suitable for side-by-side comparison
+    /// with wprof traces).
+    Perfetto,
+}
+
 /// sched_ext simulator.
 #[derive(Parser)]
 #[command(name = "scxsim", about = "sched_ext simulator")]
@@ -268,9 +286,24 @@ struct RunArgs {
     #[arg(long, value_name = "MS")]
     warmup_ms: Option<u64>,
 
-    /// Write Perfetto trace JSON to file.
+    /// Write Perfetto trace to file. The default format is Chrome
+    /// Trace Event JSON (loadable in <https://ui.perfetto.dev>);
+    /// pass `--trace-format perfetto` to write a wprof-compatible
+    /// Perfetto protobuf instead (loadable by scxtop's
+    /// `load_perfetto_trace` and side-by-side with wprof traces).
     #[arg(long, value_name = "PATH")]
     perfetto: Option<PathBuf>,
+
+    /// Output format for `--perfetto`.
+    ///
+    /// `json` (default) keeps backward-compatible Chrome JSON output.
+    /// `perfetto` emits a wprof-compatible Perfetto protobuf
+    /// (TrackEvent slices/instants with `debug_annotations` matching
+    /// wprof's vocabulary; see
+    /// `experiments/wprof_trace_baseline_20260513/REPORT.md` §3 for
+    /// the wprof event schema).
+    #[arg(long, value_name = "FMT", default_value = "json")]
+    trace_format: TraceFormat,
 
     /// Print trace events to stderr.
     #[arg(long)]
@@ -1254,10 +1287,12 @@ fn run_simulation(args: &RunArgs, scenario: Scenario) -> Result<(), RunError> {
     if let Some(path) = &args.perfetto {
         let mut file = std::fs::File::create(path)
             .map_err(|e| format!("failed to create {}: {e}", path.display()))?;
-        trace
-            .write_perfetto_json(&mut file)
-            .map_err(|e| format!("failed to write perfetto trace: {e}"))?;
-        eprintln!("wrote perfetto trace to {}", path.display());
+        let (write_result, fmt_label) = match args.trace_format {
+            TraceFormat::Json => (trace.write_perfetto_json(&mut file), "chrome-json"),
+            TraceFormat::Perfetto => (trace.write_perfetto_pb(&mut file), "wprof-perfetto-pb"),
+        };
+        write_result.map_err(|e| format!("failed to write perfetto trace: {e}"))?;
+        eprintln!("wrote perfetto trace ({fmt_label}) to {}", path.display());
     }
 
     // Record preemption trace if requested.
