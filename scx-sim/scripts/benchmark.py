@@ -480,7 +480,7 @@ def generate_bar_chart_html(
 def generate_history_html(csv_path: Path, html_path: Path) -> None:
     """Generate a time-series dashboard from historical benchmark CSV."""
     try:
-        import pandas as pd  # type: ignore[import-untyped]
+        import pandas as pd
         import plotly.graph_objects as go
         from plotly.subplots import make_subplots
     except ImportError:
@@ -544,8 +544,10 @@ def generate_history_html(csv_path: Path, html_path: Path) -> None:
         fig.update_yaxes(title_text="Speedup factor", row=plot_idx + 1, col=1)
 
     # Aggregate
-    agg = df.groupby(["git_depth", "git_commit", "config"])["speedup_factor"].mean()
-    agg = agg.reset_index()
+    agg = df.groupby(
+        ["git_depth", "git_commit", "config"],
+        as_index=False,
+    )["speedup_factor"].mean()
     for config in configs:
         cfg_agg = agg[agg["config"] == config].sort_values("git_depth")
         if cfg_agg.empty:

@@ -31,7 +31,7 @@ commands -- all across independent Bash invocations.
 
 ```bash
 # Start scxsim with --wait-debugger
-./target/release/scxsim run <workload> --scheduler <name> --wait-debugger > /tmp/debug.out 2>&1 &
+./target/release/scxsim simulate <workload> --scheduler <name> --wait-debugger > /tmp/debug.out 2>&1 &
 sleep 2
 PID=$(grep -oP 'PID:\s+\K\d+' /tmp/debug.out | head -1)
 SCRIPT=$(grep -oP 'command source \K[^"]+' /tmp/debug.out)
@@ -113,7 +113,7 @@ tmux kill-session -t debug 2>/dev/null
 The tmux approach works identically with rr replay sessions:
 
 ```bash
-rr record -- ./target/release/scxsim run <workload> --scheduler <name>
+rr record -- ./target/release/scxsim simulate <workload> --scheduler <name>
 GDB_SCRIPT=$(find target/release/build -name "libscx_<name>.gdb" | head -1)
 tmux new-session -d -s rr-debug "rr replay -d /usr/bin/gdb -- -x $GDB_SCRIPT"
 # Then same send-keys/capture-pane pattern
@@ -126,7 +126,7 @@ for scheduler `.so` function breakpoints.
 
 ```bash
 # === Bash call 1: Start the session ===
-./target/release/scxsim run workloads/simple_wake.json \
+./target/release/scxsim simulate workloads/simple_wake.json \
     --scheduler simple --wait-debugger > /tmp/debug.out 2>&1 &
 sleep 2
 PID=$(grep -oP 'PID:\s+\K\d+' /tmp/debug.out | head -1)
@@ -216,7 +216,7 @@ do not need interactive decision-making.
 
 ```bash
 # 1. Start simulation in background with --wait-debugger
-./target/release/scxsim run \
+./target/release/scxsim simulate \
     crates/scx_simulator/workloads/simple_wake.json \
     --scheduler simple --seed 42 --wait-debugger \
     > /tmp/debug-wait.out 2>&1 &
@@ -246,7 +246,7 @@ kill $BGPID 2>/dev/null; wait $BGPID 2>/dev/null
 ### 4.2 gdb Batch Mode with --wait-debugger
 
 ```bash
-./target/release/scxsim run workload.json --scheduler simple --seed 42 \
+./target/release/scxsim simulate workload.json --scheduler simple --seed 42 \
     --wait-debugger > /tmp/debug-wait.out 2>&1 &
 sleep 3
 
@@ -269,7 +269,7 @@ contains extensions that crash GDB 9.1 when attaching to this binary).
 
 ```bash
 # 1. Record
-rr record -- ./target/release/scxsim run \
+rr record -- ./target/release/scxsim simulate \
     crates/scx_simulator/workloads/simple_wake.json \
     --scheduler simple --seed 42
 
@@ -324,8 +324,8 @@ investigate.
 Tested and confirmed: two runs with `--seed 42` produce byte-identical output:
 
 ```bash
-RUN1=$(./target/release/scxsim run workload.json --scheduler simple --seed 42 2>&1)
-RUN2=$(./target/release/scxsim run workload.json --scheduler simple --seed 42 2>&1)
+RUN1=$(./target/release/scxsim simulate workload.json --scheduler simple --seed 42 2>&1)
+RUN2=$(./target/release/scxsim simulate workload.json --scheduler simple --seed 42 2>&1)
 # RUN1 == RUN2 : CONFIRMED
 ```
 
@@ -360,7 +360,7 @@ when reverse execution is needed, use rr.
 ### 6.1 Recording
 
 ```bash
-rr record -- ./target/release/scxsim run \
+rr record -- ./target/release/scxsim simulate \
     crates/scx_simulator/workloads/simple_wake.json \
     --scheduler simple --seed 42
 ```

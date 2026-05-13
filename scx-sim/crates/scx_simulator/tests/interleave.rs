@@ -1281,7 +1281,7 @@ fn test_checkpoint_divergence_detection() {
 /// The replay trace mechanism (PMU + HW breakpoints) is NOT tested here
 /// because it depends on hardware-level PMU precision that varies across
 /// environments. For PMU replay testing, use the CLI:
-///   cargo run -- run --scheduler simple --preemptive --seed=42 \
+///   cargo run -- simulate --scheduler simple --preemptive --seed=42 \
 ///     --record-preemptions /tmp/preempts workloads/simple.json
 #[test]
 fn test_replay_determinism() {
