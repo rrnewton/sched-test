@@ -276,6 +276,23 @@ pub fn free_cgroup_raw(raw: *mut c_void) {
     }
 }
 
+/// Safe wrapper for `sim_get_default_cgroup_init_args`.
+///
+/// Phase 2 (tg `compile-scx-cgroup-bw-library-into-scxsim-phase2`):
+/// returns a pointer to the C-side static `struct scx_cgroup_init_args`
+/// (defined in `csrc/sim_cgroup.c`) that the engine passes to
+/// `scheduler.cgroup_init` in place of the pre-Phase-2 NULL pointer.
+/// The pointer targets a static singleton; the library reads it once
+/// per cgroup_init call and does not retain it.
+///
+/// Safe wrapper because the underlying C function returns a pointer to
+/// a process-lifetime static -- no mutation risk, no aliasing UB.
+pub fn default_cgroup_init_args() -> *mut c_void {
+    // SAFETY: target is a process-lifetime static populated at link
+    // time; the function has no preconditions.
+    unsafe { ffi::sim_get_default_cgroup_init_args() }
+}
+
 // ---------------------------------------------------------------------------
 // CssIterGuard — safe wrapper for the C-side CSS iterator
 // ---------------------------------------------------------------------------

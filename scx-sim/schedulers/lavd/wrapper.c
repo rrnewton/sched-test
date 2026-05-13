@@ -1038,6 +1038,49 @@ __attribute__((weak)) int scx_cgroup_bw_dump(
 #define arena_spin_unlock(lock) ((void)(lock))
 #define arena_spin_trylock(lock) ({ (void)(lock); 0; })
 
+/*
+ * bpf_map_delete_elem: same helper-defs-pointer pattern as
+ * bpf_cgrp_storage_get below. scxsim already overrides
+ * bpf_map_lookup_elem and bpf_map_update_elem via
+ * `lib/scxtest/scx_test_map.h`, but not bpf_map_delete_elem. Route to
+ * scx_test_map_delete_elem (Phase 1 item 5).
+ */
+extern int scx_test_map_delete_elem(void *map, const void *key);
+#undef bpf_map_delete_elem
+#define bpf_map_delete_elem(map, key) scx_test_map_delete_elem((map), (key))
+
+/*
+ * bpf_cgrp_storage_get / _delete: ROOT CAUSE of the post-lavd_init
+ * SIGSEGV PC=0xd2 in early Stage B testing. The libbpf helper-defs
+ * header `bpf_helper_defs.h` declares these as static function pointers
+ * initialized to the helper ID number:
+ *
+ *   static long (*bpf_cgrp_storage_get)(struct bpf_map *, struct cgroup *,
+ *                                        void *, __u64) = (void *) 210;
+ *   static long (*bpf_cgrp_storage_delete)(struct bpf_map *, struct cgroup *)
+ *                                        = (void *) 211;
+ *
+ * In a real BPF program these "calls" become BPF_CALL insns the verifier
+ * lowers to kernel helper invocations. In our userspace .so, the call
+ * site loads the literal 210 (= 0xd2) into a register and `call *rax`s
+ * it -- straight into a NULL-page SIGSEGV. The Rust kfuncs.rs strong
+ * symbols never get a chance to resolve because the compiler emitted a
+ * constant load, not an external symbol reference.
+ *
+ * Fix: macro-override BEFORE cgroup_bw.bpf.c is included so the call
+ * site bypasses the helper-ID pointer entirely and routes directly to
+ * scxsim's scx_test_cgrp_storage_get / _delete (Phase 1 item 5).
+ */
+extern void *scx_test_cgrp_storage_get(void *map, const void *cgrp_ptr_loc,
+				       void *value, unsigned long flags);
+extern int scx_test_cgrp_storage_delete(void *map, const void *cgrp_ptr_loc);
+#undef bpf_cgrp_storage_get
+#define bpf_cgrp_storage_get(map, cgrp, value, flags) \
+	scx_test_cgrp_storage_get((map), (const void *)&(cgrp), (value), (flags))
+#undef bpf_cgrp_storage_delete
+#define bpf_cgrp_storage_delete(map, cgrp) \
+	scx_test_cgrp_storage_delete((map), (const void *)&(cgrp))
+
 /* bpf_iter_css_*: route LAVD's `bpf_for_each(css, pos, root, flags)`
  * to scxsim's Phase 1 item 3 flags-aware iterator (sim_bpf_iter_css_*
  * in csrc/sim_cgroup.c). Without these overrides, dlopen leaves
@@ -1054,8 +1097,19 @@ extern void sim_bpf_iter_css_destroy(struct bpf_iter_css *it);
 #define bpf_iter_css_new(it, start, flags) sim_bpf_iter_css_new((it), (start), (flags))
 #undef bpf_iter_css_next
 #define bpf_iter_css_next(it) sim_bpf_iter_css_next(it)
+/*
+ * IMPORTANT: bpf_iter_css_destroy must be an OBJECT-like macro (no
+ * parenthesized parameter list) -- not a function-like macro. The
+ * libbpf `bpf_for_each(type, cur, args...)` macro at
+ * `<bpf/bpf_helpers.h>:380` references the destroy as a bare
+ * identifier inside `__attribute__((cleanup(bpf_iter_css_destroy)))`
+ * (no `(`), so a function-like macro definition would NOT expand and
+ * cleanup would call the helper-defs NULL pointer at scope exit.
+ * Object-like substitution makes the cleanup attribute reference
+ * `sim_bpf_iter_css_destroy` directly -- which is the real function.
+ */
 #undef bpf_iter_css_destroy
-#define bpf_iter_css_destroy(it) sim_bpf_iter_css_destroy(it)
+#define bpf_iter_css_destroy sim_bpf_iter_css_destroy
 
 /* scx_atq_lock / scx_atq_unlock: declared as `static __always_inline`
  * inside `scx/scheds/include/lib/atq.h` BUT only under `#ifdef __BPF__`.

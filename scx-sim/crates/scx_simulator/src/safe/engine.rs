@@ -28,6 +28,7 @@ use crate::preempt::{
 use crate::scenario::{
     CgroupCpusetChangeEvent, CgroupCreateEvent, CgroupDestroyEvent, IrqType, PreemptMode, Scenario,
 };
+use crate::cgroup_wrapper::default_cgroup_init_args;
 use crate::scheduler_wrapper::{OptionalPtr, SchedulerWrapper, TaskPtr};
 use crate::sim_task::SimTask;
 use crate::task::{OpsTaskState, Phase, TaskState};
@@ -1595,10 +1596,20 @@ impl<S: Scheduler> Simulator<S> {
                 start_rbc(&mut s.sim);
                 #[allow(unused_assignments)]
                 let mut rc = 0i32;
+                // Phase 2 (tg `compile-scx-cgroup-bw-library-into-scxsim-phase2`):
+                // pre-Phase-2 we passed `OptionalPtr::null()` because the
+                // weak `scx_cgroup_bw_init` shim accepted NULL safely.
+                // The compiled-in cgroup_bw library dereferences
+                // `args->bw_period_us` at lib/cgroup_bw.bpf.c:898; pass a
+                // C-side default `struct scx_cgroup_init_args` (weight=100,
+                // period=100ms, quota=-1, burst=0) instead. Per-cgroup
+                // bandwidth still flows through the separate
+                // `cgroup_set_bandwidth` invocation below.
+                let args_ptr = OptionalPtr::new(default_cgroup_init_args());
                 sim_callback!(s, s, sim_arc, cpu, {
                     rc = self
                         .scheduler
-                        .cgroup_init(TaskPtr::new(raw), OptionalPtr::null());
+                        .cgroup_init(TaskPtr::new(raw), args_ptr);
                 });
                 charge_sched_time(&mut s.sim, CpuId(0), "cgroup_init");
                 assert!(rc == 0, "cgroup_init failed for cgid={} rc={rc}", cgid.0);
@@ -2834,10 +2845,14 @@ impl<S: Scheduler> Simulator<S> {
         s.cgroup_registry.prepare_css_iter_from_root();
         start_rbc(&mut s.sim);
         let rc;
+        // Phase 2: pass real default args (see comment at the equivalent
+        // call site near engine.rs:1601) -- compiled-in cgroup_bw library
+        // requires non-null args.
+        let args_ptr = OptionalPtr::new(default_cgroup_init_args());
         sim_callback!(s, guard, sim_arc, cpu, {
             rc = self
                 .scheduler
-                .cgroup_init(TaskPtr::new(raw), OptionalPtr::null());
+                .cgroup_init(TaskPtr::new(raw), args_ptr);
         });
         let s = &mut *guard;
         charge_sched_time(&mut s.sim, cpu, "cgroup_init");
@@ -2922,9 +2937,12 @@ impl<S: Scheduler> Simulator<S> {
             let cpu = s.sim.current_cpu;
             s.cgroup_registry.prepare_css_iter_from_root();
             start_rbc(&mut s.sim);
+            // Phase 2: pass real default args (see comment at the
+            // equivalent call site near engine.rs:1601).
+            let args_ptr = OptionalPtr::new(default_cgroup_init_args());
             sim_callback!(s, guard, sim_arc, cpu, {
                 self.scheduler
-                    .cgroup_init(TaskPtr::new(raw), OptionalPtr::null());
+                    .cgroup_init(TaskPtr::new(raw), args_ptr);
             });
             let s = &mut *guard;
             charge_sched_time(&mut s.sim, cpu, "cgroup_init");

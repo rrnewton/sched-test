@@ -108,6 +108,15 @@ extern "C" {
     pub fn sim_css_iter_add_post(cgrp: *mut c_void);
     pub fn sim_css_iter_set_root(root: *mut c_void);
 
+    // Phase 2 (tg `compile-scx-cgroup-bw-library-into-scxsim-phase2`):
+    // returns a pointer to a C-side static `struct scx_cgroup_init_args`
+    // populated with default values (weight=100, period=100ms,
+    // quota=-1=unlimited, burst=0). Used by `scheduler.cgroup_init` call
+    // sites that previously passed `OptionalPtr::null()` -- the
+    // pre-Phase-2 weak shim accepted NULL but the compiled-in cgroup_bw
+    // library dereferences `args->bw_period_us` and SIGSEGVs on NULL.
+    pub fn sim_get_default_cgroup_init_args() -> *mut c_void;
+
     // Global state reset functions for deterministic re-runs.
     // These reset lazy-initialization flags and static tables that
     // persist in the main binary across simulation runs.

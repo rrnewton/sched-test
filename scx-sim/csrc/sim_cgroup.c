@@ -283,3 +283,42 @@ bool sim_cgroup_is_dying(void *cgrp)
 	(void)cgrp;
 	return false;
 }
+
+/*
+ * Default `struct scx_cgroup_init_args` for scxsim's cgroup_init dispatch.
+ *
+ * Phase 2 (tg `compile-scx-cgroup-bw-library-into-scxsim-phase2`): pre-Phase-2
+ * scxsim called scheduler.cgroup_init with `args=NULL` because the old weak
+ * `scx_cgroup_bw_init` shim accepted NULL safely (`(void)args`). Phase 2's
+ * compiled-in cgroup_bw library DOES dereference `args->bw_period_us /
+ * bw_quota_us / bw_burst_us` at lib/cgroup_bw.bpf.c:898 (cbw_set_bandwidth
+ * call), so a NULL args crashes.
+ *
+ * The defaults below model "kernel default cpu.max" (unlimited quota, 100ms
+ * period). Per-cgroup bandwidth is still applied by the engine's separate
+ * `cgroup_set_bandwidth` invocation that happens right after `cgroup_init`
+ * in `safe/engine.rs:1610`. The args struct is read once and not retained
+ * by the library, so a single shared singleton is safe.
+ *
+ * Layout MUST match `struct scx_cgroup_init_args` in
+ * `scheds/vmlinux/arch/x86/vmlinux-v7.0-rc2-g28c4ef2b2e57.h:130814`:
+ *   { u32 weight; u64 bw_period_us; u64 bw_quota_us; u64 bw_burst_us; }.
+ */
+struct sim_scx_cgroup_init_args {
+	unsigned int		weight;
+	unsigned long long	bw_period_us;
+	unsigned long long	bw_quota_us;
+	unsigned long long	bw_burst_us;
+};
+
+static struct sim_scx_cgroup_init_args sim_default_cgroup_init_args = {
+	.weight = 100,
+	.bw_period_us = 100000,                   /* 100 ms */
+	.bw_quota_us = (unsigned long long)-1,    /* CBW_RUNTUME_INF_RAW */
+	.bw_burst_us = 0,
+};
+
+void *sim_get_default_cgroup_init_args(void)
+{
+	return &sim_default_cgroup_init_args;
+}
