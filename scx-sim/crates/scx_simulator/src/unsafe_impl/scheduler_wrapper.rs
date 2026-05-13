@@ -235,6 +235,26 @@ impl<S: Scheduler> SchedulerWrapper<S> {
         self.inner.probe_cbw_state(cgrp_id, llc_id, out)
     }
 
+    /// Snapshot the cgroup_bw library state for a single cgroup
+    /// identified by its RAW cgrp pointer (from scxsim's
+    /// `cgroup_registry`). The `cgid` argument is informational only
+    /// (copied into `out->cgid`).
+    ///
+    /// Returns `None` when the loaded scheduler does not link the
+    /// cgroup_bw library; `Some(rc)` otherwise (0 = success, negative
+    /// errno-style codes for "not registered" / "unlimited quota" --
+    /// see the trait docs for the full mapping).
+    ///
+    /// tg `wprof-r2-add-cgroup-bw-replenish-tracekind-smoking-gun`.
+    pub fn snapshot_by_raw_cgrp(
+        &self,
+        cgid: u64,
+        cgrp_raw: *mut std::ffi::c_void,
+        out: &mut crate::ffi::CbwCgroupSnapshot,
+    ) -> Option<i32> {
+        self.inner.snapshot_by_raw_cgrp(cgid, cgrp_raw, out)
+    }
+
     /// CPU idle state changed (`ops.update_idle`).
     pub fn update_idle(&self, cpu: i32, idle: bool) {
         // SAFETY: No pointer arguments; cpu ID is validated by the engine.

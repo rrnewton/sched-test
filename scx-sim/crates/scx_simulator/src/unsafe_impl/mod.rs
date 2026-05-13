@@ -26,6 +26,7 @@
 //! | `worker_pool` | Persistent worker thread pool with futex-based park/wake protocol |
 
 pub mod backend;
+pub mod cgroup_bw_replenish;
 pub mod cgroup_ffi;
 pub mod cgroup_wrapper;
 pub mod dispatch_pool;

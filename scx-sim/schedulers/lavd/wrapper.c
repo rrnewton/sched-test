@@ -1160,6 +1160,139 @@ int topo_cpu_to_llc_id(u32 cpu) { (void)cpu; return 0; }
 #include "../../scx/lib/cgroup_bw.bpf.c"
 
 /*
+ * =================================================================
+ * Smoking-gun replenish observer (post-fire snapshot diff)
+ * =================================================================
+ *
+ * tg `wprof-r2-add-cgroup-bw-replenish-tracekind-smoking-gun` (R2 HIGH
+ * from wprof-trace-baseline 2026-05-13). The bug's CAUSE
+ * (`period_budget` debt accounting at lib/cgroup_bw.bpf.c:1679) has NO
+ * kernel tracepoint and is INVISIBLE to wprof. scxsim is the only place
+ * we can observe it.
+ *
+ * The first attempt was a function-like macro wrapping
+ * `cbw_replenish_cgroup` BEFORE the lib include. That fails because
+ * the C preprocessor expands the macro at the FUNCTION DEFINITION site
+ * inside the lib too (the lib has `bool cbw_replenish_cgroup(struct
+ * scx_cgroup_ctx *cgx, u64 now) { ... }` -- two-arg form matches the
+ * macro), producing syntactic garbage. Splitting the lib include is
+ * not possible with standard `#include`.
+ *
+ * Workaround: snapshot/diff approach. The wrapper exposes
+ * `scxsim_cbw_snapshot_by_raw_cgrp(cgid, cgrp_raw, out)` which fills
+ * `out` with `(cgid, runtime_total_last, period_budget,
+ * burst_remaining, nquota, nquota_ub, is_throttled)` for the cgroup
+ * identified by the raw cgrp pointer (sourced from scxsim's
+ * `cgroup_registry` -- avoids re-entering the registry mutex from
+ * inside fire_timer's critical section). The Rust engine calls this
+ * for every cgroup BEFORE every `fire_timer` and AGAIN AFTER. For
+ * each cgroup whose state changed in a way consistent with
+ * replenishment (period_budget rewritten, runtime_total_last
+ * refreshed -- both happen exactly inside `replenish_timerfn` ->
+ * `cbw_replenish_cgroup`), the engine emits a
+ * `TraceKind::CgroupBwReplenish` event with computed `debt`,
+ * `burst_credit`, `keep_throttled` mirroring lib lines 1679-1706.
+ *
+ * Why it's faithful to the lib:
+ *   * `runtime_total_last` is set by `replenish_timerfn` at lib line
+ *     1894 (`WRITE_ONCE(cur_cgx->runtime_total_last,
+ *     READ_ONCE(cur_cgx->runtime_total_sloppy))`) -- happens exactly
+ *     once per replenishment cycle, BEFORE the per-cgroup
+ *     `cbw_replenish_cgroup` call. The "AFTER" snapshot reads the
+ *     value the lib actually used as input to its debt/burst-credit
+ *     formula.
+ *   * `period_budget` is the OUTPUT of `cbw_replenish_cgroup` (lib
+ *     line 1697). The "AFTER" snapshot reads it.
+ *   * `burst_remaining`, `nquota`, `nquota_ub` are stable across the
+ *     individual `cbw_replenish_cgroup` call (they only mutate at
+ *     period boundaries / config changes); the BEFORE snapshot is
+ *     correct as the value the lib's formula used.
+ *   * `debt` and `burst_credit` are then computed in Rust using the
+ *     same formulas the lib uses (lines 1679-1680).
+ *   * `keep_throttled` = `period_budget_out <= 0` (lib line 1706).
+ *
+ * Coverage caveat: a cgroup that was not replenished in the just-fired
+ * timer (e.g. accounting_timer ticked, not replenish_timer) will show
+ * unchanged state and NO event. That is correct -- no replenishment
+ * happened. The "filter" that distinguishes replenish from accounting
+ * is implicit in the state-changed predicate; no scheduler-internal
+ * slot-id knowledge is needed engine-side.
+ */
+struct scxsim_cbw_cgroup_snapshot {
+	unsigned long long	cgid;
+	long long		runtime_total_last;
+	long long		period_budget;
+	long long		burst_remaining;
+	long long		nquota;
+	long long		nquota_ub;
+	int			is_throttled;
+	int			_pad;
+};
+
+/*
+ * Look up cgroup_bw library state for a cgroup identified by its RAW
+ * cgrp pointer (NOT cgid). The caller (Rust engine) sources both the
+ * cgid AND the raw cgrp pointer from scxsim's cgroup_registry to
+ * sidestep two snags:
+ *
+ *   1. `cbw_cgroup_ids[]` (lib-internal) is only populated transiently
+ *      inside `replenish_timerfn`, so iterating it from outside the
+ *      timer is unreliable.
+ *
+ *   2. `bpf_cgroup_from_id(cgid)` -> `sim_cgroup_lookup_by_id` -> Rust
+ *      registry uses `try_lock()` on the SIM_ARC mutex, which the
+ *      engine ALREADY HOLDS at the BEFORE/AFTER snapshot points.
+ *      The lock fails, the lookup returns the root cgroup pointer for
+ *      every cgid, and every per-cgid snapshot collapses to the same
+ *      cgx. Passing the raw cgrp pointer in directly avoids the
+ *      try_lock entirely.
+ *
+ * `cbw_get_cgroup_ctx(cgrp_raw)` reads the per-cgroup CGRP_STORAGE
+ * map keyed by the cgrp pointer the engine passed at cgroup_init
+ * time -- the same pointer scxsim's cgroup_registry holds.
+ *
+ * Returns:
+ *   0  -- success, fields written; out->cgid set to `cgid`
+ *  -1  -- cgrp_raw was NULL or out was NULL (caller error)
+ *  -2  -- cbw_get_cgroup_ctx returned NULL (lib has no state for cgrp)
+ *  -3  -- cgroup is unlimited-quota (caller should skip)
+ */
+__attribute__((visibility("default")))
+int scxsim_cbw_snapshot_by_raw_cgrp(
+	unsigned long long cgid,
+	void *cgrp_raw,
+	struct scxsim_cbw_cgroup_snapshot *out)
+{
+	struct cgroup *cg = (struct cgroup *)cgrp_raw;
+	struct scx_cgroup_ctx *cgx;
+
+	if (!out || !cg)
+		return -1;
+
+	cgx = cbw_get_cgroup_ctx(cg);
+	if (!cgx)
+		return -2;
+
+	/* Skip unlimited-quota cgroups -- the lib's
+	 * cbw_replenish_cgroup early-returns for them at
+	 * out_no_replenish without touching any of the smoking-
+	 * gun fields. Matching the same gate keeps the trace
+	 * clean. */
+	if (cgx->nquota_ub == CBW_RUNTUME_INF)
+		return -3;
+
+	out->cgid = cgid;
+	out->runtime_total_last = cgx->runtime_total_last;
+	out->period_budget = cgx->period_budget;
+	out->burst_remaining = cgx->burst_remaining;
+	out->nquota = (long long)cgx->nquota;
+	out->nquota_ub = (long long)cgx->nquota_ub;
+	out->is_throttled = cgx->is_throttled;
+	out->_pad = 0;
+	return 0;
+}
+
+/*
  * Phase 2: register cgroup_bw's BPF maps with scx_test_map. Must be
  * defined AFTER the include so the map symbols (replenish_timer,
  * accounting_timer, cbw_cgrp_map, cbw_cgrp_llc_map, tree_levels_map)

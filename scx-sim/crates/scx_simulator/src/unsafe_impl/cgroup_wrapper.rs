@@ -527,8 +527,7 @@ mod tests {
         // Post-order is just the reverse for this flat root + 2 children
         // shape (children before parent).
         let descendants_post = [h1.as_ptr(), h2.as_ptr(), root];
-        let _guard =
-            CssIterGuard::prepare(root, &descendants_pre, &descendants_post);
+        let _guard = CssIterGuard::prepare(root, &descendants_pre, &descendants_post);
         // Guard created successfully — both iterators are populated.
     }
 

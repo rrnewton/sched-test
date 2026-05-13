@@ -15,6 +15,7 @@ use tracing::{debug, info, trace, warn};
 use crate::backend::e9patch::E9PatchReplayBackend;
 use crate::backend::replay::ReplayBackend;
 use crate::cgroup::{CgroupId, CgroupRegistry};
+use crate::cgroup_wrapper::default_cgroup_init_args;
 use crate::cpu::{IrqContext, LastStopReason, SimCpu};
 use crate::dsq::DsqManager;
 use crate::ffi::{self, Scheduler};
@@ -28,7 +29,6 @@ use crate::preempt::{
 use crate::scenario::{
     CgroupCpusetChangeEvent, CgroupCreateEvent, CgroupDestroyEvent, IrqType, PreemptMode, Scenario,
 };
-use crate::cgroup_wrapper::default_cgroup_init_args;
 use crate::scheduler_wrapper::{OptionalPtr, SchedulerWrapper, TaskPtr};
 use crate::sim_task::SimTask;
 use crate::task::{OpsTaskState, Phase, TaskState};
@@ -1644,9 +1644,7 @@ impl<S: Scheduler> Simulator<S> {
                 // `cgroup_set_bandwidth` invocation below.
                 let args_ptr = OptionalPtr::new(default_cgroup_init_args());
                 sim_callback!(s, s, sim_arc, cpu, {
-                    rc = self
-                        .scheduler
-                        .cgroup_init(TaskPtr::new(raw), args_ptr);
+                    rc = self.scheduler.cgroup_init(TaskPtr::new(raw), args_ptr);
                 });
                 charge_sched_time(&mut s.sim, CpuId(0), "cgroup_init");
                 assert!(rc == 0, "cgroup_init failed for cgid={} rc={rc}", cgid.0);
@@ -1813,8 +1811,7 @@ impl<S: Scheduler> Simulator<S> {
         // Avoids the `s` re-borrow conflict that the single-step
         // iter_mut + s.events.push form triggers. Stack array sized
         // to MAX_BPF_TIMERS keeps this allocation-free.
-        let mut drained: [Option<(crate::types::TimeNs, CpuId)>;
-            crate::kfuncs::MAX_BPF_TIMERS] =
+        let mut drained: [Option<(crate::types::TimeNs, CpuId)>; crate::kfuncs::MAX_BPF_TIMERS] =
             [None; crate::kfuncs::MAX_BPF_TIMERS];
         for (slot, entry) in s.sim.pending_timers.iter_mut().enumerate() {
             drained[slot] = entry.take();
@@ -2498,12 +2495,49 @@ impl<S: Scheduler> Simulator<S> {
         // timer callback can discover all cgroups (e.g. mitosis
         // update_timer_cb configures cells from the cgroup tree).
         s.cgroup_registry.prepare_css_iter_from_root();
+
+        // Source (cgid, raw cgrp ptr) pairs from cgroup_registry. The
+        // raw ptr is what the lib's CGRP_STORAGE map is keyed by --
+        // we hand it directly to `snapshot_by_raw_cgrp` so we don't
+        // need `bpf_cgroup_from_id` at all (which would deadlock on
+        // SIM_ARC try_lock at this snapshot point).
+        // tg `wprof-r2-add-cgroup-bw-replenish-tracekind-smoking-gun`.
+        let cbw_pairs: Vec<(u64, *mut c_void)> = s
+            .cgroup_registry
+            .all_cgids_preorder()
+            .into_iter()
+            .filter_map(|cid| s.cgroup_registry.get_raw(cid).map(|raw| (cid.0, raw)))
+            .collect();
+        let cbw_before = crate::cgroup_bw_replenish::snapshot_via(&cbw_pairs, |cgid, raw, out| {
+            self.scheduler.snapshot_by_raw_cgrp(cgid, raw, out)
+        });
+        let cbw_observer_active = cbw_before.is_some();
+        let cbw_before = cbw_before.unwrap_or_default();
+
         start_rbc(&mut s.sim);
         sim_callback!(s, guard, sim_arc, cpu, {
             self.scheduler.fire_timer(slot);
         });
         let s = &mut *guard;
         charge_sched_time(&mut s.sim, cpu, "fire_timer");
+
+        // Take the matching AFTER snapshot, diff against BEFORE, and
+        // emit one event per cgroup the lib replenished. Cheap when
+        // the loaded scheduler doesn't link cgroup_bw (the dlsym
+        // symbol is absent so snapshot_via returns None on the first
+        // call and we never even build the cgid list a second time).
+        if cbw_observer_active {
+            let cbw_after =
+                crate::cgroup_bw_replenish::snapshot_via(&cbw_pairs, |cgid, raw, out| {
+                    self.scheduler.snapshot_by_raw_cgrp(cgid, raw, out)
+                })
+                .unwrap_or_default();
+            let now_ns = s.sim.cpus[cpu.0 as usize].local_clock;
+            let events = crate::cgroup_bw_replenish::diff_snapshots(&cbw_before, &cbw_after);
+            for kind in events {
+                s.sim.trace.record(now_ns, cpu, kind);
+            }
+        }
 
         // Drain ALL re-armed timer slots in ascending slot order. Each
         // slot's CPU is captured by `sim_timer_start_slot` inside the
@@ -2519,8 +2553,7 @@ impl<S: Scheduler> Simulator<S> {
         // borrow-checker conflict between `s.sim.pending_timers` (the
         // source) and `s.events` (the sink) that share an ancestor
         // mut-borrow on `s`.
-        let mut drained: [Option<(crate::types::TimeNs, CpuId)>;
-            crate::kfuncs::MAX_BPF_TIMERS] =
+        let mut drained: [Option<(crate::types::TimeNs, CpuId)>; crate::kfuncs::MAX_BPF_TIMERS] =
             [None; crate::kfuncs::MAX_BPF_TIMERS];
         for (s_idx, entry) in s.sim.pending_timers.iter_mut().enumerate() {
             drained[s_idx] = entry.take();
@@ -3016,9 +3049,7 @@ impl<S: Scheduler> Simulator<S> {
         // requires non-null args.
         let args_ptr = OptionalPtr::new(default_cgroup_init_args());
         sim_callback!(s, guard, sim_arc, cpu, {
-            rc = self
-                .scheduler
-                .cgroup_init(TaskPtr::new(raw), args_ptr);
+            rc = self.scheduler.cgroup_init(TaskPtr::new(raw), args_ptr);
         });
         let s = &mut *guard;
         charge_sched_time(&mut s.sim, cpu, "cgroup_init");
@@ -3107,8 +3138,7 @@ impl<S: Scheduler> Simulator<S> {
             // equivalent call site near engine.rs:1601).
             let args_ptr = OptionalPtr::new(default_cgroup_init_args());
             sim_callback!(s, guard, sim_arc, cpu, {
-                self.scheduler
-                    .cgroup_init(TaskPtr::new(raw), args_ptr);
+                self.scheduler.cgroup_init(TaskPtr::new(raw), args_ptr);
             });
             let s = &mut *guard;
             charge_sched_time(&mut s.sim, cpu, "cgroup_init");
