@@ -1450,7 +1450,7 @@ impl<S: Scheduler> Simulator<S> {
             task_pid_to_raw,
             rng: SmallRng::seed_from_u64(scenario.seed as u64),
             ops_context: OpsContext::None,
-            pending_dispatch: None,
+            pending_dispatches: Default::default(),
             dsq_iter: None,
             staged_events: Vec::new(),
             task_last_cpu: HashMap::new(),
@@ -3306,7 +3306,7 @@ impl<S: Scheduler> Simulator<S> {
         s.sim.set_task_ops_state(pid, OpsTaskState::Queued);
 
         // select_cpu: release lock, call C, reacquire
-        s.sim.pending_dispatch = None;
+        s.sim.pending_dispatches.clear();
         set_ops_context(&mut s.sim, OpsContext::SelectCpu);
         s.sim.waker_task_raw = waker_raw;
         start_rbc(&mut s.sim);
