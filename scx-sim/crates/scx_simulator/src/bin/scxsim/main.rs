@@ -162,6 +162,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)] // CLI subcommand dispatch; parsed once at startup, no perf-critical match
 enum Command {
     /// Run a simulation from an rt-app workload.
     Run(RunArgs),

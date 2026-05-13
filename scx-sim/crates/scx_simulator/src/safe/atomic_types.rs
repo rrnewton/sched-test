@@ -419,7 +419,7 @@ mod tests {
         let prng = TimeslicePrng::new(123);
         for _ in 0..200 {
             let v = prng.roll_timeslice(10, 20);
-            assert!(v >= 10 && v <= 20, "roll_timeslice out of range: {v}");
+            assert!((10..=20).contains(&v), "roll_timeslice out of range: {v}");
         }
     }
 

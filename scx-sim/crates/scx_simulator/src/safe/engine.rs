@@ -537,7 +537,7 @@ impl EventQueue {
         one_in: u32,
     ) -> Option<Event> {
         let one_in = one_in.max(1);
-        if one_in > 1 && self.timer_interleave_rng.next_u32() % one_in != 0 {
+        if one_in > 1 && !self.timer_interleave_rng.next_u32().is_multiple_of(one_in) {
             return None;
         }
 
