@@ -4056,16 +4056,14 @@ impl<S: Scheduler> Simulator<S> {
         // the front of the local DSQ, not all queued tasks. Bug-1
         // reproducer is single-cgroup so this is sufficient; multi-
         // cgroup fairness is still out of scope here.
-        let bw_blocked_pid = if let Some(&front_pid) = s.sim.cpus[cpu.0 as usize].local_dsq.front()
-        {
-            if let Some(cgid) = pid_is_bw_throttled(&self.scheduler, &s.fields(), front_pid) {
-                Some((front_pid, cgid))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        let bw_blocked_pid = s.sim.cpus[cpu.0 as usize]
+            .local_dsq
+            .front()
+            .copied()
+            .and_then(|front_pid| {
+                pid_is_bw_throttled(&self.scheduler, &s.fields(), front_pid)
+                    .map(|cgid| (front_pid, cgid))
+            });
 
         if let Some((pid, cgid)) = bw_blocked_pid {
             eager_stash_throttled(s, pid, cgid, cpu);
@@ -4153,15 +4151,14 @@ impl<S: Scheduler> Simulator<S> {
 
         // EAGER cgroup_bw throttle (mirror of post_dispatch_run's gate).
         // See `eager_stash_throttled` for the kernel-faithful rationale.
-        let bw_blocked_pid = if let Some(&front_pid) = s.sim.cpus[cpu_idx].local_dsq.front() {
-            if let Some(cgid) = pid_is_bw_throttled(&self.scheduler, &s.fields(), front_pid) {
-                Some((front_pid, cgid))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        let bw_blocked_pid = s.sim.cpus[cpu_idx]
+            .local_dsq
+            .front()
+            .copied()
+            .and_then(|front_pid| {
+                pid_is_bw_throttled(&self.scheduler, &s.fields(), front_pid)
+                    .map(|cgid| (front_pid, cgid))
+            });
 
         if let Some((pid, cgid)) = bw_blocked_pid {
             eager_stash_throttled(s, pid, cgid, cpu);
