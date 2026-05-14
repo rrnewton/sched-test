@@ -293,6 +293,46 @@ If you validate some changes with a new manual or temporary test, that test shou
 
 NEVER add binary files or large serialized artifacts to version control without explicit permission. Always carefully review what you are adding with `git add`, and update `.gitignore` as needed.
 
+### Pre-commit hook (cargo fmt + clippy gate)
+
+The repo ships a pre-commit hook at `scx-sim/scripts/git-hooks/pre-commit`
+that automatically enforces the same `cargo fmt` and `cargo clippy` gates
+that `validate.sh` runs — but scoped to the changes you are STAGING, so
+it stays fast and only flags issues you introduced.
+
+**Install once per clone (and re-run after every fresh worktree):**
+
+    ./scx-sim/scripts/git-hooks/install.sh
+
+The installer copies the hook into `<git-common-dir>/hooks/pre-commit`,
+which is shared across all worktrees of the sched-test repo.
+
+**What the hook does:**
+
+- Skips entirely when no staged file lives under `scx-sim/`.
+- `rustfmt --check` against each staged `.rs` file under `scx-sim/`
+  (typically <1s; pre-existing formatting backlog in untouched files
+  does NOT punish you).
+- `cargo clippy --all-targets --workspace --no-deps -- -D warnings`
+  from `scx-sim/` when any staged `.rs` / `Cargo.{toml,lock}` is under
+  `scx-sim/` (~5–30s warm; `--no-deps` keeps it fast — CI still runs
+  the full version).
+
+**Escape hatches** (DO NOT use routinely — CI still rejects fmt/clippy
+violations regardless of how the hook was bypassed):
+
+    SKIP_SCXSIM_HOOK=1 git commit ...     # bypass entire hook
+    SKIP_SCXSIM_CLIPPY=1 git commit ...   # bypass clippy only (still fmts)
+    SCXSIM_HOOK_FULL_CLIPPY=1 git commit  # opt INTO full clippy (slower, matches CI)
+
+**Why this exists:** repeated `cargo fmt` + clippy backlog accumulation
+on `simulator.v6` (~16 violations cleared by PR #36 / the
+`fix_simulator_v6_cargo` task; more accumulated again immediately
+after) — agents commit without running `validate.sh`. The hook is the
+mechanical gate that prevents recurrence; running `validate.sh`
+manually before commit remains the gold standard (it also runs tests,
+typecheck, conflict-marker check, etc. that the hook does not).
+
 Pre-submit or push: also validate
 ---------------------------------
 
