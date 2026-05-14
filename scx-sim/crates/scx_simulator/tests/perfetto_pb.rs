@@ -33,7 +33,7 @@
 //! | TaskSlept/etc.   | `ONCPU`        | `TYPE_SLICE_END`   |
 //! | TaskWoke         | `WAKEE`        | `TYPE_INSTANT`     |
 //! | DsqInsert*       | `SCX_DSQ`      | `TYPE_INSTANT`     |
-//! | Tick             | `SOFTIRQ:timer`| `TYPE_INSTANT`     |
+//! | Tick             | `SOFTIRQ`      | `TYPE_INSTANT` (name `SOFTIRQ:timer`) |
 //! | CpuIdle          | `IDLE`         | `TYPE_INSTANT`     |
 //! | KickCpu          | `IPI_SEND`     | `TYPE_INSTANT` (name `IPI_SEND:single`) |
 
@@ -134,6 +134,12 @@ fn test_perfetto_pb_roundtrip_wprof_compatible() {
             Some(trace_packet::Data::TrackEvent(ev)) => {
                 nr_track_event += 1;
                 let cat = ev.categories.first().map(String::as_str).unwrap_or("");
+                let ev_name = ev.name_field.as_ref().and_then(|n| match n {
+                    perfetto_protos::track_event::track_event::Name_field::Name(s) => {
+                        Some(s.as_str())
+                    }
+                    _ => None,
+                });
                 let ty = ev
                     .type_
                     .as_ref()
@@ -145,7 +151,17 @@ fn test_perfetto_pb_roundtrip_wprof_compatible() {
                     ("ONCPU", track_event::Type::TYPE_SLICE_END) => nr_oncpu_end += 1,
                     ("WAKEE", track_event::Type::TYPE_INSTANT) => nr_wakee_instant += 1,
                     ("SCX_DSQ", track_event::Type::TYPE_INSTANT) => nr_scx_dsq_instant += 1,
-                    ("SOFTIRQ:timer", track_event::Type::TYPE_INSTANT) => {
+                    // tg `align-softirq-timer-category-naming`:
+                    // post-fix the category is plain `"SOFTIRQ"` with
+                    // the per-event subtype carried in the name field
+                    // (matching live wprof's `SOFTIRQ:rcu` /
+                    // `SOFTIRQ:hrtimer` / `SOFTIRQ:timer` /
+                    // `SOFTIRQ:sched` naming convention). scxsim
+                    // currently emits only the `:timer` subtype for
+                    // `Tick` events, so match (category, name).
+                    ("SOFTIRQ", track_event::Type::TYPE_INSTANT)
+                        if ev_name == Some("SOFTIRQ:timer") =>
+                    {
                         nr_softirq_timer_instant += 1
                     }
                     ("IDLE", track_event::Type::TYPE_INSTANT) => nr_idle_instant += 1,
@@ -208,17 +224,18 @@ fn test_perfetto_pb_roundtrip_wprof_compatible() {
     );
 
     // Categories that this trace MUST surface for wprof parity:
-    // SCX_DSQ instants and SOFTIRQ:timer instants fire on every
-    // dispatch cycle. WAKEE fires whenever workload sleep/wake
-    // boundaries occur in the 50 ms window. IDLE fires whenever a
-    // CPU goes idle.
+    // SCX_DSQ instants and SOFTIRQ category + name `SOFTIRQ:timer`
+    // instants fire on every dispatch cycle. WAKEE fires whenever
+    // workload sleep/wake boundaries occur in the 50 ms window. IDLE
+    // fires whenever a CPU goes idle.
     assert!(
         nr_scx_dsq_instant > 0,
         "no SCX_DSQ instant events emitted (DsqInsert mapping broken)"
     );
     assert!(
         nr_softirq_timer_instant > 0,
-        "no SOFTIRQ:timer instant events emitted (Tick mapping broken)"
+        "no SOFTIRQ category + name=SOFTIRQ:timer instant events emitted \
+         (Tick mapping broken — see tg align-softirq-timer-category-naming)"
     );
     assert!(
         nr_wakee_instant > 0,

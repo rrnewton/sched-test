@@ -39,7 +39,7 @@
 //!
 //! - `type_` is `TYPE_SLICE_BEGIN` / `TYPE_SLICE_END` / `TYPE_INSTANT`.
 //! - `categories` carries one of wprof's category strings (`ONCPU`,
-//!   `WAKEE`, `SCX_DSQ`, `SOFTIRQ:timer`, `HARDIRQ`, `SOFTIRQ`,
+//!   `WAKEE`, `SCX_DSQ`, `HARDIRQ`, `SOFTIRQ`,
 //!   `IDLE`, `IPI_SEND`) or one of two coarse SCXSIM_*
 //!   buckets — `SCXSIM_OPS` (all sched_ext ops/kfunc-level events
 //!   that have no wprof counterpart) and `SCXSIM_CGROUP_BW` (the
@@ -131,8 +131,19 @@ mod cat {
     /// `IPI_SEND`. tg `align-ipi-send-category-naming` (N3 follow-up
     /// to closed `rerun-stream2-comparison-after-f1-f2-land`).
     pub const IPI_SEND: &str = "IPI_SEND";
-    pub const SOFTIRQ_TIMER: &str = "SOFTIRQ:timer";
     pub const HARDIRQ: &str = "HARDIRQ";
+    /// SOFTIRQ category. Live wprof emits this as the bare string
+    /// `"SOFTIRQ"`, with the per-event subtype carried in the
+    /// TrackEvent `name` field — verified against
+    /// `scratch/wprof_cpu_bw_stall_capture_20260513/wprof_trace.pb`:
+    /// category `SOFTIRQ` carries names `SOFTIRQ:rcu` (51115),
+    /// `SOFTIRQ:hrtimer` (20503), `SOFTIRQ:timer` (19557),
+    /// `SOFTIRQ:sched` (207). scxsim previously used the discriminator
+    /// `"SOFTIRQ:timer"` AS the category, fragmenting the live-vs-sim
+    /// vocabulary; the `Tick` emit now uses the bare `SOFTIRQ` constant
+    /// here with name `"SOFTIRQ:timer"` carried in the TrackEvent name
+    /// field. tg `align-softirq-timer-category-naming` (small
+    /// follow-up to closed `align-ipi-send-category-naming`).
     pub const SOFTIRQ: &str = "SOFTIRQ";
     pub const IDLE: &str = "IDLE";
     /// All scxsim-only ops/kfunc-level events (PutPrevTask,
@@ -398,10 +409,18 @@ fn emit_event(trace: &Trace, ev: &crate::trace::TraceEvent, proto: &mut TracePro
             );
         }
 
-        // ----- Periodic tick (wprof: SOFTIRQ:timer subtype). The
-        //       per-event NAME stays "tick" so a SQL/UI filter on
-        //       name still distinguishes scxsim ticks from generic
-        //       softirq slices. -----
+        // ----- Periodic tick (wprof category `SOFTIRQ`, name
+        //       `SOFTIRQ:timer` matching live wprof's per-subtype
+        //       naming convention `:rcu` / `:hrtimer` / `:timer` /
+        //       `:sched`). scxsim's periodic tick maps to the kernel's
+        //       softirq timer subtype, so the bare `SOFTIRQ` category
+        //       overlap with live traces is direct.
+        //
+        //       tg `align-softirq-timer-category-naming` (small
+        //       follow-up to closed `align-ipi-send-category-naming`).
+        //       Pre-fix scxsim emitted category `"SOFTIRQ:timer"` with
+        //       name `"tick"`, fragmenting the live-vs-sim category
+        //       vocabulary on the SOFTIRQ axis. -----
         TraceKind::Tick { pid } => {
             let mut anns = vec![ann_uint("cpu", u64::from(cpu.0))];
             push_task_anns(&mut anns, *pid, trace.task_name(*pid));
@@ -409,8 +428,8 @@ fn emit_event(trace: &Trace, ev: &crate::trace::TraceEvent, proto: &mut TracePro
                 proto,
                 ts,
                 cpu_track_uuid(cpu),
-                cat::SOFTIRQ_TIMER,
-                "tick",
+                cat::SOFTIRQ,
+                "SOFTIRQ:timer",
                 anns,
             );
         }
@@ -1314,5 +1333,120 @@ mod tests {
             saw_target,
             "KickCpu TrackEvent missing target_cpu annotation",
         );
+    }
+
+    /// tg `align-softirq-timer-category-naming` (small follow-up to
+    /// closed `align-ipi-send-category-naming`):
+    ///
+    /// Live wprof emits SOFTIRQ events under category `"SOFTIRQ"`
+    /// (no `:timer` suffix), with the per-event subtype carried in
+    /// the TrackEvent `name` field — verified live-side as
+    /// `SOFTIRQ:rcu` (51115) + `SOFTIRQ:hrtimer` (20503) +
+    /// `SOFTIRQ:timer` (19557) + `SOFTIRQ:sched` (207) on
+    /// `scratch/wprof_cpu_bw_stall_capture_20260513/wprof_trace.pb`.
+    /// The pre-fix scxsim emitter used `"SOFTIRQ:timer"` AS the
+    /// category (with `name="tick"`), fragmenting the live-vs-sim
+    /// vocabulary so that a `SELECT DISTINCT category FROM slice`
+    /// query against either trace did not show overlap on the
+    /// SOFTIRQ axis. This regression test pins the fix:
+    ///
+    /// - Build a tiny in-memory `Trace` containing one `Tick`.
+    /// - Round-trip through `parse_from_bytes`.
+    /// - Assert exactly one TrackEvent carries category `"SOFTIRQ"`
+    ///   (NOT `"SOFTIRQ:timer"`) and name `"SOFTIRQ:timer"`, with
+    ///   the `cpu` debug_annotation present.
+    #[test]
+    fn tick_uses_wprof_softirq_naming() {
+        use crate::trace::Trace;
+        use crate::types::{CpuId, Pid};
+
+        // 4-CPU trace, one Tick instant. (`Trace::with_warmup` and
+        // `record` are pub(crate); accessible because this is a
+        // lib-internal test inside the same crate as `Trace`.)
+        let mut trace = Trace::with_warmup(4, &[], 0);
+        trace.record(5_678, CpuId(2), TraceKind::Tick { pid: Pid(0) });
+
+        let mut buf = Vec::new();
+        write_pb(&trace, &mut buf).expect("write_pb failed");
+
+        let proto: TraceProto =
+            TraceProto::parse_from_bytes(&buf).expect("parse_from_bytes failed");
+
+        // Find the (single) SOFTIRQ-family TrackEvent.
+        let mut tick_events: Vec<&TrackEvent> = Vec::new();
+        let mut all_categories: Vec<String> = Vec::new();
+        for packet in &proto.packet {
+            if let Some(trace_packet::Data::TrackEvent(ev)) = &packet.data {
+                for c in &ev.categories {
+                    all_categories.push(c.clone());
+                }
+                let is_softirq = ev
+                    .categories
+                    .iter()
+                    .any(|c| c == "SOFTIRQ" || c == "SOFTIRQ:timer");
+                let is_instant = ev.type_.as_ref().map(|t| t.enum_value_or_default())
+                    == Some(track_event::Type::TYPE_INSTANT);
+                if is_softirq && is_instant {
+                    tick_events.push(ev);
+                }
+            }
+        }
+        assert_eq!(
+            tick_events.len(),
+            1,
+            "expected exactly one SOFTIRQ* TrackEvent for one Tick, found {} \
+             (categories seen: {:?})",
+            tick_events.len(),
+            all_categories,
+        );
+
+        let ev = tick_events[0];
+
+        // Category MUST be plain `SOFTIRQ` (matches live wprof).
+        // Pre-fix value `SOFTIRQ:timer` MUST NOT reappear —
+        // regression class for this PR.
+        assert!(
+            ev.categories.iter().any(|c| c == "SOFTIRQ"),
+            "Tick TrackEvent must use category 'SOFTIRQ' (live wprof's vocabulary); \
+             got categories {:?}",
+            ev.categories,
+        );
+        assert!(
+            !ev.categories.iter().any(|c| c == "SOFTIRQ:timer"),
+            "Tick TrackEvent regressed to category 'SOFTIRQ:timer' \
+             (does not match live wprof, which uses plain 'SOFTIRQ' \
+             with the per-event subtype in the `name` field). \
+             See tg align-softirq-timer-category-naming.",
+        );
+
+        // Name MUST match wprof's per-event naming convention:
+        // `SOFTIRQ:timer` for periodic-tick events.
+        let name = ev.name_field.as_ref().and_then(|n| match n {
+            track_event::Name_field::Name(s) => Some(s.as_str()),
+            _ => None,
+        });
+        assert_eq!(
+            name,
+            Some("SOFTIRQ:timer"),
+            "Tick TrackEvent name must be 'SOFTIRQ:timer' (matches live wprof's \
+             SOFTIRQ subtype naming convention)",
+        );
+        assert_ne!(
+            name,
+            Some("tick"),
+            "Tick TrackEvent regressed to name 'tick' — see tg \
+             align-softirq-timer-category-naming for the wprof alignment.",
+        );
+
+        // Annotations: `cpu` present.
+        let mut saw_cpu = false;
+        for ann in &ev.debug_annotations {
+            if let Some(debug_annotation::Name_field::Name(n)) = &ann.name_field {
+                if n == "cpu" {
+                    saw_cpu = true;
+                }
+            }
+        }
+        assert!(saw_cpu, "Tick TrackEvent missing cpu annotation");
     }
 }
