@@ -340,6 +340,21 @@ pub struct SimulatorState {
     /// armed them (with `BPF_F_TIMER_CPU_PIN`). We capture
     /// `current_cpu` per slot for the same per-slot semantics.
     pub pending_timers: [Option<(TimeNs, CpuId)>; MAX_BPF_TIMERS],
+    /// V4-B (tg `scxsim-investigate-cbw-accounting-timer-fire-rate`):
+    /// last simulator-clock time at which slot `i` was armed via
+    /// `sim_timer_start_slot`. Used to compute
+    /// `period_ns_since_last_arm` for the
+    /// `TraceKind::CbwAccountingTimerFired` event so the analysis can
+    /// distinguish (a) the live regression mechanism (PR #3521 adaptive
+    /// accounting timer firing at the 1ms `CBW_ACCOUNTING_PERIOD_MIN`
+    /// bound = 10× speedup vs the originally-intended 100ms replenish
+    /// period) from (b) scxsim diverging from live behavior (timer
+    /// firing at originally-intended ~100ms = two-bugs-coincidentally-
+    /// producing-same-fingerprint).
+    ///
+    /// `None` until first arm; subsequent arms compute the diff and
+    /// update. SHARED-MUTABLE: only written under the SimState lock.
+    pub last_arm_at: [Option<TimeNs>; MAX_BPF_TIMERS],
     /// PER-CPU: Set by the engine before calling `select_cpu` on the
     /// waker's CPU, consumed by `bpf_get_current_task_btf` during that
     /// same callback. Only the owning worker reads/writes it.
@@ -3015,6 +3030,30 @@ pub extern "C" fn sim_timer_start_slot(slot: u32, nsecs: u64) {
             cpu = sim.current_cpu.0,
             "timer_start_slot"
         );
+        // V4-B (tg `scxsim-investigate-cbw-accounting-timer-fire-rate`):
+        // record per-slot arm with (requested_period_ns,
+        // period_ns_since_last_arm). For self-rearming timers like
+        // `accounting_timerfn`, this captures fire-to-fire interval.
+        // Filter at analysis time by `requested_period_ns` falling in
+        // [CBW_ACCOUNTING_PERIOD_MIN=1ms, CBW_ACCOUNTING_PERIOD_MAX=20ms]
+        // to isolate the cgroup_bw library's accounting timer from
+        // other slots (LAVD update_timer, cbw_replenish_timer).
+        let period_since = match sim.last_arm_at[idx] {
+            Some(prev) => sim.clock.saturating_sub(prev),
+            None => 0,
+        };
+        sim.last_arm_at[idx] = Some(sim.clock);
+        let cpu = sim.current_cpu;
+        let now = sim.clock;
+        sim.trace.record(
+            now,
+            cpu,
+            crate::trace::TraceKind::CbwAccountingTimerFired {
+                slot: idx as u8,
+                period_ns_since_last_arm: period_since,
+                requested_period_ns: nsecs,
+            },
+        );
     });
 }
 
@@ -3103,6 +3142,7 @@ mod tests {
             staged_events: Vec::new(),
             reenqueue_local_requested: false,
             pending_timers: [None; MAX_BPF_TIMERS],
+            last_arm_at: [None; MAX_BPF_TIMERS],
             waker_task_raw: None,
             idle_task_raw: ptr::null_mut(),
             noise: NoiseConfig {

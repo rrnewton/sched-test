@@ -257,7 +257,8 @@ fn emit_event(event: &TraceEvent, writer: &mut impl Write) -> io::Result<()> {
         | TraceKind::CgroupBwReenqueueOnReplenish { .. }
         | TraceKind::CgroupBwReplenish { .. }
         | TraceKind::LavdBailOnCgroupThrottle { .. }
-        | TraceKind::LavdReenqueueViaBtqDrain { .. } => {}
+        | TraceKind::LavdReenqueueViaBtqDrain { .. }
+        | TraceKind::CbwAccountingTimerFired { .. } => {}
     }
 
     // Suppress unused-variable warnings for IrqType / DispatchRejectReason

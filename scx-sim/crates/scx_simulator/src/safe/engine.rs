@@ -1488,6 +1488,7 @@ impl<S: Scheduler> Simulator<S> {
             task_ops_state: BTreeMap::new(),
             reenqueue_local_requested: false,
             pending_timers: [None; crate::kfuncs::MAX_BPF_TIMERS],
+            last_arm_at: [None; crate::kfuncs::MAX_BPF_TIMERS],
             waker_task_raw: None,
             idle_task_raw,
             noise: scenario.noise.clone(),

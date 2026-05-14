@@ -243,6 +243,38 @@ pub enum TraceKind {
     LavdReenqueueViaBtqDrain {
         cgid: crate::cgroup::CgroupId,
     },
+    /// V4-B (tg `scxsim-investigate-cbw-accounting-timer-fire-rate`):
+    /// every BPF timer arm via `sim_timer_start_slot` is recorded with
+    /// the slot, the period the BPF code requested for the next fire,
+    /// and the simulator-clock interval since the previous arm of the
+    /// same slot (= fire-to-fire interval for self-rearming timers like
+    /// `accounting_timerfn`).
+    ///
+    /// **Why this exists:** PR #3521 (commits 3+4) introduced the
+    /// adaptive accounting timer in `scx/lib/cgroup_bw.bpf.c`. The
+    /// `cbw_throttle_cgroups()` function returns
+    /// `clamp(min_time_to_throttle / 4, CBW_ACCOUNTING_PERIOD_MIN=1ms,
+    /// CBW_ACCOUNTING_PERIOD_MAX=20ms)`, so under heavy load the timer
+    /// fires every 1ms instead of the originally-intended 100ms
+    /// (`CBW_REPLENISH_PERIOD`). That's the 10× speedup
+    /// `BISECT_RESULTS.md` identifies as the regression mechanism.
+    ///
+    /// V4-B records this trace event for EVERY arm of EVERY BPF timer
+    /// slot, not just the accounting timer. The accounting timer is
+    /// identifiable post-hoc by `requested_period_ns` falling in
+    /// `[CBW_ACCOUNTING_PERIOD_MIN=1_000_000, CBW_ACCOUNTING_PERIOD_MAX=20_000_000]`.
+    /// Other slots (slot 0 = LAVD update_timer ~50ms; the
+    /// `cbw_replenish_timer` slot ~100ms) are filtered out by range.
+    ///
+    /// `period_ns_since_last_arm` is `0` on the very first arm of a
+    /// slot (no prior arm to diff against). For self-rearming timers
+    /// (where `bpf_timer_start` is called from the timer callback
+    /// itself), this measures fire-to-fire interval.
+    CbwAccountingTimerFired {
+        slot: u8,
+        period_ns_since_last_arm: u64,
+        requested_period_ns: u64,
+    },
     /// The compiled-in `scx/lib/cgroup_bw.bpf.c` library performed a
     /// per-cgroup replenishment. Captures the smoking-gun fields the
     /// library computes inside `cbw_replenish_cgroup` (the bug's CAUSE
@@ -870,6 +902,14 @@ impl Trace {
                 TraceKind::LavdReenqueueViaBtqDrain { cgid } => {
                     format!("LAVD_REENQ_BTQ cgid={}", cgid.0)
                 }
+                TraceKind::CbwAccountingTimerFired {
+                    slot,
+                    period_ns_since_last_arm,
+                    requested_period_ns,
+                } => format!(
+                    "CBW_AC_TIMER slot={} since_last={}ns requested={}ns",
+                    slot, period_ns_since_last_arm, requested_period_ns,
+                ),
                 TraceKind::CgroupBwReplenish {
                     cgid,
                     runtime_total_last,
