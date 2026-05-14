@@ -938,6 +938,24 @@ fn emit_event(trace: &Trace, ev: &crate::trace::TraceEvent, proto: &mut TracePro
                 anns,
             );
         }
+        // tg `add-cbw-throttle-cgroups-tracekind` (A3 from cgroup_bw audit):
+        // perfetto-pb instant for top-down throttle propagation transitions.
+        // Category SCXSIM_STRUCTOP matches the brief's verify query
+        // convention used by A1+A2.
+        TraceKind::CbwThrottleCgroups { cgid, throttled } => {
+            let anns = vec![
+                ann_uint("cgid", cgid.0),
+                ann_uint("throttled", u64::from(*throttled)),
+            ];
+            push_instant(
+                proto,
+                ts,
+                cpu_track_uuid(cpu),
+                "SCXSIM_STRUCTOP",
+                "cbw_throttle_cgroups",
+                anns,
+            );
+        }
     }
 }
 
@@ -1152,7 +1170,11 @@ fn event_pid(kind: &TraceKind) -> Option<Pid> {
         // put-asides into a single net-delta event so per-task PID is
         // not even available — route to the CPU lane instead.
         | TraceKind::CbwPutAside { .. }
-        | TraceKind::CbwDrainBtqBatch { .. } => None,
+        | TraceKind::CbwDrainBtqBatch { .. }
+        // tg `add-cbw-throttle-cgroups-tracekind`: CbwThrottleCgroups
+        // is cgid-keyed (a top-down hierarchy propagation observed
+        // per-cgroup, not per-task) — route to the CPU lane.
+        | TraceKind::CbwThrottleCgroups { .. } => None,
     }
 }
 

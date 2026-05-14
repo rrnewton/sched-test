@@ -599,6 +599,30 @@ fn emit_event(event: &TraceEvent, writer: &mut impl Write) -> io::Result<()> {
             ),
             None,
         )?,
+        // tg `add-cbw-throttle-cgroups-tracekind` (A3 from cgroup_bw audit):
+        // surface `cbw_throttle_cgroups` (top-down throttle propagation)
+        // as a structop in JSONL. Emitted on every `is_throttled` 0↔1
+        // transition observed in the snapshot/diff cycle. The
+        // `throttled` arg is the AFTER-snapshot value (true = newly
+        // throttled, false = newly unthrottled). Name mirrors the lib
+        // function `cbw_throttle_cgroups` so the diff harness can pivot
+        // on the lib's vocabulary directly. See variant doc-comment for
+        // the Step-1-vs-Step-2 aliasing caveat.
+        TraceKind::CbwThrottleCgroups { cgid, throttled } => emit_line(
+            writer,
+            ts,
+            cpu,
+            0,
+            "structop",
+            "cbw_throttle_cgroups",
+            "entry",
+            &format!(
+                r#""cgid":{},"throttled":{}"#,
+                cgid.0,
+                if *throttled { "true" } else { "false" },
+            ),
+            None,
+        )?,
 
         // ---- engine-internal events: NOT structops/helpers, no JSONL ---
         // These exist in scxsim because the engine models them; bpftrace
@@ -1149,5 +1173,58 @@ mod tests {
         assert!(lines[1].contains(r#""cgid":7"#));
         assert!(lines[1].contains(r#""count":5"#));
         assert!(lines[1].contains(r#""btq_len_after":3"#));
+    }
+
+    /// tg `add-cbw-throttle-cgroups-tracekind` (A3 from cgroup_bw audit):
+    /// confirm `CbwThrottleCgroups` emits one JSONL record per
+    /// transition with the right name + args. Schema-validity is
+    /// covered by `emit_basic_events_jsonl` above.
+    #[test]
+    fn cbw_throttle_cgroups_emits_jsonl() {
+        use crate::cgroup::CgroupId;
+
+        let mut trace = Trace::with_warmup(2, &[], 0);
+        // Throttle (0→1) transition.
+        trace.record(
+            100,
+            CpuId(0),
+            TraceKind::CbwThrottleCgroups {
+                cgid: CgroupId(11),
+                throttled: true,
+            },
+        );
+        // Unthrottle (1→0) transition (next replenish-period boundary).
+        trace.record(
+            200,
+            CpuId(1),
+            TraceKind::CbwThrottleCgroups {
+                cgid: CgroupId(11),
+                throttled: false,
+            },
+        );
+
+        let mut buf = Vec::new();
+        write_jsonl(&trace, &mut buf).expect("emit");
+        let text = String::from_utf8(buf).expect("utf8");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "lines: {:#?}", lines);
+
+        for line in &lines {
+            let v: serde_json::Value = serde_json::from_str(line).expect("valid JSON");
+            assert!(v.get("name").is_some());
+            assert!(v.get("phase").is_some());
+            assert!(v.get("args").is_some());
+        }
+
+        // Newly-throttled record.
+        assert!(lines[0].contains(r#""name":"cbw_throttle_cgroups""#));
+        assert!(lines[0].contains(r#""phase":"entry""#));
+        assert!(lines[0].contains(r#""cgid":11"#));
+        assert!(lines[0].contains(r#""throttled":true"#));
+
+        // Newly-unthrottled record.
+        assert!(lines[1].contains(r#""name":"cbw_throttle_cgroups""#));
+        assert!(lines[1].contains(r#""cgid":11"#));
+        assert!(lines[1].contains(r#""throttled":false"#));
     }
 }

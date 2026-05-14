@@ -420,6 +420,44 @@ pub enum TraceKind {
         /// is `btq_len_after` returning to 0 promptly.
         btq_len_after: u32,
     },
+
+    /// Cgroup `is_throttled` state transition observed between two
+    /// snapshot points. Mirrors the lib's `cbw_throttle_cgroups`
+    /// (lib/cgroup_bw.bpf.c:1281), which propagates throttle state
+    /// top-down across the cgroup hierarchy: for each cgroup with a
+    /// throttled ancestor, the lib does
+    /// `WRITE_ONCE(cur_cgx->is_throttled, true)`. The clear path
+    /// (`is_throttled` flipped from 1→0) happens at the next
+    /// replenish-period boundary.
+    ///
+    /// tg `add-cbw-throttle-cgroups-tracekind` (A3 from cgroup_bw
+    /// audit, follow-up to closed A1+A2 PR #42).
+    ///
+    /// **Caveat: aliasing of throttle causes.** A 0→1 transition on
+    /// `is_throttled` can come from either:
+    ///
+    /// * Step 1 — `cbw_update_runtime_total_sloppy` setting the flag
+    ///   because the cgroup exhausted its OWN budget, OR
+    /// * Step 2 — `cbw_throttle_cgroups` (this TraceKind's namesake)
+    ///   propagating an ancestor's throttle state DOWN to descendants.
+    ///
+    /// The snapshot/diff helper cannot distinguish them without the
+    /// full hierarchy snapshot. The TraceKind reports the OBSERVABLE
+    /// transition; readers can disambiguate by joining with concurrent
+    /// `CgroupBwReplenish` events on the same cgid (Step-1 transitions
+    /// always coincide with a replenish-period budget-exhaustion event,
+    /// Step-2 transitions appear on cgroups that did NOT individually
+    /// exhaust budget). The cpu-bw-stall-bug fingerprint is `throttled`
+    /// staying TRUE across multiple consecutive snapshots regardless of
+    /// origin.
+    CbwThrottleCgroups {
+        cgid: crate::cgroup::CgroupId,
+        /// New value of `cgx->is_throttled` (the AFTER snapshot's bit).
+        /// `true` means the cgroup just became throttled (0→1 transition);
+        /// `false` means it was just unthrottled (1→0 transition,
+        /// typically at a replenish-period boundary).
+        throttled: bool,
+    },
 }
 
 /// Reason why a dispatch to a local DSQ was rejected.
@@ -1095,6 +1133,13 @@ impl Trace {
                     "CBW_DRAIN cgid={} count={} btq_after={}",
                     cgid.0, count, btq_len_after
                 ),
+                // tg `add-cbw-throttle-cgroups-tracekind` (A3 from
+                // cgroup_bw audit). `THROTL` for newly throttled,
+                // `UNTHRL` for newly unthrottled.
+                TraceKind::CbwThrottleCgroups { cgid, throttled } => {
+                    let kind_str = if *throttled { "THROTL" } else { "UNTHRL" };
+                    format!("CBW_{kind_str} cgid={}", cgid.0)
+                }
             };
             eprintln!(
                 "[{}] cpu={:<3} {}",

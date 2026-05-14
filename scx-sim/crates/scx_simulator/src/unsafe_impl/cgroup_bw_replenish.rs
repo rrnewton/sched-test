@@ -192,6 +192,31 @@ pub fn diff_snapshots(before: &[CbwCgroupSnapshot], after: &[CbwCgroupSnapshot])
             }
         }
 
+        // ----- Throttle transition (CbwThrottleCgroups) ------------------
+        //
+        // tg `add-cbw-throttle-cgroups-tracekind` (A3 from cgroup_bw audit):
+        // detect `is_throttled` 0↔1 flips on the existing snapshot field.
+        // The lib's `cbw_throttle_cgroups` (lib/cgroup_bw.bpf.c:1281)
+        // performs Step 2 of the throttle pipeline (top-down propagation
+        // from a throttled ancestor to all its descendants), and the
+        // accounting tick's `cbw_update_runtime_total_sloppy` (Step 1)
+        // also flips the bit when a cgroup exhausts its OWN budget.
+        // Both writes are observable here as a 0→1 transition; the diff
+        // helper cannot distinguish them without a hierarchy snapshot.
+        // The TraceKind reports the OBSERVABLE transition; readers can
+        // disambiguate by joining with concurrent `CgroupBwReplenish`
+        // events on the same cgid (per the variant's doc-comment).
+        //
+        // The clear path (1→0) happens at the next replenish-period
+        // boundary inside `replenish_timerfn`; emitting it gives the
+        // observability picture symmetry with the throttle path.
+        if before_s.is_throttled != after_s.is_throttled {
+            events.push(TraceKind::CbwThrottleCgroups {
+                cgid: CgroupId(after_s.cgid),
+                throttled: after_s.is_throttled != 0,
+            });
+        }
+
         if !rtl_changed && !pb_changed {
             // No replenishment happened for this cgroup during the
             // just-fired timer. (BTQ flux is independent of replenish
@@ -432,5 +457,104 @@ mod tests {
         assert_eq!(events.len(), 2, "events: {:?}", events);
         assert!(matches!(events[0], TraceKind::CbwDrainBtqBatch { .. }));
         assert!(matches!(events[1], TraceKind::CgroupBwReplenish { .. }));
+    }
+
+    // ---- CbwThrottleCgroups (A3) tests ---------------------------------
+    //
+    // tg `add-cbw-throttle-cgroups-tracekind`. Tests use snapshots that
+    // do NOT change rtl/pb (no replenish event) and have BTQ at sentinel
+    // -1 (no BTQ event), so the only event emitted is the throttle
+    // transition.
+
+    #[test]
+    fn throttle_transition_0_to_1_emits_throttled_true() {
+        let before = vec![snap(1, 0, 1000, 0, 1000, 1000, 0)];
+        let after = vec![snap(1, 0, 1000, 0, 1000, 1000, 1)];
+        let events = diff_snapshots(&before, &after);
+        assert_eq!(events.len(), 1, "events: {:?}", events);
+        match &events[0] {
+            TraceKind::CbwThrottleCgroups { cgid, throttled } => {
+                assert_eq!(cgid.0, 1);
+                assert!(*throttled, "expected throttled=true on 0→1 transition");
+            }
+            other => panic!("expected CbwThrottleCgroups, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn throttle_transition_1_to_0_emits_throttled_false() {
+        // Replenish-period boundary clears is_throttled. We use rtl/pb
+        // unchanged here to isolate the throttle transition (the real
+        // replenish path also emits CgroupBwReplenish, exercised in
+        // `throttle_clear_coexists_with_replenish` below).
+        let before = vec![snap(1, 0, 1000, 0, 1000, 1000, 1)];
+        let after = vec![snap(1, 0, 1000, 0, 1000, 1000, 0)];
+        let events = diff_snapshots(&before, &after);
+        assert_eq!(events.len(), 1, "events: {:?}", events);
+        match &events[0] {
+            TraceKind::CbwThrottleCgroups { cgid, throttled } => {
+                assert_eq!(cgid.0, 1);
+                assert!(!*throttled, "expected throttled=false on 1→0 transition");
+            }
+            other => panic!("expected CbwThrottleCgroups, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn throttle_no_change_emits_nothing() {
+        let before = vec![snap(1, 0, 1000, 0, 1000, 1000, 1)];
+        let after = vec![snap(1, 0, 1000, 0, 1000, 1000, 1)];
+        let events = diff_snapshots(&before, &after);
+        assert!(events.is_empty(), "events: {:?}", events);
+
+        let before = vec![snap(2, 0, 1000, 0, 1000, 1000, 0)];
+        let after = vec![snap(2, 0, 1000, 0, 1000, 1000, 0)];
+        let events = diff_snapshots(&before, &after);
+        assert!(events.is_empty(), "events: {:?}", events);
+    }
+
+    #[test]
+    fn throttle_clear_coexists_with_replenish() {
+        // Replenish-period boundary path: rtl reset to 0, pb refilled,
+        // is_throttled cleared. All three events must fire in
+        // deterministic order: BTQ (none here, sentinel -1), throttle
+        // transition, then CgroupBwReplenish.
+        let before = vec![snap(1, 800, -200, 0, 1000, 1000, 1)];
+        let after = vec![snap(1, 0, 1000, 0, 1000, 1000, 0)];
+        let events = diff_snapshots(&before, &after);
+        assert_eq!(events.len(), 2, "events: {:?}", events);
+        match &events[0] {
+            TraceKind::CbwThrottleCgroups { cgid, throttled } => {
+                assert_eq!(cgid.0, 1);
+                assert!(!*throttled);
+            }
+            other => panic!("expected CbwThrottleCgroups first, got {other:?}"),
+        }
+        assert!(matches!(events[1], TraceKind::CgroupBwReplenish { .. }));
+    }
+
+    #[test]
+    fn throttle_per_cgroup_disambiguation() {
+        // Two cgroups: one becomes throttled, the other unthrottled in
+        // the same snapshot pair. Two events fire, one per cgid.
+        let before = vec![
+            snap(10, 0, 1000, 0, 1000, 1000, 0), // about to be throttled
+            snap(20, 0, 1000, 0, 1000, 1000, 1), // about to be unthrottled
+        ];
+        let after = vec![
+            snap(10, 0, 1000, 0, 1000, 1000, 1),
+            snap(20, 0, 1000, 0, 1000, 1000, 0),
+        ];
+        let events = diff_snapshots(&before, &after);
+        assert_eq!(events.len(), 2, "events: {:?}", events);
+
+        let mut by_cgid = std::collections::HashMap::new();
+        for ev in &events {
+            if let TraceKind::CbwThrottleCgroups { cgid, throttled } = ev {
+                by_cgid.insert(cgid.0, *throttled);
+            }
+        }
+        assert_eq!(by_cgid.get(&10), Some(&true));
+        assert_eq!(by_cgid.get(&20), Some(&false));
     }
 }

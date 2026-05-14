@@ -593,6 +593,16 @@ pub(crate) fn write_json(trace: &Trace, writer: &mut impl Write) -> std::io::Res
                     "btq_len_after": btq_len_after,
                 }
             }),
+            // tg `add-cbw-throttle-cgroups-tracekind` (A3): Chrome-JSON
+            // global instant for top-down throttle propagation transitions.
+            TraceKind::CbwThrottleCgroups { cgid, throttled } => json!({
+                "ph": "i", "pid": cpu, "tid": 0, "ts": ts,
+                "name": "cbw_throttle_cgroups", "cat": "cgroup_bw", "s": "g",
+                "args": {
+                    "cgid": cgid.0,
+                    "throttled": throttled,
+                }
+            }),
         };
         serde_json::to_writer(&mut *writer, &value)?;
     }
