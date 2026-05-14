@@ -22,9 +22,10 @@
 //!
 //! The new contract:
 //!
-//!   * The library state at end-of-run shows the cgroup hit the
-//!     throttle path: `is_throttled=1`, `nr_throttled_tasks=16`,
-//!     `nr_throttled_periods >= 4` of the 6 100ms periods elapsed.
+//!   * The canonical (over-subscribed) library state at end-of-run
+//!     shows the cgroup hit the throttle path: `is_throttled=1`,
+//!     `nr_throttled_tasks=16`, `nr_throttled_periods >= 4` of the 6
+//!     100ms periods elapsed.
 //!   * Determinism: across N reps, the
 //!     `(rc, is_throttled, nr_throttled_periods, nr_throttled_tasks)`
 //!     fingerprint is byte-identical.
@@ -32,6 +33,15 @@
 //!     pre-`period_budget` scx SHA's `libscx_lavd.so` via
 //!     `--scheduler-file` produces a CLEARLY DIFFERENT fingerprint.
 //!     Skipped silently when `SCXSIM_BIN_CACHE_DIR` is unset.
+//!   * Under-subscribed sibling fixture
+//!     (`bug1_canonical_undersub.json`, paired with `--cpus 32` →
+//!     0.125 tasks/cpu, deep in the 0.13–0.57 live workload band)
+//!     reproduces the same throttle fingerprint with the
+//!     workload-axis-only difference of 4 tasks vs 16. Confirms the
+//!     bug-1 mechanism is not gated on CPU oversubscription — the
+//!     cgroup_bw constraint alone drives the library into the
+//!     throttled state. See tg
+//!     `bug1-canonical-fixture-add-undersub-variant`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -54,6 +64,18 @@ const SCHEDULER: &str = "lavd";
 const CPUS: &str = "4";
 const DURATION: &str = "600ms";
 
+/// Under-subscribed sibling fixture (4 yes-loop workers, 50ms run + 50ms
+/// sleep, same shared `cpu.max=10000 100000` cgroup constraint). Designed
+/// to be paired with `--cpus 32` to land in the 0.13–0.57 tasks/cpu live
+/// workload band identified by tg
+/// `investigate-dsq-insert-vs-vtime-path-divergence`. cpu.max constraint
+/// is identical to the over-subscribed canonical, so the cgroup_bw
+/// library is exercised the same way; only the workload axis (oversub
+/// vs undersub, all-run vs run+sleep cycling) differs. Lets us confirm
+/// the bug-1 mechanism is workload-axis-agnostic in scxsim post-Stage-E.
+const FIXTURE_JSON_UNDERSUB: &str = "tests/fixtures/h6/bug1_canonical_undersub.json";
+const CPUS_UNDERSUB: &str = "32";
+
 /// Successful exit (no stall fired). Post-Stage-E the library handles
 /// throttling correctly so the canonical run completes without tripping
 /// the watchdog.
@@ -72,15 +94,56 @@ fn fixture(rel: &str) -> PathBuf {
     PathBuf::from(rel)
 }
 
-/// Run scxsim once with the canonical args. If `scheduler_file` is
-/// `Some`, pass `--scheduler-file <path>` to override the dlsym lookup.
-fn run_one_rep(scheduler_file: Option<&Path>) -> (i32, String) {
+/// Per-invocation configuration. Bundles fixture path, CPU count, and
+/// optional `--scheduler-file` override so the test entry points can
+/// share `run_one_rep` across the canonical (over-subscribed) and
+/// `bug1_canonical_undersub` (live-workload-band) variants.
+#[derive(Clone)]
+struct Invocation<'a> {
+    /// Workload JSON fixture (relative to crate root).
+    fixture_json: &'a str,
+    /// Number of simulated CPUs to pass via `--cpus`.
+    cpus: &'a str,
+    /// Optional `--scheduler-file <PATH>` override (used by the per-SHA
+    /// discrimination test to swap in cached `.so`s without rebuilding).
+    scheduler_file: Option<&'a Path>,
+}
+
+impl<'a> Invocation<'a> {
+    /// Over-subscribed canonical: 16 yes-loop workers / 4 cpus = 4.0 tasks/cpu.
+    fn canonical() -> Self {
+        Self {
+            fixture_json: FIXTURE_JSON,
+            cpus: CPUS,
+            scheduler_file: None,
+        }
+    }
+
+    /// Under-subscribed live-workload-band variant: 4 yes-loop workers
+    /// (50ms run + 50ms sleep) / 32 cpus = 0.125 tasks/cpu.
+    fn undersub() -> Self {
+        Self {
+            fixture_json: FIXTURE_JSON_UNDERSUB,
+            cpus: CPUS_UNDERSUB,
+            scheduler_file: None,
+        }
+    }
+
+    fn with_scheduler_file(mut self, p: &'a Path) -> Self {
+        self.scheduler_file = Some(p);
+        self
+    }
+}
+
+/// Run scxsim once with the given invocation config and capture
+/// `(exit_code, stderr)`.
+fn run_one_rep(inv: &Invocation<'_>) -> (i32, String) {
     let exe = env!("CARGO_BIN_EXE_scxsim");
     let mut cmd = Command::new(exe);
     cmd.args([
         "--no-disable-aslr",
         "run",
-        fixture(FIXTURE_JSON).to_str().unwrap(),
+        fixture(inv.fixture_json).to_str().unwrap(),
         "--config",
         fixture(FIXTURE_TOML).to_str().unwrap(),
         "--watchdog",
@@ -88,11 +151,11 @@ fn run_one_rep(scheduler_file: Option<&Path>) -> (i32, String) {
         "-s",
         SCHEDULER,
         "--cpus",
-        CPUS,
+        inv.cpus,
         "--duration",
         DURATION,
     ]);
-    if let Some(path) = scheduler_file {
+    if let Some(path) = inv.scheduler_file {
         cmd.args(["--scheduler-file", path.to_str().unwrap()]);
     }
     let output = cmd.output().expect("failed to spawn scxsim subprocess");
@@ -163,7 +226,7 @@ fn parse_token_after(line: &str, key: &str) -> Option<String> {
 fn test_bug1_canonical_subprocess_reproduces_throttle() {
     let _lock = common::setup_test();
 
-    let (code, stderr) = run_one_rep(None);
+    let (code, stderr) = run_one_rep(&Invocation::canonical());
     assert_eq!(
         code, EXIT_OK,
         "expected EXIT_OK ({EXIT_OK}); got {code}.\nstderr:\n{stderr}"
@@ -210,7 +273,7 @@ fn test_bug1_canonical_subprocess_deterministic_10_reps() {
     let start = Instant::now();
     let mut first: Option<Fingerprint> = None;
     for rep in 0..N {
-        let (code, stderr) = run_one_rep(None);
+        let (code, stderr) = run_one_rep(&Invocation::canonical());
         let fp = extract_fingerprint(code, &stderr);
         if let Some(prev) = &first {
             assert_eq!(
@@ -292,7 +355,7 @@ fn test_bug1_canonical_per_sha_discrimination() {
             );
             continue;
         }
-        let (code, stderr) = run_one_rep(Some(&so));
+        let (code, stderr) = run_one_rep(&Invocation::canonical().with_scheduler_file(&so));
         let fp = extract_fingerprint(code, &stderr);
         eprintln!("[bug1_canonical_subprocess] {sha} ({label}): {fp:?}");
         assert_eq!(
@@ -344,4 +407,60 @@ fn test_bug1_canonical_per_sha_discrimination() {
             fps.len()
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Test 4: under-subscribed live-workload-band variant.
+//
+// `bug1_canonical_undersub.json` is the live-workload-band sibling of the
+// canonical (4 yes-loop workers, 50ms run + 50ms sleep, same shared
+// `cpu.max=10000 100000` cgroup constraint). Designed to land in the
+// 0.13–0.57 tasks/cpu live workload band when paired with `--cpus 32`.
+// Confirms that the bug-1 mechanism reproduces in scxsim WITHOUT requiring
+// CPU oversubscription -- the cgroup_bw constraint alone is sufficient
+// to drive the library into the throttled state.
+//
+// Fingerprint expectation (matches canonical's STRUCTURE but with 4
+// tasks instead of 16):
+//   rc=0 (no false stall),
+//   is_throttled=1,
+//   nr_throttled_tasks=4 (all yes-loop workers in the BTQ),
+//   nr_throttled_periods >= 4/N (out of N=6 periods in a 600ms run).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_bug1_canonical_undersub_subprocess_reproduces_throttle() {
+    let _lock = common::setup_test();
+
+    let (code, stderr) = run_one_rep(&Invocation::undersub());
+    assert_eq!(
+        code, EXIT_OK,
+        "expected EXIT_OK ({EXIT_OK}); got {code}.\nstderr:\n{stderr}"
+    );
+
+    let fp = extract_fingerprint(code, &stderr);
+    eprintln!("[bug1_canonical_undersub] integrated-v6 fingerprint = {fp:?}");
+
+    assert_eq!(
+        fp.is_throttled, 1,
+        "undersub: expected library to report cgroup throttled at end of run; \
+         got {fp:?}.\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        fp.nr_throttled_tasks, 4,
+        "undersub: expected all 4 yes-loop workers in the BTQ; \
+         got {fp:?}.\nstderr:\n{stderr}"
+    );
+    let throttled = fp
+        .nr_throttled_periods
+        .split('/')
+        .next()
+        .unwrap_or("0")
+        .parse::<u32>()
+        .unwrap_or(0);
+    assert!(
+        throttled >= 4,
+        "undersub: expected nr_throttled_periods numerator >= 4 (out of 6 periods \
+         in a 600ms run); got {fp:?}.\nstderr:\n{stderr}"
+    );
 }
