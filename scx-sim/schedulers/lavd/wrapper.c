@@ -578,6 +578,20 @@ extern void scxsim_cgroup_bw_yield_throttled(void);
 extern void scxsim_cgroup_bw_yield_consume(void);
 extern void scxsim_cgroup_bw_yield_put_aside(void);
 extern void scxsim_cgroup_bw_yield_reenqueue(void);
+/*
+ * V2 observer hooks for lavd-side bail / drain detection. tg
+ * scxsim-eager-throttle-v2-track-lavd-bail-path. Called AFTER the lib
+ * call returns (only on success path). Recording is stats-only — no
+ * engine-side wake injected (that would duplicate the lib's drain and
+ * violate the No-Stub Rule per scx-sim/CLAUDE.md).
+ */
+extern void scxsim_cgroup_bw_observe_put_aside(int pid, unsigned long long cgid);
+extern void scxsim_cgroup_bw_observe_reenqueue(unsigned long long cgid);
+/*
+ * V4-A observer for scx_cgroup_bw_consume(cgrp, ns) call args.
+ * tg scxsim-disambiguate-runtime-overcharge-vs-lib-idealized-accounting.
+ */
+extern void scxsim_cgroup_bw_observe_consume(unsigned long long cgid, unsigned long long ns);
 extern void scxsim_cgroup_bw_yield_cancel(void);
 extern void scxsim_cgroup_bw_yield_is_cgroup_throttled(void);
 extern void scxsim_cgroup_bw_yield_is_task_throttled(void);
@@ -627,15 +641,34 @@ void lavd_fire_timer(unsigned int slot);
 	SCXSIM_CGROUP_BW_YIELD(scxsim_cgroup_bw_yield_consume); \
 	int _rc = scx_cgroup_bw_consume((c), (n)); \
 	SCXSIM_DEBUG_CONSUME_PROBE_BODY(c, n, _rc); \
+	/* V4-A observe: record (cgid, ns) on every consume call. cgrp_get_id is
+	 * static-in-lib; inline as cgrp->kn->id. (c) is `struct cgroup *` here
+	 * per the lib's prototype `int scx_cgroup_bw_consume(struct cgroup *cgrp, u64 ns)`.
+	 * Skip emit on null cgrp (initial period before cgroup is registered).
+	 */ \
+	if ((c)) scxsim_cgroup_bw_observe_consume((c)->kn->id, (unsigned long long)(n)); \
 	_rc; \
 })
 #define scx_cgroup_bw_put_aside(p, taskc, vtime, cgrp) ({ \
 	SCXSIM_CGROUP_BW_YIELD(scxsim_cgroup_bw_yield_put_aside); \
-	scx_cgroup_bw_put_aside((p), (taskc), (vtime), (cgrp)); \
+	int _scxsim_pa_rc = scx_cgroup_bw_put_aside((p), (taskc), (vtime), (cgrp)); \
+	/* V2 observe: only emit if put_aside succeeded (rc == 0).
+	 * cgroup_get_id() is static in lib; inline its body (cgrp->kn->id).
+	 */ \
+	if (_scxsim_pa_rc == 0) \
+		scxsim_cgroup_bw_observe_put_aside((p)->pid, (cgrp)->kn->id); \
+	_scxsim_pa_rc; \
 })
 #define scx_cgroup_bw_reenqueue() ({ \
 	SCXSIM_CGROUP_BW_YIELD(scxsim_cgroup_bw_yield_reenqueue); \
-	scx_cgroup_bw_reenqueue(); \
+	int _scxsim_re_rc = scx_cgroup_bw_reenqueue(); \
+	/* V2 observe: scx_cgroup_bw_reenqueue is the per-call entry that
+	 * fans out to cbw_reenqueue_cgroup for every cgroup. cgid not
+	 * reachable here (it's per-cgroup inside the lib). Emit cgid=0 as
+	 * a per-call sentinel: count > 0 proves the drain mechanism is
+	 * firing in scxsim. */ \
+	scxsim_cgroup_bw_observe_reenqueue(0); \
+	_scxsim_re_rc; \
 })
 #define scx_cgroup_bw_cancel(taskc) ({ \
 	SCXSIM_CGROUP_BW_YIELD(scxsim_cgroup_bw_yield_cancel); \

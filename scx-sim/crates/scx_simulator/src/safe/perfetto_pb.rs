@@ -630,6 +630,68 @@ fn emit_event(trace: &Trace, ev: &crate::trace::TraceEvent, proto: &mut TracePro
                 anns,
             );
         }
+        TraceKind::CgroupBwDequeueOnThrottle { pid, cgid } => {
+            let mut anns = vec![ann_uint("cgid", cgid.0), ann_uint("cpu", u64::from(cpu.0))];
+            push_task_anns(&mut anns, *pid, trace.task_name(*pid));
+            push_instant(
+                proto,
+                ts,
+                cpu_track_uuid(cpu),
+                "SCXSIM_CGBW_DEQ_THR",
+                "cgroup_bw_dequeue_on_throttle",
+                anns,
+            );
+        }
+        TraceKind::CgroupBwReenqueueOnReplenish { pid, cgid } => {
+            let mut anns = vec![ann_uint("cgid", cgid.0), ann_uint("cpu", u64::from(cpu.0))];
+            push_task_anns(&mut anns, *pid, trace.task_name(*pid));
+            push_instant(
+                proto,
+                ts,
+                cpu_track_uuid(cpu),
+                "SCXSIM_CGBW_REENQ_RPL",
+                "cgroup_bw_reenqueue_on_replenish",
+                anns,
+            );
+        }
+        TraceKind::LavdBailOnCgroupThrottle { pid, cgid } => {
+            let mut anns = vec![ann_uint("cgid", cgid.0), ann_uint("cpu", u64::from(cpu.0))];
+            push_task_anns(&mut anns, *pid, trace.task_name(*pid));
+            push_instant(
+                proto,
+                ts,
+                cpu_track_uuid(cpu),
+                "SCXSIM_LAVD_BAIL_CGT",
+                "lavd_bail_on_cgroup_throttle",
+                anns,
+            );
+        }
+        TraceKind::LavdReenqueueViaBtqDrain { cgid } => {
+            let anns = vec![ann_uint("cgid", cgid.0), ann_uint("cpu", u64::from(cpu.0))];
+            push_instant(
+                proto,
+                ts,
+                cpu_track_uuid(cpu),
+                "SCXSIM_LAVD_REENQ_BTQ",
+                "lavd_reenqueue_via_btq_drain",
+                anns,
+            );
+        }
+        TraceKind::CgroupBwConsumeNs { cgid, ns } => {
+            let anns = vec![
+                ann_uint("cgid", cgid.0),
+                ann_uint("ns", *ns),
+                ann_uint("cpu", u64::from(cpu.0)),
+            ];
+            push_instant(
+                proto,
+                ts,
+                cpu_track_uuid(cpu),
+                "SCXSIM_CGBW_CONSUME",
+                "cgroup_bw_consume",
+                anns,
+            );
+        }
         TraceKind::CgroupBwReplenish {
             cgid,
             runtime_total_last,
@@ -1153,7 +1215,10 @@ fn event_pid(kind: &TraceKind) -> Option<Pid> {
         | TraceKind::Runnable { pid, .. }
         | TraceKind::Dequeue { pid, .. }
         | TraceKind::Quiescent { pid, .. }
-        | TraceKind::CgroupMove { pid, .. } => Some(*pid),
+        | TraceKind::CgroupMove { pid, .. }
+        | TraceKind::CgroupBwDequeueOnThrottle { pid, .. }
+        | TraceKind::CgroupBwReenqueueOnReplenish { pid, .. }
+        | TraceKind::LavdBailOnCgroupThrottle { pid, .. } => Some(*pid),
         // tg `bundle-implement-secondary-tracekind-easy-wins`: route the
         // pid-bearing variants of the secondary bundle through the
         // per-task track so they appear on the right thread lane in
@@ -1193,7 +1258,13 @@ fn event_pid(kind: &TraceKind) -> Option<Pid> {
         // tg `add-cbw-throttle-cgroups-tracekind`: CbwThrottleCgroups
         // is cgid-keyed (a top-down hierarchy propagation observed
         // per-cgroup, not per-task) — route to the CPU lane.
-        | TraceKind::CbwThrottleCgroups { .. } => None,
+        | TraceKind::CbwThrottleCgroups { .. }
+        // V2 (`scxsim-eager-throttle-v2-track-lavd-bail-path`):
+        // LavdReenqueueViaBtqDrain is a per-cgroup BTQ drain event
+        // observed by the wrapper.c hook; PID is not the relevant
+        // axis. Route to the CPU lane.
+        | TraceKind::LavdReenqueueViaBtqDrain { .. }
+        | TraceKind::CgroupBwConsumeNs { .. } => None,
     }
 }
 

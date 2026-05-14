@@ -537,7 +537,7 @@ impl EventQueue {
         one_in: u32,
     ) -> Option<Event> {
         let one_in = one_in.max(1);
-        if one_in > 1 && self.timer_interleave_rng.next_u32() % one_in != 0 {
+        if one_in > 1 && !self.timer_interleave_rng.next_u32().is_multiple_of(one_in) {
             return None;
         }
 
@@ -978,6 +978,55 @@ fn pid_is_bw_throttled<S: crate::ffi::Scheduler>(
     }
 }
 
+/// Eagerly remove a bw-throttled task from its local DSQ + stash it in
+/// `bw_blocked[cgid]` for re-runnable on the next cgroup_bw replenish.
+///
+/// Mirrors the kernel's bandwidth controller behavior: when a task
+/// belongs to a throttled cgroup, the kernel removes it from sched_ext
+/// queues entirely (not just blocks dispatch). Replaces the LAZY
+/// `CgroupBwDenied` admission gate that left throttled tasks in the
+/// local DSQ — see tg
+/// `scxsim-eager-cgroup-bw-throttle-via-dequeue-wakeup-cycle` for the
+/// motivation (live LAVD's `dsq_insert : dsq_insert_vtime` ratio of
+/// 13:1 vs scxsim's 1:16,000 inversion is caused by sim's throttled
+/// tasks never re-traversing the wakeup→select_cpu→can_direct_dispatch
+/// chain that the simple-insert direct-dispatch path lives on).
+///
+/// Records `TraceKind::CgroupBwDequeueOnThrottle` so the eager-throttle
+/// cycle is observable in scxsim's JSONL emit + perfetto trace.
+///
+/// DANGER TODO(sim-eager-throttle-v2): does NOT call `ops.dequeue` /
+/// `ops.quiescent` on the stashed task. Real kernel does call those
+/// when the bandwidth controller dequeues a task. V1 of the eager
+/// model skips these notifications because the call site is mid-
+/// dispatch and the sim_callback! re-entrancy is awkward; if the
+/// validation matrix shows scheduler-internal state diverges
+/// (e.g. LAVD's per-task ops_state stays Queued when it shouldn't),
+/// V2 will add the explicit ops.dequeue + ops.quiescent calls.
+fn eager_stash_throttled(s: &mut crate::kfuncs::SimState, pid: Pid, cgid: CgroupId, cpu: CpuId) {
+    // Pop the task from the local DSQ (we already verified it's at
+    // the front).
+    let popped = s.sim.cpus[cpu.0 as usize].local_dsq.pop_front();
+    debug_assert_eq!(popped, Some(pid), "front-of-DSQ contract violated");
+
+    // Stash in bw_blocked[cgid] preserving FIFO insertion order.
+    s.sim.bw_blocked.entry(cgid).or_default().push_back(pid);
+
+    // Record the kernel-faithful "dequeue on throttle" event.
+    let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
+    s.sim.trace.record(
+        __local_t,
+        cpu,
+        TraceKind::CgroupBwDequeueOnThrottle { pid, cgid },
+    );
+    debug!(
+        pid = pid.0,
+        cgid = cgid.0,
+        cpu = cpu.0,
+        "cgroup_bw: eager-dequeue throttled task (stashed in bw_blocked)"
+    );
+}
+
 /// Compute the maximum permitted run-time slice (ns) for `pid` based on
 /// its cgroup's remaining quota in the current `cpu.max` period. Returns
 /// `None` when no bandwidth cap applies — either because (a) the task
@@ -1326,10 +1375,9 @@ impl<S: Scheduler> Simulator<S> {
         }
 
         // Assign LLC domain IDs (CCX topology)
-        let cpus_per_llc = scenario.cpus_per_llc;
-        if cpus_per_llc > 0 {
+        if let Some(cpus_per_llc) = std::num::NonZeroU32::new(scenario.cpus_per_llc) {
             for i in 0..nr_cpus {
-                cpus[i as usize].llc_id = i / cpus_per_llc;
+                cpus[i as usize].llc_id = i / cpus_per_llc.get();
             }
         }
 
@@ -1467,6 +1515,7 @@ impl<S: Scheduler> Simulator<S> {
                 scenario.nr_cpus as usize
             ],
             native_concurrent: scenario.native_concurrent,
+            bw_blocked: std::collections::BTreeMap::new(),
         };
 
         // Build the persistent replay backend once if we have a replay trace.
@@ -2558,8 +2607,68 @@ impl<S: Scheduler> Simulator<S> {
                 .unwrap_or_default();
             let now_ns = s.sim.cpus[cpu.0 as usize].local_clock;
             let events = crate::cgroup_bw_replenish::diff_snapshots(&cbw_before, &cbw_after);
+            // For each cgroup that just replenished AND is no longer
+            // throttled (`keep_throttled == false`), drain any tasks the
+            // EAGER admission gate stashed in `bw_blocked[cgid]` and
+            // schedule a TaskWake event for each — re-runnabling them
+            // through the wakeup path (ops.runnable + ops.select_cpu +
+            // ops.enqueue) so LAVD's `can_direct_dispatch` can fire
+            // and (probably) take the simple-insert direct-dispatch fast
+            // path. tg
+            // `scxsim-eager-cgroup-bw-throttle-via-dequeue-wakeup-cycle`.
             for kind in events {
+                let replenish_info = if let TraceKind::CgroupBwReplenish {
+                    cgid,
+                    keep_throttled,
+                    ..
+                } = &kind
+                {
+                    Some((*cgid, *keep_throttled))
+                } else {
+                    None
+                };
                 s.sim.trace.record(now_ns, cpu, kind);
+                if let Some((cgid, keep_throttled)) = replenish_info {
+                    if !keep_throttled {
+                        // Drain bw_blocked[cgid] (FIFO).
+                        if let Some(queue) = s.sim.bw_blocked.remove(&cgid) {
+                            for blocked_pid in queue {
+                                // Reset task state so handle_task_wake's
+                                // "skip if already runnable" guard
+                                // accepts the wake.
+                                if let Some(task) = s.tasks.get_mut(&blocked_pid) {
+                                    task.state = TaskState::Sleeping;
+                                }
+                                // Schedule a fresh wake at "now". cpu =
+                                // the CPU on which fire_timer is
+                                // running; the wake will pass this as
+                                // prev_cpu fallback.
+                                s.events.push(
+                                    now_ns,
+                                    EventKind::TaskWake {
+                                        pid: blocked_pid,
+                                        waker: None,
+                                        cpu,
+                                    },
+                                );
+                                s.sim.trace.record(
+                                    now_ns,
+                                    cpu,
+                                    TraceKind::CgroupBwReenqueueOnReplenish {
+                                        pid: blocked_pid,
+                                        cgid,
+                                    },
+                                );
+                                debug!(
+                                    pid = blocked_pid.0,
+                                    cgid = cgid.0,
+                                    cpu = cpu.0,
+                                    "cgroup_bw: eager-replenish wake (drained bw_blocked)"
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -4079,43 +4188,52 @@ impl<S: Scheduler> Simulator<S> {
             }
         }
 
-        // Diff 3 wiring: peek the front of the local DSQ. If that task's
-        // cgroup is currently throttled by cpu.max, refuse admission, leave
-        // the task in the DSQ, record a trace event, and let the CPU go
-        // idle (head-of-line blocking is intentional for the single-cgroup
-        // Bug-1 reproducer per the design doc; multi-cgroup fairness is
-        // out of scope for Diff 3).
-        let bw_denied = if let Some(&pid) = s.sim.cpus[cpu.0 as usize].local_dsq.front() {
-            if let Some(cgid) = pid_is_bw_throttled(&self.scheduler, &s.fields(), pid) {
-                let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
-                s.sim
-                    .trace
-                    .record(__local_t, cpu, TraceKind::CgroupBwDenied { pid, cgid });
-                debug!(
-                    pid = pid.0,
-                    cgid = cgid.0,
-                    cpu = cpu.0,
-                    "cgroup_bw: denying dispatch (post_dispatch_run)"
-                );
-                Some(pid)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        // EAGER cgroup_bw throttle: peek the front of the local DSQ. If
+        // that task's cgroup is currently throttled by cpu.max, eagerly
+        // remove the task from the DSQ + ops.dequeue + ops.quiescent +
+        // stash in `bw_blocked[cgid]`. The cgroup's replenish (detected
+        // post-fire_timer) will drain `bw_blocked[cgid]` and re-runnable
+        // each task via the wakeup path (ops.runnable + ops.select_cpu +
+        // ops.enqueue), letting LAVD's `can_direct_dispatch` decide
+        // afresh.
+        //
+        // This is the kernel-faithful model: the kernel's bandwidth
+        // controller dequeues throttled tasks entirely (calls
+        // dequeue_task_scx → ops.dequeue) rather than head-of-line
+        // blocking the dispatch path. The previous LAZY admission gate
+        // (`CgroupBwDenied` then leave-in-DSQ) prevented scxsim's
+        // throttled tasks from re-traversing the wakeup→select_cpu→
+        // can_direct_dispatch chain that real LAVD takes on every
+        // replenish, masking the simple-insert direct-dispatch path
+        // entirely. See tg
+        // `investigate-dsq-insert-vs-vtime-path-divergence` for the
+        // 16,000× ratio inversion that motivated this fix.
+        //
+        // Single-cgroup head-of-line behavior preserved: we only check
+        // the front of the local DSQ, not all queued tasks. Bug-1
+        // reproducer is single-cgroup so this is sufficient; multi-
+        // cgroup fairness is still out of scope here.
+        let bw_blocked_pid = s.sim.cpus[cpu.0 as usize]
+            .local_dsq
+            .front()
+            .copied()
+            .and_then(|front_pid| {
+                pid_is_bw_throttled(&self.scheduler, &s.fields(), front_pid)
+                    .map(|cgid| (front_pid, cgid))
+            });
 
-        // Try to pull a task from the local DSQ
-        if bw_denied.is_none() {
-            if let Some(pid) = s.sim.cpus[cpu.0 as usize].local_dsq.pop_front() {
-                let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
-                s.sim
-                    .trace
-                    .record(__local_t, cpu, TraceKind::PickTask { pid });
-                drop(guard);
-                self.start_running(cpu, pid, sim_arc, monitor);
-                return;
-            }
+        if let Some((pid, cgid)) = bw_blocked_pid {
+            eager_stash_throttled(s, pid, cgid, cpu);
+            // Fall through to the CPU-idle handling below.
+        } else if let Some(pid) = s.sim.cpus[cpu.0 as usize].local_dsq.pop_front() {
+            // Try to pull a task from the local DSQ
+            let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
+            s.sim
+                .trace
+                .record(__local_t, cpu, TraceKind::PickTask { pid });
+            drop(guard);
+            self.start_running(cpu, pid, sim_arc, monitor);
+            return;
         }
         {
             // CPU is idle — update the C idle cpumask so
@@ -4125,6 +4243,23 @@ impl<S: Scheduler> Simulator<S> {
             s.sim.update_smt_mask_idle(cpu);
             let local_t = s.sim.cpus[cpu.0 as usize].local_clock;
             kfuncs::set_sim_clock(local_t, Some(cpu));
+
+            // V4-C fix: clear `prev_task` once we've decided the CPU is
+            // genuinely idle. Otherwise the next `lavd_dispatch(cpu, prev)`
+            // call passes the stale prev_task to the scheduler, and LAVD's
+            // fall-through path `consume_prev(prev, ...)` →
+            // `update_stat_for_refill(prev)` →
+            // `account_task_runtime(prev)` →
+            // `scx_cgroup_bw_consume(prev->cgroup, task_time_wall)` charges
+            // prev's cgroup with full inter-tick wall time despite prev
+            // being off-CPU. That's the V4-A "engine over-charge" bug —
+            // 100M ns/period accumulates as debt → keep_throttled forever
+            // → drain bails → V3 stall pattern. Real kernel never sees
+            // this because pick_next_task during idle returns the IDLE
+            // TASK (root cgroup), not the last user task.
+            //
+            // tg `scxsim-fix-cbw-debt-runaway-or-document-as-known-cpu-bw-stall-bug`
+            s.sim.cpus[cpu.0 as usize].prev_task = None;
 
             if notify_idle {
                 // Notify scheduler that CPU is entering idle (ops.update_idle)
@@ -4175,37 +4310,28 @@ impl<S: Scheduler> Simulator<S> {
             }
         }
 
-        // Diff 3 wiring: cgroup-bw admission gate (peek and skip if throttled).
-        let bw_denied = if let Some(&pid) = s.sim.cpus[cpu_idx].local_dsq.front() {
-            if let Some(cgid) = pid_is_bw_throttled(&self.scheduler, &s.fields(), pid) {
-                let __local_t = s.sim.cpus[cpu_idx].local_clock;
-                s.sim
-                    .trace
-                    .record(__local_t, cpu, TraceKind::CgroupBwDenied { pid, cgid });
-                debug!(
-                    pid = pid.0,
-                    cgid = cgid.0,
-                    cpu = cpu.0,
-                    "cgroup_bw: denying dispatch (handle_dsq_consume)"
-                );
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        };
+        // EAGER cgroup_bw throttle (mirror of post_dispatch_run's gate).
+        // See `eager_stash_throttled` for the kernel-faithful rationale.
+        let bw_blocked_pid = s.sim.cpus[cpu_idx]
+            .local_dsq
+            .front()
+            .copied()
+            .and_then(|front_pid| {
+                pid_is_bw_throttled(&self.scheduler, &s.fields(), front_pid)
+                    .map(|cgid| (front_pid, cgid))
+            });
 
-        if !bw_denied {
-            if let Some(pid) = s.sim.cpus[cpu_idx].local_dsq.pop_front() {
-                let __local_t = s.sim.cpus[cpu_idx].local_clock;
-                s.sim
-                    .trace
-                    .record(__local_t, cpu, TraceKind::PickTask { pid });
-                drop(guard);
-                self.start_running(cpu, pid, sim_arc, monitor);
-                return;
-            }
+        if let Some((pid, cgid)) = bw_blocked_pid {
+            eager_stash_throttled(s, pid, cgid, cpu);
+            // Fall through to CPU-idle handling below.
+        } else if let Some(pid) = s.sim.cpus[cpu_idx].local_dsq.pop_front() {
+            let __local_t = s.sim.cpus[cpu_idx].local_clock;
+            s.sim
+                .trace
+                .record(__local_t, cpu, TraceKind::PickTask { pid });
+            drop(guard);
+            self.start_running(cpu, pid, sim_arc, monitor);
+            return;
         }
         {
             // CPU is idle
@@ -4213,6 +4339,11 @@ impl<S: Scheduler> Simulator<S> {
             s.sim.update_smt_mask_idle(cpu);
             let local_t = s.sim.cpus[cpu_idx].local_clock;
             kfuncs::set_sim_clock(local_t, Some(cpu));
+            // V4-C fix (mirror of the post_dispatch_run path): clear
+            // prev_task on idle so the next dispatch doesn't fall through
+            // to consume_prev with a stale prev. See V4-C commentary in
+            // post_dispatch_run for the full rationale.
+            s.sim.cpus[cpu_idx].prev_task = None;
             s.sim.trace.record(local_t, cpu, TraceKind::CpuIdle);
             info!(cpu = cpu.0, "IDLE (dsq_consume)");
         }

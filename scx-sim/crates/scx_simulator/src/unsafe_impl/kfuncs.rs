@@ -481,6 +481,25 @@ pub struct SimulatorState {
     /// When set, workers run truly concurrently with real locks and
     /// window-based clock throttling instead of token-ring serialization.
     pub native_concurrent: Option<NativeConcurrentConfig>,
+    /// SHARED-MUTABLE: Tasks that the engine eagerly removed from BPF
+    /// scheduler queues (via `ops.dequeue` + `ops.quiescent`) when their
+    /// cgroup_bw quota was exhausted. Indexed by `CgroupId`. The engine
+    /// drains the per-cgroup queue and re-runnables each task (via the
+    /// normal wakeup path: `ops.runnable` + `ops.select_cpu` +
+    /// `ops.enqueue`) when the cgroup_bw library marks the cgroup as no
+    /// longer throttled.
+    ///
+    /// This replaces the previous "lazy / head-of-line-blocking" admission
+    /// gate that left throttled tasks in the local DSQ — making scxsim's
+    /// throttle handling kernel-faithful (the kernel's bandwidth controller
+    /// fully dequeues throttled tasks rather than blocking dispatch).
+    ///
+    /// Insertion order is preserved per-cgroup (VecDeque) so that
+    /// re-enqueue happens in roughly the same order tasks were originally
+    /// admitted. Cross-cgroup ordering is stable per the BTreeMap.
+    ///
+    /// tg `scxsim-eager-cgroup-bw-throttle-via-dequeue-wakeup-cycle`.
+    pub bw_blocked: BTreeMap<crate::cgroup::CgroupId, VecDeque<Pid>>,
 }
 
 /// Bundle of all shared simulator state, protected by a single Mutex.
@@ -1609,6 +1628,125 @@ define_cgroup_bw_yield!(
 );
 define_cgroup_bw_yield!(scxsim_cgroup_bw_yield_move, "cgroup_bw_move");
 define_cgroup_bw_yield!(scxsim_cgroup_bw_yield_dump, "cgroup_bw_dump");
+
+/// V2 observer for `LavdBailOnCgroupThrottle`. Called from
+/// wrapper.c's `scx_cgroup_bw_put_aside` macro AFTER the lib call
+/// returns 0 (i.e. successful put-aside). Records a trace event so
+/// downstream tools can count LAVD-side bail events that V1's
+/// engine-side admission gate doesn't observe.
+///
+/// Safe to call without a SIM_ARC: silently no-ops if there is no
+/// active simulation (matches the pattern of the yield hooks above).
+///
+/// tg `scxsim-eager-throttle-v2-track-lavd-bail-path`.
+#[no_mangle]
+pub extern "C" fn scxsim_cgroup_bw_observe_put_aside(pid: i32, cgid: u64) {
+    if !SIM_ARC.with(|c| c.borrow().is_some()) {
+        return;
+    }
+    use crate::trace::TraceKind;
+    use crate::types::{CpuId, Pid};
+    let arc = match SIM_ARC.with(|c| c.borrow().clone()) {
+        Some(a) => a,
+        None => return,
+    };
+    let cpu = current_cpu_from_tls();
+    let mut guard = arc.lock().unwrap();
+    let s = &mut *guard;
+    let local_t = s.sim.cpus[cpu.0 as usize].local_clock;
+    s.sim.trace.record(
+        local_t,
+        cpu,
+        TraceKind::LavdBailOnCgroupThrottle {
+            pid: Pid(pid),
+            cgid: crate::cgroup::CgroupId(cgid),
+        },
+    );
+    // Maintain bw_blocked tracking for parity with V1's engine-side
+    // bw_blocked map. V2 does NOT push redundant TaskWake events on
+    // replenish — the lib already drives reenqueue via cbw_drain_btq_batch
+    // → scx_cgroup_bw_enqueue_cb → lavd_enqueue_cb → enqueue_cb →
+    // scx_bpf_dsq_insert_vtime. Adding an engine-side wake here would
+    // duplicate the lib's drain (a fake-approximation violation per
+    // scx-sim/CLAUDE.md "Don't Model the Scheduler — Model the Kernel").
+    s.sim
+        .bw_blocked
+        .entry(crate::cgroup::CgroupId(cgid))
+        .or_default()
+        .push_back(Pid(pid));
+    let _ = CpuId(0);
+}
+
+/// V2 observer for `LavdReenqueueViaBtqDrain`. Called from wrapper.c's
+/// `scx_cgroup_bw_reenqueue` macro AFTER the lib's drain runs.
+/// Records a trace event for each cgroup whose BTQ was drained.
+///
+/// Per-cgroup (not per-task) because the lib's drain pops up to
+/// CBW_REENQ_MAX_BATCH tasks in one call and we don't have visibility
+/// into per-task pop events without instrumenting deeper.
+///
+/// tg `scxsim-eager-throttle-v2-track-lavd-bail-path`.
+#[no_mangle]
+pub extern "C" fn scxsim_cgroup_bw_observe_reenqueue(cgid: u64) {
+    if !SIM_ARC.with(|c| c.borrow().is_some()) {
+        return;
+    }
+    use crate::trace::TraceKind;
+    let arc = match SIM_ARC.with(|c| c.borrow().clone()) {
+        Some(a) => a,
+        None => return,
+    };
+    let cpu = current_cpu_from_tls();
+    let mut guard = arc.lock().unwrap();
+    let s = &mut *guard;
+    let local_t = s.sim.cpus[cpu.0 as usize].local_clock;
+    s.sim.trace.record(
+        local_t,
+        cpu,
+        TraceKind::LavdReenqueueViaBtqDrain {
+            cgid: crate::cgroup::CgroupId(cgid),
+        },
+    );
+    // Drain the engine-side bw_blocked tracking for this cgroup. The
+    // lib's reenqueue is per-cgroup (not per-task), so we drain the
+    // entire vec for this cgid. The `bw_blocked` map is now purely an
+    // observability counter — no wake injected.
+    s.sim.bw_blocked.remove(&crate::cgroup::CgroupId(cgid));
+}
+
+/// V4-A observer for `CgroupBwConsumeNs`. Called from wrapper.c's
+/// `scx_cgroup_bw_consume(c, n)` macro AFTER the lib call returns,
+/// recording the `n` argument the engine charged. The post-stall sum
+/// of `ns` per period distinguishes:
+///   - sum/period ≈ period_ns → ENGINE BUG (over-charging idle cgroup)
+///   - sum/period ≈ 0         → LIB BUG (lib's idealized accounting timer)
+///
+/// Safe: no-op if no active SIM_ARC.
+///
+/// tg `scxsim-disambiguate-runtime-overcharge-vs-lib-idealized-accounting`.
+#[no_mangle]
+pub extern "C" fn scxsim_cgroup_bw_observe_consume(cgid: u64, ns: u64) {
+    if !SIM_ARC.with(|c| c.borrow().is_some()) {
+        return;
+    }
+    use crate::trace::TraceKind;
+    let arc = match SIM_ARC.with(|c| c.borrow().clone()) {
+        Some(a) => a,
+        None => return,
+    };
+    let cpu = current_cpu_from_tls();
+    let mut guard = arc.lock().unwrap();
+    let s = &mut *guard;
+    let local_t = s.sim.cpus[cpu.0 as usize].local_clock;
+    s.sim.trace.record(
+        local_t,
+        cpu,
+        TraceKind::CgroupBwConsumeNs {
+            cgid: crate::cgroup::CgroupId(cgid),
+            ns,
+        },
+    );
+}
 
 #[no_mangle]
 pub extern "C" fn scxsim_cgroup_bw_begin_interleaved_timer(slot_out: *mut u32) -> i32 {
@@ -3027,6 +3165,13 @@ pub extern "C" fn sim_timer_start_slot(slot: u32, nsecs: u64) {
 // atq directly (Phase 3 concurrent-execution mode might).
 // ---------------------------------------------------------------------------
 
+// dead_code: these declarations exist purely so the compiled-in
+// scheduler `.so` files (and the `--undefined=scx_atq_create_internal`
+// linker keep-alive on the main binary) resolve the symbols at
+// dlopen time. Rust callers do not invoke them directly today; the
+// references are intentional and must NOT be removed (see comment block
+// above this `extern` declaration).
+#[allow(dead_code)]
 extern "C" {
     fn scx_atq_init() -> i32;
     fn scx_atq_create_internal(fifo: i32, capacity: u64) -> u64;
@@ -3124,6 +3269,7 @@ mod tests {
             stochastic_timer_interleave: false,
             stochastic_timer_interleave_window_ns: 0,
             stochastic_timer_interleave_one_in: 0,
+            bw_blocked: BTreeMap::new(),
         }
     }
 

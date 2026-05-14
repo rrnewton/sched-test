@@ -198,6 +198,7 @@ pub fn run_vm(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)] // wide vm-run subprocess builder; struct refactor would scatter knobs across two files
 fn build_inner_cmd(
     scheduler: &str,
     sched_bin: &Path,

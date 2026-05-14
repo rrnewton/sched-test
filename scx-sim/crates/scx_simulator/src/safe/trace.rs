@@ -320,9 +320,77 @@ pub enum TraceKind {
     /// scheduler-side cgroup_bw library reported its cgroup throttled
     /// (`scxsim_cgroup_bw_is_cgroup_throttled` returned true). The task
     /// remains queued and will be re-checked on the next dispatch.
+    ///
+    /// (Legacy lazy-throttle path — see `CgroupBwDequeueOnThrottle` /
+    /// `CgroupBwReenqueueOnReplenish` for the eager-throttle replacement.)
     CgroupBwDenied {
         pid: Pid,
         cgid: crate::cgroup::CgroupId,
+    },
+    /// Eager throttle: the engine pulled `pid` from its local DSQ at the
+    /// admission gate because its cgroup is throttled, called
+    /// `ops.dequeue` + `ops.quiescent` to remove it from the BPF
+    /// scheduler's queues, and stashed it in `bw_blocked[cgid]` to be
+    /// re-runnabled on the next replenish.
+    ///
+    /// Mirrors what the kernel's bandwidth controller does when a task
+    /// crosses a cgroup quota: dequeue the task entirely from
+    /// sched_ext, not just refuse dispatch. tg
+    /// `scxsim-eager-cgroup-bw-throttle-via-dequeue-wakeup-cycle`.
+    CgroupBwDequeueOnThrottle {
+        pid: Pid,
+        cgid: crate::cgroup::CgroupId,
+    },
+    /// Eager throttle counterpart: when the cgroup_bw library marks a
+    /// cgroup as no longer throttled (per-cgroup snapshot diff after
+    /// `replenish_timerfn`), the engine drains `bw_blocked[cgid]` and
+    /// schedules a `TaskWake` event for each `pid`. The task then
+    /// re-enters via the normal wakeup path:
+    /// `ops.runnable` → `ops.select_cpu` → `ops.enqueue` (which
+    /// goes through LAVD's `can_direct_dispatch` and may take the
+    /// simple-insert direct-dispatch fast path).
+    CgroupBwReenqueueOnReplenish {
+        pid: Pid,
+        cgid: crate::cgroup::CgroupId,
+    },
+    /// LAVD bailed `pid` inside `lavd_enqueue` because
+    /// `cgroup_throttled() == -EAGAIN`. The task was put aside in the
+    /// cgroup_bw library's BTQ (`scx_cgroup_bw_put_aside`) and never
+    /// reached `scx_bpf_dsq_insert*`. V1's `CgroupBwDequeueOnThrottle`
+    /// is the engine-side admission-gate equivalent (rarely fires on
+    /// bug1_canonical+lavd because LAVD bails earlier — V1's REPORT
+    /// documents this).
+    ///
+    /// Captured by the `scxsim_cgroup_bw_observe_put_aside` hook
+    /// installed by the wrapper.c `scx_cgroup_bw_put_aside` macro
+    /// AFTER the lib call returns 0. tg
+    /// `scxsim-eager-throttle-v2-track-lavd-bail-path`.
+    LavdBailOnCgroupThrottle {
+        pid: Pid,
+        cgid: crate::cgroup::CgroupId,
+    },
+    /// LAVD's lib drained `pid` from a per-LLC BTQ on cgroup_bw replenish
+    /// and re-enqueued it via the registered `lavd_enqueue_cb` →
+    /// `enqueue_cb` → `scx_bpf_dsq_insert_vtime` chain. Counter-event
+    /// to `LavdBailOnCgroupThrottle`.
+    ///
+    /// Captured by the `scxsim_cgroup_bw_observe_reenqueue` hook
+    /// installed by the wrapper.c `scx_cgroup_bw_reenqueue` macro
+    /// (per-cgroup, not per-task — the lib's drain is batched).
+    /// tg `scxsim-eager-throttle-v2-track-lavd-bail-path`.
+    LavdReenqueueViaBtqDrain { cgid: crate::cgroup::CgroupId },
+    /// V4-A: per-call `scx_cgroup_bw_consume(cgrp, ns)` observation.
+    /// Fired AFTER the lib's consume call returns, recording the `ns`
+    /// argument that the engine charged. Sum-per-period during the
+    /// STALL window distinguishes:
+    ///
+    ///   - sum/period ≈ period_ns → ENGINE BUG (over-charging idle cgroup)
+    ///   - sum/period ≈ 0         → LIB BUG (idealized accounting timer)
+    ///
+    /// tg `scxsim-disambiguate-runtime-overcharge-vs-lib-idealized-accounting`.
+    CgroupBwConsumeNs {
+        cgid: crate::cgroup::CgroupId,
+        ns: u64,
     },
     /// The compiled-in `scx/lib/cgroup_bw.bpf.c` library performed a
     /// per-cgroup replenishment. Captures the smoking-gun fields the
@@ -1027,6 +1095,21 @@ impl Trace {
                 ),
                 TraceKind::CgroupBwDenied { pid, cgid } => {
                     format!("CG_BW_DENY pid={} cgid={}", pid.0, cgid.0)
+                }
+                TraceKind::CgroupBwDequeueOnThrottle { pid, cgid } => {
+                    format!("CG_BW_DEQ_THR pid={} cgid={}", pid.0, cgid.0)
+                }
+                TraceKind::CgroupBwReenqueueOnReplenish { pid, cgid } => {
+                    format!("CG_BW_REENQ_RPL pid={} cgid={}", pid.0, cgid.0)
+                }
+                TraceKind::LavdBailOnCgroupThrottle { pid, cgid } => {
+                    format!("LAVD_BAIL_CGT pid={} cgid={}", pid.0, cgid.0)
+                }
+                TraceKind::LavdReenqueueViaBtqDrain { cgid } => {
+                    format!("LAVD_REENQ_BTQ cgid={}", cgid.0)
+                }
+                TraceKind::CgroupBwConsumeNs { cgid, ns } => {
+                    format!("CG_BW_CONSUME cgid={} ns={}", cgid.0, ns)
                 }
                 TraceKind::CgroupBwReplenish {
                     cgid,

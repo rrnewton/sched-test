@@ -415,6 +415,66 @@ pub(crate) fn write_json(trace: &Trace, writer: &mut impl Write) -> std::io::Res
                     "args": { "pid": pid.0, "cgid": cgid.0 }
                 })
             }
+            TraceKind::CgroupBwDequeueOnThrottle { pid, cgid } => {
+                json!({
+                    "ph": "i",
+                    "pid": cpu,
+                    "tid": 0,
+                    "ts": ts,
+                    "name": "cgroup_bw_dequeue_on_throttle",
+                    "cat": "cgroup_bw",
+                    "s": "t",
+                    "args": { "pid": pid.0, "cgid": cgid.0 }
+                })
+            }
+            TraceKind::CgroupBwReenqueueOnReplenish { pid, cgid } => {
+                json!({
+                    "ph": "i",
+                    "pid": cpu,
+                    "tid": 0,
+                    "ts": ts,
+                    "name": "cgroup_bw_reenqueue_on_replenish",
+                    "cat": "cgroup_bw",
+                    "s": "t",
+                    "args": { "pid": pid.0, "cgid": cgid.0 }
+                })
+            }
+            TraceKind::LavdBailOnCgroupThrottle { pid, cgid } => {
+                json!({
+                    "ph": "i",
+                    "pid": cpu,
+                    "tid": 0,
+                    "ts": ts,
+                    "name": "lavd_bail_on_cgroup_throttle",
+                    "cat": "cgroup_bw",
+                    "s": "t",
+                    "args": { "pid": pid.0, "cgid": cgid.0 }
+                })
+            }
+            TraceKind::LavdReenqueueViaBtqDrain { cgid } => {
+                json!({
+                    "ph": "i",
+                    "pid": cpu,
+                    "tid": 0,
+                    "ts": ts,
+                    "name": "lavd_reenqueue_via_btq_drain",
+                    "cat": "cgroup_bw",
+                    "s": "t",
+                    "args": { "cgid": cgid.0 }
+                })
+            }
+            TraceKind::CgroupBwConsumeNs { cgid, ns } => {
+                json!({
+                    "ph": "i",
+                    "pid": cpu,
+                    "tid": 0,
+                    "ts": ts,
+                    "name": "cgroup_bw_consume",
+                    "cat": "cgroup_bw",
+                    "s": "t",
+                    "args": { "cgid": cgid.0, "ns": ns }
+                })
+            }
             TraceKind::CgroupBwReplenish {
                 cgid,
                 runtime_total_last,

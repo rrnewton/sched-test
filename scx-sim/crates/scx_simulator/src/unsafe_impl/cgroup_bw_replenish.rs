@@ -267,6 +267,7 @@ mod tests {
         snap_btq(cgid, rtl, pb, br, nq, nqub, thr, -1)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn snap_btq(
         cgid: u64,
         rtl: i64,
