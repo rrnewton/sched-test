@@ -57,7 +57,12 @@ cargo clippy --all -- -D warnings
 
 echo ""
 echo "=== Running cargo nextest ==="
-cargo nextest run --workspace
+# --no-fail-fast: surface ALL failing tests in one CI run instead of
+# stopping at the first failure. Critical for diagnosing CI-vs-local
+# divergences (mb sim-624b9e) where one root cause manifests across
+# multiple tests; without --no-fail-fast each iteration only reveals
+# one test at a time and the cycle becomes whack-a-mole.
+cargo nextest run --workspace --no-fail-fast
 
 echo ""
 echo "=== Running doc-tests ==="
