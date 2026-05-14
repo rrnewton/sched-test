@@ -240,15 +240,15 @@ pub enum TraceKind {
     /// installed by the wrapper.c `scx_cgroup_bw_reenqueue` macro
     /// (per-cgroup, not per-task — the lib's drain is batched).
     /// tg `scxsim-eager-throttle-v2-track-lavd-bail-path`.
-    LavdReenqueueViaBtqDrain {
-        cgid: crate::cgroup::CgroupId,
-    },
+    LavdReenqueueViaBtqDrain { cgid: crate::cgroup::CgroupId },
     /// V4-A: per-call `scx_cgroup_bw_consume(cgrp, ns)` observation.
     /// Fired AFTER the lib's consume call returns, recording the `ns`
     /// argument that the engine charged. Sum-per-period during the
     /// STALL window distinguishes:
+    ///
     ///   - sum/period ≈ period_ns → ENGINE BUG (over-charging idle cgroup)
     ///   - sum/period ≈ 0         → LIB BUG (idealized accounting timer)
+    ///
     /// tg `scxsim-disambiguate-runtime-overcharge-vs-lib-idealized-accounting`.
     CgroupBwConsumeNs {
         cgid: crate::cgroup::CgroupId,
