@@ -1,0 +1,166 @@
+#!/bin/sh
+# scx-sim pre-commit hook: enforce cargo fmt + clippy on scx-sim/ Rust changes.
+#
+# Why: scx-sim/CLAUDE.md mandates that ./validate.sh pass before every
+# commit. Agents have repeatedly committed without running it, allowing
+# cargo fmt and cargo clippy backlog to accumulate (~16 violations
+# cleared by PR #36 / `fix_simulator_v6_cargo`). This hook closes the
+# loop: it RUNS the same fmt + clippy gates that validate.sh runs, but
+# automatically and ONLY against the changes the user is staging.
+#
+# Source of truth: scx-sim/scripts/git-hooks/pre-commit (tracked).
+# Installed at: <git-common-dir>/hooks/pre-commit (copy, see install.sh).
+#
+# Strict-on-what-you-change scoping:
+#   - fmt:    rustfmt --check is run ONLY on staged .rs files under
+#             scx-sim/, so pre-existing backlog in untouched files does
+#             NOT punish the user. New violations YOU introduce are
+#             rejected immediately.
+#   - clippy: run workspace-wide (`--no-deps` for speed) ONLY when a
+#             staged change is .rs / Cargo.{toml,lock} under scx-sim/.
+#             Workspace clippy is unavoidable because clippy can't be
+#             scoped per-file, but clippy IS scoped per-crate by
+#             package boundaries; --no-deps keeps it fast.
+#
+# Speed targets (must be FAST or agents will bypass):
+#   - rustfmt --check on staged files:  <1s typical.
+#   - cargo clippy --no-deps:           ~5-30s warm; ~1-3min cold.
+#
+# Escape hatches (NOT to be used routinely):
+#   SKIP_SCXSIM_HOOK=1 git commit ...     # bypass entire hook
+#   SKIP_SCXSIM_CLIPPY=1 git commit ...   # bypass clippy only (still fmts)
+#
+# Toggle for full clippy (with deps, slower but matches CI exactly):
+#   SCXSIM_HOOK_FULL_CLIPPY=1 git commit ...
+
+set -eu
+
+if [ "${SKIP_SCXSIM_HOOK:-0}" = "1" ]; then
+    echo "pre-commit: SKIP_SCXSIM_HOOK=1 set — skipping scx-sim fmt/clippy hook." >&2
+    exit 0
+fi
+
+# Only act when at least one staged file lives under scx-sim/.
+staged=$(git diff --cached --name-only --diff-filter=ACMR -- 'scx-sim/' 2>/dev/null || true)
+if [ -z "$staged" ]; then
+    exit 0
+fi
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
+# --- 1. rustfmt --check on staged .rs files (always when staged) ----------
+rs_staged=$(printf '%s\n' "$staged" | grep -E '\.rs$' || true)
+if [ -n "$rs_staged" ]; then
+    if ! command -v rustfmt >/dev/null 2>&1; then
+        cat >&2 <<'MSG'
+pre-commit: rustfmt not on PATH.
+Install via `rustup component add rustfmt` (or set PATH to include cargo bin).
+To bypass (NOT recommended): SKIP_SCXSIM_HOOK=1 git commit ...
+MSG
+        exit 1
+    fi
+
+    # Edition matches scx-sim/crates/scx_simulator/Cargo.toml.
+    # rustfmt processes each file with that edition's formatting rules.
+    fmt_start=$(date +%s 2>/dev/null || echo 0)
+    fmt_failed=0
+    fmt_failures=""
+
+    # Use a here-doc loop so we don't need xargs (portable across BusyBox /
+    # macOS BSD xargs) and so the failure list survives the loop body.
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        # Only check files that still exist (skip deletes / renames-away).
+        [ -f "$f" ] || continue
+        if ! rustfmt --edition 2021 --check -- "$f" >/dev/null 2>&1; then
+            fmt_failed=1
+            fmt_failures="$fmt_failures
+  $f"
+        fi
+    done <<EOF
+$rs_staged
+EOF
+
+    if [ "$fmt_failed" -eq 1 ]; then
+        cat >&2 <<MSG
+
+pre-commit: rustfmt --check FAILED on staged file(s):$fmt_failures
+
+Fix:
+    cd $repo_root/scx-sim && cargo fmt --all
+... then re-stage the formatted files and re-run \`git commit\`.
+
+Or fix only the staged files:
+    rustfmt --edition 2021 -- <file>
+
+To bypass (NOT recommended; CI will reject):
+    SKIP_SCXSIM_HOOK=1 git commit ...
+MSG
+        exit 1
+    fi
+
+    fmt_end=$(date +%s 2>/dev/null || echo 0)
+    fmt_dur=$((fmt_end - fmt_start))
+    fmt_count=$(printf '%s\n' "$rs_staged" | grep -c . || true)
+    echo "pre-commit: rustfmt --check OK on $fmt_count staged file(s) (${fmt_dur}s)." >&2
+fi
+
+# --- 2. cargo clippy (when .rs/Cargo.{toml,lock} under scx-sim/ staged) ---
+rust_changed=$(printf '%s\n' "$staged" | grep -E '\.rs$|/Cargo\.(toml|lock)$' || true)
+if [ -z "$rust_changed" ]; then
+    # No Rust changes; nothing more to do.
+    exit 0
+fi
+
+if [ "${SKIP_SCXSIM_CLIPPY:-0}" = "1" ]; then
+    echo "pre-commit: SKIP_SCXSIM_CLIPPY=1 set — skipping clippy (fmt did run)." >&2
+    exit 0
+fi
+
+CARGO_BIN="${CARGO:-cargo}"
+if ! command -v "$CARGO_BIN" >/dev/null 2>&1; then
+    cat >&2 <<MSG
+pre-commit: cargo not on PATH (looked for: $CARGO_BIN).
+Install Rust via https://rustup.rs/ or set CARGO=/path/to/cargo.
+To bypass clippy only: SKIP_SCXSIM_CLIPPY=1 git commit ...
+To bypass entire hook: SKIP_SCXSIM_HOOK=1 git commit ...
+MSG
+    exit 1
+fi
+
+cd "$repo_root/scx-sim"
+
+if [ "${SCXSIM_HOOK_FULL_CLIPPY:-0}" = "1" ]; then
+    clippy_args="--all-targets --workspace -- -D warnings"
+    mode_label="FULL (matches CI)"
+else
+    clippy_args="--all-targets --workspace --no-deps -- -D warnings"
+    mode_label="FAST (--no-deps; CI runs full)"
+fi
+
+echo "pre-commit: cargo clippy $mode_label (scx-sim/)..." >&2
+clippy_start=$(date +%s 2>/dev/null || echo 0)
+# shellcheck disable=SC2086
+if ! "$CARGO_BIN" clippy $clippy_args; then
+    cat >&2 <<MSG
+
+pre-commit: cargo clippy FAILED.
+
+Fix from $repo_root/scx-sim/:
+    cargo clippy --all-targets --workspace -- -D warnings
+... resolve every warning, then re-stage and re-run \`git commit\`.
+
+To run the same FAST mode the hook ran (faster, less coverage):
+    cargo clippy --all-targets --workspace --no-deps -- -D warnings
+
+To bypass clippy only (still gets fmt): SKIP_SCXSIM_CLIPPY=1 git commit ...
+To bypass entire hook (NOT recommended): SKIP_SCXSIM_HOOK=1 git commit ...
+MSG
+    exit 1
+fi
+clippy_end=$(date +%s 2>/dev/null || echo 0)
+clippy_dur=$((clippy_end - clippy_start))
+echo "pre-commit: cargo clippy OK (${clippy_dur}s, mode=$mode_label)." >&2
+
+exit 0
