@@ -630,6 +630,30 @@ fn emit_event(trace: &Trace, ev: &crate::trace::TraceEvent, proto: &mut TracePro
                 anns,
             );
         }
+        TraceKind::CgroupBwDequeueOnThrottle { pid, cgid } => {
+            let mut anns = vec![ann_uint("cgid", cgid.0), ann_uint("cpu", u64::from(cpu.0))];
+            push_task_anns(&mut anns, *pid, trace.task_name(*pid));
+            push_instant(
+                proto,
+                ts,
+                cpu_track_uuid(cpu),
+                "SCXSIM_CGBW_DEQ_THR",
+                "cgroup_bw_dequeue_on_throttle",
+                anns,
+            );
+        }
+        TraceKind::CgroupBwReenqueueOnReplenish { pid, cgid } => {
+            let mut anns = vec![ann_uint("cgid", cgid.0), ann_uint("cpu", u64::from(cpu.0))];
+            push_task_anns(&mut anns, *pid, trace.task_name(*pid));
+            push_instant(
+                proto,
+                ts,
+                cpu_track_uuid(cpu),
+                "SCXSIM_CGBW_REENQ_RPL",
+                "cgroup_bw_reenqueue_on_replenish",
+                anns,
+            );
+        }
         TraceKind::CgroupBwReplenish {
             cgid,
             runtime_total_last,
@@ -1153,7 +1177,9 @@ fn event_pid(kind: &TraceKind) -> Option<Pid> {
         | TraceKind::Runnable { pid, .. }
         | TraceKind::Dequeue { pid, .. }
         | TraceKind::Quiescent { pid, .. }
-        | TraceKind::CgroupMove { pid, .. } => Some(*pid),
+        | TraceKind::CgroupMove { pid, .. }
+        | TraceKind::CgroupBwDequeueOnThrottle { pid, .. }
+        | TraceKind::CgroupBwReenqueueOnReplenish { pid, .. } => Some(*pid),
         // tg `bundle-implement-secondary-tracekind-easy-wins`: route the
         // pid-bearing variants of the secondary bundle through the
         // per-task track so they appear on the right thread lane in

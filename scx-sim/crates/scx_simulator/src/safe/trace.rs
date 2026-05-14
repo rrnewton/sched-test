@@ -320,7 +320,36 @@ pub enum TraceKind {
     /// scheduler-side cgroup_bw library reported its cgroup throttled
     /// (`scxsim_cgroup_bw_is_cgroup_throttled` returned true). The task
     /// remains queued and will be re-checked on the next dispatch.
+    ///
+    /// (Legacy lazy-throttle path — see `CgroupBwDequeueOnThrottle` /
+    /// `CgroupBwReenqueueOnReplenish` for the eager-throttle replacement.)
     CgroupBwDenied {
+        pid: Pid,
+        cgid: crate::cgroup::CgroupId,
+    },
+    /// Eager throttle: the engine pulled `pid` from its local DSQ at the
+    /// admission gate because its cgroup is throttled, called
+    /// `ops.dequeue` + `ops.quiescent` to remove it from the BPF
+    /// scheduler's queues, and stashed it in `bw_blocked[cgid]` to be
+    /// re-runnabled on the next replenish.
+    ///
+    /// Mirrors what the kernel's bandwidth controller does when a task
+    /// crosses a cgroup quota: dequeue the task entirely from
+    /// sched_ext, not just refuse dispatch. tg
+    /// `scxsim-eager-cgroup-bw-throttle-via-dequeue-wakeup-cycle`.
+    CgroupBwDequeueOnThrottle {
+        pid: Pid,
+        cgid: crate::cgroup::CgroupId,
+    },
+    /// Eager throttle counterpart: when the cgroup_bw library marks a
+    /// cgroup as no longer throttled (per-cgroup snapshot diff after
+    /// `replenish_timerfn`), the engine drains `bw_blocked[cgid]` and
+    /// schedules a `TaskWake` event for each `pid`. The task then
+    /// re-enters via the normal wakeup path:
+    /// `ops.runnable` → `ops.select_cpu` → `ops.enqueue` (which
+    /// goes through LAVD's `can_direct_dispatch` and may take the
+    /// simple-insert direct-dispatch fast path).
+    CgroupBwReenqueueOnReplenish {
         pid: Pid,
         cgid: crate::cgroup::CgroupId,
     },
@@ -1027,6 +1056,12 @@ impl Trace {
                 ),
                 TraceKind::CgroupBwDenied { pid, cgid } => {
                     format!("CG_BW_DENY pid={} cgid={}", pid.0, cgid.0)
+                }
+                TraceKind::CgroupBwDequeueOnThrottle { pid, cgid } => {
+                    format!("CG_BW_DEQ_THR pid={} cgid={}", pid.0, cgid.0)
+                }
+                TraceKind::CgroupBwReenqueueOnReplenish { pid, cgid } => {
+                    format!("CG_BW_REENQ_RPL pid={} cgid={}", pid.0, cgid.0)
                 }
                 TraceKind::CgroupBwReplenish {
                     cgid,

@@ -643,6 +643,8 @@ fn emit_event(event: &TraceEvent, writer: &mut impl Write) -> io::Result<()> {
         | TraceKind::IrqEnd { .. }
         | TraceKind::CgroupBwCharge { .. }
         | TraceKind::CgroupBwDenied { .. }
+        | TraceKind::CgroupBwDequeueOnThrottle { .. }
+        | TraceKind::CgroupBwReenqueueOnReplenish { .. }
         | TraceKind::CgroupBwReplenish { .. } => {}
     }
 
