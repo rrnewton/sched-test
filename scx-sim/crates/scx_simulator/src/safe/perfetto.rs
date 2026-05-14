@@ -475,6 +475,26 @@ pub(crate) fn write_json(trace: &Trace, writer: &mut impl Write) -> std::io::Res
                     "args": { "cgid": cgid.0, "ns": ns }
                 })
             }
+            TraceKind::CbwAccountingTimerFired {
+                slot,
+                period_ns_since_last_arm,
+                requested_period_ns,
+            } => {
+                json!({
+                    "ph": "i",
+                    "pid": cpu,
+                    "tid": 0,
+                    "ts": ts,
+                    "name": "cbw_accounting_timer_fired",
+                    "cat": "cgroup_bw",
+                    "s": "t",
+                    "args": {
+                        "slot": slot,
+                        "period_ns_since_last_arm": period_ns_since_last_arm,
+                        "requested_period_ns": requested_period_ns,
+                    }
+                })
+            }
             TraceKind::CgroupBwReplenish {
                 cgid,
                 runtime_total_last,

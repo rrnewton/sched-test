@@ -583,6 +583,26 @@ fn emit_event(trace: &Trace, ev: &crate::trace::TraceEvent, proto: &mut TracePro
                 anns,
             );
         }
+        TraceKind::CbwAccountingTimerFired {
+            slot,
+            period_ns_since_last_arm,
+            requested_period_ns,
+        } => {
+            let anns = vec![
+                ann_uint("slot", u64::from(*slot)),
+                ann_uint("period_ns_since_last_arm", *period_ns_since_last_arm),
+                ann_uint("requested_period_ns", *requested_period_ns),
+                ann_uint("cpu", u64::from(cpu.0)),
+            ];
+            push_instant(
+                proto,
+                ts,
+                cpu_track_uuid(cpu),
+                "SCXSIM_CBW_AC_TIMER",
+                "cbw_accounting_timer_fired",
+                anns,
+            );
+        }
         TraceKind::CgroupBwReplenish {
             cgid,
             runtime_total_last,
@@ -781,6 +801,7 @@ fn event_pid(kind: &TraceKind) -> Option<Pid> {
         | TraceKind::IrqEnd { .. }
         | TraceKind::CgroupBwReplenish { .. }
         | TraceKind::LavdReenqueueViaBtqDrain { .. }
-        | TraceKind::CgroupBwConsumeNs { .. } => None,
+        | TraceKind::CgroupBwConsumeNs { .. }
+        | TraceKind::CbwAccountingTimerFired { .. } => None,
     }
 }

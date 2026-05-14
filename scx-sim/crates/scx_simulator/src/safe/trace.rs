@@ -241,6 +241,19 @@ pub enum TraceKind {
     /// (per-cgroup, not per-task — the lib's drain is batched).
     /// tg `scxsim-eager-throttle-v2-track-lavd-bail-path`.
     LavdReenqueueViaBtqDrain { cgid: crate::cgroup::CgroupId },
+    /// V4-B + V5: per-arm BPF timer event. Recorded by
+    /// `sim_timer_start_slot` capturing slot, requested_period_ns, and
+    /// period_ns_since_last_arm (= fire-to-fire interval for self-
+    /// rearming timers like `accounting_timerfn`). Slot 2 = cbw
+    /// accounting_timer in the LAVD config; identifiable post-hoc by
+    /// requested_period_ns falling in
+    /// `[CBW_ACCOUNTING_PERIOD_MIN=1ms, CBW_ACCOUNTING_PERIOD_MAX=20ms]`.
+    /// tg `scxsim-investigate-cbw-accounting-timer-fire-rate`.
+    CbwAccountingTimerFired {
+        slot: u8,
+        period_ns_since_last_arm: u64,
+        requested_period_ns: u64,
+    },
     /// V4-A: per-call `scx_cgroup_bw_consume(cgrp, ns)` observation.
     /// Fired AFTER the lib's consume call returns, recording the `ns`
     /// argument that the engine charged. Sum-per-period during the
@@ -884,6 +897,14 @@ impl Trace {
                 TraceKind::CgroupBwConsumeNs { cgid, ns } => {
                     format!("CG_BW_CONSUME cgid={} ns={}", cgid.0, ns)
                 }
+                TraceKind::CbwAccountingTimerFired {
+                    slot,
+                    period_ns_since_last_arm,
+                    requested_period_ns,
+                } => format!(
+                    "CBW_AC_TIMER slot={} since_last={}ns requested={}ns",
+                    slot, period_ns_since_last_arm, requested_period_ns,
+                ),
                 TraceKind::CgroupBwReplenish {
                     cgid,
                     runtime_total_last,
