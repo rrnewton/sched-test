@@ -481,6 +481,25 @@ pub struct SimulatorState {
     /// When set, workers run truly concurrently with real locks and
     /// window-based clock throttling instead of token-ring serialization.
     pub native_concurrent: Option<NativeConcurrentConfig>,
+    /// SHARED-MUTABLE: Tasks that the engine eagerly removed from BPF
+    /// scheduler queues (via `ops.dequeue` + `ops.quiescent`) when their
+    /// cgroup_bw quota was exhausted. Indexed by `CgroupId`. The engine
+    /// drains the per-cgroup queue and re-runnables each task (via the
+    /// normal wakeup path: `ops.runnable` + `ops.select_cpu` +
+    /// `ops.enqueue`) when the cgroup_bw library marks the cgroup as no
+    /// longer throttled.
+    ///
+    /// This replaces the previous "lazy / head-of-line-blocking" admission
+    /// gate that left throttled tasks in the local DSQ — making scxsim's
+    /// throttle handling kernel-faithful (the kernel's bandwidth controller
+    /// fully dequeues throttled tasks rather than blocking dispatch).
+    ///
+    /// Insertion order is preserved per-cgroup (VecDeque) so that
+    /// re-enqueue happens in roughly the same order tasks were originally
+    /// admitted. Cross-cgroup ordering is stable per the BTreeMap.
+    ///
+    /// tg `scxsim-eager-cgroup-bw-throttle-via-dequeue-wakeup-cycle`.
+    pub bw_blocked: BTreeMap<crate::cgroup::CgroupId, VecDeque<Pid>>,
 }
 
 /// Bundle of all shared simulator state, protected by a single Mutex.
@@ -865,7 +884,6 @@ impl SimulatorState {
         local_cpu: CpuId,
         pd: PendingDispatch,
     ) -> Option<CpuId> {
-
         // Task has been dispatched — no longer in BPF scheduler's queue.
         self.set_task_ops_state(pd.pid, OpsTaskState::None);
 
@@ -3031,6 +3049,7 @@ mod tests {
             stochastic_timer_interleave: false,
             stochastic_timer_interleave_window_ns: 0,
             stochastic_timer_interleave_one_in: 0,
+            bw_blocked: BTreeMap::new(),
         }
     }
 
