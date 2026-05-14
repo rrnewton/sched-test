@@ -1375,10 +1375,9 @@ impl<S: Scheduler> Simulator<S> {
         }
 
         // Assign LLC domain IDs (CCX topology)
-        let cpus_per_llc = scenario.cpus_per_llc;
-        if cpus_per_llc > 0 {
+        if let Some(cpus_per_llc) = std::num::NonZeroU32::new(scenario.cpus_per_llc) {
             for i in 0..nr_cpus {
-                cpus[i as usize].llc_id = i / cpus_per_llc;
+                cpus[i as usize].llc_id = i / cpus_per_llc.get();
             }
         }
 
