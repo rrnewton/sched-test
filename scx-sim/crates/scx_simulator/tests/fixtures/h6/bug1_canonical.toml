@@ -6,6 +6,30 @@
 # `experiments/lavd_cpubw_stalls_202604/SCXSIM_CGROUP_BW_DESIGN.md` ("Standalone-binary
 # reproducer") for the full canonical invocation.
 #
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ COMMON PITFALL: this file MUST be passed via `--config` for the bug to  │
+# │ reproduce.                                                               │
+# │                                                                          │
+# │ `lavd_setup()` (schedulers/lavd/wrapper.c:1743) explicitly hard-codes    │
+# │ `enable_cpu_bw = false` as part of "Disable complex features for        │
+# │ initial simulation."  Without `--config <this-file>` overriding it via  │
+# │ `[scheduler.bool_globals] enable_cpu_bw = true` below, LAVD's           │
+# │ `lavd_enqueue` short-circuits the `cgroup_throttled()` check at        │
+# │ `scx/scheds/rust/scx_lavd/src/bpf/main.bpf.c:817` (`if (enable_cpu_bw   │
+# │ && …)`), the cgroup-bw library code path NEVER RUNS, and you'll see    │
+# │ no `cgroup_bw_*` events / no `LavdBailOnCgroupThrottle` events / no    │
+# │ `keep_throttled` smoking gun in the trace.                              │
+# │                                                                          │
+# │ Symptom of the trap: `scxsim run bug1_canonical.json -s lavd …` (no    │
+# │ `--config`) runs cleanly with all 16 yes_* workers fully scheduled and │
+# │ no library-state activity — looks like the bug doesn't reproduce, but  │
+# │ in fact you bypassed the bug's enabling condition.                      │
+# │                                                                          │
+# │ For ad-hoc debugging, copy the full invocation from                     │
+# │ `experiments/lavd_cpubw_stalls_202604/SCXSIM_BUG1_CGROUP_BW_STALL_REPRODUCER.md` │
+# │ which always includes `--config tests/fixtures/h6/bug1_canonical.toml`. │
+# └─────────────────────────────────────────────────────────────────────────┘
+#
 # Sub-tables segregate symbols by primitive type because `DynamicScheduler::get_symbol::<T>()`
 # requires the caller to declare `T`; the binary cannot introspect ELF/DWARF.
 
