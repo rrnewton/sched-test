@@ -159,9 +159,43 @@ pub fn diff_snapshots(before: &[CbwCgroupSnapshot], after: &[CbwCgroupSnapshot])
 
         let rtl_changed = before_s.runtime_total_last != after_s.runtime_total_last;
         let pb_changed = before_s.period_budget != after_s.period_budget;
+
+        // ----- BTQ flux (CbwPutAside / CbwDrainBtqBatch) ------------------
+        //
+        // tg `add-cbw-put-aside-and-drain-btq-batch-tracekinds` (A1+A2):
+        // detect net BTQ park/unpark between the two snapshot points and
+        // emit one event per non-zero net delta. Sentinel `-1` in either
+        // snapshot means "BTQ unknown" (lib has no LLC ctx for that
+        // cgroup) and we skip the BTQ-flux check for that cgroup.
+        //
+        // Coarsening note: a sequence of N put_asides followed by M drains
+        // between snapshots renders as `count = N - M` (positive →
+        // CbwPutAside, negative → CbwDrainBtqBatch). This is sufficient
+        // to detect the cpu-bw-stall-bug fingerprint ("BTQ length grows
+        // monotonically across replenish events without ever being
+        // drained") which is what the brief calls out as the heart of
+        // the bug.
+        if before_s.btq_total_len >= 0 && after_s.btq_total_len >= 0 {
+            let delta = after_s.btq_total_len - before_s.btq_total_len;
+            if delta > 0 {
+                events.push(TraceKind::CbwPutAside {
+                    cgid: CgroupId(after_s.cgid),
+                    count: delta as u32,
+                    btq_len_after: after_s.btq_total_len as u32,
+                });
+            } else if delta < 0 {
+                events.push(TraceKind::CbwDrainBtqBatch {
+                    cgid: CgroupId(after_s.cgid),
+                    count: (-delta) as u32,
+                    btq_len_after: after_s.btq_total_len as u32,
+                });
+            }
+        }
+
         if !rtl_changed && !pb_changed {
             // No replenishment happened for this cgroup during the
-            // just-fired timer.
+            // just-fired timer. (BTQ flux is independent of replenish
+            // and was already handled above.)
             continue;
         }
 
@@ -202,6 +236,22 @@ mod tests {
         nqub: i64,
         thr: i32,
     ) -> CbwCgroupSnapshot {
+        // Default `btq_total_len` to sentinel -1 so existing tests
+        // do not accidentally trigger the new BTQ-flux assertions.
+        // Tests that exercise BTQ flux explicitly use [`snap_btq`].
+        snap_btq(cgid, rtl, pb, br, nq, nqub, thr, -1)
+    }
+
+    fn snap_btq(
+        cgid: u64,
+        rtl: i64,
+        pb: i64,
+        br: i64,
+        nq: i64,
+        nqub: i64,
+        thr: i32,
+        btq_total_len: i32,
+    ) -> CbwCgroupSnapshot {
         CbwCgroupSnapshot {
             cgid,
             runtime_total_last: rtl,
@@ -210,7 +260,7 @@ mod tests {
             nquota: nq,
             nquota_ub: nqub,
             is_throttled: thr,
-            _pad: 0,
+            btq_total_len,
         }
     }
 
@@ -289,5 +339,98 @@ mod tests {
         ];
         let events = diff_snapshots(&before, &after);
         assert!(events.is_empty());
+    }
+
+    // ---- BTQ flux (cbw_put_aside / cbw_drain_btq_batch) tests ----------
+    //
+    // tg `add-cbw-put-aside-and-drain-btq-batch-tracekinds` (A1+A2).
+    // The BTQ flux check is independent of the replenish predicate, so
+    // these tests use snapshots that DO NOT change `runtime_total_last`
+    // or `period_budget` (no `CgroupBwReplenish` event); the only event
+    // emitted is the BTQ park/unpark.
+
+    #[test]
+    fn btq_park_emits_put_aside() {
+        // BTQ went from 0 → 5: 5 tasks net parked.
+        let before = vec![snap_btq(1, 0, 1000, 0, 1000, 1000, 0, 0)];
+        let after = vec![snap_btq(1, 0, 1000, 0, 1000, 1000, 0, 5)];
+        let events = diff_snapshots(&before, &after);
+        assert_eq!(events.len(), 1, "events: {:?}", events);
+        match &events[0] {
+            TraceKind::CbwPutAside {
+                cgid,
+                count,
+                btq_len_after,
+            } => {
+                assert_eq!(cgid.0, 1);
+                assert_eq!(*count, 5);
+                assert_eq!(*btq_len_after, 5);
+            }
+            other => panic!("expected CbwPutAside, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn btq_drain_emits_drain_batch() {
+        // BTQ went from 7 → 2: 5 tasks net drained.
+        let before = vec![snap_btq(1, 0, 1000, 0, 1000, 1000, 0, 7)];
+        let after = vec![snap_btq(1, 0, 1000, 0, 1000, 1000, 0, 2)];
+        let events = diff_snapshots(&before, &after);
+        assert_eq!(events.len(), 1, "events: {:?}", events);
+        match &events[0] {
+            TraceKind::CbwDrainBtqBatch {
+                cgid,
+                count,
+                btq_len_after,
+            } => {
+                assert_eq!(cgid.0, 1);
+                assert_eq!(*count, 5);
+                assert_eq!(*btq_len_after, 2);
+            }
+            other => panic!("expected CbwDrainBtqBatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn btq_unchanged_emits_nothing() {
+        let before = vec![snap_btq(1, 0, 1000, 0, 1000, 1000, 0, 3)];
+        let after = vec![snap_btq(1, 0, 1000, 0, 1000, 1000, 0, 3)];
+        let events = diff_snapshots(&before, &after);
+        assert!(events.is_empty(), "events: {:?}", events);
+    }
+
+    #[test]
+    fn btq_unknown_sentinel_skips_emit() {
+        // before snapshot has BTQ=-1 (lib has no LLC ctx for cgroup):
+        // diff helper must NOT emit any BTQ event even though after=10.
+        let before = vec![snap_btq(1, 0, 1000, 0, 1000, 1000, 0, -1)];
+        let after = vec![snap_btq(1, 0, 1000, 0, 1000, 1000, 0, 10)];
+        let events = diff_snapshots(&before, &after);
+        assert!(
+            events.is_empty(),
+            "BTQ-unknown sentinel must not emit; events: {:?}",
+            events,
+        );
+
+        // Symmetric: after snapshot has BTQ=-1.
+        let before = vec![snap_btq(1, 0, 1000, 0, 1000, 1000, 0, 5)];
+        let after = vec![snap_btq(1, 0, 1000, 0, 1000, 1000, 0, -1)];
+        let events = diff_snapshots(&before, &after);
+        assert!(events.is_empty(), "events: {:?}", events);
+    }
+
+    #[test]
+    fn btq_flux_coexists_with_replenish() {
+        // Same snapshot pair encodes BOTH a replenish (period_budget
+        // changed) AND a BTQ drain (btq_total_len decreased). Both
+        // events must be emitted, in deterministic order: BTQ event
+        // first (the diff helper handles BTQ before falling through to
+        // the replenish predicate).
+        let before = vec![snap_btq(1, 0, 1000, 0, 1000, 1000, 0, 8)];
+        let after = vec![snap_btq(1, 800, 500, 0, 1000, 1000, 0, 3)];
+        let events = diff_snapshots(&before, &after);
+        assert_eq!(events.len(), 2, "events: {:?}", events);
+        assert!(matches!(events[0], TraceKind::CbwDrainBtqBatch { .. }));
+        assert!(matches!(events[1], TraceKind::CgroupBwReplenish { .. }));
     }
 }

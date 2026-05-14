@@ -564,6 +564,35 @@ pub(crate) fn write_json(trace: &Trace, writer: &mut impl Write) -> std::io::Res
                 "name": "scx_bpf_dsq_nr_queued", "cat": "helper", "s": "g",
                 "args": { "dsq_id": dsq_id.0, "ret": ret }
             }),
+
+            // tg `add-cbw-put-aside-and-drain-btq-batch-tracekinds` (A1+A2):
+            // perfetto Chrome-JSON global instants for BTQ park/unpark.
+            TraceKind::CbwPutAside {
+                cgid,
+                count,
+                btq_len_after,
+            } => json!({
+                "ph": "i", "pid": cpu, "tid": 0, "ts": ts,
+                "name": "cbw_put_aside", "cat": "cgroup_bw", "s": "g",
+                "args": {
+                    "cgid": cgid.0,
+                    "count": count,
+                    "btq_len_after": btq_len_after,
+                }
+            }),
+            TraceKind::CbwDrainBtqBatch {
+                cgid,
+                count,
+                btq_len_after,
+            } => json!({
+                "ph": "i", "pid": cpu, "tid": 0, "ts": ts,
+                "name": "cbw_drain_btq_batch", "cat": "cgroup_bw", "s": "g",
+                "args": {
+                    "cgid": cgid.0,
+                    "count": count,
+                    "btq_len_after": btq_len_after,
+                }
+            }),
         };
         serde_json::to_writer(&mut *writer, &value)?;
     }

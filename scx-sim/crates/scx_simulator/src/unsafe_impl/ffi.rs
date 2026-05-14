@@ -757,8 +757,17 @@ pub struct CbwCgroupSnapshot {
     /// `cgx->is_throttled` (0/1). Reflects whether the cgroup is
     /// currently in a throttled state.
     pub is_throttled: i32,
-    /// Padding to match C layout.
-    pub _pad: i32,
+    /// Aggregate Backup-Task-Queue length across all LLC contexts for
+    /// this cgroup (`sum(scx_atq_nr_queued(llcx->btq))`). Sentinel
+    /// `-1` means the lib has no LLC ctx for this cgroup so the BTQ
+    /// length cannot be read; the Rust diff helper treats this as
+    /// "BTQ unknown" and emits no `CbwPutAside` / `CbwDrainBtqBatch`
+    /// event for the cgroup. tg
+    /// `add-cbw-put-aside-and-drain-btq-batch-tracekinds`
+    /// (A1+A2 from cgroup_bw audit). Replaces the prior `_pad` field
+    /// (same byte offset, same size — 4 bytes — so the C struct
+    /// layout is unchanged).
+    pub btq_total_len: i32,
 }
 /// `int scxsim_cbw_snapshot_by_raw_cgrp(u64 cgid, void *cgrp_raw,
 /// struct *out)`. Returns 0 on success (out filled), -1/-2 if the

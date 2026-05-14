@@ -892,6 +892,52 @@ fn emit_event(trace: &Trace, ev: &crate::trace::TraceEvent, proto: &mut TracePro
                 anns,
             );
         }
+
+        // tg `add-cbw-put-aside-and-drain-btq-batch-tracekinds` (A1+A2 from
+        // cgroup_bw audit): perfetto-pb instants for BTQ park/unpark
+        // events. Category `SCXSIM_STRUCTOP` matches the brief's verify
+        // query and the secondary-tracekind cluster's category convention.
+        // Names `cbw_put_aside` and `cbw_drain_btq_batch` mirror the lib
+        // function names directly so the mechanistic-analysis SQL can
+        // pivot on the lib's vocabulary.
+        TraceKind::CbwPutAside {
+            cgid,
+            count,
+            btq_len_after,
+        } => {
+            let anns = vec![
+                ann_uint("cgid", cgid.0),
+                ann_uint("count", u64::from(*count)),
+                ann_uint("btq_len_after", u64::from(*btq_len_after)),
+            ];
+            push_instant(
+                proto,
+                ts,
+                cpu_track_uuid(cpu),
+                "SCXSIM_STRUCTOP",
+                "cbw_put_aside",
+                anns,
+            );
+        }
+        TraceKind::CbwDrainBtqBatch {
+            cgid,
+            count,
+            btq_len_after,
+        } => {
+            let anns = vec![
+                ann_uint("cgid", cgid.0),
+                ann_uint("count", u64::from(*count)),
+                ann_uint("btq_len_after", u64::from(*btq_len_after)),
+            ];
+            push_instant(
+                proto,
+                ts,
+                cpu_track_uuid(cpu),
+                "SCXSIM_STRUCTOP",
+                "cbw_drain_btq_batch",
+                anns,
+            );
+        }
     }
 }
 
@@ -1099,7 +1145,14 @@ fn event_pid(kind: &TraceKind) -> Option<Pid> {
         | TraceKind::HelperNow { .. }
         | TraceKind::CreateDsq { .. }
         | TraceKind::DestroyDsq { .. }
-        | TraceKind::DsqNrQueued { .. } => None,
+        | TraceKind::DsqNrQueued { .. }
+        // tg `add-cbw-put-aside-and-drain-btq-batch-tracekinds`: BTQ
+        // park/unpark events are cgid-keyed (the lib's BTQ is per-cgroup,
+        // not per-task), and the snapshot/diff helper coarsens N
+        // put-asides into a single net-delta event so per-task PID is
+        // not even available — route to the CPU lane instead.
+        | TraceKind::CbwPutAside { .. }
+        | TraceKind::CbwDrainBtqBatch { .. } => None,
     }
 }
 

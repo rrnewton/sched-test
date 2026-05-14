@@ -553,6 +553,53 @@ fn emit_event(event: &TraceEvent, writer: &mut impl Write) -> io::Result<()> {
             )?;
         }
 
+        // ---- BTQ park/unpark structops (cpu-bw-stall-bug critical path) -
+        // tg `add-cbw-put-aside-and-drain-btq-batch-tracekinds` (A1+A2):
+        // surface `cbw_put_aside` (BTQ park) + `cbw_drain_btq_batch`
+        // (BTQ unpark) as structops in JSONL. Names mirror the lib
+        // function names so the diff harness can pivot on the lib's
+        // vocabulary directly. `count` is net delta between snapshot
+        // points; `btq_len_after` is aggregate BTQ length after the
+        // snapshot (the stall fingerprint is `btq_len_after` staying
+        // high or growing across consecutive `cbw_put_aside` events on
+        // the same cgid).
+        TraceKind::CbwPutAside {
+            cgid,
+            count,
+            btq_len_after,
+        } => emit_line(
+            writer,
+            ts,
+            cpu,
+            0,
+            "structop",
+            "cbw_put_aside",
+            "entry",
+            &format!(
+                r#""cgid":{},"count":{},"btq_len_after":{}"#,
+                cgid.0, count, btq_len_after
+            ),
+            None,
+        )?,
+        TraceKind::CbwDrainBtqBatch {
+            cgid,
+            count,
+            btq_len_after,
+        } => emit_line(
+            writer,
+            ts,
+            cpu,
+            0,
+            "structop",
+            "cbw_drain_btq_batch",
+            "entry",
+            &format!(
+                r#""cgid":{},"count":{},"btq_len_after":{}"#,
+                cgid.0, count, btq_len_after
+            ),
+            None,
+        )?,
+
         // ---- engine-internal events: NOT structops/helpers, no JSONL ---
         // These exist in scxsim because the engine models them; bpftrace
         // can't see scxsim-internal state. Rather than fake an emit name,
@@ -1045,5 +1092,62 @@ mod tests {
         assert!(lines[0].contains(r#""ret":null"#));
         assert!(lines[1].contains(r#""phase":"exit""#));
         assert!(lines[1].contains(r#""ret":3"#));
+    }
+
+    /// tg `add-cbw-put-aside-and-drain-btq-batch-tracekinds` (A1+A2):
+    /// confirm the 2 new BTQ-flux TraceKinds emit one JSONL record
+    /// each with the right name + args. Schema-validity is covered
+    /// by [`emit_basic_events_jsonl`] above.
+    #[test]
+    fn cbw_btq_park_unpark_emit_jsonl() {
+        use crate::cgroup::CgroupId;
+
+        let mut trace = Trace::with_warmup(2, &[], 0);
+        trace.record(
+            100,
+            CpuId(0),
+            TraceKind::CbwPutAside {
+                cgid: CgroupId(7),
+                count: 3,
+                btq_len_after: 8,
+            },
+        );
+        trace.record(
+            200,
+            CpuId(0),
+            TraceKind::CbwDrainBtqBatch {
+                cgid: CgroupId(7),
+                count: 5,
+                btq_len_after: 3,
+            },
+        );
+
+        let mut buf = Vec::new();
+        write_jsonl(&trace, &mut buf).expect("emit");
+        let text = String::from_utf8(buf).expect("utf8");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "lines: {:#?}", lines);
+
+        for line in &lines {
+            let v: serde_json::Value = serde_json::from_str(line).expect("valid JSON");
+            assert!(v.get("ts_ns").is_some());
+            assert!(v.get("name").is_some());
+            assert!(v.get("phase").is_some());
+            assert!(v.get("args").is_some());
+        }
+
+        // CbwPutAside record:
+        assert!(lines[0].contains(r#""name":"cbw_put_aside""#));
+        assert!(lines[0].contains(r#""phase":"entry""#));
+        assert!(lines[0].contains(r#""cgid":7"#));
+        assert!(lines[0].contains(r#""count":3"#));
+        assert!(lines[0].contains(r#""btq_len_after":8"#));
+
+        // CbwDrainBtqBatch record:
+        assert!(lines[1].contains(r#""name":"cbw_drain_btq_batch""#));
+        assert!(lines[1].contains(r#""phase":"entry""#));
+        assert!(lines[1].contains(r#""cgid":7"#));
+        assert!(lines[1].contains(r#""count":5"#));
+        assert!(lines[1].contains(r#""btq_len_after":3"#));
     }
 }

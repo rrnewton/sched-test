@@ -1330,7 +1330,22 @@ struct scxsim_cbw_cgroup_snapshot {
 	long long		nquota;
 	long long		nquota_ub;
 	int			is_throttled;
-	int			_pad;
+	/*
+	 * tg `add-cbw-put-aside-and-drain-btq-batch-tracekinds` (A1+A2 from
+	 * cgroup_bw audit). Aggregate Backup-Task-Queue length across all
+	 * LLC ctx for this cgroup -- the BEFORE/AFTER delta of this field
+	 * around `fire_timer` reveals the BTQ-park (`cbw_put_aside`) and
+	 * BTQ-unpark (`cbw_drain_btq_batch`) flux that the cpu-bw-stall-bug
+	 * needs to make observable. Computed by summing
+	 * `scx_atq_nr_queued(llcx->btq)` across `bpf_for(i, 0, TOPO_NR(LLC))`
+	 * (matches lib/cgroup_bw.bpf.c:1623 cbw_has_backlogged_tasks).
+	 *
+	 * Sentinel `-1` means the lookup couldn't read any LLC ctx (defensive
+	 * — should not happen for finite-quota cgroups that pass the
+	 * earlier gates), in which case the engine treats the snapshot as
+	 * "BTQ unknown" and emits no BTQ-flux event.
+	 */
+	int			btq_total_len;
 };
 
 /*
@@ -1392,7 +1407,39 @@ int scxsim_cbw_snapshot_by_raw_cgrp(
 	out->nquota = (long long)cgx->nquota;
 	out->nquota_ub = (long long)cgx->nquota_ub;
 	out->is_throttled = cgx->is_throttled;
-	out->_pad = 0;
+
+	/*
+	 * tg `add-cbw-put-aside-and-drain-btq-batch-tracekinds` (A1+A2):
+	 * sum BTQ length across all LLC contexts for this cgroup so the
+	 * Rust-side snapshot/diff helper can detect cbw_put_aside (delta>0)
+	 * and cbw_drain_btq_batch (delta<0) events between BEFORE/AFTER
+	 * fire_timer snapshots. Mirrors lib/cgroup_bw.bpf.c:1623
+	 * `cbw_has_backlogged_tasks` summing-loop, but counts queued
+	 * tasks instead of returning a boolean.
+	 *
+	 * Defensive: if `cgx->has_llcx` is false the lib has no LLC state
+	 * for this cgroup, return sentinel -1 ("BTQ unknown") so the
+	 * Rust diff helper skips emitting BTQ-flux events for it.
+	 */
+	if (!cgx->has_llcx) {
+		out->btq_total_len = -1;
+	} else {
+		int btq_total = 0;
+		struct scx_cgroup_llc_ctx *llcx;
+		scx_atq_t *btq;
+		int i;
+		bpf_for(i, 0, TOPO_NR(LLC)) {
+			llcx = cbw_get_llc_ctx_with_id(cgx->id, i);
+			if (!llcx)
+				continue;
+			btq = READ_ONCE(llcx->btq);
+			if (!btq)
+				continue;
+			btq_total += scx_atq_nr_queued(btq);
+		}
+		out->btq_total_len = btq_total;
+	}
+
 	return 0;
 }
 

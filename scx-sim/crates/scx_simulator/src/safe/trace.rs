@@ -369,6 +369,57 @@ pub enum TraceKind {
         /// `cgx->is_throttled` is set to this value at line 1751.
         keep_throttled: bool,
     },
+
+    // ----- BTQ park/unpark events (cpu-bw-stall-bug critical path) -----
+    //
+    // tg `add-cbw-put-aside-and-drain-btq-batch-tracekinds` (A1+A2 from
+    // cgroup_bw audit). Net inflow / outflow of tasks to the per-cgroup
+    // Backup-Task-Queue, observed via BEFORE/AFTER snapshot diff of
+    // `CbwCgroupSnapshot::btq_total_len` around `fire_timer`.
+    //
+    // The lib's `cbw_put_aside` (lib/cgroup_bw.bpf.c:1532) parks tasks
+    // into the BTQ when their cgroup is throttled at enqueue time, and
+    // `cbw_drain_btq_batch` (lib/cgroup_bw.bpf.c:2088) unparks them
+    // when the cgroup is replenished. Without these TraceKinds, the
+    // diff harness cannot see WHY tasks remain parked across replenish
+    // events — which is the heart of the cpu-bw-stall-bug.
+    //
+    // The events are emitted from the snapshot/diff helper in
+    // `unsafe_impl::cgroup_bw_replenish` (alongside CgroupBwReplenish);
+    // the same fire_timer hook in `engine.rs::handle_timer_fired`
+    // captures both. Net deltas are coarsened: a sequence of N
+    // put_asides followed by M drains between two snapshot points is
+    // rendered as `count = N - M` (positive → CbwPutAside, negative
+    // → CbwDrainBtqBatch). This is sufficient to detect the stall
+    // signature ("BTQ length grows monotonically across replenish
+    // events without ever being drained") which is the bug's
+    // fingerprint.
+    /// Net tasks added to the cgroup's BTQ between two snapshot
+    /// points. Inferred from `btq_total_len_after - btq_total_len_before > 0`.
+    /// Mirrors the lib's `cbw_put_aside` (lib/cgroup_bw.bpf.c:1532).
+    CbwPutAside {
+        cgid: crate::cgroup::CgroupId,
+        /// Net number of tasks added to the BTQ during the window.
+        count: u32,
+        /// Aggregate BTQ length AFTER the snapshot window. The
+        /// stall fingerprint is `btq_len_after` staying high or
+        /// growing across consecutive `CbwPutAside` events on the
+        /// same `cgid`.
+        btq_len_after: u32,
+    },
+    /// Net tasks drained from the cgroup's BTQ between two snapshot
+    /// points. Inferred from `btq_total_len_after - btq_total_len_before < 0`.
+    /// Mirrors the lib's `cbw_drain_btq_batch` (lib/cgroup_bw.bpf.c:2088),
+    /// which is called from `cbw_reenqueue_cgroup` on every per-period
+    /// replenishment.
+    CbwDrainBtqBatch {
+        cgid: crate::cgroup::CgroupId,
+        /// Net number of tasks drained from the BTQ during the window.
+        count: u32,
+        /// Aggregate BTQ length AFTER the drain. The recovery fingerprint
+        /// is `btq_len_after` returning to 0 promptly.
+        btq_len_after: u32,
+    },
 }
 
 /// Reason why a dispatch to a local DSQ was rejected.
@@ -1026,6 +1077,24 @@ impl Trace {
                 TraceKind::DsqNrQueued { dsq_id, ret } => {
                     format!("DSQ_NRQ  dsq=0x{:x} ret={}", dsq_id.0, ret)
                 }
+                // tg `add-cbw-put-aside-and-drain-btq-batch-tracekinds`
+                // (A1+A2 from cgroup_bw audit).
+                TraceKind::CbwPutAside {
+                    cgid,
+                    count,
+                    btq_len_after,
+                } => format!(
+                    "CBW_PARK cgid={} count={} btq_after={}",
+                    cgid.0, count, btq_len_after
+                ),
+                TraceKind::CbwDrainBtqBatch {
+                    cgid,
+                    count,
+                    btq_len_after,
+                } => format!(
+                    "CBW_DRAIN cgid={} count={} btq_after={}",
+                    cgid.0, count, btq_len_after
+                ),
             };
             eprintln!(
                 "[{}] cpu={:<3} {}",
