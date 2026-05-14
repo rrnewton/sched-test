@@ -545,6 +545,29 @@ fn emit_event(trace: &Trace, ev: &crate::trace::TraceEvent, proto: &mut TracePro
                 anns,
             );
         }
+        TraceKind::LavdBailOnCgroupThrottle { pid, cgid } => {
+            let mut anns = vec![ann_uint("cgid", cgid.0), ann_uint("cpu", u64::from(cpu.0))];
+            push_task_anns(&mut anns, *pid, trace.task_name(*pid));
+            push_instant(
+                proto,
+                ts,
+                cpu_track_uuid(cpu),
+                "SCXSIM_LAVD_BAIL_CGT",
+                "lavd_bail_on_cgroup_throttle",
+                anns,
+            );
+        }
+        TraceKind::LavdReenqueueViaBtqDrain { cgid } => {
+            let anns = vec![ann_uint("cgid", cgid.0), ann_uint("cpu", u64::from(cpu.0))];
+            push_instant(
+                proto,
+                ts,
+                cpu_track_uuid(cpu),
+                "SCXSIM_LAVD_REENQ_BTQ",
+                "lavd_reenqueue_via_btq_drain",
+                anns,
+            );
+        }
         TraceKind::CgroupBwReplenish {
             cgid,
             runtime_total_last,
@@ -733,13 +756,15 @@ fn event_pid(kind: &TraceKind) -> Option<Pid> {
         | TraceKind::CgroupBwCharge { pid, .. }
         | TraceKind::CgroupBwDenied { pid, .. }
         | TraceKind::CgroupBwDequeueOnThrottle { pid, .. }
-        | TraceKind::CgroupBwReenqueueOnReplenish { pid, .. } => Some(*pid),
+        | TraceKind::CgroupBwReenqueueOnReplenish { pid, .. }
+        | TraceKind::LavdBailOnCgroupThrottle { pid, .. } => Some(*pid),
         TraceKind::Balance { prev_pid } => *prev_pid,
         TraceKind::CpuIdle
         | TraceKind::DsqMoveToLocal { .. }
         | TraceKind::KickCpu { .. }
         | TraceKind::IrqStart { .. }
         | TraceKind::IrqEnd { .. }
-        | TraceKind::CgroupBwReplenish { .. } => None,
+        | TraceKind::CgroupBwReplenish { .. }
+        | TraceKind::LavdReenqueueViaBtqDrain { .. } => None,
     }
 }

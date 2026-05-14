@@ -439,6 +439,30 @@ pub(crate) fn write_json(trace: &Trace, writer: &mut impl Write) -> std::io::Res
                     "args": { "pid": pid.0, "cgid": cgid.0 }
                 })
             }
+            TraceKind::LavdBailOnCgroupThrottle { pid, cgid } => {
+                json!({
+                    "ph": "i",
+                    "pid": cpu,
+                    "tid": 0,
+                    "ts": ts,
+                    "name": "lavd_bail_on_cgroup_throttle",
+                    "cat": "cgroup_bw",
+                    "s": "t",
+                    "args": { "pid": pid.0, "cgid": cgid.0 }
+                })
+            }
+            TraceKind::LavdReenqueueViaBtqDrain { cgid } => {
+                json!({
+                    "ph": "i",
+                    "pid": cpu,
+                    "tid": 0,
+                    "ts": ts,
+                    "name": "lavd_reenqueue_via_btq_drain",
+                    "cat": "cgroup_bw",
+                    "s": "t",
+                    "args": { "cgid": cgid.0 }
+                })
+            }
             TraceKind::CgroupBwReplenish {
                 cgid,
                 runtime_total_last,
