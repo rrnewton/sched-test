@@ -587,6 +587,11 @@ extern void scxsim_cgroup_bw_yield_reenqueue(void);
  */
 extern void scxsim_cgroup_bw_observe_put_aside(int pid, unsigned long long cgid);
 extern void scxsim_cgroup_bw_observe_reenqueue(unsigned long long cgid);
+/*
+ * V4-A observer for scx_cgroup_bw_consume(cgrp, ns) call args.
+ * tg scxsim-disambiguate-runtime-overcharge-vs-lib-idealized-accounting.
+ */
+extern void scxsim_cgroup_bw_observe_consume(unsigned long long cgid, unsigned long long ns);
 extern void scxsim_cgroup_bw_yield_cancel(void);
 extern void scxsim_cgroup_bw_yield_is_cgroup_throttled(void);
 extern void scxsim_cgroup_bw_yield_is_task_throttled(void);
@@ -636,6 +641,12 @@ void lavd_fire_timer(unsigned int slot);
 	SCXSIM_CGROUP_BW_YIELD(scxsim_cgroup_bw_yield_consume); \
 	int _rc = scx_cgroup_bw_consume((c), (n)); \
 	SCXSIM_DEBUG_CONSUME_PROBE_BODY(c, n, _rc); \
+	/* V4-A observe: record (cgid, ns) on every consume call. cgrp_get_id is
+	 * static-in-lib; inline as cgrp->kn->id. (c) is `struct cgroup *` here
+	 * per the lib's prototype `int scx_cgroup_bw_consume(struct cgroup *cgrp, u64 ns)`.
+	 * Skip emit on null cgrp (initial period before cgroup is registered).
+	 */ \
+	if ((c)) scxsim_cgroup_bw_observe_consume((c)->kn->id, (unsigned long long)(n)); \
 	_rc; \
 })
 #define scx_cgroup_bw_put_aside(p, taskc, vtime, cgrp) ({ \

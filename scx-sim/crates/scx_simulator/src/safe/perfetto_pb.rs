@@ -677,6 +677,21 @@ fn emit_event(trace: &Trace, ev: &crate::trace::TraceEvent, proto: &mut TracePro
                 anns,
             );
         }
+        TraceKind::CgroupBwConsumeNs { cgid, ns } => {
+            let anns = vec![
+                ann_uint("cgid", cgid.0),
+                ann_uint("ns", *ns),
+                ann_uint("cpu", u64::from(cpu.0)),
+            ];
+            push_instant(
+                proto,
+                ts,
+                cpu_track_uuid(cpu),
+                "SCXSIM_CGBW_CONSUME",
+                "cgroup_bw_consume",
+                anns,
+            );
+        }
         TraceKind::CgroupBwReplenish {
             cgid,
             runtime_total_last,
@@ -1248,7 +1263,8 @@ fn event_pid(kind: &TraceKind) -> Option<Pid> {
         // LavdReenqueueViaBtqDrain is a per-cgroup BTQ drain event
         // observed by the wrapper.c hook; PID is not the relevant
         // axis. Route to the CPU lane.
-        | TraceKind::LavdReenqueueViaBtqDrain { .. } => None,
+        | TraceKind::LavdReenqueueViaBtqDrain { .. }
+        | TraceKind::CgroupBwConsumeNs { .. } => None,
     }
 }
 
