@@ -463,6 +463,18 @@ pub(crate) fn write_json(trace: &Trace, writer: &mut impl Write) -> std::io::Res
                     "args": { "cgid": cgid.0 }
                 })
             }
+            TraceKind::CgroupBwConsumeNs { cgid, ns } => {
+                json!({
+                    "ph": "i",
+                    "pid": cpu,
+                    "tid": 0,
+                    "ts": ts,
+                    "name": "cgroup_bw_consume",
+                    "cat": "cgroup_bw",
+                    "s": "t",
+                    "args": { "cgid": cgid.0, "ns": ns }
+                })
+            }
             TraceKind::CgroupBwReplenish {
                 cgid,
                 runtime_total_last,

@@ -243,6 +243,17 @@ pub enum TraceKind {
     LavdReenqueueViaBtqDrain {
         cgid: crate::cgroup::CgroupId,
     },
+    /// V4-A: per-call `scx_cgroup_bw_consume(cgrp, ns)` observation.
+    /// Fired AFTER the lib's consume call returns, recording the `ns`
+    /// argument that the engine charged. Sum-per-period during the
+    /// STALL window distinguishes:
+    ///   - sum/period ≈ period_ns → ENGINE BUG (over-charging idle cgroup)
+    ///   - sum/period ≈ 0         → LIB BUG (idealized accounting timer)
+    /// tg `scxsim-disambiguate-runtime-overcharge-vs-lib-idealized-accounting`.
+    CgroupBwConsumeNs {
+        cgid: crate::cgroup::CgroupId,
+        ns: u64,
+    },
     /// The compiled-in `scx/lib/cgroup_bw.bpf.c` library performed a
     /// per-cgroup replenishment. Captures the smoking-gun fields the
     /// library computes inside `cbw_replenish_cgroup` (the bug's CAUSE
@@ -869,6 +880,9 @@ impl Trace {
                 }
                 TraceKind::LavdReenqueueViaBtqDrain { cgid } => {
                     format!("LAVD_REENQ_BTQ cgid={}", cgid.0)
+                }
+                TraceKind::CgroupBwConsumeNs { cgid, ns } => {
+                    format!("CG_BW_CONSUME cgid={} ns={}", cgid.0, ns)
                 }
                 TraceKind::CgroupBwReplenish {
                     cgid,
