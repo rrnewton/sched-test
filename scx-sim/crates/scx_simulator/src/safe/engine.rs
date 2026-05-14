@@ -4247,6 +4247,23 @@ impl<S: Scheduler> Simulator<S> {
             let local_t = s.sim.cpus[cpu.0 as usize].local_clock;
             kfuncs::set_sim_clock(local_t, Some(cpu));
 
+            // V4-C fix: clear `prev_task` once we've decided the CPU is
+            // genuinely idle. Otherwise the next `lavd_dispatch(cpu, prev)`
+            // call passes the stale prev_task to the scheduler, and LAVD's
+            // fall-through path `consume_prev(prev, ...)` →
+            // `update_stat_for_refill(prev)` →
+            // `account_task_runtime(prev)` →
+            // `scx_cgroup_bw_consume(prev->cgroup, task_time_wall)` charges
+            // prev's cgroup with full inter-tick wall time despite prev
+            // being off-CPU. That's the V4-A "engine over-charge" bug —
+            // 100M ns/period accumulates as debt → keep_throttled forever
+            // → drain bails → V3 stall pattern. Real kernel never sees
+            // this because pick_next_task during idle returns the IDLE
+            // TASK (root cgroup), not the last user task.
+            //
+            // tg `scxsim-fix-cbw-debt-runaway-or-document-as-known-cpu-bw-stall-bug`
+            s.sim.cpus[cpu.0 as usize].prev_task = None;
+
             if notify_idle {
                 // Notify scheduler that CPU is entering idle (ops.update_idle)
                 set_ops_context(&mut s.sim, OpsContext::UpdateIdle);
@@ -4326,6 +4343,11 @@ impl<S: Scheduler> Simulator<S> {
             s.sim.update_smt_mask_idle(cpu);
             let local_t = s.sim.cpus[cpu_idx].local_clock;
             kfuncs::set_sim_clock(local_t, Some(cpu));
+            // V4-C fix (mirror of the post_dispatch_run path): clear
+            // prev_task on idle so the next dispatch doesn't fall through
+            // to consume_prev with a stale prev. See V4-C commentary in
+            // post_dispatch_run for the full rationale.
+            s.sim.cpus[cpu_idx].prev_task = None;
             s.sim.trace.record(local_t, cpu, TraceKind::CpuIdle);
             info!(cpu = cpu.0, "IDLE (dsq_consume)");
         }
