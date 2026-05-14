@@ -23,7 +23,7 @@
 //!   thread name is the scxsim task comm.
 //! - One thread track per CPU representing the per-CPU "scheduler
 //!   substrate". CPU-keyed instants (TIMER tick, HARDIRQ/SOFTIRQ,
-//!   IPI_SEND:resched, OFFCPU/idle, scxsim-only ops/kfunc/cgroup_bw
+//!   IPI_SEND, OFFCPU/idle, scxsim-only ops/kfunc/cgroup_bw
 //!   instants) live on this track. CPU lanes use the wprof
 //!   `swapper/N → tid -(N+1)` idle-thread convention so that scxtop's
 //!   wprof loader recognizes the lanes as CPU lanes rather than as
@@ -40,7 +40,7 @@
 //! - `type_` is `TYPE_SLICE_BEGIN` / `TYPE_SLICE_END` / `TYPE_INSTANT`.
 //! - `categories` carries one of wprof's category strings (`ONCPU`,
 //!   `WAKEE`, `SCX_DSQ`, `SOFTIRQ:timer`, `HARDIRQ`, `SOFTIRQ`,
-//!   `IDLE`, `IPI_SEND:resched`) or one of two coarse SCXSIM_*
+//!   `IDLE`, `IPI_SEND`) or one of two coarse SCXSIM_*
 //!   buckets — `SCXSIM_OPS` (all sched_ext ops/kfunc-level events
 //!   that have no wprof counterpart) and `SCXSIM_CGROUP_BW` (the
 //!   cpu-bw-stall causal channel: charge / denied / replenish).
@@ -115,7 +115,22 @@ mod cat {
     pub const ONCPU: &str = "ONCPU";
     pub const WAKEE: &str = "WAKEE";
     pub const SCX_DSQ: &str = "SCX_DSQ";
-    pub const IPI_SEND_RESCHED: &str = "IPI_SEND:resched";
+    /// IPI-send category. Live wprof emits this as the bare string
+    /// `"IPI_SEND"`, with the per-event distinction (`single` vs
+    /// `multi` target count) carried in the TrackEvent `name` field
+    /// (e.g., `"IPI_SEND:single"`, `"IPI_SEND:multi"`). scxsim
+    /// previously used `"IPI_SEND:resched"` as the category, which
+    /// fragmented the live-vs-sim category vocabulary so that
+    /// `SELECT DISTINCT category FROM slice` on either trace did
+    /// not show overlap. Verified live-side via `trace_processor_shell
+    /// -q 'SELECT name, COUNT(*) FROM slice WHERE category=...'` on
+    /// `scratch/wprof_cpu_bw_stall_capture_20260513/wprof_trace.pb`:
+    /// category `IPI_SEND` (204k events) carries names
+    /// `IPI_SEND:single` (200k) + `IPI_SEND:multi` (4k); `:resched`
+    /// only appears under the receive-side `IPI` category, not under
+    /// `IPI_SEND`. tg `align-ipi-send-category-naming` (N3 follow-up
+    /// to closed `rerun-stream2-comparison-after-f1-f2-land`).
+    pub const IPI_SEND: &str = "IPI_SEND";
     pub const SOFTIRQ_TIMER: &str = "SOFTIRQ:timer";
     pub const HARDIRQ: &str = "HARDIRQ";
     pub const SOFTIRQ: &str = "SOFTIRQ";
@@ -360,7 +375,14 @@ fn emit_event(trace: &Trace, ev: &crate::trace::TraceEvent, proto: &mut TracePro
             );
         }
 
-        // ----- IPI send (wprof: IPI_SEND:resched with target_cpu) -----
+        // ----- IPI send (wprof category `IPI_SEND`, name
+        //                 `IPI_SEND:single` for single-target kicks).
+        //
+        //       scx_bpf_kick_cpu always targets exactly one CPU, so
+        //       the `:single` name applies; the `:multi` variant is
+        //       reserved for future bulk-kick helpers (e.g. an IPI
+        //       broadcast). The annotations preserve scxsim's
+        //       sender_cpu/target_cpu identity. -----
         TraceKind::KickCpu { target_cpu } => {
             let anns = vec![
                 ann_uint("sender_cpu", u64::from(cpu.0)),
@@ -370,8 +392,8 @@ fn emit_event(trace: &Trace, ev: &crate::trace::TraceEvent, proto: &mut TracePro
                 proto,
                 ts,
                 cpu_track_uuid(cpu),
-                cat::IPI_SEND_RESCHED,
-                "kick_cpu",
+                cat::IPI_SEND,
+                "IPI_SEND:single",
                 anns,
             );
         }
@@ -931,5 +953,144 @@ fn event_pid(kind: &TraceKind) -> Option<Pid> {
         | TraceKind::CgroupInit { .. }
         | TraceKind::CgroupExit { .. }
         | TraceKind::CgroupSetBandwidth { .. } => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::trace::Trace;
+    use crate::types::CpuId;
+    use perfetto_protos::trace::Trace as TraceProto;
+    use perfetto_protos::trace_packet::trace_packet;
+    use perfetto_protos::track_event::track_event;
+    use protobuf::Message;
+
+    /// tg `align-ipi-send-category-naming` (N3 follow-up to closed
+    /// `rerun-stream2-comparison-after-f1-f2-land`):
+    ///
+    /// Live wprof emits IPI sends under category `IPI_SEND` (no
+    /// `:resched` suffix), with the per-event distinction carried
+    /// in the TrackEvent `name` field as `IPI_SEND:single` /
+    /// `IPI_SEND:multi`. The original perfetto-pb F2 hotfix used
+    /// category `IPI_SEND:resched` which fragmented the live-vs-sim
+    /// vocabulary so a `SELECT DISTINCT category FROM slice` query
+    /// against either trace did not show overlap on the IPI axis.
+    /// This regression test pins the fix:
+    ///
+    /// - Build a tiny in-memory `Trace` containing one `KickCpu`.
+    /// - Round-trip through `perfetto_protos::Trace::parse_from_bytes`.
+    /// - Assert exactly one TrackEvent carries category `IPI_SEND`
+    ///   (NOT `IPI_SEND:resched`) and name `IPI_SEND:single`,
+    ///   with both `sender_cpu` and `target_cpu` annotations.
+    ///
+    /// Verified live-side via `trace_processor_shell -q 'SELECT name,
+    /// COUNT(*) FROM slice WHERE category = ?'` on
+    /// `scratch/wprof_cpu_bw_stall_capture_20260513/wprof_trace.pb`:
+    ///   category `IPI_SEND` → name `IPI_SEND:single` (200 139) +
+    ///   `IPI_SEND:multi` (4 087); category `IPI_SEND:resched` does
+    ///   not exist in live traces.
+    #[test]
+    fn kick_cpu_uses_wprof_ipi_send_naming() {
+        // 4-CPU trace, one KickCpu instant. (`Trace::with_warmup`
+        // and `record` are pub(crate); accessible because this is a
+        // lib-internal test inside the same crate as `Trace`.)
+        let mut trace = Trace::with_warmup(4, &[], 0);
+        trace.record(
+            1_234,
+            CpuId(0),
+            TraceKind::KickCpu {
+                target_cpu: CpuId(3),
+            },
+        );
+
+        let mut buf = Vec::new();
+        write_pb(&trace, &mut buf).expect("write_pb failed");
+
+        let proto: TraceProto =
+            TraceProto::parse_from_bytes(&buf).expect("parse_from_bytes failed");
+
+        // Find the (single) IPI_SEND TrackEvent.
+        let mut kick_events: Vec<&TrackEvent> = Vec::new();
+        let mut all_categories: Vec<String> = Vec::new();
+        for packet in &proto.packet {
+            if let Some(trace_packet::Data::TrackEvent(ev)) = &packet.data {
+                for c in &ev.categories {
+                    all_categories.push(c.clone());
+                }
+                let is_ipi_send = ev
+                    .categories
+                    .iter()
+                    .any(|c| c == "IPI_SEND" || c == "IPI_SEND:resched");
+                let is_instant = ev.type_.as_ref().map(|t| t.enum_value_or_default())
+                    == Some(track_event::Type::TYPE_INSTANT);
+                if is_ipi_send && is_instant {
+                    kick_events.push(ev);
+                }
+            }
+        }
+        assert_eq!(
+            kick_events.len(),
+            1,
+            "expected exactly one IPI_SEND* TrackEvent, found {} \
+             (categories seen: {:?})",
+            kick_events.len(),
+            all_categories,
+        );
+
+        let ev = kick_events[0];
+
+        // Category MUST be plain `IPI_SEND` (matches live wprof
+        // vocabulary). Pre-fix value `IPI_SEND:resched` must NOT
+        // reappear — regression class for this PR.
+        assert!(
+            ev.categories.iter().any(|c| c == "IPI_SEND"),
+            "KickCpu TrackEvent must use category 'IPI_SEND' \
+             (live wprof's vocabulary); got categories {:?}",
+            ev.categories,
+        );
+        assert!(
+            !ev.categories.iter().any(|c| c == "IPI_SEND:resched"),
+            "KickCpu TrackEvent regressed to category 'IPI_SEND:resched' \
+             (does not match live wprof, which uses plain 'IPI_SEND' \
+             with the per-event distinction in the `name` field). \
+             See tg align-ipi-send-category-naming.",
+        );
+
+        // Name MUST match wprof's per-event naming:
+        // `IPI_SEND:single` for single-target kicks
+        // (scx_bpf_kick_cpu always targets exactly one CPU).
+        let name = ev.name_field.as_ref().and_then(|n| match n {
+            track_event::Name_field::Name(s) => Some(s.as_str()),
+            _ => None,
+        });
+        assert_eq!(
+            name,
+            Some("IPI_SEND:single"),
+            "KickCpu TrackEvent name must be 'IPI_SEND:single' \
+             (matches live wprof's name vocabulary)",
+        );
+
+        // Annotations: sender_cpu + target_cpu both present.
+        let mut saw_sender = false;
+        let mut saw_target = false;
+        for ann in &ev.debug_annotations {
+            if let Some(debug_annotation::Name_field::Name(n)) = &ann.name_field {
+                if n == "sender_cpu" {
+                    saw_sender = true;
+                }
+                if n == "target_cpu" {
+                    saw_target = true;
+                }
+            }
+        }
+        assert!(
+            saw_sender,
+            "KickCpu TrackEvent missing sender_cpu annotation",
+        );
+        assert!(
+            saw_target,
+            "KickCpu TrackEvent missing target_cpu annotation",
+        );
     }
 }

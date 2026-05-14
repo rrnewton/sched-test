@@ -35,6 +35,7 @@
 //! | DsqInsert*       | `SCX_DSQ`      | `TYPE_INSTANT`     |
 //! | Tick             | `SOFTIRQ:timer`| `TYPE_INSTANT`     |
 //! | CpuIdle          | `IDLE`         | `TYPE_INSTANT`     |
+//! | KickCpu          | `IPI_SEND`     | `TYPE_INSTANT` (name `IPI_SEND:single`) |
 
 use std::io::Write as _;
 use std::path::Path;
