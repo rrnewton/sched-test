@@ -674,7 +674,7 @@ impl Trace {
     /// The output is loadable by scxtop's `load_perfetto_trace` and
     /// uses the same category vocabulary as wprof (`ONCPU`, `WAKEE`,
     /// `SCX_DSQ`, `TIMER`, `HARDIRQ`, `SOFTIRQ`, `OFFCPU`,
-    /// `IPI_SEND:resched`) so a scxsim trace and a wprof trace can be
+    /// `IPI_SEND`) so a scxsim trace and a wprof trace can be
     /// loaded side-by-side and analyzed with the same tools. Events
     /// without a wprof counterpart use a `SCXSIM_*` category prefix.
     /// See `crates/scx_simulator/src/safe/perfetto_pb.rs` for the
