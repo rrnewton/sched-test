@@ -1,0 +1,248 @@
+{
+  "_comment_v5a": "bug1_v5_d_min_bound_active fixture, promoted from experiments/v5_multi_cgroup_fixture_20260514/fixtures/D_16cg_2each.json. 16 cgroups x 2 tasks each, cpu.max=10000us/100000us per cgroup, 32 tasks total. Exercises the cbw accounting timer at the 1ms MIN bound continuously, escaping V4-B's single-cgroup structural lock-out. Empirical baseline (V5 REPORT.md): 469 MIN-bound fires in 5s, 78% adaptive-mode coverage. tg add-bug1-v5-d-min-bound-active-integration-test.",
+  "tasks": {
+    "yes_0": {
+      "loop": -1,
+      "run": 200000,
+      "taskgroup": {
+        "path": "/test_bw_cg0",
+        "cpu.max": "10000 100000"
+      }
+    },
+    "yes_1": {
+      "loop": -1,
+      "run": 200000,
+      "taskgroup": {
+        "path": "/test_bw_cg0"
+      }
+    },
+    "yes_2": {
+      "loop": -1,
+      "run": 200000,
+      "taskgroup": {
+        "path": "/test_bw_cg1",
+        "cpu.max": "10000 100000"
+      }
+    },
+    "yes_3": {
+      "loop": -1,
+      "run": 200000,
+      "taskgroup": {
+        "path": "/test_bw_cg1"
+      }
+    },
+    "yes_4": {
+      "loop": -1,
+      "run": 200000,
+      "taskgroup": {
+        "path": "/test_bw_cg2",
+        "cpu.max": "10000 100000"
+      }
+    },
+    "yes_5": {
+      "loop": -1,
+      "run": 200000,
+      "taskgroup": {
+        "path": "/test_bw_cg2"
+      }
+    },
+    "yes_6": {
+      "loop": -1,
+      "run": 200000,
+      "taskgroup": {
+        "path": "/test_bw_cg3",
+        "cpu.max": "10000 100000"
+      }
+    },
+    "yes_7": {
+      "loop": -1,
+      "run": 200000,
+      "taskgroup": {
+        "path": "/test_bw_cg3"
+      }
+    },
+    "yes_8": {
+      "loop": -1,
+      "run": 200000,
+      "taskgroup": {
+        "path": "/test_bw_cg4",
+        "cpu.max": "10000 100000"
+      }
+    },
+    "yes_9": {
+      "loop": -1,
+      "run": 200000,
+      "taskgroup": {
+        "path": "/test_bw_cg4"
+      }
+    },
+    "yes_10": {
+      "loop": -1,
+      "run": 200000,
+      "taskgroup": {
+        "path": "/test_bw_cg5",
+        "cpu.max": "10000 100000"
+      }
+    },
+    "yes_11": {
+      "loop": -1,
+      "run": 200000,
+      "taskgroup": {
+        "path": "/test_bw_cg5"
+      }
+    },
+    "yes_12": {
+      "loop": -1,
+      "run": 200000,
+      "taskgroup": {
+        "path": "/test_bw_cg6",
+        "cpu.max": "10000 100000"
+      }
+    },
+    "yes_13": {
+      "loop": -1,
+      "run": 200000,
+      "taskgroup": {
+        "path": "/test_bw_cg6"
+      }
+    },
+    "yes_14": {
+      "loop": -1,
+      "run": 200000,
+      "taskgroup": {
+        "path": "/test_bw_cg7",
+        "cpu.max": "10000 100000"
+      }
+    },
+    "yes_15": {
+      "loop": -1,
+      "run": 200000,
+      "taskgroup": {
+        "path": "/test_bw_cg7"
+      }
+    },
+    "yes_16": {
+      "loop": -1,
+      "run": 200000,
+      "taskgroup": {
+        "path": "/test_bw_cg8",
+        "cpu.max": "10000 100000"
+      }
+    },
+    "yes_17": {
+      "loop": -1,
+      "run": 200000,
+      "taskgroup": {
+        "path": "/test_bw_cg8"
+      }
+    },
+    "yes_18": {
+      "loop": -1,
+      "run": 200000,
+      "taskgroup": {
+        "path": "/test_bw_cg9",
+        "cpu.max": "10000 100000"
+      }
+    },
+    "yes_19": {
+      "loop": -1,
+      "run": 200000,
+      "taskgroup": {
+        "path": "/test_bw_cg9"
+      }
+    },
+    "yes_20": {
+      "loop": -1,
+      "run": 200000,
+      "taskgroup": {
+        "path": "/test_bw_cg10",
+        "cpu.max": "10000 100000"
+      }
+    },
+    "yes_21": {
+      "loop": -1,
+      "run": 200000,
+      "taskgroup": {
+        "path": "/test_bw_cg10"
+      }
+    },
+    "yes_22": {
+      "loop": -1,
+      "run": 200000,
+      "taskgroup": {
+        "path": "/test_bw_cg11",
+        "cpu.max": "10000 100000"
+      }
+    },
+    "yes_23": {
+      "loop": -1,
+      "run": 200000,
+      "taskgroup": {
+        "path": "/test_bw_cg11"
+      }
+    },
+    "yes_24": {
+      "loop": -1,
+      "run": 200000,
+      "taskgroup": {
+        "path": "/test_bw_cg12",
+        "cpu.max": "10000 100000"
+      }
+    },
+    "yes_25": {
+      "loop": -1,
+      "run": 200000,
+      "taskgroup": {
+        "path": "/test_bw_cg12"
+      }
+    },
+    "yes_26": {
+      "loop": -1,
+      "run": 200000,
+      "taskgroup": {
+        "path": "/test_bw_cg13",
+        "cpu.max": "10000 100000"
+      }
+    },
+    "yes_27": {
+      "loop": -1,
+      "run": 200000,
+      "taskgroup": {
+        "path": "/test_bw_cg13"
+      }
+    },
+    "yes_28": {
+      "loop": -1,
+      "run": 200000,
+      "taskgroup": {
+        "path": "/test_bw_cg14",
+        "cpu.max": "10000 100000"
+      }
+    },
+    "yes_29": {
+      "loop": -1,
+      "run": 200000,
+      "taskgroup": {
+        "path": "/test_bw_cg14"
+      }
+    },
+    "yes_30": {
+      "loop": -1,
+      "run": 200000,
+      "taskgroup": {
+        "path": "/test_bw_cg15",
+        "cpu.max": "10000 100000"
+      }
+    },
+    "yes_31": {
+      "loop": -1,
+      "run": 200000,
+      "taskgroup": {
+        "path": "/test_bw_cg15"
+      }
+    }
+  },
+  "global": {
+    "duration": 5.0
+  }
+}
