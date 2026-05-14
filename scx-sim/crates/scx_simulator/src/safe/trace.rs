@@ -224,6 +224,82 @@ pub enum TraceKind {
         to_cgid: crate::cgroup::CgroupId,
     },
 
+    // ----- Task-lifecycle structops (TOP-5: fixture-load determinism) -----
+    //
+    // tg `bundle-implement-secondary-tracekind-easy-wins` (TOP-5 cluster
+    // from `experiments/bpftrace_gap_classification_20260513/REPORT.md`
+    // rows #4 / #5 / #6): surface the init_task / exit_task / enable
+    // structops so the live-vs-sim diff harness can validate that sim
+    // and live agree on the per-task scheduler handshake at fixture
+    // load and shutdown. Engine already invokes all three at
+    // engine.rs init_task@~1748, exit_task@~2060, enable@~4461; this
+    // is mechanical wiring with no model surgery.
+    /// `ops.init_task` — scheduler should track a new task. Carries the
+    /// callback rc so the diff harness can spot init failures.
+    InitTask { pid: Pid, rc: i32 },
+    /// `ops.exit_task` — task is exiting scheduler control.
+    ExitTask { pid: Pid },
+    /// `ops.enable` — task is being enabled (made schedulable). One-shot
+    /// per task on first run, required for full handshake parity.
+    Enable { pid: Pid },
+
+    // ----- Task affinity structop (TOP-7: affinity parity) -----
+    //
+    // tg `bundle-implement-secondary-tracekind-easy-wins` (TOP-7 row #8):
+    // surface the set_cpumask call (engine.rs:~1761) so migration-disabled
+    // / cpumask-violation bug classes can be diffed live-vs-sim. The
+    // cpumask is rendered as a stable hex string (LSB = cpu 0) computed
+    // from `bpf_cpumask_test_cpu` over the engine's nr_cpus.
+    /// `ops.set_cpumask` — scheduler notified of a task's cpumask change.
+    SetCpumask {
+        pid: Pid,
+        /// Hex bitstring with LSB = cpu 0; widths beyond u64 emit
+        /// space-separated 16-hex-digit words from low to high.
+        cpumask_hex: String,
+    },
+
+    // ----- BPF helpers (TOP-8: time-source + cgroup-helper visibility) -----
+    //
+    // tg `bundle-implement-secondary-tracekind-easy-wins` (TOP-8 rows
+    // #30 / #42 / #40): surface the `scx_bpf_now` / `scx_bpf_task_cgroup`
+    // / `scx_bpf_task_cpu` helpers. **High** cpu-bw-stall-bug relevance:
+    // the bug's smoking gun is computed against `bpf_ktime_get_ns()`
+    // snapshots; emitting `now` lets the diff harness validate the
+    // time-source agrees with live. `task_cgroup` is called by LAVD on
+    // every enqueue to look up cgroup state.
+    /// `scx_bpf_now()` — read the simulated time-source. Carries the
+    /// returned ns value so the diff harness can compare clocks.
+    HelperNow { ret_ns: TimeNs },
+    /// `scx_bpf_task_cgroup(p)` — look up the cgroup a task belongs to.
+    /// Carries pid + the resolved cgid (or 0 for "root/unknown").
+    HelperTaskCgroup {
+        pid: Pid,
+        cgid: crate::cgroup::CgroupId,
+    },
+    /// `scx_bpf_task_cpu(p)` — look up the CPU a task is assigned to
+    /// (the kernel's `task_cpu(p)` semantics). Carries pid + the
+    /// returned CPU id.
+    HelperTaskCpu { pid: Pid, ret_cpu: CpuId },
+
+    // ----- BPF DSQ-creation helpers (TOP-9: DSQ-creation visibility) -----
+    //
+    // tg `bundle-implement-secondary-tracekind-easy-wins` (TOP-9 rows
+    // #31 / #32 / #33): surface `scx_bpf_create_dsq` / `_destroy_dsq`
+    // / `_dsq_nr_queued` so the diff harness can confirm sim and live
+    // agree on the scheduler-side per-cgroup DSQ topology — LAVD
+    // creates per-cgroup DSQs at cgroup_init and missing-DSQ bugs hide
+    // here.
+    /// `scx_bpf_create_dsq(dsq_id, node)` — scheduler asked to create a
+    /// DSQ. Carries the dsq_id, requested NUMA node, and the rc.
+    CreateDsq { dsq_id: DsqId, node: i32, rc: i32 },
+    /// `scx_bpf_destroy_dsq(dsq_id)` — scheduler asked to destroy a
+    /// DSQ. Trace-only in scxsim today (the helper is a no-op stub),
+    /// but recording the request still proves the scheduler asked.
+    DestroyDsq { dsq_id: DsqId },
+    /// `scx_bpf_dsq_nr_queued(dsq_id)` — scheduler probed a DSQ depth.
+    /// Carries the queried dsq_id and the returned count.
+    DsqNrQueued { dsq_id: DsqId, ret: i32 },
+
     // ----- IRQ events -----
     /// An interrupt starts on a CPU (hardirq or softirq).
     IrqStart { cpu: CpuId, irq_type: IrqType },
@@ -918,6 +994,38 @@ impl Trace {
                     "CG_MOVE  pid={} from_cgid={} to_cgid={}",
                     pid.0, from_cgid.0, to_cgid.0
                 ),
+                // tg `bundle-implement-secondary-tracekind-easy-wins`:
+                // pretty-printers for the 10 new TraceKinds.
+                TraceKind::InitTask { pid, rc } => {
+                    format!("INIT_TSK pid={} rc={}", pid.0, rc)
+                }
+                TraceKind::ExitTask { pid } => {
+                    format!("EXIT_TSK pid={}", pid.0)
+                }
+                TraceKind::Enable { pid } => {
+                    format!("ENABLE   pid={}", pid.0)
+                }
+                TraceKind::SetCpumask { pid, cpumask_hex } => {
+                    format!("SET_MASK pid={} cpus={}", pid.0, cpumask_hex)
+                }
+                TraceKind::HelperNow { ret_ns } => {
+                    format!("HLP_NOW  ret_ns={}", ret_ns)
+                }
+                TraceKind::HelperTaskCgroup { pid, cgid } => {
+                    format!("HLP_TCG  pid={} cgid={}", pid.0, cgid.0)
+                }
+                TraceKind::HelperTaskCpu { pid, ret_cpu } => {
+                    format!("HLP_TCPU pid={} cpu={}", pid.0, ret_cpu.0)
+                }
+                TraceKind::CreateDsq { dsq_id, node, rc } => {
+                    format!("DSQ_NEW  dsq=0x{:x} node={} rc={}", dsq_id.0, node, rc)
+                }
+                TraceKind::DestroyDsq { dsq_id } => {
+                    format!("DSQ_DEL  dsq=0x{:x}", dsq_id.0)
+                }
+                TraceKind::DsqNrQueued { dsq_id, ret } => {
+                    format!("DSQ_NRQ  dsq=0x{:x} ret={}", dsq_id.0, ret)
+                }
             };
             eprintln!(
                 "[{}] cpu={:<3} {}",

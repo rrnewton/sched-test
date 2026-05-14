@@ -509,6 +509,61 @@ pub(crate) fn write_json(trace: &Trace, writer: &mut impl Write) -> std::io::Res
                     "to_cgid": to_cgid.0,
                 }
             }),
+
+            // tg `bundle-implement-secondary-tracekind-easy-wins`:
+            // Chrome-JSON instants for the 10 new structop / helper hooks
+            // (TOP-5 task lifecycle, TOP-7 affinity, TOP-8 BPF time/cgroup
+            // helpers, TOP-9 DSQ-creation helpers).
+            TraceKind::InitTask { pid, rc } => json!({
+                "ph": "i", "pid": cpu, "tid": pid.0, "ts": ts,
+                "name": "ops.init_task", "cat": "structop", "s": "t",
+                "args": { "pid": pid.0, "rc": rc }
+            }),
+            TraceKind::ExitTask { pid } => json!({
+                "ph": "i", "pid": cpu, "tid": pid.0, "ts": ts,
+                "name": "ops.exit_task", "cat": "structop", "s": "t",
+                "args": { "pid": pid.0 }
+            }),
+            TraceKind::Enable { pid } => json!({
+                "ph": "i", "pid": cpu, "tid": pid.0, "ts": ts,
+                "name": "ops.enable", "cat": "structop", "s": "t",
+                "args": { "pid": pid.0 }
+            }),
+            TraceKind::SetCpumask { pid, cpumask_hex } => json!({
+                "ph": "i", "pid": cpu, "tid": pid.0, "ts": ts,
+                "name": "ops.set_cpumask", "cat": "structop", "s": "t",
+                "args": { "pid": pid.0, "cpumask_hex": cpumask_hex }
+            }),
+            TraceKind::HelperNow { ret_ns } => json!({
+                "ph": "i", "pid": cpu, "tid": 0, "ts": ts,
+                "name": "scx_bpf_now", "cat": "helper", "s": "t",
+                "args": { "ret_ns": ret_ns }
+            }),
+            TraceKind::HelperTaskCgroup { pid, cgid } => json!({
+                "ph": "i", "pid": cpu, "tid": pid.0, "ts": ts,
+                "name": "scx_bpf_task_cgroup", "cat": "helper", "s": "t",
+                "args": { "pid": pid.0, "cgid": cgid.0 }
+            }),
+            TraceKind::HelperTaskCpu { pid, ret_cpu } => json!({
+                "ph": "i", "pid": cpu, "tid": pid.0, "ts": ts,
+                "name": "scx_bpf_task_cpu", "cat": "helper", "s": "t",
+                "args": { "pid": pid.0, "ret_cpu": ret_cpu.0 }
+            }),
+            TraceKind::CreateDsq { dsq_id, node, rc } => json!({
+                "ph": "i", "pid": cpu, "tid": 0, "ts": ts,
+                "name": "scx_bpf_create_dsq", "cat": "helper", "s": "g",
+                "args": { "dsq_id": dsq_id.0, "node": node, "rc": rc }
+            }),
+            TraceKind::DestroyDsq { dsq_id } => json!({
+                "ph": "i", "pid": cpu, "tid": 0, "ts": ts,
+                "name": "scx_bpf_destroy_dsq", "cat": "helper", "s": "g",
+                "args": { "dsq_id": dsq_id.0 }
+            }),
+            TraceKind::DsqNrQueued { dsq_id, ret } => json!({
+                "ph": "i", "pid": cpu, "tid": 0, "ts": ts,
+                "name": "scx_bpf_dsq_nr_queued", "cat": "helper", "s": "g",
+                "args": { "dsq_id": dsq_id.0, "ret": ret }
+            }),
         };
         serde_json::to_writer(&mut *writer, &value)?;
     }

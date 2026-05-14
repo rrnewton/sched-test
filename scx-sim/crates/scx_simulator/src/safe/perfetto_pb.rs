@@ -763,6 +763,135 @@ fn emit_event(trace: &Trace, ev: &crate::trace::TraceEvent, proto: &mut TracePro
                 anns,
             );
         }
+
+        // tg `bundle-implement-secondary-tracekind-easy-wins`: perfetto-pb
+        // SCXSIM_STRUCTOP instants for the 10 new structop / helper hooks.
+        TraceKind::InitTask { pid, rc } => {
+            let anns = vec![
+                ann_int("pid", i64::from(pid.0)),
+                ann_int("rc", i64::from(*rc)),
+            ];
+            push_instant(
+                proto,
+                ts,
+                cpu_track_uuid(cpu),
+                "SCXSIM_STRUCTOP",
+                "ops.init_task",
+                anns,
+            );
+        }
+        TraceKind::ExitTask { pid } => {
+            let anns = vec![ann_int("pid", i64::from(pid.0))];
+            push_instant(
+                proto,
+                ts,
+                cpu_track_uuid(cpu),
+                "SCXSIM_STRUCTOP",
+                "ops.exit_task",
+                anns,
+            );
+        }
+        TraceKind::Enable { pid } => {
+            let anns = vec![ann_int("pid", i64::from(pid.0))];
+            push_instant(
+                proto,
+                ts,
+                cpu_track_uuid(cpu),
+                "SCXSIM_STRUCTOP",
+                "ops.enable",
+                anns,
+            );
+        }
+        TraceKind::SetCpumask { pid, cpumask_hex } => {
+            let anns = vec![
+                ann_int("pid", i64::from(pid.0)),
+                ann_string("cpumask_hex", cpumask_hex.clone()),
+            ];
+            push_instant(
+                proto,
+                ts,
+                cpu_track_uuid(cpu),
+                "SCXSIM_STRUCTOP",
+                "ops.set_cpumask",
+                anns,
+            );
+        }
+        TraceKind::HelperNow { ret_ns } => {
+            let anns = vec![ann_uint("ret_ns", *ret_ns)];
+            push_instant(
+                proto,
+                ts,
+                cpu_track_uuid(cpu),
+                "SCXSIM_STRUCTOP",
+                "scx_bpf_now",
+                anns,
+            );
+        }
+        TraceKind::HelperTaskCgroup { pid, cgid } => {
+            let anns = vec![ann_int("pid", i64::from(pid.0)), ann_uint("cgid", cgid.0)];
+            push_instant(
+                proto,
+                ts,
+                cpu_track_uuid(cpu),
+                "SCXSIM_STRUCTOP",
+                "scx_bpf_task_cgroup",
+                anns,
+            );
+        }
+        TraceKind::HelperTaskCpu { pid, ret_cpu } => {
+            let anns = vec![
+                ann_int("pid", i64::from(pid.0)),
+                ann_uint("ret_cpu", u64::from(ret_cpu.0)),
+            ];
+            push_instant(
+                proto,
+                ts,
+                cpu_track_uuid(cpu),
+                "SCXSIM_STRUCTOP",
+                "scx_bpf_task_cpu",
+                anns,
+            );
+        }
+        TraceKind::CreateDsq { dsq_id, node, rc } => {
+            let anns = vec![
+                ann_uint("dsq_id", dsq_id.0),
+                ann_int("node", i64::from(*node)),
+                ann_int("rc", i64::from(*rc)),
+            ];
+            push_instant(
+                proto,
+                ts,
+                cpu_track_uuid(cpu),
+                "SCXSIM_STRUCTOP",
+                "scx_bpf_create_dsq",
+                anns,
+            );
+        }
+        TraceKind::DestroyDsq { dsq_id } => {
+            let anns = vec![ann_uint("dsq_id", dsq_id.0)];
+            push_instant(
+                proto,
+                ts,
+                cpu_track_uuid(cpu),
+                "SCXSIM_STRUCTOP",
+                "scx_bpf_destroy_dsq",
+                anns,
+            );
+        }
+        TraceKind::DsqNrQueued { dsq_id, ret } => {
+            let anns = vec![
+                ann_uint("dsq_id", dsq_id.0),
+                ann_int("ret", i64::from(*ret)),
+            ];
+            push_instant(
+                proto,
+                ts,
+                cpu_track_uuid(cpu),
+                "SCXSIM_STRUCTOP",
+                "scx_bpf_dsq_nr_queued",
+                anns,
+            );
+        }
     }
 }
 
@@ -942,6 +1071,19 @@ fn event_pid(kind: &TraceKind) -> Option<Pid> {
         | TraceKind::Dequeue { pid, .. }
         | TraceKind::Quiescent { pid, .. }
         | TraceKind::CgroupMove { pid, .. } => Some(*pid),
+        // tg `bundle-implement-secondary-tracekind-easy-wins`: route the
+        // pid-bearing variants of the secondary bundle through the
+        // per-task track so they appear on the right thread lane in
+        // perfetto-pb (matching the engine.rs/kfunc emit-site context
+        // — InitTask/ExitTask/Enable on the boot CPU, SetCpumask in
+        // task_init order, HelperTask{Cgroup,Cpu} on whatever CPU the
+        // BPF helper fires from).
+        TraceKind::InitTask { pid, .. }
+        | TraceKind::ExitTask { pid }
+        | TraceKind::Enable { pid }
+        | TraceKind::SetCpumask { pid, .. }
+        | TraceKind::HelperTaskCgroup { pid, .. }
+        | TraceKind::HelperTaskCpu { pid, .. } => Some(*pid),
         TraceKind::Balance { prev_pid } => *prev_pid,
         TraceKind::CpuIdle
         | TraceKind::DsqMoveToLocal { .. }
@@ -952,7 +1094,12 @@ fn event_pid(kind: &TraceKind) -> Option<Pid> {
         | TraceKind::UpdateIdle { .. }
         | TraceKind::CgroupInit { .. }
         | TraceKind::CgroupExit { .. }
-        | TraceKind::CgroupSetBandwidth { .. } => None,
+        | TraceKind::CgroupSetBandwidth { .. }
+        // CPU-/global-keyed helpers: no per-task track.
+        | TraceKind::HelperNow { .. }
+        | TraceKind::CreateDsq { .. }
+        | TraceKind::DestroyDsq { .. }
+        | TraceKind::DsqNrQueued { .. } => None,
     }
 }
 

@@ -54,6 +54,9 @@ void *sim_task_get_mm(struct task_struct *p);
 /* Cgroup allocation and management */
 void *sim_cgroup_alloc(unsigned long long cgid, unsigned int level, void *parent);
 void sim_cgroup_free(void *cgrp);
+/* Read kn->id (the cgid the kernel ABI exposes) from a cgroup pointer.
+ * Returns 0 if the pointer is NULL or has no kernfs_node. */
+unsigned long long sim_cgroup_get_kn_id(void *cgrp);
 void sim_cgroup_set_cpuset(void *cgrp, const unsigned int *cpus, unsigned int nr_cpus);
 void sim_task_set_cgroup(struct task_struct *p, void *cgrp);
 void *sim_task_get_cgroup(struct task_struct *p);
