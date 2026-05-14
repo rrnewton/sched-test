@@ -1714,6 +1714,40 @@ pub extern "C" fn scxsim_cgroup_bw_observe_reenqueue(cgid: u64) {
     s.sim.bw_blocked.remove(&crate::cgroup::CgroupId(cgid));
 }
 
+/// V4-A observer for `CgroupBwConsumeNs`. Called from wrapper.c's
+/// `scx_cgroup_bw_consume(c, n)` macro AFTER the lib call returns,
+/// recording the `n` argument the engine charged. The post-stall sum
+/// of `ns` per period distinguishes:
+///   - sum/period ≈ period_ns → ENGINE BUG (over-charging idle cgroup)
+///   - sum/period ≈ 0         → LIB BUG (lib's idealized accounting timer)
+///
+/// Safe: no-op if no active SIM_ARC.
+///
+/// tg `scxsim-disambiguate-runtime-overcharge-vs-lib-idealized-accounting`.
+#[no_mangle]
+pub extern "C" fn scxsim_cgroup_bw_observe_consume(cgid: u64, ns: u64) {
+    if !SIM_ARC.with(|c| c.borrow().is_some()) {
+        return;
+    }
+    use crate::trace::TraceKind;
+    let arc = match SIM_ARC.with(|c| c.borrow().clone()) {
+        Some(a) => a,
+        None => return,
+    };
+    let cpu = current_cpu_from_tls();
+    let mut guard = arc.lock().unwrap();
+    let s = &mut *guard;
+    let local_t = s.sim.cpus[cpu.0 as usize].local_clock;
+    s.sim.trace.record(
+        local_t,
+        cpu,
+        TraceKind::CgroupBwConsumeNs {
+            cgid: crate::cgroup::CgroupId(cgid),
+            ns,
+        },
+    );
+}
+
 #[no_mangle]
 pub extern "C" fn scxsim_cgroup_bw_begin_interleaved_timer(slot_out: *mut u32) -> i32 {
     if slot_out.is_null() {
