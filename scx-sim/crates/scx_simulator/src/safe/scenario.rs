@@ -666,6 +666,12 @@ pub struct Scenario {
     pub stochastic_timer_interleave_window_ns: TimeNs,
     /// Approximate rate: one eligible timer is pulled once per N yield sites.
     pub stochastic_timer_interleave_one_in: u32,
+    /// Force deterministic timer interleavings at targeted cgroup_bw race sites.
+    pub targeted_cbw_yield_sites: bool,
+    /// Fire-ahead window for targeted cgroup_bw race-site timer pulls.
+    pub targeted_cbw_yield_window_ns: TimeNs,
+    /// Maximum number of targeted cgroup_bw timer pulls per simulation.
+    pub targeted_cbw_yield_limit: u32,
     /// Preemptive interleaving configuration.
     ///
     /// When `Some`, dispatch callbacks are additionally preempted at random
@@ -747,6 +753,9 @@ pub struct ScenarioBuilder {
     stochastic_timer_interleave: bool,
     stochastic_timer_interleave_window_ns: TimeNs,
     stochastic_timer_interleave_one_in: u32,
+    targeted_cbw_yield_sites: bool,
+    targeted_cbw_yield_window_ns: TimeNs,
+    targeted_cbw_yield_limit: u32,
     preemptive: Option<PreemptiveConfig>,
     replay_trace: Option<crate::preempt::trace::PreemptionTrace>,
     no_pmu_signal: bool,
@@ -784,6 +793,9 @@ impl Scenario {
             stochastic_timer_interleave: false,
             stochastic_timer_interleave_window_ns: 20_000_000,
             stochastic_timer_interleave_one_in: 4,
+            targeted_cbw_yield_sites: false,
+            targeted_cbw_yield_window_ns: 100_000_000,
+            targeted_cbw_yield_limit: 1,
             preemptive: None,
             replay_trace: None,
             no_pmu_signal: false,
@@ -1196,6 +1208,24 @@ impl ScenarioBuilder {
         self
     }
 
+    /// Force deterministic timer interleavings at targeted cgroup_bw race sites.
+    pub fn targeted_cbw_yield_sites(mut self, enabled: bool) -> Self {
+        self.targeted_cbw_yield_sites = enabled;
+        self
+    }
+
+    /// Set the fire-ahead window for targeted cgroup_bw race-site timer pulls.
+    pub fn targeted_cbw_yield_window_ns(mut self, window_ns: TimeNs) -> Self {
+        self.targeted_cbw_yield_window_ns = window_ns;
+        self
+    }
+
+    /// Set the maximum number of targeted cgroup_bw timer pulls per simulation.
+    pub fn targeted_cbw_yield_limit(mut self, limit: u32) -> Self {
+        self.targeted_cbw_yield_limit = limit;
+        self
+    }
+
     /// Enable preemptive interleaving with the given configuration.
     ///
     /// Implies `interleave(true)`. Each dispatch callback will be
@@ -1375,6 +1405,9 @@ impl ScenarioBuilder {
             stochastic_timer_interleave: self.stochastic_timer_interleave,
             stochastic_timer_interleave_window_ns: self.stochastic_timer_interleave_window_ns,
             stochastic_timer_interleave_one_in: self.stochastic_timer_interleave_one_in,
+            targeted_cbw_yield_sites: self.targeted_cbw_yield_sites,
+            targeted_cbw_yield_window_ns: self.targeted_cbw_yield_window_ns,
+            targeted_cbw_yield_limit: self.targeted_cbw_yield_limit,
             preemptive: self.preemptive,
             replay_trace: self.replay_trace,
             no_pmu_signal: self.no_pmu_signal,

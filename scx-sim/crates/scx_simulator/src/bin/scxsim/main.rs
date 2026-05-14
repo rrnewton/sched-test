@@ -385,6 +385,23 @@ struct RunArgs {
     #[arg(long, default_value_t = 4, requires = "stochastic_timer_interleave")]
     stochastic_timer_interleave_one_in: u32,
 
+    /// Force deterministic timer interleavings at targeted PR #3521 cgroup_bw race sites.
+    #[arg(long)]
+    targeted_cbw_yield_sites: bool,
+
+    /// Fire-ahead window for --targeted-cbw-yield-sites.
+    #[arg(
+        long,
+        default_value = "100ms",
+        requires = "targeted_cbw_yield_sites",
+        value_name = "DURATION"
+    )]
+    targeted_cbw_yield_window: String,
+
+    /// Maximum number of targeted cgroup_bw timer pulls per simulation.
+    #[arg(long, default_value_t = 1, requires = "targeted_cbw_yield_sites")]
+    targeted_cbw_yield_limit: u32,
+
     /// Enable preemptive interleaving via PMU retired branch counter signals.
     ///
     /// Like --interleave, but also preempts mid-C-code at random retired
@@ -729,6 +746,12 @@ fn run(args: &RunArgs) -> Result<(), RunError> {
                 .map_err(|e| format!("--stochastic-timer-interleave-window: {e}"))?;
         scenario.stochastic_timer_interleave_one_in =
             args.stochastic_timer_interleave_one_in.max(1);
+    }
+    if args.targeted_cbw_yield_sites {
+        scenario.targeted_cbw_yield_sites = true;
+        scenario.targeted_cbw_yield_window_ns = parse_duration_ns(&args.targeted_cbw_yield_window)
+            .map_err(|e| format!("--targeted-cbw-yield-window: {e}"))?;
+        scenario.targeted_cbw_yield_limit = args.targeted_cbw_yield_limit;
     }
     if args.preemptive {
         scenario.preemptive = Some(PreemptiveConfig {

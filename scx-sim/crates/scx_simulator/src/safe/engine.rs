@@ -567,6 +567,29 @@ impl EventQueue {
         self.heap.extend(events.into_iter().map(Reverse));
         Some(selected)
     }
+
+    /// Deterministically pull the earliest non-slot-0 BPF timer at or before
+    /// the horizon. Used by targeted cgroup_bw race-site hooks where the
+    /// desired interleave is part of the experiment, not a random choice.
+    pub(crate) fn pop_targeted_timer_interleave(&mut self, horizon_ns: TimeNs) -> Option<Event> {
+        let mut events = Vec::with_capacity(self.heap.len());
+        while let Some(event) = self.pop() {
+            events.push(event);
+        }
+
+        let selected_idx = events.iter().position(|event| {
+            matches!(event.kind, EventKind::TimerFired { slot, .. } if slot != 0 && event.time_ns <= horizon_ns)
+        });
+
+        let Some(selected_idx) = selected_idx else {
+            self.heap.extend(events.into_iter().map(Reverse));
+            return None;
+        };
+
+        let selected = events.remove(selected_idx);
+        self.heap.extend(events.into_iter().map(Reverse));
+        Some(selected)
+    }
 }
 
 /// Context about the task that triggered a wakeup.
@@ -1505,6 +1528,10 @@ impl<S: Scheduler> Simulator<S> {
             stochastic_timer_interleave: scenario.stochastic_timer_interleave,
             stochastic_timer_interleave_window_ns: scenario.stochastic_timer_interleave_window_ns,
             stochastic_timer_interleave_one_in: scenario.stochastic_timer_interleave_one_in,
+            targeted_cbw_yield_sites: scenario.targeted_cbw_yield_sites,
+            targeted_cbw_yield_window_ns: scenario.targeted_cbw_yield_window_ns,
+            targeted_cbw_yield_limit: scenario.targeted_cbw_yield_limit,
+            targeted_cbw_yield_count: 0,
             preemptive: scenario.preemptive.clone(),
             replay_trace: scenario.replay_trace.clone(),
             replay_backend: None,    // Initialized below after state is built.
