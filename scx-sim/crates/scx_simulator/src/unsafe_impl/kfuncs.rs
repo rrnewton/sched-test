@@ -1736,7 +1736,7 @@ pub extern "C" fn scxsim_cgroup_bw_end_interleaved_timer() {
 
 /// Create a dispatch queue.
 #[no_mangle]
-pub extern "C" fn scx_bpf_create_dsq(dsq_id: u64, _node: i32) -> i32 {
+pub extern "C" fn scx_bpf_create_dsq(dsq_id: u64, node: i32) -> i32 {
     with_sim(kfunc_cost::SIMPLE, |sim| {
         let result = if sim.dsqs.create(DsqId(dsq_id)) {
             0
@@ -1744,6 +1744,22 @@ pub extern "C" fn scx_bpf_create_dsq(dsq_id: u64, _node: i32) -> i32 {
             -1
         };
         debug!(dsq_id, result, "enter:kfunc create_dsq");
+        // TOP-9 of secondary TraceKind easy-win bundle (tg
+        // `bundle-implement-secondary-tracekind-easy-wins`): emit
+        // helper/create_dsq entry+exit so the live-vs-sim diff
+        // harness can confirm sim and live agree on the per-cgroup
+        // DSQ topology that LAVD's cgroup_init builds.
+        let cpu = sim.current_cpu;
+        let local_t = sim.cpus[cpu.0 as usize].local_clock;
+        sim.trace.record(
+            local_t,
+            cpu,
+            TraceKind::CreateDsq {
+                dsq_id: DsqId(dsq_id),
+                node,
+                rc: result,
+            },
+        );
         result
     })
 }
@@ -2113,23 +2129,38 @@ pub extern "C" fn scx_bpf_dsq_nr_queued(dsq_id: u64) -> i32 {
     crate::interleave::maybe_yield();
     with_sim(kfunc_cost::SIMPLE, |sim| {
         let dsq = DsqId(dsq_id);
-        if dsq.is_local() {
+        let n = if dsq.is_local() {
             let cpu = sim.current_cpu.0 as usize;
             let n = sim.cpus[cpu].local_dsq.len() as i32;
             debug!(dsq_id, n, "enter:kfunc dsq_nr_queued LOCAL");
-            return n;
-        }
-        if dsq.is_local_on() {
+            n
+        } else if dsq.is_local_on() {
             let cpu = dsq.local_on_cpu();
             if (cpu.0 as usize) < sim.cpus.len() {
                 let n = sim.cpus[cpu.0 as usize].local_dsq.len() as i32;
                 debug!(dsq_id, cpu = cpu.0, n, "enter:kfunc dsq_nr_queued LOCAL_ON");
-                return n;
+                n
+            } else {
+                0
             }
-            return 0;
-        }
-        let n = sim.dsqs.nr_queued(dsq) as i32;
-        debug!(dsq_id, n, "enter:kfunc dsq_nr_queued");
+        } else {
+            let n = sim.dsqs.nr_queued(dsq) as i32;
+            debug!(dsq_id, n, "enter:kfunc dsq_nr_queued");
+            n
+        };
+        // TOP-9 of secondary TraceKind easy-win bundle: emit
+        // helper/dsq_nr_queued entry+exit. **Med** relevance:
+        // LAVD polls queue depth on dispatch decisions.
+        let cpu = sim.current_cpu;
+        let local_t = sim.cpus[cpu.0 as usize].local_clock;
+        sim.trace.record(
+            local_t,
+            cpu,
+            TraceKind::DsqNrQueued {
+                dsq_id: dsq,
+                ret: n,
+            },
+        );
         n
     })
 }
@@ -2140,8 +2171,19 @@ pub extern "C" fn scx_bpf_now() -> u64 {
     crate::preempt::set_current_kfunc("now");
     crate::interleave::maybe_yield();
     with_sim(kfunc_cost::TRIVIAL, |sim| {
-        let cpu = sim.current_cpu.0 as usize;
-        sim.cpus[cpu].local_clock
+        let cpu_idx = sim.current_cpu.0 as usize;
+        let now_ns = sim.cpus[cpu_idx].local_clock;
+        // TOP-8 of secondary TraceKind easy-win bundle (tg
+        // `bundle-implement-secondary-tracekind-easy-wins`): emit
+        // helper/now entry+exit so the live-vs-sim diff harness can
+        // validate the time-source agrees — the cpu-bw-stall-bug's
+        // smoking gun is computed against `bpf_ktime_get_ns()`
+        // snapshots and a divergence on this single helper hides the
+        // whole bug.
+        let cpu = sim.current_cpu;
+        sim.trace
+            .record(now_ns, cpu, TraceKind::HelperNow { ret_ns: now_ns });
+        now_ns
     })
 }
 
@@ -2234,6 +2276,17 @@ pub extern "C" fn scx_bpf_task_cpu(p: *const c_void) -> i32 {
     with_sim(kfunc_cost::SIMPLE, |sim| {
         let pid = sim.task_pid_from_raw(p as *mut c_void);
         let cpu = sim.task_last_cpu.get(&pid).copied().unwrap_or(CpuId(0));
+        // TOP-8 of secondary TraceKind easy-win bundle: emit
+        // helper/task_cpu entry+exit so the live-vs-sim diff harness
+        // can confirm sim and live agree on each scheduler's view of
+        // task → CPU placement.
+        let current = sim.current_cpu;
+        let local_t = sim.cpus[current.0 as usize].local_clock;
+        sim.trace.record(
+            local_t,
+            current,
+            TraceKind::HelperTaskCpu { pid, ret_cpu: cpu },
+        );
         cpu.0 as i32
     })
 }
@@ -2293,9 +2346,24 @@ pub extern "C" fn scx_bpf_put_cpumask(_cpumask: *const c_void) {}
 #[no_mangle]
 pub extern "C" fn scx_bpf_put_idle_cpumask(_cpumask: *const c_void) {}
 
-/// Destroy a DSQ. No-op in simulator.
+/// Destroy a DSQ. No-op in simulator (the engine never frees DSQs
+/// mid-run), but we record the request so the live-vs-sim diff
+/// harness still notices it (TOP-9 of the secondary TraceKind
+/// easy-win bundle).
 #[no_mangle]
-pub extern "C" fn scx_bpf_destroy_dsq(_dsq_id: u64) {}
+pub extern "C" fn scx_bpf_destroy_dsq(dsq_id: u64) {
+    with_sim(kfunc_cost::TRIVIAL, |sim| {
+        let cpu = sim.current_cpu;
+        let local_t = sim.cpus[cpu.0 as usize].local_clock;
+        sim.trace.record(
+            local_t,
+            cpu,
+            TraceKind::DestroyDsq {
+                dsq_id: DsqId(dsq_id),
+            },
+        );
+    });
+}
 
 /// No-op for bpf_ktime_get_ns -- use per-CPU local clock.
 #[no_mangle]
@@ -2603,11 +2671,37 @@ pub extern "C" fn scx_bpf_task_cgroup(p: *mut c_void, _subsys_id: i32) -> *mut c
     }
     // Get the task's cgroup from the C-side task_struct
     let cgrp = unsafe { ffi::sim_task_get_cgroup(p) };
-    if !cgrp.is_null() {
-        return cgrp;
-    }
-    // Fallback: return root cgroup (task not assigned to any cgroup)
-    unsafe { ffi::sim_get_root_cgroup() }
+    let resolved = if !cgrp.is_null() {
+        cgrp
+    } else {
+        // Fallback: return root cgroup (task not assigned to any cgroup)
+        unsafe { ffi::sim_get_root_cgroup() }
+    };
+    // TOP-8 of secondary TraceKind easy-win bundle (tg
+    // `bundle-implement-secondary-tracekind-easy-wins`): emit
+    // helper/task_cgroup entry+exit. **High** cpu-bw-stall-bug
+    // relevance: LAVD calls this on every enqueue to look up cgroup
+    // state; a divergence here means sim and live see different
+    // cgroups for the same task and the bug is invisible.
+    // SAFETY: `resolved` is either a real cgroup the engine allocated
+    // via `sim_cgroup_alloc` (which sets up `cgrp->kn->id`) or
+    // `sim_get_root_cgroup()` (which sets `kn->id = 1`); both are
+    // safe to pass to `sim_cgroup_get_kn_id`.
+    let cgid_u64 = unsafe { ffi::sim_cgroup_get_kn_id(resolved) };
+    with_sim(kfunc_cost::TRIVIAL, |sim| {
+        let pid = sim.task_pid_from_raw(p);
+        let cpu = sim.current_cpu;
+        let local_t = sim.cpus[cpu.0 as usize].local_clock;
+        sim.trace.record(
+            local_t,
+            cpu,
+            TraceKind::HelperTaskCgroup {
+                pid,
+                cgid: crate::cgroup::CgroupId(cgid_u64),
+            },
+        );
+    });
+    resolved
 }
 
 /// C-side alias: sim_wrapper.h redefines `scx_bpf_task_cgroup` as a macro

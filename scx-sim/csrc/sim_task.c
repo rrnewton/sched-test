@@ -368,6 +368,23 @@ void *sim_cgroup_alloc(u64 cgid, u32 level, void *parent)
 /*
  * Free a cgroup allocated by sim_cgroup_alloc.
  */
+/* Read the cgid stored in a cgroup's kernfs_node (the kernel ABI for
+ * cgroup identity in scxsim's struct layout — set in sim_cgroup_alloc()
+ * above). Returns 0 if either the cgrp pointer or its kn pointer is NULL.
+ *
+ * tg `bundle-implement-secondary-tracekind-easy-wins` (TOP-8 helper
+ * `scx_bpf_task_cgroup` JSONL emit): the helper returns a struct
+ * cgroup * but the live-vs-sim diff harness needs a stable u64 cgid
+ * to compare against bpftrace's print of `kn->id`.
+ */
+u64 sim_cgroup_get_kn_id(void *cgrp_ptr)
+{
+	struct cgroup *cgrp = (struct cgroup *)cgrp_ptr;
+	if (!cgrp || !cgrp->kn)
+		return 0;
+	return cgrp->kn->id;
+}
+
 void sim_cgroup_free(void *cgrp_ptr)
 {
 	struct cgroup *cgrp = (struct cgroup *)cgrp_ptr;

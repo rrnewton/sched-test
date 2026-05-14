@@ -87,6 +87,7 @@ extern "C" {
     // Cgroup allocation and management (implemented in sim_task.c)
     pub fn sim_cgroup_alloc(cgid: u64, level: u32, parent: *mut c_void) -> *mut c_void;
     pub fn sim_cgroup_free(cgrp: *mut c_void);
+    pub fn sim_cgroup_get_kn_id(cgrp: *mut c_void) -> u64;
     pub fn sim_cgroup_set_cpuset(cgrp: *mut c_void, cpus: *const u32, nr_cpus: u32);
     pub fn sim_task_set_cgroup(p: *mut c_void, cgrp: *mut c_void);
     pub fn sim_task_get_cgroup(p: *mut c_void) -> *mut c_void;
@@ -259,6 +260,64 @@ pub fn task_set_cgroup(raw: *mut c_void, cgrp: *mut c_void) {
 pub fn task_get_cpus_ptr(raw: *mut c_void) -> *const c_void {
     // SAFETY: The caller guarantees `raw` is a valid task_struct pointer.
     unsafe { sim_task_get_cpus_ptr(raw) }
+}
+
+/// Render a cpumask as a stable hex string with LSB = cpu 0.
+///
+/// tg `bundle-implement-secondary-tracekind-easy-wins` (TOP-7
+/// `TraceKind::SetCpumask`): the live-vs-sim diff harness needs an
+/// affinity representation that does not depend on the in-memory
+/// cpumask layout. We emit a string of the form `0xNNNNNNNN…`, where
+/// each 16-hex-digit word covers 64 CPUs and words are separated by
+/// `_` from low to high — i.e. word 0 is bit 0..63, word 1 is bit
+/// 64..127, etc. For the typical scxsim fixture (≤64 CPUs) the
+/// output is one word like `0xff` or `0x1`.
+///
+/// The `cpumask` pointer can be NULL (treated as "all unset"). The
+/// `nr_cpus` argument is the engine's `s.sim.cpus.len()` snapshot at
+/// emit time — we never query the cpumask beyond it.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn cpumask_to_hex(cpumask: *const c_void, nr_cpus: u32) -> String {
+    if cpumask.is_null() || nr_cpus == 0 {
+        return "0x0".to_string();
+    }
+    // Pack into u64 words, LSB = cpu 0.
+    let nr_words = (nr_cpus as usize).div_ceil(64);
+    let mut words: Vec<u64> = vec![0; nr_words];
+    for cpu in 0..nr_cpus {
+        // SAFETY: `cpumask` was obtained from `sim_task_get_cpus_ptr`
+        // which the engine's task-init path produces; it remains valid
+        // for the lifetime of the task_struct. `bpf_cpumask_test_cpu`
+        // only reads the bit at `cpu`, which is bounded by `nr_cpus`.
+        let set = unsafe { bpf_cpumask_test_cpu(cpu, cpumask) };
+        if set {
+            let w = (cpu / 64) as usize;
+            let b = cpu % 64;
+            words[w] |= 1u64 << b;
+        }
+    }
+    // Emit low-word first; for ≤64-CPU fixtures this collapses to a
+    // single `0xN` token, matching what bpftrace prints.
+    let mut s = String::with_capacity(2 + nr_words * 17);
+    s.push_str("0x");
+    let mut first = true;
+    for w in words.iter().rev() {
+        // Skip leading zero words to keep the common case compact.
+        if first && *w == 0 && words.len() > 1 {
+            continue;
+        }
+        if first {
+            s.push_str(&format!("{:x}", w));
+            first = false;
+        } else {
+            s.push_str(&format!("_{:016x}", w));
+        }
+    }
+    if first {
+        // All-zero cpumask: words.iter().rev() never produced output.
+        s.push('0');
+    }
+    s
 }
 
 /// Set up cpumask pointer, clear it, set individual CPUs, and set

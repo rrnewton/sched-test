@@ -1733,6 +1733,9 @@ impl<S: Scheduler> Simulator<S> {
         sorted_pids.sort_by_key(|p| p.0);
         {
             let cpu = s.sim.current_cpu;
+            // Snapshot nr_cpus once: it's stable for the duration of the
+            // init loop and we use it as the cpumask-hex bit-width.
+            let nr_cpus_for_mask = s.sim.cpus.len() as u32;
             for pid in sorted_pids {
                 let task_raw = s.tasks[&pid].raw();
                 let task_pid = s.tasks[&pid].pid;
@@ -1740,6 +1743,7 @@ impl<S: Scheduler> Simulator<S> {
                 start_rbc(&mut s.sim);
                 #[allow(unused_assignments)]
                 let mut rc = 0i32;
+                let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
                 sim_callback!(s, s, sim_arc, cpu, {
                     rc = if let Some(cgrp_raw) = cgrp_raw {
                         self.scheduler
@@ -1748,6 +1752,15 @@ impl<S: Scheduler> Simulator<S> {
                         self.scheduler.init_task(TaskPtr::new(task_raw))
                     };
                 });
+                // TOP-5 of secondary TraceKind easy-win bundle (tg
+                // `bundle-implement-secondary-tracekind-easy-wins`):
+                // emit the init_task entry+exit pair via JSONL so the
+                // live-vs-sim diff harness can validate that sim and
+                // live agree on per-task fixture-load handshake order
+                // and rc.
+                s.sim
+                    .trace
+                    .record(__local_t, cpu, TraceKind::InitTask { pid: task_pid, rc });
                 charge_sched_time(&mut s.sim, CpuId(0), "init_task");
                 assert!(rc == 0, "init_task failed for pid={} rc={rc}", task_pid.0);
 
@@ -1756,10 +1769,24 @@ impl<S: Scheduler> Simulator<S> {
 
                 // Notify scheduler of initial cpumask (mirrors kernel enumeration)
                 let cpus_ptr = ffi::task_get_cpus_ptr(task_raw);
+                let cpumask_hex = ffi::cpumask_to_hex(cpus_ptr, nr_cpus_for_mask);
                 start_rbc(&mut s.sim);
+                let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
                 sim_callback!(s, s, sim_arc, cpu, {
                     self.scheduler.set_cpumask(TaskPtr::new(task_raw), cpus_ptr);
                 });
+                // TOP-7 of secondary TraceKind easy-win bundle: surface
+                // the per-task initial cpumask the engine tells the
+                // scheduler about. Required for affinity-parity checks
+                // (migration-disabled / cpumask-violation bug classes).
+                s.sim.trace.record(
+                    __local_t,
+                    cpu,
+                    TraceKind::SetCpumask {
+                        pid: task_pid,
+                        cpumask_hex,
+                    },
+                );
                 charge_sched_time(&mut s.sim, CpuId(0), "set_cpumask");
             }
         }
@@ -2056,9 +2083,17 @@ impl<S: Scheduler> Simulator<S> {
             for &(pid, raw) in &task_raws {
                 debug!(pid = pid.0, "enter:structop exit_task");
                 start_rbc(&mut s.sim);
+                let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
                 sim_callback!(s, s, sim_arc, cpu, {
                     self.scheduler.exit_task(TaskPtr::new(raw));
                 });
+                // TOP-5 of secondary TraceKind easy-win bundle: emit
+                // the per-task exit_task structop so the live-vs-sim
+                // diff harness validates fixture-shutdown handshake
+                // ordering matches.
+                s.sim
+                    .trace
+                    .record(__local_t, cpu, TraceKind::ExitTask { pid });
                 charge_sched_time(&mut s.sim, CpuId(0), "exit_task");
             }
         }
@@ -4457,10 +4492,17 @@ impl<S: Scheduler> Simulator<S> {
             set_ops_context(&mut s.sim, OpsContext::Enable);
             debug!(pid = pid.0, "enter:structop enable");
             start_rbc(&mut s.sim);
+            let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
             sim_callback!(s, guard, sim_arc, cpu, {
                 self.scheduler.enable(TaskPtr::new(raw));
             });
             let s = &mut *guard;
+            // TOP-5 of secondary TraceKind easy-win bundle: emit
+            // ops.enable so the live-vs-sim diff harness can validate
+            // the per-task one-shot enable handshake order matches.
+            s.sim
+                .trace
+                .record(__local_t, cpu, TraceKind::Enable { pid });
             charge_sched_time(&mut s.sim, cpu, "enable");
         }
 

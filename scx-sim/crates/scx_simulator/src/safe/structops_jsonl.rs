@@ -365,6 +365,194 @@ fn emit_event(event: &TraceEvent, writer: &mut impl Write) -> io::Result<()> {
             None,
         )?,
 
+        // ---- task-lifecycle structops (TOP-5: fixture-load determinism) -
+        TraceKind::InitTask { pid, rc } => {
+            // entry record carries the pid:
+            emit_line(
+                writer,
+                ts,
+                cpu,
+                pid.0,
+                "structop",
+                "init_task",
+                "entry",
+                &format!(r#""task_pid":{}"#, pid.0),
+                None,
+            )?;
+            // exit record carries the callback rc in `ret`:
+            emit_line(
+                writer,
+                ts,
+                cpu,
+                pid.0,
+                "structop",
+                "init_task",
+                "exit",
+                "",
+                Some(&rc.to_string()),
+            )?;
+        }
+        TraceKind::ExitTask { pid } => emit_line(
+            writer,
+            ts,
+            cpu,
+            pid.0,
+            "structop",
+            "exit_task",
+            "entry",
+            &format!(r#""task_pid":{}"#, pid.0),
+            None,
+        )?,
+        TraceKind::Enable { pid } => emit_line(
+            writer,
+            ts,
+            cpu,
+            pid.0,
+            "structop",
+            "enable",
+            "entry",
+            &format!(r#""task_pid":{}"#, pid.0),
+            None,
+        )?,
+
+        // ---- task affinity structop (TOP-7: affinity parity) -----------
+        TraceKind::SetCpumask { pid, cpumask_hex } => emit_line(
+            writer,
+            ts,
+            cpu,
+            pid.0,
+            "structop",
+            "set_cpumask",
+            "entry",
+            &format!(r#""task_pid":{},"cpumask_hex":"{}""#, pid.0, cpumask_hex),
+            None,
+        )?,
+
+        // ---- BPF helpers (TOP-8: time/cgroup/cpu visibility) -----------
+        TraceKind::HelperNow { ret_ns } => {
+            emit_line(writer, ts, cpu, 0, "helper", "now", "entry", "", None)?;
+            emit_line(
+                writer,
+                ts,
+                cpu,
+                0,
+                "helper",
+                "now",
+                "exit",
+                "",
+                Some(&ret_ns.to_string()),
+            )?;
+        }
+        TraceKind::HelperTaskCgroup { pid, cgid } => {
+            emit_line(
+                writer,
+                ts,
+                cpu,
+                pid.0,
+                "helper",
+                "task_cgroup",
+                "entry",
+                &format!(r#""task_pid":{}"#, pid.0),
+                None,
+            )?;
+            emit_line(
+                writer,
+                ts,
+                cpu,
+                pid.0,
+                "helper",
+                "task_cgroup",
+                "exit",
+                "",
+                Some(&cgid.0.to_string()),
+            )?;
+        }
+        TraceKind::HelperTaskCpu { pid, ret_cpu } => {
+            emit_line(
+                writer,
+                ts,
+                cpu,
+                pid.0,
+                "helper",
+                "task_cpu",
+                "entry",
+                &format!(r#""task_pid":{}"#, pid.0),
+                None,
+            )?;
+            emit_line(
+                writer,
+                ts,
+                cpu,
+                pid.0,
+                "helper",
+                "task_cpu",
+                "exit",
+                "",
+                Some(&ret_cpu.0.to_string()),
+            )?;
+        }
+
+        // ---- BPF DSQ-creation helpers (TOP-9: DSQ-creation visibility) -
+        TraceKind::CreateDsq { dsq_id, node, rc } => {
+            emit_line(
+                writer,
+                ts,
+                cpu,
+                0,
+                "helper",
+                "create_dsq",
+                "entry",
+                &format!(r#""dsq_id":{},"node":{}"#, dsq_id.0, node),
+                None,
+            )?;
+            emit_line(
+                writer,
+                ts,
+                cpu,
+                0,
+                "helper",
+                "create_dsq",
+                "exit",
+                "",
+                Some(&rc.to_string()),
+            )?;
+        }
+        TraceKind::DestroyDsq { dsq_id } => emit_line(
+            writer,
+            ts,
+            cpu,
+            0,
+            "helper",
+            "destroy_dsq",
+            "entry",
+            &format!(r#""dsq_id":{}"#, dsq_id.0),
+            None,
+        )?,
+        TraceKind::DsqNrQueued { dsq_id, ret } => {
+            emit_line(
+                writer,
+                ts,
+                cpu,
+                0,
+                "helper",
+                "dsq_nr_queued",
+                "entry",
+                &format!(r#""dsq_id":{}"#, dsq_id.0),
+                None,
+            )?;
+            emit_line(
+                writer,
+                ts,
+                cpu,
+                0,
+                "helper",
+                "dsq_nr_queued",
+                "exit",
+                "",
+                Some(&ret.to_string()),
+            )?;
+        }
+
         // ---- engine-internal events: NOT structops/helpers, no JSONL ---
         // These exist in scxsim because the engine models them; bpftrace
         // can't see scxsim-internal state. Rather than fake an emit name,
@@ -656,6 +844,181 @@ mod tests {
         assert!(l[0].contains(r#""task_pid":7"#));
         assert!(l[0].contains(r#""from_cgid":1"#));
         assert!(l[0].contains(r#""to_cgid":11"#));
+    }
+
+    /// tg `bundle-implement-secondary-tracekind-easy-wins`:
+    /// confirm the 10 new TraceKind variants emit the expected JSONL
+    /// `(kind, name, phase)` tuples for the live-vs-sim diff harness.
+    /// Mirrors the `bundle_cpu_bw_easy_wins_emit_jsonl` test above —
+    /// one helper closure to extract `(name, phase)` matches, then
+    /// one assertion per variant.
+    #[test]
+    fn bundle_secondary_easy_wins_emit_jsonl() {
+        use crate::cgroup::CgroupId;
+
+        let mut trace = Trace::with_warmup(4, &[], 0);
+
+        // TOP-5 task-lifecycle:
+        trace.record(10, CpuId(0), TraceKind::InitTask { pid: Pid(7), rc: 0 });
+        trace.record(20, CpuId(0), TraceKind::ExitTask { pid: Pid(7) });
+        trace.record(30, CpuId(0), TraceKind::Enable { pid: Pid(7) });
+
+        // TOP-7 affinity:
+        trace.record(
+            40,
+            CpuId(1),
+            TraceKind::SetCpumask {
+                pid: Pid(7),
+                cpumask_hex: "0xf".to_string(),
+            },
+        );
+
+        // TOP-8 helpers:
+        trace.record(50, CpuId(2), TraceKind::HelperNow { ret_ns: 1_234_567 });
+        trace.record(
+            60,
+            CpuId(2),
+            TraceKind::HelperTaskCgroup {
+                pid: Pid(7),
+                cgid: CgroupId(11),
+            },
+        );
+        trace.record(
+            70,
+            CpuId(2),
+            TraceKind::HelperTaskCpu {
+                pid: Pid(7),
+                ret_cpu: CpuId(3),
+            },
+        );
+
+        // TOP-9 DSQ-creation helpers:
+        trace.record(
+            80,
+            CpuId(0),
+            TraceKind::CreateDsq {
+                dsq_id: DsqId(0x1100),
+                node: -1,
+                rc: 0,
+            },
+        );
+        trace.record(
+            90,
+            CpuId(0),
+            TraceKind::DestroyDsq {
+                dsq_id: DsqId(0x1100),
+            },
+        );
+        trace.record(
+            100,
+            CpuId(0),
+            TraceKind::DsqNrQueued {
+                dsq_id: DsqId(0x1100),
+                ret: 5,
+            },
+        );
+
+        let mut buf = Vec::new();
+        write_jsonl(&trace, &mut buf).expect("emit");
+        let text = String::from_utf8(buf).expect("utf8");
+        let lines: Vec<&str> = text.lines().collect();
+
+        let find = |name: &str, phase: &str| -> Vec<&str> {
+            let needle_name = format!(r#""name":"{name}""#);
+            let needle_phase = format!(r#""phase":"{phase}""#);
+            lines
+                .iter()
+                .filter(|l| l.contains(&needle_name) && l.contains(&needle_phase))
+                .copied()
+                .collect()
+        };
+
+        // TOP-5 init_task entry+exit (rc carried in `ret`).
+        let l = find("init_task", "entry");
+        assert_eq!(l.len(), 1);
+        assert!(l[0].contains(r#""task_pid":7"#));
+        let l = find("init_task", "exit");
+        assert_eq!(l.len(), 1);
+        assert!(l[0].contains(r#""ret":0"#));
+
+        // TOP-5 exit_task entry-only.
+        let l = find("exit_task", "entry");
+        assert_eq!(l.len(), 1);
+        assert!(l[0].contains(r#""task_pid":7"#));
+
+        // TOP-5 enable entry-only.
+        let l = find("enable", "entry");
+        assert_eq!(l.len(), 1);
+        assert!(l[0].contains(r#""task_pid":7"#));
+
+        // TOP-7 set_cpumask carries a stable hex string.
+        let l = find("set_cpumask", "entry");
+        assert_eq!(l.len(), 1);
+        assert!(l[0].contains(r#""task_pid":7"#));
+        assert!(l[0].contains(r#""cpumask_hex":"0xf""#));
+
+        // TOP-8 helpers — all three emit entry+exit (the rc / ret value
+        // is the cpu-bw-stall-bug-relevant payload).
+        let l = find("now", "entry");
+        assert_eq!(l.len(), 1);
+        let l = find("now", "exit");
+        assert_eq!(l.len(), 1);
+        assert!(l[0].contains(r#""ret":1234567"#));
+
+        let l = find("task_cgroup", "entry");
+        assert_eq!(l.len(), 1);
+        assert!(l[0].contains(r#""task_pid":7"#));
+        let l = find("task_cgroup", "exit");
+        assert_eq!(l.len(), 1);
+        assert!(l[0].contains(r#""ret":11"#));
+
+        let l = find("task_cpu", "entry");
+        assert_eq!(l.len(), 1);
+        let l = find("task_cpu", "exit");
+        assert_eq!(l.len(), 1);
+        assert!(l[0].contains(r#""ret":3"#));
+
+        // TOP-9 DSQ-creation helpers.
+        let l = find("create_dsq", "entry");
+        assert_eq!(l.len(), 1);
+        assert!(l[0].contains(r#""dsq_id":4352"#)); // 0x1100
+        assert!(l[0].contains(r#""node":-1"#));
+        let l = find("create_dsq", "exit");
+        assert_eq!(l.len(), 1);
+        assert!(l[0].contains(r#""ret":0"#));
+
+        let l = find("destroy_dsq", "entry");
+        assert_eq!(l.len(), 1);
+        assert!(l[0].contains(r#""dsq_id":4352"#));
+
+        let l = find("dsq_nr_queued", "entry");
+        assert_eq!(l.len(), 1);
+        let l = find("dsq_nr_queued", "exit");
+        assert_eq!(l.len(), 1);
+        assert!(l[0].contains(r#""ret":5"#));
+
+        // Schema sanity: every line round-trips through serde_json.
+        for line in &lines {
+            let v: serde_json::Value = serde_json::from_str(line).expect("valid JSON");
+            assert!(v.get("ts_ns").is_some());
+        }
+    }
+
+    /// tg `bundle-implement-secondary-tracekind-easy-wins`: smoke-test
+    /// the cpumask_to_hex helper, which is the new piece that does NOT
+    /// have a paired live counterpart and so isn't covered by the
+    /// JSONL-emit tests above.
+    #[test]
+    fn cpumask_to_hex_renders_lsb_cpu_zero() {
+        use crate::ffi::cpumask_to_hex;
+        // NULL cpumask → "0x0".
+        assert_eq!(cpumask_to_hex(std::ptr::null(), 4), "0x0");
+        // nr_cpus == 0 → "0x0".
+        assert_eq!(cpumask_to_hex(0xdead_beef as *const _, 0), "0x0");
+        // Note: passing a real mask is the responsibility of an
+        // integration test (it requires a live `bpf_cpumask` set up by
+        // the C-side); the JSONL-emit assertion above covers the round
+        // trip via a SetCpumask record with a hand-crafted hex string.
     }
 
     /// SelectTaskRq emits BOTH entry and exit records, with the
