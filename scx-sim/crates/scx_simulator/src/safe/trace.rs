@@ -353,6 +353,34 @@ pub enum TraceKind {
         pid: Pid,
         cgid: crate::cgroup::CgroupId,
     },
+    /// LAVD bailed `pid` inside `lavd_enqueue` because
+    /// `cgroup_throttled() == -EAGAIN`. The task was put aside in the
+    /// cgroup_bw library's BTQ (`scx_cgroup_bw_put_aside`) and never
+    /// reached `scx_bpf_dsq_insert*`. V1's `CgroupBwDequeueOnThrottle`
+    /// is the engine-side admission-gate equivalent (rarely fires on
+    /// bug1_canonical+lavd because LAVD bails earlier — V1's REPORT
+    /// documents this).
+    ///
+    /// Captured by the `scxsim_cgroup_bw_observe_put_aside` hook
+    /// installed by the wrapper.c `scx_cgroup_bw_put_aside` macro
+    /// AFTER the lib call returns 0. tg
+    /// `scxsim-eager-throttle-v2-track-lavd-bail-path`.
+    LavdBailOnCgroupThrottle {
+        pid: Pid,
+        cgid: crate::cgroup::CgroupId,
+    },
+    /// LAVD's lib drained `pid` from a per-LLC BTQ on cgroup_bw replenish
+    /// and re-enqueued it via the registered `lavd_enqueue_cb` →
+    /// `enqueue_cb` → `scx_bpf_dsq_insert_vtime` chain. Counter-event
+    /// to `LavdBailOnCgroupThrottle`.
+    ///
+    /// Captured by the `scxsim_cgroup_bw_observe_reenqueue` hook
+    /// installed by the wrapper.c `scx_cgroup_bw_reenqueue` macro
+    /// (per-cgroup, not per-task — the lib's drain is batched).
+    /// tg `scxsim-eager-throttle-v2-track-lavd-bail-path`.
+    LavdReenqueueViaBtqDrain {
+        cgid: crate::cgroup::CgroupId,
+    },
     /// The compiled-in `scx/lib/cgroup_bw.bpf.c` library performed a
     /// per-cgroup replenishment. Captures the smoking-gun fields the
     /// library computes inside `cbw_replenish_cgroup` (the bug's CAUSE
@@ -1062,6 +1090,12 @@ impl Trace {
                 }
                 TraceKind::CgroupBwReenqueueOnReplenish { pid, cgid } => {
                     format!("CG_BW_REENQ_RPL pid={} cgid={}", pid.0, cgid.0)
+                }
+                TraceKind::LavdBailOnCgroupThrottle { pid, cgid } => {
+                    format!("LAVD_BAIL_CGT pid={} cgid={}", pid.0, cgid.0)
+                }
+                TraceKind::LavdReenqueueViaBtqDrain { cgid } => {
+                    format!("LAVD_REENQ_BTQ cgid={}", cgid.0)
                 }
                 TraceKind::CgroupBwReplenish {
                     cgid,
