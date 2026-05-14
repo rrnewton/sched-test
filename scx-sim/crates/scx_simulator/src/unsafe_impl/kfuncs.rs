@@ -1629,6 +1629,91 @@ define_cgroup_bw_yield!(
 define_cgroup_bw_yield!(scxsim_cgroup_bw_yield_move, "cgroup_bw_move");
 define_cgroup_bw_yield!(scxsim_cgroup_bw_yield_dump, "cgroup_bw_dump");
 
+/// V2 observer for `LavdBailOnCgroupThrottle`. Called from
+/// wrapper.c's `scx_cgroup_bw_put_aside` macro AFTER the lib call
+/// returns 0 (i.e. successful put-aside). Records a trace event so
+/// downstream tools can count LAVD-side bail events that V1's
+/// engine-side admission gate doesn't observe.
+///
+/// Safe to call without a SIM_ARC: silently no-ops if there is no
+/// active simulation (matches the pattern of the yield hooks above).
+///
+/// tg `scxsim-eager-throttle-v2-track-lavd-bail-path`.
+#[no_mangle]
+pub extern "C" fn scxsim_cgroup_bw_observe_put_aside(pid: i32, cgid: u64) {
+    if !SIM_ARC.with(|c| c.borrow().is_some()) {
+        return;
+    }
+    use crate::trace::TraceKind;
+    use crate::types::{CpuId, Pid};
+    let arc = match SIM_ARC.with(|c| c.borrow().clone()) {
+        Some(a) => a,
+        None => return,
+    };
+    let cpu = current_cpu_from_tls();
+    let mut guard = arc.lock().unwrap();
+    let s = &mut *guard;
+    let local_t = s.sim.cpus[cpu.0 as usize].local_clock;
+    s.sim.trace.record(
+        local_t,
+        cpu,
+        TraceKind::LavdBailOnCgroupThrottle {
+            pid: Pid(pid),
+            cgid: crate::cgroup::CgroupId(cgid),
+        },
+    );
+    // Maintain bw_blocked tracking for parity with V1's engine-side
+    // bw_blocked map. V2 does NOT push redundant TaskWake events on
+    // replenish — the lib already drives reenqueue via cbw_drain_btq_batch
+    // → scx_cgroup_bw_enqueue_cb → lavd_enqueue_cb → enqueue_cb →
+    // scx_bpf_dsq_insert_vtime. Adding an engine-side wake here would
+    // duplicate the lib's drain (a fake-approximation violation per
+    // scx-sim/CLAUDE.md "Don't Model the Scheduler — Model the Kernel").
+    s.sim
+        .bw_blocked
+        .entry(crate::cgroup::CgroupId(cgid))
+        .or_default()
+        .push_back(Pid(pid));
+    let _ = CpuId(0);
+}
+
+/// V2 observer for `LavdReenqueueViaBtqDrain`. Called from wrapper.c's
+/// `scx_cgroup_bw_reenqueue` macro AFTER the lib's drain runs.
+/// Records a trace event for each cgroup whose BTQ was drained.
+///
+/// Per-cgroup (not per-task) because the lib's drain pops up to
+/// CBW_REENQ_MAX_BATCH tasks in one call and we don't have visibility
+/// into per-task pop events without instrumenting deeper.
+///
+/// tg `scxsim-eager-throttle-v2-track-lavd-bail-path`.
+#[no_mangle]
+pub extern "C" fn scxsim_cgroup_bw_observe_reenqueue(cgid: u64) {
+    if !SIM_ARC.with(|c| c.borrow().is_some()) {
+        return;
+    }
+    use crate::trace::TraceKind;
+    let arc = match SIM_ARC.with(|c| c.borrow().clone()) {
+        Some(a) => a,
+        None => return,
+    };
+    let cpu = current_cpu_from_tls();
+    let mut guard = arc.lock().unwrap();
+    let s = &mut *guard;
+    let local_t = s.sim.cpus[cpu.0 as usize].local_clock;
+    s.sim.trace.record(
+        local_t,
+        cpu,
+        TraceKind::LavdReenqueueViaBtqDrain {
+            cgid: crate::cgroup::CgroupId(cgid),
+        },
+    );
+    // Drain the engine-side bw_blocked tracking for this cgroup. The
+    // lib's reenqueue is per-cgroup (not per-task), so we drain the
+    // entire vec for this cgid. The `bw_blocked` map is now purely an
+    // observability counter — no wake injected.
+    s.sim.bw_blocked.remove(&crate::cgroup::CgroupId(cgid));
+}
+
 #[no_mangle]
 pub extern "C" fn scxsim_cgroup_bw_begin_interleaved_timer(slot_out: *mut u32) -> i32 {
     if slot_out.is_null() {
