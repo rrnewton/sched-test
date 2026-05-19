@@ -8,6 +8,7 @@ on:
       - 'scx-sim/**'
       - 'lib/scxtest/**'
       - 'scheds/**'
+      - '.github/workflows/simulator.yml'
   pull_request:
     branches:
       - '**'
@@ -15,6 +16,7 @@ on:
       - 'scx-sim/**'
       - 'lib/scxtest/**'
       - 'scheds/**'
+      - '.github/workflows/simulator.yml'
 
 permissions:
   contents: read
@@ -26,6 +28,26 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+
+      - name: Free up disk space on runner
+        # The ubuntu-latest runner ships with ~15-20 GiB of pre-installed
+        # tooling (Android SDK, .NET, Haskell, etc.) that this workflow
+        # doesn't use. Cargo's incremental build + the e9patch cache
+        # routinely push the runner past its disk ceiling during link
+        # ("No space left on device" — observed 2026-05-19 on
+        # simulator.v6 / agent/cgroup-bw-real-phase2-rootcause). Clearing
+        # the unused tooling buys ~10 GiB of headroom.
+        run: |
+          df -h /
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /opt/hostedtoolcache/Java_Temurin-Hotspot_jdk || true
+          sudo apt-get autoremove -y || true
+          sudo apt-get clean || true
+          df -h /
 
       - name: Install dependencies
         run: |
