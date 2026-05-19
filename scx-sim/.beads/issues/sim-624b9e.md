@@ -1,6 +1,6 @@
 ---
 title: 'bug1_canonical CI failure root cause (V4-C-confirmed: NOT clang ABI; NEW: engine→library disconnect on Ubuntu 24.04 runner)'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 labels:
@@ -8,7 +8,8 @@ labels:
 - cgroup-bw
 - cpu-bw-stall-bug
 created_at: 2026-05-14T02:38:40.620846939+00:00
-updated_at: 2026-05-14T02:38:40.620846939+00:00
+updated_at: 2026-05-19T16:08:43.683345776+00:00
+closed_at: 2026-05-19T16:08:43.683345476+00:00
 ---
 
 # Description
