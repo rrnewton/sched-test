@@ -175,27 +175,34 @@ fn parse_token_after(line: &str, key: &str) -> Option<String> {
 //   drain bails → no pick. Post-V4-C: is_throttled clears correctly,
 //   nr_throttled_tasks reflects only legitimate quota enforcement.
 //
-// CI-IGNORED (TODO sim-624b9e): On the GitHub Actions Ubuntu 24.04
-// runner this test STILL fails post-V4-C — fingerprint
-// `{is_throttled:0, nr_throttled_periods:'0/6', nr_throttled_tasks:0}`
-// — because the cgroup_bw library's `nr_throttled_periods` counter
-// stays at 0/6 (library never throttles). V4-A's instrumentation
-// confirmed the engine IS calling `scx_cgroup_bw_consume(cgid, ~100M)`
-// every period on CI; the library is failing to translate those
-// charges into the `runtime_total_sloppy` accumulator and therefore
-// never crosses period_budget. Same root cause as the V4-A consume_ns
-// tests in `bug1_canonical_consume_ns_bound.rs` (gated below).
-// Tracked under mb sim-624b9e (Phase 2 — clang/llvm version + percpu-
-// array codegen suspect). The assertion `nr_throttled_periods >= 4`
-// is the trip-wire here.
+// Previously gated `#[ignore]` under mb sim-624b9e: on the GitHub Actions
+// Ubuntu 24.04 runner this test FAILED post-V4-C with fingerprint
+// `{is_throttled:0, nr_throttled_periods:'0/6', nr_throttled_tasks:0}` —
+// `runtime_total_sloppy=0` end-of-run despite the engine calling
+// `scx_cgroup_bw_consume(cgid, ~100M)` every period.
+//
+// Phase 2 ROOT CAUSE (2026-05-19, Phase 2 task
+// `phase2-rootcause-engine-library-handshake-percpu-codegen-ubuntu2404`):
+// `struct cgroup_llc_id { u64 cgrp_id; int llc_id; }` has 4 bytes of
+// trailing padding (sizeof = 16). clang 18 -O2 (Ubuntu 24.04 default)
+// leaves those padding bytes UNINITIALIZED for stack-local designated-
+// initializer construction; clang 22+ zeroes them. scxsim's
+// `scx_test_map_lookup_elem` uses `memcmp` over the full `key_size = 16`,
+// so on clang 18 the post-insert padding garbage in `cbw_alloc_llc_ctx`
+// differs from the post-lookup padding garbage in `cbw_get_llc_ctx_with_id`
+// → memcmp never matches → `cbw_get_llc_ctx` returns NULL →
+// `scx_cgroup_bw_consume` silently returns 0 without accumulating into
+// `llcx->runtime_total` → `runtime_total_sloppy` stays 0 → library never
+// throttles.
+//
+// FIX: `schedulers/lavd/wrapper.c::lavd_register_cbw_maps` overrides
+// `cbw_cgrp_llc_test_map.key_size` from 16 down to 12 (cgrp_id + llc_id
+// fields only), so `memcmp` ignores the uninit padding regardless of
+// compiler version. Verified with bundled clang 18.1.8 reproducer:
+// `experiments/phase2_engine_library_handshake_root_cause_20260519/REPORT.md`.
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "CI-only failure on Ubuntu 24.04 runner; library never throttles \
-            because engine→library handshake is broken (engine sends consume, \
-            library doesn't accumulate runtime). See mb sim-624b9e (Phase 2 \
-            root-cause investigation). Run with `cargo test -- --ignored` for \
-            local validation."]
 fn test_bug1_canonical_subprocess_reproduces_throttle() {
     let _lock = common::setup_test();
 

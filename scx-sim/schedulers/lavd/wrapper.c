@@ -1534,8 +1534,48 @@ static void lavd_register_cbw_maps(void)
 	cbw_cgrp_test_map.max_entries = 2048; /* CBW_NR_CGRP_MAX from cgroup_bw.bpf.c */
 	scx_test_map_register(&cbw_cgrp_test_map, &cbw_cgrp_map);
 
-	/* HASH: keyed by cgroup_llc_id, value = scx_cgroup_llc_ctx. */
+	/* HASH: keyed by cgroup_llc_id, value = scx_cgroup_llc_ctx.
+	 *
+	 * mb sim-624b9e ROOT CAUSE (Phase 2 root-cause, 2026-05-19):
+	 * `struct cgroup_llc_id { u64 cgrp_id; int llc_id; }` has
+	 * sizeof = 16 (12 useful bytes + 4 trailing PADDING bytes).
+	 * The library initializes the key on the stack at two distinct
+	 * sites (lib/cgroup_bw.bpf.c:606 cbw_alloc_llc_ctx INSERT and
+	 * :634 cbw_get_llc_ctx_with_id LOOKUP) using designated
+	 * initializers:
+	 *
+	 *     struct cgroup_llc_id key = { .cgrp_id = X, .llc_id = Y };
+	 *
+	 * Per C standard (and DR 451), padding-byte values are
+	 * IMPLEMENTATION-DEFINED for partial-init aggregates. clang 18
+	 * (Ubuntu 24.04 default) leaves padding UNINITIALIZED at -O2
+	 * (verified by direct codegen test: cgroup_llc_id padding
+	 * byte[12] = 0xa0 from prior stack garbage). clang 22+
+	 * (devserver toolchains) ZEROES the padding. Production BPF is
+	 * unaffected because the verifier enforces zero-initialized
+	 * keys, so this is a userspace-shim-only divergence.
+	 *
+	 * scxsim's scx_test_map uses memcmp(stored_key, lookup_key,
+	 * key_size) to find entries. On clang 18 the padding bytes
+	 * differ between insert-time and lookup-time stack frames →
+	 * memcmp never matches → cbw_get_llc_ctx returns NULL →
+	 * scx_cgroup_bw_consume silently no-ops (returns 0 at
+	 * lib/cgroup_bw.bpf.c:1530) → runtime_total stays 0 →
+	 * runtime_total_sloppy stays 0 → cgroup never throttles.
+	 *
+	 * FIX: shrink key_size from sizeof(struct cgroup_llc_id) = 16
+	 * down to the 12 meaningful bytes (cgrp_id + llc_id). memcmp
+	 * then ignores the 4 padding bytes regardless of compiler
+	 * version. Production BPF behavior unchanged (BPF maps are
+	 * indexed by hash; this is a scxsim-only memcmp path).
+	 *
+	 * Regression test: tests/cgroup_llc_id_padding_codegen.rs
+	 * proves the padding-uninit behavior in clang 18 vs 22 and
+	 * verifies the fix. */
 	INIT_SCX_TEST_MAP(&cbw_cgrp_llc_test_map, cbw_cgrp_llc_map);
+	cbw_cgrp_llc_test_map.key_size =
+		sizeof(((struct cgroup_llc_id *)0)->cgrp_id) +
+		sizeof(((struct cgroup_llc_id *)0)->llc_id);
 	scx_test_map_register(&cbw_cgrp_llc_test_map, &cbw_cgrp_llc_map);
 
 	/* PERCPU_ARRAY tree_levels_map: keyed by u32, value = struct tree_levels.

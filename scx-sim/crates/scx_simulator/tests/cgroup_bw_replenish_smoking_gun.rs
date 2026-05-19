@@ -219,21 +219,16 @@ fn test_cgroup_bw_replenish_events_fire_under_lavd_with_cpu_bw() {
 /// either the V4-C fix is incomplete or a new over-charge path was
 /// added).
 ///
-/// CI-IGNORED (TODO sim-624b9e): On the GitHub Actions Ubuntu 24.04
-/// runner this test fails with "no keep_throttled=true at all"
-/// (`{2: [(false, 0, 10000000)]}` — single replenish observation,
-/// never throttled). Same root cause as the `bug1_canonical_subprocess`
-/// (PR #40) and V4-A `consume_ns` tests: on CI the cgroup_bw library
-/// doesn't accumulate runtime even though the engine charges every
-/// period. Engine→library handshake is broken on the CI runner; likely
-/// a clang/llvm codegen difference around the `runtime_total_sloppy`
-/// percpu accumulator path. Tracked under mb sim-624b9e (Phase 2).
+/// Previously gated under mb sim-624b9e. Phase 2 root-cause
+/// investigation (2026-05-19) identified the real cause: clang 18 -O2
+/// (Ubuntu 24.04 default) leaves `struct cgroup_llc_id` padding bytes
+/// UNINITIALIZED for stack-local designated initializers, breaking the
+/// memcmp-based `cbw_cgrp_llc_map` lookup → `runtime_total_sloppy`
+/// stays 0 → cgroup never throttles. Fix in
+/// `schedulers/lavd/wrapper.c::lavd_register_cbw_maps` (key_size
+/// override). See
+/// `experiments/phase2_engine_library_handshake_root_cause_20260519/REPORT.md`.
 #[test]
-#[ignore = "CI-only failure on Ubuntu 24.04 runner; cgroup_bw library never \
-            throttles because engine→library handshake is broken (engine \
-            sends consume, library doesn't accumulate runtime). See mb \
-            sim-624b9e (Phase 2 root-cause investigation). Run with `cargo \
-            test -- --ignored` for local validation."]
 fn test_cgroup_bw_replenish_smoking_gun_fires_on_h6_cell_c() {
     let _lock = common::setup_test();
     let sched = DynamicScheduler::lavd(4);

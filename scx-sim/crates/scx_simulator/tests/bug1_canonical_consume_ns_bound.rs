@@ -162,24 +162,16 @@ fn aggregate_consume_per_period(trace: &Trace) -> BTreeMap<u64, BTreeMap<u64, u6
 /// per-period bounds intrinsically loose; the average captures the
 /// fundamental V4-C property).
 ///
-/// CI-IGNORED (TODO sim-624b9e): This V4-A instrumentation test, like
-/// `test_bug1_canonical_subprocess_reproduces_throttle` in
-/// `bug1_canonical_repro.rs`, FAILS on the GitHub Actions Ubuntu 24.04
-/// runner but PASSES locally. PR #45's CI signal showed avg consume
-/// ~100M ns/period (the pre-V4-C over-charge value) — meaning V4-C's
-/// engine fix is NOT effective on the CI runner, even though it works
-/// locally. Same root cause as Phase 1 (CI environment divergence,
-/// likely clang/llvm version producing different `.so` codegen for the
-/// engine→library cgroup-attribution path). Phase 2 root-cause work is
-/// tracked under mb sim-624b9e; until that lands, this test is gated
-/// behind `#[ignore]` so the V4-C cascade can land. Run with
-/// `cargo test -- --ignored test_bug1_canonical_consume_ns` for local
-/// validation.
+/// Previously gated `#[ignore]` under mb sim-624b9e (CI-only Ubuntu 24.04
+/// failure). Phase 2 root-cause investigation (2026-05-19) identified the
+/// real cause: clang 18 -O2 leaves `struct cgroup_llc_id` padding bytes
+/// UNINITIALIZED for stack-local designated initializers, breaking the
+/// memcmp-based `cbw_cgrp_llc_map` lookup → engine `scx_cgroup_bw_consume`
+/// silently no-ops → `runtime_total_sloppy` stays 0 → cgroup never throttles.
+/// Fix in `schedulers/lavd/wrapper.c::lavd_register_cbw_maps` (key_size
+/// override skipping trailing padding). See
+/// `experiments/phase2_engine_library_handshake_root_cause_20260519/REPORT.md`.
 #[test]
-#[ignore = "CI-only failure on Ubuntu 24.04 runner; V4-C engine fix not \
-            effective in CI environment. See mb sim-624b9e (Phase 2 \
-            root-cause investigation). Run with `cargo test -- --ignored` \
-            for local validation."]
 fn test_bug1_canonical_consume_ns_bound() {
     let _lock = common::setup_test();
     let sched = DynamicScheduler::lavd(4);
@@ -252,16 +244,10 @@ fn test_bug1_canonical_consume_ns_bound() {
 /// catches the pre-V4-C bug-shape directly: if EVERY period has
 /// non-zero consume, the engine is still charging during STALL.
 ///
-/// CI-IGNORED (TODO sim-624b9e): same CI-environment divergence as
-/// `test_bug1_canonical_consume_ns_bound` above. PR #45 CI showed all
-/// 6 periods non-zero with ~100M ns/period (the pre-V4-C bug shape
-/// returning on Ubuntu 24.04 runner only). Tracked under mb
-/// sim-624b9e Phase 2.
+/// Previously gated under mb sim-624b9e. Root cause (Phase 2,
+/// 2026-05-19) is the same `struct cgroup_llc_id` padding-byte uninit
+/// issue under clang 18 — see test 1's comment + the wrapper.c fix.
 #[test]
-#[ignore = "CI-only failure on Ubuntu 24.04 runner; V4-C engine fix not \
-            effective in CI environment. See mb sim-624b9e (Phase 2 \
-            root-cause investigation). Run with `cargo test -- --ignored` \
-            for local validation."]
 fn test_bug1_canonical_consume_ns_zero_during_stall() {
     let _lock = common::setup_test();
     let sched = DynamicScheduler::lavd(4);
