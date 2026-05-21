@@ -1,7 +1,8 @@
 # Output Formats
 
-> **Status — stub.** This page will fully document each output sink
-> with sample fragments.
+Summary of every artefact scxsim can emit. For sample fragments and
+end-to-end recipes per sink, see
+[Running Simulations → Trace Output](../running-simulations/trace-output.md).
 
 | Sink | Flag / mechanism | Format |
 |---|---|---|

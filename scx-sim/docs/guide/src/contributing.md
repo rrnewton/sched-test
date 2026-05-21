@@ -29,21 +29,23 @@ scx-sim/docs/guide/
     └── architecture.md / architecture/*.md
 ```
 
-## Filling in stubs
+## Editing existing chapters
 
-Every stub page is marked with a `> **Status — stub.**` block. The
-plan is to fill them in incrementally:
+The initial guide content is in place; ongoing changes should preserve
+the same style:
 
-1. **High-value, low-volatility first.** Exit codes, output formats,
-   and the rt-app workload schema are stable; the CLI flag list and
-   recipe details change more often.
-2. **Generate where possible.** A future improvement generates the
+1. **Generate where possible.** A future improvement generates the
    CLI reference from `--help` output at build time, and generates
    the exit-code table from the `ExitKind` enum in `safe/types.rs`.
-   Hand-writing those tables is intentionally a stop-gap.
-3. **Cite source.** Every concrete claim in a chapter should link
-   either to a source file or to a worked-example fixture under
-   `tests/fixtures/` or `examples/`.
+   Hand-writing those tables is intentionally a stop-gap; if you
+   touch them, prefer adding the generator over re-hand-editing.
+2. **Cite source.** Every concrete claim in a chapter should link
+   either to a source file (pinned to `simulator.v6`) or to a
+   worked-example fixture under `tests/fixtures/` or `examples/`.
+3. **Keep examples runnable.** If you change a CLI flag default or
+   rename a workload, update every chapter that quotes it. The
+   `make test-examples` gate (see below) catches workload breakage but
+   not stale flag text.
 
 ## Style
 

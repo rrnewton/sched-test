@@ -1,6 +1,6 @@
 # Glossary
 
-> **Status — stub.** Single-line definitions of recurring terms.
+Single-line definitions of recurring terms.
 
 | Term | Definition |
 |---|---|
