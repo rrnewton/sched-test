@@ -1,22 +1,177 @@
 # Determinism and Seeds
 
-> **Status — stub.** This page will cover the determinism guarantees
-> (and intentional non-guarantees) and how to harden a reproducer.
+scxsim's headline guarantee is that two runs of the same workload
+under the same configuration produce byte-identical output. This
+page is the precise statement of that guarantee, the knobs that
+control it, and the verification path.
 
-Planned content:
+## The contract
 
-- The contract: **same workload + same `--seed` + same scheduler `.so`
-  + same scxsim revision ⇒ byte-identical trace.**
-- The `--seed` flag (`u32` integer, or the literal `entropy` for OS
-  randomness; falls back to env `SCX_SIM_SEED`, then to `42`).
-- The `--fixed-priority` flag (insertion-order tiebreak instead of
-  PRNG-randomized; used to detect ordering-dependent bugs).
-- `--no-noise`, `--no-overhead`, `--no-rbc`, `--rbc-ns` — knobs that
-  trade realism for determinism granularity.
-- `--determinism-check` — runs twice and compares the checkpoint
-  sequences; the canonical CI-side check.
-- Why ASLR is disabled and the process re-execs (`--no-disable-aslr`
-  to opt out); rationale: stable `.so` base addresses for
-  deterministic replay.
-- Record/replay: capture preemption sites with
-  `--record-preemptions PATH` and re-run with `scxsim replay`.
+> **Same workload + same `--seed` + same scheduler `.so` + same
+> scxsim revision ⇒ byte-identical trace.**
+
+"Byte-identical" applies to:
+
+- the stderr summary block,
+- the `--perfetto` output (JSON or protobuf),
+- the `--structops-jsonl` output,
+- the `--record-preemptions` output,
+- the verbose-summary block.
+
+It does **not** apply to:
+
+- wallclock-derived metadata (e.g. file timestamps),
+- log lines printed before the simulator's own re-exec (the
+  pre-re-exec lines come from a non-deterministic Rust startup path
+  and are filtered out of the diff harness),
+- traces captured under stress-mode flags with `--seed entropy` (by
+  design — see [Twin Design Principles](./twin-design-principles.md)).
+
+## The `--seed` flag
+
+```text
+--seed <SEED>
+    PRNG seed (u32 integer or "entropy" for OS randomness).
+    Falls back to SCX_SIM_SEED env var, then default (42).
+```
+
+The seed feeds three sources of randomness:
+
+1. **Tick jitter.** Small offsets on per-CPU scheduling-tick
+   timestamps (suppressed by `--no-noise`).
+2. **Context-switch overhead noise.** Per-switch noise on top of
+   the structop RBC cost (suppressed by `--no-overhead`).
+3. **Event tiebreaking.** When two events have the same simulated
+   timestamp, default behaviour PRNG-randomizes their order. This is
+   how rare ordering-dependent bugs become statistically discoverable
+   across seed sweeps. Override with `--fixed-priority` (use
+   insertion order instead).
+
+Default seed is `42` if neither `--seed` nor `SCX_SIM_SEED` is set.
+
+## Knobs that affect what is deterministic
+
+| Flag | Effect on the trace |
+|---|---|
+| `--seed N` | Pin the PRNG. Re-runs are byte-identical. |
+| `--seed entropy` | OS randomness. Re-runs *intentionally* differ; used for fuzzing across seeds. |
+| `--fixed-priority` | Insertion-order tiebreaking. Removes one degree of nondeterminism but masks ordering bugs the PRNG would expose. Avoid except for ground-truth tracing. |
+| `--no-noise` | Remove tick jitter. |
+| `--no-overhead` | Remove context-switch-overhead noise. |
+| `--no-rbc` / `--rbc-ns 0` | Disable PMU-derived scheduler overhead. Equivalent to "the scheduler is instantaneous." |
+| `--rbc-ns N` | Set ns charged per retired conditional branch (default `10`). Higher = heavier scheduler. |
+
+The strict-determinism upper bound — used by tests that want zero
+variance — is:
+
+```bash
+scxsim run -s lavd --seed 42 --no-noise --no-overhead --rbc-ns 0 ...
+```
+
+## `--determinism-check`
+
+The single-line CI gate:
+
+```bash
+scxsim run --scheduler lavd --cpus 4 --duration 50ms --seed 42 \
+    --determinism-check examples/hello.json
+```
+
+Last line on success:
+
+```text
+Determinism check PASSED: 22 checkpoints matched
+```
+
+`--determinism-check` runs the simulation twice internally with the
+same seed, enables an aggressive checkpoint mode that records
+deterministic state at every scheduling event, and compares the
+checkpoint sequences from both runs. On divergence it exits non-zero
+with a report of the first checkpoint that differs.
+
+The 22-checkpoint count above is workload-dependent (hello.json is
+small). The `cpu_bound` workload, for example, produces ~355
+checkpoints across a 100 ms simulation. Number of checkpoints does
+not matter; the success line is what CI matches.
+
+## ASLR and re-execution
+
+The first thing scxsim does is print:
+
+```text
+scxsim: disabling ASLR and re-executing...
+```
+
+and re-exec itself with `personality(ADDR_NO_RANDOMIZE)`. This makes
+`.so` base addresses stable across runs, which is a requirement for
+deterministic replay (`scxsim replay`) and for the `bin_cache`
+regression-bisect workflow.
+
+Opt out with `--no-disable-aslr` when wrapping scxsim in a script
+that itself sets process attributes you don't want clobbered — at the
+cost of losing the determinism guarantee for replay.
+
+## Record / replay
+
+For the strongest form of determinism — across machines, across
+debugger sessions, across re-runs of the same `.so` binary — capture
+preemption sites once and replay them:
+
+```bash
+# Capture
+scxsim run -s lavd --cpus 4 --duration 200ms \
+    --record-preemptions /tmp/preempts.txt \
+    examples/cpu_bound.json
+
+# Replay (later, possibly on another machine with the same .so)
+scxsim replay /tmp/preempts.txt
+```
+
+The preemption trace is a small text file with a metadata header
+followed by one line per recorded preemption point. The header
+captures the seed, the workload, the scheduler `.so` path, and a
+hash of the `.so` so that mismatches are caught at load time:
+
+```text
+# scxsim preemption trace
+# workers: 4
+# break_on: rbc
+# total: 0
+# nr_cpus: 4
+# nr_tasks: 1
+# seed: 42
+# duration_ns: 30000000
+# scheduler: lavd
+# so_hash: 0xa4f5c653d5aed108
+# so_path: /.../scx-sim/target/release/build/scx_simulator-.../out/schedulers/libscx_lavd.so
+```
+
+See [Running Simulations → Replaying Preemption Traces](../running-simulations/replay.md)
+for the full file format.
+
+## What is *not* deterministic
+
+By design:
+
+- **`--seed entropy`** — uses OS randomness. Re-runs differ.
+- **`vm-run` outputs** — driven by a real kernel; subject to real
+  wallclock jitter, ASLR, real interrupts.
+- **Wallclock metadata.** Trace files have a creation time; the
+  events inside are deterministic but the file's mtime is not.
+
+By bug:
+
+- Any divergence under fixed `--seed`, fixed `.so`, fixed scxsim
+  revision is a bug, and `--determinism-check` is the standing CI
+  gate that catches it.
+
+## Verifying a reproducer
+
+The hardening checklist for "is my Bug-1 reproducer deterministic?":
+
+1. Pin everything: `--seed 42 --scheduler-file /path/to/specific.so
+   --config repro.toml`.
+2. `--determinism-check`. Must PASS.
+3. Two-runs diff: see [Recipes → Verifying Determinism](../recipes/verify-determinism.md).
+4. Cross-machine: capture `--record-preemptions /tmp/p.txt` and have
+   a teammate `scxsim replay /tmp/p.txt` on their machine.
