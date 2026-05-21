@@ -1,3 +1,9 @@
+// Copyright (c) Meta Platforms, Inc. and affiliates.
+// All rights reserved.
+//
+// This source code is licensed under the BSD-style license found in the
+// LICENSE file in the root directory of this source tree.
+
 //! Benchmarking utilities for the scheduler testing framework
 //!
 //! This module provides utilities for benchmarking workloads and measuring
