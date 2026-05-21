@@ -1,8 +1,8 @@
 load("@fbsource//tools/build_defs:rust_binary.bzl", "rust_binary")
 load("@fbsource//tools/build_defs:rust_library.bzl", "rust_library")
-​​​
+
 oncall("sched_ext")
-​​​
+
 # Single-crate approach: matches Cargo's structure exactly
 rust_library(
     name = "schtest_lib",
@@ -27,7 +27,7 @@ rust_library(
         "fbsource//third-party/rust:term_size",
     ],
 )
-​​​
+
 rust_binary(
     name = "schtest",
     srcs = ["src/main.rs"],
