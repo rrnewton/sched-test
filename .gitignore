@@ -29,3 +29,6 @@ rt-app-*.log
 *.profraw
 *.profdata
 coverage-out/
+
+# mdbook build output for the scxsim guide
+scx-sim/docs/guide/book/

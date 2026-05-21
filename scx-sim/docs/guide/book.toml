@@ -1,0 +1,34 @@
+[book]
+title = "scxsim — the sched_ext simulator"
+description = "Deterministic, time-accelerated simulator for sched_ext BPF schedulers. Run real BPF scheduler `.so` files against rt-app workloads in seconds without booting a kernel."
+authors = ["scxsim contributors"]
+language = "en"
+src = "src"
+
+[rust]
+edition = "2021"
+
+[output.html]
+default-theme = "rust"
+preferred-dark-theme = "ayu"
+git-repository-url = "https://github.com/facebookexperimental/sched-test"
+edit-url-template = "https://github.com/facebookexperimental/sched-test/edit/simulator.v6/scx-sim/docs/guide/{path}"
+mathjax-support = false
+no-section-label = false
+
+[output.html.fold]
+enable = true
+level = 1
+
+[output.html.print]
+enable = true
+
+[output.html.search]
+enable = true
+limit-results = 30
+use-boolean-and = true
+boost-title = 2
+boost-hierarchy = 1
+boost-paragraph = 1
+expand = true
+heading-split-level = 3
