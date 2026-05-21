@@ -6,7 +6,8 @@
 # Use the venv python if available, otherwise system python3
 PYTHON := $(or $(wildcard .venv/bin/python3),python3)
 
-.PHONY: benchmark benchmark-perf install-e9patch rebuild-schedulers
+.PHONY: benchmark benchmark-perf install-e9patch rebuild-schedulers \
+        test-examples
 
 benchmark:
 	$(PYTHON) scripts/benchmark.py run
@@ -52,3 +53,21 @@ rebuild-schedulers:
 	@echo ">>> Built scheduler .so files:"
 	@find target/release/build -name 'libscx_*.so' -not -path '*-uninstrumented*' \
 	  -printf '%p\n' | sort | xargs -r sha256sum
+
+# Run every `examples/*.json` workload through scxsim and assert exit
+# code 0. Acts as the guide's example-rot guard: if a CLI rename, an
+# rt-app schema change, or a scheduler default shift breaks a config a
+# guide reader is about to copy, this target is the first thing to go
+# red. See `docs/guide/tests/test_examples.sh` for the full script
+# (including tunable env vars such as SCXSIM_TEST_SCHEDULERS).
+#
+# The script auto-builds scxsim if `target/release/scxsim` is absent,
+# so this target works on a fresh clone without a separate `cargo
+# build` step. To re-use an already-built binary at a non-default
+# location, override SCXSIM, e.g.:
+#   make test-examples SCXSIM=/path/to/scxsim
+#
+# To widen the scheduler matrix:
+#   make test-examples SCXSIM_TEST_SCHEDULERS="simple lavd"
+test-examples:
+	@bash docs/guide/tests/test_examples.sh

@@ -1,0 +1,121 @@
+name: scxsim guide examples
+
+# Smoke test for the scx-sim guide's example workloads. The full
+# integration suite lives in `simulator.yml` (validate.sh + cargo
+# nextest); THIS workflow is intentionally narrow — for each
+# `scx-sim/examples/*.json` workload, run `scxsim run --duration
+# 100ms` and assert exit code 0. The point is to catch the specific
+# regression "the guide's hello.json no longer parses / runs" without
+# waiting for the heavyweight simulator workflow to finish.
+#
+# Triggers limited to the surface this workflow actually exercises:
+# the examples themselves, the test script + Makefile target, and the
+# scxsim binary (anything under scx-sim/crates/scx_simulator/src/ or
+# the scheduler sources that build the .so files). Editing a comment
+# in unrelated scxsim code won't queue a job.
+
+on:
+  push:
+    branches:
+      - '**'
+    paths:
+      - 'scx-sim/examples/**'
+      - 'scx-sim/docs/guide/tests/**'
+      - 'scx-sim/Makefile'
+      - 'scx-sim/crates/scx_simulator/**'
+      - 'scx-sim/csrc/**'
+      - 'scx-sim/schedulers/**'
+      - 'scx-sim/build.rs'
+      - 'scx-sim/Cargo.lock'
+      - 'scx-sim/Cargo.toml'
+      - '.github/workflows/scxsim-examples.yml'
+  pull_request:
+    branches:
+      - '**'
+    paths:
+      - 'scx-sim/examples/**'
+      - 'scx-sim/docs/guide/tests/**'
+      - 'scx-sim/Makefile'
+      - 'scx-sim/crates/scx_simulator/**'
+      - 'scx-sim/csrc/**'
+      - 'scx-sim/schedulers/**'
+      - 'scx-sim/build.rs'
+      - 'scx-sim/Cargo.lock'
+      - 'scx-sim/Cargo.toml'
+      - '.github/workflows/scxsim-examples.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  examples:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # Same disk-pressure mitigation as simulator.yml — cargo
+      # incremental + e9patch routinely exhaust the runner.
+      - name: Free up disk space on runner
+        run: |
+          df -h /
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /opt/hostedtoolcache/Java_Temurin-Hotspot_jdk || true
+          sudo apt-get autoremove -y || true
+          sudo apt-get clean || true
+          df -h /
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libelf-dev \
+            build-essential xxd markdown zlib1g-dev
+
+      # Share the cargo + simulator target cache with simulator.yml so
+      # the second of the two jobs to run on a given commit benefits
+      # from the other's compile.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            scx-sim/target/
+          key: ${{ runner.os }}-simulator-${{ hashFiles('scx-sim/Cargo.lock') }}
+
+      - uses: actions/cache@v4
+        with:
+          path: scx-sim/third_party/e9patch/
+          key: ${{ runner.os }}-e9patch-v1
+
+      - name: Install e9patch
+        working-directory: scx-sim
+        run: make install-e9patch
+
+      # The test script will `cargo build --release -p scx_simulator
+      # --bin scxsim` if it doesn't find target/release/scxsim, so an
+      # explicit build step here is optional — we do it explicitly to
+      # keep the build cost in its own labelled step (faster to spot
+      # in the job log if it regresses).
+      - name: Build scxsim (release)
+        working-directory: scx-sim
+        run: cargo build --release -p scx_simulator --bin scxsim
+
+      - name: Run guide-example smoke tests
+        working-directory: scx-sim
+        # SCXSIM_TEST_SCHEDULERS defaults to "simple" — cheap and
+        # fast. Widen here if/when a guide example targets a specific
+        # scheduler (e.g. an lavd-only fixture would warrant adding
+        # "lavd" here).
+        env:
+          SCXSIM_TEST_SCHEDULERS: "simple lavd"
+          SCXSIM_TEST_DURATION: "100ms"
+          SCXSIM_TEST_WATCHDOG: "5s"
+          NO_COLOR: "1"
+        run: make test-examples

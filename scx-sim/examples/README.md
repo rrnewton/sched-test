@@ -51,3 +51,24 @@ view per-CPU tracks and per-task slices visually.
 See the guide chapter
 [`docs/guide/src/concepts/workloads.md`](../docs/guide/src/concepts/workloads.md)
 for the full rt-app JSON schema scxsim accepts.
+
+## Testing the examples
+
+Every `*.json` in this directory is exercised on every CI run by
+[`docs/guide/tests/test_examples.sh`](../docs/guide/tests/test_examples.sh)
+— it runs each workload through `scxsim run --duration 100ms` and
+asserts exit code 0. Run it locally before publishing a new example:
+
+```bash
+cd scx-sim
+make test-examples
+# or to sweep across schedulers:
+make test-examples SCXSIM_TEST_SCHEDULERS="simple lavd"
+```
+
+If you add an example here, no further wiring is needed; the script
+picks up every `examples/*.json` automatically. If the example
+requires a *specific* scheduler to be meaningful, also add that
+scheduler name to `SCXSIM_TEST_SCHEDULERS` in
+`.github/workflows/scxsim-examples.yml` so CI exercises the relevant
+combination.
