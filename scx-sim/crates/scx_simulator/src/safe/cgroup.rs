@@ -423,7 +423,7 @@ impl CgroupRegistry {
     /// dropped. Bump the constant if the workload ever needs more.
     ///
     /// Must be called from the simulator's single-threaded context
-    /// (which is guaranteed by the Arc<Mutex> / token-ring protocol).
+    /// (which is guaranteed by the `Arc<Mutex>` / token-ring protocol).
     pub fn prepare_css_iter(&self, root_cgid: CgroupId) {
         if let Some(root) = self.cgroups.get(&root_cgid) {
             let root_ptr = root.alloc.as_ptr();

@@ -389,8 +389,8 @@ impl WorkerPool {
 
     /// Wake the first `count` workers with the given command.
     ///
-    /// Unlike [`run_round`](Self::run_round), this does NOT wait for
-    /// completion. The caller must call [`wait_workers_complete`] after
+    /// Unlike `run_round`, this does NOT wait for
+    /// completion. The caller must call [`Self::wait_workers_complete`] after
     /// performing any engine-side work (e.g. running an engine loop).
     ///
     /// # Panics

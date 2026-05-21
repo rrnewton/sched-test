@@ -2,7 +2,7 @@
 //!
 //! [`LavdProbes`] resolves function pointers from the loaded LAVD `.so`
 //! and wraps them for safe(r) access. [`LavdMonitor`] implements the
-//! [`Monitor`](crate::monitor::Monitor) trait to sample LAVD state at
+//! [`crate::monitor::Monitor`] trait to sample LAVD state at
 //! each scheduling event.
 //!
 //! # Safety

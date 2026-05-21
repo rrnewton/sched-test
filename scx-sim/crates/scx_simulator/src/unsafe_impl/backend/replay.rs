@@ -2,7 +2,7 @@
 //!
 //! Replays a recorded preemption trace using a hybrid PMU + hardware
 //! breakpoint approach. The PMU timer fires when we're within
-//! [`REPLAY_MARGIN`](crate::preempt::REPLAY_MARGIN) branches of the target,
+//! [`REPLAY_MARGIN`] branches of the target,
 //! then a hardware breakpoint catches the exact instruction pointer.
 //!
 //! Both PMU timer and HW breakpoint are REQUIRED. If either is unavailable

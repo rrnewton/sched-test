@@ -1,7 +1,7 @@
 //! Native concurrent backend — no PMU, no token ring.
 //!
-//! Provides [`NullBackend`] (a [`PreemptionBackend`] with no instrumentation)
-//! and [`NativeOrchestrator`] (a [`ThreadOrchestrator`] that lets all workers
+//! Provides `NullBackend` (a `PreemptionBackend` with no instrumentation)
+//! and `NativeOrchestrator` (a thread orchestrator that lets all workers
 //! run freely in parallel). Together they implement the `--native-concurrent`
 //! dispatch path where threads run with true OS-level concurrency and no
 //! serialisation.

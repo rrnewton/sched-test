@@ -5,8 +5,8 @@
 //! counter and yields via `e9_preempt_yield` when it expires.
 //!
 //! Contains two backends:
-//! - [`E9PatchBackend`]: Recording mode — random PRNG timeslices.
-//! - [`E9PatchReplayBackend`]: Replay mode — supports two sub-modes:
+//! - `E9PatchBackend`: Recording mode — random PRNG timeslices.
+//! - `E9PatchReplayBackend`: Replay mode — supports two sub-modes:
 //!   - **Branch-count mode** (`break_on: rbc`): arms the counter at exact
 //!     branch deltas from the trace's cumulative `structop_rbc` values.
 //!   - **RIP mode** (`break_on: insn`): patches specific instruction

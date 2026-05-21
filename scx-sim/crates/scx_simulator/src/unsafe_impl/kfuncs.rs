@@ -633,7 +633,7 @@ impl SimulatorState {
     /// `SCX_TASK_QUEUED` is **not** cleared here when going to None
     /// (dispatch resolution) — the kernel keeps the flag set until the
     /// task starts running or goes to sleep.  The engine clears it
-    /// via [`clear_task_queued`] at those points.
+    /// via [`Self::clear_task_queued`] at those points.
     pub fn set_task_ops_state(&mut self, pid: Pid, new_state: OpsTaskState) {
         self.task_ops_state.insert(pid, new_state);
         if new_state == OpsTaskState::Queued {

@@ -268,7 +268,7 @@ impl EngineRing {
     /// Worker: mark as finished and notify the engine.
     ///
     /// Sets this worker's bit in the finished mask, publishes the yield
-    /// info, and wakes the engine. Unlike [`yield_to_engine`], this does
+    /// info, and wakes the engine. Unlike [`Self::yield_to_engine`], this does
     /// NOT block -- the worker thread returns immediately and should exit.
     ///
     /// **Async-signal-safe**: only atomic stores and futex_wake.

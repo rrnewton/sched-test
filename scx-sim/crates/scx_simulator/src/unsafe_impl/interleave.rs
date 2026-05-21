@@ -28,7 +28,7 @@
 //!
 //! ## Safety
 //!
-//! Token passing ensures only one thread accesses [`SimulatorState`] at
+//! Token passing ensures only one thread accesses [`crate::kfuncs::SimulatorState`] at
 //! a time. Raw pointers are shared across threads, but actual access is
 //! serialized by the token. The [`maybe_yield`] call happens BEFORE
 //! `with_sim()`, so no `&mut SimulatorState` reference is held when a
@@ -340,7 +340,7 @@ pub fn install(ring: &TokenRing, worker_id: WorkerId) {
     });
 }
 
-/// Install interleave context for an [`EngineRing`] on the current worker thread.
+/// Install interleave context for an [`crate::engine_ring::EngineRing`] on the current worker thread.
 ///
 /// Called by worker threads at startup, before waiting for the token.
 pub fn install_engine_ring(ring: &crate::engine_ring::EngineRing, worker_id: WorkerId) {
@@ -361,7 +361,7 @@ pub fn uninstall() {
 /// Yield point called at the top of each state-accessing kfunc.
 ///
 /// Dispatches to the appropriate interleaving backend:
-/// - If preemptive context is installed: uses [`preempt::maybe_yield_preemptive`]
+/// - If preemptive context is installed: uses [`crate::preempt::maybe_yield_preemptive`]
 ///   (futex-based, signal-safe, PMU timer aware).
 /// - If cooperative context is installed: uses the installed ring's yield
 ///   function ([`EngineRing`](crate::engine_ring::EngineRing)).

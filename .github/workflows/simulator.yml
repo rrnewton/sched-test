@@ -86,3 +86,17 @@ jobs:
         if: hashFiles('scx-sim/validate.sh') == ''
         working-directory: scx-sim
         run: cargo build --workspace
+
+      - name: Doc lint (cargo doc with -D warnings)
+        # Enforce that scx_simulator's rustdoc comments build clean.
+        # Catches broken intra-doc links, links to private items from
+        # public docs, redundant link targets, and malformed markdown
+        # (unclosed HTML tags etc.). Doc warnings degrade the rendered
+        # output and tend to accumulate silently; -D warnings keeps the
+        # backlog at zero. The build-script C-compiler warnings emitted
+        # via cargo:warning= are NOT rustdoc warnings and do not fail
+        # this step.
+        working-directory: scx-sim
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --no-deps -p scx_simulator

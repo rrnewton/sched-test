@@ -34,13 +34,13 @@
 //!
 //! ## Relationship to [`interleave`]
 //!
-//! - [`interleave::maybe_yield`] dispatches cooperative yields at kfunc
-//!   boundaries via the installed ring (currently [`EngineRing`]).
+//! - [`crate::interleave::maybe_yield`] dispatches cooperative yields at kfunc
+//!   boundaries via the installed ring (currently [`crate::engine_ring::EngineRing`]).
 //! - [`PreemptRing`] uses atomics/futex for both cooperative and preemptive
 //!   yields, making it safe to call from signal handlers.
 //!
 //! When preemptive interleaving is enabled, `PreemptRing` replaces
-//! `EngineRing`. The existing [`interleave::maybe_yield`] cooperative yield
+//! `EngineRing`. The existing [`crate::interleave::maybe_yield`] cooperative yield
 //! points continue to work -- they call into `PreemptRing` instead of
 //! `EngineRing`.
 //!
@@ -1095,7 +1095,7 @@ pub fn compute_so_hash_from_path(path: &str) -> u64 {
 /// Preemption instrumentation: record store, counters, and timeslice PRNG.
 ///
 /// Previously also handled thread orchestration (futex-based token ring).
-/// That role is now filled by [`EngineRing`](crate::engine_ring::EngineRing);
+/// That role is now filled by [`crate::engine_ring::EngineRing`];
 /// `PreemptRing` retains only instrumentation and timeslice generation.
 pub struct PreemptRing {
     /// Total number of workers.
@@ -1362,7 +1362,7 @@ fn is_preemption_inhibited() -> bool {
 /// re-enables the counter without resetting or changing the period (see
 /// `rearm_timer` docs for the full recording/replay asymmetry explanation).
 /// The replay backend manages the timer period directly via
-/// [`arm_replay_timer_pub`] and [`arm_replay_next_target`].
+/// [`arm_replay_timer_pub`] and `arm_replay_next_target`.
 ///
 /// `timeslice_min` and `timeslice_max` must match the recording scenario's
 /// values so that `rearm_timer`'s PRNG consumption produces the same
@@ -1422,7 +1422,7 @@ impl std::fmt::Display for KfuncYieldPhase {
 
 /// Cooperative yield point for kfunc entry (using the PreemptRing).
 ///
-/// Functionally identical to [`interleave::maybe_yield`] but uses the
+/// Functionally identical to [`crate::interleave::maybe_yield`] but uses the
 /// futex-based `PreemptRing` instead of `Mutex`/`Condvar` cooperative yields.
 ///
 /// The PMU timer is disabled on entry and stays disabled on return.
@@ -2167,7 +2167,7 @@ fn arm_replay_timer(timer_fd: RawFd, target_rbc: u64) {
     }
 }
 
-/// Public wrapper for [`arm_replay_timer`], used by the backend to arm the
+/// Public wrapper for `arm_replay_timer`, used by the backend to arm the
 /// first replay target before entering scheduler C code.
 pub fn arm_replay_timer_pub(timer_fd: RawFd, target_rbc: u64) {
     arm_replay_timer(timer_fd, target_rbc);

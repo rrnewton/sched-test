@@ -2,7 +2,7 @@
 //!
 //! Provides a trait-based abstraction for different preemption backends
 //! (PMU timer, hardware breakpoint replay, e9patch). Each backend
-//! implements [`PreemptionBackend`] to define how workers are instrumented.
+//! implements `PreemptionBackend` to define how workers are instrumented.
 //!
 //! # Safety
 //!
@@ -36,13 +36,13 @@ pub(crate) struct StructopDelta {
 
 /// Relative RBC count -- branches to execute from the current counter position.
 ///
-/// Used by [`PmuBackend`](pmu::PmuBackend) for random timeslices.
+/// Used by `PmuBackend` (in `pmu`) for random timeslices.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RelativeRbc(pub u64);
 
 /// Absolute RBC count -- cumulative branches from the start of the current structop.
 ///
-/// Used by [`ReplayBackend`](replay::ReplayBackend) for precise targeting.
+/// Used by `ReplayBackend` (in `replay`) for precise targeting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AbsoluteRbc(pub u64);
 
