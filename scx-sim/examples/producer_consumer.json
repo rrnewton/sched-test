@@ -1,0 +1,24 @@
+{
+  "_comment": "Producer / consumer example using rt-app's suspend/resume primitives. The 'consumer' begins suspended (suspend: 'consumer' — wait on its own named event). Each iteration the 'producer' runs for 2ms, signals the consumer (resume: 'consumer'), runs another 2ms, then sleeps 5ms. The consumer wakes, runs for 1ms processing the 'work', and re-suspends. This pattern is the rt-app equivalent of a wait/signal queue and is what scxsim uses internally for crates/scx_simulator/workloads/simple_wake.json. Useful for observing wake-up paths, run-queue insertion ordering, and how a scheduler handles a producer that is the *only* source of runnable work for the consumer.",
+  "_run_units": "rt-app 'run'/'sleep' are microseconds; 'suspend'/'resume' values are arbitrary event names that pair across tasks.",
+  "global": {
+    "duration": 0.1,
+    "default_policy": "SCHED_OTHER"
+  },
+  "tasks": {
+    "producer": {
+      "priority": 0,
+      "loop": -1,
+      "run0": 2000,
+      "resume": "consumer",
+      "run1": 2000,
+      "sleep": 5000
+    },
+    "consumer": {
+      "priority": 0,
+      "loop": -1,
+      "suspend": "consumer",
+      "run": 1000
+    }
+  }
+}

@@ -13,8 +13,12 @@ optimized for clarity, not for triggering scheduler behaviour.
 | File | What it demonstrates |
 |---|---|
 | `hello.json` | Minimal single-task workload. The "hello world" of scxsim. |
+| `simple_two_tasks.json` | Two tasks at different rt-app priorities — minimal way to see wake-up interleaving. |
 | `cpu_bound.json` | Four CPU-bound workers exercising fan-out and time-slicing. |
+| `producer_consumer.json` | A producer signals a suspended consumer via `resume` / `suspend`. Wake-path demo. |
+| `cpu_bound_vs_io_bound.json` | Mixed workload: two long-running CPU tasks plus two short-burst IO-style tasks. Contrasts throughput vs latency. |
 | `cgroup_hierarchy.json` | Two cgroups (`/background` throttled to 20%, `/interactive` unconstrained), four tasks split across them. |
+| `cgroup_throttling.json` | Single `/throttled` cgroup at a strict 10% quota plus one free task — narrowly demonstrates the throttle / unthrottle cycle. |
 
 ## Running them
 

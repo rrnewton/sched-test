@@ -19,7 +19,50 @@ finding, and regression testing.
 - **Hardware breakpoint support** — replay mode uses PMU counters for exact
   preemption point reproduction.
 
-## Quick start
+## Quick start (Docker)
+
+The fastest way to try scxsim end-to-end. Requires only Docker on the
+host — no Rust toolchain, no system build dependencies (clang, libelf,
+…). The image installs everything internally and bakes in the
+example workloads.
+
+```bash
+git clone --recursive https://github.com/rrnewton/sched-test.git
+cd sched-test/scx-sim
+docker build -t scxsim .
+docker run --rm scxsim
+```
+
+(`--recursive` initialises the `scx` submodule which the scheduler
+build needs. If you already cloned without it: `git submodule update
+--init --recursive`.)
+
+That last command runs `examples/hello.json` against the `simple`
+scheduler for 100 ms of simulated time and prints a per-CPU
+structop / kfunc summary. Replace the default with any example —
+including capturing a Perfetto trace for visualization:
+
+```bash
+docker run --rm -v /tmp:/out scxsim \
+    run -s lavd --cpus 4 --duration 100ms \
+        --perfetto /out/cpu_bound.json examples/cpu_bound.json
+# upload /tmp/cpu_bound.json to https://ui.perfetto.dev/
+```
+
+See [`examples/`](examples/) for the full set of runnable workloads
+and the [scxsim guide](docs/guide/src/getting-started/quick-start.md)
+for next steps.
+
+> The Dockerfile is single-stage on purpose — the release binary embeds
+> the absolute path to its scheduler `.so` directory (`SCHEDULER_SO_DIR`,
+> resolved at build time), so the image must keep the source tree in
+> place. For a real development environment, follow the
+> "[Step-by-step build](#step-by-step-build)" instructions below
+> instead.
+
+## Step-by-step build
+
+For local development or when Docker is not available.
 
 ### 1. Install system dependencies
 
@@ -46,28 +89,37 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ### 3. Clone and initialize submodules
 
 ```bash
-git clone <repo-url>
-cd <repo>/scx-sim
+git clone https://github.com/rrnewton/sched-test.git
+cd sched-test
 git submodule update --init --recursive
+cd scx-sim
 ```
 
 ### 4. Build
 
 ```bash
-cargo build --workspace
+cargo build --release -p scx_simulator --bin scxsim
 ```
 
-### 5. Build schedulers
+The build script also compiles the scheduler `.so` libraries
+(`libscx_simple.so`, `libscx_lavd.so`, …) as a side effect — no
+separate `make -C schedulers` step is required.
+
+### 5. Run a simulation
 
 ```bash
-make -C schedulers
+target/release/scxsim run -s simple --cpus 4 --duration 100ms \
+    examples/hello.json
 ```
 
-### 6. Run a simulation
+Or try one of the other guide examples:
 
 ```bash
-cargo run --release -- simulate -s simple workloads/two_runners.json
+target/release/scxsim run -s lavd --cpus 4 --duration 200ms \
+    --perfetto /tmp/cpu_bound.json examples/cpu_bound.json
 ```
+
+See [`examples/README.md`](examples/README.md) for the full inventory.
 
 ## Usage
 
@@ -213,6 +265,13 @@ limitations.
 
 ## Documentation
 
+- **[scxsim guide](docs/guide/src/SUMMARY.md)** (mdbook source) —
+  full conceptual + how-to documentation: getting started, running
+  simulations, recipes (compare schedulers, verify determinism,
+  reproduce a stall, lldb), architecture overview, and CLI reference.
+  Render locally with `make -C docs/guide serve`.
+- **[examples/README.md](examples/README.md)** — runnable rt-app
+  workloads referenced from the guide.
 - **[CLAUDE.md](CLAUDE.md)** — Development guidelines, coding conventions,
   system dependency details, and workflow instructions.
 - **[OPTIMIZATION.md](OPTIMIZATION.md)** — Performance patterns and

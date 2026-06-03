@@ -1,0 +1,22 @@
+{
+  "_comment": "Two-task example: a 'low' priority task that runs continuously and a 'high' priority task that wakes up every 5ms for a short burst. With SCHED_OTHER and `priority` values (rt-app: lower number = higher priority), scxsim treats both as fair-class but the per-task wake-up cadence creates a clear interleaving on the Perfetto timeline. Useful for observing wake-up + preemption behaviour with the bare minimum of moving parts (compare hello.json which has only one task).",
+  "_run_units": "rt-app 'run'/'sleep' are microseconds; priority is the rt-app nice-like field (lower = more eager).",
+  "global": {
+    "duration": 0.1,
+    "default_policy": "SCHED_OTHER"
+  },
+  "tasks": {
+    "low": {
+      "priority": 0,
+      "loop": -1,
+      "run": 2000,
+      "sleep": 500
+    },
+    "high": {
+      "priority": -10,
+      "loop": -1,
+      "run": 500,
+      "sleep": 5000
+    }
+  }
+}
