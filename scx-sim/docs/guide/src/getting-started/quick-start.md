@@ -99,6 +99,12 @@ iterations, and completes after ~9.7 ms of simulated time.
 - **Capture the structops stream.** `--structops-jsonl /tmp/h.jsonl`
   writes a JSONL trace diffable against bpftrace captures from a
   live kernel. See [Trace Output](../running-simulations/trace-output.md).
+- **Perfetto protobuf instead of JSON.** Add
+  `--trace-format perfetto` (and use a `.pb` path) to emit a
+  wprof-compatible Perfetto protobuf trace — smaller and faster to
+  load than JSON for long runs, though not human-readable. Loadable
+  by scxtop's `load_perfetto_trace` and side-by-side with wprof
+  captures. See [Trace Output → Perfetto protobuf](../running-simulations/trace-output.md#perfetto-trace-protobuf).
 
 ## Next
 

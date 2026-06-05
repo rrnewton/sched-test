@@ -115,19 +115,72 @@ Opt out with `--no-disable-aslr` when wrapping scxsim in a script
 that itself sets process attributes you don't want clobbered — at the
 cost of losing the determinism guarantee for replay.
 
+## What are valid preemption targets?
+
+Determinism depends on where in the scheduler's execution we are
+allowed to preempt one structop and run another. Not all preemption
+points are reproducible across runs, and the trade-offs differ by
+target.
+
+1. **Natural yield points.** A scheduler structop naturally yields
+   back to userspace / kernel when it is DONE executing (e.g.
+   `ops.enqueue` returns, `ops.dispatch` finishes its work). These
+   are deterministic by construction — the boundary is defined by
+   the scheduler's own control flow, not by an external counter.
+
+2. **Branch-based preemption (RBC).** Additional preemptions in the
+   middle of scheduler C code can target conditional branches. This
+   is efficient because of the precise, deterministic Retired Branch
+   Counter (RBC) in the CPU. RBC counting **is deterministic under
+   speculation**, so seeds using RBC-based preemption are fully
+   reproducible across runs WITHOUT a recording step. This is the
+   default break mode (`break_on: rbc` in preemption-trace headers).
+
+3. **Arbitrary instruction preemption.** For finer-grained
+   interleaving exploration, we can preempt at arbitrary
+   instructions — not just conditional branches. However, this
+   relies on counters (e.g. retired instruction count) that are
+   **intrinsically nondeterministic under speculation**. Therefore:
+
+   - The ONLY way to get reproducibility with arbitrary-instruction
+     preemption is to **record nondeterministically first**, then
+     **replay** using the e9patch backend to insert traps at the
+     exact instructions we know we want to break on.
+   - **Disadvantage:** requires a recording phase; no
+     run-from-cold reproducibility from seed alone.
+   - **Advantage:** can explore interleavings that RBC-only
+     preemption CANNOT reach — for example, splitting up a block
+     of write instructions with no conditional branch between
+     them.
+
 ## Record / replay
 
-For the strongest form of determinism — across machines, across
-debugger sessions, across re-runs of the same `.so` binary — capture
-preemption sites once and replay them:
+Record / replay is NOT a "stronger" form of determinism — it is a
+different trade-off in the preemption-target space described above:
+
+| Mode | Reproducible without recording? | Interleavings reachable |
+|---|---|---|
+| RBC preemption (default) | **Yes** — RBC is deterministic under speculation. Same seed → same trace. | Conditional-branch boundaries only. |
+| Arbitrary-instruction + record/replay | **No** — recording phase is mandatory; instruction-count signal delivery is nondeterministic. | Any instruction, including inside straight-line code with no branches. |
+
+Use record/replay when you specifically need to reach an
+interleaving that RBC preemption cannot — for example, splitting a
+contiguous block of writes that has no intervening conditional
+branch. For everything else, the default RBC mode gives byte-
+identical reruns from `--seed` alone with no recording step.
+
+The capture / replay commands:
 
 ```bash
-# Capture
+# Capture (records arbitrary-instruction preemption sites observed
+# during a nondeterministic run)
 scxsim run -s lavd --cpus 4 --duration 200ms \
     --record-preemptions /tmp/preempts.txt \
     examples/cpu_bound.json
 
-# Replay (later, possibly on another machine with the same .so)
+# Replay (later, possibly on another machine with the same .so).
+# Uses e9patch to insert traps at the exact recorded instruction
+# addresses, so the recorded interleaving is reproduced bit-for-bit.
 scxsim replay /tmp/preempts.txt
 ```
 
@@ -149,6 +202,13 @@ hash of the `.so` so that mismatches are caught at load time:
 # so_hash: 0xa4f5c653d5aed108
 # so_path: /.../scx-sim/target/release/build/scx_simulator-.../out/schedulers/libscx_lavd.so
 ```
+
+The `break_on:` field records which preemption-target class was in
+use during capture (`rbc` for the default branch-based mode, or
+`insn` for arbitrary-instruction mode). A replay run rejects a
+trace whose `so_hash` does not match the loaded scheduler binary —
+mismatched `.so` files cannot reproduce the recorded instruction
+addresses.
 
 See [Running Simulations → Replaying Preemption Traces](../running-simulations/replay.md)
 for the full file format.
