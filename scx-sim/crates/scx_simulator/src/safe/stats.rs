@@ -288,11 +288,9 @@ impl TraceStats {
                     }
                 }
 
-                TraceKind::DsqInsertVtime { dsq_id, .. } => {
-                    if post_warmup {
-                        stats.dsq_insert_vtime_count += 1;
-                        *stats.dsq_dispatch_histogram.entry(*dsq_id).or_insert(0) += 1;
-                    }
+                TraceKind::DsqInsertVtime { dsq_id, .. } if post_warmup => {
+                    stats.dsq_insert_vtime_count += 1;
+                    *stats.dsq_dispatch_histogram.entry(*dsq_id).or_insert(0) += 1;
                 }
 
                 TraceKind::EnqueueTask { pid, .. } => {
@@ -317,11 +315,9 @@ impl TraceStats {
                     task_enqueue_time.insert(*pid, event.time_ns);
                 }
 
-                TraceKind::Balance { .. } => {
-                    if post_warmup {
-                        let cpu_stats = stats.cpus.get_mut(&event.cpu).unwrap();
-                        cpu_stats.balance_count += 1;
-                    }
+                TraceKind::Balance { .. } if post_warmup => {
+                    let cpu_stats = stats.cpus.get_mut(&event.cpu).unwrap();
+                    cpu_stats.balance_count += 1;
                 }
 
                 TraceKind::CpuIdle => {
@@ -345,16 +341,12 @@ impl TraceStats {
                     cpu_last_tick.insert(event.cpu, event.time_ns);
                 }
 
-                TraceKind::DsqMoveToLocal { .. } => {
-                    if post_warmup {
-                        stats.dsq_move_to_local_count += 1;
-                    }
+                TraceKind::DsqMoveToLocal { .. } if post_warmup => {
+                    stats.dsq_move_to_local_count += 1;
                 }
 
-                TraceKind::KickCpu { .. } => {
-                    if post_warmup {
-                        stats.kick_cpu_count += 1;
-                    }
+                TraceKind::KickCpu { .. } if post_warmup => {
+                    stats.kick_cpu_count += 1;
                 }
 
                 _ => {}

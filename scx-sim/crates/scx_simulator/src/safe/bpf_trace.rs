@@ -169,10 +169,10 @@ impl BpfTrace {
                             trace.task_names.insert(*next_pid, next_comm.clone());
                         }
                     }
-                    BpfEventKind::SchedWakeup { pid, comm, .. } => {
-                        if pid.0 != 0 && !comm.is_empty() {
-                            trace.task_names.insert(*pid, comm.clone());
-                        }
+                    BpfEventKind::SchedWakeup { pid, comm, .. }
+                        if pid.0 != 0 && !comm.is_empty() =>
+                    {
+                        trace.task_names.insert(*pid, comm.clone());
                     }
                     _ => {}
                 }
@@ -363,10 +363,8 @@ impl BpfTrace {
                     stats.kick_cpu_count += 1;
                 }
 
-                BpfEventKind::Consume { success, .. } => {
-                    if *success {
-                        stats.dsq_move_to_local_count += 1;
-                    }
+                BpfEventKind::Consume { success: true, .. } => {
+                    stats.dsq_move_to_local_count += 1;
                 }
 
                 _ => {}
