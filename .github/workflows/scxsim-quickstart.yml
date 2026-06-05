@@ -1,0 +1,153 @@
+name: scxsim quickstart
+
+# Exercises the two pasteable quick starts documented at
+# scx-sim/docs/guide/src/getting-started/installation.md (Docker + Nix)
+# end-to-end. The point is to guarantee that the install page never
+# silently breaks: if the Dockerfile or flake.nix regress, this
+# workflow goes red on the next push.
+#
+# Deliberately SEPARATE from the heavy simulator.yml workflow (which
+# runs validate.sh / cargo nextest / coverage) and the scxsim-examples
+# workflow (which sweeps every examples/*.json). Either of those can
+# stay green while this one detects "the recommended one-liner no
+# longer works." Each job here builds + runs ONE simulation (the
+# hello-world workload) and asserts it dispatched the expected number
+# of tasks via the `local_dsq_dispatches: 5` summary line.
+#
+# Triggers narrow to the surface this workflow actually exercises:
+# the Dockerfile, .dockerignore, flake.nix, the install-page guide,
+# and the scxsim binary / scheduler sources (anything a quickstart run
+# needs to compile and execute). A comment-only edit elsewhere in
+# scxsim won't queue a job.
+
+on:
+  push:
+    branches:
+      - '**'
+    paths:
+      - 'scx-sim/Dockerfile'
+      - 'scx-sim/.dockerignore'
+      - 'scx-sim/flake.nix'
+      - 'scx-sim/flake.lock'
+      - 'scx-sim/examples/**'
+      - 'scx-sim/docs/guide/src/getting-started/installation.md'
+      - 'scx-sim/crates/scx_simulator/**'
+      - 'scx-sim/csrc/**'
+      - 'scx-sim/schedulers/**'
+      - 'scx-sim/build.rs'
+      - 'scx-sim/Cargo.toml'
+      - 'scx-sim/Cargo.lock'
+      - '.github/workflows/scxsim-quickstart.yml'
+  pull_request:
+    branches:
+      - '**'
+    paths:
+      - 'scx-sim/Dockerfile'
+      - 'scx-sim/.dockerignore'
+      - 'scx-sim/flake.nix'
+      - 'scx-sim/flake.lock'
+      - 'scx-sim/examples/**'
+      - 'scx-sim/docs/guide/src/getting-started/installation.md'
+      - 'scx-sim/crates/scx_simulator/**'
+      - 'scx-sim/csrc/**'
+      - 'scx-sim/schedulers/**'
+      - 'scx-sim/build.rs'
+      - 'scx-sim/Cargo.toml'
+      - 'scx-sim/Cargo.lock'
+      - '.github/workflows/scxsim-quickstart.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  docker:
+    name: docker build + run hello.json
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # The Dockerfile lives in scx-sim/ and expects the build context
+      # to be that directory (its .dockerignore is scoped to scx-sim/).
+      - name: docker build -t scxsim scx-sim/
+        run: docker build -t scxsim scx-sim/
+
+      # Smoke-run the default ENTRYPOINT/CMD (simple scheduler,
+      # examples/hello.json, 4 cpus, 100ms). Assert the expected
+      # summary line is present and exit code 0.
+      - name: docker run --rm scxsim   (assert local_dsq_dispatches: 5)
+        run: |
+          set -e
+          out=$(docker run --rm scxsim)
+          echo "$out" | tail -25
+          echo "$out" | grep -E 'local_dsq_dispatches:\s+5' \
+            || { echo "FAIL: expected 'local_dsq_dispatches: 5' in output" >&2; exit 1; }
+
+      # Sanity check the perfetto-trace variant from the guide so a
+      # mount + alternate scheduler invocation also stays working.
+      - name: docker run with perfetto trace (lavd, cpu_bound.json)
+        run: |
+          set -e
+          mkdir -p /tmp/scxsim-trace
+          docker run --rm -v /tmp/scxsim-trace:/out scxsim \
+              run -s lavd --cpus 4 --duration 100ms \
+                  --perfetto /out/cpu_bound.json examples/cpu_bound.json
+          test -s /tmp/scxsim-trace/cpu_bound.json \
+            || { echo "FAIL: perfetto trace not written" >&2; exit 1; }
+          echo "wrote $(stat -c%s /tmp/scxsim-trace/cpu_bound.json) bytes of perfetto JSON"
+
+  nix:
+    name: nix develop + cargo build + run hello.json
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # Free disk on the runner — nix store + cargo target combined
+      # routinely exhaust the default 14GB, especially after the
+      # release build below. Mirrors the same step in
+      # scxsim-examples.yml / simulator.yml.
+      - name: Free up disk space on runner
+        run: |
+          df -h /
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /opt/hostedtoolcache/Java_Temurin-Hotspot_jdk || true
+          sudo apt-get autoremove -y || true
+          sudo apt-get clean || true
+          df -h /
+
+      - name: Install Nix (flakes enabled)
+        uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: nix flake check (eval-only, no build)
+        working-directory: scx-sim
+        run: nix flake check --no-build
+
+      # `nix develop` enters the devShell defined in scx-sim/flake.nix
+      # and runs the build + smoke-run end-to-end. We assert the same
+      # `local_dsq_dispatches: 5` line the Docker job does — same
+      # workload, same scheduler, same expected output, just a
+      # different install path.
+      - name: nix develop -> cargo build + hello.json
+        working-directory: scx-sim
+        run: |
+          set -e
+          nix develop --command bash -c '
+            set -e
+            cargo build --release -p scx_simulator --bin scxsim
+            out=$(./target/release/scxsim run -s simple --cpus 4 \
+                    --duration 100ms examples/hello.json)
+            echo "$out" | tail -25
+            echo "$out" | grep -E "local_dsq_dispatches:\s+5" \
+              || { echo "FAIL: expected local_dsq_dispatches: 5" >&2; exit 1; }
+          '

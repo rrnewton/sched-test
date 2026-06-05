@@ -6,6 +6,101 @@ files cached under `target/release/build/.../out/schedulers/`.
 
 [scx-sim-tree]: https://github.com/facebookexperimental/sched-test/tree/simulator.v6/scx-sim
 
+If you only want to *try* scxsim, the two quick starts below skip the
+system-dependency dance entirely. Either path produces a working
+`scxsim` plus the bundled `examples/`, and runs the hello workload
+end-to-end. Sections further down cover hand-rolled installs on
+Ubuntu / Debian / Fedora, plus optional add-ons like `e9patch` and
+`virtme-ng`.
+
+## Quick start: Docker
+
+Zero system deps beyond Docker itself. The image bakes in clang,
+Rust, libelf, and the example workloads, so the first run is the only
+slow step (1–3 minutes — most of it apt + rustup downloads, then a
+release-mode cargo build):
+
+```bash
+git clone --recursive https://github.com/rrnewton/sched-test.git
+cd sched-test/scx-sim
+docker build -t scxsim .
+docker run --rm scxsim
+```
+
+The final command runs `examples/hello.json` against the `simple`
+scheduler for 100 ms of simulated time. The last line should read:
+
+```text
+local_dsq_dispatches: 5
+```
+
+and exit code is 0. To run a different example — for instance, the
+LAVD scheduler against `examples/cpu_bound.json` while capturing a
+Perfetto trace:
+
+```bash
+docker run --rm -v /tmp:/out scxsim \
+    run -s lavd --cpus 4 --duration 100ms \
+        --perfetto /out/cpu_bound.json examples/cpu_bound.json
+# Then drop /tmp/cpu_bound.json onto https://ui.perfetto.dev/
+```
+
+The image is intentionally single-stage: the release binary embeds
+the absolute path to its scheduler `.so` directory (resolved at
+`cargo build` time — see [`crates/scx_simulator/build.rs`][build-rs]),
+so a multi-stage copy would leave the binary pointing at a directory
+that doesn't exist in the runtime layer. For day-to-day development,
+prefer the [Nix dev shell](#quick-start-nix) or [a native
+install](#building-from-source) below.
+
+[build-rs]: https://github.com/rrnewton/sched-test/blob/simulator.v6/scx-sim/crates/scx_simulator/build.rs
+
+## Quick start: Nix
+
+If you already have [Nix][nix-install] (with flakes enabled), one
+command drops you into a shell with the right clang, Rust, libelf,
+zlib, pkg-config, and friends — no `apt-get` or `dnf` required. The
+flake itself lives at [`scx-sim/flake.nix`][flake-nix].
+
+```bash
+git clone --recursive https://github.com/rrnewton/sched-test.git
+cd sched-test/scx-sim
+nix develop
+# inside the dev shell:
+cargo build --release -p scx_simulator --bin scxsim
+./target/release/scxsim run -s simple --cpus 4 --duration 100ms \
+    examples/hello.json
+```
+
+Same expected last line as Docker: `local_dsq_dispatches: 5`, exit
+code 0.
+
+To run a one-liner without cloning manually (Nix fetches the flake
+itself; you still need the `scx` submodule init afterward):
+
+```bash
+nix develop github:rrnewton/sched-test?dir=scx-sim --command bash -c '
+    git submodule update --init --recursive &&
+    cd scx-sim &&
+    cargo build --release -p scx_simulator --bin scxsim &&
+    ./target/release/scxsim run -s simple --cpus 4 --duration 100ms \
+        examples/hello.json'
+```
+
+The flake exposes a `devShells.default` only — not a `packages.default`
+— because `build.rs` reaches into `../scx` for BPF headers and the
+release binary embeds an absolute `SCHEDULER_SO_DIR`, which a hermetic
+`nix-build` wouldn't preserve at runtime without extra wrapping. The
+dev shell is the supported path.
+
+Both quick starts are exercised on every push by the
+[`scxsim-quickstart`][qs-workflow] GitHub Actions workflow; if either
+breaks, expect a red check on the next push to `simulator.v6`.
+
+[nix-install]: https://nixos.org/download/
+[flake-nix]: https://github.com/rrnewton/sched-test/blob/simulator.v6/scx-sim/flake.nix
+[qs-workflow]: https://github.com/rrnewton/sched-test/blob/simulator.v6/.github/workflows/scxsim-quickstart.yml
+
 ## Prerequisites
 
 | Tool | Purpose | Minimum |

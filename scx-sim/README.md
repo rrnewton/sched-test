@@ -60,6 +60,31 @@ for next steps.
 > "[Step-by-step build](#step-by-step-build)" instructions below
 > instead.
 
+## Quick start (Nix)
+
+If [Nix](https://nixos.org/download/) (with flakes) is already
+installed, `flake.nix` provides a dev shell with every system dep
+(clang, libelf, zlib, pkg-config, Rust) so you can skip
+`apt-get install` entirely:
+
+```bash
+git clone --recursive https://github.com/rrnewton/sched-test.git
+cd sched-test/scx-sim
+nix develop
+# inside the dev shell:
+cargo build --release -p scx_simulator --bin scxsim
+./target/release/scxsim run -s simple --cpus 4 --duration 100ms \
+    examples/hello.json
+```
+
+The flake intentionally exposes a `devShell` only (not a buildable
+package) — the same reason the Dockerfile is single-stage. See the
+[guide's installation page][guide-install] for the full discussion
+plus a `nix develop github:...` one-liner that fetches the flake
+without a manual clone.
+
+[guide-install]: docs/guide/src/getting-started/installation.md#quick-start-nix
+
 ## Step-by-step build
 
 For local development or when Docker is not available.
