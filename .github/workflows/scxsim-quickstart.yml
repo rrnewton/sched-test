@@ -77,7 +77,7 @@ jobs:
       # Smoke-run the default ENTRYPOINT/CMD (simple scheduler,
       # examples/hello.json, 4 cpus, 100ms). Assert the expected
       # summary line is present and exit code 0.
-      - name: docker run --rm scxsim   (assert local_dsq_dispatches: 5)
+      - name: "docker run --rm scxsim   (assert local_dsq_dispatches: 5)"
         run: |
           set -e
           out=$(docker run --rm scxsim)
