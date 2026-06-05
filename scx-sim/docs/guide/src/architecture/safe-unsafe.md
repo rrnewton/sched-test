@@ -2,9 +2,11 @@
 
 scxsim is organized around a deliberate split: a large pure-Rust
 [`safe/`][safe-tree] module that owns deterministic simulator state,
-and a small [`unsafe_impl/`][unsafe-tree] module that owns the FFI
-trampolines into the dlopen'd scheduler `.so` and the kfunc emulation
-shim that stands in for the kernel.
+and a small [`unsafe_impl/`][unsafe-tree] module that owns the **FFI**
+(Foreign Function Interface) trampolines into the `dlopen`'d
+scheduler `.so` and the **kfunc** (kernel-function emulation) shim
+that stands in for the kernel. (Both terms in the
+[Glossary](../glossary.md).)
 
 [safe-tree]: https://github.com/facebookexperimental/sched-test/tree/simulator.v6/scx-sim/crates/scx_simulator/src/safe
 [unsafe-tree]: https://github.com/facebookexperimental/sched-test/tree/simulator.v6/scx-sim/crates/scx_simulator/src/unsafe_impl
@@ -49,8 +51,10 @@ that the engine doesn't own.
 | `unsafe_impl/loader.rs` | The dlopen + symbol-resolution path; resolves `ops.<name>` from `bpf_struct_ops_<name>`. |
 
 This module is unavoidably `unsafe` because the scheduler `.so` is
-BPF-emitted machine code that the simulator must call directly. Every
-`unsafe` block is audited against `ai_docs/safety_audit.md`.
+native machine code (clang-compiled from the scheduler's C source
+with a native target rather than the BPF target) that the simulator
+must call directly through raw function pointers. Every `unsafe`
+block is audited against `ai_docs/safety_audit.md`.
 
 ## Where the boundary lives
 

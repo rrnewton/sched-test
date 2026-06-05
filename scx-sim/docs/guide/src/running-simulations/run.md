@@ -3,6 +3,19 @@
 `scxsim run` is the main entry point: an rt-app JSON workload goes
 in; trace and summary outputs come out.
 
+> **Acronyms used on this page** (full definitions in the
+> [Glossary](../glossary.md)):
+> **CPU** = Central Processing Unit;
+> **SMT** = Simultaneous Multi-Threading;
+> **DSQ** = Dispatch Queue;
+> **PRNG** = Pseudo-Random Number Generator (seeded for determinism);
+> **PMU** = Performance Monitoring Unit (hardware perf counters);
+> **RBC** = Retired Branch Count (PMU event used for the scheduler
+> overhead model);
+> **BPF** = Berkeley Packet Filter (the kernel-side compile target;
+> under scxsim the scheduler `.so` is native, not BPF bytecode —
+> see [Introduction](../introduction.md)).
+
 ```text
 scxsim run [OPTIONS] [WORKLOAD]
 ```

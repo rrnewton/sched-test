@@ -6,10 +6,10 @@ by automation (CI, bisect scripts, the `bug_finding/` harness).
 
 | Exit code | `ExitKind` | Meaning |
 |----------:|------------|---------|
-| 0  | `Normal`                        | Workload completed without a stall, BPF error, or resource exhaustion. |
-| 1  | (generic)                       | Pre-simulation failure (bad CLI flag, workload parse error, scheduler load failure, ...). |
+| 0  | `Normal`                        | Workload completed without a stall, scheduler-side error, or resource exhaustion. |
+| 1  | (generic)                       | Pre-simulation failure (bad CLI flag, workload parse error, scheduler-load failure, ...). |
 | 42 | `ErrorStall`                    | Watchdog tripped before workload completion (`--watchdog-timeout`). |
-| 43 | `ErrorBpf`                      | The loaded BPF scheduler returned an error from a struct_ops callback. |
+| 43 | `ErrorBpf`                      | The loaded scheduler `.so` returned an error from a struct_ops callback. (The variant name preserves the kernel-side terminology where the scheduler runs as BPF bytecode; under scxsim the same code path is native, but the error semantics are identical.) |
 | 44 | `ErrorDispatchLoopExhausted`    | Dispatch loop exceeded its budget (typically a busy-loop in the scheduler). |
 | 45 | `ErrorCgroupExhausted`          | Cgroup-registry exhausted (`CBW_NR_CGRP_MAX`). |
 

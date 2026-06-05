@@ -22,7 +22,9 @@ Each field:
   and any active CLI duration.
 - `global.default_policy: "SCHED_OTHER"` — sched_ext-only mode; rt-app
   POSIX scheduling-policy enum, not used by scxsim's scheduling
-  decisions (those come from the loaded BPF `.so`).
+  decisions (those come from the loaded scheduler `.so` — the
+  scheduler's C source compiled to native code, see
+  [Introduction](../introduction.md)).
 - `tasks.hello.priority: 0` — nice-equivalent; passed to the
   scheduler as a hint.
 - `tasks.hello.loop: 5` — iteration count. `-1` means "loop until
@@ -97,8 +99,10 @@ Trace Summary:
 
 Same five dispatches, very different RBC count: `simple` retires
 `654` conditional branches inside scheduler callbacks vs LAVD's
-`11_954`. That ~20x ratio is the cost of LAVD's vtime / cgroup-bw /
-selection machinery vs `simple`'s "put it on this CPU, done."
+`11_954`. (**RBC** = Retired Branch Count, a Performance Monitoring
+Unit / PMU event counter — see the [Glossary](../glossary.md).) That
+~20x ratio is the cost of LAVD's vtime / cgroup-bw / selection
+machinery vs `simple`'s "put it on this CPU, done."
 
 The PMU-overhead model (`--rbc-ns 10`, the default) translates that
 RBC count into simulated wallclock charged against the dispatch path.

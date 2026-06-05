@@ -85,9 +85,10 @@ simple):
 | `total rbc` | ~600 | ~50,000+ |
 | `local_dsq_dispatches` | (direct) | (mostly local) |
 
-The RBC ratio is the headline "cost-of-scheduler" difference — see
-[Concepts → Determinism](../concepts/determinism.md) for the PMU
-overhead model.
+The RBC (Retired Branch Count — a PMU / Performance Monitoring Unit
+event counter; see [Glossary](../glossary.md)) ratio is the headline
+"cost-of-scheduler" difference — see [Concepts →
+Determinism](../concepts/determinism.md) for the PMU overhead model.
 
 ## 4. Axis 3: structops stream
 

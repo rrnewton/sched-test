@@ -74,13 +74,13 @@ iterations, and completes after ~9.7 ms of simulated time.
 | `Max concurrent running: 1` | High-water mark for parallel-running tasks. |
 | `Total time slices: 5` | Distinct on-CPU intervals; matches the five-iteration `loop`. |
 | `All tasks completed: 9.6ms (9.7% of simulation)` | When the last task finished; the remaining 90% is idle. |
-| `structops`, `rbc`, `kfuncs` | sched_ext callbacks invoked, retired conditional branches inside them, and helper-function calls. The PMU-overhead model uses `rbc`; see [Determinism](../concepts/determinism.md). |
+| `structops`, `rbc`, `kfuncs` | sched_ext callbacks invoked, **RBC** (Retired Branch Count — retired conditional branches) inside them, and helper-function (kfunc) calls. The PMU-overhead (Performance Monitoring Unit) model uses `rbc`; see [Determinism](../concepts/determinism.md) and the [Glossary](../glossary.md). |
 | `longest_structop_rbc: 812` | Worst-case RBC count for a single callback in this run. |
 | `total_events: 64` | Simulator trace events emitted. |
 | `total_ticks: 2` | Scheduling-tick fires (the `tick` kfunc, fired every ~4 ms). |
 | `total_sleeps / total_wakes: 5 / 5` | Matches the `loop: 5` `sleep: 1000us` cadence. |
 | `total_idle_duration: 5.030ms` | CPU 0 was idle in the 1-ms windows between iterations. |
-| `local_dsq_dispatches: 5` | All five wake-ups dispatched into the local (per-CPU) DSQ. |
+| `local_dsq_dispatches: 5` | All five wake-ups dispatched into the local (per-CPU) **DSQ** (Dispatch Queue). |
 
 ## Variations
 

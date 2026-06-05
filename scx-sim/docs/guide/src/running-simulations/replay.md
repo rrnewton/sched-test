@@ -9,16 +9,18 @@ debuggable, reproducible artefacts.
 ## Why this exists
 
 The default `scxsim run` is deterministic given a `--seed`. Once you
-add `--preemptive`, however, preemption fires on PMU retired-branch
-counts, and PMU delivery has **skid** (~30–100 branches between
-"counter overflows" and "signal handler runs"). This makes runs
-divergent on each invocation — until you pin the preemption points
-into a trace and replay from it.
+add `--preemptive`, however, preemption fires on **PMU**
+(Performance Monitoring Unit, hardware performance counters)
+retired-branch counts, and PMU delivery has **skid** (~30–100
+branches between "counter overflows" and "signal handler runs").
+This makes runs divergent on each invocation — until you pin the
+preemption points into a trace and replay from it.
 
-The recorded trace captures **where** each preemption fired (RBC
-count + dynamic instance + worker). Replay re-injects each
-preemption at exactly the same place by setting hardware
-breakpoints — eliminating skid.
+The recorded trace captures **where** each preemption fired (**RBC**,
+Retired Branch Count + dynamic instance + worker; see
+[Glossary](../glossary.md)). Replay re-injects each preemption at
+exactly the same place by setting hardware breakpoints — eliminating
+skid.
 
 ## Record
 

@@ -5,6 +5,14 @@ how the fixture is constructed, what the invocation actually proves,
 and how to diagnose. Bug-1 is the production cgroup-bandwidth stall
 that motivated much of the H6 investigation track.
 
+> **Acronyms on this page:** **LAVD** = Latency-Aware Virtual
+> Deadline (the primary scheduler under study). **BPF** = Berkeley
+> Packet Filter — the *kernel* compile target for sched_ext
+> schedulers; in this guide the loaded `.so` is *native* code
+> compiled from the same C source, not BPF bytecode (see
+> [Introduction](../introduction.md)). Full definitions in the
+> [Glossary](../glossary.md).
+
 **Inputs** (all in-tree):
 
 - Workload: [`tests/fixtures/h6/bug1_canonical.json`][bug1-json]

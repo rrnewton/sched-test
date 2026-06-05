@@ -35,12 +35,16 @@ It does **not** apply to:
     Falls back to SCX_SIM_SEED env var, then default (42).
 ```
 
+(**PRNG** = Pseudo-Random Number Generator — see [Glossary](../glossary.md).)
+
 The seed feeds three sources of randomness:
 
 1. **Tick jitter.** Small offsets on per-CPU scheduling-tick
    timestamps (suppressed by `--no-noise`).
 2. **Context-switch overhead noise.** Per-switch noise on top of
-   the structop RBC cost (suppressed by `--no-overhead`).
+   the structop RBC (Retired Branch Count, a hardware PMU event —
+   see [Glossary](../glossary.md)) cost (suppressed by
+   `--no-overhead`).
 3. **Event tiebreaking.** When two events have the same simulated
    timestamp, default behaviour PRNG-randomizes their order. This is
    how rare ordering-dependent bugs become statistically discoverable

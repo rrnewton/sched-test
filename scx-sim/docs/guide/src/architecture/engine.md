@@ -38,10 +38,12 @@ simulation finishes in well under a second of wallclock on a typical
 machine — this is what gives scxsim its speed.
 
 Tick events default to ~4 ms periodicity per CPU, with PRNG-driven
-jitter suppressible by `--no-noise`. Context-switch overhead is
-charged as PRNG noise on top of structop RBC (suppressible by
-`--no-overhead`). PMU-derived overhead charges
-`rbc_count * --rbc-ns` to each callback's notional cost.
+(Pseudo-Random Number Generator, seeded for determinism) jitter
+suppressible by `--no-noise`. Context-switch overhead is charged as
+PRNG noise on top of structop RBC (Retired Branch Count, a hardware
+PMU counter — see [Glossary](../glossary.md); suppressible by
+`--no-overhead`). PMU-derived (Performance Monitoring Unit) overhead
+charges `rbc_count * --rbc-ns` to each callback's notional cost.
 
 ## Per-CPU run loop
 
@@ -72,8 +74,10 @@ When the engine needs to invoke a scheduler callback, it goes
 through `unsafe_impl/struct_ops.rs` — the FFI trampoline. The
 trampoline:
 
-1. Loads arguments into the calling convention the BPF-emitted code
-   expects.
+1. Loads arguments into the calling convention the scheduler's
+   native-compiled code expects (the scheduler `.so` is the
+   scheduler's C source compiled with clang's native target, not
+   the BPF target — see [Introduction](../introduction.md)).
 2. Calls the function pointer fetched from the dlopen'd `.so`.
 3. Pre/post wraps with RBC counter reads (for the overhead model).
 4. Emits a `TraceKind::StructOp{Entry, Exit}` event.

@@ -9,8 +9,20 @@ for any of the knobs:
 1. **Match production by default.**
 2. **Opt-in exaggerated knobs for stress.**
 
-These shape every default in the CLI and every promise the simulator
-makes about its output.
+These shape every default in the CLI (Command-Line Interface) and
+every promise the simulator makes about its output.
+
+> **Acronym primer** (used throughout this page; full definitions in
+> the [Glossary](../glossary.md)):
+> - **RBC** — Retired Branch Count, a hardware Performance Monitoring
+>   Unit (PMU) event counter scxsim uses to estimate per-callback
+>   scheduler cost (charged at `--rbc-ns` ns per branch, default 10 ns).
+> - **PRNG** — Pseudo-Random Number Generator, seeded for determinism.
+> - **BPF** — Berkeley Packet Filter; in this guide "BPF scheduler"
+>   means *a scheduler written for the sched_ext BPF interface*, not
+>   that the loaded `.so` contains BPF bytecode — under scxsim it is
+>   native code, see [Introduction](../introduction.md).
+> - **DSQ** — Dispatch Queue (sched_ext per-CPU / global run queue).
 
 ## Principle 1: Match production by default
 

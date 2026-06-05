@@ -11,10 +11,10 @@ files cached under `target/release/build/.../out/schedulers/`.
 | Tool | Purpose | Minimum |
 |---|---|---|
 | Rust toolchain | Compiling scxsim itself. Pinned by `rust-toolchain.toml`. | rustup, stable |
-| `clang` | Compiling the in-tree BPF scheduler sources. | 15+ (18 recommended) |
-| `bpftool` | Generating BPF skeleton headers consumed by the schedulers. | shipped with kernel-tools |
-| `libelf` headers | BPF object handling. | `libelf-dev` |
-| `libzstd` headers | BPF object handling. | `libzstd-dev` |
+| `clang` | Compiling the in-tree scheduler C sources. Note: scxsim invokes clang with a **native** target (NOT `--target=bpf`), so the schedulers are built as ordinary native shared libraries — see [Introduction](../introduction.md). | 15+ (18 recommended) |
+| `bpftool` | Generating Berkeley Packet Filter (BPF) skeleton headers that the scheduler C sources `#include`; needed even for native builds because the C source references the skeleton layout. | shipped with kernel-tools |
+| `libelf` headers | ELF object-file handling (used by `libbpf-sys` build deps). | `libelf-dev` |
+| `libzstd` headers | Zstandard compression headers (used by `libbpf-sys` build deps). | `libzstd-dev` |
 | `pkg-config` | Locating the above libraries during the build. | any |
 
 Optional:
@@ -61,8 +61,9 @@ cargo build --release -p scx_simulator --bin scxsim
 
 [repo]: https://github.com/facebookexperimental/sched-test
 
-The build invokes the BPF toolchain via the workspace `build.rs`, so
-the first build takes 1–3 minutes; subsequent builds are incremental.
+The build invokes `clang` (with a native target, not the BPF target)
+on each scheduler's C sources via the workspace `build.rs`, so the
+first build takes 1–3 minutes; subsequent builds are incremental.
 The resulting binary lands at `scx-sim/target/release/scxsim`.
 
 Add it to `$PATH` (optional but expected in the rest of the guide):
@@ -93,8 +94,8 @@ Commands:
   help    Print this message or the help of the given subcommand(s)
 ```
 
-**2. `scxsim run --list-schedulers` confirms the five BPF schedulers
-built and were cached:**
+**2. `scxsim run --list-schedulers` confirms the five sched_ext
+schedulers (native-compiled `.so` libraries) built and were cached:**
 
 ```bash
 scxsim run --list-schedulers
@@ -147,9 +148,10 @@ losing the ASLR-stability guarantee.
 - **`bpftool` not on `$PATH`.** Either install `linux-tools-generic`
   or build bpftool from source; some distros only ship a kernel-tied
   variant.
-- **Slow first build.** Most of the time is BPF compilation, not Rust.
-  Subsequent `cargo build` is fast (skeleton headers are cached); a
-  full BPF rebuild only triggers when `scheds/` sources change.
+- **Slow first build.** Most of the time is clang-ing the scheduler
+  C sources to native `.so` libraries, not Rust. Subsequent
+  `cargo build` is fast (skeleton headers are cached); a full
+  scheduler-`.so` rebuild only triggers when `scheds/` sources change.
 
 See also the top-level [`scx-sim/README.md`][scxsim-readme] for the
 authoritative install + build steps.

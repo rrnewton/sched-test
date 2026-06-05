@@ -1,10 +1,13 @@
 # What scxsim Simulates
 
-scxsim is a discrete-event simulator that loads a real sched_ext BPF
-scheduler `.so` and drives it against an rt-app-style workload, in
-virtual time, on a virtual CPU topology. The scheduler code is
-unchanged from what would run on a real kernel; everything around it
-is modeled.
+scxsim is a discrete-event simulator that loads a real sched_ext
+scheduler — built from the *same* C source that the kernel build
+compiles to BPF bytecode, but here compiled with vanilla clang to a
+**native** `.so` shared library — and drives it against an
+rt-app-style workload, in virtual time, on a virtual CPU topology.
+The scheduler source is unchanged from what would run on a real
+kernel; only the compilation target differs. Everything around the
+scheduler is modeled.
 
 This page enumerates what the model covers, what it deliberately stubs
 out, and where the boundaries live.
@@ -48,10 +51,10 @@ the scxsim crate:
   tree, the trace emitter. Everything here is deterministic given a
   seed and is what tests reason about.
 - **`unsafe_impl/`** — FFI bridge. This is where calls cross from
-  simulator-Rust into the scheduler `.so`'s BPF-emitted code. The
-  trampolines, the kfunc emulation shims, the dispatch worker pool,
-  and (when enabled) the e9patch / PMU preemption injection live
-  here.
+  simulator-Rust into the native machine code that clang produced
+  from the scheduler's C source. The trampolines, the kfunc
+  emulation shims, the dispatch worker pool, and (when enabled) the
+  e9patch / PMU preemption injection live here.
 
 If a behaviour you observe in a trace is wrong, the question
 "`safe/` bug, `unsafe_impl/` bug, or scheduler bug?" determines who
@@ -59,9 +62,11 @@ fixes it. See [Architecture → Safe vs Unsafe Layers](../architecture/safe-unsa
 
 ## Implication for bugs
 
-Because the scheduler code is real, bugs in the scheduler reproduce
-inside scxsim *because they are the same code*. The H6 / Bug-1
-canonical reproducer
+Because the scheduler C source is the same source the kernel build
+uses, bugs in the scheduler reproduce inside scxsim *because they
+are literally the same source code* — only the compilation target
+differs (native `.so` here vs BPF bytecode in the kernel). The H6 /
+Bug-1 canonical reproducer
 ([`tests/fixtures/h6/bug1_canonical.{json,toml}`][bug1]) is a
 production cgroup-bw stall that triggers under scxsim against the
 same `libscx_lavd.so` that runs on the kernel.

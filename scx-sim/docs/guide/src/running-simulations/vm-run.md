@@ -2,9 +2,13 @@
 
 `scxsim vm-run` is the ground-truth half of scxsim: it drives the
 same workload against a real Linux kernel running inside
-[virtme-ng (`vng`)][vng], with the chosen scheduler loaded as a
-real BPF program in that VM. The output is directly comparable
-against a `scxsim run` trace of the same workload.
+[virtme-ng (`vng`)][vng], with the chosen scheduler loaded as an
+actual BPF (Berkeley Packet Filter) bytecode program in that
+**VM** (Virtual Machine). This is the *real* kernel-target build of
+the scheduler — clang's `--target=bpf` output — as opposed to the
+native-target `.so` that `scxsim run` loads. The output is directly
+comparable against a `scxsim run` trace of the same workload, which
+is what makes vm-run the fidelity check for the simulator.
 
 [vng]: https://github.com/arighi/virtme-ng
 

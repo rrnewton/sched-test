@@ -1,9 +1,13 @@
 # Debugging with LLDB
 
-scxsim is a single-process Rust binary that dlopen's a real BPF
-scheduler `.so`. Both the engine and the scheduler are debuggable
-under lldb, including with full type summaries and a Bug-1-specific
-diagnose command.
+scxsim is a single-process Rust binary that `dlopen`s a native
+shared library built from the real sched_ext scheduler's C source
+(compiled with clang's native target, not the BPF target — so the
+scheduler runs as ordinary userspace machine code). Both the engine
+and the scheduler are debuggable under lldb, including with full
+type summaries and a Bug-1-specific diagnose command. **This is
+something kernel BPF cannot offer:** there is no native debugger
+for BPF bytecode running in the kernel.
 
 This recipe walks the canonical attach loop and the helpers under
 [`scx-sim/lldb_debug/`][lldb-debug].

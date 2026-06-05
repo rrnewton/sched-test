@@ -1,9 +1,13 @@
 # Schedulers
 
-scxsim ships five BPF schedulers, built from the in-tree
+scxsim ships five sched_ext schedulers, built from the in-tree
 [`scx`](https://github.com/sched-ext/scx) submodule and cached under
 `scx-sim/target/release/build/.../out/schedulers/` after a release
-build. Pick one with `--scheduler <name>`.
+build. Each scheduler's C source — the same source that the kernel
+build compiles to BPF (Berkeley Packet Filter) bytecode — is here
+compiled with clang's **native** target to produce a `libscx_<name>.so`
+shared library; see [Introduction](../introduction.md) for the
+pipeline distinction. Pick one with `--scheduler <name>`.
 
 ## The five bundled schedulers
 
