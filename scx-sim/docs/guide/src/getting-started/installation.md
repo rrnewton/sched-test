@@ -22,10 +22,14 @@ release-mode cargo build):
 
 ```bash
 git clone --recursive https://github.com/rrnewton/sched-test.git
-cd sched-test/scx-sim
-docker build -t scxsim .
+cd sched-test
+docker build -t scxsim -f scx-sim/Dockerfile .
 docker run --rm scxsim
 ```
+
+(The build context is the repo root — not `scx-sim/` — because the
+simulator's `build.rs` reaches up into `lib/scxtest`, `scheds/`, and
+the `scx/` submodule when compiling the BPF scheduler C sources.)
 
 The final command runs `examples/hello.json` against the `simple`
 scheduler for 100 ms of simulated time. The last line should read:

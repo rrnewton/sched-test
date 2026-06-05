@@ -1,0 +1,52 @@
+# Keep the docker build context for scx-sim/Dockerfile small. The
+# build context is the REPO ROOT (see scx-sim/Dockerfile header for
+# why), so this file mirrors what the simulator's Cargo build
+# regenerates anyway, plus broader harness noise.
+#
+# Without this, the context can balloon by hundreds of MB of trace
+# captures and stale build artifacts.
+
+# Cargo build output everywhere.
+target/
+**/target/
+
+# Profiling / coverage artefacts.
+*.profraw
+*.profdata
+.coverage_html/
+coverage-out/
+.venv/
+
+# Local issue tracker state — not needed for builds.
+.beads/
+**/.beads/
+
+# Editor / IDE / OS noise.
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+tags
+
+# In-tree submodule + library build artefacts.
+scx-sim/schedulers/build/
+scx-sim/csrc/build/
+scx-sim/third_party/e9patch/
+
+# mdbook output for the scxsim guide.
+scx-sim/docs/guide/book/
+
+# Captured experiments + transient AI scratch notes — heavy and
+# irrelevant to a working scxsim image.
+experiments/
+ai_docs/
+scratch/
+
+# Tests and benchmark histories that aren't needed at runtime and are
+# heavy on disk.
+data/benchmarks/
+
+# Don't ship git history into the container.
+.git/
+**/.git/

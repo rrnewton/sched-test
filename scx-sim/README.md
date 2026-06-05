@@ -28,14 +28,18 @@ example workloads.
 
 ```bash
 git clone --recursive https://github.com/rrnewton/sched-test.git
-cd sched-test/scx-sim
-docker build -t scxsim .
+cd sched-test
+docker build -t scxsim -f scx-sim/Dockerfile .
 docker run --rm scxsim
 ```
 
 (`--recursive` initialises the `scx` submodule which the scheduler
 build needs. If you already cloned without it: `git submodule update
---init --recursive`.)
+--init --recursive`. The build context is the repo root, not
+`scx-sim/`, because the simulator's `build.rs` reaches up into
+`lib/scxtest`, `scheds/`, and the `scx/` submodule when compiling
+the BPF scheduler C sources — see `scx-sim/Dockerfile` for the
+gory details.)
 
 That last command runs `examples/hello.json` against the `simple`
 scheduler for 100 ms of simulated time and prints a per-CPU

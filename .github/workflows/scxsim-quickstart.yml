@@ -27,6 +27,7 @@ on:
     paths:
       - 'scx-sim/Dockerfile'
       - 'scx-sim/.dockerignore'
+      - '.dockerignore'
       - 'scx-sim/flake.nix'
       - 'scx-sim/flake.lock'
       - 'scx-sim/examples/**'
@@ -44,6 +45,7 @@ on:
     paths:
       - 'scx-sim/Dockerfile'
       - 'scx-sim/.dockerignore'
+      - '.dockerignore'
       - 'scx-sim/flake.nix'
       - 'scx-sim/flake.lock'
       - 'scx-sim/examples/**'
@@ -69,10 +71,12 @@ jobs:
         with:
           submodules: recursive
 
-      # The Dockerfile lives in scx-sim/ and expects the build context
-      # to be that directory (its .dockerignore is scoped to scx-sim/).
-      - name: docker build -t scxsim scx-sim/
-        run: docker build -t scxsim scx-sim/
+      # The Dockerfile lives in scx-sim/ but the build context must be
+      # the REPO ROOT — build.rs walks up out of scx-sim/ to find
+      # lib/scxtest/, scheds/, and the scx/ submodule. The repo-root
+      # .dockerignore keeps the context small.
+      - name: docker build -t scxsim
+        run: docker build -t scxsim -f scx-sim/Dockerfile .
 
       # Smoke-run the default ENTRYPOINT/CMD (simple scheduler,
       # examples/hello.json, 4 cpus, 100ms). Assert the expected

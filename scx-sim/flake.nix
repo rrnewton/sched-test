@@ -29,7 +29,16 @@
   # The dev-shell approach above is the supported path.)
   description = "scx_simulator — deterministic discrete-event simulator for sched_ext schedulers";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-24.05";
+  # Pin nixpkgs by SHA, not by channel name. `nixos-unstable` would
+  # work for *modern* nix (2.18+) via the flake.lock, but
+  # cachix/install-nix-action used in CI sometimes resolves channel
+  # names against the runner's NIX_PATH and silently downgrades to an
+  # older nixpkgs (we observed it picking 24.05 / rustc 1.77 even with
+  # flake.lock pointing at unstable, which then fails on the Cargo.lock
+  # v4 / rustc-1.88-required combo). A pinned SHA bypasses that
+  # entirely. SHA below is nixos-unstable from 2026-05-31, giving
+  # clang 21.1.8 + rustc 1.95.0. Bump when the workspace MSRV bumps.
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/331800de5053fcebacf6813adb5db9c9dca22a0c";
   inputs.flake-utils.url = "github:numtide/flake-utils";
 
   outputs = { self, nixpkgs, flake-utils }:
