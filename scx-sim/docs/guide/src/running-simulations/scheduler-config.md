@@ -108,4 +108,4 @@ for the full walkthrough.
    like a constant for the duration of the run. To change a value,
    exit and restart with a new `--config`.
 
-[bug1-toml]: https://github.com/facebookexperimental/sched-test/blob/simulator.v6/scx-sim/crates/scx_simulator/tests/fixtures/h6/bug1_canonical.toml
+[bug1-toml]: https://github.com/rrnewton/sched-test/blob/simulator.v6/scx-sim/crates/scx_simulator/tests/fixtures/h6/bug1_canonical.toml

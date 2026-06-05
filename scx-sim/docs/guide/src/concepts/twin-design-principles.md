@@ -4,7 +4,7 @@ scxsim has two design pillars, codified in
 [`scx-sim/CLAUDE.md`][claude-md]. Internalize them before reaching
 for any of the knobs:
 
-[claude-md]: https://github.com/facebookexperimental/sched-test/blob/simulator.v6/scx-sim/CLAUDE.md
+[claude-md]: https://github.com/rrnewton/sched-test/blob/simulator.v6/scx-sim/CLAUDE.md
 
 1. **Match production by default.**
 2. **Opt-in exaggerated knobs for stress.**

@@ -5,7 +5,7 @@ it advances virtual time, fires events into the scheduler's
 struct_ops callbacks, and drives per-CPU run loops. Implemented in
 [`safe/engine.rs`][engine-rs] and `safe/scenario.rs`.
 
-[engine-rs]: https://github.com/facebookexperimental/sched-test/blob/simulator.v6/scx-sim/crates/scx_simulator/src/safe/engine.rs
+[engine-rs]: https://github.com/rrnewton/sched-test/blob/simulator.v6/scx-sim/crates/scx_simulator/src/safe/engine.rs
 
 ## Event loop
 
@@ -88,7 +88,7 @@ each callback runs to completion before the engine resumes.
 ## Sources
 
 - [`safe/engine.rs`][engine-rs] — the event loop and per-CPU state.
-- [`safe/scenario.rs`](https://github.com/facebookexperimental/sched-test/blob/simulator.v6/scx-sim/crates/scx_simulator/src/safe/scenario.rs) —
+- [`safe/scenario.rs`](https://github.com/rrnewton/sched-test/blob/simulator.v6/scx-sim/crates/scx_simulator/src/safe/scenario.rs) —
   workload → initial event-heap translation.
 - `ai_docs/concurrency_model_exploration.md` — design notes on
   serial vs interleaved dispatch.

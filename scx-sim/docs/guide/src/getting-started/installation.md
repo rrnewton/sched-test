@@ -4,7 +4,7 @@ scxsim is a Rust workspace under [`scx-sim/`][scx-sim-tree]. Building
 it produces a single binary, `scxsim`, plus a set of scheduler `.so`
 files cached under `target/release/build/.../out/schedulers/`.
 
-[scx-sim-tree]: https://github.com/facebookexperimental/sched-test/tree/simulator.v6/scx-sim
+[scx-sim-tree]: https://github.com/rrnewton/sched-test/tree/simulator.v6/scx-sim
 
 If you only want to *try* scxsim, the two quick starts below skip the
 system-dependency dance entirely. Either path produces a working
@@ -124,7 +124,7 @@ Optional:
 | `virtme-ng` (`vng`) | Required for the `vm-run` subcommand (real-kernel ground-truth comparison). |
 | `bpftrace` | Required for `vm-run --bpf-trace`. |
 
-[e9-install]: https://github.com/facebookexperimental/sched-test/blob/simulator.v6/scx-sim/scripts/install_e9patch.sh
+[e9-install]: https://github.com/rrnewton/sched-test/blob/simulator.v6/scx-sim/scripts/install_e9patch.sh
 
 On Debian / Ubuntu, the apt-installable prerequisites are roughly:
 
@@ -147,18 +147,18 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 ## Building from source
 
-From a fresh checkout of [`facebookexperimental/sched-test`][repo],
+From a fresh checkout of [`rrnewton/sched-test`][repo],
 checkout the simulator branch and build the release binary:
 
 ```bash
-git clone https://github.com/facebookexperimental/sched-test.git
+git clone https://github.com/rrnewton/sched-test.git
 cd sched-test
 git checkout simulator.v6
 cd scx-sim
 cargo build --release -p scx_simulator --bin scxsim
 ```
 
-[repo]: https://github.com/facebookexperimental/sched-test
+[repo]: https://github.com/rrnewton/sched-test
 
 The build invokes `clang` (with a native target, not the BPF target)
 on each scheduler's C sources via the workspace `build.rs`, so the
@@ -255,4 +255,4 @@ losing the ASLR-stability guarantee.
 See also the top-level [`scx-sim/README.md`][scxsim-readme] for the
 authoritative install + build steps.
 
-[scxsim-readme]: https://github.com/facebookexperimental/sched-test/blob/simulator.v6/scx-sim/README.md
+[scxsim-readme]: https://github.com/rrnewton/sched-test/blob/simulator.v6/scx-sim/README.md

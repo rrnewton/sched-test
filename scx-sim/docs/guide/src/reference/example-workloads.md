@@ -3,12 +3,12 @@
 scxsim ships two parallel sets of workloads:
 
 1. **Demo / guide examples** under
-   [`scx-sim/examples/`](https://github.com/facebookexperimental/sched-test/tree/simulator.v6/scx-sim/examples) —
+   [`scx-sim/examples/`](https://github.com/rrnewton/sched-test/tree/simulator.v6/scx-sim/examples) —
    short, well-commented rt-app JSON files referenced from the guide.
    These are designed to be the first thing a new user runs.
 2. **Test fixtures** under
-   [`scx-sim/crates/scx_simulator/workloads/`](https://github.com/facebookexperimental/sched-test/tree/simulator.v6/scx-sim/crates/scx_simulator/workloads) and
-   [`scx-sim/crates/scx_simulator/tests/fixtures/`](https://github.com/facebookexperimental/sched-test/tree/simulator.v6/scx-sim/crates/scx_simulator/tests/fixtures) —
+   [`scx-sim/crates/scx_simulator/workloads/`](https://github.com/rrnewton/sched-test/tree/simulator.v6/scx-sim/crates/scx_simulator/workloads) and
+   [`scx-sim/crates/scx_simulator/tests/fixtures/`](https://github.com/rrnewton/sched-test/tree/simulator.v6/scx-sim/crates/scx_simulator/tests/fixtures) —
    integration-test fixtures (Bug-1 canonical, H6 cells, dsq stress).
    These are precise and not always easy to read; the demos are
    curated subsets of the same shape.
@@ -17,11 +17,11 @@ scxsim ships two parallel sets of workloads:
 
 | File | Demonstrates |
 |---|---|
-| [`examples/hello.json`](https://github.com/facebookexperimental/sched-test/blob/simulator.v6/scx-sim/examples/hello.json) | Minimal single-task workload — a five-iteration "hello world." |
-| [`examples/cpu_bound.json`](https://github.com/facebookexperimental/sched-test/blob/simulator.v6/scx-sim/examples/cpu_bound.json) | Four CPU-bound workers showing how the scheduler distributes load. |
-| [`examples/cgroup_hierarchy.json`](https://github.com/facebookexperimental/sched-test/blob/simulator.v6/scx-sim/examples/cgroup_hierarchy.json) | Two cgroups with different `cpu.max` quotas (`/background` throttled, `/interactive` unconstrained). |
+| [`examples/hello.json`](https://github.com/rrnewton/sched-test/blob/simulator.v6/scx-sim/examples/hello.json) | Minimal single-task workload — a five-iteration "hello world." |
+| [`examples/cpu_bound.json`](https://github.com/rrnewton/sched-test/blob/simulator.v6/scx-sim/examples/cpu_bound.json) | Four CPU-bound workers showing how the scheduler distributes load. |
+| [`examples/cgroup_hierarchy.json`](https://github.com/rrnewton/sched-test/blob/simulator.v6/scx-sim/examples/cgroup_hierarchy.json) | Two cgroups with different `cpu.max` quotas (`/background` throttled, `/interactive` unconstrained). |
 
-See [`examples/README.md`](https://github.com/facebookexperimental/sched-test/blob/simulator.v6/scx-sim/examples/README.md)
+See [`examples/README.md`](https://github.com/rrnewton/sched-test/blob/simulator.v6/scx-sim/examples/README.md)
 for one-liners on how to run each.
 
 ## Production fixtures (selected)

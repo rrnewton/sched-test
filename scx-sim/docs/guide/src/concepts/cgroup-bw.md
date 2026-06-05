@@ -9,9 +9,9 @@ The implementation lives in the [`scx_cgroup_tree`][cgroup-tree]
 crate plus [`safe/cgroup.rs`][safe-cgroup] and
 [`unsafe_impl/cgroup_ffi.rs`][unsafe-cgroup].
 
-[cgroup-tree]: https://github.com/facebookexperimental/sched-test/tree/simulator.v6/scx-sim/crates/scx_cgroup_tree
-[safe-cgroup]: https://github.com/facebookexperimental/sched-test/blob/simulator.v6/scx-sim/crates/scx_simulator/src/safe/cgroup.rs
-[unsafe-cgroup]: https://github.com/facebookexperimental/sched-test/blob/simulator.v6/scx-sim/crates/scx_simulator/src/unsafe_impl/cgroup_ffi.rs
+[cgroup-tree]: https://github.com/rrnewton/sched-test/tree/simulator.v6/scx-sim/crates/scx_cgroup_tree
+[safe-cgroup]: https://github.com/rrnewton/sched-test/blob/simulator.v6/scx-sim/crates/scx_simulator/src/safe/cgroup.rs
+[unsafe-cgroup]: https://github.com/rrnewton/sched-test/blob/simulator.v6/scx-sim/crates/scx_simulator/src/unsafe_impl/cgroup_ffi.rs
 
 ## Concept refresher
 
@@ -158,7 +158,7 @@ watchdog trips at 80 ms with `ExitKind::ErrorStall` (exit code 42).
 See [Recipes → Reproducing a Stall Bug](../recipes/repro-stall.md)
 for the full walkthrough.
 
-[bug1]: https://github.com/facebookexperimental/sched-test/tree/simulator.v6/scx-sim/crates/scx_simulator/tests/fixtures/h6
+[bug1]: https://github.com/rrnewton/sched-test/tree/simulator.v6/scx-sim/crates/scx_simulator/tests/fixtures/h6
 
 ## Diagnostics
 
@@ -172,5 +172,5 @@ Useful flags / outputs for cgroup-bw investigations:
   `CGROUP_REPLENISH`.
 - lldb attach (`--wait-debugger`) — inspect cgroup tree state via
   the helpers under
-  [`lldb_debug/`](https://github.com/facebookexperimental/sched-test/tree/simulator.v6/scx-sim/lldb_debug);
+  [`lldb_debug/`](https://github.com/rrnewton/sched-test/tree/simulator.v6/scx-sim/lldb_debug);
   `bug1_diagnose` is the canonical cgroup-bw helper.

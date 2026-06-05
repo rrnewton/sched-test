@@ -6,7 +6,7 @@ emitter in [`safe/trace.rs`][trace-rs] and fans out to multiple
 downstream sinks. This is the machinery behind every artefact
 described in [Trace Output Sinks](../running-simulations/trace-output.md).
 
-[trace-rs]: https://github.com/facebookexperimental/sched-test/blob/simulator.v6/scx-sim/crates/scx_simulator/src/safe/trace.rs
+[trace-rs]: https://github.com/rrnewton/sched-test/blob/simulator.v6/scx-sim/crates/scx_simulator/src/safe/trace.rs
 
 ## The event type
 
@@ -90,9 +90,9 @@ an event.
 ## Sources
 
 - [`safe/trace.rs`][trace-rs] — the central emitter.
-- [`safe/perfetto.rs`](https://github.com/facebookexperimental/sched-test/blob/simulator.v6/scx-sim/crates/scx_simulator/src/safe/perfetto.rs) —
+- [`safe/perfetto.rs`](https://github.com/rrnewton/sched-test/blob/simulator.v6/scx-sim/crates/scx_simulator/src/safe/perfetto.rs) —
   Perfetto JSON and protobuf writers.
-- [`safe/bpf_trace.rs`](https://github.com/facebookexperimental/sched-test/blob/simulator.v6/scx-sim/crates/scx_simulator/src/safe/bpf_trace.rs) —
+- [`safe/bpf_trace.rs`](https://github.com/rrnewton/sched-test/blob/simulator.v6/scx-sim/crates/scx_simulator/src/safe/bpf_trace.rs) —
   structops JSONL writer.
 - `ai_docs/record_replay_architecture.md` — design of the preemption
   trace format and replay loop.

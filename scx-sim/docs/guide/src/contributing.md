@@ -63,7 +63,7 @@ the same style:
 
 Every `*.json` workload under `scx-sim/examples/` is exercised on
 every CI run by the
-[`scxsim guide examples`](https://github.com/facebookexperimental/sched-test/actions/workflows/scxsim-examples.yml)
+[`scxsim guide examples`](https://github.com/rrnewton/sched-test/actions/workflows/scxsim-examples.yml)
 GitHub Actions workflow, which invokes:
 
 ```bash
@@ -72,7 +72,7 @@ make test-examples
 ```
 
 `make test-examples` is a thin wrapper around
-[`docs/guide/tests/test_examples.sh`](https://github.com/facebookexperimental/sched-test/blob/simulator.v6/scx-sim/docs/guide/tests/test_examples.sh).
+[`docs/guide/tests/test_examples.sh`](https://github.com/rrnewton/sched-test/blob/simulator.v6/scx-sim/docs/guide/tests/test_examples.sh).
 The script enumerates `examples/*.json`, runs each through
 `scxsim run --duration 100ms --watchdog 5s --cpus 4`, and asserts
 exit code 0. Failures print the captured stderr/stdout so the

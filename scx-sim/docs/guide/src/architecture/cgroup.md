@@ -13,9 +13,9 @@ crates/modules.
 | [`safe/cgroup.rs`][safe-cgroup] | Simulator state: per-cgroup `runtime_ns`, `is_throttled`, the periodic `CgroupBwReplenish` event, and the throttle-pivot bookkeeping. |
 | [`unsafe_impl/cgroup_ffi.rs`][cgroup-ffi] / `cgroup_wrapper.rs` | BPF-side view: when the scheduler reads `cgroup->cpu.max` or calls `bpf_cgroup_throttled()`, these shim the access into the safe-side state. |
 
-[cgroup-tree-crate]: https://github.com/facebookexperimental/sched-test/tree/simulator.v6/scx-sim/crates/scx_cgroup_tree
-[safe-cgroup]: https://github.com/facebookexperimental/sched-test/blob/simulator.v6/scx-sim/crates/scx_simulator/src/safe/cgroup.rs
-[cgroup-ffi]: https://github.com/facebookexperimental/sched-test/blob/simulator.v6/scx-sim/crates/scx_simulator/src/unsafe_impl/cgroup_ffi.rs
+[cgroup-tree-crate]: https://github.com/rrnewton/sched-test/tree/simulator.v6/scx-sim/crates/scx_cgroup_tree
+[safe-cgroup]: https://github.com/rrnewton/sched-test/blob/simulator.v6/scx-sim/crates/scx_simulator/src/safe/cgroup.rs
+[cgroup-ffi]: https://github.com/rrnewton/sched-test/blob/simulator.v6/scx-sim/crates/scx_simulator/src/unsafe_impl/cgroup_ffi.rs
 
 ## Where cgroups come from
 
@@ -111,5 +111,5 @@ set and is verified byte-for-byte by `--determinism-check`.
 - [`safe/cgroup.rs`][safe-cgroup] — simulator-side state, replenish
   event handler, throttle bookkeeping.
 - [`unsafe_impl/cgroup_ffi.rs`][cgroup-ffi] — BPF-side accessors.
-- [`unsafe_impl/cgroup_wrapper.rs`](https://github.com/facebookexperimental/sched-test/blob/simulator.v6/scx-sim/crates/scx_simulator/src/unsafe_impl/cgroup_wrapper.rs) —
+- [`unsafe_impl/cgroup_wrapper.rs`](https://github.com/rrnewton/sched-test/blob/simulator.v6/scx-sim/crates/scx_simulator/src/unsafe_impl/cgroup_wrapper.rs) —
   thin layer mediating the safe / unsafe view.

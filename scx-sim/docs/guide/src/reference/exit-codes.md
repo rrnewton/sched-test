@@ -23,6 +23,6 @@ automation should pattern-match this line rather than parsing surrounding
 log noise.
 
 This table mirrors
-[`scx-sim/README.md`](https://github.com/facebookexperimental/sched-test/blob/simulator.v6/scx-sim/README.md);
+[`scx-sim/README.md`](https://github.com/rrnewton/sched-test/blob/simulator.v6/scx-sim/README.md);
 a future improvement is to generate it directly from the `ExitKind`
 enum in `safe/types.rs` so the two cannot drift.

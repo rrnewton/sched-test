@@ -22,8 +22,8 @@ scxsim run [OPTIONS] [WORKLOAD]
 
 If `WORKLOAD` is omitted, scxsim uses a small built-in default — but
 the common case is to pass the path to a workload file from
-[`examples/`](https://github.com/facebookexperimental/sched-test/tree/simulator.v6/scx-sim/examples) or
-[`crates/scx_simulator/workloads/`](https://github.com/facebookexperimental/sched-test/tree/simulator.v6/scx-sim/crates/scx_simulator/workloads).
+[`examples/`](https://github.com/rrnewton/sched-test/tree/simulator.v6/scx-sim/examples) or
+[`crates/scx_simulator/workloads/`](https://github.com/rrnewton/sched-test/tree/simulator.v6/scx-sim/crates/scx_simulator/workloads).
 
 The full canonical option list is `scxsim run --help` (also mirrored
 at [Reference → CLI](../reference/cli.md)). This page groups the

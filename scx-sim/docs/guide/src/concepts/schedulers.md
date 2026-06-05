@@ -40,7 +40,7 @@ top-level [`scx-sim/README.md`][readme] for the build flags that
 enable each. The selection is normally automatic, but a partial
 build can omit individual schedulers.
 
-[readme]: https://github.com/facebookexperimental/sched-test/blob/simulator.v6/scx-sim/README.md
+[readme]: https://github.com/rrnewton/sched-test/blob/simulator.v6/scx-sim/README.md
 
 ## Pointing at a custom `.so`
 

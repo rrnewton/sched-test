@@ -12,7 +12,7 @@ and the four follow-on experiments you can run with one flag.
 {{#include ../../../../examples/hello.json}}
 ```
 
-[hello-json]: https://github.com/facebookexperimental/sched-test/blob/simulator.v6/scx-sim/examples/hello.json
+[hello-json]: https://github.com/rrnewton/sched-test/blob/simulator.v6/scx-sim/examples/hello.json
 
 Each field:
 

@@ -16,7 +16,7 @@ scxsim run \
     examples/hello.json
 ```
 
-[scx-sim]: https://github.com/facebookexperimental/sched-test/tree/simulator.v6/scx-sim
+[scx-sim]: https://github.com/rrnewton/sched-test/tree/simulator.v6/scx-sim
 
 ## What gets printed
 

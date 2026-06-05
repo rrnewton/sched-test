@@ -20,8 +20,8 @@ that motivated much of the H6 investigation track.
 - Test harness: `tests/bug1_canonical_repro.rs`
 - Background: `crates/scx_simulator/tests/fixtures/h6/README.md`
 
-[bug1-json]: https://github.com/facebookexperimental/sched-test/blob/simulator.v6/scx-sim/crates/scx_simulator/tests/fixtures/h6/bug1_canonical.json
-[bug1-toml]: https://github.com/facebookexperimental/sched-test/blob/simulator.v6/scx-sim/crates/scx_simulator/tests/fixtures/h6/bug1_canonical.toml
+[bug1-json]: https://github.com/rrnewton/sched-test/blob/simulator.v6/scx-sim/crates/scx_simulator/tests/fixtures/h6/bug1_canonical.json
+[bug1-toml]: https://github.com/rrnewton/sched-test/blob/simulator.v6/scx-sim/crates/scx_simulator/tests/fixtures/h6/bug1_canonical.toml
 
 ## TL;DR
 

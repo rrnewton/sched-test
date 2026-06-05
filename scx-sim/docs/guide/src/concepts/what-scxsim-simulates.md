@@ -76,7 +76,7 @@ fault timing, real network jitter, real interrupt storms) will not
 reproduce. Such cases need [`vm-run`](../running-simulations/vm-run.md)
 or bare-metal.
 
-[bug1]: https://github.com/facebookexperimental/sched-test/tree/simulator.v6/scx-sim/crates/scx_simulator/tests/fixtures/h6
+[bug1]: https://github.com/rrnewton/sched-test/tree/simulator.v6/scx-sim/crates/scx_simulator/tests/fixtures/h6
 
 See also [Concepts → Twin Design Principles](./twin-design-principles.md)
 for the policy that determines which knobs are realistic by default

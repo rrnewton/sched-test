@@ -12,7 +12,7 @@ for BPF bytecode running in the kernel.
 This recipe walks the canonical attach loop and the helpers under
 [`scx-sim/lldb_debug/`][lldb-debug].
 
-[lldb-debug]: https://github.com/facebookexperimental/sched-test/tree/simulator.v6/scx-sim/lldb_debug
+[lldb-debug]: https://github.com/rrnewton/sched-test/tree/simulator.v6/scx-sim/lldb_debug
 
 ## 1. Launch with `--wait-debugger`
 
@@ -92,7 +92,7 @@ See [`scx-sim/lldb_debug/README.md`][lldb-readme] for the full list
 and the `worked_example.sh` end-to-end demo against
 `bug1_canonical.json`.
 
-[lldb-readme]: https://github.com/facebookexperimental/sched-test/blob/simulator.v6/scx-sim/lldb_debug/README.md
+[lldb-readme]: https://github.com/rrnewton/sched-test/blob/simulator.v6/scx-sim/lldb_debug/README.md
 
 ## 4. Run the workload to completion
 

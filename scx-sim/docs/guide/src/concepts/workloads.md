@@ -9,7 +9,7 @@ The parser lives in [`safe/rtapp.rs`][rtapp-rs]; this page documents
 the subset and the scxsim-specific extensions.
 
 [rtapp]: https://github.com/scheduler-tools/rt-app
-[rtapp-rs]: https://github.com/facebookexperimental/sched-test/blob/simulator.v6/scx-sim/crates/scx_simulator/src/safe/rtapp.rs
+[rtapp-rs]: https://github.com/rrnewton/sched-test/blob/simulator.v6/scx-sim/crates/scx_simulator/src/safe/rtapp.rs
 
 ## Minimal shape
 
@@ -156,6 +156,6 @@ Simulation complete:
 - Fixtures: [`scx-sim/crates/scx_simulator/workloads/`][workloads-tree]
   and [`tests/fixtures/`][fixtures-tree].
 
-[examples-tree]: https://github.com/facebookexperimental/sched-test/tree/simulator.v6/scx-sim/examples
-[workloads-tree]: https://github.com/facebookexperimental/sched-test/tree/simulator.v6/scx-sim/crates/scx_simulator/workloads
-[fixtures-tree]: https://github.com/facebookexperimental/sched-test/tree/simulator.v6/scx-sim/crates/scx_simulator/tests/fixtures
+[examples-tree]: https://github.com/rrnewton/sched-test/tree/simulator.v6/scx-sim/examples
+[workloads-tree]: https://github.com/rrnewton/sched-test/tree/simulator.v6/scx-sim/crates/scx_simulator/workloads
+[fixtures-tree]: https://github.com/rrnewton/sched-test/tree/simulator.v6/scx-sim/crates/scx_simulator/tests/fixtures

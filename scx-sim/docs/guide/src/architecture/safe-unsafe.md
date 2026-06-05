@@ -8,8 +8,8 @@ scheduler `.so` and the **kfunc** (kernel-function emulation) shim
 that stands in for the kernel. (Both terms in the
 [Glossary](../glossary.md).)
 
-[safe-tree]: https://github.com/facebookexperimental/sched-test/tree/simulator.v6/scx-sim/crates/scx_simulator/src/safe
-[unsafe-tree]: https://github.com/facebookexperimental/sched-test/tree/simulator.v6/scx-sim/crates/scx_simulator/src/unsafe_impl
+[safe-tree]: https://github.com/rrnewton/sched-test/tree/simulator.v6/scx-sim/crates/scx_simulator/src/safe
+[unsafe-tree]: https://github.com/rrnewton/sched-test/tree/simulator.v6/scx-sim/crates/scx_simulator/src/unsafe_impl
 
 The rule of thumb:
 

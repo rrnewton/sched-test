@@ -11,8 +11,8 @@ edition = "2021"
 [output.html]
 default-theme = "rust"
 preferred-dark-theme = "ayu"
-git-repository-url = "https://github.com/facebookexperimental/sched-test"
-edit-url-template = "https://github.com/facebookexperimental/sched-test/edit/simulator.v6/scx-sim/docs/guide/{path}"
+git-repository-url = "https://github.com/rrnewton/sched-test"
+edit-url-template = "https://github.com/rrnewton/sched-test/edit/simulator.v6/scx-sim/docs/guide/{path}"
 mathjax-support = false
 no-section-label = false
 
