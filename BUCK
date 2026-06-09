@@ -6,7 +6,8 @@ oncall("sched_ext")
 # Single-crate approach: matches Cargo's structure exactly
 rust_library(
     name = "schtest_lib",
-    srcs = ["schtest/rust/src/lib.rs"] + glob([
+    srcs = ["schtest/rust/src/lib.rs"]
+    + glob([
         "schtest/rust/src/util/**/*.rs",
         "schtest/rust/src/workloads/**/*.rs",
         "schtest/rust/src/cases/**/*.rs",
