@@ -2870,6 +2870,21 @@ pub extern "C" fn sim_scx_bpf_dsq_move(p: *mut c_void, dst_dsq_id: u64, _enq_fla
 // Updated bpf_task_from_pid — return real task_struct*
 // ---------------------------------------------------------------------------
 
+/// Reserved PID for the simulator's synthetic "loader" task.
+///
+/// Upstream cgroup_bw (sched-ext/scx `a52f85e3` "lib/cgroup_bw: resolve root
+/// cgroup through the loader task") resolves the root cgroup by capturing the
+/// loader process's tgid at `scx_cgroup_bw_lib_init()` and later doing
+/// `bpf_task_from_pid(cbw_loader_tgid)->cgroups->dfl_cgrp`. The simulator has
+/// no separate loader process, so the LAVD wrapper publishes this reserved
+/// tgid via `bpf_get_current_pid_tgid()` and we resolve it to the always-
+/// present idle task (which lives in the root cgroup) here.
+///
+/// Must match `SIM_CBW_LOADER_TGID` in `schedulers/lavd/wrapper.c`. The value
+/// is in the reserved high PID range so it never collides with a workload
+/// task's PID.
+pub const SIM_CBW_LOADER_PID: i32 = 0x7FFF_FF00;
+
 /// Look up a task by PID and return its task_struct pointer.
 ///
 /// In BPF this is a verifier workaround; in the simulator we use it
@@ -2877,6 +2892,13 @@ pub extern "C" fn sim_scx_bpf_dsq_move(p: *mut c_void, dst_dsq_id: u64, _enq_fla
 #[no_mangle]
 pub extern "C" fn bpf_task_from_pid(pid: i32) -> *mut c_void {
     with_sim(kfunc_cost::SIMPLE, |sim| {
+        // cgroup_bw's loader-task root-cgroup resolution: map the reserved
+        // loader PID to the synthetic idle task, which sim_task_alloc() places
+        // in the root cgroup (cgroups->dfl_cgrp == sim root). See
+        // SIM_CBW_LOADER_PID above.
+        if pid == SIM_CBW_LOADER_PID {
+            return sim.idle_task_raw;
+        }
         sim.task_pid_to_raw
             .get(&Pid(pid))
             .map_or(ptr::null_mut(), |&raw| raw as *mut c_void)

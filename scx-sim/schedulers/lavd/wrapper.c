@@ -64,11 +64,29 @@
 #define bpf_per_cpu_ptr(ptr, cpu) ((typeof(ptr))0)
 
 /*
- * bpf_get_current_pid_tgid -- no meaningful PID in the simulator.
+ * Reserved PID for the simulator's synthetic "loader" task — the stand-in
+ * for the scx_lavd userspace loader process. Upstream cgroup_bw
+ * (sched-ext/scx a52f85e3 "lib/cgroup_bw: resolve root cgroup through the
+ * loader task") resolves the root cgroup by capturing the loader's tgid at
+ * scx_cgroup_bw_lib_init() time and later doing
+ * bpf_task_from_pid(cbw_loader_tgid)->cgroups->dfl_cgrp. The simulator has
+ * no separate loader process, so we model it with the always-present idle
+ * task (which lives in the root cgroup): bpf_task_from_pid() returns the
+ * idle task for this reserved pid (see kfuncs.rs). Must match
+ * SIM_CBW_LOADER_PID in crates/scx_simulator/src/unsafe_impl/kfuncs.rs.
+ */
+#define SIM_CBW_LOADER_TGID 0x7FFFFF00u
+
+/*
+ * bpf_get_current_pid_tgid -- no meaningful PID in the simulator, EXCEPT we
+ * publish the reserved loader tgid in the high 32 bits so cgroup_bw's
+ * scx_cgroup_bw_lib_init() captures cbw_loader_tgid = SIM_CBW_LOADER_TGID
+ * (it reads `>> 32`). The low 32 bits (the pid, read by LAVD's
+ * `lavd_pid = (u32)bpf_get_current_pid_tgid()`) stay 0 as before.
  * Static function pointer in bpf_helper_defs.h, safe to override.
  */
 #undef bpf_get_current_pid_tgid
-#define bpf_get_current_pid_tgid() ((u64)0)
+#define bpf_get_current_pid_tgid() (((u64)SIM_CBW_LOADER_TGID) << 32)
 
 /*
  * bpf_ksym_exists -- kernel symbol existence check.
@@ -637,46 +655,73 @@ void lavd_fire_timer(unsigned int slot);
  * scx/lib/cgroup_bw.bpf.c is included below, so the real library
  * definitions remain untouched.
  */
+/*
+ * Resource-exhaustion modeling. Upstream migrated the per-cgroup context off
+ * a fixed-size BPF map onto the BPF arena (sched-ext/scx 48757ded/4fa7fb81),
+ * so the real scx_cgroup_bw_init() now allocates cgx via scx_static_alloc()
+ * and only ENOMEMs on true arena exhaustion (CBW_NR_CGRP_MAX=2048 worth).
+ * The simulator models a configurable, smaller BPF-map limit
+ * (scenario.max_cgroups) via the Rust CgroupRegistry. Re-introduce that
+ * accounting here at the registration entry point: consult
+ * sim_cgroup_registry_allocate() before the real init (returning -ENOMEM past
+ * the limit, exactly as the pre-arena BPF map did) and release on exit. This
+ * preserves the resource-exhaustion code path (test_lavd_cgroup_resource_
+ * exhaustion) without perturbing the library's real allocation logic.
+ */
+extern int sim_cgroup_registry_allocate(void);
+extern void sim_cgroup_registry_free(void);
+
 #define scx_cgroup_bw_lib_init(config) ({ \
 	SCXSIM_CGROUP_BW_YIELD(scxsim_cgroup_bw_yield_lib_init); \
 	scx_cgroup_bw_lib_init((config)); \
 })
 #define scx_cgroup_bw_init(cgrp, args) ({ \
 	SCXSIM_CGROUP_BW_YIELD(scxsim_cgroup_bw_yield_init); \
-	scx_cgroup_bw_init((cgrp), (args)); \
+	int _scxsim_cg_rc = sim_cgroup_registry_allocate(); \
+	_scxsim_cg_rc ? _scxsim_cg_rc : scx_cgroup_bw_init((cgrp), (args)); \
 })
 #define scx_cgroup_bw_exit(cgrp) ({ \
 	SCXSIM_CGROUP_BW_YIELD(scxsim_cgroup_bw_yield_exit); \
+	sim_cgroup_registry_free(); \
 	scx_cgroup_bw_exit((cgrp)); \
 })
 #define scx_cgroup_bw_set(cgrp, period_us, quota_us, burst_us) ({ \
 	SCXSIM_CGROUP_BW_YIELD(scxsim_cgroup_bw_yield_set); \
 	scx_cgroup_bw_set((cgrp), (period_us), (quota_us), (burst_us)); \
 })
-#define scx_cgroup_bw_throttled(cgrp, p) ({ \
+/*
+ * Upstream sched-ext/scx 776ae41e ("lib/cgroup_bw: use cgrp_id instead of
+ * cgroup pointer in throttle/consume/put_aside") changed the first argument
+ * of throttle/consume and the last argument of put_aside from
+ * `struct cgroup *` to `u64 cgrp_id`. The per-task caching series
+ * (f4fbc4f1/335e754e/d8481623, "scx_task_cgroup_bw ... per-task caching")
+ * also added a trailing `u64 taskc` cache argument to throttle and consume.
+ * The macros now mirror the new arity, and the scxsim observe hooks consume
+ * the cgrp_id directly (it is no longer a dereferenceable pointer).
+ */
+#define scx_cgroup_bw_throttled(cgrp_id, p, taskc) ({ \
 	SCXSIM_CGROUP_BW_YIELD(scxsim_cgroup_bw_yield_throttled); \
-	scx_cgroup_bw_throttled((cgrp), (p)); \
+	scx_cgroup_bw_throttled((cgrp_id), (p), (taskc)); \
 })
-#define scx_cgroup_bw_consume(c, n) ({ \
+#define scx_cgroup_bw_consume(c, n, taskc) ({ \
 	SCXSIM_CGROUP_BW_YIELD(scxsim_cgroup_bw_yield_consume); \
-	int _rc = scx_cgroup_bw_consume((c), (n)); \
+	int _rc = scx_cgroup_bw_consume((c), (n), (taskc)); \
 	SCXSIM_DEBUG_CONSUME_PROBE_BODY(c, n, _rc); \
-	/* V4-A observe: record (cgid, ns) on every consume call. cgrp_get_id is
-	 * static-in-lib; inline as cgrp->kn->id. (c) is `struct cgroup *` here
-	 * per the lib's prototype `int scx_cgroup_bw_consume(struct cgroup *cgrp, u64 ns)`.
-	 * Skip emit on null cgrp (initial period before cgroup is registered).
+	/* V4-A observe: record (cgid, ns) on every consume call. (c) is now the
+	 * `u64 cgrp_id` directly (post-776ae41e), so emit it as-is. Skip emit on
+	 * cgrp_id 0 (initial period before cgroup is registered).
 	 */ \
-	if ((c)) scxsim_cgroup_bw_observe_consume((c)->kn->id, (unsigned long long)(n)); \
+	if ((c)) scxsim_cgroup_bw_observe_consume((unsigned long long)(c), (unsigned long long)(n)); \
 	_rc; \
 })
-#define scx_cgroup_bw_put_aside(p, taskc, vtime, cgrp) ({ \
+#define scx_cgroup_bw_put_aside(p, taskc, vtime, cgrp_id) ({ \
 	SCXSIM_CGROUP_BW_YIELD(scxsim_cgroup_bw_yield_put_aside); \
-	int _scxsim_pa_rc = scx_cgroup_bw_put_aside((p), (taskc), (vtime), (cgrp)); \
-	/* V2 observe: only emit if put_aside succeeded (rc == 0).
-	 * cgroup_get_id() is static in lib; inline its body (cgrp->kn->id).
+	int _scxsim_pa_rc = scx_cgroup_bw_put_aside((p), (taskc), (vtime), (cgrp_id)); \
+	/* V2 observe: only emit if put_aside succeeded (rc == 0). The cgroup is
+	 * now identified by `u64 cgrp_id` directly (post-776ae41e).
 	 */ \
 	if (_scxsim_pa_rc == 0) \
-		scxsim_cgroup_bw_observe_put_aside((p)->pid, (cgrp)->kn->id); \
+		scxsim_cgroup_bw_observe_put_aside((p)->pid, (unsigned long long)(cgrp_id)); \
 	_scxsim_pa_rc; \
 })
 #define scx_cgroup_bw_reenqueue() ({ \
@@ -716,8 +761,8 @@ void lavd_fire_timer(unsigned int slot);
 	scxsim_cgroup_bw_consume_count_pre++; \
 	scxsim_cgroup_bw_consume_sum_ns += (unsigned long long)(n); \
 	if ((scxsim_cgroup_bw_consume_count_pre & 0xfff) == 1) \
-		scxsim_probe_dprintf(2, "[SCXSIM-PROBE] consume cgrp=%p level=%d ns=%llu count=%llu sum_ns=%llu rc=%d\n", \
-			(void *)(c), (c) ? ((int)(c)->level) : -1, \
+		scxsim_probe_dprintf(2, "[SCXSIM-PROBE] consume cgrp_id=%llu ns=%llu count=%llu sum_ns=%llu rc=%d\n", \
+			(unsigned long long)(c), \
 			(unsigned long long)(n), scxsim_cgroup_bw_consume_count_pre, \
 			scxsim_cgroup_bw_consume_sum_ns, (rc)); \
 } while (0)
@@ -941,10 +986,33 @@ void lavd_fire_timer(unsigned int slot)
  * or NULL if no registry is installed or the ID is not found.
  */
 extern void *sim_cgroup_lookup_by_id(u64 cgid);
+extern void *sim_get_root_cgroup(void);
 
 struct cgroup *bpf_cgroup_from_id(u64 cgroupid)
 {
 	return (struct cgroup *)sim_cgroup_lookup_by_id(cgroupid);
+}
+
+/*
+ * bpf_cgroup_ancestor(cgrp, level) -- return the ancestor of @cgrp at the
+ * given hierarchy level. Upstream cgroup_bw uses this for:
+ *   - root resolution in cbw_get_root_cgrp() (a52f85e3): level 0 == root
+ *   - deep-hierarchy parent walks (e1ad015c): cgrp->level - 1 == parent
+ *
+ * The simulator models a flat hierarchy: workload cgroups are direct
+ * children of the root (level 1), so level 0 is the only ancestor that
+ * exists and resolves to sim_get_root_cgroup(). Deeper levels are not
+ * modeled and return NULL — matching the simulator's prior behavior, where
+ * the generic kfunc stub (sim_bpf_stubs.c) returned NULL for every ancestor
+ * query. A level-1 cgroup's parent walk (level 0) therefore correctly
+ * resolves to the root.
+ */
+struct cgroup *bpf_cgroup_ancestor(struct cgroup *cgrp, int level)
+{
+	(void)cgrp;
+	if (level == 0)
+		return (struct cgroup *)sim_get_root_cgroup();
+	return NULL;
 }
 
 /* Cgroup reference release -- no-op */
@@ -1314,7 +1382,28 @@ int topo_cpu_to_llc_id(u32 cpu) { (void)cpu; return 0; }
  *   - cgroup_bw.bpf.c calls scx_atq_* -- resolves to csrc/sim_atq.c
  *     (Phase 1 item 7) at .so dlopen via -rdynamic.
  */
+/*
+ * Upstream migrated scx_cgroup_ctx / scx_cgroup_llc_ctx onto the BPF arena
+ * (sched-ext/scx 4fa7fb81 + 48757ded) and now allocates them through
+ * scx_static_alloc() (lib/sdt_task.h: a thin wrapper over
+ * scx_static_alloc_internal()). The simulator deliberately does NOT pull in
+ * sdt_task.h, so without an override scx_static_alloc() is implicitly
+ * declared (int return) and the cgx/llcx allocations fail to compile.
+ *
+ * Route it through the simulator's deterministic bump allocator instead. The
+ * alignment argument is honored at the arena's fixed 16-byte granularity;
+ * cacheline (64-byte) alignment is purely a false-sharing optimization for
+ * real multi-CPU BPF and has no bearing on the single-threaded simulator's
+ * correctness. Defined immediately before the library include so it only
+ * affects cgroup_bw.bpf.c's internal allocations.
+ */
+#include "sim_arena.h"
+#ifndef scx_static_alloc
+#define scx_static_alloc(bytes, alignment) \
+	(sim_arena_calloc((unsigned long)(bytes)))
+#endif
 #include "../../scx/lib/cgroup_bw.bpf.c"
+#undef scx_static_alloc
 #undef scxsim_cbw_yield
 
 /*
@@ -1669,13 +1758,19 @@ __attribute__((visibility("default")))
 int scxsim_cgroup_bw_consume(struct cgroup *cgrp, unsigned long long consumed_ns)
 {
 	scxsim_cgroup_bw_consume_count++;
-	return scx_cgroup_bw_consume(cgrp, consumed_ns);
+	/*
+	 * Post-776ae41e the library takes a u64 cgrp_id (not a cgroup pointer)
+	 * plus a trailing per-task cache arg. The engine's FFI still hands us a
+	 * struct cgroup *, so resolve the id here (cgroup_get_id == cgrp->kn->id)
+	 * and pass taskc=0 (no per-task context available at this call site).
+	 */
+	return scx_cgroup_bw_consume(cgrp ? cgrp->kn->id : 0, consumed_ns, 0);
 }
 
 __attribute__((visibility("default")))
 int scxsim_cgroup_bw_throttled(struct cgroup *cgrp, struct task_struct *p)
 {
-	return scx_cgroup_bw_throttled(cgrp, p);
+	return scx_cgroup_bw_throttled(cgrp ? cgrp->kn->id : 0, p, 0);
 }
 
 /*
@@ -2125,41 +2220,57 @@ void lavd_set_cgroup_bw_max(unsigned int max)
  * simulation. Each returns 0/default if the context is not available.
  */
 
-/* Per-task probes: access task_ctx fields via get_task_ctx(). */
+/*
+ * Per-task probes: access task_ctx fields.
+ *
+ * These run from the Rust monitor (Monitor::sample) OUTSIDE simulator kfunc
+ * context — SIM_ARC is not installed, so any kfunc that reads the current CPU
+ * id will panic. Upstream sched-ext/scx 66da81a3 ("scx_lavd: cache last
+ * task_ctx lookup per CPU") changed get_task_ctx(p) to read the per-CPU
+ * task_ctx cache via get_cpu_ctx(), which calls
+ * sim_bpf_get_smp_processor_id() and therefore requires SIM_ARC. Probes must
+ * not depend on the current CPU, so they call the underlying slowpath
+ * directly with cpuc=NULL: a pure task-storage lookup (scx_task_data(p)) with
+ * no per-CPU cache read/write.
+ */
+static inline struct task_ctx *lavd_probe_task_ctx(struct task_struct *p)
+{
+	return (struct task_ctx *)__get_task_ctx_slowpath(p, NULL);
+}
 
 u16 lavd_probe_lat_cri(struct task_struct *p)
 {
-	struct task_ctx *taskc = get_task_ctx(p);
+	struct task_ctx *taskc = lavd_probe_task_ctx(p);
 	return taskc ? taskc->lat_cri : 0;
 }
 
 u64 lavd_probe_wait_freq(struct task_struct *p)
 {
-	struct task_ctx *taskc = get_task_ctx(p);
+	struct task_ctx *taskc = lavd_probe_task_ctx(p);
 	return taskc ? taskc->wait_freq : 0;
 }
 
 u64 lavd_probe_wake_freq(struct task_struct *p)
 {
-	struct task_ctx *taskc = get_task_ctx(p);
+	struct task_ctx *taskc = lavd_probe_task_ctx(p);
 	return taskc ? taskc->wake_freq : 0;
 }
 
 u64 lavd_probe_avg_runtime(struct task_struct *p)
 {
-	struct task_ctx *taskc = get_task_ctx(p);
+	struct task_ctx *taskc = lavd_probe_task_ctx(p);
 	return taskc ? taskc->avg_runtime_wall : 0;
 }
 
 u16 lavd_probe_lat_cri_waker(struct task_struct *p)
 {
-	struct task_ctx *taskc = get_task_ctx(p);
+	struct task_ctx *taskc = lavd_probe_task_ctx(p);
 	return taskc ? taskc->lat_cri_waker : 0;
 }
 
 u16 lavd_probe_lat_cri_wakee(struct task_struct *p)
 {
-	struct task_ctx *taskc = get_task_ctx(p);
+	struct task_ctx *taskc = lavd_probe_task_ctx(p);
 	return taskc ? taskc->lat_cri_wakee : 0;
 }
 
@@ -2226,7 +2337,7 @@ u8 lavd_probe_can_boost_slice(void)
 /* Probe for task's slice_wall from task_ctx. */
 u64 lavd_probe_task_slice_wall(struct task_struct *p)
 {
-	struct task_ctx *taskc = get_task_ctx(p);
+	struct task_ctx *taskc = lavd_probe_task_ctx(p);
 	return taskc ? taskc->slice_wall : 0;
 }
 

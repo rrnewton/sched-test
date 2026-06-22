@@ -294,6 +294,30 @@ static void *cosmos_map_lookup(void *map, const void *key)
 #include "cosmos_main_patched.c"
 
 /*
+ * scx_bpf_cpu_node(): map a CPU to its NUMA node id.
+ *
+ * Upstream sched-ext/scx 36d589bb ("scx_cosmos: Enable full built-in
+ * NUMA-aware idle CPU selection") introduced calls to scx_bpf_cpu_node()
+ * behind __COMPAT_scx_bpf_cpu_node(). Because the cosmos wrapper defines
+ * bpf_ksym_exists()==1 (see top of file), the COMPAT macro calls the kfunc
+ * unconditionally — so the simulator must provide it, or the call jumps
+ * through the NULL weak __ksym symbol and SIGSEGVs (test_numa_topology).
+ *
+ * Resolve the node from the wrapper's cpu_node_map (populated by
+ * cosmos_configure_numa()); fall back to node 0 when the CPU is unmapped
+ * (NUMA disabled, or a single-node topology). bpf_map_lookup_elem is the
+ * cosmos_map_lookup override defined above, so this stays consistent with
+ * the rest of the wrapper's map handling.
+ */
+s32 scx_bpf_cpu_node(s32 cpu)
+{
+	u32 key = (u32)cpu;
+	u32 *node = bpf_map_lookup_elem(&cpu_node_map, &key);
+
+	return node ? (s32)*node : 0;
+}
+
+/*
  * Static per-CPU context array, defined after the scheduler source
  * so that struct cpu_ctx is available.
  */
@@ -339,8 +363,16 @@ void cosmos_register_maps(void)
 	INIT_SCX_TEST_MAP(&cpu_node_test_map, cpu_node_map);
 	scx_test_map_register(&cpu_node_test_map, &cpu_node_map);
 
-	wakeup_timer_map_ptr = (void *)&wakeup_timer;
-	cosmos_timer_map = (void *)&wakeup_timer;
+	/*
+	 * Upstream scx_cosmos dropped deferred CPU wakeups and removed the
+	 * `wakeup_timer` object (sched-ext/scx 79f892807cff "Deprecate deferred
+	 * CPU wakeup" + 225b98c0 "Remove unused wakeup_timer"). COSMOS now has
+	 * no BPF timer, so there is nothing to wire up here. The timer override
+	 * infrastructure above (cosmos_timer_cb/_ptr/_map, sim_wakeup_timer_buf)
+	 * stays harmlessly dormant: cosmos_timer_cb is never set, so
+	 * cosmos_fire_timer() is a no-op and cosmos_map_lookup() falls through
+	 * to the normal map lookup (wakeup_timer_map_ptr stays NULL).
+	 */
 }
 
 /*
@@ -374,7 +406,12 @@ void cosmos_setup(unsigned int num_cpus)
 	struct cpu_arg arg = { .cpu_id = 0 };
 
 	smt_enabled = true;
-	avoid_smt = true;
+	/*
+	 * Upstream scx_cosmos deprecated the SMT-avoidance toggle and made it
+	 * unconditional (sched-ext/scx 9278fb1e "Deprecate SMT avoidance
+	 * option"), removing the `avoid_smt` BPF global. SMT contention is now
+	 * always avoided, so there is no knob to set here.
+	 */
 	primary_all = true;
 	flat_idle_scan = false;
 	preferred_idle_scan = false;
