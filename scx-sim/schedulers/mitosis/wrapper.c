@@ -25,17 +25,23 @@ extern void *memset(void *s, int c, unsigned long n);
  * ---------------------------------------------------------------------------*/
 
 /*
- * bpf_ksym_exists gates scx's compat.bpf.h modern-vs-legacy kfunc ternaries.
- * The simulator provides the modern scx kfunc surface, so report symbols as
- * present (=1). The gated kfuncs mitosis uses are mostly #undef-routed to sim
- * exports in sim_wrapper.h already; the one gate that isn't,
- * __COMPAT_scx_bpf_cpu_curr (compat.bpf.h), then returns the real
- * scx_bpf_cpu_curr rather than scx_bpf_cpu_rq(cpu)->curr -- the sim's
- * scx_bpf_cpu_rq returns NULL, so the =0 branch was always NULL and suppressed
- * mitosis's enable_slice_shrinking path. (Supersedes a stale comment that set
- * =0 to avoid scx_bpf_select_cpu_and "unimplemented" -- it is implemented, and
- * mitosis's select path uses neither it nor scx_bpf_select_cpu_dfl but
- * pick_idle_cpu.)
+ * NOTE: for mitosis this bpf_ksym_exists override is INERT -- =1 and =0 are
+ * behavior-identical. It is kept only until the per-scheduler overrides are
+ * replaced by a generic rule, and documents a subtlety worth not re-learning:
+ *
+ * This redefine lands AFTER sim_wrapper.h has included <scx/common.bpf.h> (hence
+ * compat.bpf.h), so the static-inline __COMPAT_* helpers there (notably
+ * __COMPAT_scx_bpf_cpu_curr) were already compiled against libbpf's
+ * bpf_ksym_exists = !!sym and cannot be changed by this define. mitosis has no
+ * direct bpf_ksym_exists / ___new / ___old uses, and its plain compat macros are
+ * #undef-routed to sim exports in sim_wrapper.h -- so this override governs no
+ * live mitosis path. __COMPAT_scx_bpf_cpu_curr always calls the real
+ * scx_bpf_cpu_curr regardless of this value, because the simulator provides that
+ * symbol (resolved at dlopen) so !!sym is always true.
+ *
+ * (An earlier comment here claimed =1 makes __COMPAT_scx_bpf_cpu_curr return the
+ * real cpu_curr while =0 forced a NULL scx_bpf_cpu_rq fallback -- that was FALSE
+ * per the include-order reasoning above.)
  */
 #undef bpf_ksym_exists
 #define bpf_ksym_exists(sym) (1)
@@ -356,6 +362,37 @@ void mitosis_fire_timer(unsigned int slot)
 	(void)slot;
 	if (mitosis_timer_cb && mitosis_timer_ptr)
 		mitosis_timer_cb(mitosis_timer_map, &key, mitosis_timer_ptr);
+}
+
+/* ---------------------------------------------------------------------------
+ * mitosis_sum_cstat: host-side test observation of a per-cell stat counter.
+ *
+ * cpu_ctxs is a PERCPU_ARRAY (single key 0); each CPU's struct cpu_ctx holds
+ * u64 cstats[MAX_CELLS][NR_CSTATS] (intf.h). cstat_inc accumulates per (cell,
+ * cpu), so the host-visible total for a stat index is the sum over all cells
+ * and all CPUs. Summing every cell avoids assuming which cell a task lands in.
+ * Lets a test observe e.g. CSTAT_SLICE_SHRINK_* firing, which is not visible in
+ * the event trace (slice_shrink_apply writes p->scx.slice + bumps the counter).
+ * Mirrors the host-context map access the setup seed loop already performs.
+ * ---------------------------------------------------------------------------*/
+u64 mitosis_sum_cstat(u32 idx)
+{
+	const u32 key0 = 0;
+	u64 sum = 0;
+	int cpu;
+	u32 cell;
+
+	if (idx >= NR_CSTATS)
+		return 0;
+	for (cpu = 0; cpu < (int)nr_possible_cpus && cpu < (int)MAX_SIM_CPUS; cpu++) {
+		struct cpu_ctx *cctx =
+			scx_test_map_lookup_percpu_elem(&cpu_ctxs, &key0, cpu);
+		if (!cctx)
+			continue;
+		for (cell = 0; cell < (u32)MAX_CELLS; cell++)
+			sum += cctx->cstats[cell][idx];
+	}
+	return sum;
 }
 
 /* ---------------------------------------------------------------------------

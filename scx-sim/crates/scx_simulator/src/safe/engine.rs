@@ -1307,6 +1307,26 @@ impl Simulator<ffi::DynamicScheduler> {
     pub fn read_u64_global(&self, name: &str) -> Option<u64> {
         self.scheduler.inner().read_u64_global(name)
     }
+
+    /// Write a `bool` scheduler config global by symbol name (e.g.
+    /// `enable_slice_shrinking`). Returns `None` if absent. Set scheduler config
+    /// BEFORE `run` — the faithful analog of libbpf patching `.rodata` before
+    /// program load. Delegates to the loaded `DynamicScheduler`.
+    pub fn write_bool_global(&self, name: &str, value: bool) -> Option<()> {
+        self.scheduler.inner().write_bool_global(name, value)
+    }
+
+    /// Write a `u32` scheduler config global by symbol name. See
+    /// [`Self::write_bool_global`]. Delegates to the loaded `DynamicScheduler`.
+    pub fn write_u32_global(&self, name: &str, value: u32) -> Option<()> {
+        self.scheduler.inner().write_u32_global(name, value)
+    }
+
+    /// Write a `u64` scheduler config global by symbol name. See
+    /// [`Self::write_bool_global`]. Delegates to the loaded `DynamicScheduler`.
+    pub fn write_u64_global(&self, name: &str, value: u64) -> Option<()> {
+        self.scheduler.inner().write_u64_global(name, value)
+    }
 }
 
 impl<S: Scheduler> Simulator<S> {

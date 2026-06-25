@@ -942,6 +942,47 @@ impl DynamicScheduler {
         }
     }
 
+    /// Write a `bool` BPF config global in the loaded `.so` by symbol name.
+    ///
+    /// Returns `None` if the symbol is absent (mirrors [`Self::read_u64_global`]).
+    /// Sets a scheduler `const volatile` config global (e.g.
+    /// `enable_slice_shrinking`) BEFORE `run`; this is the kernel-faithful analog
+    /// of libbpf patching the `.rodata` map before `BPF_PROG_LOAD` (the value is
+    /// fixed before the scheduler program executes, never mutated mid-run). The
+    /// named symbol must be a `bool` global — a symbol of a different width
+    /// corrupts adjacent memory.
+    pub fn write_bool_global(&self, name: &str, value: bool) -> Option<()> {
+        // SAFETY: get_symbol resolves `name` to the address of a bool global; the
+        // returned Symbol borrows &self, keeping the library mapped for the
+        // write. The .so strips `const` (-Dconst=) so the symbol is a writable
+        // global; `volatile` on it matches write_volatile. Contract: `name` is a
+        // bool global.
+        unsafe {
+            self.get_symbol::<*mut bool>(name.as_bytes())
+                .map(|sym| std::ptr::write_volatile(*sym, value))
+        }
+    }
+
+    /// Write a `u32` BPF config global. See [`Self::write_bool_global`] for the
+    /// pre-`run` rodata contract; `name` must be a `u32` global.
+    pub fn write_u32_global(&self, name: &str, value: u32) -> Option<()> {
+        // SAFETY: as `write_bool_global`; contract: `name` is a u32 global.
+        unsafe {
+            self.get_symbol::<*mut u32>(name.as_bytes())
+                .map(|sym| std::ptr::write_volatile(*sym, value))
+        }
+    }
+
+    /// Write a `u64` BPF config global. See [`Self::write_bool_global`] for the
+    /// pre-`run` rodata contract; `name` must be a `u64` global.
+    pub fn write_u64_global(&self, name: &str, value: u64) -> Option<()> {
+        // SAFETY: as `write_bool_global`; contract: `name` is a u64 global.
+        unsafe {
+            self.get_symbol::<*mut u64>(name.as_bytes())
+                .map(|sym| std::ptr::write_volatile(*sym, value))
+        }
+    }
+
     /// Load a scheduler from a `.so` file.
     ///
     /// - `path`: path to the `.so` file

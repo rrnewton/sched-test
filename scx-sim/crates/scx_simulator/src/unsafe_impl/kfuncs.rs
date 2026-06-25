@@ -2727,10 +2727,13 @@ pub extern "C" fn bpf_get_current_task_btf_kfunc() -> *mut c_void {
     bpf_get_current_task_btf()
 }
 
-/// Get the task running on a given CPU.
+/// Get the task running on a given CPU. Returns NULL if the CPU index is out of
+/// range or the CPU has no current task.
 ///
-/// Needed as a linkable symbol for compat paths, even though
-/// `__COMPAT_scx_bpf_cpu_curr` is overridden to a macro returning NULL.
+/// Backs `__COMPAT_scx_bpf_cpu_curr` (compat.bpf.h): that compat helper calls
+/// this kfunc whenever `scx_bpf_cpu_curr` resolves as a symbol — which it always
+/// does in the simulator (defined here, exported via -rdynamic) — so the compat
+/// path resolves to this implementation.
 #[no_mangle]
 pub extern "C" fn scx_bpf_cpu_curr(cpu: i32) -> *mut c_void {
     with_sim(kfunc_cost::SIMPLE, |sim| {

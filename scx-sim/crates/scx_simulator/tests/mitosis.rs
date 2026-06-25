@@ -3311,3 +3311,127 @@ fn test_mitosis_cpuset_change_detection() {
 // TODO(sim-llc): Add proper LLC topology support to the simulator to test
 // llc_aware.bpf.h code paths.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// slice_shrinking: end-to-end behavior (enable_slice_shrinking rodata → shrink).
+// ---------------------------------------------------------------------------
+
+/// `u64 mitosis_sum_cstat(u32 idx)` (mitosis/wrapper.c) sums the per-cell stat
+/// counter `idx` across all cells and CPUs. Observes CSTAT_SLICE_SHRINK_*
+/// firing, which is not visible in the event trace (slice_shrink_apply mutates
+/// p->scx.slice + bumps a per-cpu counter).
+type SumCstatFn = unsafe extern "C" fn(u32) -> u64;
+
+/// enable_slice_shrinking end-to-end: setting the slice-shrink rodata config via
+/// the write_*_global accessors makes mitosis shrink a running task's slice when
+/// a pinned waiter contends for its CPU, observable as CSTAT_SLICE_SHRINK_* > 0.
+/// Guards the feature wiring: write_{bool,u32,u64}_global + the rodata config
+/// fields + slice_shrink_apply's per-cell cstat accounting + the percpu-cstat
+/// read (mitosis_sum_cstat).
+///
+/// This does NOT isolate the cpu_curr compat path: __COMPAT_scx_bpf_cpu_curr
+/// always calls the real scx_bpf_cpu_curr in the sim (the symbol is always
+/// provided, so libbpf's !!sym is always true), so the enqueue-shrink fires
+/// regardless of mitosis's bpf_ksym_exists override — no scenario can
+/// distinguish that override on/off (see the wrapper.c bpf_ksym_exists note).
+///
+/// Scenario (2 CPUs, mitosis configured for 2 so the cell cpumask is {0,1}):
+/// A pinned to cpu0 runs from t=0 (cpu0 busy); B pinned to cpu0 wakes at t=5ms.
+/// cpu0 is not idle so B does not direct-dispatch → enqueue(B). all_cell_cpus_allowed
+/// = bpf_cpumask_subset(cell, cpus_ptr) (is the cell ⊆ the task's allowed CPUs):
+/// the cell {0,1} is NOT ⊆ B's {0}, so all_cell_cpus_allowed is false →
+/// `!B.all_cell_cpus_allowed && enable_slice_shrinking` → slice_shrink_on_enqueue
+/// shrinks A's slice → cstat++. (mitosis(N) must match cpus(N): mitosis(1) makes
+/// the cell {0}, which IS ⊆ B's {0} → all_cell_cpus_allowed true → the
+/// enqueue-shrink path is never reached.) The enqueue-shrink and the
+/// running-shrink both bump CSTAT_SLICE_SHRINK_*; the test asserts only that
+/// shrinking occurs.
+#[test]
+fn test_slice_shrinking_fires() {
+    let _lock = common::setup_test();
+
+    let sched = DynamicScheduler::mitosis(2);
+
+    // const volatile rodata config, set before run() — the faithful analog of
+    // libbpf patching .rodata before the program executes. Defaults are
+    // BSS-zero, and a zero multiplier/max makes slice_shrink_limit degenerate,
+    // so all four must be set.
+    sched
+        .write_bool_global("enable_slice_shrinking", true)
+        .expect("enable_slice_shrinking symbol");
+    sched
+        .write_u64_global("slice_shrink_min_ns", 500_000)
+        .expect("slice_shrink_min_ns symbol");
+    sched
+        .write_u64_global("slice_shrink_max_ns", 4_000_000)
+        .expect("slice_shrink_max_ns symbol");
+    sched
+        .write_u32_global("slice_shrink_multiplier", 2)
+        .expect("slice_shrink_multiplier symbol");
+
+    // Capture the cstat reader before the Simulator consumes the scheduler.
+    // SAFETY: mitosis_sum_cstat is `u64 fn(u32)` exported by libscx_mitosis.so;
+    // the fn pointer is Copy. The `sim` binding below keeps the .so mapped (it
+    // owns the Library) for the call after run().
+    let sum_cstat: SumCstatFn = unsafe {
+        *sched
+            .get_symbol::<SumCstatFn>(b"mitosis_sum_cstat\0")
+            .expect("mitosis_sum_cstat symbol")
+    };
+
+    let scenario = Scenario::builder()
+        .cpus(2)
+        .task(TaskDef {
+            name: "A".into(),
+            pid: Pid(1),
+            nice: 0,
+            behavior: TaskBehavior {
+                phases: vec![Phase::Run(50_000_000)],
+                repeat: RepeatMode::Forever,
+            },
+            start_time_ns: 0,
+            mm_id: None,
+            allowed_cpus: Some(vec![CpuId(0)]),
+            parent_pid: None,
+            cgroup_name: None,
+            task_flags: 0,
+            migration_disabled: 0,
+        })
+        .task(TaskDef {
+            name: "B".into(),
+            pid: Pid(2),
+            nice: 0,
+            behavior: TaskBehavior {
+                phases: vec![Phase::Run(50_000_000)],
+                repeat: RepeatMode::Forever,
+            },
+            start_time_ns: 5_000_000,
+            mm_id: None,
+            allowed_cpus: Some(vec![CpuId(0)]),
+            parent_pid: None,
+            cgroup_name: None,
+            task_flags: 0,
+            migration_disabled: 0,
+        })
+        .duration_ms(50)
+        .build();
+
+    let sim = Simulator::new(sched);
+    let _ = sim.run(scenario);
+
+    // The shrink behavior fired end-to-end (rodata write + shrink machinery).
+    // enum cell_stat_idx (intf.h): CSTAT_SLICE_SHRINK_MAX=9, _PROPORTIONAL=10,
+    // _MIN=11. SAFETY: sim is alive, so the .so backing sum_cstat is mapped.
+    const CSTAT_SLICE_SHRINK_MAX: u32 = 9;
+    const CSTAT_SLICE_SHRINK_PROPORTIONAL: u32 = 10;
+    const CSTAT_SLICE_SHRINK_MIN: u32 = 11;
+    let shrinks = unsafe {
+        sum_cstat(CSTAT_SLICE_SHRINK_MAX)
+            + sum_cstat(CSTAT_SLICE_SHRINK_PROPORTIONAL)
+            + sum_cstat(CSTAT_SLICE_SHRINK_MIN)
+    };
+    assert!(
+        shrinks > 0,
+        "slice shrinking must fire (CSTAT_SLICE_SHRINK_* > 0); got {shrinks}"
+    );
+}
