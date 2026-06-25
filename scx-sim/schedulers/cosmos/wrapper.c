@@ -18,13 +18,6 @@
  */
 
 /*
- * Enable scx_bpf_select_cpu_and — implemented in the simulator.
- * With flat_idle_scan=false, COSMOS will use this instead of flat scan.
- */
-#undef bpf_ksym_exists
-#define bpf_ksym_exists(sym) (1)
-
-/*
  * The simulator always calls select_cpu before enqueue, so the
  * CPU is always selected.
  */
@@ -298,10 +291,11 @@ static void *cosmos_map_lookup(void *map, const void *key)
  *
  * Upstream sched-ext/scx 36d589bb ("scx_cosmos: Enable full built-in
  * NUMA-aware idle CPU selection") introduced calls to scx_bpf_cpu_node()
- * behind __COMPAT_scx_bpf_cpu_node(). Because the cosmos wrapper defines
- * bpf_ksym_exists()==1 (see top of file), the COMPAT macro calls the kfunc
- * unconditionally — so the simulator must provide it, or the call jumps
- * through the NULL weak __ksym symbol and SIGSEGVs (test_numa_topology).
+ * behind __COMPAT_scx_bpf_cpu_node(). That COMPAT macro calls the kfunc when
+ * bpf_ksym_exists(scx_bpf_cpu_node) holds; because this wrapper defines
+ * scx_bpf_cpu_node (below), libbpf's !!sym is true, so the macro calls it — the
+ * simulator must provide it (this function), or the call would jump through a
+ * NULL weak __ksym symbol and SIGSEGV (test_numa_topology).
  *
  * Resolve the node from the wrapper's cpu_node_map (populated by
  * cosmos_configure_numa()); fall back to node 0 when the CPU is unmapped

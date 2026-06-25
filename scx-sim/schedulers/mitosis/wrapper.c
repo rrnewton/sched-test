@@ -25,28 +25,6 @@ extern void *memset(void *s, int c, unsigned long n);
  * ---------------------------------------------------------------------------*/
 
 /*
- * NOTE: for mitosis this bpf_ksym_exists override is INERT -- =1 and =0 are
- * behavior-identical. It is kept only until the per-scheduler overrides are
- * replaced by a generic rule, and documents a subtlety worth not re-learning:
- *
- * This redefine lands AFTER sim_wrapper.h has included <scx/common.bpf.h> (hence
- * compat.bpf.h), so the static-inline __COMPAT_* helpers there (notably
- * __COMPAT_scx_bpf_cpu_curr) were already compiled against libbpf's
- * bpf_ksym_exists = !!sym and cannot be changed by this define. mitosis has no
- * direct bpf_ksym_exists / ___new / ___old uses, and its plain compat macros are
- * #undef-routed to sim exports in sim_wrapper.h -- so this override governs no
- * live mitosis path. __COMPAT_scx_bpf_cpu_curr always calls the real
- * scx_bpf_cpu_curr regardless of this value, because the simulator provides that
- * symbol (resolved at dlopen) so !!sym is always true.
- *
- * (An earlier comment here claimed =1 makes __COMPAT_scx_bpf_cpu_curr return the
- * real cpu_curr while =0 forced a NULL scx_bpf_cpu_rq fallback -- that was FALSE
- * per the include-order reasoning above.)
- */
-#undef bpf_ksym_exists
-#define bpf_ksym_exists(sym) (1)
-
-/*
  * The simulator always calls select_cpu before enqueue, so the
  * CPU is always selected.
  */

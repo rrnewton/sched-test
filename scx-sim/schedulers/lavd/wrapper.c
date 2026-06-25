@@ -89,13 +89,6 @@
 #define bpf_get_current_pid_tgid() (((u64)SIM_CBW_LOADER_TGID) << 32)
 
 /*
- * bpf_ksym_exists -- kernel symbol existence check.
- * Return 0 (absent) to disable kfunc probing paths.
- */
-#undef bpf_ksym_exists
-#define bpf_ksym_exists(sym) (0)
-
-/*
  * __COMPAT_scx_bpf_dsq_peek -- override the compat wrapper to directly
  * call scx_bpf_dsq_peek which is implemented in kfuncs.rs. The compat
  * wrapper normally falls through to bpf_iter_scx_dsq_* when bpf_ksym_exists
