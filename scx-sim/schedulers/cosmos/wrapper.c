@@ -218,42 +218,11 @@ int scx_pmu_read(struct task_struct *p, u64 event, u64 *value, bool clear)
 }
 
 /*
- * BPF timer overrides for deferred wakeups.
- *
- * bpf_timer_set_callback stores the callback pointer.
- * bpf_timer_start calls sim_timer_start() (Rust kfunc) to schedule
- * a TimerFired event in the simulator's event queue.
- * cosmos_fire_timer() invokes the stored callback from the engine.
+ * bpf_map_lookup_elem override: route COSMOS map lookups to the test-map
+ * registry (the simulator's stand-in for kernel BPF maps).
  */
-static int (*cosmos_timer_cb)(void *, int *, struct bpf_timer *);
-static struct bpf_timer *cosmos_timer_ptr;
-static void *cosmos_timer_map;
-
-extern void sim_timer_start(unsigned long long nsecs);
-
-#undef bpf_timer_set_callback
-#define bpf_timer_set_callback(timer, cb) \
-	(cosmos_timer_cb = (typeof(cosmos_timer_cb))(cb), \
-	 cosmos_timer_ptr = (struct bpf_timer *)(timer), 0)
-
-#undef bpf_timer_start
-#define bpf_timer_start(timer, nsecs, flags) \
-	(sim_timer_start(nsecs), 0)
-
-/*
- * Static wakeup_timer backing storage.
- * The struct bpf_timer inside is opaque to us — we just need to provide
- * memory for bpf_map_lookup_elem to return. The bpf_timer fields aren't
- * accessed; our macros intercept bpf_timer_init/set_callback/start.
- * Size is generous to accommodate any struct wakeup_timer layout.
- */
-static char sim_wakeup_timer_buf[256];
-static void *wakeup_timer_map_ptr;
-
 static void *cosmos_map_lookup(void *map, const void *key)
 {
-	if (map == wakeup_timer_map_ptr && wakeup_timer_map_ptr != NULL)
-		return sim_wakeup_timer_buf;
 	return scx_test_map_lookup_elem(map, key);
 }
 #undef bpf_map_lookup_elem
@@ -341,38 +310,6 @@ void cosmos_register_maps(void)
 
 	INIT_SCX_TEST_MAP(&cpu_node_test_map, cpu_node_map);
 	scx_test_map_register(&cpu_node_test_map, &cpu_node_map);
-
-	/*
-	 * Upstream scx_cosmos dropped deferred CPU wakeups and removed the
-	 * `wakeup_timer` object (sched-ext/scx 79f892807cff "Deprecate deferred
-	 * CPU wakeup" + 225b98c0 "Remove unused wakeup_timer"). COSMOS now has
-	 * no BPF timer, so there is nothing to wire up here. The timer override
-	 * infrastructure above (cosmos_timer_cb/_ptr/_map, sim_wakeup_timer_buf)
-	 * stays harmlessly dormant: cosmos_timer_cb is never set, so
-	 * cosmos_fire_timer() is a no-op and cosmos_map_lookup() falls through
-	 * to the normal map lookup (wakeup_timer_map_ptr stays NULL).
-	 */
-}
-
-/*
- * Fire the stored BPF timer callback.
- * Called from the Rust engine when a TimerFired event is processed.
- *
- * Phase 1 BPF infra scale-up items 1+2 (tg
- * `scxsim-bpf-infra-scale-up-phase1`): the engine now passes a `slot`
- * id so multi-timer schedulers (LAVD post-Phase-1, Phase-2 compiled-in
- * cgroup_bw library) can dispatch to the right callback. COSMOS is a
- * single-timer scheduler (only `wakeup_timer`); it ignores `slot` and
- * always fires its only timer. The single arg is required by the new
- * FFI signature `FireTimerFn = unsafe extern "C" fn(u32)` so the
- * symbol resolves.
- */
-void cosmos_fire_timer(unsigned int slot)
-{
-	int key = 0;
-	(void)slot;
-	if (cosmos_timer_cb && cosmos_timer_ptr)
-		cosmos_timer_cb(cosmos_timer_map, &key, cosmos_timer_ptr);
 }
 
 /*
