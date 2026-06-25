@@ -144,48 +144,54 @@ fn main() {
     // Linker flags for the main binary
     // ---------------------------------------------------------------
 
-    // Export all symbols so .so can resolve kfuncs and scxtest functions
-    println!("cargo:rustc-link-arg=-rdynamic");
-
-    // Force scxtest map functions into the binary even though Rust doesn't
-    // reference them directly — the .so's scheduler code calls them via
-    // the bpf_map_lookup_elem macro.
-    println!("cargo:rustc-link-arg=-Wl,--undefined=scx_test_map_lookup_elem");
-    // Also export scx_test_map_clear_all for deterministic re-runs.
-    // This clears the thread-local map registry between simulation runs.
-    println!("cargo:rustc-link-arg=-Wl,--undefined=scx_test_map_clear_all");
-
-    // Force SDT (per-task storage) functions into the binary. The .so files
-    // do not include sim_sdt_stubs.c — they resolve these from the main binary.
-    // This ensures there's only one copy of the SDT hash table, allowing
-    // sim_sdt_reset() to work correctly for deterministic re-runs.
-    println!("cargo:rustc-link-arg=-Wl,--undefined=scx_task_init");
-    println!("cargo:rustc-link-arg=-Wl,--undefined=scx_task_alloc");
-    println!("cargo:rustc-link-arg=-Wl,--undefined=scx_task_data");
-    println!("cargo:rustc-link-arg=-Wl,--undefined=scx_task_free");
-    println!("cargo:rustc-link-arg=-Wl,--undefined=scx_arena_subprog_init");
-
-    // Force e9_preempt_yield and E9_SHARED_RBC into the binary so the
-    // e9patch-instrumented .so files can resolve them via -rdynamic.
-    println!("cargo:rustc-link-arg=-Wl,--undefined=e9_preempt_yield");
-    println!("cargo:rustc-link-arg=-Wl,--undefined=E9_SHARED_RBC");
-    // Arena allocator symbols used by both sim_sdt_stubs (main binary) and
-    // sim_bpf_stubs (.so) — ensure they're exported via -rdynamic.
-    println!("cargo:rustc-link-arg=-Wl,--undefined=sim_arena_buf");
-    println!("cargo:rustc-link-arg=-Wl,--undefined=sim_arena_offset");
-
-    // sim_atq.c symbols (Phase 1 BPF infra scale-up item 7). No Rust code
-    // references them directly today -- Phase 2's compiled-in
-    // cgroup_bw.bpf.c is the consumer, and it lives in scheduler `.so`
-    // files that resolve via dlopen + -rdynamic. Force the .o into the
-    // binary so the symbols are present at .so load time.
+    // Symbols DEFINED in the static C libs compiled into the main binary that
+    // the dlopen'd scheduler `.so` files resolve at load time. Rust does not
+    // reference them, so without `--undefined` the linker drops them and a
+    // `.so` SIGSEGVs at its first kfunc call; `-rdynamic` puts them in the
+    // binary's dynamic symbol table so dlopen can find them.
     //
-    // One `--undefined` forces the whole sim_atq.o translation unit; all
-    // scx_atq_* symbols come along for the ride via static-linker
-    // semantics. We pin scx_atq_create_internal because it's the only
-    // entry point that a consumer can call without already holding an
-    // atq pointer.
-    println!("cargo:rustc-link-arg=-Wl,--undefined=scx_atq_create_internal");
+    // Grouped rationale:
+    // - scx_test_map_*: scheduler code calls them via the bpf_map_lookup_elem
+    //   macro; clear_all resets the thread-local map registry between runs.
+    // - scx_task_*/scx_arena_subprog_init: per-task SDT storage. The `.so`
+    //   files omit sim_sdt_stubs.c and resolve these from the binary so there
+    //   is ONE SDT hash table (sim_sdt_reset works for deterministic re-runs).
+    // - e9_preempt_yield/E9_SHARED_RBC: resolved by e9patch-instrumented `.so`
+    //   variants. (a later change will feature-gate the e9 path; when it does, drop these
+    //   two here — consumers read the emitted list, so nothing else changes.)
+    // - sim_arena_*: arena allocator shared by sim_sdt_stubs (binary) and
+    //   sim_bpf_stubs (.so).
+    // - scx_atq_create_internal: one `--undefined` forces the whole sim_atq.o
+    //   TU (all scx_atq_* follow); cgroup_bw.bpf.c in the `.so` consumes them.
+    //
+    // Emitted ALSO as `SCXSIM_EXPORTED_SYMS` (single source of truth): tests/
+    // symbol_export.rs asserts each resolves in the process image, and a
+    // downstream binary embedding scx_simulator re-emits the same set for its
+    // own test binaries — no hand-copied list to drift.
+    const EXPORTED_SYMS: &[&str] = &[
+        "scx_test_map_lookup_elem",
+        "scx_test_map_clear_all",
+        "scx_task_init",
+        "scx_task_alloc",
+        "scx_task_data",
+        "scx_task_free",
+        "scx_arena_subprog_init",
+        "e9_preempt_yield",
+        "E9_SHARED_RBC",
+        "sim_arena_buf",
+        "sim_arena_offset",
+        "scx_atq_create_internal",
+    ];
+
+    // Export all symbols so `.so` files can resolve kfuncs and scxtest funcs.
+    println!("cargo:rustc-link-arg=-rdynamic");
+    for sym in EXPORTED_SYMS {
+        println!("cargo:rustc-link-arg=-Wl,--undefined={sym}");
+    }
+    println!(
+        "cargo:rustc-env=SCXSIM_EXPORTED_SYMS={}",
+        EXPORTED_SYMS.join(",")
+    );
 
     // Link the clang profile runtime when coverage is enabled.
     // This provides __llvm_profile_* symbols for the instrumented .so files.
