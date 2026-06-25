@@ -180,45 +180,21 @@ extern u64 sim_bpf_ktime_get_ns(void);
 extern void *sim_dsq_iter_begin(u64 dsq_id, u64 flags);
 extern void *sim_dsq_iter_next(void);
 
-static __always_inline int sim_bpf_iter_scx_dsq_new(struct bpf_iter_scx_dsq *it,
-						    u64 dsq_id, u64 flags)
-{
-	u64 *opaque = (u64 *)it;
-
-	opaque[0] = (u64)(unsigned long)sim_dsq_iter_begin(dsq_id, flags);
-	opaque[1] = 1;
-	return 0;
-}
-
-static __always_inline struct task_struct *
-sim_bpf_iter_scx_dsq_next(struct bpf_iter_scx_dsq *it)
-{
-	u64 *opaque = (u64 *)it;
-
-	if (opaque[1]) {
-		opaque[1] = 0;
-		return (struct task_struct *)(unsigned long)opaque[0];
-	}
-
-	return (struct task_struct *)sim_dsq_iter_next();
-}
-
-static __always_inline void
-sim_bpf_iter_scx_dsq_destroy(struct bpf_iter_scx_dsq *it)
-{
-	while (sim_bpf_iter_scx_dsq_next(it))
-		;
-}
-
+/*
+ * DSQ iterator glue. bpf_for_each(scx_dsq, ...) takes the ADDRESS of
+ * bpf_iter_scx_dsq_destroy (a cleanup() attribute, a no-paren reference), so a
+ * function-like macro cannot satisfy it -- the concrete, address-takeable
+ * functions live in csrc/sim_dsq_iter_glue.c, compiled into every .so. Declare
+ * them here so all wrappers resolve the same symbols, both for the direct
+ * new()/next() calls and the cleanup destroy address-take. The #undef clears
+ * the helper-id pointer constants bpf_helper_defs.h defines for these names.
+ */
 #undef bpf_iter_scx_dsq_new
-#define bpf_iter_scx_dsq_new(it, dsq_id, flags) \
-	sim_bpf_iter_scx_dsq_new((it), (dsq_id), (flags))
-
 #undef bpf_iter_scx_dsq_next
-#define bpf_iter_scx_dsq_next(it) sim_bpf_iter_scx_dsq_next((it))
-
 #undef bpf_iter_scx_dsq_destroy
-#define bpf_iter_scx_dsq_destroy(it) sim_bpf_iter_scx_dsq_destroy((it))
+extern int bpf_iter_scx_dsq_new(struct bpf_iter_scx_dsq *it, u64 dsq_id, u64 flags);
+extern struct task_struct *bpf_iter_scx_dsq_next(struct bpf_iter_scx_dsq *it);
+extern void bpf_iter_scx_dsq_destroy(struct bpf_iter_scx_dsq *it);
 
 /*
  * Undo BPF CO-RE enum variable macros from enums.autogen.bpf.h.

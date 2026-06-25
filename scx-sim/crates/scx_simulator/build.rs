@@ -429,6 +429,7 @@ fn build_schedulers(
         // Full-CFLAGS TUs.
         let full_srcs = [
             sched_dir.join("wrapper.c"),
+            csrc_dir.join("sim_dsq_iter_glue.c"),
             csrc_dir.join("sim_bpf_stubs.c"),
             scxtest_dir.join("overrides.c"),
         ];
