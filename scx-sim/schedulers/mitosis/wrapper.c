@@ -25,11 +25,20 @@ extern void *memset(void *s, int c, unsigned long n);
  * ---------------------------------------------------------------------------*/
 
 /*
- * Force scx_bpf_select_cpu_dfl fallback -- avoids needing
- * scx_bpf_select_cpu_and which isn't implemented in the simulator.
+ * bpf_ksym_exists gates scx's compat.bpf.h modern-vs-legacy kfunc ternaries.
+ * The simulator provides the modern scx kfunc surface, so report symbols as
+ * present (=1). The gated kfuncs mitosis uses are mostly #undef-routed to sim
+ * exports in sim_wrapper.h already; the one gate that isn't,
+ * __COMPAT_scx_bpf_cpu_curr (compat.bpf.h), then returns the real
+ * scx_bpf_cpu_curr rather than scx_bpf_cpu_rq(cpu)->curr -- the sim's
+ * scx_bpf_cpu_rq returns NULL, so the =0 branch was always NULL and suppressed
+ * mitosis's enable_slice_shrinking path. (Supersedes a stale comment that set
+ * =0 to avoid scx_bpf_select_cpu_and "unimplemented" -- it is implemented, and
+ * mitosis's select path uses neither it nor scx_bpf_select_cpu_dfl but
+ * pick_idle_cpu.)
  */
 #undef bpf_ksym_exists
-#define bpf_ksym_exists(sym) (0)
+#define bpf_ksym_exists(sym) (1)
 
 /*
  * The simulator always calls select_cpu before enqueue, so the
