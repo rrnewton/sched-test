@@ -3065,7 +3065,7 @@ pub extern "C" fn bpf_cgroup_release(_cgrp: *mut c_void) {}
 //
 // The C entry points -- `scx_test_cgrp_storage_get`,
 // `scx_test_task_storage_get`, `scx_test_map_lookup_percpu_elem`,
-// `scx_test_cgrp_storage_delete`, `scx_test_map_delete_elem` -- are
+// `scx_test_cgrp_storage_delete`, `scx_storage_delete` -- are
 // the same ones that scheduler wrapper.c files install via macro
 // `#define`; the kfuncs.rs versions below provide the strong symbols
 // resolved at .so load time when a wrapper has NOT installed an
@@ -3093,7 +3093,7 @@ extern "C" {
         value: *mut c_void,
         flags: u64,
     ) -> *mut c_void;
-    fn scx_test_map_delete_elem(map: *mut c_void, key: *const c_void) -> i32;
+    fn scx_storage_delete(map: *mut c_void, key: *const c_void) -> i32;
     fn scx_test_map_lookup_percpu_elem(
         map: *mut c_void,
         key: *const c_void,
@@ -3183,7 +3183,7 @@ pub extern "C" fn bpf_task_storage_delete(map: *mut c_void, task: *mut c_void) -
     if map.is_null() {
         return -2; // -ENOENT
     }
-    let rc = unsafe { scx_test_map_delete_elem(map, &task as *const _ as *const c_void) };
+    let rc = unsafe { scx_storage_delete(map, &task as *const _ as *const c_void) };
     if rc == 0 {
         0
     } else {

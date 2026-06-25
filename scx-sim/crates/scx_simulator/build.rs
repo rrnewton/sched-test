@@ -184,8 +184,10 @@ fn main() {
     // binary's dynamic symbol table so dlopen can find them.
     //
     // Grouped rationale:
-    // - scx_test_map_*: scheduler code calls them via the bpf_map_lookup_elem
-    //   macro; clear_all resets the thread-local map registry between runs.
+    // - scx_test_map_*: scheduler code calls them via the bpf_map_lookup_elem /
+    //   bpf_map_delete_elem macros (lavd routes bpf_map_delete_elem to
+    //   scx_test_map_delete_elem for cbw_cgrp_map); clear_all resets the
+    //   thread-local map registry between runs.
     // - scx_task_*/scx_arena_subprog_init: per-task SDT storage. The `.so`
     //   files omit sim_sdt_stubs.c and resolve these from the binary so there
     //   is ONE SDT hash table (sim_sdt_reset works for deterministic re-runs).
@@ -203,6 +205,7 @@ fn main() {
     // own test binaries — no hand-copied list to drift.
     const EXPORTED_SYMS: &[&str] = &[
         "scx_test_map_lookup_elem",
+        "scx_test_map_delete_elem",
         "scx_test_map_clear_all",
         "scx_task_init",
         "scx_task_alloc",
