@@ -57,13 +57,6 @@
 #define bpf_ringbuf_submit(data, flags) do {} while(0)
 
 /*
- * bpf_per_cpu_ptr -- kernel per-CPU variables don't exist in the
- * simulator. Return NULL so callers skip the code path.
- */
-#undef bpf_per_cpu_ptr
-#define bpf_per_cpu_ptr(ptr, cpu) ((typeof(ptr))0)
-
-/*
  * Reserved PID for the simulator's synthetic "loader" task — the stand-in
  * for the scx_lavd userspace loader process. Upstream cgroup_bw
  * (sched-ext/scx a52f85e3 "lib/cgroup_bw: resolve root cgroup through the
@@ -87,15 +80,6 @@
  */
 #undef bpf_get_current_pid_tgid
 #define bpf_get_current_pid_tgid() (((u64)SIM_CBW_LOADER_TGID) << 32)
-
-/*
- * __COMPAT_scx_bpf_dsq_peek -- override the compat wrapper to directly
- * call scx_bpf_dsq_peek which is implemented in kfuncs.rs. The compat
- * wrapper normally falls through to bpf_iter_scx_dsq_* when bpf_ksym_exists
- * returns 0, but those iterators aren't implemented in the simulator.
- */
-extern struct task_struct *scx_bpf_dsq_peek(u64 dsq_id);
-#define __COMPAT_scx_bpf_dsq_peek(dsq_id) scx_bpf_dsq_peek(dsq_id)
 
 /*
  * bpf_iter_scx_dsq_*: bpf_for_each(scx_dsq, ...) uses a cleanup() destructor,
@@ -143,12 +127,6 @@ void bpf_iter_scx_dsq_destroy(struct bpf_iter_scx_dsq *it)
 #if !__has_builtin(__builtin_memcpy_inline)
 #define __builtin_memcpy_inline(dst, src, sz) __builtin_memcpy(dst, src, sz)
 #endif
-
-/*
- * The simulator always calls select_cpu before enqueue.
- */
-#undef __COMPAT_is_enq_cpu_selected
-#define __COMPAT_is_enq_cpu_selected(enq_flags) (true)
 
 /*
  * is_migration_disabled: use the simulator's task_struct accessor.

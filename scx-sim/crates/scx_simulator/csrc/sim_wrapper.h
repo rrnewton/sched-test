@@ -321,6 +321,24 @@ extern s32 sim_scx_bpf_select_cpu_and(struct task_struct *p, s32 prev_cpu,
 #define __COMPAT_scx_bpf_task_cgroup(p) __sim_task_cgroup((void *)(p), 0)
 
 /*
+ * The simulator always runs select_cpu before enqueue, so the enqueue CPU is
+ * always selected. Folded here from the per-scheduler wrappers (mitosis/cosmos/
+ * lavd all defined this identically). Must follow the common.bpf.h include above
+ * so it shadows the compat.bpf.h static inline at scheduler call sites.
+ */
+#undef __COMPAT_is_enq_cpu_selected
+#define __COMPAT_is_enq_cpu_selected(enq_flags) (true)
+
+/*
+ * __COMPAT_scx_bpf_dsq_peek -- route directly to the simulator's scx_bpf_dsq_peek
+ * kfunc (resolved from the Rust binary at dlopen) instead of the compat
+ * fall-through to bpf_iter_scx_dsq_* ksym-probing. Folded here from the
+ * per-scheduler wrappers (mitosis/cosmos/lavd were identical).
+ */
+extern struct task_struct *scx_bpf_dsq_peek(u64 dsq_id);
+#define __COMPAT_scx_bpf_dsq_peek(dsq_id) scx_bpf_dsq_peek(dsq_id)
+
+/*
  * Override BPF_STRUCT_OPS to produce regular C functions.
  * In BPF mode, BPF_STRUCT_OPS wraps functions with SEC annotations and
  * BPF_PROG argument unpacking. In simulator mode, we just want plain

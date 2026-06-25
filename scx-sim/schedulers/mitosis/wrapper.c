@@ -25,21 +25,6 @@ extern void *memset(void *s, int c, unsigned long n);
  * ---------------------------------------------------------------------------*/
 
 /*
- * The simulator always calls select_cpu before enqueue, so the
- * CPU is always selected.
- */
-#undef __COMPAT_is_enq_cpu_selected
-#define __COMPAT_is_enq_cpu_selected(enq_flags) (true)
-
-/*
- * __COMPAT_scx_bpf_dsq_peek -- route directly to the simulator's export.
- * This avoids taking the ksym-probing path when the scheduler asks for
- * lockless DSQ peek support.
- */
-extern struct task_struct *scx_bpf_dsq_peek(u64 dsq_id);
-#define __COMPAT_scx_bpf_dsq_peek(dsq_id) scx_bpf_dsq_peek(dsq_id)
-
-/*
  * bpf_iter_scx_dsq_*: bpf_for_each(scx_dsq, ...) uses a cleanup() destructor,
  * so mitosis needs concrete function symbols, not just macro rewrites.
  */
@@ -159,15 +144,6 @@ extern void sim_timer_start(unsigned long long nsecs);
 /* no_free_ptr just returns the pointer unchanged */
 #undef no_free_ptr
 #define no_free_ptr(p) (p)
-
-/* bpf_kptr_xchg: atomically exchange pointer, return old value */
-static inline void *sim_kptr_xchg(void **kptr, void *new_val) {
-	void *old = *kptr;
-	*kptr = new_val;
-	return old;
-}
-#undef bpf_kptr_xchg
-#define bpf_kptr_xchg(kptr, val) sim_kptr_xchg((void **)(kptr), (void *)(val))
 
 /* Cgroup acquire/release - simulator doesn't do reference counting */
 static inline struct cgroup *sim_cgroup_acquire(struct cgroup *cgrp) {

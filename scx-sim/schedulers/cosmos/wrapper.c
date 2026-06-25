@@ -18,21 +18,6 @@
  */
 
 /*
- * The simulator always calls select_cpu before enqueue, so the
- * CPU is always selected.
- */
-#undef __COMPAT_is_enq_cpu_selected
-#define __COMPAT_is_enq_cpu_selected(enq_flags) (true)
-
-/*
- * __COMPAT_scx_bpf_dsq_peek -- route directly to the simulator's export.
- * This avoids falling through to bpf_iter_scx_dsq_* weak symbols when
- * COSMOS peeks into a shared DSQ.
- */
-extern struct task_struct *scx_bpf_dsq_peek(u64 dsq_id);
-#define __COMPAT_scx_bpf_dsq_peek(dsq_id) scx_bpf_dsq_peek(dsq_id)
-
-/*
  * bpf_iter_scx_dsq_*: bpf_for_each(scx_dsq, ...) uses a cleanup() destructor,
  * so COSMOS needs concrete function symbols, not just macro rewrites.
  */
