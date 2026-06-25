@@ -339,6 +339,29 @@ extern struct task_struct *scx_bpf_dsq_peek(u64 dsq_id);
 #define __COMPAT_scx_bpf_dsq_peek(dsq_id) scx_bpf_dsq_peek(dsq_id)
 
 /*
+ * is_migration_disabled: the simulator sets task_struct::migration_disabled
+ * explicitly (no BPF trampoline prolog exists to spuriously bump it), so
+ * migration_disabled > 0 unambiguously means migration-disabled. Folded here
+ * from the per-scheduler wrappers (mitosis/cosmos/lavd defined this
+ * identically). Must follow the common.bpf.h include above so it shadows the
+ * common.bpf.h static inline at scheduler call sites.
+ *
+ * Without this override the inline gates on bpf_core_field_exists(
+ * p->migration_disabled), which the simulator forces to 0 (see
+ * __builtin_preserve_field_info above), so the inline returns false for every
+ * task -- a scheduler that calls is_migration_disabled with no override (e.g.
+ * tickless) would treat migration_disabled >= 1 tasks as migratable. This
+ * override corrects that.
+ *
+ * Tests that should also reflect real-kernel behavior (where the inline treats
+ * migration_disabled == 1 as the ambiguous BPF-prolog case) should set
+ * migration_disabled >= 2 to model an unambiguously migration-disabled task.
+ */
+extern unsigned short sim_task_get_migration_disabled(struct task_struct *p);
+#undef is_migration_disabled
+#define is_migration_disabled(p) (sim_task_get_migration_disabled(p) > 0)
+
+/*
  * Override BPF_STRUCT_OPS to produce regular C functions.
  * In BPF mode, BPF_STRUCT_OPS wraps functions with SEC annotations and
  * BPF_PROG argument unpacking. In simulator mode, we just want plain

@@ -129,22 +129,6 @@ void bpf_iter_scx_dsq_destroy(struct bpf_iter_scx_dsq *it)
 #endif
 
 /*
- * is_migration_disabled: use the simulator's task_struct accessor.
- *
- * The kernel's is_migration_disabled() checks p->migration_disabled with
- * special handling for migration_disabled == 1 (ambiguous because BPF
- * prolog increments it). In the simulator, we don't run actual BPF code,
- * so we use a simpler check: migration_disabled > 0 means disabled.
- *
- * For production bug reproduction (sim-7cc89), set migration_disabled >= 2
- * on the task to model a task that was already migration-disabled before
- * entering the scheduler callback.
- */
-extern unsigned short sim_task_get_migration_disabled(struct task_struct *p);
-#undef is_migration_disabled
-#define is_migration_disabled(p) (sim_task_get_migration_disabled(p) > 0)
-
-/*
  * scx_clock_task / scx_clock_pelt override.
  *
  * Route to the simulator's kfunc which returns local_clock - irq_cumulative_ns.
