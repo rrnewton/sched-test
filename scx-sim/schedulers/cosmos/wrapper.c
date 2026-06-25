@@ -55,36 +55,6 @@ void bpf_iter_scx_dsq_destroy(struct bpf_iter_scx_dsq *it)
 }
 
 /*
- * Override __COMPAT_scx_bpf_cpu_curr to return actual running tasks.
- *
- * The default sim_wrapper.h override returns NULL, which makes
- * is_cpu_idle() always return false (with scx_bpf_error).
- * We need proper idle detection for deferred wakeups and PMU routing.
- *
- * For idle CPUs (scx_bpf_cpu_curr returns NULL), we return a synthetic
- * idle task with PF_IDLE set so is_cpu_idle() returns true.
- */
-extern struct task_struct *scx_bpf_cpu_curr(int cpu);
-static struct task_struct sim_idle_task;
-static bool sim_idle_task_init;
-
-static struct task_struct *cosmos_cpu_curr(int cpu)
-{
-	struct task_struct *p = scx_bpf_cpu_curr(cpu);
-	if (p)
-		return p;
-	/* Return synthetic idle task for idle CPUs */
-	if (!sim_idle_task_init) {
-		__builtin_memset(&sim_idle_task, 0, sizeof(sim_idle_task));
-		sim_idle_task.flags = PF_IDLE;
-		sim_idle_task_init = true;
-	}
-	return &sim_idle_task;
-}
-#undef __COMPAT_scx_bpf_cpu_curr
-#define __COMPAT_scx_bpf_cpu_curr(cpu) cosmos_cpu_curr(cpu)
-
-/*
  * Route bpf_map_lookup_percpu_elem to a static cpu_ctx array.
  * Forward-declared here; defined after the scheduler source since
  * struct cpu_ctx is defined there.

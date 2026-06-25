@@ -268,31 +268,6 @@ static void *lavd_map_lookup(void *map, const void *key);
 #define bpf_map_lookup_elem(map, key) lavd_map_lookup((void *)(map), key)
 
 /*
- * __COMPAT_scx_bpf_cpu_curr override.
- * Return actual running task or a synthetic idle task.
- */
-extern struct task_struct *scx_bpf_cpu_curr(int cpu);
-static struct task_struct sim_lavd_idle_task;
-static bool sim_lavd_idle_init;
-
-static struct task_struct *lavd_cpu_curr(int cpu)
-{
-	struct task_struct *p = scx_bpf_cpu_curr(cpu);
-	if (p)
-		return p;
-	if (!sim_lavd_idle_init) {
-		__builtin_memset(&sim_lavd_idle_task, 0,
-				 sizeof(sim_lavd_idle_task));
-		sim_lavd_idle_task.flags = PF_IDLE;
-		sim_lavd_idle_init = true;
-	}
-	return &sim_lavd_idle_task;
-}
-
-#undef __COMPAT_scx_bpf_cpu_curr
-#define __COMPAT_scx_bpf_cpu_curr(cpu) lavd_cpu_curr(cpu)
-
-/*
  * Division-by-zero protection: provided by sim_sigfpe.c (separate TU
  * to avoid signal.h / vmlinux.h type conflicts).
  */

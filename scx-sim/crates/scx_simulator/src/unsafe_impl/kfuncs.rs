@@ -2727,8 +2727,11 @@ pub extern "C" fn bpf_get_current_task_btf_kfunc() -> *mut c_void {
     bpf_get_current_task_btf()
 }
 
-/// Get the task running on a given CPU. Returns NULL if the CPU index is out of
-/// range or the CPU has no current task.
+/// Get the task running on a given CPU. For an in-range CPU this returns the
+/// current task, or the synthetic idle task (`idle_task_raw`, PF_IDLE) when the
+/// CPU is idle -- matching the kernel, whose `scx_bpf_cpu_curr` returns
+/// `cpu_rq(cpu)->curr` (the idle task on an idle CPU, never NULL). Returns NULL
+/// only for an out-of-range CPU (the kernel's invalid-cpu path).
 ///
 /// Backs `__COMPAT_scx_bpf_cpu_curr` (compat.bpf.h): that compat helper calls
 /// this kfunc whenever `scx_bpf_cpu_curr` resolves as a symbol — which it always
@@ -2746,7 +2749,9 @@ pub extern "C" fn scx_bpf_cpu_curr(cpu: i32) -> *mut c_void {
                 return raw as *mut c_void;
             }
         }
-        ptr::null_mut()
+        // In-range idle CPU: return the synthetic idle task (PF_IDLE), matching
+        // the kernel's rq->idle. NULL is reserved for the out-of-range case above.
+        sim.idle_task_raw
     })
 }
 
@@ -4453,6 +4458,12 @@ mod tests {
 
         let raw = register_task(&mut arc.lock().unwrap().sim, Pid(5));
         arc.lock().unwrap().sim.cpus[1].current_task = Some(Pid(5));
+        // An in-range idle CPU returns the synthetic idle task (PF_IDLE),
+        // matching the kernel's rq->idle. The real engine installs this at init
+        // (engine.rs); test_state leaves it null, so install a real one here so
+        // the idle assertion below actually guards (not a null==null false-pass).
+        let idle_raw = crate::ffi::alloc_idle_task();
+        arc.lock().unwrap().sim.idle_task_raw = idle_raw;
 
         let cpu = arc.lock().unwrap().sim.current_cpu;
         enter_test_sim(&arc, cpu);
@@ -4462,10 +4473,14 @@ mod tests {
         exit_test_sim();
 
         assert_eq!(p, raw);
-        assert!(idle.is_null());
+        // In-range idle CPU -> the synthetic idle task, not NULL.
+        assert_eq!(idle, idle_raw);
+        // Out-of-range CPU -> NULL (the kernel's invalid-cpu path).
         assert!(oob.is_null());
 
         free_task(&mut arc.lock().unwrap().sim, Pid(5));
+        // SAFETY: idle_raw came from alloc_idle_task and is unused after this.
+        unsafe { crate::ffi::free_task_raw(idle_raw) };
     }
 
     // -----------------------------------------------------------------------
