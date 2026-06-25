@@ -10,6 +10,34 @@ fn main() {
     let root_dir = workspace_dir.join("..").canonicalize().unwrap();
     let out_dir: PathBuf = env::var("OUT_DIR").unwrap().into();
 
+    // scx source root. Defaults to the bundled submodule at <repo-root>/scx;
+    // SCX_ROOT overrides it so a crate embedding scx_simulator can supply its
+    // own scx sources (the published crate does not carry the submodule). When
+    // set, the path must exist and look like an scx checkout (have scheds/include)
+    // — fail loud rather than silently miscompile against a partial tree.
+    //
+    // `scx_override_active` is true only when SCX_ROOT resolves to a DIFFERENT
+    // tree than the bundled submodule. It gates schedulers whose wrappers still
+    // hardcode the bundled scx/lib path (lavd) and so cannot follow the override
+    // until those includes are rehomed.
+    let default_scx_root = root_dir.join("scx");
+    let (scx_root, scx_override_active) = match env::var("SCX_ROOT") {
+        Ok(v) => {
+            let canon = PathBuf::from(&v)
+                .canonicalize()
+                .unwrap_or_else(|e| panic!("SCX_ROOT={v} is not accessible: {e}"));
+            assert!(
+                canon.join("scheds/include").is_dir(),
+                "SCX_ROOT={v} does not look like an scx checkout (missing scheds/include)"
+            );
+            let is_default =
+                default_scx_root.canonicalize().ok().as_deref() == Some(canon.as_path());
+            (canon, !is_default)
+        }
+        Err(_) => (default_scx_root, false),
+    };
+    println!("cargo:rerun-if-env-changed=SCX_ROOT");
+
     let coverage = env::var("SCX_SIM_COVERAGE").as_deref() == Ok("1");
 
     // C substrate vendored into this crate so `cargo package` ships it
@@ -23,11 +51,11 @@ fn main() {
         // scxtest unit-test infrastructure (vendored into this crate)
         scxtest_dir.clone(),
         // Scheduler include paths
-        root_dir.join("scheds/include"),
-        root_dir.join("scheds/include/lib"),
-        root_dir.join("scheds/vmlinux"),
-        root_dir.join("scheds/vmlinux/arch/x86"),
-        root_dir.join("scheds/include/bpf-compat"),
+        scx_root.join("scheds/include"),
+        scx_root.join("scheds/include/lib"),
+        scx_root.join("scheds/vmlinux"),
+        scx_root.join("scheds/vmlinux/arch/x86"),
+        scx_root.join("scheds/include/bpf-compat"),
         // libbpf headers
         env::var("DEP_BPF_INCLUDE")
             .expect("libbpf-sys include must be available")
@@ -127,7 +155,7 @@ fn main() {
     // SCX cgroup_bw API flag-day probe: the NEW function signatures are gated
     // on the presence of `struct scx_task_cgroup_bw` in
     // scheds/include/lib/cgroup.h (mirrors schedulers/Makefile SCX_CGROUP_BW_API).
-    let cgroup_bw_new_api = std::fs::read_to_string(root_dir.join("scheds/include/lib/cgroup.h"))
+    let cgroup_bw_new_api = std::fs::read_to_string(scx_root.join("scheds/include/lib/cgroup.h"))
         .map(|s| {
             // Matches schedulers/Makefile's `grep '^struct scx_task_cgroup_bw'`
             // exactly (line-anchored, no leading-whitespace tolerance) so this
@@ -143,10 +171,11 @@ fn main() {
         &csrc_dir,
         &scxtest_dir,
         &include_paths,
-        &root_dir,
+        &scx_root,
         &compiler,
         coverage,
         cgroup_bw_new_api,
+        scx_override_active,
     );
 
     println!("cargo:rerun-if-env-changed=SCXSIM_PHASE2_REAL_CGROUP_BW");
@@ -276,21 +305,21 @@ fn main() {
         println!("cargo:rerun-if-changed={}", workspace_dir.join(d).display());
     }
     let scx_rerun_dirs: &[&str] = &[
-        // scx submodule subtrees pulled in by wrapper.c per-scheduler #includes
-        // and by the include_paths above. Watching each subtree forces a
-        // rebuild whenever the submodule is swapped to a SHA that touched
-        // those files.
-        "scx/lib",                              // ravg.bpf.c, cgroup_bw.bpf.c, ...
-        "scx/scheds/rust/scx_lavd/src/bpf",     // LAVD wrapper transitive include
-        "scx/scheds/rust/scx_mitosis/src/bpf",  // mitosis wrapper transitive include
-        "scx/scheds/rust/scx_cosmos/src/bpf",   // cosmos wrapper transitive include
-        "scx/scheds/rust/scx_tickless/src/bpf", // tickless wrapper transitive include
-        // scx submodule headers used by ALL schedulers via include_paths above
-        "scx/scheds/include",
-        "scx/scheds/vmlinux",
+        // scx source-root subtrees (paths relative to SCX_ROOT) pulled in by
+        // wrapper.c per-scheduler #includes and by the include_paths above.
+        // Watching each subtree forces a rebuild whenever the scx source is
+        // swapped to a revision that touched those files.
+        "lib",                              // ravg.bpf.c, cgroup_bw.bpf.c, ...
+        "scheds/rust/scx_lavd/src/bpf",     // LAVD wrapper transitive include
+        "scheds/rust/scx_mitosis/src/bpf",  // mitosis wrapper transitive include
+        "scheds/rust/scx_cosmos/src/bpf",   // cosmos wrapper transitive include
+        "scheds/rust/scx_tickless/src/bpf", // tickless wrapper transitive include
+        // scx headers used by ALL schedulers via include_paths above
+        "scheds/include",
+        "scheds/vmlinux",
     ];
     for d in scx_rerun_dirs {
-        println!("cargo:rerun-if-changed={}", root_dir.join(d).display());
+        println!("cargo:rerun-if-changed={}", scx_root.join(d).display());
     }
     println!("cargo:rerun-if-env-changed=SCX_SIM_COVERAGE");
 }
@@ -310,6 +339,12 @@ fn main() {
 ///   SIGFPE decoder, the RBC trampoline layout, and the branchless mem ops.
 /// - `sim_sdt_stubs.c` is deliberately NOT linked into the `.so` (the single
 ///   SDT table lives in the main binary).
+///
+/// `scx_root` is the scx source tree (default = the bundled submodule, or an
+/// SCX_ROOT override). When `override_active` (the override resolves to a tree
+/// other than the bundled submodule), lavd is skipped: its wrapper hardcodes
+/// `scx/lib` includes that still anchor on the submodule and cannot follow the
+/// override.
 #[allow(clippy::too_many_arguments)]
 fn build_schedulers(
     schedulers_src: &Path,
@@ -317,10 +352,11 @@ fn build_schedulers(
     csrc_dir: &Path,
     scxtest_dir: &Path,
     include_paths: &[PathBuf],
-    root_dir: &Path,
+    scx_root: &Path,
     compiler: &str,
     coverage: bool,
     cgroup_bw_new_api: bool,
+    override_active: bool,
 ) {
     // CFLAGS_BASE — applied to every scheduler TU (mirrors Makefile CFLAGS_BASE).
     let cflags_base: &[&str] = &[
@@ -360,6 +396,22 @@ fn build_schedulers(
     for name in &names {
         let sched_dir = schedulers_src.join(name);
 
+        // lavd's wrapper.c hardcodes `#include "../../scx/lib/{ravg,cgroup_bw}.bpf.c"`
+        // anchored on the bundled submodule, so it cannot follow an SCX_ROOT
+        // override. Skip it under an active override rather than silently mixing
+        // scheds/ from the override with scx/lib bodies from the submodule; the
+        // other schedulers compile against the override, and a later load of the
+        // absent libscx_lavd.so fails loud. Rehoming the wrapper's relative
+        // includes to a stable -I lifts this restriction.
+        if override_active && name == "lavd" {
+            println!(
+                "cargo:warning=scx_simulator: skipping lavd under SCX_ROOT override — \
+                 its wrapper hardcodes ../../scx/lib includes anchored on the bundled \
+                 submodule; lavd builds under SCX_ROOT once those includes are rehomed."
+            );
+            continue;
+        }
+
         // `simple` has no config.mk: `const` stays intact and it pulls no scx
         // BPF include (its scheduler source is local). Every other scheduler
         // strips `const` (BPF const-volatile globals must be writable) and adds
@@ -369,7 +421,7 @@ fn build_schedulers(
         let strip_const = name != "simple";
         let mut extra_includes: Vec<PathBuf> = Vec::new();
         if name != "simple" {
-            extra_includes.push(root_dir.join(format!("scheds/rust/scx_{name}/src/bpf")));
+            extra_includes.push(scx_root.join(format!("scheds/rust/scx_{name}/src/bpf")));
             if name == "lavd" || name == "cosmos" {
                 extra_includes.push(sched_dir.clone());
             }
@@ -381,7 +433,7 @@ fn build_schedulers(
         // zero divisor. Regenerated from the upstream source on every build so
         // a stale checked-in copy cannot drift from the active scx SHA.
         if name == "cosmos" {
-            let src = root_dir.join("scheds/rust/scx_cosmos/src/bpf/main.bpf.c");
+            let src = scx_root.join("scheds/rust/scx_cosmos/src/bpf/main.bpf.c");
             let content = std::fs::read_to_string(&src)
                 .unwrap_or_else(|e| panic!("read {}: {e}", src.display()));
             let patched = content.replace(
