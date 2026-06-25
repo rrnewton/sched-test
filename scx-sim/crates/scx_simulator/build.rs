@@ -12,11 +12,16 @@ fn main() {
 
     let coverage = env::var("SCX_SIM_COVERAGE").as_deref() == Ok("1");
 
+    // C substrate vendored into this crate so `cargo package` ships it
+    // (previously at scx-sim/csrc and repo-root lib/scxtest, outside the crate).
+    let csrc_dir = manifest_dir.join("csrc");
+    let scxtest_dir = manifest_dir.join("scxtest");
+
     let include_paths: Vec<PathBuf> = vec![
-        // Our own C source directory (at workspace root)
-        workspace_dir.join("csrc"),
-        // Existing unit test infrastructure
-        root_dir.join("lib/scxtest"),
+        // Our own C source directory (vendored into this crate)
+        csrc_dir.clone(),
+        // scxtest unit-test infrastructure (vendored into this crate)
+        scxtest_dir.clone(),
         // Scheduler include paths
         root_dir.join("scheds/include"),
         root_dir.join("scheds/include/lib"),
@@ -59,16 +64,16 @@ fn main() {
     // strong kfunc symbols and SDT functions exported via -rdynamic.
     let mut scxtest = cc::Build::new();
     scxtest.files([
-        root_dir.join("lib/scxtest/scx_test.c"),
-        root_dir.join("lib/scxtest/scx_test_map.c"),
-        root_dir.join("lib/scxtest/scx_test_cpumask.c"),
+        scxtest_dir.join("scx_test.c"),
+        scxtest_dir.join("scx_test_map.c"),
+        scxtest_dir.join("scx_test_cpumask.c"),
     ]);
     configure_build(&mut scxtest);
     scxtest.compile("scxtest");
 
     // Build the task_struct accessor library
     let mut sim_task = cc::Build::new();
-    sim_task.file(workspace_dir.join("csrc/sim_task.c"));
+    sim_task.file(csrc_dir.join("sim_task.c"));
     configure_build(&mut sim_task);
     sim_task.compile("sim_task");
 
@@ -80,15 +85,15 @@ fn main() {
     // sim_sdt_stubs.c and sim_arena.c are compiled together so they share
     // the arena storage (sim_arena_buf/sim_arena_offset).
     let mut sim_sdt = cc::Build::new();
-    sim_sdt.file(workspace_dir.join("csrc/sim_sdt_stubs.c"));
-    sim_sdt.file(workspace_dir.join("csrc/sim_arena.c"));
+    sim_sdt.file(csrc_dir.join("sim_sdt_stubs.c"));
+    sim_sdt.file(csrc_dir.join("sim_arena.c"));
     configure_build(&mut sim_sdt);
     sim_sdt.compile("sim_sdt_stubs");
 
     // Build the cgroup CSS iterator support.
     // Provides sim_css_next() and related functions for bpf_for_each(css, ...).
     let mut sim_cgroup = cc::Build::new();
-    sim_cgroup.file(workspace_dir.join("csrc/sim_cgroup.c"));
+    sim_cgroup.file(csrc_dir.join("sim_cgroup.c"));
     configure_build(&mut sim_cgroup);
     sim_cgroup.compile("sim_cgroup");
 
@@ -100,7 +105,7 @@ fn main() {
     // exported via -rdynamic so scheduler `.so` files can resolve
     // `scx_atq_*` references at dlopen time.
     let mut sim_atq = cc::Build::new();
-    sim_atq.file(workspace_dir.join("csrc/sim_atq.c"));
+    sim_atq.file(csrc_dir.join("sim_atq.c"));
     configure_build(&mut sim_atq);
     sim_atq.compile("sim_atq");
 
@@ -121,6 +126,8 @@ fn main() {
         .arg(format!("BUILD_DIR={}", scheduler_dir.display()))
         .arg(format!("SIMULATOR_DIR={}", workspace_dir.display()))
         .arg(format!("ROOT_DIR={}", root_dir.display()))
+        .arg(format!("CSRC_DIR={}", csrc_dir.display()))
+        .arg(format!("SCXTEST_DIR={}", scxtest_dir.display()))
         .arg(format!("BPF_INCLUDE={bpf_include}"))
         .arg(format!("CC={compiler}"));
     if coverage {
@@ -253,17 +260,18 @@ fn main() {
     // `*_BPF_DIR := $(ROOT_DIR)/...` in its `config.mk`, and add the
     // corresponding directory to this list. Today's wrappers transitively
     // depend on the dirs below.
+    // Vendored C substrate (lives in this crate).
+    println!("cargo:rerun-if-changed={}", csrc_dir.display());
+    println!("cargo:rerun-if-changed={}", scxtest_dir.display());
+
     let rerun_dirs: &[&str] = &[
         // scx-sim local source — Makefile + wrapper.c per scheduler
         "schedulers",
-        "csrc",
     ];
     for d in rerun_dirs {
         println!("cargo:rerun-if-changed={}", workspace_dir.join(d).display());
     }
     let scx_rerun_dirs: &[&str] = &[
-        // Test infrastructure (lives at sched-test root, not under scx submodule)
-        "lib/scxtest",
         // scx submodule subtrees pulled in by wrapper.c per-scheduler #includes
         // and by the include_paths above. Watching each subtree forces a
         // rebuild whenever the submodule is swapped to a SHA that touched

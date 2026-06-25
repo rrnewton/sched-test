@@ -2,7 +2,7 @@
  * sim_wrapper.h - Wrapper header for compiling BPF schedulers as userspace C
  *
  * This header must be included BEFORE the scheduler's .bpf.c file.
- * It sets up the test infrastructure from lib/scxtest/, includes
+ * It sets up the test infrastructure from scxtest/, includes
  * common.bpf.h (to set its header guard), then overrides BPF macros
  * to produce regular C functions callable from the simulator.
  */

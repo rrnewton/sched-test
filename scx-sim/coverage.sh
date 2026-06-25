@@ -184,7 +184,7 @@ if [[ $FLAG_ALL -eq 0 ]]; then
     # Exclude infrastructure, stubs, headers, and wrappers — keep only
     # scheds/rust/scx_*/src/bpf/* and schedulers/simple/scx_simple.bpf.c
     SOURCE_FILTER+=(
-        "-ignore-filename-regex=lib/scxtest/"
+        "-ignore-filename-regex=/scxtest/"
         "-ignore-filename-regex=csrc/sim_"
         "-ignore-filename-regex=scheds/include/"
         "-ignore-filename-regex=bpf_experimental\\.h"

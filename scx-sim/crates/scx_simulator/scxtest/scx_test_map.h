@@ -32,7 +32,7 @@ void *scx_test_task_storage_get(void *map, const void *key, void *value,
 				unsigned long flags);
 
 /*
- * Phase 1 BPF infra scale-up item 5: real per-cgroup local storage.
+ * Real per-cgroup local storage.
  *
  * `scx_test_cgrp_storage_get(map, cgrp_ptr_loc, value, flags)` returns
  * the per-cgroup slot for `cgrp_ptr_loc` (the address of a
