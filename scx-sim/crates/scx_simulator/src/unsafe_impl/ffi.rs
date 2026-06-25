@@ -925,6 +925,23 @@ impl DynamicScheduler {
         self._lib.get(name).ok()
     }
 
+    /// Read a `u64` BPF global from the loaded `.so` by symbol name.
+    ///
+    /// Returns `None` if the symbol is absent. Observes scheduler counters
+    /// (e.g. dispatch tallies) for tests and inspection. The scheduler's
+    /// counters are declared `volatile u64`, so the read is volatile. The named
+    /// symbol must be a `u64` global; a symbol of a different type/size yields
+    /// an unspecified value.
+    pub fn read_u64_global(&self, name: &str) -> Option<u64> {
+        // SAFETY: get_symbol resolves `name` to the address of a u64 global; the
+        // returned Symbol borrows &self, keeping the library mapped for the
+        // read. Contract: `name` is a u64 global.
+        unsafe {
+            self.get_symbol::<*const u64>(name.as_bytes())
+                .map(|sym| std::ptr::read_volatile(*sym))
+        }
+    }
+
     /// Load a scheduler from a `.so` file.
     ///
     /// - `path`: path to the `.so` file

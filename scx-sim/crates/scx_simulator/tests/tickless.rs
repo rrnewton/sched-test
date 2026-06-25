@@ -90,3 +90,20 @@ fn test_weighted_fairness() {
         rt_light * 100 / total
     );
 }
+
+/// The read_u64_global accessor resolves real u64 scheduler globals and returns
+/// None for unknown symbols (rather than panicking).
+#[test]
+fn test_read_u64_global_accessor() {
+    let _lock = common::setup_test();
+    let sim = Simulator::new(DynamicScheduler::tickless(1));
+    assert!(
+        sim.read_u64_global("nr_primary_dispatches").is_some(),
+        "a real u64 scheduler global should resolve"
+    );
+    assert!(
+        sim.read_u64_global("definitely_not_a_real_symbol_xyz")
+            .is_none(),
+        "an unknown symbol should return None, not panic"
+    );
+}

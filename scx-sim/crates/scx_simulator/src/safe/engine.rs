@@ -1298,6 +1298,17 @@ macro_rules! sim_callback {
     };
 }
 
+impl Simulator<ffi::DynamicScheduler> {
+    /// Read a `u64` BPF global from the loaded scheduler by symbol name.
+    ///
+    /// Returns `None` if the symbol is absent. Callable after `run` (the
+    /// scheduler `.so` stays mapped). Delegates to the loaded
+    /// `DynamicScheduler`'s global read.
+    pub fn read_u64_global(&self, name: &str) -> Option<u64> {
+        self.scheduler.inner().read_u64_global(name)
+    }
+}
+
 impl<S: Scheduler> Simulator<S> {
     pub fn new(scheduler: S) -> Self {
         Simulator {
