@@ -2494,6 +2494,27 @@ pub extern "C" fn sim_bpf_get_smp_processor_id() -> u32 {
     with_sim(kfunc_cost::TRIVIAL, |sim| sim.current_cpu.0)
 }
 
+/// Light, panic-free current-CPU accessor for the generic C map layer.
+///
+/// Reads the per-callback identity context directly (a plain `Cell::get` via
+/// `get_callback_ctx`) — NO `SIM_ARC` lock, NO `maybe_yield`, NO RBC counter
+/// management. Unlike `sim_bpf_get_smp_processor_id` (which does all three and
+/// panics when `SIM_ARC` is not installed), this is safe to call from inside
+/// the RBC-guarded `scx_test_map_lookup_elem` hot path without perturbing
+/// determinism, and never panics.
+///
+/// Returns `u32::MAX` when there is no callback context (scheduler setup or
+/// test scaffolding), where a per-CPU plain lookup has no defined "current
+/// CPU"; the C caller treats that sentinel as "no slot" and returns NULL.
+/// Used to resolve `bpf_map_lookup_elem` on a PERCPU map to the current CPU's
+/// slot (kernel semantics).
+#[no_mangle]
+pub extern "C" fn sim_current_cpu_or_none() -> u32 {
+    get_callback_ctx()
+        .map(|c| c.current_cpu.0)
+        .unwrap_or(u32::MAX)
+}
+
 /// Returns 1 if the current CPU is in hardirq context, 0 otherwise.
 #[no_mangle]
 pub extern "C" fn sim_bpf_in_hardirq() -> u32 {

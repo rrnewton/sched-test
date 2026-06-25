@@ -7,6 +7,22 @@
 #include "scx_test_map.h"
 #include "sim_rbc_guard.h"
 
+/*
+ * Sentinel cpu for plain bpf_map_lookup_elem on a PERCPU map: "the current
+ * callback CPU" (kernel semantics). Resolved lazily in scx_test_map_lookup's
+ * PERCPU branch via sim_current_cpu_or_none() — NORMAL maps ignore cpu, so the
+ * accessor is never called for them, keeping setup/test-scaffolding contexts
+ * (no callback context) safe.
+ */
+#define SCX_CPU_CURRENT (-1)
+
+/*
+ * Light, panic-free current-CPU accessor (Rust, resolved from the loading
+ * binary). Returns UINT_MAX when there is no callback context; the (int) cast
+ * yields -1, which the percpu bounds-check below maps to NULL.
+ */
+extern unsigned int sim_current_cpu_or_none(void);
+
 enum {
 	SCX_MAP_TYPE_NORMAL,
 	SCX_MAP_TYPE_PERCPU,
@@ -81,6 +97,12 @@ static struct scx_test_map *scx_percpu_entry(const void *map_ptr, int cpu)
 {
 	for (int i = 0; i < scx_percpu_map_entries_count; i++) {
 		if (scx_percpu_map_entries[i].map_ptr == map_ptr) {
+			/* cpu may be -1 (no current callback CPU — e.g. a percpu
+			 * plain lookup outside any callback): fail safe to NULL,
+			 * the kernel-faithful "no current cpu" answer, never an
+			 * out-of-bounds index. */
+			if (cpu < 0 || cpu >= scx_percpu_map_entries[i].map->nr_cpus)
+				return NULL;
 			return &scx_percpu_map_entries[i].map->per_cpu_maps[cpu];
 		}
 	}
@@ -102,6 +124,12 @@ static struct scx_test_map *scx_test_map_lookup(const void *map_ptr, int cpu)
 	for (int i = 0; i < scx_map_types_count; i++) {
 		if (scx_map_types[i].map_ptr == map_ptr) {
 			if (scx_map_types[i].map_type == SCX_MAP_TYPE_PERCPU) {
+				/* Plain lookup (SCX_CPU_CURRENT) resolves to the
+				 * current callback CPU; explicit-cpu callers pass a
+				 * real cpu. Resolve only in this PERCPU branch so
+				 * NORMAL-map lookups never call the accessor. */
+				if (cpu == SCX_CPU_CURRENT)
+					cpu = (int)sim_current_cpu_or_none();
 				return scx_percpu_entry(map_ptr, cpu);
 			} else if (scx_map_types[i].map_type == SCX_MAP_TYPE_NORMAL) {
 				return scx_normal_entry(map_ptr);
@@ -129,7 +157,9 @@ void *scx_test_map_lookup_percpu_elem(void *map, const void *key, int cpu)
 void *scx_test_map_lookup_elem(void *map, const void *key)
 {
 	RBC_GUARD_START;
-	struct scx_test_map *test_map = scx_test_map_lookup(map, 0);
+	/* Plain lookup: SCX_CPU_CURRENT resolves to the current callback CPU for
+	 * PERCPU maps (kernel semantics); NORMAL maps ignore the cpu arg. */
+	struct scx_test_map *test_map = scx_test_map_lookup(map, SCX_CPU_CURRENT);
 	if (!test_map)
 		RBC_GUARD_RETURN(NULL);
 
