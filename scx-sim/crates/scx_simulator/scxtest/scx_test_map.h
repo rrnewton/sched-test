@@ -142,3 +142,18 @@ int scx_test_map_update_percpu_elem(void *map, const void *key, const void *valu
 #define bpf_task_storage_get(map, task, value, flags) \
 	({ void *scx_obj_key_ = (void *)(task); \
 	   scx_test_task_storage_get(map, &scx_obj_key_, value, flags); })
+/*
+ * Per-cgroup local storage, same object-identity model as bpf_task_storage_get.
+ * libbpf's bpf_cgrp_storage_get/_delete are helper-ID pointer constants that
+ * would SIGSEGV if called in the simulator, so a macro is mandatory. Bind the
+ * cgroup pointer to a temp and pass its ADDRESS so the storage compares the
+ * 8-byte pointer value (scx_test_cgrp_storage_get / scx_storage_delete). A
+ * scheduler needing per-cgroup behavior (e.g. lavd's cap-aware accounting)
+ * installs its own override that #undefs and shadows this after the header.
+ */
+#define bpf_cgrp_storage_get(map, cgrp, value, flags) \
+	({ void *scx_cgrp_key_ = (void *)(cgrp); \
+	   scx_test_cgrp_storage_get(map, &scx_cgrp_key_, value, flags); })
+#define bpf_cgrp_storage_delete(map, cgrp) \
+	({ void *scx_cgrp_key_ = (void *)(cgrp); \
+	   scx_test_cgrp_storage_delete(map, &scx_cgrp_key_); })
