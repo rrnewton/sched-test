@@ -1307,10 +1307,6 @@ extern void sim_bpf_iter_css_destroy(struct bpf_iter_css *it);
 #undef cast_user
 #define cast_user(ptr) /* nop */
 
-/* RCU read lock no-ops. */
-#define bpf_rcu_read_lock()   ((void)0)
-#define bpf_rcu_read_unlock() ((void)0)
-
 /* CO-RE field existence: scxsim's task_struct (from vmlinux.h) is the
  * real kernel layout, so every field cgroup_bw probes via
  * `bpf_core_field_exists` is in fact present. Override to return 1.

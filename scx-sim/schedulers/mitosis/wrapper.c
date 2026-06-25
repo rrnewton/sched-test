@@ -160,16 +160,6 @@ extern void sim_timer_start(unsigned long long nsecs);
  * override them with our neutralized versions.
  * ---------------------------------------------------------------------------*/
 
-/*
- * RCU read lock stubs - must be defined before cleanup.bpf.h since it
- * references them. The simulator doesn't have real RCU.
- */
-#undef bpf_rcu_read_lock
-#define bpf_rcu_read_lock() ((void)0)
-
-#undef bpf_rcu_read_unlock
-#define bpf_rcu_read_unlock() ((void)0)
-
 /* Include cleanup.bpf.h to let it define its RAII framework first.
  * Upstream moved cleanup.bpf.h from scx_mitosis/src/bpf/ to
  * scheds/include/lib/. Use angle-bracket include to find it via

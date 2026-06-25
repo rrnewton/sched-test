@@ -74,26 +74,18 @@
 #define bpf_probe_read_kernel(dst, sz, src) \
 	({ __builtin_memset((dst), 0, (sz)); (long)(-14); })
 
-extern void *bpf_kptr_xchg_impl(void **kptr, void *new_val);
-#undef bpf_kptr_xchg
-#define bpf_kptr_xchg(kptr, val) \
-	bpf_kptr_xchg_impl((void **)(kptr), (void *)(val))
-
 /*
- * Time helpers: bpf_ktime_get_ns returns simulated clock (just 0 for now).
- * These are frequently used by schedulers for time comparisons.
+ * RCU read-side critical sections are no-ops in the single-threaded
+ * deterministic simulator (no concurrent reclaim). bpf_rcu_read_lock/unlock
+ * are real BPF kfuncs declared __ksym in common.bpf.h; overrides.c provides a
+ * weak no-op fallback, but defining the macro here elides every call site
+ * uniformly and before any scheduler's <lib/cleanup.bpf.h> RAII guards (which
+ * reference them). Replaces the former per-scheduler copies in mitosis/lavd.
  */
-extern unsigned long long sim_bpf_ktime_get_ns(void);
-#undef bpf_ktime_get_ns
-#define bpf_ktime_get_ns() sim_bpf_ktime_get_ns()
-
-/*
- * bpf_get_smp_processor_id: return current CPU id.
- * Already provided by sim_bpf_get_smp_processor_id in the simulator.
- */
-extern unsigned int sim_bpf_get_smp_processor_id(void);
-#undef bpf_get_smp_processor_id
-#define bpf_get_smp_processor_id() sim_bpf_get_smp_processor_id()
+#undef bpf_rcu_read_lock
+#define bpf_rcu_read_lock() ((void)0)
+#undef bpf_rcu_read_unlock
+#define bpf_rcu_read_unlock() ((void)0)
 
 /*
  * bpf_this_cpu_ptr / bpf_per_cpu_ptr: per-CPU variable access.
@@ -124,14 +116,12 @@ extern unsigned int sim_bpf_get_smp_processor_id(void);
 #define bpf_core_type_size(type) sizeof(type)
 
 /*
- * bpf_get_current_task_btf: BPF helper returning current task_struct *.
- * In bpf_helper_defs.h, it's a static function pointer initialized to NULL.
- * Override to call the Rust kfunc via -rdynamic. The Rust binary exports
- * bpf_get_current_task_btf as #[no_mangle] extern "C".
+ * bpf_get_current_task_btf_kfunc: Rust kfunc (#[no_mangle], resolved via
+ * -rdynamic at dlopen) returning the current task_struct *. Backs the
+ * bpf_get_current_task() macro above; the bpf_get_current_task_btf() override
+ * itself is provided later (sim_bpf_get_current_task_btf).
  */
 extern void *bpf_get_current_task_btf_kfunc(void);
-#undef bpf_get_current_task_btf
-#define bpf_get_current_task_btf() ((struct task_struct *)bpf_get_current_task_btf_kfunc())
 
 /*
  * bpf_probe_read_kernel_str — userspace stub.
