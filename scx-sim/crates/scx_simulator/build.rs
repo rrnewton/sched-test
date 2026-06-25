@@ -1,5 +1,5 @@
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
@@ -110,7 +110,11 @@ fn main() {
     sim_atq.compile("sim_atq");
 
     // ---------------------------------------------------------------
-    // Shared libraries (.so) for schedulers — built via Makefile
+    // Shared libraries (.so) for schedulers — compiled here via clang.
+    // Ported from `make -C schedulers` so the .so build is self-contained
+    // and uses the same toolchain as the cc::Build static libs above. The
+    // Makefile is retained only for the optional `make e9` post-processing,
+    // which instruments the .so files produced here.
     // ---------------------------------------------------------------
 
     let scheduler_dir = if coverage {
@@ -118,34 +122,34 @@ fn main() {
     } else {
         out_dir.join("schedulers")
     };
-    let bpf_include = env::var("DEP_BPF_INCLUDE").expect("libbpf-sys include must be available");
+    std::fs::create_dir_all(&scheduler_dir).expect("create scheduler output dir");
 
-    let mut make = Command::new("make");
-    make.arg("-C")
-        .arg(workspace_dir.join("schedulers"))
-        .arg(format!("BUILD_DIR={}", scheduler_dir.display()))
-        .arg(format!("SIMULATOR_DIR={}", workspace_dir.display()))
-        .arg(format!("ROOT_DIR={}", root_dir.display()))
-        .arg(format!("CSRC_DIR={}", csrc_dir.display()))
-        .arg(format!("SCXTEST_DIR={}", scxtest_dir.display()))
-        .arg(format!("BPF_INCLUDE={bpf_include}"))
-        .arg(format!("CC={compiler}"));
-    if coverage {
-        make.arg("SCX_SIM_COVERAGE=1");
-    }
-    // Phase 2 (tg `compile-scx-cgroup-bw-library-into-scxsim-phase2`):
-    // forward the env var into the Make invocation so
-    // `schedulers/Makefile` can `ifeq ($(SCXSIM_PHASE2_REAL_CGROUP_BW),1)`
-    // and inject `-DSCXSIM_PHASE2_REAL_CGROUP_BW=1` into the LAVD wrapper
-    // compile. The `cargo:rerun-if-env-changed=...` below ensures
-    // build.rs re-runs when the env var flips.
-    if let Ok(v) = env::var("SCXSIM_PHASE2_REAL_CGROUP_BW") {
-        make.arg(format!("SCXSIM_PHASE2_REAL_CGROUP_BW={}", v));
-    }
+    // SCX cgroup_bw API flag-day probe: the NEW function signatures are gated
+    // on the presence of `struct scx_task_cgroup_bw` in
+    // scheds/include/lib/cgroup.h (mirrors schedulers/Makefile SCX_CGROUP_BW_API).
+    let cgroup_bw_new_api = std::fs::read_to_string(root_dir.join("scheds/include/lib/cgroup.h"))
+        .map(|s| {
+            // Matches schedulers/Makefile's `grep '^struct scx_task_cgroup_bw'`
+            // exactly (line-anchored, no leading-whitespace tolerance) so this
+            // probe and the still-live Makefile grep used by `make e9` agree.
+            s.lines()
+                .any(|l| l.starts_with("struct scx_task_cgroup_bw"))
+        })
+        .unwrap_or(false);
+
+    build_schedulers(
+        &workspace_dir.join("schedulers"),
+        &scheduler_dir,
+        &csrc_dir,
+        &scxtest_dir,
+        &include_paths,
+        &root_dir,
+        &compiler,
+        coverage,
+        cgroup_bw_new_api,
+    );
+
     println!("cargo:rerun-if-env-changed=SCXSIM_PHASE2_REAL_CGROUP_BW");
-    let status = make.status().expect("failed to run make");
-
-    assert!(status.success(), "scheduler Makefile failed: exit {status}");
 
     // ---------------------------------------------------------------
     // Linker flags for the main binary
@@ -289,4 +293,186 @@ fn main() {
         println!("cargo:rerun-if-changed={}", root_dir.join(d).display());
     }
     println!("cargo:rerun-if-env-changed=SCX_SIM_COVERAGE");
+}
+
+/// Compile every scheduler `.so` from its `wrapper.c` plus the shared sim C
+/// translation units, replicating `schedulers/Makefile` exactly. Each subdir
+/// of `schedulers_src` that contains a `wrapper.c` is discovered and built into
+/// `libscx_<name>.so` under `out`.
+///
+/// TU split (must match the Makefile and the static-lib cc::Build above):
+/// - FULL-CFLAGS TUs (`wrapper.c`, `sim_bpf_stubs.c`, `overrides.c`): base
+///   flags + coverage + cgroup_bw API + the cgroup_bw compile-in + every include + per-scheduler
+///   extras (`-Dconst=` and the scx BPF include for all but `simple`).
+/// - SPECIAL TUs (`sim_sigfpe.c`, `sim_rbc_trampoline.c`,
+///   `sim_deterministic_mem.c`): CFLAGS_BASE ONLY — no includes, no coverage,
+///   no defines. Coverage instrumentation or vmlinux.h here corrupts the x86
+///   SIGFPE decoder, the RBC trampoline layout, and the branchless mem ops.
+/// - `sim_sdt_stubs.c` is deliberately NOT linked into the `.so` (the single
+///   SDT table lives in the main binary).
+#[allow(clippy::too_many_arguments)]
+fn build_schedulers(
+    schedulers_src: &Path,
+    out: &Path,
+    csrc_dir: &Path,
+    scxtest_dir: &Path,
+    include_paths: &[PathBuf],
+    root_dir: &Path,
+    compiler: &str,
+    coverage: bool,
+    cgroup_bw_new_api: bool,
+) {
+    // CFLAGS_BASE — applied to every scheduler TU (mirrors Makefile CFLAGS_BASE).
+    let cflags_base: &[&str] = &[
+        "-fPIC",
+        "-DSCX_BPF_UNITTEST",
+        "-g",
+        "-O2",
+        "-Wno-unused-parameter",
+        "-Wno-unknown-attributes",
+        "-Wno-implicit-function-declaration",
+    ];
+
+    // Discover schedulers: subdirs of schedulers_src that contain wrapper.c.
+    let mut names: Vec<String> = std::fs::read_dir(schedulers_src)
+        .expect("read schedulers dir")
+        .flatten()
+        .filter(|e| e.path().join("wrapper.c").is_file())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+    names.sort();
+    assert!(
+        !names.is_empty(),
+        "no schedulers (subdirs with wrapper.c) under {}",
+        schedulers_src.display()
+    );
+
+    // -I list shared by the full-CFLAGS TUs: the crate include set + the
+    // schedulers/ dir. The schedulers/ anchor resolves each wrapper.c's
+    // `#include "../../scx/lib/*.bpf.c"` relative includes (see the matching
+    // comment in schedulers/Makefile INCLUDES).
+    let base_includes: Vec<&Path> = include_paths
+        .iter()
+        .map(PathBuf::as_path)
+        .chain(std::iter::once(schedulers_src))
+        .collect();
+
+    for name in &names {
+        let sched_dir = schedulers_src.join(name);
+
+        // `simple` has no config.mk: `const` stays intact and it pulls no scx
+        // BPF include (its scheduler source is local). Every other scheduler
+        // strips `const` (BPF const-volatile globals must be writable) and adds
+        // its scheds/rust/scx_<name>/src/bpf dir; lavd/cosmos additionally
+        // include their own scheduler dir (a generated/patched source lives
+        // there).
+        let strip_const = name != "simple";
+        let mut extra_includes: Vec<PathBuf> = Vec::new();
+        if name != "simple" {
+            extra_includes.push(root_dir.join(format!("scheds/rust/scx_{name}/src/bpf")));
+            if name == "lavd" || name == "cosmos" {
+                extra_includes.push(sched_dir.clone());
+            }
+        }
+
+        // cosmos: regenerate the div-by-zero-guarded copy of main.bpf.c. BPF
+        // integer division by zero yields 0; native C raises SIGFPE. The sed
+        // transform in cosmos/config.mk guards the one divide that can see a
+        // zero divisor. Regenerated from the upstream source on every build so
+        // a stale checked-in copy cannot drift from the active scx SHA.
+        if name == "cosmos" {
+            let src = root_dir.join("scheds/rust/scx_cosmos/src/bpf/main.bpf.c");
+            let content = std::fs::read_to_string(&src)
+                .unwrap_or_else(|e| panic!("read {}: {e}", src.display()));
+            let patched = content.replace(
+                "new_freq = (100 * NSEC_PER_MSEC) / interval;",
+                "new_freq = interval ? (100 * NSEC_PER_MSEC) / interval : 0;",
+            );
+            std::fs::write(sched_dir.join("cosmos_main_patched.c"), patched)
+                .expect("write cosmos_main_patched.c");
+        }
+
+        let mut objs: Vec<PathBuf> = Vec::new();
+
+        // Full-CFLAGS TUs.
+        let full_srcs = [
+            sched_dir.join("wrapper.c"),
+            csrc_dir.join("sim_bpf_stubs.c"),
+            scxtest_dir.join("overrides.c"),
+        ];
+        for src in &full_srcs {
+            let obj = out.join(format!("{name}_{}.o", file_stem(src)));
+            let mut cmd = Command::new(compiler);
+            cmd.args(cflags_base);
+            if coverage {
+                cmd.args(["-fprofile-instr-generate", "-fcoverage-mapping"]);
+            }
+            if cgroup_bw_new_api {
+                cmd.arg("-DSCX_CGROUP_BW_NEW_API=1");
+            }
+            cmd.arg("-DSCXSIM_PHASE2_REAL_CGROUP_BW=1");
+            if strip_const {
+                cmd.arg("-Dconst=");
+            }
+            for inc in base_includes
+                .iter()
+                .copied()
+                .chain(extra_includes.iter().map(PathBuf::as_path))
+            {
+                cmd.arg("-I").arg(inc);
+            }
+            cmd.arg("-c").arg("-o").arg(&obj).arg(src);
+            run(cmd, &format!("compile {} for {name}", src.display()));
+            objs.push(obj);
+        }
+
+        // Special TUs: CFLAGS_BASE only.
+        for tu in [
+            "sim_sigfpe.c",
+            "sim_rbc_trampoline.c",
+            "sim_deterministic_mem.c",
+        ] {
+            let src = csrc_dir.join(tu);
+            let obj = out.join(format!("{name}_{}.o", file_stem(&src)));
+            let mut cmd = Command::new(compiler);
+            cmd.args(cflags_base);
+            cmd.arg("-c").arg("-o").arg(&obj).arg(&src);
+            run(cmd, &format!("compile {tu} for {name}"));
+            objs.push(obj);
+        }
+
+        // Link the .so. `-Wl,--init=e9_so_init` gives the otherwise
+        // freestanding (`-nostdlib`) library a DT_INIT so e9tool's loader
+        // runs it; the coverage build swaps `-nostdlib` for the profile
+        // runtime instead.
+        let so = out.join(format!("libscx_{name}.so"));
+        let mut link = Command::new(compiler);
+        link.arg("-shared");
+        if coverage {
+            link.arg("-fprofile-instr-generate");
+        } else {
+            link.arg("-nostdlib");
+        }
+        link.arg("-Wl,--init=e9_so_init").arg("-o").arg(&so);
+        for obj in &objs {
+            link.arg(obj);
+        }
+        run(link, &format!("link libscx_{name}.so"));
+    }
+}
+
+/// File stem of a C source as a `&str` (e.g. `sim_bpf_stubs.c` → `sim_bpf_stubs`).
+fn file_stem(p: &Path) -> &str {
+    p.file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_else(|| panic!("source path has no UTF-8 stem: {}", p.display()))
+}
+
+/// Run a compile/link command, panicking with `desc` on spawn failure or a
+/// non-zero exit (a failed scheduler build must fail the cargo build loudly).
+fn run(mut cmd: Command, desc: &str) {
+    let status = cmd
+        .status()
+        .unwrap_or_else(|e| panic!("spawn failed ({desc}): {e}"));
+    assert!(status.success(), "{desc} failed: {status}");
 }
