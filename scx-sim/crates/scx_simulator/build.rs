@@ -14,14 +14,10 @@ fn main() {
     // SCX_ROOT overrides it so a crate embedding scx_simulator can supply its
     // own scx sources (the published crate does not carry the submodule). When
     // set, the path must exist and look like an scx checkout (have scheds/include)
-    // — fail loud rather than silently miscompile against a partial tree.
-    //
-    // `scx_override_active` is true only when SCX_ROOT resolves to a DIFFERENT
-    // tree than the bundled submodule. It gates schedulers whose wrappers still
-    // hardcode the bundled scx/lib path (lavd) and so cannot follow the override
-    // until those includes are rehomed.
-    let default_scx_root = root_dir.join("scx");
-    let (scx_root, scx_override_active) = match env::var("SCX_ROOT") {
+    // — fail loud rather than silently miscompile against a partial tree. Every
+    // scheduler's scx sources (headers, BPF source, and the scx/lib bodies lavd
+    // compiles in) derive from scx_root, so all schedulers follow the override.
+    let scx_root = match env::var("SCX_ROOT") {
         Ok(v) => {
             let canon = PathBuf::from(&v)
                 .canonicalize()
@@ -30,11 +26,9 @@ fn main() {
                 canon.join("scheds/include").is_dir(),
                 "SCX_ROOT={v} does not look like an scx checkout (missing scheds/include)"
             );
-            let is_default =
-                default_scx_root.canonicalize().ok().as_deref() == Some(canon.as_path());
-            (canon, !is_default)
+            canon
         }
-        Err(_) => (default_scx_root, false),
+        Err(_) => root_dir.join("scx"),
     };
     println!("cargo:rerun-if-env-changed=SCX_ROOT");
 
@@ -175,7 +169,6 @@ fn main() {
         &compiler,
         coverage,
         cgroup_bw_new_api,
-        scx_override_active,
     );
 
     println!("cargo:rerun-if-env-changed=SCXSIM_PHASE2_REAL_CGROUP_BW");
@@ -341,10 +334,9 @@ fn main() {
 ///   SDT table lives in the main binary).
 ///
 /// `scx_root` is the scx source tree (default = the bundled submodule, or an
-/// SCX_ROOT override). When `override_active` (the override resolves to a tree
-/// other than the bundled submodule), lavd is skipped: its wrapper hardcodes
-/// `scx/lib` includes that still anchor on the submodule and cannot follow the
-/// override.
+/// SCX_ROOT override). All scheduler scx sources — including lavd's compiled-in
+/// scx/lib bodies (ravg.bpf.c, cgroup_bw.bpf.c), resolved via -I<scx_root>/lib —
+/// derive from scx_root, so every scheduler follows the override.
 #[allow(clippy::too_many_arguments)]
 fn build_schedulers(
     schedulers_src: &Path,
@@ -356,7 +348,6 @@ fn build_schedulers(
     compiler: &str,
     coverage: bool,
     cgroup_bw_new_api: bool,
-    override_active: bool,
 ) {
     // CFLAGS_BASE — applied to every scheduler TU (mirrors Makefile CFLAGS_BASE).
     let cflags_base: &[&str] = &[
@@ -383,34 +374,20 @@ fn build_schedulers(
         schedulers_src.display()
     );
 
-    // -I list shared by the full-CFLAGS TUs: the crate include set + the
-    // schedulers/ dir. The schedulers/ anchor resolves each wrapper.c's
-    // `#include "../../scx/lib/*.bpf.c"` relative includes (see the matching
-    // comment in schedulers/Makefile INCLUDES).
+    // -I list shared by the full-CFLAGS TUs: the crate include set + <scx_root>/lib,
+    // where lavd's compiled-in scx library bodies (ravg.bpf.c, cgroup_bw.bpf.c)
+    // resolve so they follow SCX_ROOT. (The former -I schedulers anchor existed
+    // only to resolve the wrappers' "../../scx/lib/*.bpf.c" relative includes,
+    // which are now rehomed to plain names found via <scx_root>/lib.)
+    let scx_lib = scx_root.join("lib");
     let base_includes: Vec<&Path> = include_paths
         .iter()
         .map(PathBuf::as_path)
-        .chain(std::iter::once(schedulers_src))
+        .chain(std::iter::once(scx_lib.as_path()))
         .collect();
 
     for name in &names {
         let sched_dir = schedulers_src.join(name);
-
-        // lavd's wrapper.c hardcodes `#include "../../scx/lib/{ravg,cgroup_bw}.bpf.c"`
-        // anchored on the bundled submodule, so it cannot follow an SCX_ROOT
-        // override. Skip it under an active override rather than silently mixing
-        // scheds/ from the override with scx/lib bodies from the submodule; the
-        // other schedulers compile against the override, and a later load of the
-        // absent libscx_lavd.so fails loud. Rehoming the wrapper's relative
-        // includes to a stable -I lifts this restriction.
-        if override_active && name == "lavd" {
-            println!(
-                "cargo:warning=scx_simulator: skipping lavd under SCX_ROOT override — \
-                 its wrapper hardcodes ../../scx/lib includes anchored on the bundled \
-                 submodule; lavd builds under SCX_ROOT once those includes are rehomed."
-            );
-            continue;
-        }
 
         // `simple` has no config.mk: `const` stays intact and it pulls no scx
         // BPF include (its scheduler source is local). Every other scheduler

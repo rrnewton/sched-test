@@ -490,7 +490,7 @@ static RAVG_FN_ATTRS int ravg_from_arena(struct ravg_data *to, struct ravg_data 
  * Guard the header include since common.bpf.h is already included.
  */
 #define __SCX_RAVG_BPF_H__  /* prevent ravg.h re-include */
-#include "../../scx/lib/ravg.bpf.c"
+#include "ravg.bpf.c"  /* resolved via -I<scx_root>/lib */
 
 /*
  * =================================================================
@@ -1402,7 +1402,7 @@ int topo_cpu_to_llc_id(u32 cpu) { (void)cpu; return 0; }
 #define scx_static_alloc(bytes, alignment) \
 	(sim_arena_calloc((unsigned long)(bytes)))
 #endif
-#include "../../scx/lib/cgroup_bw.bpf.c"
+#include "cgroup_bw.bpf.c"  /* resolved via -I<scx_root>/lib */
 #undef scx_static_alloc
 #undef scxsim_cbw_yield
 
