@@ -2,7 +2,10 @@ use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 
-use scxsim_build::{build_schedulers, scx_include_paths, standalone_definitions, EXPORTED_SYMS};
+use scxsim_build::{
+    build_schedulers, cgroup_bw_new_api, resolve_scx_root, scx_include_paths,
+    standalone_definitions, EXPORTED_SYMS,
+};
 
 fn main() {
     let manifest_dir: PathBuf = env::var("CARGO_MANIFEST_DIR").unwrap().into();
@@ -12,27 +15,13 @@ fn main() {
     let root_dir = workspace_dir.join("..").canonicalize().unwrap();
     let out_dir: PathBuf = env::var("OUT_DIR").unwrap().into();
 
-    // scx source root. Defaults to the bundled submodule at <repo-root>/scx;
-    // SCX_ROOT overrides it so a crate embedding scx_simulator can supply its
-    // own scx sources (the published crate does not carry the submodule). When
-    // set, the path must exist and look like an scx checkout (have scheds/include)
-    // — fail loud rather than silently miscompile against a partial tree. Every
-    // scheduler's scx sources (headers, BPF source, and the scx/lib bodies lavd
-    // compiles in) derive from scx_root, so all schedulers follow the override.
-    let scx_root = match env::var("SCX_ROOT") {
-        Ok(v) => {
-            let canon = PathBuf::from(&v)
-                .canonicalize()
-                .unwrap_or_else(|e| panic!("SCX_ROOT={v} is not accessible: {e}"));
-            assert!(
-                canon.join("scheds/include").is_dir(),
-                "SCX_ROOT={v} does not look like an scx checkout (missing scheds/include)"
-            );
-            canon
-        }
-        Err(_) => root_dir.join("scx"),
-    };
-    println!("cargo:rerun-if-env-changed=SCX_ROOT");
+    // scx source root: the SCX_ROOT override (so a crate embedding scx_simulator
+    // can supply its own scx sources -- the published crate carries no submodule)
+    // or the bundled submodule at <repo-root>/scx. Resolution + validity check
+    // live in scxsim_build::resolve_scx_root, shared with the embed harness, so
+    // every scheduler's scx sources (headers, BPF source, the scx/lib bodies lavd
+    // compiles in) follow one override path.
+    let scx_root = resolve_scx_root(&root_dir.join("scx"));
 
     let coverage = env::var("SCX_SIM_COVERAGE").as_deref() == Ok("1");
 
@@ -145,18 +134,10 @@ fn main() {
     };
     std::fs::create_dir_all(&scheduler_dir).expect("create scheduler output dir");
 
-    // SCX cgroup_bw API flag-day probe: the NEW function signatures are gated
-    // on the presence of `struct scx_task_cgroup_bw` in
-    // scheds/include/lib/cgroup.h (mirrors schedulers/Makefile SCX_CGROUP_BW_API).
-    let cgroup_bw_new_api = std::fs::read_to_string(scx_root.join("scheds/include/lib/cgroup.h"))
-        .map(|s| {
-            // Matches schedulers/Makefile's `grep '^struct scx_task_cgroup_bw'`
-            // exactly (line-anchored, no leading-whitespace tolerance) so this
-            // probe and the still-live Makefile grep used by `make e9` agree.
-            s.lines()
-                .any(|l| l.starts_with("struct scx_task_cgroup_bw"))
-        })
-        .unwrap_or(false);
+    // SCX cgroup_bw API flag-day probe (shared with the embed harness): the NEW
+    // function signatures are gated on `struct scx_task_cgroup_bw` in
+    // scheds/include/lib/cgroup.h, matching schedulers/Makefile's grep.
+    let cgroup_bw_new_api = cgroup_bw_new_api(&scx_root);
 
     // The standalone scheduler set as owned definitions; an embedder drives the
     // same build_schedulers with its own definitions (one build path, two providers).

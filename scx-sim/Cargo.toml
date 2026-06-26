@@ -4,6 +4,7 @@ members = [
     "crates/scx_perf",
     "crates/scx_cgroup_tree",
     "crates/scxsim-build",
+    "crates/embed_harness",
 ]
 resolver = "2"
 

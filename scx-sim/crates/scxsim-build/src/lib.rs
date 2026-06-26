@@ -311,6 +311,51 @@ pub fn scx_include_paths(scx_root: &Path, bpf_include: &Path) -> Vec<PathBuf> {
     ]
 }
 
+/// Resolve the scx source root for a scheduler `.so` build. Returns the
+/// `SCX_ROOT` env override if set -- canonicalized and asserted to look like an
+/// scx checkout (must contain `scheds/include`), failing loud otherwise -- else
+/// the supplied `default` (the bundled submodule, for in-repo builds). Emits
+/// `cargo:rerun-if-env-changed=SCX_ROOT`, so call it only from a build script.
+/// Shared by scx_simulator's build script and the embed harness so the override
+/// and the validity check are one source of truth.
+pub fn resolve_scx_root(default: &Path) -> PathBuf {
+    println!("cargo:rerun-if-env-changed=SCX_ROOT");
+    match std::env::var("SCX_ROOT") {
+        Ok(v) => {
+            let canon = PathBuf::from(&v)
+                .canonicalize()
+                .unwrap_or_else(|e| panic!("SCX_ROOT={v} is not accessible: {e}"));
+            assert!(
+                canon.join("scheds/include").is_dir(),
+                "SCX_ROOT={v} does not look like an scx checkout (missing scheds/include)"
+            );
+            canon
+        }
+        Err(_) => default.to_path_buf(),
+    }
+}
+
+/// Whether the scx tree at `scx_root` uses the NEW cgroup_bw function signatures,
+/// gated on `struct scx_task_cgroup_bw` in scheds/include/lib/cgroup.h. The
+/// result is passed to [`build_schedulers`] as its `cgroup_bw_new_api` flag; a
+/// missing/unreadable header reads as the old API (`false`). Mirrors
+/// schedulers/Makefile's `grep '^struct scx_task_cgroup_bw'` (line-anchored, no
+/// leading-whitespace tolerance) so this probe and the still-live Makefile grep
+/// used by `make e9` agree.
+pub fn cgroup_bw_new_api(scx_root: &Path) -> bool {
+    std::fs::read_to_string(scx_root.join("scheds/include/lib/cgroup.h"))
+        .map(|s| header_has_new_cgroup_bw_api(&s))
+        .unwrap_or(false)
+}
+
+/// The line-anchored match used by [`cgroup_bw_new_api`], split out so it can be
+/// unit-tested without an scx tree.
+fn header_has_new_cgroup_bw_api(header: &str) -> bool {
+    header
+        .lines()
+        .any(|l| l.starts_with("struct scx_task_cgroup_bw"))
+}
+
 /// Compile every scheduler `.so` from its `wrapper.c` plus the shared sim C
 /// translation units, replicating `schedulers/Makefile` exactly. Each subdir
 /// of `schedulers_src` that contains a `wrapper.c` is discovered and built into
@@ -609,5 +654,25 @@ mod tests {
             ]
         );
         assert!(!got.iter().any(|p| p == Path::new("/scx/lib")));
+    }
+
+    /// `header_has_new_cgroup_bw_api` matches only a line-anchored
+    /// `struct scx_task_cgroup_bw` declaration -- the same shape as
+    /// schedulers/Makefile's `grep '^struct scx_task_cgroup_bw'`.
+    #[test]
+    fn cgroup_bw_api_probe_is_line_anchored() {
+        assert!(header_has_new_cgroup_bw_api(
+            "struct foo;\nstruct scx_task_cgroup_bw {\n\tu64 a;\n};\n"
+        ));
+        // Leading whitespace must NOT match (the Makefile grep is `^struct ...`).
+        assert!(!header_has_new_cgroup_bw_api(
+            "    struct scx_task_cgroup_bw {\n};\n"
+        ));
+        // A mention inside a comment must NOT match.
+        assert!(!header_has_new_cgroup_bw_api(
+            "// struct scx_task_cgroup_bw is new\nstruct other;\n"
+        ));
+        // A different struct declaration must NOT match.
+        assert!(!header_has_new_cgroup_bw_api("struct scx_task;\n"));
     }
 }
