@@ -375,6 +375,59 @@ fn header_has_new_cgroup_bw_api(header: &str) -> bool {
         .any(|l| l.starts_with("struct scx_task_cgroup_bw"))
 }
 
+/// Kernel-config / version scalars an embedder can override so a scheduler `.so`
+/// (and the host static lib) compiles against the kernel under test instead of
+/// the standalone defaults in `csrc/sim_kconfig_defaults.h`. Each `None` field
+/// keeps the C default (byte-identical build); each `Some` emits
+/// `-DSIM_<NAME>=<value>` via [`cflag_defines`](Self::cflag_defines).
+///
+/// IN-SIM REALITY (today): only [`no_hz_idle`](Self::no_hz_idle) changes
+/// scheduling behavior -- it gates lavd's sys_stat idle-drift branch.
+/// [`kernel_version`](Self::kernel_version) + [`preempt_rcu`](Self::preempt_rcu)
+/// are a COUPLED PAIR feeding scx's `is_migration_disabled` (preempt_rcu
+/// short-circuits the version check), but the sim overrides that callback with
+/// ground-truth `migration_disabled`, so the pair affects only the cosmetic dump
+/// banner until that override is unwound -- set them TOGETHER for a coherent
+/// migrate-disable model. [`hz`](Self::hz) is the tickless fallback, reachable
+/// only when `tick_freq` is 0. The values are still compiled into the `.so`
+/// (fidelity-forward), so an embedder supplying the kernel-under-test's values is
+/// correct even where the consumer is presently shadowed.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct KernelConfig {
+    /// LINUX_KERNEL_VERSION, encoded major<<16 | minor<<8 | patch (default 0x061200).
+    pub kernel_version: Option<u32>,
+    /// CONFIG_PREEMPT_RCU (default false).
+    pub preempt_rcu: Option<bool>,
+    /// CONFIG_HZ (default 250).
+    pub hz: Option<u32>,
+    /// CONFIG_NO_HZ_IDLE (default false).
+    pub no_hz_idle: Option<bool>,
+}
+
+impl KernelConfig {
+    /// The `-DSIM_<NAME>=<value>` flags for the `Some` fields, integer-encoded
+    /// (bools as 1/0) to match the header defaults' integer encoding -- and, for
+    /// `no_hz_idle` (which has no header default), the `bool` assignment site in
+    /// lavd/wrapper.c. Empty for the all-`None` (standalone) config, so the build
+    /// is byte-identical.
+    pub fn cflag_defines(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(v) = self.kernel_version {
+            out.push(format!("-DSIM_LINUX_KERNEL_VERSION={v}"));
+        }
+        if let Some(v) = self.preempt_rcu {
+            out.push(format!("-DSIM_CONFIG_PREEMPT_RCU={}", v as u8));
+        }
+        if let Some(v) = self.hz {
+            out.push(format!("-DSIM_CONFIG_HZ={v}"));
+        }
+        if let Some(v) = self.no_hz_idle {
+            out.push(format!("-DSIM_CONFIG_NO_HZ_IDLE={}", v as u8));
+        }
+        out
+    }
+}
+
 /// Compile every scheduler `.so` from its `wrapper.c` plus the shared sim C
 /// translation units, replicating `schedulers/Makefile` exactly. Each subdir
 /// of `schedulers_src` that contains a `wrapper.c` is discovered and built into
@@ -399,6 +452,10 @@ fn header_has_new_cgroup_bw_api(header: &str) -> bool {
 /// SCX_ROOT override). All scheduler scx sources — including lavd's compiled-in
 /// scx/lib bodies (ravg.bpf.c, cgroup_bw.bpf.c), resolved via -I<scx_root>/lib —
 /// derive from scx_root, so every scheduler follows the override.
+///
+/// `kernel_config` overrides the kernel-config / version scalars (see
+/// [`KernelConfig`]); `KernelConfig::default()` keeps the standalone defaults
+/// (byte-identical).
 #[allow(clippy::too_many_arguments)]
 pub fn build_schedulers(
     schedulers_src: &Path,
@@ -411,7 +468,14 @@ pub fn build_schedulers(
     compiler: &str,
     coverage: bool,
     cgroup_bw_new_api: bool,
+    kernel_config: &KernelConfig,
 ) {
+    // -DSIM_<NAME> overrides for the kernel-config scalars (empty for standalone
+    // => header defaults => byte-identical). Applied to the full TUs only; the
+    // special TUs carry no kconfig symbols. Inert -D on a TU that doesn't expand
+    // the macro has no effect, so all provided overrides go to every full TU.
+    let kconfig_defines = kernel_config.cflag_defines();
+
     // CFLAGS_BASE — applied to every scheduler TU (mirrors Makefile CFLAGS_BASE).
     let cflags_base: &[&str] = &[
         "-fPIC",
@@ -520,6 +584,7 @@ pub fn build_schedulers(
                 cmd.arg("-DSCX_CGROUP_BW_NEW_API=1");
             }
             cmd.arg("-DSCXSIM_PHASE2_REAL_CGROUP_BW=1");
+            cmd.args(&kconfig_defines);
             if strip_const {
                 cmd.arg("-Dconst=");
             }
@@ -718,5 +783,37 @@ mod tests {
         ));
         // A different struct declaration must NOT match.
         assert!(!header_has_new_cgroup_bw_api("struct scx_task;\n"));
+    }
+
+    /// `KernelConfig::default()` (all None) emits no -D, so the standalone build
+    /// stays byte-identical; each `Some` emits the integer-encoded
+    /// `-DSIM_<NAME>` (bools as 1/0, version/hz as decimal), in field order.
+    #[test]
+    fn kernel_config_cflag_defines() {
+        assert!(KernelConfig::default().cflag_defines().is_empty());
+
+        let kc = KernelConfig {
+            kernel_version: Some(0x07_0100),
+            preempt_rcu: Some(true),
+            hz: Some(1000),
+            no_hz_idle: Some(false),
+        };
+        let defs = kc.cflag_defines();
+        assert_eq!(defs.len(), 4);
+        // Version is decimal-encoded (not hex), matching the C integer literal.
+        assert_eq!(
+            defs[0],
+            format!("-DSIM_LINUX_KERNEL_VERSION={}", 0x07_0100u32)
+        );
+        assert_eq!(defs[1], "-DSIM_CONFIG_PREEMPT_RCU=1");
+        assert_eq!(defs[2], "-DSIM_CONFIG_HZ=1000");
+        assert_eq!(defs[3], "-DSIM_CONFIG_NO_HZ_IDLE=0");
+
+        // Only the Some fields appear.
+        let only = KernelConfig {
+            no_hz_idle: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(only.cflag_defines(), vec!["-DSIM_CONFIG_NO_HZ_IDLE=1"]);
     }
 }

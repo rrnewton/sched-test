@@ -9,8 +9,8 @@ use std::env;
 use std::path::PathBuf;
 
 use scxsim_build::{
-    build_schedulers, cgroup_bw_new_api, resolve_scx_root, scx_include_paths, SchedulerDefinition,
-    EXPORTED_SYMS,
+    build_schedulers, cgroup_bw_new_api, resolve_scx_root, scx_include_paths, KernelConfig,
+    SchedulerDefinition, EXPORTED_SYMS,
 };
 
 fn main() {
@@ -105,6 +105,7 @@ fn main() {
         &compiler,
         false, // coverage
         cgroup_bw_new_api,
+        &KernelConfig::default(), // standalone kernel-config defaults
     );
 
     println!("cargo:rustc-env=HARNESS_SO_DIR={}", so_dir.display());

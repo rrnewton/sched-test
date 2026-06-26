@@ -18,6 +18,7 @@
 
 /* Use kern_types.h for basic types (u32, s32, etc.) */
 #include "kern_types.h"
+#include "sim_kconfig_defaults.h"
 #include <stdbool.h>
 #include <stddef.h>
 
@@ -319,13 +320,16 @@ struct cgroup *bpf_cgroup_from_id(u64 id)
 /*
  * LINUX_KERNEL_VERSION: __kconfig global declared in common.bpf.h.
  * With __kconfig stripped, it becomes a bare extern declaration.
- * Provide a definition so scheduler .so files link.
- * Value: 6.18.0 encoded as (major << 16 | minor << 8 | patch).
+ * Provide a definition so scheduler .so files link. Default 6.18.0 (encoded
+ * major << 16 | minor << 8 | patch); an embedder overrides via
+ * -DSIM_LINUX_KERNEL_VERSION (see sim_kconfig_defaults.h).
  */
-int LINUX_KERNEL_VERSION = 0x061200;
+int LINUX_KERNEL_VERSION = SIM_LINUX_KERNEL_VERSION;
 
 /*
  * CONFIG_PREEMPT_RCU: __kconfig __weak bool from common.bpf.h.
- * Set false — simulator doesn't model preempt RCU.
+ * Default false (simulator doesn't model preempt RCU); embedder overrides via
+ * -DSIM_CONFIG_PREEMPT_RCU. Paired with LINUX_KERNEL_VERSION in
+ * is_migration_disabled.
  */
-bool CONFIG_PREEMPT_RCU = false;
+bool CONFIG_PREEMPT_RCU = SIM_CONFIG_PREEMPT_RCU;

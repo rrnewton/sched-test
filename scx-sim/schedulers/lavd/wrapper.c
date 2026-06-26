@@ -10,6 +10,7 @@
  */
 #include "sim_wrapper.h"
 #include "sim_task.h"
+#include "sim_kconfig_defaults.h"
 
 
 /*
@@ -247,9 +248,16 @@ unsigned long hw_pressure;
  * In BPF, this resolves to the kernel config; in simulation it's a
  * regular weak symbol. Without a definition, the weak symbol resolves
  * to address 0x0 in the -nostdlib .so, causing a SIGSEGV on access.
- * Set to false — the simulator doesn't model NO_HZ_IDLE.
+ * Default false (simulator doesn't model NO_HZ_IDLE) via a TENTATIVE
+ * definition -- giving it an explicit `= 0` would reorder lavd's .bss and change
+ * the .so bytes, so the standalone build keeps the bare declaration. An embedder
+ * enables lavd's sys_stat idle-drift branch with -DSIM_CONFIG_NO_HZ_IDLE=1.
  */
+#ifdef SIM_CONFIG_NO_HZ_IDLE
+bool CONFIG_NO_HZ_IDLE = SIM_CONFIG_NO_HZ_IDLE;
+#else
 bool CONFIG_NO_HZ_IDLE;
+#endif
 
 /*
  * bpf_probe_read_kernel override for LAVD.

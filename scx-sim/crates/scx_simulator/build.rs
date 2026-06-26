@@ -4,7 +4,7 @@ use std::process::Command;
 
 use scxsim_build::{
     build_schedulers, cgroup_bw_new_api, resolve_scx_root, scx_include_paths,
-    standalone_definitions, EXPORTED_SYMS,
+    standalone_definitions, KernelConfig, EXPORTED_SYMS,
 };
 
 fn main() {
@@ -51,6 +51,12 @@ fn main() {
     // attributes (preserve_access_index from vmlinux.h).
     let compiler = env::var("BPF_CLANG").unwrap_or_else(|_| "clang".into());
 
+    // Standalone uses the kernel-config defaults baked into sim_kconfig_defaults.h
+    // (no overrides). An embedder constructs a non-default KernelConfig to compile
+    // the .so + host sim_task against the kernel under test. Default => empty
+    // cflag_defines => byte-identical .so.
+    let kernel_config = KernelConfig::default();
+
     // DRY helper: apply common config to a cc::Build
     let configure_build = |build: &mut cc::Build| {
         build
@@ -83,10 +89,18 @@ fn main() {
     configure_build(&mut scxtest);
     scxtest.compile("scxtest");
 
-    // Build the task_struct accessor library
+    // Build the task_struct accessor library. sim_task.c carries the host-side
+    // LINUX_KERNEL_VERSION definition, so an embedder's kernel_config overrides
+    // reach it too (no-op for the standalone default).
     let mut sim_task = cc::Build::new();
     sim_task.file(csrc_dir.join("sim_task.c"));
     configure_build(&mut sim_task);
+    // Apply the kernel_config -D flags via .flag() (not .define()) so the single
+    // cflag_defines() encoder is reused for both the .so Command path and this
+    // cc::Build path -- .define() would force a second name/value split.
+    for d in kernel_config.cflag_defines() {
+        sim_task.flag(&d);
+    }
     sim_task.compile("sim_task");
 
     // Build the SDT / arena per-task storage stubs.
@@ -155,6 +169,7 @@ fn main() {
         &compiler,
         coverage,
         cgroup_bw_new_api,
+        &kernel_config,
     );
 
     println!("cargo:rerun-if-env-changed=SCXSIM_PHASE2_REAL_CGROUP_BW");

@@ -10,6 +10,7 @@
  * the few libc functions we need.
  */
 #include "sim_wrapper.h"
+#include "sim_kconfig_defaults.h"
 
 /* Forward declarations for libc functions to avoid stdlib.h/vmlinux.h conflicts */
 extern void *calloc(unsigned long nmemb, unsigned long size);
@@ -17,8 +18,14 @@ extern void free(void *ptr);
 extern void *memcpy(void *dst, const void *src, unsigned long n);
 extern void *memset(void *s, int c, unsigned long n);
 
-/* Provide the LINUX_KERNEL_VERSION symbol that common.bpf.h declares as extern */
-int LINUX_KERNEL_VERSION = 0;
+/*
+ * Provide the LINUX_KERNEL_VERSION symbol that common.bpf.h declares as extern.
+ * Shares SIM_LINUX_KERNEL_VERSION with the .so-side definition in
+ * sim_bpf_stubs.c so the host and .so values cannot diverge (previously this was
+ * 0 while the .so was 0x061200). Nothing on the host reads it (link stub only);
+ * unifying the value removes the latent inconsistency.
+ */
+int LINUX_KERNEL_VERSION = SIM_LINUX_KERNEL_VERSION;
 
 /*
  * Global root cgroup structures for simulator cgroup modeling.

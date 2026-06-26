@@ -11,12 +11,16 @@
  */
 #include "sim_wrapper.h"
 #include "sim_task.h"
+#include "sim_kconfig_defaults.h"
 
 /*
  * CONFIG_HZ: __kconfig extern referenced by tickless. In the kernel,
- * this resolves to the HZ config value. Default to 250 for simulation.
+ * this resolves to the HZ config value. Default 250 for simulation; an embedder
+ * overrides via -DSIM_CONFIG_HZ (see sim_kconfig_defaults.h). Reachable only when
+ * tick_freq is 0 (`tick_freq ? : CONFIG_HZ`); the tickless manifest sets
+ * tick_freq=250, so CONFIG_HZ is the fallback.
  */
-unsigned int CONFIG_HZ = 250;
+unsigned int CONFIG_HZ = SIM_CONFIG_HZ;
 
 /* Include tickless interface header, then the scheduler source.
  * common.bpf.h is already included (header guard set), so our
