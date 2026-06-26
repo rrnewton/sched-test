@@ -83,7 +83,31 @@ pub const SCHEDULERS: &[SchedulerManifest] = &[
         scx_bpf_dir: true,
         extra_local_include: true,
         codegen: Some(Codegen::CosmosDivZeroGuard),
-        runtime: SchedulerRuntime::EMPTY,
+        // Migrated from cosmos_setup's config-global writes.
+        // smt_enabled=true (SMT avoidance is unconditional upstream; the avoid_smt
+        // toggle was deprecated, so there is no avoid_smt global to set).
+        // perf_config / slice_ns / slice_lag / busy_threshold are u64; nr_node_ids
+        // is u32. Five globals' setup value differs from the BPF rodata default, so
+        // those writes are load-bearing: nr_node_ids, mm_affinity, perf_config,
+        // slice_ns, busy_threshold. numa_enabled and nr_node_ids are re-overwritten
+        // by cosmos_configure_numa, which runs after apply_rodata (ffi.rs), so these
+        // manifest values are the correct pre-NUMA defaults.
+        runtime: SchedulerRuntime {
+            rodata: &[
+                ("smt_enabled", ConfigValue::Bool(true)),
+                ("primary_all", ConfigValue::Bool(true)),
+                ("flat_idle_scan", ConfigValue::Bool(false)),
+                ("preferred_idle_scan", ConfigValue::Bool(false)),
+                ("cpufreq_enabled", ConfigValue::Bool(true)),
+                ("numa_enabled", ConfigValue::Bool(false)),
+                ("nr_node_ids", ConfigValue::U32(1)),
+                ("mm_affinity", ConfigValue::Bool(true)),
+                ("perf_config", ConfigValue::U64(1)),
+                ("slice_ns", ConfigValue::U64(20_000_000)),
+                ("slice_lag", ConfigValue::U64(20_000_000)),
+                ("busy_threshold", ConfigValue::U64(1)),
+            ],
+        },
     },
     SchedulerManifest {
         name: "lavd",

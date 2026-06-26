@@ -193,31 +193,16 @@ void cosmos_register_maps(void)
 
 /*
  * Combined setup function called from Rust before cosmos_init().
- * Sets global variables to disable complex features, registers maps,
- * and enables CPU 0 in the primary domain.
+ * Registers maps and enables CPU 0 in the primary domain; the config globals are
+ * written before run by the manifest apply_rodata path (scheduler_manifest.rs
+ * cosmos.runtime.rodata), not here. num_cpus is unused (cosmos has no
+ * CPU-count-derived rodata) but kept for the generic {prefix}_setup signature.
  */
 void cosmos_setup(unsigned int num_cpus)
 {
 	struct cpu_arg arg = { .cpu_id = 0 };
 
-	smt_enabled = true;
-	/*
-	 * Upstream scx_cosmos deprecated the SMT-avoidance toggle and made it
-	 * unconditional (sched-ext/scx 9278fb1e "Deprecate SMT avoidance
-	 * option"), removing the `avoid_smt` BPF global. SMT contention is now
-	 * always avoided, so there is no knob to set here.
-	 */
-	primary_all = true;
-	flat_idle_scan = false;
-	preferred_idle_scan = false;
-	cpufreq_enabled = true;
-	numa_enabled = false;
-	nr_node_ids = 1;
-	mm_affinity = true;
-	perf_config = 1;  /* Enable PMU tracking (any non-zero value) */
-	slice_ns = 20000000;   /* 20ms */
-	slice_lag = 20000000;  /* 20ms */
-	busy_threshold = 1;   /* system "not busy" → flat idle scan path */
+	(void)num_cpus;
 
 	cosmos_register_maps();
 	enable_primary_cpu(&arg);
