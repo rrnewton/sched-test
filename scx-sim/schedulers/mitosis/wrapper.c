@@ -243,8 +243,9 @@ u64 mitosis_sum_cstat(u32 idx)
 /* ---------------------------------------------------------------------------
  * Setup function called from Rust before mitosis_init().
  *
- * Sets global variables, populates the all_cpus bitmask, and clears
- * all static map arrays so the scheduler starts with clean state.
+ * Registers + pre-seeds the maps, clears timer state, and populates the
+ * all_cpus bitmask. The config globals are written before run by the manifest
+ * apply_rodata path (scheduler_manifest.rs mitosis.runtime.rodata), not here.
  * ---------------------------------------------------------------------------*/
 void mitosis_setup(unsigned int num_cpus)
 {
@@ -258,16 +259,6 @@ void mitosis_setup(unsigned int num_cpus)
 	mitosis_timer_cb = NULL;
 	mitosis_timer_ptr = NULL;
 	mitosis_timer_map = NULL;
-
-	/* Set globals to safe simulator values */
-	nr_possible_cpus = num_cpus;
-	smt_enabled = false;
-	slice_ns = 20000000;   /* 20ms */
-	root_cgid = 1;
-	debug_events_enabled = false;
-	exiting_task_workaround_enabled = false;
-	cpu_controller_disabled = true;
-	reject_multicpu_pinning = false;
 
 	/* Populate all_cpus bitmask for each simulated CPU */
 	memset((void *)all_cpus, 0, sizeof(all_cpus));
