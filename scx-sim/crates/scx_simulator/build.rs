@@ -39,9 +39,11 @@ fn main() {
     // order). -I resolution is first-match, so this reproduces the standalone
     // build's historical -I sequence exactly -- keep crate-local dirs ahead of
     // the scx trees and preserve the order (the .so build is sensitive to it).
+    // None vmlinux override: the standalone build uses the vendored,
+    // scx-versioned vmlinux (an embedder passes Some(kernel_vmlinux_dir)).
     let include_paths: Vec<PathBuf> = [csrc_dir.clone(), scxtest_dir.clone()]
         .into_iter()
-        .chain(scx_include_paths(&scx_root, &bpf_include))
+        .chain(scx_include_paths(&scx_root, &bpf_include, None))
         .collect();
 
     // Common compiler: BPF scheduler code compiled as userspace C has

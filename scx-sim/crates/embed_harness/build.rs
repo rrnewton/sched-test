@@ -51,10 +51,12 @@ fn main() {
     let csrc_dir = scx_sim_crate.join("csrc");
     let scxtest_dir = scx_sim_crate.join("scxtest");
 
-    // Same include order as the standalone build, via the shared helper.
+    // Same include order as the standalone build, via the shared helper. None
+    // vmlinux override -- this in-repo proof uses the vendored vmlinux; a real
+    // embedder driving a booted kernel passes Some(its kernel-derived vmlinux).
     let include_paths: Vec<PathBuf> = [csrc_dir.clone(), scxtest_dir.clone()]
         .into_iter()
-        .chain(scx_include_paths(&scx_root, &bpf_include))
+        .chain(scx_include_paths(&scx_root, &bpf_include, None))
         .collect();
 
     // build_schedulers discovers ALL <name>/wrapper.c subdirs under its

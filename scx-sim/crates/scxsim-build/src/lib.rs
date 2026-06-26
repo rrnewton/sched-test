@@ -300,15 +300,34 @@ pub const EXPORTED_SYMS: &[&str] = &[
 /// Does NOT include the caller's crate-local csrc/scxtest dirs (caller-private),
 /// nor `<scx_root>/lib` ([`build_schedulers`] appends that itself), so neither is
 /// double-added.
-pub fn scx_include_paths(scx_root: &Path, bpf_include: &Path) -> Vec<PathBuf> {
-    vec![
+///
+/// `vmlinux_override`: when `Some(dir)`, `dir` (which must contain a `vmlinux.h`)
+/// REPLACES the two vendored `scheds/vmlinux` entries -- `scheds/vmlinux`
+/// symlinks `vmlinux.h` into `scheds/vmlinux/arch/x86` (the symlink target dir,
+/// where the version-pinned header lives), so both `-I` entries serve only to
+/// resolve `#include "vmlinux.h"`. The vendored vmlinux is pinned to one scx
+/// version, so an embedder (e.g. ktstr) passes the vmlinux it derived from the
+/// kernel under test, compiling the `.so` against the matching kernel ABI.
+/// `None` keeps the vendored, scx-versioned vmlinux (the standalone default).
+pub fn scx_include_paths(
+    scx_root: &Path,
+    bpf_include: &Path,
+    vmlinux_override: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut paths = vec![
         scx_root.join("scheds/include"),
         scx_root.join("scheds/include/lib"),
-        scx_root.join("scheds/vmlinux"),
-        scx_root.join("scheds/vmlinux/arch/x86"),
-        scx_root.join("scheds/include/bpf-compat"),
-        bpf_include.to_path_buf(),
-    ]
+    ];
+    match vmlinux_override {
+        Some(dir) => paths.push(dir.to_path_buf()),
+        None => {
+            paths.push(scx_root.join("scheds/vmlinux"));
+            paths.push(scx_root.join("scheds/vmlinux/arch/x86"));
+        }
+    }
+    paths.push(scx_root.join("scheds/include/bpf-compat"));
+    paths.push(bpf_include.to_path_buf());
+    paths
 }
 
 /// Resolve the scx source root for a scheduler `.so` build. Returns the
@@ -633,15 +652,20 @@ mod tests {
         );
     }
 
-    /// `scx_include_paths` returns exactly the scx-derived `-I` dirs in the order
-    /// the standalone build.rs used inline, excluding `<scx_root>/lib`
+    /// `scx_include_paths` with `None` returns exactly the scx-derived `-I` dirs
+    /// in the order the standalone build.rs used inline, excluding `<scx_root>/lib`
     /// (build_schedulers appends that -- double-add hazard) and the caller's
-    /// crate-local csrc/scxtest.
+    /// crate-local csrc/scxtest; with `Some(override)` it replaces the two vendored
+    /// vmlinux entries in-slot with the override dir.
     #[test]
     fn scx_include_paths_order_and_contents() {
         let scx = Path::new("/scx");
         let bpf = Path::new("/bpf/include");
-        let got = scx_include_paths(scx, bpf);
+
+        // Default (None): the vendored, scx-versioned vmlinux entries, in the
+        // historical -I order. Must exclude <scx_root>/lib (build_schedulers
+        // appends it) and the caller's crate-local csrc/scxtest.
+        let got = scx_include_paths(scx, bpf, None);
         assert_eq!(
             got,
             vec![
@@ -654,6 +678,26 @@ mod tests {
             ]
         );
         assert!(!got.iter().any(|p| p == Path::new("/scx/lib")));
+
+        // Override (Some): the embedder's kernel-derived vmlinux dir REPLACES the
+        // two vendored scheds/vmlinux entries in the same slot; the vendored ones
+        // no longer appear, and the surrounding order is preserved.
+        let km = Path::new("/kernel/vmlinux");
+        let got = scx_include_paths(scx, bpf, Some(km));
+        assert_eq!(
+            got,
+            vec![
+                PathBuf::from("/scx/scheds/include"),
+                PathBuf::from("/scx/scheds/include/lib"),
+                PathBuf::from("/kernel/vmlinux"),
+                PathBuf::from("/scx/scheds/include/bpf-compat"),
+                PathBuf::from("/bpf/include"),
+            ]
+        );
+        assert!(!got.iter().any(|p| p == Path::new("/scx/scheds/vmlinux")));
+        assert!(!got
+            .iter()
+            .any(|p| p == Path::new("/scx/scheds/vmlinux/arch/x86")));
     }
 
     /// `header_has_new_cgroup_bw_api` matches only a line-anchored
