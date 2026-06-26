@@ -33,6 +33,7 @@ pub enum Codegen {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ConfigValue {
     Bool(bool),
+    U8(u8),
     U32(u32),
     U64(u64),
     NumCpus,
@@ -115,7 +116,27 @@ pub const SCHEDULERS: &[SchedulerManifest] = &[
         scx_bpf_dir: true,
         extra_local_include: true,
         codegen: None,
-        runtime: SchedulerRuntime::EMPTY,
+        // Migrated from lavd_setup's const-volatile config-global writes.
+        // nr_cpu_ids resolves to num_cpus; nr_llcs and no_use_em are load-bearing
+        // (the BPF rodata default 0 differs from the setup value). no_use_em and
+        // verbose are u8 (const volatile u8 -- U32 would 3-byte-overrun adjacent
+        // rodata). Only const-volatile globals are here; the plain-volatile mutable
+        // globals the scheduler overwrites at runtime (nr_cpus_onln, power_mode,
+        // is_powersave_mode, no_core_compaction, no_freq_scaling, no_preemption),
+        // the computed per-CPU arrays, and the cpdom init stay in lavd_setup.
+        runtime: SchedulerRuntime {
+            rodata: &[
+                ("nr_cpu_ids", ConfigValue::NumCpus),
+                ("nr_llcs", ConfigValue::U64(1)),
+                ("is_smt_active", ConfigValue::Bool(false)),
+                ("enable_cpu_bw", ConfigValue::Bool(false)),
+                ("is_autopilot_on", ConfigValue::Bool(false)),
+                ("no_wake_sync", ConfigValue::Bool(false)),
+                ("no_slice_boost", ConfigValue::Bool(false)),
+                ("no_use_em", ConfigValue::U8(1)),
+                ("verbose", ConfigValue::U8(0)),
+            ],
+        },
     },
     SchedulerManifest {
         name: "mitosis",

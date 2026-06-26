@@ -1767,29 +1767,20 @@ void lavd_setup(unsigned int num_cpus)
 	lavd_register_cbw_maps();
 #endif
 
-	/* Core globals */
-	nr_cpus_onln = num_cpus;
-	nr_cpu_ids = num_cpus;
-	nr_llcs = 1;
-	is_smt_active = false;
-
 	/*
-	 * Power mode: default to performance (matches --performance flag).
-	 * This keeps no_core_compaction=true and is_powersave_mode=false.
+	 * Mutable (plain-volatile) globals the scheduler overwrites at runtime
+	 * (do_set_power_profile / autopilot) -- NOT rodata, so they stay here as
+	 * setup-time initial values. The const-volatile config globals (nr_cpu_ids,
+	 * nr_llcs, is_smt_active, enable_cpu_bw, is_autopilot_on, no_wake_sync,
+	 * no_slice_boost, no_use_em, verbose) are written before run by the manifest
+	 * apply_rodata path (scheduler_manifest.rs lavd.runtime.rodata), not here.
 	 */
+	nr_cpus_onln = num_cpus;
 	power_mode = 0; /* LAVD_PM_PERFORMANCE */
 	is_powersave_mode = false;
-
-	/* Disable complex features for initial simulation */
-	enable_cpu_bw = false;
-	is_autopilot_on = false;
 	no_core_compaction = true;
 	no_freq_scaling = true;
 	no_preemption = false;
-	no_wake_sync = false;
-	no_slice_boost = false;
-	no_use_em = true; /* no kernel energy model in the simulator */
-	verbose = 0;
 
 	/* Per-CPU topology: uniform capacity, no big/little, no SMT */
 	for (cpu = 0; cpu < num_cpus && cpu < LAVD_CPU_ID_MAX; cpu++) {

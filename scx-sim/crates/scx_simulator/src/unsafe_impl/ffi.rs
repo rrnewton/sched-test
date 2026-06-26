@@ -983,6 +983,17 @@ impl DynamicScheduler {
         }
     }
 
+    /// Write a `u8` BPF config global. See [`Self::write_bool_global`] for the
+    /// pre-`run` rodata contract; `name` must be a `u8` global (a u32/u64 write
+    /// would overrun the 1-byte symbol into adjacent rodata).
+    pub fn write_u8_global(&self, name: &str, value: u8) -> Option<()> {
+        // SAFETY: as `write_bool_global`; contract: `name` is a u8 global.
+        unsafe {
+            self.get_symbol::<*mut u8>(name.as_bytes())
+                .map(|sym| std::ptr::write_volatile(*sym, value))
+        }
+    }
+
     /// Load a scheduler from a `.so` file.
     ///
     /// - `path`: path to the `.so` file
@@ -1047,6 +1058,7 @@ impl DynamicScheduler {
         for (name, value) in m.runtime.rodata {
             let written = match value {
                 ConfigValue::Bool(b) => self.write_bool_global(name, *b),
+                ConfigValue::U8(v) => self.write_u8_global(name, *v),
                 ConfigValue::U32(v) => self.write_u32_global(name, *v),
                 ConfigValue::U64(v) => self.write_u64_global(name, *v),
                 ConfigValue::NumCpus => self.write_u32_global(name, nr_cpus),
