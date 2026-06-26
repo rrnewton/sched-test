@@ -14,7 +14,7 @@ use std::process::Command;
 
 /// Source-text transform applied to a scheduler's upstream BPF source before
 /// compilation (a pre-existing build step, not manifest-generated code).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Codegen {
     /// cosmos: guard the one division in update_freq() against a zero divisor.
     /// BPF integer divide-by-zero yields 0; native C raises SIGFPE.
@@ -24,7 +24,7 @@ pub enum Codegen {
 /// A scheduler config global's value, written before run via write_*_global.
 /// `NumCpus` resolves to the simulator's CPU count at apply time (e.g. the
 /// nr_cpu_ids / nr_possible_cpus / nr_cpus_onln globals).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
 pub enum ConfigValue {
     Bool(bool),
     U8(u8),
@@ -182,6 +182,49 @@ pub const SCHEDULERS: &[SchedulerManifest] = &[
     },
 ];
 
+/// Owned, serializable per-scheduler descriptor -- the public INPUT type the
+/// build path consumes (`build_schedulers` takes `&[SchedulerDefinition]`).
+/// `standalone_definitions()` supplies these from the bundled `SCHEDULERS` const
+/// for the standalone build; an embedder (cargo-ktstr) constructs them from cargo
+/// metadata. The runtime (ffi.rs `apply_manifest_rodata`) still reads the
+/// `SCHEDULERS` const directly (rewired in a later step).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SchedulerDefinition {
+    /// Scheduler name; matches the schedulers/<name>/ dir and the .so/ops prefix.
+    pub name: String,
+    /// Strip `const` so BPF const-volatile globals are writable (all but `simple`).
+    pub strip_const: bool,
+    /// Add -I <scx_root>/scheds/rust/scx_<name>/src/bpf (all but `simple`).
+    pub scx_bpf_dir: bool,
+    /// Add -I <schedulers>/<name> (a generated/patched source lives there).
+    pub extra_local_include: bool,
+    /// Source codegen transform applied before compilation, if any.
+    pub codegen: Option<Codegen>,
+    /// const-volatile config globals written before run, as (symbol, value).
+    pub rodata: Vec<(String, ConfigValue)>,
+}
+
+/// The bundled schedulers as owned [`SchedulerDefinition`]s -- the standalone
+/// provider, value-identical to the `SCHEDULERS` manifest const.
+pub fn standalone_definitions() -> Vec<SchedulerDefinition> {
+    SCHEDULERS
+        .iter()
+        .map(|m| SchedulerDefinition {
+            name: m.name.to_string(),
+            strip_const: m.strip_const,
+            scx_bpf_dir: m.scx_bpf_dir,
+            extra_local_include: m.extra_local_include,
+            codegen: m.codegen,
+            rodata: m
+                .runtime
+                .rodata
+                .iter()
+                .map(|(s, v)| (s.to_string(), *v))
+                .collect(),
+        })
+        .collect()
+}
+
 /// Symbols DEFINED in the static C libs compiled into the main binary that the
 /// dlopen'd scheduler `.so` files resolve at load time. Rust does not reference
 /// them, so without `--undefined` the linker drops them and a `.so` SIGSEGVs at
@@ -238,6 +281,7 @@ pub const EXPORTED_SYMS: &[&str] = &[
 #[allow(clippy::too_many_arguments)]
 pub fn build_schedulers(
     schedulers_src: &Path,
+    defs: &[SchedulerDefinition],
     out: &Path,
     csrc_dir: &Path,
     scxtest_dir: &Path,
@@ -274,9 +318,9 @@ pub fn build_schedulers(
     // The declared manifest and the discovered directories must agree so neither
     // drifts silently (a stale manifest entry without a dir; the reverse -- a dir
     // without a manifest entry -- is caught by the per-name lookup below).
-    for m in SCHEDULERS {
+    for m in defs {
         assert!(
-            names.iter().any(|n| n == m.name),
+            names.iter().any(|n| n.as_str() == m.name.as_str()),
             "manifest lists scheduler {} but schedulers/{}/wrapper.c does not exist",
             m.name,
             m.name
@@ -304,9 +348,9 @@ pub fn build_schedulers(
         // every other scheduler strips `const` (BPF const-volatile globals must be
         // writable) and adds scheds/rust/scx_<name>/src/bpf; lavd/cosmos also
         // include their own dir (a generated/patched source lives there).
-        let m = SCHEDULERS
+        let m = defs
             .iter()
-            .find(|m| m.name == name.as_str())
+            .find(|m| m.name.as_str() == name.as_str())
             .unwrap_or_else(|| panic!("no manifest entry for scheduler {name}"));
 
         let strip_const = m.strip_const;
@@ -419,4 +463,32 @@ fn run(mut cmd: Command, desc: &str) {
         .status()
         .unwrap_or_else(|e| panic!("spawn failed ({desc}): {e}"));
     assert!(status.success(), "{desc} failed: {status}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `standalone_definitions()` must reproduce the `SCHEDULERS` manifest const
+    /// field-for-field, so the owned provider is a faithful stand-in for the const
+    /// everywhere the build and runtime later consume it.
+    #[test]
+    fn standalone_definitions_match_manifest() {
+        let defs = standalone_definitions();
+        assert_eq!(defs.len(), SCHEDULERS.len());
+        for (d, m) in defs.iter().zip(SCHEDULERS.iter()) {
+            assert_eq!(d.name, m.name);
+            assert_eq!(d.strip_const, m.strip_const);
+            assert_eq!(d.scx_bpf_dir, m.scx_bpf_dir);
+            assert_eq!(d.extra_local_include, m.extra_local_include);
+            assert_eq!(d.codegen, m.codegen);
+            let want: Vec<(String, ConfigValue)> = m
+                .runtime
+                .rodata
+                .iter()
+                .map(|(s, v)| (s.to_string(), *v))
+                .collect();
+            assert_eq!(d.rodata, want);
+        }
+    }
 }

@@ -2,7 +2,7 @@ use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 
-use scxsim_build::{build_schedulers, EXPORTED_SYMS, SCHEDULERS};
+use scxsim_build::{build_schedulers, standalone_definitions, EXPORTED_SYMS};
 
 fn main() {
     let manifest_dir: PathBuf = env::var("CARGO_MANIFEST_DIR").unwrap().into();
@@ -161,8 +161,12 @@ fn main() {
         })
         .unwrap_or(false);
 
+    // The standalone scheduler set as owned definitions; an embedder drives the
+    // same build_schedulers with its own definitions (one build path, two providers).
+    let defs = standalone_definitions();
     build_schedulers(
         &workspace_dir.join("schedulers"),
+        &defs,
         &scheduler_dir,
         &csrc_dir,
         &scxtest_dir,
@@ -270,7 +274,7 @@ fn main() {
         scx_root.join("scheds/include"), // headers used by ALL schedulers
         scx_root.join("scheds/vmlinux"),
     ];
-    for m in SCHEDULERS {
+    for m in &defs {
         if m.scx_bpf_dir {
             scx_rerun_dirs.push(scx_root.join(format!("scheds/rust/scx_{}/src/bpf", m.name)));
         }
