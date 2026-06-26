@@ -2,6 +2,9 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+// Declarative per-scheduler descriptors.
+include!("scheduler_manifest.rs");
+
 fn main() {
     let manifest_dir: PathBuf = env::var("CARGO_MANIFEST_DIR").unwrap().into();
     // Workspace root is two levels up from crates/scx_simulator
@@ -292,6 +295,11 @@ fn main() {
     // Vendored C substrate (lives in this crate).
     println!("cargo:rerun-if-changed={}", csrc_dir.display());
     println!("cargo:rerun-if-changed={}", scxtest_dir.display());
+    // The manifest is include!d (cargo does not auto-track include! files).
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir.join("scheduler_manifest.rs").display()
+    );
 
     let rerun_dirs: &[&str] = &[
         // scx-sim local source — Makefile + wrapper.c per scheduler
@@ -376,6 +384,17 @@ fn build_schedulers(
         "no schedulers (subdirs with wrapper.c) under {}",
         schedulers_src.display()
     );
+    // The declared manifest and the discovered directories must agree so neither
+    // drifts silently (a stale manifest entry without a dir; the reverse -- a dir
+    // without a manifest entry -- is caught by the per-name lookup below).
+    for m in SCHEDULERS {
+        assert!(
+            names.iter().any(|n| n == m.name),
+            "manifest lists scheduler {} but schedulers/{}/wrapper.c does not exist",
+            m.name,
+            m.name
+        );
+    }
 
     // -I list shared by the full-CFLAGS TUs: the crate include set + <scx_root>/lib,
     // where lavd's compiled-in scx library bodies (ravg.bpf.c, cgroup_bw.bpf.c)
@@ -392,19 +411,24 @@ fn build_schedulers(
     for name in &names {
         let sched_dir = schedulers_src.join(name);
 
-        // `simple` has no config.mk: `const` stays intact and it pulls no scx
-        // BPF include (its scheduler source is local). Every other scheduler
-        // strips `const` (BPF const-volatile globals must be writable) and adds
-        // its scheds/rust/scx_<name>/src/bpf dir; lavd/cosmos additionally
-        // include their own scheduler dir (a generated/patched source lives
-        // there).
-        let strip_const = name != "simple";
+        // Per-scheduler build variation is declared in the manifest (strip-const,
+        // scx-bpf-dir, local-include, codegen), not hardcoded name branches.
+        // `simple` strips no `const` and pulls no scx BPF include (local source);
+        // every other scheduler strips `const` (BPF const-volatile globals must be
+        // writable) and adds scheds/rust/scx_<name>/src/bpf; lavd/cosmos also
+        // include their own dir (a generated/patched source lives there).
+        let m = SCHEDULERS
+            .iter()
+            .find(|m| m.name == name.as_str())
+            .unwrap_or_else(|| panic!("no manifest entry for scheduler {name}"));
+
+        let strip_const = m.strip_const;
         let mut extra_includes: Vec<PathBuf> = Vec::new();
-        if name != "simple" {
+        if m.scx_bpf_dir {
             extra_includes.push(scx_root.join(format!("scheds/rust/scx_{name}/src/bpf")));
-            if name == "lavd" || name == "cosmos" {
-                extra_includes.push(sched_dir.clone());
-            }
+        }
+        if m.extra_local_include {
+            extra_includes.push(sched_dir.clone());
         }
 
         // cosmos: regenerate the div-by-zero-guarded copy of main.bpf.c. BPF
@@ -412,7 +436,7 @@ fn build_schedulers(
         // transform in cosmos/config.mk guards the one divide that can see a
         // zero divisor. Regenerated from the upstream source on every build so
         // a stale checked-in copy cannot drift from the active scx SHA.
-        if name == "cosmos" {
+        if m.codegen == Some(Codegen::CosmosDivZeroGuard) {
             let src = scx_root.join("scheds/rust/scx_cosmos/src/bpf/main.bpf.c");
             let content = std::fs::read_to_string(&src)
                 .unwrap_or_else(|e| panic!("read {}: {e}", src.display()));
