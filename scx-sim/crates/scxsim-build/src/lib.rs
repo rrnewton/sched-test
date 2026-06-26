@@ -187,8 +187,12 @@ pub const SCHEDULERS: &[SchedulerManifest] = &[
 /// the build (`build_schedulers`) and the runtime
 /// (`DynamicScheduler::load_with_definition`) consume.
 /// `standalone_definitions()` supplies these from the bundled `SCHEDULERS` const
-/// for the standalone build; an embedder (cargo-ktstr) constructs them from cargo
-/// metadata.
+/// for the standalone build; an embedder (cargo-ktstr) constructs them via
+/// [`SchedulerDefinition::new`] from a scheduler name it already holds.
+///
+/// There is no source-location field: `build_schedulers` derives a scheduler's
+/// BPF source dir from `scx_root` + [`name`](Self::name) and its `wrapper.c` dir
+/// from `schedulers_src` + name, so the name is the only source key.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SchedulerDefinition {
     /// Scheduler name; matches the schedulers/<name>/ dir and the .so/ops prefix.
@@ -203,6 +207,37 @@ pub struct SchedulerDefinition {
     pub codegen: Option<Codegen>,
     /// const-volatile config globals written before run, as (symbol, value).
     pub rodata: Vec<(String, ConfigValue)>,
+}
+
+impl SchedulerDefinition {
+    /// Embedder-facing constructor. `name` is the scheduler's `.so` / ops prefix
+    /// and the key `build_schedulers` derives the BPF source dir
+    /// (`scx_root`/scheds/rust/scx_<name>/src/bpf) and `wrapper.c` dir
+    /// (`schedulers_src`/<name>) from. Build-side policy flags default to the
+    /// common non-`simple` profile: `strip_const` and `scx_bpf_dir` true,
+    /// `extra_local_include` false, no `codegen`. (`strip_const`/`scx_bpf_dir`
+    /// are false only for `simple`; lavd and cosmos override
+    /// `extra_local_include`/`codegen`.) rodata is empty until supplied via
+    /// [`with_rodata`](Self::with_rodata). The fields stay `pub` so the `simple`,
+    /// lavd, and cosmos exceptions are set by direct assignment.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            strip_const: true,
+            scx_bpf_dir: true,
+            extra_local_include: false,
+            codegen: None,
+            rodata: Vec::new(),
+        }
+    }
+
+    /// Set the const-volatile config globals written before run, as
+    /// (symbol, value). The common embedder path is
+    /// `SchedulerDefinition::new(name).with_rodata(..)`.
+    pub fn with_rodata(mut self, rodata: Vec<(String, ConfigValue)>) -> Self {
+        self.rodata = rodata;
+        self
+    }
 }
 
 /// The bundled schedulers as owned [`SchedulerDefinition`]s -- the standalone
@@ -254,6 +289,27 @@ pub const EXPORTED_SYMS: &[&str] = &[
     "sim_arena_offset",
     "scx_atq_create_internal",
 ];
+
+/// The scx-derived `-I` directories for the scheduler `.so` build, computed from
+/// an explicit `scx_root` (no submodule assumption, no cargo-metadata
+/// derivation). `bpf_include` is the libbpf-sys header dir (the standalone build
+/// passes its `DEP_BPF_INCLUDE`; an embedder passes its own). The returned
+/// sequence reproduces the standalone build's historical `-I` order exactly:
+/// `-I` resolution is first-match, so the order is part of the build contract
+/// (changing it can change which header wins, and the resulting `.so` bytes).
+/// Does NOT include the caller's crate-local csrc/scxtest dirs (caller-private),
+/// nor `<scx_root>/lib` ([`build_schedulers`] appends that itself), so neither is
+/// double-added.
+pub fn scx_include_paths(scx_root: &Path, bpf_include: &Path) -> Vec<PathBuf> {
+    vec![
+        scx_root.join("scheds/include"),
+        scx_root.join("scheds/include/lib"),
+        scx_root.join("scheds/vmlinux"),
+        scx_root.join("scheds/vmlinux/arch/x86"),
+        scx_root.join("scheds/include/bpf-compat"),
+        bpf_include.to_path_buf(),
+    ]
+}
 
 /// Compile every scheduler `.so` from its `wrapper.c` plus the shared sim C
 /// translation units, replicating `schedulers/Makefile` exactly. Each subdir
@@ -491,5 +547,67 @@ mod tests {
                 .collect();
             assert_eq!(d.rodata, want);
         }
+    }
+
+    /// `new` encodes the common non-`simple` build-side profile, so an embedder's
+    /// `SchedulerDefinition::new(name)` reproduces a plain scheduler's manifest
+    /// policy (the build-side flags) without restating it; `with_rodata` sets the
+    /// one field `new` leaves empty. `new`'s defaults deliberately do NOT match
+    /// lavd/cosmos (which override extra_local_include/codegen) or `simple`.
+    #[test]
+    fn new_defaults_match_plain_scheduler_manifest() {
+        let def = SchedulerDefinition::new("mitosis");
+        assert_eq!(def.name, "mitosis");
+        assert!(def.strip_const);
+        assert!(def.scx_bpf_dir);
+        assert!(!def.extra_local_include);
+        assert_eq!(def.codegen, None);
+        assert!(def.rodata.is_empty());
+
+        // new()'s build-side flags equal the manifest entry for a plain
+        // non-`simple` scheduler (mitosis); the only field new() leaves to
+        // with_rodata is rodata (which the mitosis manifest entry populates).
+        let mitosis = standalone_definitions()
+            .into_iter()
+            .find(|d| d.name == "mitosis")
+            .expect("mitosis in bundled set");
+        assert_eq!(def.strip_const, mitosis.strip_const);
+        assert_eq!(def.scx_bpf_dir, mitosis.scx_bpf_dir);
+        assert_eq!(def.extra_local_include, mitosis.extra_local_include);
+        assert_eq!(def.codegen, mitosis.codegen);
+        assert!(
+            !mitosis.rodata.is_empty(),
+            "mitosis manifest has rodata that new() intentionally omits"
+        );
+
+        let with = SchedulerDefinition::new("x")
+            .with_rodata(vec![("nr_cpu_ids".to_string(), ConfigValue::NumCpus)]);
+        assert_eq!(
+            with.rodata,
+            vec![("nr_cpu_ids".to_string(), ConfigValue::NumCpus)]
+        );
+    }
+
+    /// `scx_include_paths` returns exactly the scx-derived `-I` dirs in the order
+    /// the standalone build.rs used inline, excluding `<scx_root>/lib`
+    /// (build_schedulers appends that -- double-add hazard) and the caller's
+    /// crate-local csrc/scxtest.
+    #[test]
+    fn scx_include_paths_order_and_contents() {
+        let scx = Path::new("/scx");
+        let bpf = Path::new("/bpf/include");
+        let got = scx_include_paths(scx, bpf);
+        assert_eq!(
+            got,
+            vec![
+                PathBuf::from("/scx/scheds/include"),
+                PathBuf::from("/scx/scheds/include/lib"),
+                PathBuf::from("/scx/scheds/vmlinux"),
+                PathBuf::from("/scx/scheds/vmlinux/arch/x86"),
+                PathBuf::from("/scx/scheds/include/bpf-compat"),
+                PathBuf::from("/bpf/include"),
+            ]
+        );
+        assert!(!got.iter().any(|p| p == Path::new("/scx/lib")));
     }
 }

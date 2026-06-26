@@ -2,7 +2,7 @@ use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 
-use scxsim_build::{build_schedulers, standalone_definitions, EXPORTED_SYMS};
+use scxsim_build::{build_schedulers, scx_include_paths, standalone_definitions, EXPORTED_SYMS};
 
 fn main() {
     let manifest_dir: PathBuf = env::var("CARGO_MANIFEST_DIR").unwrap().into();
@@ -41,22 +41,19 @@ fn main() {
     let csrc_dir = manifest_dir.join("csrc");
     let scxtest_dir = manifest_dir.join("scxtest");
 
-    let include_paths: Vec<PathBuf> = vec![
-        // Our own C source directory (vendored into this crate)
-        csrc_dir.clone(),
-        // scxtest unit-test infrastructure (vendored into this crate)
-        scxtest_dir.clone(),
-        // Scheduler include paths
-        scx_root.join("scheds/include"),
-        scx_root.join("scheds/include/lib"),
-        scx_root.join("scheds/vmlinux"),
-        scx_root.join("scheds/vmlinux/arch/x86"),
-        scx_root.join("scheds/include/bpf-compat"),
-        // libbpf headers
-        env::var("DEP_BPF_INCLUDE")
-            .expect("libbpf-sys include must be available")
-            .into(),
-    ];
+    // libbpf headers (libbpf-sys exports its include dir as DEP_BPF_INCLUDE).
+    let bpf_include: PathBuf = env::var("DEP_BPF_INCLUDE")
+        .expect("libbpf-sys include must be available")
+        .into();
+    // Crate-local C dirs first, then the scx-derived -I set (shared with
+    // embedders via scxsim_build::scx_include_paths, one source of truth for the
+    // order). -I resolution is first-match, so this reproduces the standalone
+    // build's historical -I sequence exactly -- keep crate-local dirs ahead of
+    // the scx trees and preserve the order (the .so build is sensitive to it).
+    let include_paths: Vec<PathBuf> = [csrc_dir.clone(), scxtest_dir.clone()]
+        .into_iter()
+        .chain(scx_include_paths(&scx_root, &bpf_include))
+        .collect();
 
     // Common compiler: BPF scheduler code compiled as userspace C has
     // inherently unused parameters (fixed BPF ops signatures) and unknown
