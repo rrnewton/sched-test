@@ -109,14 +109,6 @@ extern u64 sim_scx_clock_task(u32 cpu);
 #define MAX_SIM_CPUS 128
 
 /*
- * Forward declaration for per-CPU lookup.
- * Defined after LAVD source since struct cpu_ctx is needed.
- */
-static struct cpu_ctx *lavd_lookup_percpu_elem(int cpu);
-#undef bpf_map_lookup_percpu_elem
-#define bpf_map_lookup_percpu_elem(map, key, cpu) lavd_lookup_percpu_elem(cpu)
-
-/*
  * BPF timer overrides for periodic system stat updates AND for any
  * additional timer the cgroup_bw library compiled in by Phase 2 will
  * arm (e.g. `cbw_replenish_timer`).
@@ -207,19 +199,12 @@ static int lavd_timer_slot_for(struct bpf_timer *timer)
 	})
 
 /*
- * Map lookup override.
- *
- * LAVD uses bpf_map_lookup_elem for two maps:
- *   cpu_ctx_stor (PERCPU_ARRAY) -- routed to our static per-CPU array
- *   update_timer (ARRAY)        -- routed to static backing storage
- *
- * Pointers are set in lavd_register_maps() after the source is included.
+ * Map lookup override. With the cgroup_bw flagship compiled in, lavd_map_lookup
+ * short-circuits the cbw replenish/accounting timer maps to static single-entry
+ * storage (defined post-include); everything else -- including cpu_ctx_stor and
+ * update_timer, now on the generic test-map registry -- falls through to
+ * scx_test_map_lookup_elem.
  */
-static void *lavd_cpu_ctx_stor_ptr;
-static void *lavd_update_timer_map_ptr;
-static char lavd_update_timer_buf[256];
-
-extern unsigned int sim_bpf_get_smp_processor_id(void);
 
 /*
  * Forward declaration -- definition after LAVD source where struct cpu_ctx
@@ -689,11 +674,6 @@ extern void sim_cgroup_registry_free(void);
  * =================================================================
  */
 
-/*
- * Per-CPU context array and map lookup (struct cpu_ctx now available).
- */
-static struct cpu_ctx percpu_ctx[MAX_SIM_CPUS];
-
 #ifdef SCXSIM_PHASE2_REAL_CGROUP_BW
 /*
  * Phase 2: forward decls for cgroup_bw library timer-map short-circuit
@@ -709,14 +689,6 @@ extern void *cbw_accounting_timer_map_ptr;
 
 static void *lavd_map_lookup(void *map, const void *key)
 {
-	if (map == lavd_cpu_ctx_stor_ptr && lavd_cpu_ctx_stor_ptr) {
-		int cpu = sim_bpf_get_smp_processor_id();
-		if (cpu >= 0 && cpu < MAX_SIM_CPUS)
-			return &percpu_ctx[cpu];
-		return NULL;
-	}
-	if (map == lavd_update_timer_map_ptr && lavd_update_timer_map_ptr)
-		return lavd_update_timer_buf;
 #ifdef SCXSIM_PHASE2_REAL_CGROUP_BW
 	/* Phase 2: cgroup_bw library timer maps short-circuit to static
 	 * single-entry storage so `bpf_map_lookup_elem(&replenish_timer,
@@ -732,20 +704,8 @@ static void *lavd_map_lookup(void *map, const void *key)
 }
 
 /*
- * Per-CPU context lookup (definition after struct cpu_ctx is available).
- */
-static struct cpu_ctx *lavd_lookup_percpu_elem(int cpu)
-{
-	if (cpu < 0 || cpu >= MAX_SIM_CPUS)
-		return NULL;
-	return &percpu_ctx[cpu];
-}
-
-/*
  * Register BPF maps with the test map infrastructure.
  */
-static struct scx_test_map cpu_ctx_test_map;
-
 #ifdef SCXSIM_PHASE2_REAL_CGROUP_BW
 /*
  * Phase 2 BPF map glue: register cgroup_bw's 5 maps so that
@@ -782,8 +742,7 @@ char cbw_replenish_timer_storage[256] __attribute__((aligned(16)));
 char cbw_accounting_timer_storage[256] __attribute__((aligned(16)));
 
 /* Pointers used by lavd_map_lookup() to short-circuit the cgroup_bw
- * timer maps to the static backing arrays above (mirrors how
- * `lavd_update_timer_map_ptr` short-circuits LAVD's own update_timer).
+ * timer maps to the static backing arrays above.
  * Defined here for visibility to lavd_map_lookup; populated by
  * lavd_register_maps which runs AFTER cgroup_bw.bpf.c is included
  * (so `&replenish_timer` / `&accounting_timer` are in scope). */
@@ -795,11 +754,8 @@ void lavd_register_maps(void)
 {
 	scx_test_map_clear_all();
 
-	INIT_SCX_TEST_MAP(&cpu_ctx_test_map, cpu_ctx_stor);
-	scx_test_map_register(&cpu_ctx_test_map, &cpu_ctx_stor);
-
-	lavd_cpu_ctx_stor_ptr = (void *)&cpu_ctx_stor;
-	lavd_update_timer_map_ptr = (void *)&update_timer;
+	SCX_REGISTER_PERCPU(cpu_ctx_stor, true);
+	SCX_REGISTER_ARRAY(update_timer, true);
 
 	/*
 	 * Phase 1 BPF infra scale-up items 1+2: clear the multi-timer
@@ -2116,8 +2072,8 @@ void lavd_set_cgroup_bw_max(unsigned int max)
  * context — SIM_ARC is not installed, so any kfunc that reads the current CPU
  * id will panic. Upstream sched-ext/scx 66da81a3 ("scx_lavd: cache last
  * task_ctx lookup per CPU") changed get_task_ctx(p) to read the per-CPU
- * task_ctx cache via get_cpu_ctx(), which calls
- * sim_bpf_get_smp_processor_id() and therefore requires SIM_ARC. Probes must
+ * task_ctx cache via get_cpu_ctx(), which resolves the current CPU (through the
+ * generic per-CPU map lookup) and is valid only inside a callback. Probes must
  * not depend on the current CPU, so they call the underlying slowpath
  * directly with cpuc=NULL: a pure task-storage lookup (scx_task_data(p)) with
  * no per-CPU cache read/write.
@@ -2311,14 +2267,14 @@ u8 lavd_probe_ovrflw_cpumask_null(void)
 
 u8 lavd_probe_cpuc_is_online(int cpu)
 {
-	if (cpu < 0 || cpu >= MAX_SIM_CPUS)
-		return 0;
-	return (u8)percpu_ctx[cpu].is_online;
+	struct cpu_ctx *cctx = scx_test_map_lookup_percpu_elem(
+		(void *)&cpu_ctx_stor, &(u32){ 0 }, cpu);
+	return cctx ? (u8)cctx->is_online : 0;
 }
 
 u32 lavd_probe_cpuc_eff_cap(int cpu)
 {
-	if (cpu < 0 || cpu >= MAX_SIM_CPUS)
-		return 0;
-	return percpu_ctx[cpu].effective_capacity;
+	struct cpu_ctx *cctx = scx_test_map_lookup_percpu_elem(
+		(void *)&cpu_ctx_stor, &(u32){ 0 }, cpu);
+	return cctx ? cctx->effective_capacity : 0;
 }
