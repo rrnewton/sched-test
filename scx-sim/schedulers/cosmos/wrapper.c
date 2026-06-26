@@ -12,20 +12,8 @@
 #include "sim_wrapper.h"
 #include "sim_task.h"
 
-/*
- * COSMOS-specific macro overrides (defined after sim_wrapper.h,
- * before main.bpf.c).
- */
-
-/*
- * Route bpf_map_lookup_percpu_elem to a static cpu_ctx array.
- * Forward-declared here; defined after the scheduler source since
- * struct cpu_ctx is defined there.
- */
+/* Simulator CPU count; sizes the per-CPU map registration (SCX_REGISTER_PERCPU). */
 #define MAX_SIM_CPUS 128
-static struct cpu_ctx *cosmos_lookup_percpu_elem(int cpu);
-#undef bpf_map_lookup_percpu_elem
-#define bpf_map_lookup_percpu_elem(map, key, cpu) cosmos_lookup_percpu_elem(cpu)
 
 /*
  * Simulated PMU kfunc stubs.
@@ -187,50 +175,20 @@ s32 scx_bpf_cpu_node(s32 cpu)
 }
 
 /*
- * Static per-CPU context array, defined after the scheduler source
- * so that struct cpu_ctx is available.
+ * Register the COSMOS BPF maps with the test-map registry. task_ctx_stor
+ * (TASK_STORAGE) and cpu_node_map (HASH) are create-on-demand; node_ctx_stor
+ * (ARRAY) is kernel-preallocated, so it is pre-seeded with zeroed entries that
+ * init_node() looks up during cosmos_init(); cpu_ctx_stor (PERCPU_ARRAY, one
+ * entry per CPU) is likewise seeded.
  */
-static struct cpu_ctx percpu_ctx[MAX_SIM_CPUS];
-
-static struct cpu_ctx *cosmos_lookup_percpu_elem(int cpu)
-{
-	if (cpu < 0 || cpu >= MAX_SIM_CPUS)
-		return NULL;
-	return &percpu_ctx[cpu];
-}
-
-/*
- * Register the COSMOS BPF maps with the test map infrastructure.
- *
- * task_ctx_stor (TASK_STORAGE), node_ctx_stor (ARRAY), and cpu_node_map (HASH)
- * are registered here; cpu_ctx_stor (PERCPU_ARRAY) is handled by the static
- * array above.
- */
-static struct scx_test_map task_ctx_map;
-static struct scx_test_map node_ctx_test_map;
-static struct scx_test_map cpu_node_test_map;
-
 void cosmos_register_maps(void)
 {
-	u32 node;
-	struct node_ctx zero_node = {};
-
 	scx_test_map_clear_all();
 
-	INIT_SCX_TEST_MAP_FROM_TASK_STORAGE(&task_ctx_map, task_ctx_stor);
-	scx_test_map_register(&task_ctx_map, &task_ctx_stor);
-
-	/*
-	 * ARRAY maps are preallocated in the kernel. Seed zeroed entries here so
-	 * init_node() can always look up node_ctx_stor during cosmos_init().
-	 */
-	INIT_SCX_TEST_MAP(&node_ctx_test_map, node_ctx_stor);
-	scx_test_map_register(&node_ctx_test_map, &node_ctx_stor);
-	for (node = 0; node < node_ctx_test_map.max_entries; node++)
-		bpf_map_update_elem(&node_ctx_stor, &node, &zero_node, 0);
-
-	INIT_SCX_TEST_MAP(&cpu_node_test_map, cpu_node_map);
-	scx_test_map_register(&cpu_node_test_map, &cpu_node_map);
+	SCX_REGISTER_STORAGE(task_ctx_stor);
+	SCX_REGISTER_ARRAY(node_ctx_stor, true);
+	SCX_REGISTER_ARRAY(cpu_node_map, false);
+	SCX_REGISTER_PERCPU(cpu_ctx_stor, true);
 }
 
 /*

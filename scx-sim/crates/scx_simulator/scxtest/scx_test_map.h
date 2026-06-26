@@ -127,9 +127,12 @@ int scx_test_map_update_percpu_elem(void *map, const void *key, const void *valu
  * One-line map registration: the INIT_SCX_TEST_MAP* + scx_test_map_register
  * pair (plus optional pre-seed), used from the per-scheduler register function
  * after the scheduler source is included (the map's element types must be
- * visible for the INIT macros' sizeof/typeof). The macro KIND must match the
- * map's BPF_MAP_TYPE_* declaration -- a wrong KIND picks the wrong INIT macro
- * (wrong key/value sizing) silently, so verify the KIND against the .bpf.h decl.
+ * visible for the INIT macros' sizeof/typeof). Choose the macro by the map's
+ * init family, verified against the .bpf.h decl (a wrong choice picks the wrong
+ * INIT macro and mis-sizes the key/value silently): STORAGE for
+ * BPF_MAP_TYPE_{TASK,CGRP}_STORAGE; PERCPU for BPF_MAP_TYPE_PERCPU_ARRAY; ARRAY
+ * for BPF_MAP_TYPE_ARRAY, _HASH and other key/value maps (all via
+ * INIT_SCX_TEST_MAP).
  *
  * ARRAY/STORAGE use a block-scoped static scx_test_map descriptor (the registry
  * stores its address, so it must outlive run). PERCPU's descriptor is heap-
@@ -137,7 +140,8 @@ int scx_test_map_update_percpu_elem(void *map, const void *key, const void *valu
  *
  * pre_seed (ARRAY/PERCPU): when true, every key gets a zeroed value of the map's
  * value type -- ARRAY keys [0..max_entries); PERCPU keys [0..max_entries) on
- * every CPU. STORAGE maps are create-on-demand, never pre-seeded.
+ * every CPU. STORAGE maps are create-on-demand and never pre-seeded; a HASH is
+ * the create-on-demand ARRAY case (pre_seed=false).
  */
 #define SCX_REGISTER_STORAGE(bpfmap) \
 	do { \
