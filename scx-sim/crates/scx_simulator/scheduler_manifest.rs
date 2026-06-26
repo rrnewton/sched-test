@@ -12,8 +12,13 @@
 // fields (maps, rodata, init actions) are added in later increments and the
 // runtime will include! the same file so there is one source of truth.
 
+// build.rs and the runtime lib each include! this file and read a DIFFERENT
+// subset of the fields/types, so each compilation context sees the other's as
+// unused -- #[allow(dead_code)] on the shared types silences that.
+
 /// Source-text transform applied to a scheduler's upstream BPF source before
 /// compilation (a pre-existing build step, not manifest-generated code).
+#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Codegen {
     /// cosmos: guard the one division in update_freq() against a zero divisor.
@@ -21,8 +26,35 @@ pub enum Codegen {
     CosmosDivZeroGuard,
 }
 
-/// Declarative per-scheduler descriptor. Build-side fields only for now;
-/// register/setup fields (maps, rodata, init actions) land in later increments.
+/// A scheduler config global's value, written before run via write_*_global.
+/// `NumCpus` resolves to the simulator's CPU count at apply time (e.g. the
+/// nr_cpu_ids / nr_possible_cpus / nr_cpus_onln globals).
+#[allow(dead_code)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ConfigValue {
+    Bool(bool),
+    U32(u32),
+    U64(u64),
+    NumCpus,
+}
+
+/// The runtime (register/setup) half of a scheduler's manifest. Grows
+/// incrementally -- rodata now; maps and init actions in later increments.
+#[allow(dead_code)]
+pub struct SchedulerRuntime {
+    /// const-volatile config globals the generic setup writes before run, as
+    /// (symbol, value). Replaces the per-scheduler C setup's rodata writes.
+    pub rodata: &'static [(&'static str, ConfigValue)],
+}
+
+impl SchedulerRuntime {
+    /// A scheduler with no generic runtime data (e.g. simple).
+    pub const EMPTY: Self = Self { rodata: &[] };
+}
+
+/// Declarative per-scheduler descriptor: build-side fields (read by build.rs)
+/// plus the runtime register/setup half (read by the lib).
+#[allow(dead_code)]
 pub struct SchedulerManifest {
     /// Scheduler name; matches the schedulers/<name>/ directory.
     pub name: &'static str,
@@ -38,6 +70,8 @@ pub struct SchedulerManifest {
     pub extra_local_include: bool,
     /// Source codegen transform applied before compilation, if any.
     pub codegen: Option<Codegen>,
+    /// Runtime register/setup data consumed by the generic setup path.
+    pub runtime: SchedulerRuntime,
 }
 
 /// The declared scheduler set. The build cross-checks this against the
@@ -49,6 +83,7 @@ pub const SCHEDULERS: &[SchedulerManifest] = &[
         scx_bpf_dir: true,
         extra_local_include: true,
         codegen: Some(Codegen::CosmosDivZeroGuard),
+        runtime: SchedulerRuntime::EMPTY,
     },
     SchedulerManifest {
         name: "lavd",
@@ -56,6 +91,7 @@ pub const SCHEDULERS: &[SchedulerManifest] = &[
         scx_bpf_dir: true,
         extra_local_include: true,
         codegen: None,
+        runtime: SchedulerRuntime::EMPTY,
     },
     SchedulerManifest {
         name: "mitosis",
@@ -63,6 +99,7 @@ pub const SCHEDULERS: &[SchedulerManifest] = &[
         scx_bpf_dir: true,
         extra_local_include: false,
         codegen: None,
+        runtime: SchedulerRuntime::EMPTY,
     },
     SchedulerManifest {
         name: "simple",
@@ -70,6 +107,7 @@ pub const SCHEDULERS: &[SchedulerManifest] = &[
         scx_bpf_dir: false,
         extra_local_include: false,
         codegen: None,
+        runtime: SchedulerRuntime::EMPTY,
     },
     SchedulerManifest {
         name: "tickless",
@@ -77,5 +115,15 @@ pub const SCHEDULERS: &[SchedulerManifest] = &[
         scx_bpf_dir: true,
         extra_local_include: false,
         codegen: None,
+        // Migrated from tickless_setup's rodata writes. nr_cpu_ids
+        // resolves to num_cpus at apply time; the rest are fixed config.
+        runtime: SchedulerRuntime {
+            rodata: &[
+                ("nr_cpu_ids", ConfigValue::NumCpus),
+                ("smt_enabled", ConfigValue::Bool(false)),
+                ("slice_ns", ConfigValue::U64(20_000_000)),
+                ("tick_freq", ConfigValue::U64(250)),
+            ],
+        },
     },
 ];

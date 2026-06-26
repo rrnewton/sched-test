@@ -1019,11 +1019,44 @@ impl DynamicScheduler {
         // SAFETY: The library contains the expected ops symbols with
         // correct signatures (built by our build system).
         let ops = unsafe { Self::load_ops(&lib, prefix) };
-        Self {
+        let sched = Self {
             _lib: lib,
             ops,
             prefix: prefix.to_owned(),
             so_path: path.to_owned(),
+        };
+        // Apply the scheduler's manifest rodata (config globals) before run --
+        // the kernel-faithful analog of patching .rodata before BPF_PROG_LOAD,
+        // and before any ops body runs. Replaces per-scheduler C setup rodata
+        // writes as they migrate to the manifest.
+        sched.apply_manifest_rodata(nr_cpus);
+        sched
+    }
+
+    /// Write the config globals declared in this scheduler's manifest entry
+    /// (`runtime.rodata`) into the loaded `.so`, before any ops body runs.
+    ///
+    /// `ConfigValue::NumCpus` resolves to `nr_cpus`. Panics if a declared global
+    /// is absent from the `.so` -- a manifest/scheduler mismatch is a bug, never
+    /// a silent skip.
+    fn apply_manifest_rodata(&self, nr_cpus: u32) {
+        use crate::scheduler_manifest::{ConfigValue, SCHEDULERS};
+        let Some(m) = SCHEDULERS.iter().find(|m| m.name == self.prefix) else {
+            return;
+        };
+        for (name, value) in m.runtime.rodata {
+            let written = match value {
+                ConfigValue::Bool(b) => self.write_bool_global(name, *b),
+                ConfigValue::U32(v) => self.write_u32_global(name, *v),
+                ConfigValue::U64(v) => self.write_u64_global(name, *v),
+                ConfigValue::NumCpus => self.write_u32_global(name, nr_cpus),
+            };
+            written.unwrap_or_else(|| {
+                panic!(
+                    "manifest rodata global `{name}` not found in {}.so",
+                    self.prefix
+                )
+            });
         }
     }
 
