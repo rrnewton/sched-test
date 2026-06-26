@@ -35,11 +35,6 @@ pub mod safe;
 // === Unsafe-heavy modules — grouped under unsafe_impl/ ===
 pub mod unsafe_impl;
 
-// Declarative per-scheduler manifest. The crate-root scheduler_manifest.rs
-// is the single source of truth, shared with build.rs (which include!s it).
-#[path = "../scheduler_manifest.rs"]
-pub(crate) mod scheduler_manifest;
-
 // Re-export safe modules at crate root so `crate::types`, `crate::dsq`, etc.
 // continue to resolve for all internal `use crate::xxx` paths.
 pub(crate) use safe::atomic_types;

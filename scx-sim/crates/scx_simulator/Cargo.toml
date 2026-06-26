@@ -14,6 +14,7 @@ perfetto_protos = "0.51"
 protobuf = "3"
 rand = { version = "0.8", features = ["small_rng"] }
 scx_perf = { path = "../scx_perf" }
+scxsim-build = { path = "../scxsim-build" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 toml = "0.8"
@@ -25,6 +26,7 @@ criterion = { version = "0.6", features = ["html_reports"] }
 
 [build-dependencies]
 cc = "1.2.29"
+scxsim-build = { path = "../scxsim-build" }
 
 [[bench]]
 name = "simulator"

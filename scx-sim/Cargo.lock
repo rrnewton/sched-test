@@ -904,12 +904,17 @@ dependencies = [
  "protobuf",
  "rand",
  "scx_perf",
+ "scxsim-build",
  "serde",
  "serde_json",
  "toml",
  "tracing",
  "tracing-subscriber",
 ]
+
+[[package]]
+name = "scxsim-build"
+version = "0.1.0"
 
 [[package]]
 name = "semver"

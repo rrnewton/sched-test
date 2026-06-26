@@ -1,9 +1,8 @@
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 
-// Declarative per-scheduler descriptors.
-include!("scheduler_manifest.rs");
+use scxsim_build::{build_schedulers, EXPORTED_SYMS, SCHEDULERS};
 
 fn main() {
     let manifest_dir: PathBuf = env::var("CARGO_MANIFEST_DIR").unwrap().into();
@@ -180,48 +179,11 @@ fn main() {
     // Linker flags for the main binary
     // ---------------------------------------------------------------
 
-    // Symbols DEFINED in the static C libs compiled into the main binary that
-    // the dlopen'd scheduler `.so` files resolve at load time. Rust does not
-    // reference them, so without `--undefined` the linker drops them and a
-    // `.so` SIGSEGVs at its first kfunc call; `-rdynamic` puts them in the
-    // binary's dynamic symbol table so dlopen can find them.
-    //
-    // Grouped rationale:
-    // - scx_test_map_*: scheduler code calls them via the bpf_map_lookup_elem /
-    //   bpf_map_delete_elem macros (lavd routes bpf_map_delete_elem to
-    //   scx_test_map_delete_elem for cbw_cgrp_map); clear_all resets the
-    //   thread-local map registry between runs.
-    // - scx_task_*/scx_arena_subprog_init: per-task SDT storage. The `.so`
-    //   files omit sim_sdt_stubs.c and resolve these from the binary so there
-    //   is ONE SDT hash table (sim_sdt_reset works for deterministic re-runs).
-    // - e9_preempt_yield/E9_SHARED_RBC: resolved by e9patch-instrumented `.so`
-    //   variants. (a later change will feature-gate the e9 path; when it does, drop these
-    //   two here — consumers read the emitted list, so nothing else changes.)
-    // - sim_arena_*: arena allocator shared by sim_sdt_stubs (binary) and
-    //   sim_bpf_stubs (.so).
-    // - scx_atq_create_internal: one `--undefined` forces the whole sim_atq.o
-    //   TU (all scx_atq_* follow); cgroup_bw.bpf.c in the `.so` consumes them.
-    //
-    // Emitted ALSO as `SCXSIM_EXPORTED_SYMS` (single source of truth): tests/
-    // symbol_export.rs asserts each resolves in the process image, and a
-    // downstream binary embedding scx_simulator re-emits the same set for its
-    // own test binaries — no hand-copied list to drift.
-    const EXPORTED_SYMS: &[&str] = &[
-        "scx_test_map_lookup_elem",
-        "scx_test_map_delete_elem",
-        "scx_test_map_clear_all",
-        "scx_task_init",
-        "scx_task_alloc",
-        "scx_task_data",
-        "scx_task_free",
-        "scx_arena_subprog_init",
-        "e9_preempt_yield",
-        "E9_SHARED_RBC",
-        "sim_arena_buf",
-        "sim_arena_offset",
-        "scx_atq_create_internal",
-    ];
-
+    // The kfunc/SDT/arena/atq/e9 symbols the dlopen'd `.so` resolve from this
+    // binary at load time live in scxsim_build::EXPORTED_SYMS (the single source
+    // of truth an embedder re-emits; see that const for the grouped rationale).
+    // Emitted three ways below: -rdynamic + per-symbol --undefined on this
+    // binary, plus SCXSIM_EXPORTED_SYMS for tests/symbol_export.rs.
     // Export all symbols so `.so` files can resolve kfuncs and scxtest funcs.
     println!("cargo:rustc-link-arg=-rdynamic");
     for sym in EXPORTED_SYMS {
@@ -287,19 +249,12 @@ fn main() {
     // - tg `official-scheduler-rebuild-action-replace-touch-build-rs-hack`
     // - experiments/lavd_cpubw_stalls_202604/CPU_BW_STALL_BUG_REPRODUCER_REPORT.md
     //
-    // When a NEW scheduler is added under `scx-sim/schedulers/`, audit its
-    // `wrapper.c` for `#include "../../scx/...` lines and any
-    // `*_BPF_DIR := $(ROOT_DIR)/...` in its `config.mk`, and add the
-    // corresponding directory to this list. Today's wrappers transitively
-    // depend on the dirs below.
+    // The scx watch list below is GENERATED from the manifest (each scheduler's
+    // scx_bpf_dir subtree + the shared header/lib trees), so a NEW scheduler's
+    // subtree is covered automatically -- no manual edit to a hardcoded list.
     // Vendored C substrate (lives in this crate).
     println!("cargo:rerun-if-changed={}", csrc_dir.display());
     println!("cargo:rerun-if-changed={}", scxtest_dir.display());
-    // The manifest is include!d (cargo does not auto-track include! files).
-    println!(
-        "cargo:rerun-if-changed={}",
-        manifest_dir.join("scheduler_manifest.rs").display()
-    );
 
     let rerun_dirs: &[&str] = &[
         // scx-sim local source — Makefile + wrapper.c per scheduler
@@ -308,228 +263,20 @@ fn main() {
     for d in rerun_dirs {
         println!("cargo:rerun-if-changed={}", workspace_dir.join(d).display());
     }
-    let scx_rerun_dirs: &[&str] = &[
-        // scx source-root subtrees (paths relative to SCX_ROOT) pulled in by
-        // wrapper.c per-scheduler #includes and by the include_paths above.
-        // Watching each subtree forces a rebuild whenever the scx source is
-        // swapped to a revision that touched those files.
-        "lib",                              // ravg.bpf.c, cgroup_bw.bpf.c, ...
-        "scheds/rust/scx_lavd/src/bpf",     // LAVD wrapper transitive include
-        "scheds/rust/scx_mitosis/src/bpf",  // mitosis wrapper transitive include
-        "scheds/rust/scx_cosmos/src/bpf",   // cosmos wrapper transitive include
-        "scheds/rust/scx_tickless/src/bpf", // tickless wrapper transitive include
-        // scx headers used by ALL schedulers via include_paths above
-        "scheds/include",
-        "scheds/vmlinux",
+    // Shared scx trees every scheduler pulls in, plus each scheduler's own scx
+    // BPF subtree (generated from the manifest's scx_bpf_dir flag).
+    let mut scx_rerun_dirs: Vec<PathBuf> = vec![
+        scx_root.join("lib"),            // ravg.bpf.c, cgroup_bw.bpf.c, ...
+        scx_root.join("scheds/include"), // headers used by ALL schedulers
+        scx_root.join("scheds/vmlinux"),
     ];
-    for d in scx_rerun_dirs {
-        println!("cargo:rerun-if-changed={}", scx_root.join(d).display());
+    for m in SCHEDULERS {
+        if m.scx_bpf_dir {
+            scx_rerun_dirs.push(scx_root.join(format!("scheds/rust/scx_{}/src/bpf", m.name)));
+        }
+    }
+    for d in &scx_rerun_dirs {
+        println!("cargo:rerun-if-changed={}", d.display());
     }
     println!("cargo:rerun-if-env-changed=SCX_SIM_COVERAGE");
-}
-
-/// Compile every scheduler `.so` from its `wrapper.c` plus the shared sim C
-/// translation units, replicating `schedulers/Makefile` exactly. Each subdir
-/// of `schedulers_src` that contains a `wrapper.c` is discovered and built into
-/// `libscx_<name>.so` under `out`.
-///
-/// TU split (must match the Makefile and the static-lib cc::Build above):
-/// - FULL-CFLAGS TUs (`wrapper.c`, `sim_bpf_stubs.c`, `overrides.c`): base
-///   flags + coverage + cgroup_bw API + the cgroup_bw compile-in + every include + per-scheduler
-///   extras (`-Dconst=` and the scx BPF include for all but `simple`).
-/// - SPECIAL TUs (`sim_sigfpe.c`, `sim_rbc_trampoline.c`,
-///   `sim_deterministic_mem.c`): CFLAGS_BASE ONLY — no includes, no coverage,
-///   no defines. Coverage instrumentation or vmlinux.h here corrupts the x86
-///   SIGFPE decoder, the RBC trampoline layout, and the branchless mem ops.
-/// - `sim_sdt_stubs.c` is deliberately NOT linked into the `.so` (the single
-///   SDT table lives in the main binary).
-///
-/// `scx_root` is the scx source tree (default = the bundled submodule, or an
-/// SCX_ROOT override). All scheduler scx sources — including lavd's compiled-in
-/// scx/lib bodies (ravg.bpf.c, cgroup_bw.bpf.c), resolved via -I<scx_root>/lib —
-/// derive from scx_root, so every scheduler follows the override.
-#[allow(clippy::too_many_arguments)]
-fn build_schedulers(
-    schedulers_src: &Path,
-    out: &Path,
-    csrc_dir: &Path,
-    scxtest_dir: &Path,
-    include_paths: &[PathBuf],
-    scx_root: &Path,
-    compiler: &str,
-    coverage: bool,
-    cgroup_bw_new_api: bool,
-) {
-    // CFLAGS_BASE — applied to every scheduler TU (mirrors Makefile CFLAGS_BASE).
-    let cflags_base: &[&str] = &[
-        "-fPIC",
-        "-DSCX_BPF_UNITTEST",
-        "-g",
-        "-O2",
-        "-Wno-unused-parameter",
-        "-Wno-unknown-attributes",
-        "-Wno-implicit-function-declaration",
-    ];
-
-    // Discover schedulers: subdirs of schedulers_src that contain wrapper.c.
-    let mut names: Vec<String> = std::fs::read_dir(schedulers_src)
-        .expect("read schedulers dir")
-        .flatten()
-        .filter(|e| e.path().join("wrapper.c").is_file())
-        .filter_map(|e| e.file_name().into_string().ok())
-        .collect();
-    names.sort();
-    assert!(
-        !names.is_empty(),
-        "no schedulers (subdirs with wrapper.c) under {}",
-        schedulers_src.display()
-    );
-    // The declared manifest and the discovered directories must agree so neither
-    // drifts silently (a stale manifest entry without a dir; the reverse -- a dir
-    // without a manifest entry -- is caught by the per-name lookup below).
-    for m in SCHEDULERS {
-        assert!(
-            names.iter().any(|n| n == m.name),
-            "manifest lists scheduler {} but schedulers/{}/wrapper.c does not exist",
-            m.name,
-            m.name
-        );
-    }
-
-    // -I list shared by the full-CFLAGS TUs: the crate include set + <scx_root>/lib,
-    // where lavd's compiled-in scx library bodies (ravg.bpf.c, cgroup_bw.bpf.c)
-    // resolve so they follow SCX_ROOT. (The former -I schedulers anchor existed
-    // only to resolve the wrappers' "../../scx/lib/*.bpf.c" relative includes,
-    // which are now rehomed to plain names found via <scx_root>/lib.)
-    let scx_lib = scx_root.join("lib");
-    let base_includes: Vec<&Path> = include_paths
-        .iter()
-        .map(PathBuf::as_path)
-        .chain(std::iter::once(scx_lib.as_path()))
-        .collect();
-
-    for name in &names {
-        let sched_dir = schedulers_src.join(name);
-
-        // Per-scheduler build variation is declared in the manifest (strip-const,
-        // scx-bpf-dir, local-include, codegen), not hardcoded name branches.
-        // `simple` strips no `const` and pulls no scx BPF include (local source);
-        // every other scheduler strips `const` (BPF const-volatile globals must be
-        // writable) and adds scheds/rust/scx_<name>/src/bpf; lavd/cosmos also
-        // include their own dir (a generated/patched source lives there).
-        let m = SCHEDULERS
-            .iter()
-            .find(|m| m.name == name.as_str())
-            .unwrap_or_else(|| panic!("no manifest entry for scheduler {name}"));
-
-        let strip_const = m.strip_const;
-        let mut extra_includes: Vec<PathBuf> = Vec::new();
-        if m.scx_bpf_dir {
-            extra_includes.push(scx_root.join(format!("scheds/rust/scx_{name}/src/bpf")));
-        }
-        if m.extra_local_include {
-            extra_includes.push(sched_dir.clone());
-        }
-
-        // cosmos: regenerate the div-by-zero-guarded copy of main.bpf.c. BPF
-        // integer division by zero yields 0; native C raises SIGFPE. The sed
-        // transform in cosmos/config.mk guards the one divide that can see a
-        // zero divisor. Regenerated from the upstream source on every build so
-        // a stale checked-in copy cannot drift from the active scx SHA.
-        if m.codegen == Some(Codegen::CosmosDivZeroGuard) {
-            let src = scx_root.join("scheds/rust/scx_cosmos/src/bpf/main.bpf.c");
-            let content = std::fs::read_to_string(&src)
-                .unwrap_or_else(|e| panic!("read {}: {e}", src.display()));
-            let patched = content.replace(
-                "new_freq = (100 * NSEC_PER_MSEC) / interval;",
-                "new_freq = interval ? (100 * NSEC_PER_MSEC) / interval : 0;",
-            );
-            std::fs::write(sched_dir.join("cosmos_main_patched.c"), patched)
-                .expect("write cosmos_main_patched.c");
-        }
-
-        let mut objs: Vec<PathBuf> = Vec::new();
-
-        // Full-CFLAGS TUs.
-        let full_srcs = [
-            sched_dir.join("wrapper.c"),
-            csrc_dir.join("sim_dsq_iter_glue.c"),
-            csrc_dir.join("sim_bpf_stubs.c"),
-            scxtest_dir.join("overrides.c"),
-        ];
-        for src in &full_srcs {
-            let obj = out.join(format!("{name}_{}.o", file_stem(src)));
-            let mut cmd = Command::new(compiler);
-            cmd.args(cflags_base);
-            if coverage {
-                cmd.args(["-fprofile-instr-generate", "-fcoverage-mapping"]);
-            }
-            if cgroup_bw_new_api {
-                cmd.arg("-DSCX_CGROUP_BW_NEW_API=1");
-            }
-            cmd.arg("-DSCXSIM_PHASE2_REAL_CGROUP_BW=1");
-            if strip_const {
-                cmd.arg("-Dconst=");
-            }
-            for inc in base_includes
-                .iter()
-                .copied()
-                .chain(extra_includes.iter().map(PathBuf::as_path))
-            {
-                cmd.arg("-I").arg(inc);
-            }
-            cmd.arg("-c").arg("-o").arg(&obj).arg(src);
-            run(cmd, &format!("compile {} for {name}", src.display()));
-            objs.push(obj);
-        }
-
-        // Special TUs: CFLAGS_BASE only.
-        for tu in [
-            "sim_sigfpe.c",
-            "sim_rbc_trampoline.c",
-            "sim_deterministic_mem.c",
-        ] {
-            let src = csrc_dir.join(tu);
-            let obj = out.join(format!("{name}_{}.o", file_stem(&src)));
-            let mut cmd = Command::new(compiler);
-            cmd.args(cflags_base);
-            cmd.arg("-c").arg("-o").arg(&obj).arg(&src);
-            run(cmd, &format!("compile {tu} for {name}"));
-            objs.push(obj);
-        }
-
-        // Link the .so. `-Wl,--init=e9_so_init` gives the otherwise
-        // freestanding (`-nostdlib`) library a DT_INIT so e9tool's loader
-        // runs it; the coverage build swaps `-nostdlib` for the profile
-        // runtime instead.
-        let so = out.join(format!("libscx_{name}.so"));
-        let mut link = Command::new(compiler);
-        link.arg("-shared");
-        if coverage {
-            link.arg("-fprofile-instr-generate");
-        } else {
-            link.arg("-nostdlib");
-        }
-        link.arg("-Wl,--init=e9_so_init").arg("-o").arg(&so);
-        for obj in &objs {
-            link.arg(obj);
-        }
-        run(link, &format!("link libscx_{name}.so"));
-    }
-}
-
-/// File stem of a C source as a `&str` (e.g. `sim_bpf_stubs.c` → `sim_bpf_stubs`).
-fn file_stem(p: &Path) -> &str {
-    p.file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or_else(|| panic!("source path has no UTF-8 stem: {}", p.display()))
-}
-
-/// Run a compile/link command, panicking with `desc` on spawn failure or a
-/// non-zero exit (a failed scheduler build must fail the cargo build loudly).
-fn run(mut cmd: Command, desc: &str) {
-    let status = cmd
-        .status()
-        .unwrap_or_else(|e| panic!("spawn failed ({desc}): {e}"));
-    assert!(status.success(), "{desc} failed: {status}");
 }

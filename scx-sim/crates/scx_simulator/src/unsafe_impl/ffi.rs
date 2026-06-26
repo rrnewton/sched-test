@@ -1051,7 +1051,7 @@ impl DynamicScheduler {
     /// is absent from the `.so` -- a manifest/scheduler mismatch is a bug, never
     /// a silent skip.
     fn apply_manifest_rodata(&self, nr_cpus: u32) {
-        use crate::scheduler_manifest::{ConfigValue, SCHEDULERS};
+        use scxsim_build::{ConfigValue, SCHEDULERS};
         let Some(m) = SCHEDULERS.iter().find(|m| m.name == self.prefix) else {
             return;
         };
