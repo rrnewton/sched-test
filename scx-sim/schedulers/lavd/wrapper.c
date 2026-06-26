@@ -728,7 +728,6 @@ static struct scx_test_map cbw_cgrp_test_map;
 static struct scx_test_map cbw_cgrp_llc_test_map;
 static struct scx_test_map cbw_replenish_timer_test_map;
 static struct scx_test_map cbw_accounting_timer_test_map;
-static struct scx_percpu_test_map *cbw_tree_levels_test_map;
 
 /* Static backing for the single-entry ARRAY maps so
  * `bpf_map_lookup_elem(&replenish_timer, &key=0)` returns a real
@@ -1454,19 +1453,14 @@ static void lavd_register_cbw_maps(void)
 	__builtin_memset(cbw_throttled_cgroup_ids, 0,
 			 sizeof(cbw_throttled_cgroup_ids));
 
-	/* CGRP_STORAGE: keyed by struct cgroup *, value = scx_cgroup_ctx.
-	 * BPF_MAP_TYPE_CGRP_STORAGE has no max_entries field; use the
-	 * TASK_STORAGE-style init then explicitly bump max_entries to
-	 * CBW_NR_CGRP_MAX (the production cgroup_bw library's own ceiling
-	 * defined in lib/cgroup_bw.bpf.c). The default 100-slot limit
-	 * baked into INIT_SCX_TEST_MAP_FROM_TASK_STORAGE is too low for
-	 * the cpu-bw-stall-bug stress matrix (test_lavd_cgroup_exhaustion_stress
-	 * creates 100 cgroups + root + helpers > 100 -> -ENOMEM). Matching
-	 * the library's own ceiling makes scxsim's cgroup-storage capacity
-	 * mirror what the kernel allows for cgroup_bw consumers. */
-	INIT_SCX_TEST_MAP_FROM_TASK_STORAGE(&cbw_cgrp_test_map, cbw_cgrp_map);
-	cbw_cgrp_test_map.max_entries = 2048; /* CBW_NR_CGRP_MAX from cgroup_bw.bpf.c */
-	scx_test_map_register(&cbw_cgrp_test_map, &cbw_cgrp_map);
+	/* HASH keyed by u64 cgrp_id (BPF_MAP_TYPE_HASH, lib/cgroup_bw.bpf.c),
+	 * accessed via bpf_map_lookup_elem(&cbw_cgrp_map, &cgrp_id) -- NOT
+	 * cgroup-pointer storage. INIT_SCX_TEST_MAP derives key_size=sizeof(u64)=8
+	 * and max_entries=CBW_NR_CGRP_MAX (2048, the library ceiling) from the decl,
+	 * so no override is needed (test_lavd_cgroup_exhaustion_stress needs the full
+	 * 2048). Registered into the named cbw_cgrp_test_map so the introspection
+	 * probe below can read .nr/.keys. */
+	SCX_REGISTER_ARRAY_INTO(cbw_cgrp_test_map, cbw_cgrp_map);
 
 	/* HASH: keyed by cgroup_llc_id, value = scx_cgroup_llc_ctx.
 	 *
@@ -1506,54 +1500,19 @@ static void lavd_register_cbw_maps(void)
 	 * Regression test: tests/cgroup_llc_id_padding_codegen.rs
 	 * proves the padding-uninit behavior in clang 18 vs 22 and
 	 * verifies the fix. */
-	INIT_SCX_TEST_MAP(&cbw_cgrp_llc_test_map, cbw_cgrp_llc_map);
-	cbw_cgrp_llc_test_map.key_size =
+	SCX_REGISTER_ARRAY_INTO_KEYSZ(cbw_cgrp_llc_test_map, cbw_cgrp_llc_map,
 		sizeof(((struct cgroup_llc_id *)0)->cgrp_id) +
-		sizeof(((struct cgroup_llc_id *)0)->llc_id);
-	scx_test_map_register(&cbw_cgrp_llc_test_map, &cbw_cgrp_llc_map);
+		sizeof(((struct cgroup_llc_id *)0)->llc_id));
 
-	/* PERCPU_ARRAY tree_levels_map: keyed by u32, value = struct tree_levels.
-	 * Allocate per-CPU storage; MAX_SIM_CPUS is the simulator ceiling. */
-	cbw_tree_levels_test_map = scx_alloc_percpu_test_map(MAX_SIM_CPUS);
-	INIT_SCX_PERCPU_TEST_MAP(cbw_tree_levels_test_map, tree_levels_map);
-	scx_register_percpu_test_map(cbw_tree_levels_test_map,
-				     &tree_levels_map);
-
-	/*
-	 * SEED the PERCPU_ARRAY entry. Phase 2 Stage E (tg
-	 * `investigate-scxsim-engine-throttles-before-scheduler-cgroup-bw`):
-	 * scxsim's scx_test_map storage for PERCPU_ARRAY does not
-	 * pre-allocate slots the way the kernel does -- nr starts at 0
-	 * and only grows via map_update_elem. The cgroup_bw library
-	 * never updates tree_levels_map (it's read-only after init from
-	 * its perspective), so without seeding bpf_map_lookup_elem
-	 * returns NULL for key=0, get_clean_tree_levels() returns NULL,
-	 * cbw_update_runtime_total_sloppy() returns -ENOMEM, and the
-	 * accounting -> throttle chain is severed. The library's per-LLC
-	 * runtime_total accumulator (~tens of µs at probe time) is never
-	 * promoted to cgx->runtime_total_sloppy, so is_throttled never
-	 * flips and per-SHA discrimination is impossible.
-	 *
-	 * Seed entry [key=0, value=zeroed struct tree_levels] for every
-	 * CPU. tree_levels_map has max_entries=1 in the library
-	 * declaration; we only need key=0.
-	 *
-	 * This is the root cause identified in tg note "MAJOR FINDING
-	 * 2026-05-13" -- scxsim's percpu-array-storage seeding gap, not
-	 * a key-padding issue.
-	 */
-	{
-		struct tree_levels zero_tl;
-		const u32 zero_key = 0;
-		int cpu;
-
-		__builtin_memset(&zero_tl, 0, sizeof(zero_tl));
-		for (cpu = 0; cpu < (int)MAX_SIM_CPUS; cpu++) {
-			scx_test_map_update_percpu_elem(&tree_levels_map,
-							&zero_key, &zero_tl,
-							cpu, /*BPF_ANY=*/0);
-		}
-	}
+	/* PERCPU_ARRAY tree_levels_map (u32 key, max_entries=1): register +
+	 * pre-seed key 0 on every CPU. The cgroup_bw library reads tree_levels_map
+	 * key 0 but never updates it, so without the seed bpf_map_lookup_elem returns
+	 * NULL -> get_clean_tree_levels() NULL -> cbw_update_runtime_total_sloppy()
+	 * -ENOMEM -> the accounting->throttle chain is severed (the percpu-array
+	 * seeding gap, not a key-padding issue). SCX_REGISTER_PERCPU's pre_seed seeds
+	 * [0..max_entries=1) per CPU, reproducing the former explicit key-0 per-CPU
+	 * seed. Not host-probed, so the hidden descriptor is fine. */
+	SCX_REGISTER_PERCPU(tree_levels_map, true);
 }
 
 /*
@@ -1704,7 +1663,7 @@ struct scxsim_cbw_probe_result {
 	long long              consumed_count_pre;   /* probe counter */
 	void                  *cgrp_ptr;             /* cgrp pointer the probe got */
 	int                    cbw_cgrp_map_nr;      /* number of entries in cbw_cgrp_map */
-	void                  *cbw_cgrp_map_first_key;/* keys[0] (= first stored cgrp ptr) */
+	void                  *cbw_cgrp_map_first_key;/* keys[0] (= first stored u64 cgrp_id) */
 	int                    cbw_cgrp_llc_map_nr;
 };
 
@@ -1771,9 +1730,10 @@ int scxsim_probe_cbw_state(unsigned long long cgrp_id, int llc_id,
 
 	out->cbw_cgrp_map_nr = cbw_cgrp_test_map.nr;
 	if (cbw_cgrp_test_map.nr > 0 && cbw_cgrp_test_map.keys) {
-		/* Each key is sizeof(struct cgroup *) = 8 bytes -- the
-		 * cgrp pointer that bpf_cgrp_storage_get's caller passed
-		 * (via &cgrp dereference). */
+		/* Each key is a u64 cgrp_id = 8 bytes -- cbw_cgrp_map is a
+		 * HASH keyed by cgroup id (bpf_map_lookup_elem(&cbw_cgrp_map,
+		 * &cgrp_id)), not cgroup-pointer storage; the 8-byte read is
+		 * the first stored cgrp_id. */
 		out->cbw_cgrp_map_first_key = *(void **)cbw_cgrp_test_map.keys;
 	}
 	out->cbw_cgrp_llc_map_nr = cbw_cgrp_llc_test_map.nr;

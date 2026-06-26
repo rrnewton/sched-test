@@ -164,6 +164,33 @@ int scx_test_map_update_percpu_elem(void *map, const void *key, const void *valu
 		} \
 	} while (0)
 
+/*
+ * INTO variants: register into a CALLER-NAMED descriptor instead of a hidden
+ * block-scoped static. Use when host introspection must read the descriptor by
+ * name after registration (lavd's cgroup_bw probe reads .nr/.keys). The caller
+ * owns `desc` (a file-scope static), so there is no internal static and no name
+ * clash. HASH/ARRAY only -- no pre_seed (the only callers are create-on-demand
+ * HASH maps; seed explicitly if ever needed).
+ */
+#define SCX_REGISTER_ARRAY_INTO(desc, bpfmap) \
+	do { \
+		INIT_SCX_TEST_MAP(&(desc), bpfmap); \
+		scx_test_map_register(&(desc), &bpfmap); \
+	} while (0)
+
+/*
+ * Like SCX_REGISTER_ARRAY_INTO but overrides key_size BEFORE register
+ * (load-bearing when the memcmp key width differs from sizeof(declared key) --
+ * e.g. clang-18 struct padding). Tweaking before register is order-exact and
+ * does not rely on the registry's lazy field read.
+ */
+#define SCX_REGISTER_ARRAY_INTO_KEYSZ(desc, bpfmap, key_size_val) \
+	do { \
+		INIT_SCX_TEST_MAP(&(desc), bpfmap); \
+		(desc).key_size = (key_size_val); \
+		scx_test_map_register(&(desc), &bpfmap); \
+	} while (0)
+
 #define SCX_REGISTER_PERCPU(bpfmap, pre_seed) \
 	do { \
 		struct scx_percpu_test_map *_scx_reg_pc = \
