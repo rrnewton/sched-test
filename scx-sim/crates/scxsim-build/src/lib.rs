@@ -1,13 +1,14 @@
 //! Build-time scheduler `.so` compilation plus the declarative per-scheduler
 //! manifest, factored into a standalone crate so BOTH `scx_simulator`'s build
 //! script and an embedder (e.g. cargo-ktstr) can drive the same build path and
-//! share the same [`SchedulerManifest`] type. Follows the declarative model of
-//! scx's own `scx_cargo::BpfBuilder` (each scheduler declares WHAT it needs as
-//! data; no codegen).
+//! share the same [`SchedulerDefinition`] input type. Follows the declarative
+//! model of scx's own `scx_cargo::BpfBuilder` (each scheduler declares WHAT it
+//! needs as data; no codegen).
 //!
 //! `scx_simulator` depends on this crate both as a normal dependency (the
-//! runtime reads `SCHEDULERS[..].runtime.rodata`) and as a build-dependency
-//! (its build script calls [`build_schedulers`] and iterates [`EXPORTED_SYMS`]).
+//! runtime applies a [`SchedulerDefinition`]'s rodata via
+//! `DynamicScheduler::load_with_definition`) and as a build-dependency (its build
+//! script calls [`build_schedulers`] and iterates [`EXPORTED_SYMS`]).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -182,12 +183,12 @@ pub const SCHEDULERS: &[SchedulerManifest] = &[
     },
 ];
 
-/// Owned, serializable per-scheduler descriptor -- the public INPUT type the
-/// build path consumes (`build_schedulers` takes `&[SchedulerDefinition]`).
+/// Owned, serializable per-scheduler descriptor -- the public INPUT type both
+/// the build (`build_schedulers`) and the runtime
+/// (`DynamicScheduler::load_with_definition`) consume.
 /// `standalone_definitions()` supplies these from the bundled `SCHEDULERS` const
 /// for the standalone build; an embedder (cargo-ktstr) constructs them from cargo
-/// metadata. The runtime (ffi.rs `apply_manifest_rodata`) still reads the
-/// `SCHEDULERS` const directly (rewired in a later step).
+/// metadata.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SchedulerDefinition {
     /// Scheduler name; matches the schedulers/<name>/ dir and the .so/ops prefix.

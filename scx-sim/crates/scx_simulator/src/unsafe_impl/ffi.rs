@@ -994,15 +994,40 @@ impl DynamicScheduler {
         }
     }
 
-    /// Load a scheduler from a `.so` file.
+    /// Load a bundled scheduler `.so` by `prefix` (the standalone path).
     ///
     /// - `path`: path to the `.so` file
-    /// - `prefix`: symbol prefix (e.g., "simple" or "tickless")
+    /// - `prefix`: scheduler name / symbol prefix (e.g. "simple", "tickless")
     /// - `nr_cpus`: passed to `{prefix}_setup()` if the symbol exists
+    ///
+    /// Resolves the bundled definition for `prefix` and delegates to
+    /// [`load_with_definition`](Self::load_with_definition). An unknown prefix
+    /// panics rather than silently skipping config (No Silent Failures); the
+    /// build's manifest<->dir cross-check guarantees every bundled
+    /// `libscx_<name>.so` has a matching definition, so the standalone path
+    /// never hits this panic.
+    pub fn load(path: &str, prefix: &str, nr_cpus: u32) -> Self {
+        let def = scxsim_build::standalone_definitions()
+            .into_iter()
+            .find(|d| d.name == prefix)
+            .unwrap_or_else(|| panic!("no scheduler definition for prefix `{prefix}`"));
+        Self::load_with_definition(path, &def, nr_cpus)
+    }
+
+    /// Load a scheduler `.so` and apply a supplied `SchedulerDefinition` -- the
+    /// generic core both the standalone `load` and an embedder drive. The
+    /// definition carries the ops prefix (`def.name`) and the rodata config and
+    /// has no dependency on the bundled `SCHEDULERS` const, so an embedder can
+    /// load a scheduler the bundled set never knew about.
     ///
     /// Mandatory ops (`init`, `select_cpu`, etc.) panic if missing.
     /// Optional ops (`runnable`, `init_task`) become `None` if missing.
-    pub fn load(path: &str, prefix: &str, nr_cpus: u32) -> Self {
+    pub fn load_with_definition(
+        path: &str,
+        def: &scxsim_build::SchedulerDefinition,
+        nr_cpus: u32,
+    ) -> Self {
+        let prefix = def.name.as_str();
         // SAFETY: The .so is built by our build system from known-safe C source.
         // Use RTLD_NOW for eager binding so all PLT entries are resolved at
         // load time. Without this, lazy PLT resolution during simulation adds
@@ -1036,26 +1061,22 @@ impl DynamicScheduler {
             prefix: prefix.to_owned(),
             so_path: path.to_owned(),
         };
-        // Apply the scheduler's manifest rodata (config globals) before run --
-        // the kernel-faithful analog of patching .rodata before BPF_PROG_LOAD,
-        // and before any ops body runs. Replaces per-scheduler C setup rodata
-        // writes as they migrate to the manifest.
-        sched.apply_manifest_rodata(nr_cpus);
+        // Apply the definition's rodata (config globals) before run -- the
+        // kernel-faithful analog of patching .rodata before BPF_PROG_LOAD, and
+        // before any ops body runs.
+        sched.apply_rodata(&def.rodata, nr_cpus);
         sched
     }
 
-    /// Write the config globals declared in this scheduler's manifest entry
-    /// (`runtime.rodata`) into the loaded `.so`, before any ops body runs.
+    /// Write the supplied config globals (`rodata`) into the loaded `.so`, before
+    /// any ops body runs.
     ///
     /// `ConfigValue::NumCpus` resolves to `nr_cpus`. Panics if a declared global
-    /// is absent from the `.so` -- a manifest/scheduler mismatch is a bug, never
+    /// is absent from the `.so` -- a definition/scheduler mismatch is a bug, never
     /// a silent skip.
-    fn apply_manifest_rodata(&self, nr_cpus: u32) {
-        use scxsim_build::{ConfigValue, SCHEDULERS};
-        let Some(m) = SCHEDULERS.iter().find(|m| m.name == self.prefix) else {
-            return;
-        };
-        for (name, value) in m.runtime.rodata {
+    fn apply_rodata(&self, rodata: &[(String, scxsim_build::ConfigValue)], nr_cpus: u32) {
+        use scxsim_build::ConfigValue;
+        for (name, value) in rodata {
             let written = match value {
                 ConfigValue::Bool(b) => self.write_bool_global(name, *b),
                 ConfigValue::U8(v) => self.write_u8_global(name, *v),
@@ -1064,10 +1085,7 @@ impl DynamicScheduler {
                 ConfigValue::NumCpus => self.write_u32_global(name, nr_cpus),
             };
             written.unwrap_or_else(|| {
-                panic!(
-                    "manifest rodata global `{name}` not found in {}.so",
-                    self.prefix
-                )
+                panic!("rodata global `{name}` not found in {}.so", self.prefix)
             });
         }
     }
@@ -1731,6 +1749,16 @@ mod tests {
     type IterNewFn = unsafe extern "C" fn(*mut c_void, u64, u64) -> i32;
     type IterNextFn = unsafe extern "C" fn(*mut c_void) -> *mut c_void;
     type IterDestroyFn = unsafe extern "C" fn(*mut c_void);
+
+    /// No Silent Failures: loading a scheduler whose prefix has no bundled
+    /// definition must PANIC, not silently skip its rodata config (the prior
+    /// behavior). The definition is resolved before the `.so` is opened, so the
+    /// bogus path is never touched.
+    #[test]
+    #[should_panic(expected = "no scheduler definition for prefix")]
+    fn load_unknown_prefix_panics() {
+        let _ = DynamicScheduler::load("/nonexistent/libscx_bogus.so", "bogus_scheduler_xyz", 1);
+    }
 
     #[test]
     fn mitosis_exports_dsq_iterator_symbols() {
