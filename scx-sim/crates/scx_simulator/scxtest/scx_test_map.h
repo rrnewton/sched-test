@@ -123,6 +123,31 @@ int scx_test_map_update_percpu_elem(void *map, const void *key, const void *valu
 	scx_init_percpu_test_map(map, MAX_ENTRIES(bpfmap), \
 		sizeof(typeof(*bpfmap.key)), sizeof(typeof(*bpfmap.value)))
 
+/*
+ * One-line map registration: the INIT_SCX_TEST_MAP* + scx_test_map_register
+ * pair, with the scx_test_map descriptor as a block-scoped static (the registry
+ * stores its address, so it must outlive run). The map's element types must be
+ * visible (sizeof/typeof in the INIT macros), so these are used from the
+ * per-scheduler register function after the scheduler source is included. The
+ * macro KIND must match the map's BPF_MAP_TYPE_* declaration -- a wrong KIND
+ * picks the wrong INIT macro (wrong key/value sizing) silently, so verify the
+ * KIND against the .bpf.h decl. Seeded/percpu variants are added when a
+ * scheduler that needs them migrates.
+ */
+#define SCX_REGISTER_STORAGE(bpfmap) \
+	do { \
+		static struct scx_test_map _scx_reg_map; \
+		INIT_SCX_TEST_MAP_FROM_TASK_STORAGE(&_scx_reg_map, bpfmap); \
+		scx_test_map_register(&_scx_reg_map, &bpfmap); \
+	} while (0)
+
+#define SCX_REGISTER_ARRAY(bpfmap) \
+	do { \
+		static struct scx_test_map _scx_reg_map; \
+		INIT_SCX_TEST_MAP(&_scx_reg_map, bpfmap); \
+		scx_test_map_register(&_scx_reg_map, &bpfmap); \
+	} while (0)
+
 #define bpf_map_lookup_elem(map, key) scx_test_map_lookup_elem(map, key)
 #define bpf_map_lookup_percpu_elem(map, key, cpu) scx_test_map_lookup_percpu_elem(map, key, cpu)
 #define bpf_map_update_elem(map, key, value, flags) \

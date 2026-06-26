@@ -31,18 +31,12 @@ unsigned int CONFIG_HZ = 250;
  * used by bpf_map_lookup_elem / bpf_task_storage_get. This function
  * should be called before tickless_init().
  */
-static struct scx_test_map task_ctx_map;
-static struct scx_test_map cpu_ctx_map;
-
 void tickless_register_maps(void)
 {
 	scx_test_map_clear_all();
 
-	INIT_SCX_TEST_MAP_FROM_TASK_STORAGE(&task_ctx_map, task_ctx_stor);
-	scx_test_map_register(&task_ctx_map, &task_ctx_stor);
-
-	INIT_SCX_TEST_MAP(&cpu_ctx_map, cpu_ctx_stor);
-	scx_test_map_register(&cpu_ctx_map, &cpu_ctx_stor);
+	SCX_REGISTER_STORAGE(task_ctx_stor);
+	SCX_REGISTER_ARRAY(cpu_ctx_stor);
 }
 
 /*
