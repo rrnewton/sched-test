@@ -36,7 +36,7 @@ void tickless_register_maps(void)
 	scx_test_map_clear_all();
 
 	SCX_REGISTER_STORAGE(task_ctx_stor);
-	SCX_REGISTER_ARRAY(cpu_ctx_stor);
+	SCX_REGISTER_ARRAY(cpu_ctx_stor, false);
 }
 
 /*

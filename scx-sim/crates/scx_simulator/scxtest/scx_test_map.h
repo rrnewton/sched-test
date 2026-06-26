@@ -125,14 +125,19 @@ int scx_test_map_update_percpu_elem(void *map, const void *key, const void *valu
 
 /*
  * One-line map registration: the INIT_SCX_TEST_MAP* + scx_test_map_register
- * pair, with the scx_test_map descriptor as a block-scoped static (the registry
- * stores its address, so it must outlive run). The map's element types must be
- * visible (sizeof/typeof in the INIT macros), so these are used from the
- * per-scheduler register function after the scheduler source is included. The
- * macro KIND must match the map's BPF_MAP_TYPE_* declaration -- a wrong KIND
- * picks the wrong INIT macro (wrong key/value sizing) silently, so verify the
- * KIND against the .bpf.h decl. Seeded/percpu variants are added when a
- * scheduler that needs them migrates.
+ * pair (plus optional pre-seed), used from the per-scheduler register function
+ * after the scheduler source is included (the map's element types must be
+ * visible for the INIT macros' sizeof/typeof). The macro KIND must match the
+ * map's BPF_MAP_TYPE_* declaration -- a wrong KIND picks the wrong INIT macro
+ * (wrong key/value sizing) silently, so verify the KIND against the .bpf.h decl.
+ *
+ * ARRAY/STORAGE use a block-scoped static scx_test_map descriptor (the registry
+ * stores its address, so it must outlive run). PERCPU's descriptor is heap-
+ * allocated (scx_alloc_percpu_test_map), so its pointer can be a local.
+ *
+ * pre_seed (ARRAY/PERCPU): when true, every key gets a zeroed value of the map's
+ * value type -- ARRAY keys [0..max_entries); PERCPU keys [0..max_entries) on
+ * every CPU. STORAGE maps are create-on-demand, never pre-seeded.
  */
 #define SCX_REGISTER_STORAGE(bpfmap) \
 	do { \
@@ -141,11 +146,37 @@ int scx_test_map_update_percpu_elem(void *map, const void *key, const void *valu
 		scx_test_map_register(&_scx_reg_map, &bpfmap); \
 	} while (0)
 
-#define SCX_REGISTER_ARRAY(bpfmap) \
+#define SCX_REGISTER_ARRAY(bpfmap, pre_seed) \
 	do { \
 		static struct scx_test_map _scx_reg_map; \
 		INIT_SCX_TEST_MAP(&_scx_reg_map, bpfmap); \
 		scx_test_map_register(&_scx_reg_map, &bpfmap); \
+		if (pre_seed) { \
+			typeof(*bpfmap.value) _scx_reg_zero = {}; \
+			for (unsigned int _scx_reg_i = 0; \
+			     _scx_reg_i < _scx_reg_map.max_entries; _scx_reg_i++) \
+				bpf_map_update_elem(&bpfmap, &_scx_reg_i, \
+						    &_scx_reg_zero, 0); \
+		} \
+	} while (0)
+
+#define SCX_REGISTER_PERCPU(bpfmap, pre_seed) \
+	do { \
+		struct scx_percpu_test_map *_scx_reg_pc = \
+			scx_alloc_percpu_test_map(MAX_SIM_CPUS); \
+		INIT_SCX_PERCPU_TEST_MAP(_scx_reg_pc, bpfmap); \
+		scx_register_percpu_test_map(_scx_reg_pc, &bpfmap); \
+		if (pre_seed) { \
+			typeof(*bpfmap.value) _scx_reg_zero = {}; \
+			for (int _scx_reg_c = 0; \
+			     _scx_reg_c < (int)MAX_SIM_CPUS; _scx_reg_c++) \
+				for (unsigned int _scx_reg_k = 0; \
+				     _scx_reg_k < (unsigned int)MAX_ENTRIES(bpfmap); \
+				     _scx_reg_k++) \
+					scx_test_map_update_percpu_elem( \
+						&bpfmap, &_scx_reg_k, \
+						&_scx_reg_zero, _scx_reg_c, 0); \
+		} \
 	} while (0)
 
 #define bpf_map_lookup_elem(map, key) scx_test_map_lookup_elem(map, key)

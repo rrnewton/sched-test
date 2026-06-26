@@ -170,83 +170,23 @@ void bpf_iter_css_destroy(struct bpf_iter_css *it)
  */
 #define MAX_SIM_CPUS 128
 
-static struct scx_test_map debug_events_test_map;
-static struct scx_test_map cells_test_map;
-static struct scx_test_map cell_cpumasks_test_map;
-static struct scx_test_map update_timer_test_map;
-static struct scx_test_map task_ctxs_test_map;
-static struct scx_test_map cgrp_ctxs_test_map;
-static struct scx_percpu_test_map *cpu_ctxs_test_map;
-static struct scx_percpu_test_map *cgrp_init_percpu_cpumask_test_map;
-
 static void mitosis_register_maps(void)
 {
-	u32 i;
-	int cpu;
-
 	scx_test_map_clear_all();
 
 	/* ARRAY maps: register + pre-seed [0..max_entries) with zeroed values. */
-	{
-		struct debug_event zero = {};
-		INIT_SCX_TEST_MAP(&debug_events_test_map, debug_events);
-		scx_test_map_register(&debug_events_test_map, &debug_events);
-		for (i = 0; i < debug_events_test_map.max_entries; i++)
-			bpf_map_update_elem(&debug_events, &i, &zero, 0);
-	}
-	{
-		struct cell zero = {};
-		INIT_SCX_TEST_MAP(&cells_test_map, cells);
-		scx_test_map_register(&cells_test_map, &cells);
-		for (i = 0; i < cells_test_map.max_entries; i++)
-			bpf_map_update_elem(&cells, &i, &zero, 0);
-	}
-	{
-		struct cell_cpumask_wrapper zero = {};
-		INIT_SCX_TEST_MAP(&cell_cpumasks_test_map, cell_cpumasks);
-		scx_test_map_register(&cell_cpumasks_test_map, &cell_cpumasks);
-		for (i = 0; i < cell_cpumasks_test_map.max_entries; i++)
-			bpf_map_update_elem(&cell_cpumasks, &i, &zero, 0);
-	}
-	{
-		struct update_timer zero = {};
-		INIT_SCX_TEST_MAP(&update_timer_test_map, update_timer);
-		scx_test_map_register(&update_timer_test_map, &update_timer);
-		for (i = 0; i < update_timer_test_map.max_entries; i++)
-			bpf_map_update_elem(&update_timer, &i, &zero, 0);
-	}
+	SCX_REGISTER_ARRAY(debug_events, true);
+	SCX_REGISTER_ARRAY(cells, true);
+	SCX_REGISTER_ARRAY(cell_cpumasks, true);
+	SCX_REGISTER_ARRAY(update_timer, true);
 
 	/* PERCPU_ARRAY maps: per-CPU storage + pre-seed every key on every CPU. */
-	{
-		struct cpu_ctx zero = {};
-		const u32 key0 = 0;
-		cpu_ctxs_test_map = scx_alloc_percpu_test_map(MAX_SIM_CPUS);
-		INIT_SCX_PERCPU_TEST_MAP(cpu_ctxs_test_map, cpu_ctxs);
-		scx_register_percpu_test_map(cpu_ctxs_test_map, &cpu_ctxs);
-		for (cpu = 0; cpu < (int)MAX_SIM_CPUS; cpu++)
-			scx_test_map_update_percpu_elem(&cpu_ctxs, &key0, &zero,
-							cpu, 0);
-	}
-	{
-		struct cpumask_entry zero = {};
-		cgrp_init_percpu_cpumask_test_map =
-			scx_alloc_percpu_test_map(MAX_SIM_CPUS);
-		INIT_SCX_PERCPU_TEST_MAP(cgrp_init_percpu_cpumask_test_map,
-					 cgrp_init_percpu_cpumask);
-		scx_register_percpu_test_map(cgrp_init_percpu_cpumask_test_map,
-					     &cgrp_init_percpu_cpumask);
-		for (cpu = 0; cpu < (int)MAX_SIM_CPUS; cpu++)
-			for (i = 0; i < (u32)MAX_CPUMASK_ENTRIES; i++)
-				scx_test_map_update_percpu_elem(
-					&cgrp_init_percpu_cpumask, &i, &zero,
-					cpu, 0);
-	}
+	SCX_REGISTER_PERCPU(cpu_ctxs, true);
+	SCX_REGISTER_PERCPU(cgrp_init_percpu_cpumask, true);
 
 	/* TASK_STORAGE / CGRP_STORAGE: register; create-on-demand, identity-keyed. */
-	INIT_SCX_TEST_MAP_FROM_TASK_STORAGE(&task_ctxs_test_map, task_ctxs);
-	scx_test_map_register(&task_ctxs_test_map, &task_ctxs);
-	INIT_SCX_TEST_MAP_FROM_TASK_STORAGE(&cgrp_ctxs_test_map, cgrp_ctxs);
-	scx_test_map_register(&cgrp_ctxs_test_map, &cgrp_ctxs);
+	SCX_REGISTER_STORAGE(task_ctxs);
+	SCX_REGISTER_STORAGE(cgrp_ctxs);
 }
 
 /* ---------------------------------------------------------------------------
