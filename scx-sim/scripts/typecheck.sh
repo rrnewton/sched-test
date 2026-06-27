@@ -1,6 +1,6 @@
 #!/bin/bash
-# typecheck.sh - Run mypy --strict on all Python files in the project.
-# Can be run standalone or is called by validate.sh.
+# typecheck.sh - Run mypy --strict on all Python files via uvx (ephemeral,
+# uv-cached: no project .venv, no pip install). Run standalone or via validate.sh.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -12,42 +12,15 @@ if [ -z "$PYTHON_FILES" ]; then
     exit 0
 fi
 
-# Find mypy and its stub dependencies — install if missing
-MYPY_DEPS=(mypy pandas-stubs)
-MYPY_CMD=""
-PIP_CMD=""
-if command -v mypy &>/dev/null; then
-    MYPY_CMD="mypy"
-elif [ -x .venv/bin/mypy ]; then
-    MYPY_CMD=".venv/bin/mypy"
-fi
-if [ -d .venv ]; then
-    PIP_CMD=".venv/bin/pip"
-elif command -v pip &>/dev/null; then
-    PIP_CMD="pip"
+if ! command -v uvx &>/dev/null; then
+    echo "ERROR: uvx (uv) not found — required to run the mypy typecheck." >&2
+    echo "  Install uv: curl -LsSf https://astral.sh/uv/install.sh | sh" >&2
+    exit 1
 fi
 
-HAVE_PANDAS_STUBS=false
-if [ -n "$PIP_CMD" ] && $PIP_CMD show pandas-stubs &>/dev/null; then
-    HAVE_PANDAS_STUBS=true
-fi
-
-if [ -z "$MYPY_CMD" ] || [ "$HAVE_PANDAS_STUBS" = false ]; then
-    echo "mypy or required type stubs not found — installing..."
-    if [ -n "$PIP_CMD" ]; then
-        $PIP_CMD install "${MYPY_DEPS[@]}" >&2
-        if [ -x .venv/bin/mypy ]; then
-            MYPY_CMD=".venv/bin/mypy"
-        else
-            MYPY_CMD="mypy"
-        fi
-    else
-        echo "ERROR: mypy/type stubs not found and no pip available to install them." >&2
-        echo "  Install manually: pip install ${MYPY_DEPS[*]} (or .venv/bin/pip install ${MYPY_DEPS[*]})" >&2
-        exit 1
-    fi
-fi
-
-echo "=== Running Python type checks (mypy --strict) ==="
-$MYPY_CMD --strict $PYTHON_FILES
+echo "=== Running Python type checks (uvx mypy --strict) ==="
+# uvx runs mypy in an ephemeral, uv-cached environment — no project .venv and no
+# pip install. --with pandas-stubs: benchmark.py imports pandas (needs stubs under
+# --strict). $PYTHON_FILES is intentionally unquoted (word-split into one arg per file).
+uvx --with pandas-stubs mypy --strict $PYTHON_FILES
 echo "  mypy --strict passed."
