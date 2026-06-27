@@ -53,23 +53,55 @@ echo "  No unsafe code found in $SAFE_DIR — OK"
 
 echo ""
 echo "=== Running cargo clippy ==="
-cargo clippy --all -- -D warnings
+# --all-targets compiles example + test + bench targets too (matches the
+# pre-commit hook). Without it, example targets like
+# crates/scx_perf/examples/measure_skid.rs are never built by validate.sh and
+# could bit-rot — this is the "examples build guard".
+cargo clippy --all-targets --workspace -- -D warnings
 
 echo ""
-echo "=== Running cargo nextest ==="
-# --no-fail-fast: surface ALL failing tests in one CI run instead of
-# stopping at the first failure. Critical for diagnosing CI-vs-local
-# divergences (mb sim-624b9e) where one root cause manifests across
-# multiple tests; without --no-fail-fast each iteration only reveals
-# one test at a time and the cycle becomes whack-a-mole.
-cargo nextest run --workspace --no-fail-fast
+echo "=== Running cargo llvm-cov nextest (instrumented; Rust library coverage) ==="
+# Instrumented run REPLACES the plain `cargo nextest run --workspace`: it runs
+# the identical nextest suite (same pass/fail) under llvm source-based coverage,
+# so coverage is not additive cost. --no-report defers report generation; the
+# per-crate ratchet below reuses this run's profile data (target/llvm-cov-target).
+# --no-fail-fast surfaces ALL failing tests in one run. This
+# instruments RUST only (SCX_SIM_COVERAGE unset) — scheduler .so C coverage stays
+# coverage.sh's separate concern.
+#
+# embed_harness (a workspace member) is built and its link-contract test runs
+# here: a broken EXPORTED_SYMS re-emission -> RTLD_NOW load failure -> test
+# failure -> this aborts under set -e. That IS the embedder link-contract guard
+# (no separate embed step needed).
+command -v cargo-llvm-cov >/dev/null 2>&1 || {
+    echo "ERROR: cargo-llvm-cov is required for the Rust coverage gate." >&2
+    echo "       Install: cargo install cargo-llvm-cov && rustup component add llvm-tools-preview" >&2
+    exit 1
+}
+cargo llvm-cov nextest --workspace --no-fail-fast --no-report
 
 echo ""
 echo "=== Running doc-tests ==="
+# nextest cannot run doctests, so they stay a separate run (the one sanctioned
+# `cargo test` use). Doctest-covered lines are not counted by the ratchet below.
 cargo test --workspace --doc
 
+echo ""
+echo "=== Rust library coverage ratchet (self-test + gate) ==="
+# Verify the ratchet's own logic, then gate. The gate reuses the profile data
+# from the instrumented `cargo llvm-cov nextest` run above and hard-fails if any
+# library crate regresses below its committed baseline
+# (data/rust_coverage_baseline.csv, raise-only via
+# `python3 scripts/coverage_ratchet.py --update-baseline`).
+python3 scripts/test_coverage_ratchet.py
+python3 scripts/coverage_ratchet.py
+
 # --- Build e9-instrumented schedulers if e9patch is available ---
-# The cargo commands above have already built the base .so files.
+# The cargo commands above have already built the base .so files. NOTE: the
+# instrumented `cargo llvm-cov nextest` builds into target/llvm-cov-target/, not
+# target/debug/ — the target/debug build the e9 discovery below relies on is
+# populated by the normal-target-dir steps (clippy --all-targets and the doctest
+# run). If those are reordered/removed, this step degrades to a record_skip.
 # If e9tool is installed, build _e9.so variants so the stress.py smoke
 # test exercises e9patch mode automatically.
 E9TOOL="${E9TOOL:-$(ls third_party/e9patch/e9tool 2>/dev/null || which e9tool 2>/dev/null || true)}"
