@@ -14,8 +14,8 @@
 
 use std::collections::HashMap;
 
-use scx_simulator::probes::{LavdMonitor, LavdProbes};
 use scx_simulator::*;
+use scx_simulator::{LavdMonitor, LavdProbes};
 
 #[macro_use]
 mod common;

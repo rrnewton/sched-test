@@ -1,7 +1,7 @@
 //! Characterization tests for the path-driven scheduler loader.
 //!
 //! These pin the contract that the path-agnostic loader API
-//! (`ffi::discover_schedulers` + `DynamicScheduler::load`) behaves
+//! (`discover_schedulers` + `DynamicScheduler::load`) behaves
 //! identically to the compile-time `env!(SCHEDULER_SO_DIR)`-baked named
 //! constructor. A later change migrates the named constructors off `env!` to runtime
 //! path resolution (`simple()` is expected to delegate to `load()` with a
@@ -46,7 +46,7 @@ fn fixed_scenario() -> Scenario {
         .build()
 }
 
-fn names(found: &[ffi::SchedulerInfo]) -> Vec<String> {
+fn names(found: &[SchedulerInfo]) -> Vec<String> {
     found.iter().map(|s| s.name.clone()).collect()
 }
 
@@ -56,7 +56,7 @@ fn names(found: &[ffi::SchedulerInfo]) -> Vec<String> {
 #[test]
 fn test_discover_schedulers_finds_simple() {
     let _lock = common::setup_test();
-    let found = ffi::discover_schedulers(Path::new(SO_DIR));
+    let found = discover_schedulers(Path::new(SO_DIR));
     assert!(
         !found.is_empty(),
         "discover_schedulers found no libscx_*.so in {SO_DIR}"

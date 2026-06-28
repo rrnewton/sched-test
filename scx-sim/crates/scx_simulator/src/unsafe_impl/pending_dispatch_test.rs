@@ -1,8 +1,20 @@
+//! In-crate relocation of the former `tests/pending_dispatch.rs`.
+//!
+//! This is an end-to-end engine test: a custom [`Scheduler`](crate::Scheduler)
+//! whose `dispatch` callback calls the kfunc `scx_bpf_dsq_insert` twice, driven
+//! through `Simulator::run`, asserting both tasks schedule. The kfuncs are the
+//! sim's in-crate default implementations (crate-internal, not public API), so
+//! the test lives in-crate to reach `crate::kfuncs::scx_bpf_dsq_insert`. It is
+//! integration-shaped and would move back to `tests/` once an ergonomic
+//! test-time kfunc-override surface exists.
+
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::ffi::c_void;
 
-use scx_simulator::*;
+use crate::{
+    DsqId, Phase, Pid, RepeatMode, Scenario, Scheduler, Simulator, TaskBehavior, TaskDef, TraceKind,
+};
 
 #[derive(Default)]
 struct MultiInsertDispatchScheduler {
@@ -30,7 +42,7 @@ impl Scheduler for MultiInsertDispatchScheduler {
         let mut queued = self.queued.borrow_mut();
         for _ in 0..2 {
             let p = queued.pop_front().unwrap();
-            scx_simulator::kfuncs::scx_bpf_dsq_insert(p, DsqId::LOCAL.0, 1_000_000, 0);
+            crate::kfuncs::scx_bpf_dsq_insert(p, DsqId::LOCAL.0, 1_000_000, 0);
         }
     }
 

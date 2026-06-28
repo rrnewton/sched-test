@@ -15,6 +15,11 @@ use std::path::Path;
 // ---------------------------------------------------------------------------
 // task_struct accessors (implemented in csrc/sim_task.c)
 // ---------------------------------------------------------------------------
+// These `extern "C"` decls bind C symbols (several are in the EXPORTED_SYMS
+// dlopen kfunc-export contract); rustc sees no Rust caller for some, so dead_code
+// is allowed at the BLOCK level only -- the lint stays live over the module's
+// Rust public API (the bulk of this file).
+#[allow(dead_code)]
 extern "C" {
     pub fn sim_task_alloc() -> *mut c_void;
     pub fn sim_task_free(p: *mut c_void);
@@ -186,6 +191,8 @@ pub fn test_and_clear_cpu_idle(cpu: i32) -> bool {
 ///
 /// Returns a raw pointer that must eventually be freed with
 /// [`free_task_raw`].
+// Test-only helper (wraps sim_task_alloc + PF_IDLE); no non-test caller.
+#[allow(dead_code)]
 pub fn alloc_idle_task() -> *mut c_void {
     // SAFETY: sim_task_alloc returns a heap-allocated, zeroed task_struct.
     // sim_task_set_flags sets a u32 field on the struct.
@@ -201,6 +208,8 @@ pub fn alloc_idle_task() -> *mut c_void {
 ///
 /// # Safety
 /// `p` must have been obtained from `sim_task_alloc` and not yet freed.
+// Test-only helper (the symmetric free for alloc_idle_task); no non-test caller.
+#[allow(dead_code)]
 pub unsafe fn free_task_raw(p: *mut c_void) {
     sim_task_free(p);
 }

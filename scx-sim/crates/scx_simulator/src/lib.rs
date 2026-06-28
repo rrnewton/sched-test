@@ -54,16 +54,14 @@ pub(crate) mod safe;
 // re-exports / `prelude`, not `scx_simulator::unsafe_impl::*`.
 pub(crate) mod unsafe_impl;
 
-// Re-export the safe modules at the crate root. With `safe` now `pub(crate)`,
-// these aliases + the curated items below + the `prelude` ARE the public surface.
-// Aliases with no external consumer are `pub(crate)` (internal-only); a few stay
-// `pub` (det_hashmap/rtapp/scenario/structops_jsonl/task/trace/workloads) because
-// an external test, the bin, or a doctest still reaches them by module path,
-// pending migration onto a curated re-export.
+// Re-export the safe modules at the crate root so internal `crate::types`,
+// `crate::dsq`, etc. paths resolve. All are `pub(crate)` -- the public surface is
+// the curated item re-exports below + the `prelude`, never these module paths.
+// Exception: `workloads` stays `pub` as a public scenario-preset namespace
+// (`scx_simulator::workloads::cpu_bound`, ...), not internal plumbing.
 pub(crate) use safe::atomic_types;
 pub(crate) use safe::cgroup;
 pub(crate) use safe::cpu;
-pub use safe::det_hashmap;
 pub(crate) use safe::dsq;
 pub(crate) use safe::engine;
 pub(crate) use safe::fmt;
@@ -71,35 +69,37 @@ pub(crate) use safe::monitor;
 pub(crate) use safe::perf;
 pub(crate) use safe::perfetto;
 pub(crate) use safe::perfetto_pb;
-pub use safe::rtapp;
-pub use safe::scenario;
+pub(crate) use safe::scenario;
 pub(crate) use safe::stats;
-pub use safe::structops_jsonl;
-pub use safe::task;
-pub use safe::trace;
+pub(crate) use safe::task;
+pub(crate) use safe::trace;
 pub(crate) use safe::types;
 pub use safe::workloads;
 
 // Re-export the unsafe_impl sub-modules at the crate root so internal
-// `crate::ffi`, `crate::kfuncs`, etc. paths resolve. Most are `pub(crate)` --
-// the public surface is the curated re-exports below + the `prelude`. The few
-// left `pub` (backend/ffi/kfuncs/preempt/probes) still have external
-// module-path consumers pending migration / a surface decision.
-pub use unsafe_impl::backend;
+// `crate::ffi`, `crate::kfuncs`, etc. paths resolve. All are `pub(crate)` -- the
+// public surface is the curated re-exports below + the `prelude`. `probes` is
+// cfg-gated (standalone-only debug-inspection surface).
+pub(crate) use unsafe_impl::backend;
 pub(crate) use unsafe_impl::cgroup_bw_replenish;
 pub(crate) use unsafe_impl::cgroup_ffi;
 pub(crate) use unsafe_impl::cgroup_wrapper;
 pub(crate) use unsafe_impl::engine_ring;
-pub use unsafe_impl::ffi;
+pub(crate) use unsafe_impl::ffi;
 pub(crate) use unsafe_impl::interleave;
-pub use unsafe_impl::kfuncs;
-pub use unsafe_impl::preempt;
-pub use unsafe_impl::probes;
+pub(crate) use unsafe_impl::kfuncs;
+pub(crate) use unsafe_impl::preempt;
+#[cfg(feature = "standalone")]
+pub(crate) use unsafe_impl::probes;
 pub(crate) use unsafe_impl::scheduler_wrapper;
 pub(crate) use unsafe_impl::sim_task;
 pub(crate) use unsafe_impl::task_wrapper;
 
 // Re-export the main public types for convenience.
+// `e9patch` is the standalone CLI's e9 instrumentation namespace (the scxsim bin
+// reaches derive_e9rip_path / collect_trace_rips / create_e9rip_so /
+// mmap_rip_shared through it).
+pub use backend::e9patch;
 pub use cgroup::{CgroupId, CgroupInfo, CgroupRegistry, DEFAULT_MAX_CGROUPS};
 pub use engine::{ExitKind, SimulationResult, Simulator};
 pub use ffi::{
@@ -112,11 +112,13 @@ pub use preempt::trace::TraceMetadata;
 pub use preempt::{
     compare_checkpoints, compute_so_hash, compute_so_hash_from_path, drain_determinism_checkpoints,
     drain_preemption_records, enable_determinism_mode, enable_preemption_collection, fnv1a_combine,
-    fnv1a_hash_bytes, fnv1a_hash_u64, is_determinism_mode_enabled, record_checkpoint,
-    reset_preemption_sequence, scheduler_so_base, scheduler_so_path, CheckpointDivergence,
-    CheckpointEvent, DeterminismCheckpoint, DivergenceType, PreemptionRecord, StructopInfo,
-    INSN_BYTES_LEN,
+    fnv1a_hash_bytes, fnv1a_hash_u64, is_determinism_mode_enabled, mmap_shared_rbc,
+    record_checkpoint, reset_preemption_sequence, scheduler_so_base, scheduler_so_path,
+    CheckpointDivergence, CheckpointEvent, DeterminismCheckpoint, DivergenceType, PreemptionRecord,
+    StructopInfo, INSN_BYTES_LEN,
 };
+#[cfg(feature = "standalone")]
+pub use probes::{LavdMonitor, LavdProbes, LavdSnapshot};
 pub use safe::bpf_trace::{
     BpfEventKind, BpfTrace, BpfTraceEvent, TraceComparisonResult, TraceDifferences,
 };
@@ -126,13 +128,15 @@ pub use safe::perf::PmuEvent;
 pub use safe::perf::RbcCounter;
 pub use safe::rtapp::load_rtapp;
 pub use safe::scenario::{
-    CgroupBandwidth, CgroupCpusetChangeEvent, CgroupCreateEvent, CgroupDef, CgroupDestroyEvent,
-    CgroupMigrateEvent, CpuPreemptEvent, HotplugEvent, IrqEvent, IrqType, NativeConcurrentConfig,
-    NoiseConfig, OverheadConfig, PreemptMode, PreemptiveConfig, Scenario,
+    parse_duration_ns, parse_seed, CgroupBandwidth, CgroupCpusetChangeEvent, CgroupCreateEvent,
+    CgroupDef, CgroupDestroyEvent, CgroupMigrateEvent, CpuPreemptEvent, HotplugEvent, IrqEvent,
+    IrqType, NativeConcurrentConfig, NoiseConfig, OverheadConfig, PreemptMode, PreemptiveConfig,
+    Scenario,
 };
 pub use safe::stats::{
     percentile, CpuStats, DistributionStats, TaskStats, TraceComparison, TraceStats,
 };
+pub use safe::structops_jsonl::write_jsonl;
 pub use safe::trace::{
     DsqLengthSample, DsqSampleTrigger, Trace, TraceEvent, TraceKind, TraceSummary,
 };

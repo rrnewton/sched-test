@@ -8,7 +8,7 @@
 //! unit test only checks well-formedness of hand-crafted events; this pins
 //! the public surface + real-engine output the embed will consume.)
 
-use scx_simulator::structops_jsonl::write_jsonl;
+use scx_simulator::write_jsonl;
 use scx_simulator::*;
 use serde_json::Value;
 

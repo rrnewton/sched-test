@@ -167,6 +167,8 @@ impl OpsContext {
 pub struct PendingDispatch {
     pub pid: Pid,
     pub dsq_id: DsqId,
+    #[allow(dead_code)]
+    // dormant: parallel-dispatch / replay / preemptive path, inert in the sequential engine
     pub enq_flags: u64,
     pub vtime: Option<Vtime>,
 }
@@ -488,6 +490,8 @@ pub struct SimulatorState {
     /// Native concurrency backend configuration (None = disabled).
     /// When set, workers run truly concurrently with real locks and
     /// window-based clock throttling instead of token-ring serialization.
+    #[allow(dead_code)]
+    // dormant: parallel-dispatch / replay / preemptive path, inert in the sequential engine
     pub native_concurrent: Option<NativeConcurrentConfig>,
     /// SHARED-MUTABLE: Tasks that the engine eagerly removed from BPF
     /// scheduler queues (via `ops.dequeue` + `ops.quiescent`) when their
@@ -677,6 +681,7 @@ impl SimulatorState {
             .is_some_and(|c| c.is_idle() && c.local_dsq.is_empty())
     }
 
+    #[allow(dead_code)] // dormant: parallel-dispatch / replay / preemptive path, inert in the sequential engine
     pub fn find_any_idle_cpu(&self) -> Option<CpuId> {
         self.cpus
             .iter()
@@ -1178,6 +1183,7 @@ pub(crate) fn get_engine_sim_arc() -> Option<SimArc> {
 /// # Safety
 /// The caller must ensure `state` remains valid and unaliased for the
 /// duration between `enter_sim` and `exit_sim`.
+#[allow(dead_code)] // dormant: parallel-dispatch / replay / preemptive path, inert in the sequential engine
 pub unsafe fn enter_sim(state: &mut SimulatorState, cpu: CpuId) {
     state.current_cpu = cpu;
     set_sim_clock(state.cpus[cpu.0 as usize].local_clock, Some(cpu));
@@ -1209,6 +1215,7 @@ pub unsafe fn enter_sim(state: &mut SimulatorState, cpu: CpuId) {
 /// **Not safe for concurrent paths** where another worker may already
 /// hold the token after `finish()`. Use [`exit_sim_no_clear_ops`] in
 /// those cases and clear `ops_context` manually before `finish()`.
+#[allow(dead_code)] // dormant: parallel-dispatch / replay / preemptive path, inert in the sequential engine
 pub fn exit_sim() {
     // Restore per-callback context from CALLBACK_CTX back to SimulatorState.
     // The yield functions may have saved/restored CALLBACK_CTX across token
@@ -1248,6 +1255,7 @@ pub fn exit_sim() {
 /// `None` from the old worker would clobber the new worker's value,
 /// causing the PMU signal handler to record `ops=none` instead of the
 /// true callback context.
+#[allow(dead_code)] // dormant: parallel-dispatch / replay / preemptive path, inert in the sequential engine
 pub fn exit_sim_no_clear_ops() {
     // Sync CALLBACK_CTX back (same as exit_sim but without clearing ops_context).
     if let Some(ctx) = get_callback_ctx() {

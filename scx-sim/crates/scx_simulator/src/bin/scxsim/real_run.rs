@@ -567,7 +567,7 @@ fn command_exists(cmd: &str) -> bool {
 /// simulation testing.
 #[allow(dead_code)]
 pub fn scenario_to_rtapp_json(scenario: &scx_simulator::Scenario) -> Result<String, String> {
-    use scx_simulator::task::Phase;
+    use scx_simulator::Phase;
     use serde_json::{json, Map, Value};
 
     let duration_secs = (scenario.duration_ns / 1_000_000_000) as i64;

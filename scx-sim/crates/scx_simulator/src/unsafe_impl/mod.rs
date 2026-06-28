@@ -30,6 +30,10 @@ pub mod cgroup_bw_replenish;
 pub mod cgroup_ffi;
 pub mod cgroup_wrapper;
 pub mod dispatch_pool;
+// Engine-mediated orchestration, dormant in the sequential engine: the
+// EngineRing type is retained (backend imports it), its methods drive the future
+// parallel path.
+#[allow(dead_code)]
 pub mod engine_ring;
 pub mod ffi;
 // Dormant parallel/race-interleaving path: re-homed (not deleted) in the
@@ -39,6 +43,11 @@ pub mod ffi;
 pub mod interleave;
 pub mod kfuncs;
 pub mod preempt;
+// Standalone-only debug-inspection probes (LavdMonitor/LavdProbes). Gated so a
+// `default-features = false` embed build does not compile this module (it has no
+// embed consumer); the embed inspection path is the generic accessor surface,
+// not these lavd-specific probes.
+#[cfg(feature = "standalone")]
 pub mod probes;
 pub mod scheduler_wrapper;
 pub mod sim_task;
@@ -53,3 +62,9 @@ pub mod task_wrapper;
 // unreachable from the sequential event loop.
 #[allow(dead_code)]
 pub mod worker_pool;
+
+// In-crate relocation of the former tests/pending_dispatch.rs: an end-to-end
+// engine test whose scheduler calls the in-crate-default kfunc
+// scx_bpf_dsq_insert, so it must reach `crate::kfuncs`.
+#[cfg(test)]
+mod pending_dispatch_test;

@@ -9,7 +9,7 @@
 //! degradation contract changing them to a hard error is a deliberate,
 //! test-visible decision rather than silent drift.
 
-use scx_simulator::rtapp::load_rtapp;
+use scx_simulator::load_rtapp;
 use scx_simulator::*;
 
 mod common;
