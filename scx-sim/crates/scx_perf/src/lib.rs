@@ -9,14 +9,20 @@
 //!   for preemptive interleaving — after N retired branches, the PMU fires a
 //!   signal that interrupts the running thread.
 //!
-//! - [`RdpmcHandle`]: Fast branchless counter read via the `rdpmc` x86
-//!   instruction. Created from an `RbcCounter` or `RbcTimer` by mmap'ing the
-//!   perf event fd. Safe to call from signal handlers.
+//! - [`RdpmcHandle`] (`x86_64` only): Fast branchless counter read via the
+//!   `rdpmc` x86 instruction. Created from an `RbcCounter` or `RbcTimer` by
+//!   mmap'ing the perf event fd. Safe to call from signal handlers. On other
+//!   architectures this fast-read path is not compiled.
 //!
 //! - [`HwBreakpoint`]: Hardware execution breakpoint using CPU debug registers
 //!   (DR0-DR3) via `perf_event_open` with `PERF_TYPE_BREAKPOINT`.
 //!
 //! CPU detection covers Intel (family 0x06) and AMD Zen 1-5 (families 0x17/0x19/0x1A).
+//! PMU counting requires `x86_64` (CPUID detection + the `rdpmc` read are x86
+//! instructions); on other architectures [`PmuConfig::detect`] returns `None`
+//! and callers degrade to the PMU-absent model. The portable surface
+//! (`perf_event_open`-based [`RbcCounter`]/[`RbcTimer`]/[`HwBreakpoint`]) still
+//! compiles on any Linux target.
 //!
 //! Extracted from Reverie (BSD-2-Clause).
 
@@ -110,11 +116,17 @@ pub struct PmuConfig {
 }
 
 /// CPUID vendor and family info extracted from leaf 0x0 and 0x1.
+///
+/// `x86_64`-only: CPUID is an x86 instruction. Off `x86_64` there is no RBC
+/// detection path, so neither the type nor [`PmuConfig::detect`]'s CPUID body
+/// is compiled.
+#[cfg(target_arch = "x86_64")]
 struct CpuIdInfo {
     vendor: [u8; 12],
     family: u32,
 }
 
+#[cfg(target_arch = "x86_64")]
 impl CpuIdInfo {
     /// Query CPUID to get vendor string and full family ID.
     #[allow(unused_unsafe)] // __cpuid became safe in Rust 1.91+
@@ -149,7 +161,11 @@ impl CpuIdInfo {
 impl PmuConfig {
     /// Detect the RBC event for the current CPU via CPUID.
     ///
-    /// Returns `None` if the CPU family/vendor is not recognized.
+    /// Returns `None` if the CPU family/vendor is not recognized. On non-`x86_64`
+    /// targets there is no CPUID / `rdpmc` RBC path at all, so the variant
+    /// defined below always returns `None` and callers degrade to the PMU-absent
+    /// model (the same path taken on an unrecognized x86 CPU).
+    #[cfg(target_arch = "x86_64")]
     pub fn detect() -> Option<Self> {
         let info = CpuIdInfo::detect();
 
@@ -167,6 +183,15 @@ impl PmuConfig {
         };
 
         Some(PmuConfig { rcb_event })
+    }
+
+    /// Non-`x86_64`: no CPUID / `rdpmc` RBC counter path exists, so always
+    /// returns `None`. Callers (`try_create_rbc_counter`, `try_create_pmu_timer`)
+    /// already `warn` + degrade on `None`, so the unsupported-arch case is
+    /// surfaced exactly like an unsupported x86 CPU.
+    #[cfg(not(target_arch = "x86_64"))]
+    pub fn detect() -> Option<Self> {
+        None
     }
 
     /// Resolve a PMU event to `(perf_event_attr.type_, perf_event_attr.config)`.
@@ -288,6 +313,9 @@ impl RbcCounter {
     ///
     /// Maps the perf event fd into memory so the counter can be read via the
     /// `rdpmc` x86 instruction without any syscall overhead.
+    ///
+    /// `x86_64`-only (see [`RdpmcHandle`]).
+    #[cfg(target_arch = "x86_64")]
     pub fn mmap_rdpmc(&self) -> Result<RdpmcHandle, PerfError> {
         RdpmcHandle::from_fd(self.fd)
     }
@@ -420,6 +448,9 @@ impl RbcTimer {
     ///
     /// Maps the perf event fd into memory so the counter can be read via the
     /// `rdpmc` x86 instruction without any syscall overhead.
+    ///
+    /// `x86_64`-only (see [`RdpmcHandle`]).
+    #[cfg(target_arch = "x86_64")]
     pub fn mmap_rdpmc(&self) -> Result<RdpmcHandle, PerfError> {
         RdpmcHandle::from_fd(self.fd)
     }
@@ -487,6 +518,12 @@ fn read_counter(fd: RawFd) -> Result<u64, PerfError> {
 ///
 /// `ecx` is the counter index (from `perf_event_mmap_page.index - 1`).
 /// Returns the full 64-bit counter value (EAX | EDX << 32).
+///
+/// `x86_64`-only: emits the `rdpmc` instruction. The whole `rdpmc` fast-read
+/// cluster ([`RdpmcHandle`], `RbcCounter::mmap_rdpmc`, `RbcTimer::mmap_rdpmc`)
+/// is gated off other targets — there, userspace counter reads would use an
+/// arch-specific path (e.g. arm64 `mrs`) this code does not implement.
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 fn rdpmc(ecx: u32) -> u64 {
     let lo: u32;
@@ -535,6 +572,11 @@ fn set_signal_delivery(fd: RawFd, tid: libc::pid_t, signo: libc::c_int) -> Resul
 /// Created from an [`RbcCounter`] or [`RbcTimer`] by mmap'ing the perf event
 /// fd. The resulting handle can read the counter value using the `rdpmc` x86
 /// instruction, which is branchless and safe to call from signal handlers.
+///
+/// `x86_64`-only: `read()` issues the `rdpmc` instruction. Off `x86_64` the
+/// whole handle (and the `mmap_rdpmc` constructors) is not compiled — see the
+/// [`rdpmc`] free function.
+#[cfg(target_arch = "x86_64")]
 pub struct RdpmcHandle {
     mmap_page: *const perf::bindings::perf_event_mmap_page,
 }
@@ -542,8 +584,10 @@ pub struct RdpmcHandle {
 // The mmap pointer is valid cross-thread for the same perf event fd (which is
 // per-thread anyway). The mapping is read-only and the kernel maintains
 // coherency via the seqcount lock.
+#[cfg(target_arch = "x86_64")]
 unsafe impl Send for RdpmcHandle {}
 
+#[cfg(target_arch = "x86_64")]
 impl RdpmcHandle {
     /// Create an `RdpmcHandle` by mmap'ing a perf event file descriptor.
     ///
@@ -626,6 +670,7 @@ impl RdpmcHandle {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 impl Drop for RdpmcHandle {
     fn drop(&mut self) {
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
@@ -1040,6 +1085,10 @@ mod tests {
     }
 
     /// Helper: create an RbcCounter or skip the test if unavailable.
+    ///
+    /// `x86_64`-only: used solely by the `rdpmc` fast-read tests below, which
+    /// are themselves `x86_64`-only.
+    #[cfg(target_arch = "x86_64")]
     fn make_counter_or_skip() -> Option<(PmuConfig, RbcCounter)> {
         let config = match PmuConfig::detect() {
             Some(c) => c,
@@ -1059,6 +1108,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn test_rdpmc_basic() {
         let (_config, counter) = match make_counter_or_skip() {
             Some(pair) => pair,
@@ -1090,6 +1140,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_arch = "x86_64")]
     fn test_rdpmc_matches_read() {
         let (_config, counter) = match make_counter_or_skip() {
             Some(pair) => pair,
