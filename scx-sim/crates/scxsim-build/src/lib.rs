@@ -592,11 +592,22 @@ pub fn build_schedulers(
         if m.extra_local_include {
             extra_includes.push(sched_dir.clone());
         }
+        // A patched scheduler's generated source is written into OUT_DIR (NOT the
+        // source tree -- see below), so resolve it via -I<out>. Prepend so it is
+        // searched before sched_dir: an embedder building from a read-only sim
+        // copy has no source-tree copy, and a dev's stale gitignored one must
+        // never shadow the freshly generated OUT_DIR copy.
+        if !m.source_patches.is_empty() {
+            extra_includes.insert(0, out.to_path_buf());
+        }
 
         // Source-text patches: regenerate a find/replace-patched copy of the
-        // scheduler's upstream main.bpf.c next to the wrapper as
-        // <name>_main_patched.c (the wrapper #includes it; extra_local_include
-        // resolves it). Regenerated from upstream on every build so a stale copy
+        // scheduler's upstream main.bpf.c into OUT_DIR as <name>_main_patched.c,
+        // which the wrapper #includes via the -I<out> above (angle include, so
+        // the includer-dir search never picks up a stale source-tree copy).
+        // Writing to OUT_DIR (not the source tree) is what lets an embedder build
+        // a patched scheduler from a READ-ONLY copy of sim (cargo registry cache
+        // / vendored). Regenerated from upstream every build so a stale copy
         // cannot drift from the active scx SHA. cosmos uses this to guard the one
         // update_freq() divide against a zero divisor (BPF integer divide-by-zero
         // yields 0; native C raises SIGFPE). A patch whose `find` is absent
@@ -614,7 +625,7 @@ pub fn build_schedulers(
                 );
                 content = content.replace(find.as_str(), replace.as_str());
             }
-            std::fs::write(sched_dir.join(format!("{name}_main_patched.c")), content)
+            std::fs::write(out.join(format!("{name}_main_patched.c")), content)
                 .unwrap_or_else(|e| panic!("write {name}_main_patched.c: {e}"));
         }
 
