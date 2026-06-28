@@ -220,8 +220,19 @@ impl SchedulerDefinition {
     /// `extra_local_include` false, no `source_patches`. (`strip_const`/`scx_bpf_dir`
     /// are false only for `simple`; lavd and cosmos override
     /// `extra_local_include`/`source_patches`.) rodata is empty until supplied via
-    /// [`with_rodata`](Self::with_rodata). The fields stay `pub` so the `simple`,
-    /// lavd, and cosmos exceptions are set by direct assignment.
+    /// [`with_rodata`](Self::with_rodata).
+    ///
+    /// CANONICAL construction (the expression a code-generating embedder DSL,
+    /// e.g. ktstr's scheduler-definition DSL, should emit): `new(name)` then
+    /// chain the `with_*` builders for any field that differs from the common
+    /// profile — [`with_strip_const`](Self::with_strip_const) /
+    /// [`with_scx_bpf_dir`](Self::with_scx_bpf_dir) /
+    /// [`with_extra_local_include`](Self::with_extra_local_include) for the build
+    /// flags, [`with_source_patches`](Self::with_source_patches) for a patched
+    /// scheduler, [`with_rodata`](Self::with_rodata) for config globals. The
+    /// fields are also `pub` (for serde round-trip + a non-fluent escape hatch),
+    /// but the fluent `new(..).with_*(..)` chain is the documented onboarding
+    /// contract — a single expression, which is what codegen wants to emit.
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -238,6 +249,35 @@ impl SchedulerDefinition {
     /// `SchedulerDefinition::new(name).with_rodata(..)`.
     pub fn with_rodata(mut self, rodata: Vec<(String, ConfigValue)>) -> Self {
         self.rodata = rodata;
+        self
+    }
+
+    /// Set the source-text find/replace patches (see [`source_patches`](Self::source_patches)).
+    /// Fluent peer of [`with_rodata`](Self::with_rodata) for a patched scheduler
+    /// (e.g. cosmos's divide-by-zero guard).
+    pub fn with_source_patches(mut self, patches: Vec<(String, String)>) -> Self {
+        self.source_patches = patches;
+        self
+    }
+
+    /// Override `strip_const` (default `true`; set `false` for a scheduler whose
+    /// source is local and needs no const-volatile rodata writes, e.g. `simple`).
+    pub fn with_strip_const(mut self, strip_const: bool) -> Self {
+        self.strip_const = strip_const;
+        self
+    }
+
+    /// Override `scx_bpf_dir` (default `true`; set `false` for a scheduler with no
+    /// `<scx_root>/scheds/rust/scx_<name>/src/bpf` include, e.g. `simple`).
+    pub fn with_scx_bpf_dir(mut self, scx_bpf_dir: bool) -> Self {
+        self.scx_bpf_dir = scx_bpf_dir;
+        self
+    }
+
+    /// Override `extra_local_include` (default `false`; set `true` for a scheduler
+    /// that keeps a generated/patched source in its own dir, e.g. lavd/cosmos).
+    pub fn with_extra_local_include(mut self, extra_local_include: bool) -> Self {
+        self.extra_local_include = extra_local_include;
         self
     }
 }

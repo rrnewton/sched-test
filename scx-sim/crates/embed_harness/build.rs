@@ -87,12 +87,13 @@ fn main() {
     let so_dir = out_dir.join("schedulers");
     std::fs::create_dir_all(&so_dir).expect("create harness .so output dir");
 
-    // An embedder builds the definition FROM SCRATCH (not standalone_definitions).
-    // `simple` is the one scheduler that overrides new()'s defaults: its source
-    // is local (no scx BPF dir) and needs no const stripping.
-    let mut simple_def = SchedulerDefinition::new("simple");
-    simple_def.strip_const = false;
-    simple_def.scx_bpf_dir = false;
+    // An embedder builds the definition FROM SCRATCH (not standalone_definitions),
+    // via the canonical fluent chain (new + with_* — the expression a scheduler
+    // DSL emits). `simple` is the one scheduler that overrides new()'s defaults:
+    // its source is local (no scx BPF dir) and needs no const stripping.
+    let simple_def = SchedulerDefinition::new("simple")
+        .with_strip_const(false)
+        .with_scx_bpf_dir(false);
 
     build_schedulers(
         &harness_scheds,
