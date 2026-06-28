@@ -38,31 +38,14 @@ extern void *memset(void *s, int c, unsigned long n);
  * ---------------------------------------------------------------------------*/
 
 /* ---------------------------------------------------------------------------
- * BPF timer overrides
- *
- * bpf_timer_set_callback stores the callback pointer.
- * bpf_timer_start calls sim_timer_start() (Rust kfunc) to schedule
- * a TimerFired event in the simulator's event queue.
- * mitosis_fire_timer() invokes the stored callback from the engine.
+ * BPF timer overrides: the generic slot-table in csrc/sim_timer.h. Mitosis is
+ * a single-timer scheduler, so its one timer lands in slot 0 (first-fit) --
+ * behavior-identical to the former slot-less sim_timer_start (which is
+ * sim_timer_start_slot(0, ...)). mitosis_fire_timer (below) forwards the
+ * engine's TimerFired to the generic scxsim_fire_timer. Must follow
+ * sim_wrapper.h (for struct bpf_timer + the bpf_timer_* helper macros).
  * ---------------------------------------------------------------------------*/
-static int (*mitosis_timer_cb)(void *, int *, struct bpf_timer *);
-static struct bpf_timer *mitosis_timer_ptr;
-static void *mitosis_timer_map;
-
-extern void sim_timer_start(unsigned long long nsecs);
-
-#undef bpf_timer_init
-#define bpf_timer_init(timer, map, flags) \
-	(mitosis_timer_map = (void *)(map), 0)
-
-#undef bpf_timer_set_callback
-#define bpf_timer_set_callback(timer, cb) \
-	(mitosis_timer_cb = (typeof(mitosis_timer_cb))(cb), \
-	 mitosis_timer_ptr = (struct bpf_timer *)(timer), 0)
-
-#undef bpf_timer_start
-#define bpf_timer_start(timer, nsecs, flags) \
-	(sim_timer_start(nsecs), 0)
+#include "sim_timer.h"
 
 /* ---------------------------------------------------------------------------
  * RAII cleanup neutralization
@@ -199,10 +182,9 @@ static void mitosis_register_maps(void)
  * ---------------------------------------------------------------------------*/
 void mitosis_fire_timer(unsigned int slot)
 {
-	int key = 0;
-	(void)slot;
-	if (mitosis_timer_cb && mitosis_timer_ptr)
-		mitosis_timer_cb(mitosis_timer_map, &key, mitosis_timer_ptr);
+	/* The Rust engine resolves the per-scheduler "mitosis_fire_timer" symbol;
+	 * forward to the generic dispatcher (csrc/sim_timer.h). */
+	scxsim_fire_timer(slot);
 }
 
 /* ---------------------------------------------------------------------------
@@ -252,9 +234,7 @@ void mitosis_setup(unsigned int num_cpus)
 	mitosis_register_maps();
 
 	/* Clear timer state from previous runs */
-	mitosis_timer_cb = NULL;
-	mitosis_timer_ptr = NULL;
-	mitosis_timer_map = NULL;
+	scxsim_timer_reset();
 
 	/* Populate all_cpus bitmask for each simulated CPU */
 	memset((void *)all_cpus, 0, sizeof(all_cpus));

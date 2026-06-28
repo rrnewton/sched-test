@@ -110,94 +110,15 @@ extern u64 sim_scx_clock_task(u32 cpu);
 #define MAX_SIM_CPUS 128
 
 /*
- * BPF timer overrides for periodic system stat updates AND for any
- * additional timer the cgroup_bw library compiled in by Phase 2 will
- * arm (e.g. `cbw_replenish_timer`).
- *
- * Phase 1 BPF infra scale-up items 1+2 (tg
- * `scxsim-bpf-infra-scale-up-phase1`, design doc section Phase 1 items
- * 1+2): replaces the prior single global timer state with a fixed
- * `LAVD_MAX_BPF_TIMERS = 8` slot table keyed by `(struct bpf_timer *)`.
- *
- * Slot allocation policy: `bpf_timer_init(timer, map, flags)` finds
- * the first free slot whose `timer_ptr` is NULL, claims it for the
- * supplied `(struct bpf_timer *)`, and records the timer's map.
- * `bpf_timer_set_callback(timer, cb)` and
- * `bpf_timer_start(timer, nsecs, flags)` look up the slot for the
- * supplied `timer` and update / fire it. `lavd_fire_timer(slot)`
- * dispatches the engine's `EventKind::TimerFired { slot }` to the
- * right callback.
- *
- * Slot 0 is the conventional update_timer slot; subsequent slots are
- * assigned in init order. The table is reset by `lavd_register_maps`
- * so consecutive simulation runs start with a clean slate (matches
- * the existing single-timer determinism guarantee).
- *
- * This MUST stay <= the Rust-side `MAX_BPF_TIMERS` constant in
- * `unsafe_impl/kfuncs.rs`. If LAVD ever needs more, bump both and
- * add a build-time assertion.
+ * BPF timer machinery is the generic slot-table in csrc/sim_timer.h (8-slot
+ * first-fit keyed by (struct bpf_timer *)): LAVD's update_timer (slot 0,
+ * registered first) and the compiled-in cgroup_bw cbw_replenish_timer
+ * share it. lavd_fire_timer (below) forwards the engine's
+ * EventKind::TimerFired { slot } to the generic scxsim_fire_timer.
+ * Must be included AFTER sim_wrapper.h (for struct bpf_timer + the bpf_timer_*
+ * helper macros it overrides).
  */
-#define LAVD_MAX_BPF_TIMERS 8
-
-struct lavd_timer_slot {
-	struct bpf_timer *timer_ptr; /* NULL = unused slot */
-	int (*timer_cb)(void *, int *, struct bpf_timer *);
-	void *timer_map;
-};
-
-static struct lavd_timer_slot lavd_timer_table[LAVD_MAX_BPF_TIMERS];
-
-extern void sim_timer_start(unsigned long long nsecs);
-extern void sim_timer_start_slot(unsigned int slot, unsigned long long nsecs);
-
-/*
- * Find or assign a slot for the given (struct bpf_timer *).
- *
- * Returns the slot index in [0, LAVD_MAX_BPF_TIMERS), or -1 on
- * exhaustion (which means LAVD_MAX_BPF_TIMERS / MAX_BPF_TIMERS is too
- * low for the workload -- bump them in lockstep).
- */
-static int lavd_timer_slot_for(struct bpf_timer *timer)
-{
-	int i;
-	for (i = 0; i < LAVD_MAX_BPF_TIMERS; i++) {
-		if (lavd_timer_table[i].timer_ptr == timer)
-			return i;
-	}
-	for (i = 0; i < LAVD_MAX_BPF_TIMERS; i++) {
-		if (!lavd_timer_table[i].timer_ptr) {
-			lavd_timer_table[i].timer_ptr = timer;
-			return i;
-		}
-	}
-	return -1;
-}
-
-#undef bpf_timer_init
-#define bpf_timer_init(timer, map, flags) \
-	({ \
-		int _s = lavd_timer_slot_for((struct bpf_timer *)(timer)); \
-		if (_s >= 0) lavd_timer_table[_s].timer_map = (void *)(map); \
-		0; \
-	})
-
-#undef bpf_timer_set_callback
-#define bpf_timer_set_callback(timer, cb) \
-	({ \
-		int _s = lavd_timer_slot_for((struct bpf_timer *)(timer)); \
-		if (_s >= 0) \
-			lavd_timer_table[_s].timer_cb = \
-				(typeof(lavd_timer_table[0].timer_cb))(cb); \
-		0; \
-	})
-
-#undef bpf_timer_start
-#define bpf_timer_start(timer, nsecs, flags) \
-	({ \
-		int _s = lavd_timer_slot_for((struct bpf_timer *)(timer)); \
-		if (_s >= 0) sim_timer_start_slot((unsigned int)_s, (nsecs)); \
-		0; \
-	})
+#include "sim_timer.h"
 
 /*
  * Map lookup override. With the cgroup_bw flagship compiled in, lavd_map_lookup
@@ -771,7 +692,7 @@ void lavd_register_maps(void)
 	 * (struct bpf_timer *) might reuse a stale slot's callback,
 	 * destroying determinism.
 	 */
-	__builtin_memset(lavd_timer_table, 0, sizeof(lavd_timer_table));
+	scxsim_timer_reset();
 
 	/*
 	 * Phase 2: cgroup_bw's BPF maps live in cgroup_bw.bpf.c which is
@@ -799,15 +720,9 @@ static void lavd_register_cbw_maps(void);
  */
 void lavd_fire_timer(unsigned int slot)
 {
-	int key = 0;
-	if (slot >= LAVD_MAX_BPF_TIMERS)
-		return;
-	if (lavd_timer_table[slot].timer_cb && lavd_timer_table[slot].timer_ptr) {
-		lavd_timer_table[slot].timer_cb(
-			lavd_timer_table[slot].timer_map,
-			&key,
-			lavd_timer_table[slot].timer_ptr);
-	}
+	/* The Rust engine resolves the per-scheduler "lavd_fire_timer" symbol;
+	 * forward to the generic dispatcher (csrc/sim_timer.h). */
+	scxsim_fire_timer(slot);
 }
 
 /*
