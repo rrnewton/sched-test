@@ -9,9 +9,10 @@ use crate::fmt::FmtTs;
 use crate::scenario::IrqType;
 use crate::task::TaskDef;
 use crate::types::{CpuId, DsqId, Pid, TimeNs, Vtime};
+use serde::{Deserialize, Serialize};
 
 /// What triggered a DSQ length sample.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DsqSampleTrigger {
     /// Task was inserted into the DSQ.
     Insert,
@@ -22,7 +23,7 @@ pub enum DsqSampleTrigger {
 }
 
 /// A point-in-time sample of a DSQ's length.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DsqLengthSample {
     /// Simulated time when sample was taken.
     pub time_ns: TimeNs,
@@ -38,7 +39,7 @@ pub struct DsqLengthSample {
 ///
 /// This struct captures high-level metrics that can be compared between
 /// simulated and real kernel traces to identify realism gaps.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TraceSummary {
     /// Total number of trace events recorded.
     pub total_events: usize,
@@ -83,7 +84,7 @@ impl std::fmt::Display for TraceSummary {
 }
 
 /// A single trace event produced by the simulator.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraceEvent {
     /// Simulated time in nanoseconds when this event occurred.
     pub time_ns: TimeNs,
@@ -94,7 +95,7 @@ pub struct TraceEvent {
 }
 
 /// The type of scheduling event recorded.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TraceKind {
     /// A task was scheduled to run on this CPU.
     TaskScheduled { pid: Pid },
@@ -529,7 +530,7 @@ pub enum TraceKind {
 }
 
 /// Reason why a dispatch to a local DSQ was rejected.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DispatchRejectReason {
     /// Target CPU is not in the task's cpumask.
     CpumaskViolation,
@@ -538,7 +539,7 @@ pub enum DispatchRejectReason {
 }
 
 /// A complete simulation trace, containing all events in chronological order.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Trace {
     events: Vec<TraceEvent>,
     pub(crate) nr_cpus: u32,

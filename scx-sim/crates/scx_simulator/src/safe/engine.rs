@@ -386,7 +386,7 @@ fn check_bpf_error(state: &mut SimulatorState, ignore: bool) -> Option<ExitKind>
 }
 
 /// How the simulation terminated.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ExitKind {
     /// Simulation ran to completion (duration exhausted).
     Normal,

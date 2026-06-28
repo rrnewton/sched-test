@@ -14,7 +14,9 @@ use crate::cgroup_wrapper::{
 use crate::types::CpuId;
 
 /// Unique cgroup identifier (kernel's cgroup->kn->id).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct CgroupId(pub u64);
 
 impl CgroupId {
