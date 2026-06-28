@@ -228,8 +228,9 @@ runs a `Scenario`:
 use scx_simulator::*;             // DynamicScheduler, Simulator, Scenario, TaskDef, ExitKind, ...
 use scxsim_build::SchedulerDefinition;
 
-let sched = DynamicScheduler::load_with_definition(so_path, &def, nr_cpus);  // ffi.rs
-let trace = Simulator::new(sched).run(scenario);                            // engine.rs
+// In a fn returning Result<_, LoadError> -- embedders prefer the fallible entry:
+let sched = DynamicScheduler::try_load_with_definition(so_path, &def, nr_cpus)?;  // ffi.rs
+let trace = Simulator::new(sched).run(scenario);                                 // engine.rs
 assert_eq!(trace.exit_kind(), &ExitKind::Normal);
 ```
 
@@ -241,9 +242,19 @@ contract; `crates/embed_harness/tests/embed.rs` has a minimal 1-CPU/1-task
 Use `load_with_definition` (`crates/scx_simulator/src/unsafe_impl/ffi.rs`), NOT
 `load`: `load` resolves the definition from the BUNDLED `standalone_definitions()`
 and panics on a prefix it doesn't know, so an embedder loading a scheduler the
-bundled set never knew about must pass its own `def`. Definitions and config fail
-loud: `apply_rodata` panics on a const-volatile global that the `.so` doesn't
-define, and a missing exported symbol fails the `RTLD_NOW` load.
+bundled set never knew about must pass its own `def`.
+
+An embedder should prefer the FALLIBLE twin
+`try_load_with_definition(so_path, &def, nr_cpus) -> Result<DynamicScheduler, LoadError>`
+(and `try_load`): a bad `.so`, a missing exported symbol, or an undefined rodata
+global is then a recoverable `LoadError` (`LibraryOpen` / `UnknownPrefix` /
+`MissingOp` / `MissingRodataGlobal`, exported from `scx_simulator`) instead of a
+process abort across the FFI boundary. The infallible `load_with_definition` /
+`load` are thin `unwrap`-panic wrappers over the `try_*` forms (correct for the
+standalone binary). Either way config fails loud, never silent: the load applies
+the definition's const-volatile rodata globals before any ops body runs and
+reports (`MissingRodataGlobal`) / panics on any global the `.so` doesn't define,
+and a missing exported symbol fails the `RTLD_NOW` load.
 
 ## What scx-sim provides vs what the embedder owns
 
