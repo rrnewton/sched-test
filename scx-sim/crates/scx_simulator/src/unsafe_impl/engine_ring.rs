@@ -354,6 +354,9 @@ impl EngineRing {
 ///
 /// This is a pure helper that does not access `EngineRing` state directly,
 /// making it easy to test in isolation.
+// Exercised only by this module's tests; the sequential engine never picks
+// the next worker by clock (that drives the dormant interleaving path).
+#[allow(dead_code)]
 pub fn pick_by_min_clock(
     clocks: impl Iterator<Item = (WorkerId, CpuId, u64)>,
     finished_mask: u64,

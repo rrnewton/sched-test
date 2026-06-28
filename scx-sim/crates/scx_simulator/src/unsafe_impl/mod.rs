@@ -32,11 +32,24 @@ pub mod cgroup_wrapper;
 pub mod dispatch_pool;
 pub mod engine_ring;
 pub mod ffi;
+// Dormant parallel/race-interleaving path: re-homed (not deleted) in the
+// sequential engine; retained for the future parallel backend. The token-ring
+// wiring fns are unreachable from the sequential event loop (WorkerId stays live).
+#[allow(dead_code)]
 pub mod interleave;
 pub mod kfuncs;
 pub mod preempt;
 pub mod probes;
 pub mod scheduler_wrapper;
 pub mod sim_task;
+// Foundational safe `task_struct` accessor wrapper (SimTaskHandle). The full
+// get/set accessor API is built but not yet wired into the engine, which still
+// reads/writes task fields via raw SimTask/ffi; only `new_idle` and `as_raw`
+// are currently consumed. Retained as the safe-boundary surface, not dead.
+#[allow(dead_code)]
 pub mod task_wrapper;
+// Dormant persistent-thread-pool: re-homed (not deleted) in the sequential
+// engine; retained for the future parallel backend. The whole module is
+// unreachable from the sequential event loop.
+#[allow(dead_code)]
 pub mod worker_pool;

@@ -45,54 +45,62 @@
 //! documents the full link/build contract.
 
 // === Safe modules (zero unsafe) — grouped under safe/ ===
-pub mod safe;
+// `pub(crate)`: the public surface is the curated re-exports below + the
+// `prelude`, NOT `scx_simulator::safe::*` (no external consumer uses that path).
+pub(crate) mod safe;
 
 // === Unsafe-heavy modules — grouped under unsafe_impl/ ===
-pub mod unsafe_impl;
+// `pub(crate)`: same as `safe` -- internals are reached via the curated
+// re-exports / `prelude`, not `scx_simulator::unsafe_impl::*`.
+pub(crate) mod unsafe_impl;
 
-// Re-export safe modules at crate root so `crate::types`, `crate::dsq`, etc.
-// continue to resolve for all internal `use crate::xxx` paths.
+// Re-export the safe modules at the crate root. With `safe` now `pub(crate)`,
+// these aliases + the curated items below + the `prelude` ARE the public surface.
+// Aliases with no external consumer are `pub(crate)` (internal-only); a few stay
+// `pub` (det_hashmap/rtapp/scenario/structops_jsonl/task/trace/workloads) because
+// an external test, the bin, or a doctest still reaches them by module path,
+// pending migration onto a curated re-export.
 pub(crate) use safe::atomic_types;
-pub use safe::bpf_trace;
-pub use safe::cgroup;
-pub use safe::cpu;
+pub(crate) use safe::cgroup;
+pub(crate) use safe::cpu;
 pub use safe::det_hashmap;
-pub use safe::dsq;
-pub use safe::engine;
-pub use safe::fmt;
-pub use safe::monitor;
-pub use safe::perf;
+pub(crate) use safe::dsq;
+pub(crate) use safe::engine;
+pub(crate) use safe::fmt;
+pub(crate) use safe::monitor;
+pub(crate) use safe::perf;
 pub(crate) use safe::perfetto;
 pub(crate) use safe::perfetto_pb;
 pub use safe::rtapp;
 pub use safe::scenario;
-pub use safe::stats;
+pub(crate) use safe::stats;
 pub use safe::structops_jsonl;
 pub use safe::task;
 pub use safe::trace;
-pub use safe::types;
+pub(crate) use safe::types;
 pub use safe::workloads;
 
-// Re-export unsafe_impl sub-modules at crate root for backward compatibility.
-// All internal `crate::ffi`, `crate::kfuncs`, etc. paths continue to resolve.
+// Re-export the unsafe_impl sub-modules at the crate root so internal
+// `crate::ffi`, `crate::kfuncs`, etc. paths resolve. Most are `pub(crate)` --
+// the public surface is the curated re-exports below + the `prelude`. The few
+// left `pub` (backend/ffi/kfuncs/preempt/probes) still have external
+// module-path consumers pending migration / a surface decision.
 pub use unsafe_impl::backend;
-pub use unsafe_impl::cgroup_bw_replenish;
-pub use unsafe_impl::cgroup_ffi;
-pub use unsafe_impl::cgroup_wrapper;
-pub use unsafe_impl::engine_ring;
+pub(crate) use unsafe_impl::cgroup_bw_replenish;
+pub(crate) use unsafe_impl::cgroup_ffi;
+pub(crate) use unsafe_impl::cgroup_wrapper;
+pub(crate) use unsafe_impl::engine_ring;
 pub use unsafe_impl::ffi;
-pub use unsafe_impl::interleave;
+pub(crate) use unsafe_impl::interleave;
 pub use unsafe_impl::kfuncs;
 pub use unsafe_impl::preempt;
 pub use unsafe_impl::probes;
-pub use unsafe_impl::scheduler_wrapper;
-pub use unsafe_impl::sim_task;
-pub use unsafe_impl::task_wrapper;
-pub use unsafe_impl::worker_pool;
+pub(crate) use unsafe_impl::scheduler_wrapper;
+pub(crate) use unsafe_impl::sim_task;
+pub(crate) use unsafe_impl::task_wrapper;
 
 // Re-export the main public types for convenience.
 pub use cgroup::{CgroupId, CgroupInfo, CgroupRegistry, DEFAULT_MAX_CGROUPS};
-pub use cgroup_wrapper::{free_cgroup_raw, CgroupAlloc, CgroupPtr, CssIterGuard, SimCgroupHandle};
 pub use engine::{ExitKind, SimulationResult, Simulator};
 pub use ffi::{
     discover_schedulers, DebuggerInfo, DynamicScheduler, LavdPowerMode, LoadError, Scheduler,
@@ -129,10 +137,7 @@ pub use safe::trace::{
     DsqLengthSample, DsqSampleTrigger, Trace, TraceEvent, TraceKind, TraceSummary,
 };
 pub use safe::types::{CpuId, DsqId, KickFlags, MmId, Pid, TimeNs, Vtime};
-pub use scheduler_wrapper::{OptionalPtr, SchedulerWrapper, TaskPtr};
-pub use sim_task::SimTask;
 pub use task::{nice_to_weight, sched_weight_to_cgroup, Phase, RepeatMode, TaskBehavior, TaskDef};
-pub use task_wrapper::SimTaskHandle;
 
 /// Curated public surface for embedding scx-sim as a library.
 ///
