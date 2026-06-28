@@ -318,6 +318,28 @@ struct cgroup *bpf_cgroup_from_id(u64 id)
 }
 
 /*
+ * bpf_cgroup_acquire / bpf_cgroup_release: cgroup refcount kfuncs. The
+ * single-threaded deterministic simulator models no cgroup refcounting, so
+ * acquire is the identity and release is a no-op. Weak FUNCTION stubs (not
+ * macros): bpf_experimental.h declares these extern __ksym, and a
+ * function-like macro would mangle that declaration (see
+ * schedulers/lavd/wrapper.c). Replace the former per-scheduler copies
+ * (mitosis's sim_cgroup_acquire macro pair, lavd's local bpf_cgroup_release
+ * fn).
+ */
+__attribute__((weak))
+struct cgroup *bpf_cgroup_acquire(struct cgroup *cgrp)
+{
+	return cgrp;
+}
+
+__attribute__((weak))
+void bpf_cgroup_release(struct cgroup *cgrp)
+{
+	(void)cgrp;
+}
+
+/*
  * LINUX_KERNEL_VERSION: __kconfig global declared in common.bpf.h.
  * With __kconfig stripped, it becomes a bare extern declaration.
  * Provide a definition so scheduler .so files link. Default 6.18.0 (encoded

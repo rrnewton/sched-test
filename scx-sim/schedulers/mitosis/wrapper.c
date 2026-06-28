@@ -96,15 +96,11 @@ extern void sim_timer_start(unsigned long long nsecs);
 #undef no_free_ptr
 #define no_free_ptr(p) (p)
 
-/* Cgroup acquire/release - simulator doesn't do reference counting */
-static inline struct cgroup *sim_cgroup_acquire(struct cgroup *cgrp) {
-	return cgrp;
-}
-#undef bpf_cgroup_acquire
-#define bpf_cgroup_acquire(cgrp) sim_cgroup_acquire(cgrp)
-
-#undef bpf_cgroup_release
-#define bpf_cgroup_release(cgrp) ((void)0)
+/*
+ * Cgroup acquire/release (no reference counting in the sim) are the generic
+ * weak stubs in csrc/sim_bpf_stubs.c (acquire=identity, release=no-op),
+ * shared by every .so. No per-scheduler override needed here.
+ */
 
 /*
  * bpf_iter_css_*: the simulator's compare tests only exercise the root

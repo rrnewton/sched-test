@@ -871,11 +871,10 @@ struct cgroup *bpf_cgroup_ancestor(struct cgroup *cgrp, int level)
 	return NULL;
 }
 
-/* Cgroup reference release -- no-op */
-void bpf_cgroup_release(struct cgroup *cgrp)
-{
-	(void)cgrp;
-}
+/*
+ * Cgroup reference release (no-op in the sim) is the generic weak stub in
+ * csrc/sim_bpf_stubs.c, shared by every .so. No per-scheduler override here.
+ */
 
 /*
  * =================================================================
