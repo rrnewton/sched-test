@@ -4,6 +4,16 @@ version = "1.0.0"
 edition = "2021"
 publish = false
 
+[features]
+# `standalone` (default-on) gates the convenience constructors
+# (DynamicScheduler::simple/tickless/cosmos/mitosis/lavd/...) that resolve
+# scheduler `.so` paths from the compile-time `SCHEDULER_SO_DIR` env var. An
+# embedder builds with `default-features = false` and loads schedulers via
+# `load_with_definition` / `try_load_with_definition` (explicit path + a
+# SchedulerDefinition it supplies), so it never references `SCHEDULER_SO_DIR`.
+default = ["standalone"]
+standalone = []
+
 [dependencies]
 clap = { version = "4.5", features = ["derive", "env"] }
 libbpf-sys = "=1.6.1"

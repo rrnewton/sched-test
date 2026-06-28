@@ -1181,18 +1181,21 @@ impl DynamicScheduler {
     }
 
     /// Load the scx_simple scheduler.
+    #[cfg(feature = "standalone")]
     pub fn simple() -> Self {
         let dir = env!("SCHEDULER_SO_DIR");
         Self::load(&format!("{dir}/libscx_simple.so"), "simple", 1)
     }
 
     /// Load the scx_tickless scheduler, configured for `nr_cpus` CPUs.
+    #[cfg(feature = "standalone")]
     pub fn tickless(nr_cpus: u32) -> Self {
         let dir = env!("SCHEDULER_SO_DIR");
         Self::load(&format!("{dir}/libscx_tickless.so"), "tickless", nr_cpus)
     }
 
     /// Load the scx_cosmos scheduler, configured for `nr_cpus` CPUs.
+    #[cfg(feature = "standalone")]
     pub fn cosmos(nr_cpus: u32) -> Self {
         let dir = env!("SCHEDULER_SO_DIR");
         Self::load(&format!("{dir}/libscx_cosmos.so"), "cosmos", nr_cpus)
@@ -1203,6 +1206,7 @@ impl DynamicScheduler {
     /// Mitosis is a dynamic affinity scheduler that assigns cgroups to
     /// cells with discrete CPU sets. In the simulator, all tasks belong
     /// to the root cgroup (cell 0).
+    #[cfg(feature = "standalone")]
     pub fn mitosis(nr_cpus: u32) -> Self {
         let dir = env!("SCHEDULER_SO_DIR");
         Self::load(&format!("{dir}/libscx_mitosis.so"), "mitosis", nr_cpus)
@@ -1214,6 +1218,7 @@ impl DynamicScheduler {
     /// scheduler that combines virtual deadline ordering with latency
     /// criticality tracking. In the simulator, complex features like
     /// cgroup bandwidth, autopilot, and core compaction are disabled.
+    #[cfg(feature = "standalone")]
     pub fn lavd(nr_cpus: u32) -> Self {
         let dir = env!("SCHEDULER_SO_DIR");
         Self::load(&format!("{dir}/libscx_lavd.so"), "lavd", nr_cpus)
@@ -1227,6 +1232,7 @@ impl DynamicScheduler {
     /// `try_to_steal_task`, `force_to_steal_task`).
     ///
     /// `nr_cpus` must be >= `nr_domains` and `nr_domains` must be >= 2.
+    #[cfg(feature = "standalone")]
     pub fn lavd_multi_domain(nr_cpus: u32, nr_domains: u32) -> Self {
         assert!(nr_domains >= 2, "need at least 2 domains");
         assert!(
@@ -1404,6 +1410,7 @@ impl DynamicScheduler {
     ///
     /// CPUs are grouped sequentially into `nr_nodes` NUMA nodes.
     /// `nr_cpus` must be divisible by `nr_nodes`.
+    #[cfg(feature = "standalone")]
     pub fn cosmos_with_numa(nr_cpus: u32, nr_nodes: u32) -> Self {
         assert!(nr_nodes > 0);
         assert!(nr_cpus >= nr_nodes);

@@ -21,6 +21,13 @@ scxsim-build = { path = "../scxsim-build" }
 # scx_simulator's non-transitive link args, and pulls in the C static libs that
 # DEFINE the exported symbols) and scxsim-build (for the SchedulerDefinition type
 # it constructs from scratch).
+#
+# default-features = false: an embedder does not want the `standalone` convenience
+# constructors (they bake in scx_simulator's compile-time SCHEDULER_SO_DIR). The
+# test loads via load_with_definition, so it never needs them. (Under a
+# `--workspace` build, feature unification still turns `standalone` on for the
+# shared scx_simulator because scx_simulator's own tests request it; an isolated
+# `cargo test -p embed_harness` is what links the standalone-free build.)
 [dev-dependencies]
-scx_simulator = { path = "../scx_simulator" }
+scx_simulator = { path = "../scx_simulator", default-features = false }
 scxsim-build = { path = "../scxsim-build" }

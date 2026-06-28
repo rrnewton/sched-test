@@ -60,6 +60,18 @@ echo "=== Running cargo clippy ==="
 cargo clippy --all-targets --workspace -- -D warnings
 
 echo ""
+echo "=== Building the embed surface without the standalone feature ==="
+# Proves an embedder building scx_simulator with default-features = false still
+# compiles: the library + binary reach schedulers via load_with_definition and
+# never the standalone-gated simple()/tickless()/.../cosmos_with_numa() ctors
+# (which bake in the compile-time SCHEDULER_SO_DIR). Because `-p` selects a single
+# package, no other workspace member is built to request `standalone`, so this is
+# immune to the cross-member feature unification that turns it back on in the
+# --workspace runs above and below (separate invocations are cargo's own
+# prescribed remedy for avoiding that unification).
+cargo build -p scx_simulator --no-default-features
+
+echo ""
 echo "=== Running cargo llvm-cov nextest (instrumented; Rust library coverage) ==="
 # Instrumented run REPLACES the plain `cargo nextest run --workspace`: it runs
 # the identical nextest suite (same pass/fail) under llvm source-based coverage,

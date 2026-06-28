@@ -13,8 +13,13 @@
 //!
 //! # Usage
 //!
+//! The standalone quick-start loads a bundled scheduler with a convenience
+//! constructor (`DynamicScheduler::simple` and friends). These exist only with
+//! the default `standalone` feature, which bakes in a compile-time
+//! `SCHEDULER_SO_DIR`:
+//!
 //! ```rust,no_run
-//! use scx_simulator::*;
+//! use scx_simulator::prelude::*;
 //!
 //! let scenario = Scenario::builder()
 //!     .cpus(2)
@@ -28,6 +33,16 @@
 //! let trace = Simulator::new(DynamicScheduler::simple()).run(scenario);
 //! trace.dump();
 //! ```
+//!
+//! # Embedding
+//!
+//! An embedder builds with `default-features = false` (which drops the
+//! `standalone` convenience constructors above) and loads a scheduler it built
+//! itself: pass an explicit `.so` path plus a `SchedulerDefinition` to
+//! [`DynamicScheduler::load_with_definition`], or the fallible
+//! [`DynamicScheduler::try_load_with_definition`]. The `embed_harness` crate is
+//! a worked downstream example, and `ai_docs/ktstr_scxsim_embed_contract.md`
+//! documents the full link/build contract.
 
 // === Safe modules (zero unsafe) — grouped under safe/ ===
 pub mod safe;
