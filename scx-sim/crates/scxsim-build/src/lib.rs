@@ -3,7 +3,8 @@
 //! script and an embedder (e.g. cargo-ktstr) can drive the same build path and
 //! share the same [`SchedulerDefinition`] input type. Follows the declarative
 //! model of scx's own `scx_cargo::BpfBuilder` (each scheduler declares WHAT it
-//! needs as data; no codegen).
+//! needs as data -- build flags, rodata, and any source-text patches -- rather
+//! than as per-scheduler code branches).
 //!
 //! `scx_simulator` depends on this crate both as a normal dependency (the
 //! runtime applies a [`SchedulerDefinition`]'s rodata via
@@ -12,15 +13,6 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-
-/// Source-text transform applied to a scheduler's upstream BPF source before
-/// compilation (a pre-existing build step, not manifest-generated code).
-#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
-pub enum Codegen {
-    /// cosmos: guard the one division in update_freq() against a zero divisor.
-    /// BPF integer divide-by-zero yields 0; native C raises SIGFPE.
-    CosmosDivZeroGuard,
-}
 
 /// A scheduler config global's value, written before run via write_*_global.
 /// `NumCpus` resolves to the simulator's CPU count at apply time (e.g. the
@@ -62,8 +54,12 @@ pub struct SchedulerManifest {
     /// Add `-I <schedulers>/<name>` -- lavd and cosmos keep a generated/patched
     /// source (e.g. cosmos_main_patched.c) in their own directory.
     pub extra_local_include: bool,
-    /// Source codegen transform applied before compilation, if any.
-    pub codegen: Option<Codegen>,
+    /// Source-text find/replace patches applied to the scheduler's upstream
+    /// `main.bpf.c` before compilation, as `(find, replace)`. Empty for none.
+    /// A pre-existing build step (not manifest-generated code): the patched copy
+    /// is written next to the wrapper as `<name>_main_patched.c`, which the
+    /// wrapper `#include`s (resolved via `extra_local_include`).
+    pub source_patches: &'static [(&'static str, &'static str)],
     /// Runtime register/setup data consumed by the generic setup path.
     pub runtime: SchedulerRuntime,
 }
@@ -76,7 +72,12 @@ pub const SCHEDULERS: &[SchedulerManifest] = &[
         strip_const: true,
         scx_bpf_dir: true,
         extra_local_include: true,
-        codegen: Some(Codegen::CosmosDivZeroGuard),
+        // Guard the one division in update_freq() against a zero divisor: BPF
+        // integer divide-by-zero yields 0; native C raises SIGFPE.
+        source_patches: &[(
+            "new_freq = (100 * NSEC_PER_MSEC) / interval;",
+            "new_freq = interval ? (100 * NSEC_PER_MSEC) / interval : 0;",
+        )],
         // Migrated from cosmos_setup's config-global writes.
         // smt_enabled=true (SMT avoidance is unconditional upstream; the avoid_smt
         // toggle was deprecated, so there is no avoid_smt global to set).
@@ -108,7 +109,7 @@ pub const SCHEDULERS: &[SchedulerManifest] = &[
         strip_const: true,
         scx_bpf_dir: true,
         extra_local_include: true,
-        codegen: None,
+        source_patches: &[],
         // Migrated from lavd_setup's const-volatile config-global writes.
         // nr_cpu_ids resolves to num_cpus; nr_llcs and no_use_em are load-bearing
         // (the BPF rodata default 0 differs from the setup value). no_use_em and
@@ -136,7 +137,7 @@ pub const SCHEDULERS: &[SchedulerManifest] = &[
         strip_const: true,
         scx_bpf_dir: true,
         extra_local_include: false,
-        codegen: None,
+        source_patches: &[],
         // Migrated from mitosis_setup's config-global writes. nr_possible_cpus
         // resolves to num_cpus at apply time; root_cgid is a u64 (cgid width). The 3
         // flags whose C rodata default differs from the value here (smt_enabled,
@@ -161,7 +162,7 @@ pub const SCHEDULERS: &[SchedulerManifest] = &[
         strip_const: false,
         scx_bpf_dir: false,
         extra_local_include: false,
-        codegen: None,
+        source_patches: &[],
         runtime: SchedulerRuntime::EMPTY,
     },
     SchedulerManifest {
@@ -169,7 +170,7 @@ pub const SCHEDULERS: &[SchedulerManifest] = &[
         strip_const: true,
         scx_bpf_dir: true,
         extra_local_include: false,
-        codegen: None,
+        source_patches: &[],
         // Migrated from tickless_setup's rodata writes. nr_cpu_ids
         // resolves to num_cpus at apply time; the rest are fixed config.
         runtime: SchedulerRuntime {
@@ -203,8 +204,9 @@ pub struct SchedulerDefinition {
     pub scx_bpf_dir: bool,
     /// Add -I <schedulers>/<name> (a generated/patched source lives there).
     pub extra_local_include: bool,
-    /// Source codegen transform applied before compilation, if any.
-    pub codegen: Option<Codegen>,
+    /// Source-text find/replace patches applied to the upstream `main.bpf.c`
+    /// before compilation, as `(find, replace)`. Empty for none.
+    pub source_patches: Vec<(String, String)>,
     /// const-volatile config globals written before run, as (symbol, value).
     pub rodata: Vec<(String, ConfigValue)>,
 }
@@ -215,9 +217,9 @@ impl SchedulerDefinition {
     /// (`scx_root`/scheds/rust/scx_<name>/src/bpf) and `wrapper.c` dir
     /// (`schedulers_src`/<name>) from. Build-side policy flags default to the
     /// common non-`simple` profile: `strip_const` and `scx_bpf_dir` true,
-    /// `extra_local_include` false, no `codegen`. (`strip_const`/`scx_bpf_dir`
+    /// `extra_local_include` false, no `source_patches`. (`strip_const`/`scx_bpf_dir`
     /// are false only for `simple`; lavd and cosmos override
-    /// `extra_local_include`/`codegen`.) rodata is empty until supplied via
+    /// `extra_local_include`/`source_patches`.) rodata is empty until supplied via
     /// [`with_rodata`](Self::with_rodata). The fields stay `pub` so the `simple`,
     /// lavd, and cosmos exceptions are set by direct assignment.
     pub fn new(name: impl Into<String>) -> Self {
@@ -226,7 +228,7 @@ impl SchedulerDefinition {
             strip_const: true,
             scx_bpf_dir: true,
             extra_local_include: false,
-            codegen: None,
+            source_patches: Vec::new(),
             rodata: Vec::new(),
         }
     }
@@ -250,7 +252,11 @@ pub fn standalone_definitions() -> Vec<SchedulerDefinition> {
             strip_const: m.strip_const,
             scx_bpf_dir: m.scx_bpf_dir,
             extra_local_include: m.extra_local_include,
-            codegen: m.codegen,
+            source_patches: m
+                .source_patches
+                .iter()
+                .map(|(f, r)| (f.to_string(), r.to_string()))
+                .collect(),
             rodata: m
                 .runtime
                 .rodata
@@ -528,7 +534,7 @@ pub fn build_schedulers(
         let sched_dir = schedulers_src.join(name);
 
         // Per-scheduler build variation is declared in the manifest (strip-const,
-        // scx-bpf-dir, local-include, codegen), not hardcoded name branches.
+        // scx-bpf-dir, local-include, source-patches), not hardcoded name branches.
         // `simple` strips no `const` and pulls no scx BPF include (local source);
         // every other scheduler strips `const` (BPF const-volatile globals must be
         // writable) and adds scheds/rust/scx_<name>/src/bpf; lavd/cosmos also
@@ -547,21 +553,29 @@ pub fn build_schedulers(
             extra_includes.push(sched_dir.clone());
         }
 
-        // cosmos: regenerate the div-by-zero-guarded copy of main.bpf.c. BPF
-        // integer division by zero yields 0; native C raises SIGFPE. The sed
-        // transform in cosmos/config.mk guards the one divide that can see a
-        // zero divisor. Regenerated from the upstream source on every build so
-        // a stale checked-in copy cannot drift from the active scx SHA.
-        if m.codegen == Some(Codegen::CosmosDivZeroGuard) {
-            let src = scx_root.join("scheds/rust/scx_cosmos/src/bpf/main.bpf.c");
-            let content = std::fs::read_to_string(&src)
+        // Source-text patches: regenerate a find/replace-patched copy of the
+        // scheduler's upstream main.bpf.c next to the wrapper as
+        // <name>_main_patched.c (the wrapper #includes it; extra_local_include
+        // resolves it). Regenerated from upstream on every build so a stale copy
+        // cannot drift from the active scx SHA. cosmos uses this to guard the one
+        // update_freq() divide against a zero divisor (BPF integer divide-by-zero
+        // yields 0; native C raises SIGFPE). A patch whose `find` is absent
+        // (upstream rename/drift) fails the build loudly rather than silently
+        // dropping the transform and shipping a crashing .so.
+        if !m.source_patches.is_empty() {
+            let src = scx_root.join(format!("scheds/rust/scx_{name}/src/bpf/main.bpf.c"));
+            let mut content = std::fs::read_to_string(&src)
                 .unwrap_or_else(|e| panic!("read {}: {e}", src.display()));
-            let patched = content.replace(
-                "new_freq = (100 * NSEC_PER_MSEC) / interval;",
-                "new_freq = interval ? (100 * NSEC_PER_MSEC) / interval : 0;",
-            );
-            std::fs::write(sched_dir.join("cosmos_main_patched.c"), patched)
-                .expect("write cosmos_main_patched.c");
+            for (find, replace) in &m.source_patches {
+                assert!(
+                    content.contains(find.as_str()),
+                    "source_patch find string absent in {} (upstream drift?): {find:?}",
+                    src.display()
+                );
+                content = content.replace(find.as_str(), replace.as_str());
+            }
+            std::fs::write(sched_dir.join(format!("{name}_main_patched.c")), content)
+                .unwrap_or_else(|e| panic!("write {name}_main_patched.c: {e}"));
         }
 
         let mut objs: Vec<PathBuf> = Vec::new();
@@ -667,7 +681,12 @@ mod tests {
             assert_eq!(d.strip_const, m.strip_const);
             assert_eq!(d.scx_bpf_dir, m.scx_bpf_dir);
             assert_eq!(d.extra_local_include, m.extra_local_include);
-            assert_eq!(d.codegen, m.codegen);
+            let want_patches: Vec<(String, String)> = m
+                .source_patches
+                .iter()
+                .map(|(f, r)| (f.to_string(), r.to_string()))
+                .collect();
+            assert_eq!(d.source_patches, want_patches);
             let want: Vec<(String, ConfigValue)> = m
                 .runtime
                 .rodata
@@ -682,7 +701,7 @@ mod tests {
     /// `SchedulerDefinition::new(name)` reproduces a plain scheduler's manifest
     /// policy (the build-side flags) without restating it; `with_rodata` sets the
     /// one field `new` leaves empty. `new`'s defaults deliberately do NOT match
-    /// lavd/cosmos (which override extra_local_include/codegen) or `simple`.
+    /// lavd/cosmos (which override extra_local_include/source_patches) or `simple`.
     #[test]
     fn new_defaults_match_plain_scheduler_manifest() {
         let def = SchedulerDefinition::new("mitosis");
@@ -690,7 +709,7 @@ mod tests {
         assert!(def.strip_const);
         assert!(def.scx_bpf_dir);
         assert!(!def.extra_local_include);
-        assert_eq!(def.codegen, None);
+        assert!(def.source_patches.is_empty());
         assert!(def.rodata.is_empty());
 
         // new()'s build-side flags equal the manifest entry for a plain
@@ -703,7 +722,7 @@ mod tests {
         assert_eq!(def.strip_const, mitosis.strip_const);
         assert_eq!(def.scx_bpf_dir, mitosis.scx_bpf_dir);
         assert_eq!(def.extra_local_include, mitosis.extra_local_include);
-        assert_eq!(def.codegen, mitosis.codegen);
+        assert_eq!(def.source_patches, mitosis.source_patches);
         assert!(
             !mitosis.rodata.is_empty(),
             "mitosis manifest has rodata that new() intentionally omits"
