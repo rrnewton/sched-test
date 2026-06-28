@@ -119,6 +119,25 @@ pub use sim_task::SimTask;
 pub use task::{nice_to_weight, sched_weight_to_cgroup, Phase, RepeatMode, TaskBehavior, TaskDef};
 pub use task_wrapper::SimTaskHandle;
 
+/// Curated public surface for embedding scx-sim as a library.
+///
+/// `use scx_simulator::prelude::*` brings in just the embed flow — load a
+/// scheduler ([`DynamicScheduler`] / [`LoadError`]), build a [`Scenario`], run it
+/// with a [`Simulator`], inspect the [`Trace`] / [`ExitKind`] — without the
+/// crate-root glob, which also re-exports internal modules. The runtime load
+/// entry takes a [`SchedulerDefinition`](scxsim_build::SchedulerDefinition), so
+/// the prelude re-exports the `scxsim_build` config types too: an embedder needs
+/// one import at runtime.
+pub mod prelude {
+    pub use crate::engine::{ExitKind, SimulationResult, Simulator};
+    pub use crate::ffi::{DynamicScheduler, LoadError};
+    pub use crate::scenario::{CgroupDef, Scenario};
+    pub use crate::task::{Phase, RepeatMode, TaskBehavior, TaskDef};
+    pub use crate::trace::{Trace, TraceEvent, TraceSummary};
+    pub use crate::types::{CpuId, DsqId, MmId, Pid, TimeNs, Vtime};
+    pub use scxsim_build::{ConfigValue, KernelConfig, SchedulerDefinition};
+}
+
 use std::sync::Mutex;
 
 /// Global lock for serializing simulator tests.

@@ -20,8 +20,8 @@
 //! fail with `undefined symbol: sim_arena_offset` -- the implicit negative
 //! control, verified once manually.)
 
-use scx_simulator::*;
-use scxsim_build::SchedulerDefinition;
+// One import: the curated embed surface (re-exports scxsim_build::SchedulerDefinition).
+use scx_simulator::prelude::*;
 
 #[test]
 fn embedder_built_simple_so_loads_and_runs() {

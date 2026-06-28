@@ -225,8 +225,7 @@ After build.rs produces `libscx_<name>.so` (path exposed via a
 runs a `Scenario`:
 
 ```rust
-use scx_simulator::*;             // DynamicScheduler, Simulator, Scenario, TaskDef, ExitKind, ...
-use scxsim_build::SchedulerDefinition;
+use scx_simulator::prelude::*;    // DynamicScheduler, LoadError, Simulator, Scenario, TaskDef, ExitKind, SchedulerDefinition, ...
 
 // In a fn returning Result<_, LoadError> -- embedders prefer the fallible entry:
 let sched = DynamicScheduler::try_load_with_definition(so_path, &def, nr_cpus)?;  // ffi.rs
