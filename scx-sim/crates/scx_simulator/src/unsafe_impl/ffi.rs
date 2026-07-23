@@ -1214,6 +1214,90 @@ impl DynamicScheduler {
         sched
     }
 
+    /// Select COSMOS's lightweight idle-CPU scan paths.
+    ///
+    /// Mirrors the production `scx_cosmos --flat-idle-scan` /
+    /// `--preferred-idle-scan` options. When either is enabled and `prev_cpu`
+    /// is not busy, `pick_idle_cpu()` routes through `pick_idle_cpu_flat()` /
+    /// `pick_idle_cpu_pref_smt()` (and `get_idle_smtmask()` / `test_cpu_idle()`)
+    /// instead of the `scx_bpf_select_cpu_and()` kfunc path.
+    ///
+    /// Must be called after construction and before `Simulator::run()`.
+    pub fn cosmos_set_idle_scan(&self, nr_cpus: u32, flat: bool, preferred: bool) {
+        type SetIdleScanFn = unsafe extern "C" fn(u32, i32, i32);
+        // SAFETY: Symbol resolved from a `.so` built by our build system.
+        unsafe {
+            let sym: libloading::Symbol<SetIdleScanFn> = self
+                ._lib
+                .get(b"cosmos_set_idle_scan")
+                .expect("cosmos_set_idle_scan not found");
+            (sym)(nr_cpus, flat as i32, preferred as i32);
+        }
+    }
+
+    /// Install an asymmetric (big.LITTLE) per-CPU capacity table.
+    ///
+    /// `caps[cpu]` is the CPU's normalized capacity (production uses `[1, 1024]`
+    /// where 1024 is the fastest core). Setting a heterogeneous table makes
+    /// `all_cpus_same_capacity=false`, so COSMOS's `is_cpu_faster()` and
+    /// `scale_by_cpu_capacity()` compare real per-CPU capacities — mirroring
+    /// scx_cosmos running on a hybrid-core machine.
+    ///
+    /// Must be called after construction and before `Simulator::run()`.
+    pub fn cosmos_set_cpu_capacity(&self, caps: &[u64]) {
+        type SetCapFn = unsafe extern "C" fn(u32, *const u64);
+        // SAFETY: Symbol resolved from a `.so` built by our build system; the
+        // callee reads `caps.len()` entries from the pointer.
+        unsafe {
+            let sym: libloading::Symbol<SetCapFn> = self
+                ._lib
+                .get(b"cosmos_set_cpu_capacity")
+                .expect("cosmos_set_cpu_capacity not found");
+            (sym)(caps.len() as u32, caps.as_ptr());
+        }
+    }
+
+    /// Set per-CPU user utilization (the signal cosmos userspace polls and
+    /// writes into `cpu_util_map`). `util` is on the production `[0, 1024]`
+    /// scale. When `cpu_util_map[cpu] >= busy_threshold`, `is_cpu_busy()`
+    /// returns true and COSMOS switches from per-CPU round-robin queues to the
+    /// global deadline queue (exercising `task_dl()` / the shared-DSQ path).
+    ///
+    /// The simulator does not yet derive utilization automatically, so tests
+    /// set it to match their workload (e.g. `1024` for a saturated run).
+    ///
+    /// Must be called after construction and before `Simulator::run()`.
+    pub fn cosmos_set_cpu_util(&self, nr_cpus: u32, util: u64) {
+        type SetUtilFn = unsafe extern "C" fn(u32, u64);
+        // SAFETY: Symbol resolved from a `.so` built by our build system.
+        unsafe {
+            let sym: libloading::Symbol<SetUtilFn> = self
+                ._lib
+                .get(b"cosmos_set_cpu_util")
+                .expect("cosmos_set_cpu_util not found");
+            (sym)(nr_cpus, util);
+        }
+    }
+
+    /// Populate per-CPU SMT sibling masks, mirroring COSMOS's
+    /// `init_smt_domains()` which calls the `enable_sibling_cpu` syscall prog
+    /// for every SMT sibling pair. `threads_per_core` must match the
+    /// `Scenario`'s `smt()` setting so the sibling grouping lines up with the
+    /// engine's topology.
+    ///
+    /// Must be called after construction and before `Simulator::run()`.
+    pub fn cosmos_enable_smt_siblings(&self, nr_cpus: u32, threads_per_core: u32) {
+        type EnableSiblingsFn = unsafe extern "C" fn(u32, u32);
+        // SAFETY: Symbol resolved from a `.so` built by our build system.
+        unsafe {
+            let sym: libloading::Symbol<EnableSiblingsFn> = self
+                ._lib
+                .get(b"cosmos_enable_smt_siblings")
+                .expect("cosmos_enable_smt_siblings not found");
+            (sym)(nr_cpus, threads_per_core);
+        }
+    }
+
     /// Look up scheduler ops function pointers from the loaded library.
     ///
     /// Mandatory symbols panic if missing. Optional symbols become `None`.

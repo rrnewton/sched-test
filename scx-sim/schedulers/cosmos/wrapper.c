@@ -340,16 +340,30 @@ static struct cpu_ctx *cosmos_lookup_percpu_elem(int cpu)
 static struct scx_test_map task_ctx_map;
 static struct scx_test_map node_ctx_test_map;
 static struct scx_test_map cpu_node_test_map;
+static struct scx_test_map cpu_util_test_map;
 
 void cosmos_register_maps(void)
 {
-	u32 node;
+	u32 node, cpu;
 	struct node_ctx zero_node = {};
+	u64 zero_util = 0;
 
 	scx_test_map_clear_all();
 
 	INIT_SCX_TEST_MAP_FROM_TASK_STORAGE(&task_ctx_map, task_ctx_stor);
 	scx_test_map_register(&task_ctx_map, &task_ctx_stor);
+
+	/*
+	 * cpu_util_map (BPF_MAP_TYPE_ARRAY): per-CPU user utilization in
+	 * [0..1024], written periodically by cosmos userspace (main.rs poll
+	 * loop) and read by is_cpu_busy(). Back it with zeroed entries so the
+	 * scheduler can always look it up; cosmos_set_cpu_util() lets tests
+	 * play userspace's role and drive the busy/deadline-mode path.
+	 */
+	INIT_SCX_TEST_MAP(&cpu_util_test_map, cpu_util_map);
+	scx_test_map_register(&cpu_util_test_map, &cpu_util_map);
+	for (cpu = 0; cpu < cpu_util_test_map.max_entries; cpu++)
+		bpf_map_update_elem(&cpu_util_map, &cpu, &zero_util, 0);
 
 	/*
 	 * ARRAY maps are preallocated in the kernel. Seed zeroed entries here so
@@ -451,4 +465,100 @@ void cosmos_configure_numa(unsigned int num_cpus, unsigned int nr_nodes)
 
 	numa_enabled = true;
 	nr_node_ids = nr_nodes;
+}
+
+/*
+ * Test knob: select COSMOS's lightweight idle-CPU scan paths.
+ *
+ * Mirrors the production `scx_cosmos --flat-idle-scan` / `--preferred-idle-scan`
+ * options (see scx_cosmos main.rs: rodata.flat_idle_scan / preferred_idle_scan).
+ * When either is enabled and prev_cpu is not busy, pick_idle_cpu() routes to
+ * pick_idle_cpu_flat()/pick_idle_cpu_pref_smt() instead of the
+ * scx_bpf_select_cpu_and() kfunc path (main.bpf.c pick_idle_cpu(), line ~842).
+ *
+ * When @preferred is set, production fills preferred_cpus[] from the topology's
+ * capacity/locality ordering. The simulator has no such ordering to import, so
+ * we seed an identity ranking (preferred_cpus[i] = i) which is a valid ordering
+ * and makes pick_idle_cpu_pref_smt() visit every CPU.
+ */
+void cosmos_set_idle_scan(unsigned int num_cpus, int flat, int preferred)
+{
+	unsigned int i;
+
+	flat_idle_scan = flat ? true : false;
+	preferred_idle_scan = preferred ? true : false;
+
+	if (preferred) {
+		for (i = 0; i < num_cpus && i < MAX_CPUS; i++)
+			preferred_cpus[i] = i;
+	}
+}
+
+/*
+ * Test knob: install an asymmetric (big.LITTLE) per-CPU capacity table.
+ *
+ * Mirrors scx_cosmos userspace, which normalizes each CPU's capacity to
+ * [1, 1024] and writes rodata.cpu_capacity[cpu] (main.rs ~line 614), setting
+ * all_cpus_same_capacity=false when the machine has heterogeneous cores. With
+ * this in place COSMOS's is_cpu_faster()/scale_by_cpu_capacity() compare real
+ * per-CPU capacities (main.bpf.c line ~665/1357).
+ */
+void cosmos_set_cpu_capacity(unsigned int num_cpus, const unsigned long long *caps)
+{
+	unsigned int i;
+
+	all_cpus_same_capacity = false;
+	for (i = 0; i < num_cpus && i < MAX_CPUS; i++)
+		cpu_capacity[i] = caps[i];
+}
+
+/*
+ * Test knob: populate per-CPU SMT sibling masks.
+ *
+ * Mirrors scx_cosmos's init_smt_domains() (main.rs), which walks the topology's
+ * SMT siblings and calls the enable_sibling_cpu SEC("syscall") prog once per
+ * (cpu, sibling) pair. The simulator lays SMT siblings out as consecutive
+ * blocks of @threads_per_core CPUs per core (engine.rs build_cpus), so we
+ * reproduce that grouping here and invoke enable_sibling_cpu() for every
+ * ordered sibling pair within each core, exactly as userspace does at init.
+ */
+/*
+ * Test knob: set per-CPU user utilization (the signal cosmos userspace polls
+ * and writes into cpu_util_map every --polling-ms; see main.rs). @util is on
+ * the production [0..1024] scale. is_cpu_busy(cpu) returns true when
+ * cpu_util_map[cpu] >= busy_threshold, switching COSMOS from per-CPU
+ * round-robin queues to the global deadline queue (task_dl / shared DSQ).
+ *
+ * The simulator does not yet compute per-CPU utilization automatically
+ * (mb sim-642cb2), so tests set it explicitly to match their workload — e.g.
+ * a saturated oversubscribed run sets util near 1024.
+ */
+void cosmos_set_cpu_util(unsigned int num_cpus, unsigned long long util)
+{
+	unsigned int cpu;
+
+	for (cpu = 0; cpu < num_cpus && cpu < MAX_CPUS; cpu++)
+		bpf_map_update_elem(&cpu_util_map, &cpu, &util, 0);
+}
+
+void cosmos_enable_smt_siblings(unsigned int num_cpus, unsigned int threads_per_core)
+{
+	unsigned int base, a, b;
+
+	if (threads_per_core < 2)
+		return;
+
+	for (base = 0; base + threads_per_core <= num_cpus; base += threads_per_core) {
+		for (a = 0; a < threads_per_core; a++) {
+			for (b = 0; b < threads_per_core; b++) {
+				struct domain_arg arg;
+
+				if (a == b)
+					continue;
+				arg.cpu_id = (s32)(base + a);
+				arg.sibling_cpu_id = (s32)(base + b);
+				enable_sibling_cpu(&arg);
+			}
+		}
+	}
 }
