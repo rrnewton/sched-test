@@ -1214,6 +1214,112 @@ impl DynamicScheduler {
         sched
     }
 
+    /// Enable (or disable) COSMOS's lightweight flat idle-CPU scan.
+    ///
+    /// Mirrors `scx_cosmos --flat-idle-scan`. When enabled, `pick_idle_cpu()`
+    /// uses the BPF-side `pick_idle_cpu_flat()` / `pick_idle_cpu_pref_smt()`
+    /// scan (and `get_idle_smtmask()` / `test_cpu_idle()`) instead of the
+    /// `scx_bpf_select_cpu_and()` kfunc path that `cosmos_setup()` forces.
+    ///
+    /// Must be called on a `cosmos()` scheduler before `Simulator::run()`.
+    pub fn cosmos_set_flat_idle_scan(&self, enabled: bool) {
+        self.cosmos_call_set_u32("cosmos_set_flat_idle_scan", enabled as u32);
+    }
+
+    /// Enable (or disable) COSMOS's preferred-order idle-CPU scan.
+    ///
+    /// Mirrors `scx_cosmos --preferred-idle-scan`. Routes through
+    /// `pick_idle_cpu_flat()` but scans CPUs in the `preferred_cpus[]`
+    /// ranking; seed that ranking with [`Self::cosmos_set_preferred_cpu`].
+    pub fn cosmos_set_preferred_idle_scan(&self, enabled: bool) {
+        self.cosmos_call_set_u32("cosmos_set_preferred_idle_scan", enabled as u32);
+    }
+
+    /// Seed one entry of the `preferred_cpus[]` idle-scan ranking
+    /// (`rank` = scan position, `cpu` = CPU id placed at that rank).
+    pub fn cosmos_set_preferred_cpu(&self, rank: u32, cpu: crate::types::CpuId) {
+        self.cosmos_call_set_u32_u64("cosmos_set_preferred_cpu", rank, cpu.0 as u64);
+    }
+
+    /// Set a CPU's capacity (`0..=1024`, where `1024` == `SCX_CPUPERF_ONE`)
+    /// and mark the system heterogeneous.
+    ///
+    /// Mimics the per-CPU capacity `scx_cosmos` derives from a big.LITTLE
+    /// host. Enables `is_cpu_faster()` / `cpus_share_cache()` on the wakeup
+    /// migration path and `scale_by_cpu_capacity()` slice scaling.
+    pub fn cosmos_set_cpu_capacity(&self, cpu: crate::types::CpuId, capacity: u64) {
+        self.cosmos_call_set_u32_u64("cosmos_set_cpu_capacity", cpu.0, capacity);
+    }
+
+    /// Set a CPU's userspace-reported utilization (`0..=1024`) in
+    /// `cpu_util_map`.
+    ///
+    /// In production this map is refreshed periodically from userspace; the
+    /// simulator has no such loop, so tests populate it here to drive
+    /// `is_cpu_busy() == true` and reach the deadline / shared-DSQ path
+    /// (`task_dl()`).
+    pub fn cosmos_set_cpu_util(&self, cpu: crate::types::CpuId, util: u64) {
+        self.cosmos_call_set_u32_u64("cosmos_set_cpu_util", cpu.0, util);
+    }
+
+    /// Set `busy_threshold`: `is_cpu_busy()` reports busy when a CPU's
+    /// `cpu_util_map` value is `>=` this threshold (`--busy-threshold`).
+    pub fn cosmos_set_busy_threshold(&self, threshold: u64) {
+        self.cosmos_call_set_u64("cosmos_set_busy_threshold", threshold);
+    }
+
+    /// Enable (or disable) tick-driven time preemption (`--time-preemption`).
+    ///
+    /// When enabled, `cosmos_tick()` force-preempts a task that has exceeded
+    /// its slice on a busy/contended CPU, so a saturated system rotates its
+    /// shared DSQ (deadline-ordered) rather than letting the first-dispatched
+    /// tasks monopolize their CPUs. Also covers the `cosmos_tick` body.
+    pub fn cosmos_set_time_preemption(&self, enabled: bool) {
+        self.cosmos_call_set_u32("cosmos_set_time_preemption", enabled as u32);
+    }
+
+    /// Invoke a COSMOS `void(u32)` wrapper setter by symbol name.
+    fn cosmos_call_set_u32(&self, sym_name: &str, val: u32) {
+        type SetU32Fn = unsafe extern "C" fn(u32);
+        // SAFETY: Symbol resolved from a `.so` built by our build system;
+        // the named cosmos setter has the `void(u32)` signature.
+        unsafe {
+            let sym: libloading::Symbol<SetU32Fn> = self
+                ._lib
+                .get(sym_name.as_bytes())
+                .unwrap_or_else(|e| panic!("{sym_name} not found: {e}"));
+            (sym)(val);
+        }
+    }
+
+    /// Invoke a COSMOS `void(u64)` wrapper setter by symbol name.
+    fn cosmos_call_set_u64(&self, sym_name: &str, val: u64) {
+        type SetU64Fn = unsafe extern "C" fn(u64);
+        // SAFETY: Symbol resolved from a `.so` built by our build system;
+        // the named cosmos setter has the `void(u64)` signature.
+        unsafe {
+            let sym: libloading::Symbol<SetU64Fn> = self
+                ._lib
+                .get(sym_name.as_bytes())
+                .unwrap_or_else(|e| panic!("{sym_name} not found: {e}"));
+            (sym)(val);
+        }
+    }
+
+    /// Invoke a COSMOS `void(u32, u64)` wrapper setter by symbol name.
+    fn cosmos_call_set_u32_u64(&self, sym_name: &str, a: u32, b: u64) {
+        type SetU32U64Fn = unsafe extern "C" fn(u32, u64);
+        // SAFETY: Symbol resolved from a `.so` built by our build system;
+        // the named cosmos setter has the `void(u32, u64)` signature.
+        unsafe {
+            let sym: libloading::Symbol<SetU32U64Fn> = self
+                ._lib
+                .get(sym_name.as_bytes())
+                .unwrap_or_else(|e| panic!("{sym_name} not found: {e}"));
+            (sym)(a, b);
+        }
+    }
+
     /// Look up scheduler ops function pointers from the loaded library.
     ///
     /// Mandatory symbols panic if missing. Optional symbols become `None`.

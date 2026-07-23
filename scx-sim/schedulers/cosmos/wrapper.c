@@ -340,11 +340,13 @@ static struct cpu_ctx *cosmos_lookup_percpu_elem(int cpu)
 static struct scx_test_map task_ctx_map;
 static struct scx_test_map node_ctx_test_map;
 static struct scx_test_map cpu_node_test_map;
+static struct scx_test_map cpu_util_test_map;
 
 void cosmos_register_maps(void)
 {
-	u32 node;
+	u32 node, cpu;
 	struct node_ctx zero_node = {};
+	u64 zero_util = 0;
 
 	scx_test_map_clear_all();
 
@@ -362,6 +364,19 @@ void cosmos_register_maps(void)
 
 	INIT_SCX_TEST_MAP(&cpu_node_test_map, cpu_node_map);
 	scx_test_map_register(&cpu_node_test_map, &cpu_node_map);
+
+	/*
+	 * cpu_util_map (ARRAY, key u32 -> value u64) holds per-CPU userspace
+	 * utilization; is_cpu_busy() reads it. In production it is refreshed
+	 * periodically from userspace. Register + zero-seed it here so
+	 * is_cpu_busy() lookups always succeed (default: not busy) and so
+	 * cosmos_set_cpu_util() writes land in a live map — otherwise the
+	 * deadline/shared-DSQ path (task_dl()) is unreachable under sim.
+	 */
+	INIT_SCX_TEST_MAP(&cpu_util_test_map, cpu_util_map);
+	scx_test_map_register(&cpu_util_test_map, &cpu_util_map);
+	for (cpu = 0; cpu < cpu_util_test_map.max_entries; cpu++)
+		bpf_map_update_elem(&cpu_util_map, &cpu, &zero_util, 0);
 
 	/*
 	 * Upstream scx_cosmos dropped deferred CPU wakeups and removed the
@@ -451,4 +466,105 @@ void cosmos_configure_numa(unsigned int num_cpus, unsigned int nr_nodes)
 
 	numa_enabled = true;
 	nr_node_ids = nr_nodes;
+}
+
+/*
+ * =================================================================
+ * Coverage-oriented knob setters (tg write-cosmos-tests)
+ * =================================================================
+ *
+ * cosmos_setup() intentionally pins COSMOS into its simplest
+ * configuration (flat_idle_scan=false, homogeneous capacity, empty
+ * cpu_util_map). That leaves several production code paths dormant
+ * under simulation — the flat/SMT idle scan, heterogeneous-capacity
+ * placement, and the busy/deadline (shared-DSQ) path. See
+ * scx-sim/ai_docs/COVERAGE_AUDIT_20260722.md.
+ *
+ * The setters below let a test opt into those configurations. They
+ * write the SAME const-volatile globals / BPF maps that the real
+ * scx_cosmos userspace loader (and the periodic userspace utilization
+ * sampler) populate on a matching host — so this is substrate
+ * modeling (what the kernel/userspace provides), NOT a reimplementation
+ * of scheduler logic. Each must be called AFTER cosmos_setup() and
+ * BEFORE the first ops callback.
+ */
+
+/*
+ * Enable/disable the lightweight flat idle-CPU scan (scx_cosmos
+ * --flat-idle-scan). When set, pick_idle_cpu() uses the BPF-side
+ * pick_idle_cpu_flat()/pick_idle_cpu_pref_smt() scan instead of the
+ * scx_bpf_select_cpu_and() kfunc path.
+ */
+void cosmos_set_flat_idle_scan(unsigned int val)
+{
+	flat_idle_scan = !!val;
+}
+
+/*
+ * Enable/disable the preferred-order idle-CPU scan (scx_cosmos
+ * --preferred-idle-scan). Also routes through pick_idle_cpu_flat(), but
+ * scans CPUs in the preferred_cpus[] ranking (seed it with
+ * cosmos_set_preferred_cpu()).
+ */
+void cosmos_set_preferred_idle_scan(unsigned int val)
+{
+	preferred_idle_scan = !!val;
+}
+
+/*
+ * Seed one entry of the preferred_cpus[] ranking used by the preferred
+ * idle scan (rank = scan position, cpu = CPU id at that rank).
+ */
+void cosmos_set_preferred_cpu(unsigned int rank, unsigned long long cpu)
+{
+	if (rank < MAX_CPUS)
+		preferred_cpus[rank] = cpu;
+}
+
+/*
+ * Set a CPU's capacity (0..SCX_CPUPERF_ONE == 1024) and mark the system
+ * heterogeneous. Mirrors the per-CPU capacity scx_cosmos derives from a
+ * big.LITTLE host, enabling is_cpu_faster()/cpus_share_cache() on the
+ * wakeup migration path and scale_by_cpu_capacity() slice scaling.
+ */
+void cosmos_set_cpu_capacity(unsigned int cpu, unsigned long long capacity)
+{
+	if (cpu < MAX_CPUS) {
+		cpu_capacity[cpu] = capacity;
+		all_cpus_same_capacity = false;
+	}
+}
+
+/*
+ * Set a CPU's userspace-reported utilization (0..1024) in cpu_util_map.
+ * In production this map is refreshed periodically from userspace; the
+ * simulator has no such loop, so tests populate it here to drive
+ * is_cpu_busy()==true and reach the deadline/shared-DSQ path (task_dl()).
+ */
+void cosmos_set_cpu_util(unsigned int cpu, unsigned long long util)
+{
+	u32 key = cpu;
+	u64 val = util;
+
+	bpf_map_update_elem(&cpu_util_map, &key, &val, 0);
+}
+
+/*
+ * Set busy_threshold: is_cpu_busy() reports busy when a CPU's
+ * cpu_util_map value is >= this threshold (scx_cosmos --busy-threshold).
+ */
+void cosmos_set_busy_threshold(unsigned long long val)
+{
+	busy_threshold = val;
+}
+
+/*
+ * Enable/disable tick-driven time preemption (scx_cosmos --time-preemption).
+ * When set, cosmos_tick() force-preempts a task that has exceeded its slice
+ * while the CPU is busy/contended, so a saturated system rotates its shared
+ * DSQ instead of letting the first-dispatched tasks monopolize their CPUs.
+ */
+void cosmos_set_time_preemption(unsigned int val)
+{
+	time_preemption = !!val;
 }
