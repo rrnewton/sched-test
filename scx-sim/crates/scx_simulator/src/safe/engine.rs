@@ -413,6 +413,12 @@ impl ExitKind {
 
 /// SCX wake flags.
 const SCX_ENQ_WAKEUP: u64 = 0x1;
+/// A regular wakeup routed through `try_to_wake_up()`. The kernel sets this on
+/// every ttwu-path activation, which is the common case; schedulers gate
+/// wakeup-only logic on it (e.g. cosmos `is_wakeup()` at main.bpf.c:858, which
+/// guards `is_cpu_faster()`/`cpus_share_cache()`). Matches kernel
+/// SCX_WAKE_TTWU (= 8). See mb sim-e10316.
+const SCX_WAKE_TTWU: u64 = 8;
 /// Synchronous wakeup: waker is about to sleep/yield, hinting the scheduler
 /// to place the wakee on the same CPU.  Matches kernel SCX_WAKE_SYNC (= 16).
 const SCX_WAKE_SYNC: u64 = 16;
@@ -3536,6 +3542,18 @@ impl<S: Scheduler> Simulator<S> {
         } else {
             SCX_ENQ_WAKEUP
         };
+        // wake_flags for ops.select_cpu() are a DISTINCT namespace from the
+        // SCX_ENQ_* flags passed to runnable/enqueue: in the kernel every
+        // wakeup routed through try_to_wake_up() carries SCX_WAKE_TTWU, plus
+        // SCX_WAKE_SYNC for synchronous (waker-yielding) wakeups. Build them
+        // separately so wakeup-gated scheduler logic runs (cosmos is_wakeup()
+        // hybrid-core migration), while leaving the traced enq_flags — which
+        // enqueue_flags.rs pins — untouched. See mb sim-e10316.
+        let wake_flags = if waker_raw.is_some() {
+            SCX_WAKE_TTWU | SCX_WAKE_SYNC
+        } else {
+            SCX_WAKE_TTWU
+        };
         set_ops_context(&mut s.sim, OpsContext::Runnable);
         s.sim.waker_task_raw = waker_raw;
         debug!(pid = pid.0, "enter:structop runnable");
@@ -3565,7 +3583,7 @@ impl<S: Scheduler> Simulator<S> {
         sim_callback!(s, guard, sim_arc, wake_cpu, {
             selected_cpu_raw =
                 self.scheduler
-                    .select_cpu(TaskPtr::new(raw), prev_cpu.0 as i32, enq_flags);
+                    .select_cpu(TaskPtr::new(raw), prev_cpu.0 as i32, wake_flags);
         });
         let s = &mut *guard;
 

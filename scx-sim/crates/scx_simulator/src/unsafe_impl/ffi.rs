@@ -1298,6 +1298,28 @@ impl DynamicScheduler {
         }
     }
 
+    /// Register a GPU task's preferred NUMA node in COSMOS's `gpu_pid_map`.
+    ///
+    /// Mirrors scx_cosmos userspace, which reads the NVML GPU-process list and
+    /// writes `pid -> node` entries into `gpu_pid_map`. Once registered,
+    /// `gpu_node_by_pid(pid)` returns `node`, so `cosmos_select_cpu()`'s
+    /// GPU-affinity branch (main.bpf.c ~1085) runs `pick_cpu_on_gpu_node()` →
+    /// `can_use_node()` for the task — the only path that reaches
+    /// `can_use_node()` (mb sim-c63e46). Requires NUMA (`cosmos_with_numa`).
+    ///
+    /// Must be called after construction and before `Simulator::run()`.
+    pub fn cosmos_add_gpu_task(&self, pid: u32, node: u32) {
+        type AddGpuTaskFn = unsafe extern "C" fn(u32, u32);
+        // SAFETY: Symbol resolved from a `.so` built by our build system.
+        unsafe {
+            let sym: libloading::Symbol<AddGpuTaskFn> = self
+                ._lib
+                .get(b"cosmos_add_gpu_task")
+                .expect("cosmos_add_gpu_task not found");
+            (sym)(pid, node);
+        }
+    }
+
     /// Look up scheduler ops function pointers from the loaded library.
     ///
     /// Mandatory symbols panic if missing. Optional symbols become `None`.

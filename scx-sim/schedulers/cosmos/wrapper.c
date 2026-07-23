@@ -341,6 +341,19 @@ static struct scx_test_map task_ctx_map;
 static struct scx_test_map node_ctx_test_map;
 static struct scx_test_map cpu_node_test_map;
 static struct scx_test_map cpu_util_test_map;
+static struct scx_test_map gpu_pid_test_map;
+/*
+ * gpu_pid_map is registered lazily by cosmos_add_gpu_task() rather than in
+ * cosmos_register_maps(), so runs without GPU tasks (the common case) do not
+ * pay the extra map registration. This matters for reproducibility: registering
+ * an otherwise-unused map for every run perturbs the C-heap allocation pattern
+ * enough to expose a latent address-sensitivity in exact two-run trace
+ * comparisons (test_cosmos_domain_determinism); see mb sim-c63e46. The
+ * scheduler observes identical behaviour either way — an empty/absent gpu_pid_map
+ * both make gpu_node_by_pid() return -ENOENT. This flag is reset per run in
+ * cosmos_register_maps() (which scx_test_map_clear_all()s the whole registry).
+ */
+static bool gpu_pid_map_registered;
 
 void cosmos_register_maps(void)
 {
@@ -349,6 +362,7 @@ void cosmos_register_maps(void)
 	u64 zero_util = 0;
 
 	scx_test_map_clear_all();
+	gpu_pid_map_registered = false;
 
 	INIT_SCX_TEST_MAP_FROM_TASK_STORAGE(&task_ctx_map, task_ctx_stor);
 	scx_test_map_register(&task_ctx_map, &task_ctx_stor);
@@ -561,4 +575,31 @@ void cosmos_enable_smt_siblings(unsigned int num_cpus, unsigned int threads_per_
 			}
 		}
 	}
+}
+
+/*
+ * Test knob: register a GPU task's preferred NUMA node in gpu_pid_map.
+ *
+ * Mirrors scx_cosmos userspace, which reads the NVML GPU-process list and
+ * writes pid -> node entries into gpu_pid_map (see scx_cosmos main.rs GPU
+ * affinity handling). With an entry present, gpu_node_by_pid() returns @node,
+ * so cosmos_select_cpu()'s GPU-affinity branch (main.bpf.c ~1085) calls
+ * pick_cpu_on_gpu_node() -> can_use_node() for @pid, exercising the per-node
+ * cpumask restriction that is otherwise unreachable under sim (mb sim-c63e46).
+ *
+ * @node must be a valid NUMA node id (requires cosmos_with_numa()). Must be
+ * called after construction (cosmos_setup/cosmos_configure_numa) and before
+ * Simulator::run(). Registers gpu_pid_map with the test-map infra on first use
+ * (see gpu_pid_map_registered above for why registration is lazy).
+ */
+void cosmos_add_gpu_task(unsigned int pid, unsigned int node)
+{
+	u32 key = pid, val = node;
+
+	if (!gpu_pid_map_registered) {
+		INIT_SCX_TEST_MAP(&gpu_pid_test_map, gpu_pid_map);
+		scx_test_map_register(&gpu_pid_test_map, &gpu_pid_map);
+		gpu_pid_map_registered = true;
+	}
+	bpf_map_update_elem(&gpu_pid_map, &key, &val, 0);
 }

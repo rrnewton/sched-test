@@ -245,11 +245,10 @@ fn test_preferred_idle_scan() {
 ///
 /// NOTE: the related wakeup-migration block that calls `is_cpu_faster()` /
 /// `cpus_share_cache()` (main.bpf.c ~858) is gated on `is_wakeup(wake_flags)`
-/// == `wake_flags & SCX_WAKE_TTWU`, which the sim does not currently set (it
-/// sends `SCX_WAKE_SYNC` only). Those two functions therefore stay uncovered
-/// pending the substrate fix in mb sim-e10316; this test still installs the
-/// asymmetric table + a waker/wakee workload so it is ready to cover them once
-/// TTWU is delivered.
+/// == `wake_flags & SCX_WAKE_TTWU`. The engine now delivers `SCX_WAKE_TTWU` on
+/// waker-driven wakes (mb sim-e10316, resolved); those two functions are
+/// covered by `test_hybrid_core_wakeup_migration` below. This test focuses on
+/// the slice-scaling path.
 #[test]
 fn test_heterogeneous_capacity() {
     let _lock = common::setup_test();
@@ -307,10 +306,9 @@ fn test_heterogeneous_capacity() {
 /// NOTE: `can_use_node()` itself (main.bpf.c ~474) is reachable only through
 /// the GPU-affinity branch of `pick_cpu_on_gpu_node()` (which requires
 /// `gpu_node_by_pid(pid)` to return a node), and short-circuits for non-GPU
-/// tasks. Covering it needs the GPU
-/// subsystem modeled in the sim (gpu_enabled + gpu_pid_map) — tracked in
-/// mb sim-c63e46; the audit §4.3 hint (plain restricted affinity) was
-/// incomplete.
+/// tasks. It is covered by `test_gpu_node_affinity` below, which registers a
+/// GPU task via `cosmos_add_gpu_task()` (mb sim-c63e46, resolved); the audit
+/// §4.3 hint (plain restricted affinity) was incomplete.
 #[test]
 fn test_numa_restricted_affinity() {
     let _lock = common::setup_test();
@@ -490,4 +488,147 @@ fn test_select_cpu_enqueue_matrix() {
             );
         }
     }
+}
+
+/// Hybrid-core wakeup migration (`is_cpu_faster` / `cpus_share_cache`).
+///
+/// cosmos `pick_idle_cpu()`'s "move the wakee toward a faster waker CPU" block
+/// (main.bpf.c ~858) is gated on `is_wakeup(wake_flags)` ==
+/// `(wake_flags & SCX_WAKE_TTWU)`. The engine now delivers `SCX_WAKE_TTWU` on
+/// waker-driven wakes (mb sim-e10316), so with an asymmetric big.LITTLE
+/// capacity table a waker pinned to a big core, waking wakees that were last on
+/// LITTLE cores, makes `is_cpu_faster(waker_cpu, wakee_prev_cpu)` true — which
+/// in turn calls `cpus_share_cache()`. Both functions ran 0% under sim before
+/// the TTWU fix (audit §4.2). The wakees are allowed on the waker's big core
+/// (so `this_cpu` is passed through as allowed) AND on the LITTLE cores (so
+/// their `prev_cpu` is genuinely slower than the waker's).
+#[test]
+fn test_hybrid_core_wakeup_migration() {
+    let _lock = common::setup_test();
+    let sched = DynamicScheduler::cosmos(4);
+    // CPUs 0,1 = big (1024); CPUs 2,3 = LITTLE (512).
+    sched.cosmos_set_cpu_capacity(&[1024, 1024, 512, 512]);
+
+    let mut b = Scenario::builder().cpus(4);
+    // Waker pinned to a big core (cpu 0); it wakes both wakees each cycle.
+    b = b.task(TaskDef {
+        name: "waker".into(),
+        pid: Pid(1),
+        nice: 0,
+        behavior: TaskBehavior {
+            phases: vec![
+                Phase::Run(3_000_000),
+                Phase::Wake(Pid(2)),
+                Phase::Wake(Pid(3)),
+                Phase::Sleep(2_000_000),
+            ],
+            repeat: RepeatMode::Forever,
+        },
+        start_time_ns: 0,
+        mm_id: None,
+        allowed_cpus: Some(vec![CpuId(0)]),
+        parent_pid: None,
+        cgroup_name: None,
+        task_flags: 0,
+        migration_disabled: 0,
+    });
+    // Wakees allowed on the big core (cpu 0, the waker's CPU) plus the LITTLE
+    // cores (2,3): with cpu 0 occupied by the waker they run on the slower
+    // cores, so on wakeup `this_cpu`(=0, big) is faster than their `prev_cpu`.
+    for pid in [2, 3] {
+        b = b.task(TaskDef {
+            name: format!("wakee{pid}"),
+            pid: Pid(pid),
+            nice: 0,
+            behavior: TaskBehavior {
+                phases: vec![Phase::Run(2_000_000), Phase::Sleep(6_000_000)],
+                repeat: RepeatMode::Forever,
+            },
+            start_time_ns: 0,
+            mm_id: None,
+            allowed_cpus: Some(vec![CpuId(0), CpuId(2), CpuId(3)]),
+            parent_pid: None,
+            cgroup_name: None,
+            task_flags: 0,
+            migration_disabled: 0,
+        });
+    }
+    let scenario = b.duration_ms(200).build();
+
+    let trace = Simulator::new(sched).run(scenario);
+
+    for pid in 1..=3 {
+        assert!(
+            trace.total_runtime(Pid(pid)) > 0,
+            "task {pid} got no runtime in hybrid-core wakeup test"
+        );
+    }
+}
+
+/// GPU-affinity node gating (`can_use_node`).
+///
+/// `can_use_node()` (main.bpf.c ~474) is reachable ONLY through
+/// `pick_cpu_on_gpu_node()` (~506), whose guard
+/// `target_node = gpu_node_by_pid(p->pid)` returns a node only for a task
+/// registered in `gpu_pid_map` — populated in production from NVML.
+/// `cosmos_add_gpu_task()` registers such a task (mb sim-c63e46). With NUMA
+/// enabled and the GPU task pinned to a node OTHER than its GPU node,
+/// `cosmos_select_cpu()`'s GPU branch (~1085) evaluates
+/// `can_use_node(p, gpu_node)` on every wakeup. It was 0% under sim before this
+/// (audit §4.3 — the hint there, "plain restricted affinity", was incomplete;
+/// `can_use_node` is GPU-gated).
+///
+/// NOTE: the task is pinned to CPUs that do NOT intersect the GPU node's
+/// cpumask, so `can_use_node()` returns false and `pick_cpu_on_gpu_node()`
+/// short-circuits BEFORE `__COMPAT_scx_bpf_pick_idle_cpu_node()`, which the sim
+/// does not yet model (it would hit a NULL weak ksym). `can_use_node()` is
+/// still fully executed. Covering its `return true` path (and the GPU dispatch
+/// itself) needs the idle-CPU-by-node kfunc modeled — tracked in mb sim-c63e46.
+#[test]
+fn test_gpu_node_affinity() {
+    let _lock = common::setup_test();
+    // 4 CPUs / 2 nodes: node 0 = {0,1}, node 1 = {2,3} (see cosmos_configure_numa).
+    let sched = DynamicScheduler::cosmos_with_numa(4, 2);
+    // Register pid 1 as a GPU task whose preferred node is node 1 ({2,3}) ...
+    sched.cosmos_add_gpu_task(1, 1);
+
+    let scenario = Scenario::builder()
+        .cpus(4)
+        .task(TaskDef {
+            name: "gpu_task".into(),
+            pid: Pid(1),
+            nice: 0,
+            behavior: wakey_task("gpu", 3_000_000, 2_000_000),
+            start_time_ns: 0,
+            mm_id: None,
+            // ... but pin it to node 0's CPUs {0,1}, which do NOT intersect
+            // node 1: it always runs on node 0 (so gpu_node != current node →
+            // can_use_node is evaluated) and can_use_node() returns false.
+            allowed_cpus: Some(vec![CpuId(0), CpuId(1)]),
+            parent_pid: None,
+            cgroup_name: None,
+            task_flags: 0,
+            migration_disabled: 0,
+        })
+        // A second, non-GPU task on the same node keeps the run realistic.
+        .task(TaskDef {
+            name: "other".into(),
+            pid: Pid(2),
+            nice: 0,
+            behavior: wakey_task("o", 3_000_000, 2_000_000),
+            start_time_ns: 0,
+            mm_id: None,
+            allowed_cpus: Some(vec![CpuId(0), CpuId(1)]),
+            parent_pid: None,
+            cgroup_name: None,
+            task_flags: 0,
+            migration_disabled: 0,
+        })
+        .duration_ms(200)
+        .build();
+
+    let trace = Simulator::new(sched).run(scenario);
+
+    assert!(trace.total_runtime(Pid(1)) > 0, "gpu task got no runtime");
+    assert!(trace.total_runtime(Pid(2)) > 0, "other task got no runtime");
 }
