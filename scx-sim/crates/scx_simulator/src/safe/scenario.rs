@@ -116,6 +116,47 @@ pub struct IrqEvent {
     pub wake_pids: Vec<Pid>,
 }
 
+/// A userspace-lock futex transition the scheduler can observe, as delivered
+/// by the kernel's futex tracepoint/fexit. This is what LAVD's `lock.bpf.c`
+/// keys its lock-holder boosting off of. See `ai_docs/FUTEX_SIM_DESIGN.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FutexOp {
+    /// A contended `futex_wait` returned success — the task acquired the lock.
+    /// Delivered to the scheduler as `FUTEX_WAIT` with `ret == 0`, which boosts
+    /// the lock holder (`LAVD_FLAG_FUTEX_BOOST`).
+    WaitAcquired,
+    /// A `futex_wake` woke ≥1 waiter — the lock was released. Delivered as
+    /// `FUTEX_WAKE` with `ret == 1` (waiters woken), which clears the boost.
+    WakeReleased,
+}
+
+impl FutexOp {
+    /// The `(op, ret)` pair passed to the scheduler's `futex_hook` — the
+    /// FUTEX_* command and the syscall return the scheduler observes.
+    /// `FUTEX_WAIT = 0`, `FUTEX_WAKE = 1` (see `linux/uapi/linux/futex.h`,
+    /// mirrored in `lock.bpf.c`).
+    pub fn to_op_ret(self) -> (i32, i64) {
+        match self {
+            FutexOp::WaitAcquired => (0 /* FUTEX_WAIT */, 0),
+            FutexOp::WakeReleased => (1 /* FUTEX_WAKE */, 1),
+        }
+    }
+}
+
+/// A scheduled futex transition to inject during simulation, mirroring
+/// [`IrqEvent`]. The engine delivers it to the scheduler's real futex hooks
+/// (running actual `lock.bpf.c` code) at `at_ns`, provided `pid` is the task
+/// running on a CPU at that instant.
+#[derive(Debug, Clone)]
+pub struct FutexEvent {
+    /// The task performing the futex op (must be running when it fires).
+    pub pid: Pid,
+    /// When the op fires (simulated ns).
+    pub at_ns: TimeNs,
+    /// Which transition (wait-acquired boosts, wake-released unboosts).
+    pub op: FutexOp,
+}
+
 /// CPU bandwidth configuration for a cgroup (cpu.max parameters).
 #[derive(Debug, Clone)]
 pub struct CgroupBandwidth {
@@ -702,6 +743,8 @@ pub struct Scenario {
     pub max_cgroups: u32,
     /// IRQ events to inject during the simulation.
     pub irq_events: Vec<IrqEvent>,
+    /// Scheduled futex transitions to inject (LAVD lock-holder boosting).
+    pub futex_events: Vec<FutexEvent>,
     /// Native concurrency backend configuration.
     ///
     /// When `Some`, workers run truly concurrently with real locks and
@@ -761,6 +804,7 @@ pub struct ScenarioBuilder {
     no_pmu_signal: bool,
     max_cgroups: u32,
     irq_events: Vec<IrqEvent>,
+    futex_events: Vec<FutexEvent>,
     native_concurrent: Option<NativeConcurrentConfig>,
     wait_debugger: bool,
     warmup_ns: TimeNs,
@@ -801,6 +845,7 @@ impl Scenario {
             no_pmu_signal: false,
             max_cgroups: DEFAULT_MAX_CGROUPS,
             irq_events: Vec::new(),
+            futex_events: Vec::new(),
             native_concurrent: None,
             wait_debugger: false,
             warmup_ns: 0,
@@ -1381,6 +1426,18 @@ impl ScenarioBuilder {
         self
     }
 
+    /// Schedule a futex transition for `pid` at `at_ns` (LAVD lock-holder
+    /// boosting). `pid` must be the task running on some CPU when the event
+    /// fires (otherwise the engine warns and skips it — use a workload where
+    /// the task is on-CPU at `at_ns`, e.g. a running task's mid-run window).
+    ///
+    /// `FutexOp::WaitAcquired` boosts the holder; `FutexOp::WakeReleased`
+    /// clears the boost. See `ai_docs/FUTEX_SIM_DESIGN.md`.
+    pub fn futex_event(mut self, pid: Pid, at_ns: TimeNs, op: FutexOp) -> Self {
+        self.futex_events.push(FutexEvent { pid, at_ns, op });
+        self
+    }
+
     /// Build the scenario.
     pub fn build(self) -> Scenario {
         assert!(
@@ -1443,6 +1500,7 @@ impl ScenarioBuilder {
             no_pmu_signal: self.no_pmu_signal,
             max_cgroups: self.max_cgroups,
             irq_events: self.irq_events,
+            futex_events: self.futex_events,
             native_concurrent: self.native_concurrent,
             wait_debugger: self.wait_debugger,
             warmup_ns: self.warmup_ns,

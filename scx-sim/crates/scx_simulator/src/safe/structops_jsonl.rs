@@ -641,6 +641,7 @@ fn emit_event(event: &TraceEvent, writer: &mut impl Write) -> io::Result<()> {
         | TraceKind::DispatchRejected { .. }
         | TraceKind::IrqStart { .. }
         | TraceKind::IrqEnd { .. }
+        | TraceKind::FutexBoost { .. }
         | TraceKind::CgroupBwCharge { .. }
         | TraceKind::CgroupBwDenied { .. }
         | TraceKind::CgroupBwDequeueOnThrottle { .. }

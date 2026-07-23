@@ -384,6 +384,24 @@ pub(crate) fn write_json(trace: &Trace, writer: &mut impl Write) -> std::io::Res
                 })
             }
 
+            // Futex lock-holder boost: instant event on the task's lane.
+            TraceKind::FutexBoost { pid, op, boosted } => {
+                json!({
+                    "ph": "i",
+                    "pid": cpu,
+                    "tid": pid.0,
+                    "ts": ts,
+                    "name": "futex_boost",
+                    "cat": "futex",
+                    "s": "t",
+                    "args": {
+                        "pid": pid.0,
+                        "op": format!("{op:?}"),
+                        "boosted": boosted
+                    }
+                })
+            }
+
             // Diff 3 wiring: cgroup bandwidth (cpu.max) trace events.
             // Emitted as instant events keyed to the CPU lane so they
             // line up visually with the affected task's slice in Perfetto.

@@ -955,6 +955,47 @@ void lavd_fire_timer(unsigned int slot)
 }
 
 /*
+ * Deliver a simulated futex transition to the REAL LAVD lock.bpf.c hooks.
+ *
+ * The scxsim engine resolves this as `lavd_futex_hook` (the `futex_op` FFI
+ * op) and calls it from inside a sim_callback! block, with current_cpu
+ * already set to the running task's CPU -- so bpf_get_current_task_btf() /
+ * get_cpu_ctx() attribute the boost to the correct task. This mirrors the
+ * lavd_fire_timer() substrate entry above.
+ *
+ * This models the kernel delivering a futex syscall tracepoint; the boost
+ * decision itself runs entirely inside lock.bpf.c (scx-sim CLAUDE.md No-Stub
+ * rule -- we do NOT reimplement the boost in Rust or here). We route through
+ * the tracepoint hooks (rtp_sys_enter_futex + rtp_sys_exit_futex) because
+ * they take plain struct pointers; the enter/exit pair drives the whole
+ * FUTEX_WAIT/WAKE/LOCK_PI/UNLOCK_PI switch -> __inc/__dec_futex_boost.
+ *
+ *   op  = a FUTEX_* command (FUTEX_WAIT boosts on ret==0; FUTEX_WAKE
+ *         unboosts on ret>0; the PI variants likewise -- see lock.bpf.c).
+ *   ret = the syscall return the scheduler observes.
+ *
+ * Returns the running task's task_ctx.flags after the hook so the engine can
+ * observe LAVD_FLAG_FUTEX_BOOST (bit 0), or -1 if the current task has no
+ * LAVD task_ctx. Reading the flag is observation only; it is owned/set by
+ * lock.bpf.c. The tp_syscall_enter_futex / tp_syscall_exit types are defined
+ * in lock.bpf.c (included above).
+ */
+long lavd_futex_hook(int op, long ret)
+{
+	struct tp_syscall_enter_futex fx_enter = { .op = op };
+	struct tp_syscall_exit fx_exit = { .ret = ret };
+	struct task_struct *p;
+	task_ctx *taskc;
+
+	rtp_sys_enter_futex(&fx_enter);	/* stores op into cpuc->futex_op */
+	rtp_sys_exit_futex(&fx_exit);	/* op switch -> __inc/__dec_futex_boost */
+
+	p = bpf_get_current_task_btf();
+	taskc = get_task_ctx(p);
+	return taskc ? (long)taskc->flags : -1;
+}
+
+/*
  * Phase 2 (tg `compile-scx-cgroup-bw-library-into-scxsim-phase2`,
  * Stage D shim retirement): the production
  * `scx/lib/cgroup_bw.bpf.c` compiled in below provides STRONG

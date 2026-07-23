@@ -27,7 +27,8 @@ use crate::preempt::{
     is_determinism_mode_enabled, record_checkpoint, scheduler_so_path, CheckpointEvent,
 };
 use crate::scenario::{
-    CgroupCpusetChangeEvent, CgroupCreateEvent, CgroupDestroyEvent, IrqType, PreemptMode, Scenario,
+    CgroupCpusetChangeEvent, CgroupCreateEvent, CgroupDestroyEvent, FutexOp, IrqType, PreemptMode,
+    Scenario,
 };
 use crate::scheduler_wrapper::{OptionalPtr, SchedulerWrapper, TaskPtr};
 use crate::sim_task::SimTask;
@@ -708,6 +709,11 @@ pub(crate) enum EventKind {
     },
     /// An interrupt handler completes on a CPU.
     IrqEnd { cpu: CpuId },
+    /// A scheduled futex transition: deliver `op` to the scheduler's real
+    /// futex hooks for `pid`. The CPU is derived at fire time from whichever
+    /// CPU `pid` is running on (the hooks act on the running task). See
+    /// `handle_futex_op` and `ai_docs/FUTEX_SIM_DESIGN.md`.
+    FutexOp { pid: Pid, op: FutexOp },
     /// Per-CPU event: consume from global DSQ into local DSQ.
     ///
     /// Scheduled after ops.dispatch() returns with an empty local DSQ.
@@ -2020,6 +2026,17 @@ impl<S: Scheduler> Simulator<S> {
             );
         }
 
+        // Seed futex events from the scenario (LAVD lock-holder boosting).
+        for fx in &scenario.futex_events {
+            s.events.push(
+                fx.at_ns,
+                EventKind::FutexOp {
+                    pid: fx.pid,
+                    op: fx.op,
+                },
+            );
+        }
+
         // Track cgroup resource limit
         let max_cgroups = scenario.max_cgroups;
 
@@ -2457,6 +2474,10 @@ impl<S: Scheduler> Simulator<S> {
                 s.sim.advance_cpu_clock(*cpu);
                 kfuncs::set_sim_clock(s.sim.cpus[cpu.0 as usize].local_clock, Some(*cpu));
             }
+            // FutexOp derives its CPU from the running task at fire time, so no
+            // pre-dispatch per-CPU clock advance is done here (the handler
+            // advances the derived CPU's clock itself).
+            EventKind::FutexOp { .. } => {}
         }
 
         match event.kind {
@@ -2551,6 +2572,11 @@ impl<S: Scheduler> Simulator<S> {
             EventKind::IrqEnd { cpu } => {
                 drop(guard);
                 self.handle_irq_end(cpu, sim_arc);
+                guard = sim_arc.lock().unwrap();
+            }
+            EventKind::FutexOp { pid, op } => {
+                drop(guard);
+                self.handle_futex_op(pid, op, sim_arc, monitor);
                 guard = sim_arc.lock().unwrap();
             }
             EventKind::DsqConsume { cpu } => {
@@ -3444,6 +3470,66 @@ impl<S: Scheduler> Simulator<S> {
             .record(__local_t, cpu, TraceKind::IrqEnd { cpu });
 
         info!(cpu = cpu.0, "IRQ END");
+    }
+
+    /// Deliver a scheduled futex transition to the scheduler's real futex
+    /// hooks (LAVD lock-holder boosting). Mirrors `handle_timer_fired`: it
+    /// runs a non-struct_ops C entry (`<prefix>_futex_hook`, resolved as the
+    /// `futex_op` op) inside `sim_callback!` with the running task's CPU
+    /// context installed, so the boost is attributed to the correct task.
+    ///
+    /// Per the No-Stub rule, the boost decision runs entirely in the real
+    /// `lock.bpf.c`; the engine only *delivers* the event, exactly as the
+    /// kernel delivers a futex tracepoint. The returned task flags are read
+    /// only for the `FutexBoost` trace observation.
+    ///
+    /// The CPU is derived from whichever CPU `pid` is running on. If `pid` is
+    /// not currently the running task on any CPU, the hooks would attribute to
+    /// the wrong task, so we log and skip (No-Silent-Failures) rather than
+    /// mis-attribute the boost — use a workload where `pid` is on-CPU at the
+    /// event time (see `ai_docs/FUTEX_SIM_DESIGN.md`).
+    fn handle_futex_op(&self, pid: Pid, op: FutexOp, sim_arc: &SimArc, monitor: &mut dyn Monitor) {
+        let _ = monitor;
+        let mut guard = sim_arc.lock().unwrap();
+        let s = &mut *guard;
+
+        // Derive the CPU `pid` is running on.
+        let cpu = match (0..s.sim.cpus.len())
+            .map(|i| CpuId(i as u32))
+            .find(|c| s.sim.cpus[c.0 as usize].current_task == Some(pid))
+        {
+            Some(c) => c,
+            None => {
+                warn!(
+                    pid = pid.0,
+                    "futex op for a task not currently running on any CPU; skipped"
+                );
+                return;
+            }
+        };
+
+        s.sim.advance_cpu_clock(cpu);
+        set_ops_context(&mut s.sim, OpsContext::None);
+        start_rbc(&mut s.sim);
+
+        let (op_i32, ret_i64) = op.to_op_ret();
+        // Assigned exactly once inside the callback below (sim_callback! always
+        // runs its block); read afterwards for the FutexBoost observation.
+        let flags: i64;
+        sim_callback!(s, guard, sim_arc, cpu, {
+            flags = self.scheduler.futex_op(op_i32, ret_i64);
+        });
+        let s = &mut *guard;
+        charge_sched_time(&mut s.sim, cpu, "futex_op");
+
+        // LAVD_FLAG_FUTEX_BOOST == 0x1 (lavd.bpf.h). flags == -1 means the
+        // task had no scheduler task_ctx (boost not applicable).
+        let boosted = flags >= 0 && (flags & 0x1) != 0;
+        let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
+        s.sim
+            .trace
+            .record(__local_t, cpu, TraceKind::FutexBoost { pid, op, boosted });
+        info!(pid = pid.0, ?op, boosted, "FUTEX OP");
     }
 
     /// Handle a task waking up.

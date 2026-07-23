@@ -433,6 +433,17 @@ pub trait Scheduler {
     /// Calls into C code.
     unsafe fn fire_timer(&self, _slot: u32) {}
 
+    /// Deliver a simulated futex transition to the scheduler's real futex
+    /// hooks (`op` = FUTEX_* command, `ret` = observed syscall return).
+    /// Returns the running task's scheduler flags for observation, or `-1`
+    /// if the scheduler does not implement futex boosting. Optional.
+    ///
+    /// # Safety
+    /// Calls into C code.
+    unsafe fn futex_op(&self, _op: i32, _ret: i64) -> i64 {
+        -1
+    }
+
     /// Periodic tick on the current CPU (ops.tick). Optional.
     /// `p` is the currently running task.
     /// # Safety
@@ -668,6 +679,10 @@ type CpuReleaseFn = unsafe extern "C" fn(i32, *mut c_void);
 type ExitFn = unsafe extern "C" fn(*mut c_void);
 type SetupFn = unsafe extern "C" fn(u32);
 type FireTimerFn = unsafe extern "C" fn(u32);
+/// `<prefix>_futex_hook(op, ret) -> flags`: deliver a simulated futex
+/// transition to the scheduler's real futex hooks and return the running
+/// task's flags for observation. Only LAVD provides this.
+type FutexHookFn = unsafe extern "C" fn(i32, i64) -> i64;
 type QuiescentFn = unsafe extern "C" fn(*mut c_void, u64);
 type DequeueFn = unsafe extern "C" fn(*mut c_void, u64);
 type TickFn = unsafe extern "C" fn(*mut c_void);
@@ -804,6 +819,7 @@ struct SchedOps {
     cpu_release: Option<CpuReleaseFn>,
     exit: Option<ExitFn>,
     fire_timer: Option<FireTimerFn>,
+    futex_op: Option<FutexHookFn>,
     quiescent: Option<QuiescentFn>,
     dequeue: Option<DequeueFn>,
     tick: Option<TickFn>,
@@ -1363,6 +1379,8 @@ impl DynamicScheduler {
             exit: try_get!("exit").map(|p| std::mem::transmute::<*const (), ExitFn>(p)),
             fire_timer: try_get!("fire_timer")
                 .map(|p| std::mem::transmute::<*const (), FireTimerFn>(p)),
+            futex_op: try_get!("futex_hook")
+                .map(|p| std::mem::transmute::<*const (), FutexHookFn>(p)),
             quiescent: try_get!("quiescent")
                 .map(|p| std::mem::transmute::<*const (), QuiescentFn>(p)),
             dequeue: try_get!("dequeue").map(|p| std::mem::transmute::<*const (), DequeueFn>(p)),
@@ -1557,6 +1575,14 @@ impl Scheduler for DynamicScheduler {
     unsafe fn fire_timer(&self, slot: u32) {
         if let Some(f) = self.ops.fire_timer {
             f(slot);
+        }
+    }
+
+    unsafe fn futex_op(&self, op: i32, ret: i64) -> i64 {
+        if let Some(f) = self.ops.futex_op {
+            f(op, ret)
+        } else {
+            -1
         }
     }
 

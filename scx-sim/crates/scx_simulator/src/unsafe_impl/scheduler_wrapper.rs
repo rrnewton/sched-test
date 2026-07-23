@@ -290,6 +290,16 @@ impl<S: Scheduler> SchedulerWrapper<S> {
         unsafe { self.inner.fire_timer(slot as u32) }
     }
 
+    /// Deliver a simulated futex transition (`op` = FUTEX_* command, `ret` =
+    /// observed syscall return) to the scheduler's real futex hooks, returning
+    /// the running task's scheduler flags for observation (`-1` if the
+    /// scheduler does not implement futex boosting). See `lavd_futex_hook`.
+    pub fn futex_op(&self, op: i32, ret: i64) -> i64 {
+        // SAFETY: delegates to the scheduler's `<prefix>_futex_hook` C entry,
+        // which only marshals args and calls the real BPF futex hooks.
+        unsafe { self.inner.futex_op(op, ret) }
+    }
+
     /// Periodic tick (`ops.tick`).
     pub fn tick(&self, p: TaskPtr) {
         // SAFETY: `p` is guaranteed non-null by `TaskPtr::new`.

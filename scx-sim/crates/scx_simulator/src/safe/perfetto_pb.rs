@@ -1037,6 +1037,21 @@ fn emit_event(trace: &Trace, ev: &crate::trace::TraceEvent, proto: &mut TracePro
                 anns,
             );
         }
+        TraceKind::FutexBoost { pid, op, boosted } => {
+            let anns = vec![
+                ann_int("pid", i64::from(pid.0)),
+                ann_string("op", format!("{op:?}")),
+                ann_uint("boosted", u64::from(*boosted)),
+            ];
+            push_instant(
+                proto,
+                ts,
+                cpu_track_uuid(cpu),
+                "SCXSIM_STRUCTOP",
+                "futex_boost",
+                anns,
+            );
+        }
     }
 }
 
@@ -1238,6 +1253,7 @@ fn event_pid(kind: &TraceKind) -> Option<Pid> {
         | TraceKind::KickCpu { .. }
         | TraceKind::IrqStart { .. }
         | TraceKind::IrqEnd { .. }
+        | TraceKind::FutexBoost { .. }
         | TraceKind::CgroupBwReplenish { .. }
         | TraceKind::UpdateIdle { .. }
         | TraceKind::CgroupInit { .. }

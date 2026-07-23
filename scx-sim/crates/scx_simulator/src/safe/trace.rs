@@ -6,7 +6,7 @@
 use crate::dsq::DsqManager;
 use crate::engine::ExitKind;
 use crate::fmt::FmtTs;
-use crate::scenario::IrqType;
+use crate::scenario::{FutexOp, IrqType};
 use crate::task::TaskDef;
 use crate::types::{CpuId, DsqId, Pid, TimeNs, Vtime};
 
@@ -305,6 +305,17 @@ pub enum TraceKind {
     IrqStart { cpu: CpuId, irq_type: IrqType },
     /// An interrupt handler completes on a CPU.
     IrqEnd { cpu: CpuId },
+
+    // ----- Futex (lock-holder boost) events -----
+    /// A simulated futex transition was delivered to the scheduler's real
+    /// futex hooks for `pid`. `boosted` is the task's `LAVD_FLAG_FUTEX_BOOST`
+    /// state *after* the hook ran (true after an acquire, false after a
+    /// release) — the observable effect of the real `lock.bpf.c` code.
+    FutexBoost {
+        pid: Pid,
+        op: FutexOp,
+        boosted: bool,
+    },
 
     // ----- Cgroup bandwidth (cpu.max) events -----
     /// Trace marker: `delta_ns` of CPU time consumed by `pid` in `cgid`.
@@ -1085,6 +1096,9 @@ impl Trace {
                     format!("IRQ_START cpu={} type={}", cpu.0, kind_str)
                 }
                 TraceKind::IrqEnd { cpu } => format!("IRQ_END  cpu={}", cpu.0),
+                TraceKind::FutexBoost { pid, op, boosted } => {
+                    format!("FUTEX_BOOST pid={} op={:?} boosted={}", pid.0, op, boosted)
+                }
                 TraceKind::CgroupBwCharge {
                     pid,
                     cgid,
