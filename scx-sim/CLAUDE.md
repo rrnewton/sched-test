@@ -176,6 +176,183 @@ approximations under any name (`*Manager`, `*State`, `*Tracker`,
 `*Cache`, `Sim*`) when the production owner of that state is a BPF
 scheduler.
 
+CRITICAL: Twin Design Principles (match production + exaggerated knobs)
+================================================================================
+
+The two No-Stub rules above govern WHAT executes inside scxsim — the
+scheduler's own BPF code, not a Rust approximation of it. The Twin
+Design Principles below govern HOW the scxsim engine, harness, and
+infrastructure surrounding the scheduler must BEHAVE. They are
+complementary, not redundant: the No-Stub rules prevent fake
+SCHEDULERS; the Twin Design Principles prevent a fake KERNEL /
+HARNESS underneath an otherwise-real scheduler.
+
+User mandate (web 2026-05-14):
+> *(1) be able to model production as closely as possible, always try
+> to match to what the live kernel does and what we can observe in
+> traces of live kernel workloads.*
+>
+> *(2) have knobs to selectively EXAGGERATE dimensions for stress
+> testing (e.g. extra delays) beyond what is probable on live kernel /
+> real HW.*
+
+Principle 1 — Match Production by Default
+------------------------------------------
+
+The scxsim engine, harness, and infrastructure default to **matching
+what the live kernel does and what we can observe in traces of live
+kernel workloads.** Any divergence from production behavior is
+**technical debt** — file it explicitly (a tg task, a `DANGER TODO(<issue>)`
+in code, or both) and either pay it down or make it an opt-in knob
+under Principle 2.
+
+Concrete checkpoints scxsim must match production on by default:
+
+- **Engine timing.** Per-task runtime accounting, period boundaries,
+  IPI semantics, scheduler tick delivery, watchdog firing. Charging
+  runtime to a task that wasn't actually on-CPU during that interval
+  (the V4-A engine over-charge bug) is a Principle 1 violation.
+- **BPF substrate semantics.** Kfunc return values, map operations,
+  per-CPU storage, BPF timer firing, iterator scope. The scheduler
+  observes a substrate that behaves like the kernel, not a
+  scxsim-specific approximation.
+- **Trace stream.** The bpftrace structops/helpers tracer (the
+  side-by-side BPF-call diff harness — `scxsim --trace-format perfetto`
+  + the matched live-kernel bpftrace recipe + the JSONL emitter +
+  `bug_finding/` diff tooling) is the **canonical fidelity check**.
+  Two runs of "the same workload" — one inside scxsim, one inside a
+  live kernel under wprof — should produce equivalent BPF call
+  streams within documented tolerances. Divergence in that diff
+  *is* the debt-discovery channel.
+- **Scheduler observation.** Anything the BPF scheduler can see
+  (CPU count, cgroup hierarchy, task state transitions, queue
+  occupancy, vtime, wake flags) must reflect what the kernel would
+  show. The scheduler must EXPERIENCE scxsim the same way it would
+  experience the kernel.
+
+Worked example (canonical anti-pattern): the cpu-bw-stall-bug
+**engine over-charge** finding (V4-A trace evidence,
+`audit-cgroup-bw-real-shim-state-202605`) and its 2-line surgical
+fix in V4-C. scxsim's engine was passing a stale `prev_task` to
+`lavd_dispatch(cpu, prev)` on idle CPUs, causing LAVD's
+`account_task_runtime` → `scx_cgroup_bw_consume(prev->cgroup,
+~100M ns/period)` to charge runtime to a task that wasn't actually
+on-CPU. The result: scxsim reproduced cpu-bw-stall-bug via a
+**different mechanism** than the live kernel does (PR #3521
+timer-MIN-bound regression). Both bugs were real, both produced the
+same observable symptom (LAVD `runnable task stall` watchdog → cgroup
+permanently throttled), but they were different bugs. The engine
+divergence had been silent debt for the entire investigation; once
+named (V4-A, via `CgroupBwConsumeNs` TraceKind), it became fixable
+(V4-C, +2 lines clearing `prev_task=None` on idle CPUs).
+
+Permanent infrastructure for catching the next Principle 1 violation
+of this class:
+
+- `CgroupBwConsumeNs` and `CgroupBwReplenish` TraceKinds expose every
+  consume / refill of cgroup_bw debt with the causal fields
+  (`keep_throttled`, `debt`, `period_budget_*`) queryable via
+  trace_processor SQL.
+- `CbwPutAside`, `CbwDrainBtqBatch`, `cbw_throttle_cgroups`,
+  `LavdBailOnCgroupThrottle`, `LavdReenqueueViaBtqDrain`,
+  `CgroupSetBandwidth`, `CgroupInit/Exit/Move` complete the
+  cgroup-bw-relevant trace surface.
+- The bpftrace structops/helpers tracer + scxsim JSONL emitter +
+  `bug_finding/` diff harness operationalize the live ↔ scxsim
+  comparison.
+
+Principle 2 — Exaggerated-Knob Stress Testing (Opt-In Only)
+------------------------------------------------------------
+
+Optional, **opt-in** modes that push scxsim BEYOND production
+behavior are explicitly allowed and encouraged for robustness
+testing — race-window enlargement, extra delays in dispatch /
+wake-up paths, jitter in IPI delivery, artificial cgroup-quota
+oscillation patterns, etc. They exist because some bug classes only
+surface under exaggerated conditions that production rarely (but
+not never) encounters.
+
+Every such knob MUST be:
+
+- **Explicitly opt-in.** A CLI flag (`--stochastic-timer-interleave`,
+  `--charge-granularity tick`), a fixture-config field, or an env
+  var. Default behavior is **never** exaggerated.
+- **Self-documenting.** The name describes what dimension is being
+  exaggerated. `--extra-dispatch-delay-ns` is good; `--mode2` is
+  not.
+- **Clearly distinguished from production-fidelity baseline mode.**
+  A trace, log, or report produced under exaggerated knobs MUST
+  surface the active knob set (e.g., in the run header) so that
+  downstream consumers cannot mistake exaggerated-mode output for
+  production-fidelity output.
+- **Documented at the call-site and in `--help`.** State what the
+  knob exaggerates, why it exists (which bug class it targets),
+  and the production-fidelity cost (e.g., "race-window enlargement;
+  may produce events that are physically possible but extremely
+  rare on real hardware").
+
+Existing examples that follow this discipline:
+
+- `--stochastic-timer-interleave` (PR #32, `concurrent-mode-phase3`):
+  random interleaving of cgroup_bw timer firing with dispatch
+  decisions to surface timer-vs-dispatch races. Off by default;
+  surfaces in trace headers when on.
+- `--charge-granularity tick` (`charge-granularity-experiment`):
+  per-tick (HZ=250) cgroup_bw charging instead of per-stop charging;
+  intended to characterize sensitivity to charge-rate granularity.
+  Off by default.
+
+Anti-pattern: a knob whose default-on behavior diverges from
+production. If you find yourself writing one, you have either
+(a) a Principle 1 violation that should be tracked as debt and
+fixed in the engine, or (b) an opt-in knob that has been mis-wired
+on. Neither is acceptable.
+
+How the Two Principles Interact
+--------------------------------
+
+A scxsim run is in one of two **modes**:
+
+1. **Production-fidelity mode (default).** No exaggerated knobs
+   active. The engine behaves as Principle 1 demands. Output is
+   trustworthy as a stand-in for live-kernel observation, subject to
+   any documented (filed-as-debt) divergences. This is the only mode
+   in which a scxsim result should be cited as evidence of how live
+   production behaves.
+2. **Stress-test mode (any exaggerated knob active).** One or more
+   opt-in knobs are on. Output is useful for surfacing race classes
+   and corner cases, but its quantitative claims do **not**
+   automatically transfer to production. A bug found in stress mode
+   must be reproduced in production-fidelity mode (or shown
+   equivalent in the live kernel) before it can be claimed as a
+   production bug.
+
+When investigating a bug:
+
+- Always start in production-fidelity mode. If production-fidelity
+  reproduces the bug, you have a candidate live-kernel bug.
+- If production-fidelity does NOT reproduce the bug but stress-mode
+  does, you have a candidate race-class hypothesis — test it against
+  the live kernel before publishing.
+- If scxsim reproduces a live bug via a *different mechanism* than
+  the live kernel does (the V4-A vs PR #3521 situation), you have
+  TWO bugs: a Principle 1 violation in the scxsim engine AND the
+  live-kernel bug. Both need to be fixed.
+
+Reviewer Rule
+--------------
+
+Reviewers MUST refuse to land:
+
+- Engine / harness / infrastructure changes that introduce silent
+  divergence from production behavior, with no `DANGER TODO(<issue>)`
+  marker and no tg task tracking the debt.
+- Knobs that exaggerate beyond production but default to ON, or that
+  do not surface their active state in trace / log output.
+- Test fixtures or canonical reproducers whose results would be
+  mis-citable as live-kernel evidence because the run was actually
+  in stress-test mode.
+
 Coding conventions
 ========================================
 
