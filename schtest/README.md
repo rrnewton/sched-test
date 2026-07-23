@@ -39,3 +39,7 @@ This will:
 2. Wait for it to install a custom scheduler
 3. Run the tests against that scheduler
 4. Kill the scheduler when done
+
+## License
+
+This project is licensed under the BSD License - see the [LICENSE](LICENSE) file for details.
