@@ -1026,6 +1026,36 @@ impl ScenarioBuilder {
         self
     }
 
+    /// Define a NESTED cgroup (under an existing parent) that also carries
+    /// bandwidth limits (cpu.max).
+    ///
+    /// Combines [`Self::cgroup_nested`] (parenting) with
+    /// [`Self::cgroup_with_bandwidth`] (cpu.max): the parent must have been
+    /// defined previously, the child inherits the parent's cpuset (`None`),
+    /// and after `cgroup_init` the engine calls `cgroup_set_bandwidth` with
+    /// the given parameters. Use this to exercise bandwidth enforcement on a
+    /// cgroup that lives below the root of the hierarchy.
+    pub fn cgroup_nested_bw(
+        mut self,
+        name: &str,
+        parent: &str,
+        period_us: u64,
+        quota_us: u64,
+        burst_us: u64,
+    ) -> Self {
+        self.cgroups.push(CgroupDef {
+            name: name.to_string(),
+            parent_name: Some(parent.to_string()),
+            cpuset: None,
+            bandwidth: Some(CgroupBandwidth {
+                period_us,
+                quota_us,
+                burst_us,
+            }),
+        });
+        self
+    }
+
     /// Add a task to a specific cgroup.
     ///
     /// This is a convenience wrapper for building a TaskDef with a cgroup assignment.
