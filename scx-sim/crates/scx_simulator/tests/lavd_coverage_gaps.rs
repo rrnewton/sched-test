@@ -7,16 +7,35 @@
 //! workload through the resulting branch. The task notes record the measured
 //! `llvm-cov` net-new-line delta for each.
 //!
-//! Scope note: several audit-identified uncovered *functions* are NOT
-//! test-addressable and are deliberately out of scope — the futex
-//! priority-boost subsystem (`lock.bpf.c`) and the execve
-//! `set_aggressive_migration` hook are BPF-substrate gaps (the simulator does
-//! not deliver those tracepoints), `set_power_profile` is a `SEC("syscall")`
-//! prog, `get_cpuperf_cap`/`conv_wall_to_invr` are dead code (no live caller),
-//! and `idle.bpf.c::migrate_to_neighbor` requires an internal state
-//! combination (a task sticky to a saturated domain while a neighbor has a
-//! fully idle core, with `is_stealee` set at the select_cpu instant) that the
-//! deterministic scenario API cannot reliably co-produce. See task notes.
+//! Scope note (updated by `cover-lavd-power-idle-gaps`): the futex
+//! priority-boost subsystem (`lock.bpf.c`) is a BPF-substrate gap (the
+//! simulator does not deliver futex enter/exit tracepoints); the execve
+//! `set_aggressive_migration` hook is `SEC("?tracepoint/...sys_enter_execve")`
+//! and the simulator does not deliver syscall tracepoints, so it and its
+//! sole callee `set_aggressive_migration` (a `static`, i.e. non-exported
+//! function) cannot be reached; `conv_wall_to_invr` is a `static __inline`
+//! with zero live callers so the compiler never emits it (confirmed absent
+//! from the `.so` symbol table); `set_cpu_flag` is a `__hidden inline` with
+//! zero live callers (never emitted, never dynamically resolvable); and
+//! `get_nice_prio` is `__hidden` and only reachable through
+//! `introspec.bpf.c::submit_task_ctx`, whose `bpf_ringbuf_reserve` the
+//! simulator wrapper stubs to `NULL` — so it returns `-ENOMEM` before ever
+//! calling `get_nice_prio`. Each of these was verified against the scx lavd
+//! BPF source and the built `libscx_lavd.so` symbol table; see task
+//! `cover-lavd-power-idle-gaps` notes.
+//!
+//! Newly covered here (previously listed as out of scope): the power-profile
+//! switch `do_set_power_profile` via the autopilot runtime path
+//! (`do_autopilot` → `do_set_power_profile`, PERFORMANCE transition +
+//! `update_power_mode_time`), and `get_cpuperf_cap` (exported accessor,
+//! exercised over FFI).
+//!
+//! Still NOT test-addressable and documented below with the empirically
+//! confirmed mechanism (each measured 0% under coverage instrumentation): the
+//! `set_power_profile` `SEC("syscall")` wrapper (its body needs an installed
+//! simulator context and there is no syscall-injection API), and the
+//! idle-migration fallbacks `pick_random_cpu` / `cpumask_any_distribute` /
+//! `migrate_to_neighbor` (topology / affinity-substrate gaps).
 
 use scx_simulator::*;
 
@@ -41,6 +60,22 @@ unsafe fn lavd_set_u8(sched: &DynamicScheduler, name: &str, val: u8) {
         .get_symbol(name.as_bytes())
         .unwrap_or_else(|| panic!("symbol {name} not found"));
     std::ptr::write_volatile(*sym, val);
+}
+
+/// Read one `u16` slot of a LAVD `u16[]` global (e.g. `cpu_capacity`).
+unsafe fn lavd_get_u16_at(sched: &DynamicScheduler, name: &str, idx: usize) -> u16 {
+    let sym: libloading::Symbol<'_, *mut u16> = sched
+        .get_symbol(name.as_bytes())
+        .unwrap_or_else(|| panic!("symbol {name} not found"));
+    std::ptr::read_volatile((*sym).add(idx))
+}
+
+/// Write one `u16` slot of a LAVD `u16[]` global.
+unsafe fn lavd_set_u16_at(sched: &DynamicScheduler, name: &str, idx: usize, val: u16) {
+    let sym: libloading::Symbol<'_, *mut u16> = sched
+        .get_symbol(name.as_bytes())
+        .unwrap_or_else(|| panic!("symbol {name} not found"));
+    std::ptr::write_volatile((*sym).add(idx), val);
 }
 
 /// Set up a minimal valid PCO (power/core-order) table so the core-compaction
@@ -270,3 +305,191 @@ fn test_lavd_no_slice_boost() {
     assert!(trace.schedule_count(Pid(1)) > 0, "ping never scheduled");
     assert!(trace.schedule_count(Pid(2)) > 0, "pong never scheduled");
 }
+
+// ---------------------------------------------------------------------------
+// Target: power.bpf.c `do_set_power_profile` via the autopilot runtime path.
+//
+// `do_set_power_profile()` is the power-mode switch. It runs from
+// `do_autopilot()`, which the periodic `update_sys_stat` timer calls when
+// autopilot is enabled: it maps the measured required-capacity to POWERSAVE /
+// BALANCED / PERFORMANCE and calls `do_set_power_profile()` to enact the
+// change. A workload that starts nearly idle (only light I/O) and then becomes
+// saturated (a burst of CPU hogs) makes the required-capacity cross the
+// autopilot thresholds, so the switch runs across multiple arms on the *real*
+// runtime path (No-Stub Rule: real scheduler C code — not the userspace-init
+// helper `wrapper.c::lavd_set_power_mode`, which sets the globals directly and
+// bypasses the switch).
+//
+// Note: the `set_power_profile` `SEC("syscall")` wrapper (a one-line
+// `return do_set_power_profile(input->power_mode);`) cannot be covered from a
+// test: invoking it directly aborts (its body calls `scx_bpf_now()`, which
+// requires an installed simulator context), and the simulator has no API to
+// inject a syscall-prog invocation mid-run. That single wrapper line is a
+// substrate gap (no syscall-prog injection, mb sim-91a825); its body
+// `do_set_power_profile` is what this test exercises.
+// ---------------------------------------------------------------------------
+
+/// Autopilot enabled + an idle→saturated load swing drives
+/// `do_autopilot()` → `do_set_power_profile()` across power-mode thresholds.
+#[test]
+fn test_lavd_autopilot_runtime_power_switch() {
+    let _lock = common::setup_test();
+
+    let nr_cpus = 4u32;
+    let sched = DynamicScheduler::lavd(nr_cpus);
+    unsafe {
+        setup_pco(&sched, nr_cpus);
+    }
+    sched.lavd_set_autopilot(true);
+
+    // Autopilot starts BALANCED. Phase 1 (0..~250ms): CPU hogs saturate every
+    // CPU → high required-capacity → autopilot climbs to PERFORMANCE, running
+    // `do_set_power_profile`'s switch + `update_power_mode_time`. Phase 2
+    // (~250ms..600ms): the hogs finish and only two light I/O tasks remain, so
+    // the run continues under low load while the autopilot keeps evaluating.
+    // (The BALANCED/POWERSAVE arms are not reliably reachable here — the
+    // required-capacity EWMA decays too slowly to cross both lower thresholds
+    // within the run — so this test targets the PERFORMANCE transition and the
+    // surrounding machinery, not all three arms.)
+    let mut b = Scenario::builder()
+        .cpus(nr_cpus)
+        .seed(7)
+        .detect_bpf_errors();
+    let mut pid = 1i32;
+    // Light I/O tasks that persist for the whole run (define the low-load
+    // floor after the hogs exit).
+    for _ in 0..2 {
+        b = b.task(TaskDef {
+            name: format!("io{pid}"),
+            pid: Pid(pid),
+            nice: -5,
+            behavior: workloads::io_bound(20_000, 4_000_000),
+            start_time_ns: 0,
+            mm_id: None,
+            allowed_cpus: None,
+            parent_pid: None,
+            cgroup_name: None,
+            task_flags: 0,
+            migration_disabled: 0,
+        });
+        pid += 1;
+    }
+    // Finite CPU hogs: run flat-out for ~250ms then exit, collapsing the load.
+    for _ in 0..nr_cpus {
+        b = b.task(TaskDef {
+            name: format!("hog{pid}"),
+            pid: Pid(pid),
+            nice: 0,
+            behavior: TaskBehavior {
+                phases: vec![Phase::Run(250_000_000)],
+                repeat: RepeatMode::Once,
+            },
+            start_time_ns: 0,
+            mm_id: None,
+            allowed_cpus: None,
+            parent_pid: None,
+            cgroup_name: None,
+            task_flags: 0,
+            migration_disabled: 0,
+        });
+        pid += 1;
+    }
+
+    let trace = Simulator::new(sched).run(b.duration_ms(600).build());
+    assert!(
+        !trace.has_error(),
+        "unexpected error: {:?}",
+        trace.exit_kind()
+    );
+    // Sanity: a hog ran to completion (busy phase materialized) and the light
+    // I/O tasks kept running afterward (the low-load phase materialized), so
+    // the autopilot timer observed both a saturated and a light regime.
+    assert!(
+        trace.total_runtime(Pid(pid - 1)) > 0,
+        "hog made no progress; saturated phase never materialized"
+    );
+    assert!(
+        trace.total_runtime(Pid(1)) > 0,
+        "light I/O task never ran; low-load phase never materialized"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Target: power.bpf.c `get_cpuperf_cap` (exported accessor).
+//
+// `get_cpuperf_cap(cpu)` returns `cpu_capacity[cpu]`. Its only in-tree caller
+// is `conv_wall_to_invr`, which itself has zero callers, so it is dead under
+// the current scx source — but it is an *exported* symbol, so we exercise the
+// real accessor (and its bounds handling) directly over FFI. This is a
+// regression guard for the accessor, not a claim that the live scheduler
+// reaches it.
+// ---------------------------------------------------------------------------
+
+/// `get_cpuperf_cap(cpu)` reads back the per-CPU capacity table entry.
+#[test]
+fn test_lavd_get_cpuperf_cap_reads_capacity_table() {
+    let _lock = common::setup_test();
+
+    let sched = DynamicScheduler::lavd(4);
+    type GetCpuperfCapFn = unsafe extern "C" fn(i32) -> u16;
+
+    unsafe {
+        let sym: libloading::Symbol<'_, GetCpuperfCapFn> = sched
+            .get_symbol(b"get_cpuperf_cap\0")
+            .expect("get_cpuperf_cap symbol not found");
+
+        // Write a known capacity to a slot, then confirm the accessor returns
+        // it. Save/restore the slot so we do not perturb the shared `.so`
+        // state for subsequent tests under the serialized SIM_LOCK.
+        let saved = lavd_get_u16_at(&sched, "cpu_capacity\0", 2);
+        lavd_set_u16_at(&sched, "cpu_capacity\0", 2, 777);
+        assert_eq!(
+            (sym)(2),
+            777,
+            "get_cpuperf_cap must return the cpu_capacity[] slot"
+        );
+        lavd_set_u16_at(&sched, "cpu_capacity\0", 2, saved);
+        assert_eq!((sym)(2), saved, "capacity slot restored");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NOT test-addressable: idle.bpf.c `pick_random_cpu`, `cpumask_any_distribute`,
+// and `migrate_to_neighbor`.
+//
+// These were empirically confirmed unreachable under scxsim's current lavd
+// substrate (each candidate scenario measured 0% coverage with `coverage.sh`
+// instrumentation). The mechanisms:
+//
+// * `pick_random_cpu` is taken only when `find_sticky_cpu_and_cpdom()` returns
+//   `sticky_cpdom < 0`, which requires the task's `prev_cpu` to be *not
+//   runnable* (affinity excludes it) with no runnable waker/sticky domain.
+//   scxsim models `TaskDef::initial_cpu()` kernel-faithfully — a task's first
+//   CPU is always inside its cpumask (`task.rs`: "a new task's cpu field is set
+//   to the CPU where it was forked, which is always within its cpumask") — and
+//   the scenario API has no runtime affinity-narrowing event (no
+//   `Phase::SetAffinity`), so `prev_cpu` is never outside the allowed set. The
+//   only other path (the `cpu < 0` fallback at `idle.bpf.c:926`) is the branch
+//   the source itself annotates as "impossible". `cpumask_any_distribute` is
+//   called only from `pick_random_cpu`, so it inherits the same gap.
+//
+// * `migrate_to_neighbor` has two call sites, both blocked:
+//   - `idle.bpf.c:872` is gated on `!i_smt_empty`, i.e. `is_smt_active` AND a
+//     fully-idle SMT core. The lavd scxsim wrapper (`schedulers/lavd/wrapper.c`
+//     `lavd_setup`) hardcodes `is_smt_active = false`. Even when forced true
+//     (whitebox) alongside a real idle-SMT-mask substrate (`scenario.smt(2)`)
+//     and a strongly imbalanced two-domain workload, the required simultaneous
+//     state — the selected task's sticky domain is a `stealee` with no fully
+//     idle core *while* a neighbor domain has a fully idle core, all at the
+//     `lavd_select_cpu` instant — did not co-occur (measured 0%).
+//   - `idle.bpf.c:897` requires `LAVD_FLAG_MIGRATION_AGGRESSIVE`, set only by
+//     `set_aggressive_migration()` from the execve tracepoint hook, which the
+//     simulator does not deliver (see the syscall-tracepoint gap above).
+//
+// Closing these needs scxsim infrastructure, not a new test:
+// * migrate_to_neighbor — propagate `scenario.smt()` into the lavd wrapper's
+//   `is_smt_active` + per-CPU SMT sibling topology, plus a stealee/idle-neighbor
+//   scenario primitive (mb sim-39706c).
+// * pick_random_cpu / cpumask_any_distribute — a runtime affinity-narrowing
+//   scenario event so a task can wake with `prev_cpu` outside its cpumask
+//   (mb sim-110125).
