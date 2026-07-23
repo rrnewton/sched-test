@@ -4949,4 +4949,192 @@ mod tests {
             assert_eq!(scx_atq_cancel(ptr::null_mut()), 0);
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Task-state helpers: scx_bpf_task_running / _task_cpu / _task_cgroup
+    // (tg test-scx-bpf-helpers) — verify return values match the documented
+    // BPF API behavior.
+    // -----------------------------------------------------------------------
+
+    /// `scx_bpf_task_running(p)` is true iff the task is the current task on
+    /// some CPU, and false otherwise.
+    #[test]
+    fn test_scx_bpf_task_running() {
+        let _lock = SIM_LOCK.lock().unwrap();
+        let state = test_state(4);
+        let arc = test_sim_arc(state);
+
+        let raw = register_task(&mut arc.lock().unwrap().sim, Pid(9));
+
+        // Not scheduled anywhere yet -> not running.
+        let cpu = arc.lock().unwrap().sim.current_cpu;
+        enter_test_sim(&arc, cpu);
+        let before = scx_bpf_task_running(raw);
+        exit_test_sim();
+        assert!(!before, "task not on any CPU must report not-running");
+
+        // Make it the current task on CPU 2 -> running.
+        arc.lock().unwrap().sim.cpus[2].current_task = Some(Pid(9));
+        enter_test_sim(&arc, cpu);
+        let after = scx_bpf_task_running(raw);
+        exit_test_sim();
+        assert!(after, "task that is current on a CPU must report running");
+
+        free_task(&mut arc.lock().unwrap().sim, Pid(9));
+    }
+
+    /// `scx_bpf_task_cpu(p)` returns the task's last CPU, falling back to CPU 0
+    /// for a task that has never run.
+    #[test]
+    fn test_scx_bpf_task_cpu() {
+        let _lock = SIM_LOCK.lock().unwrap();
+        let state = test_state(4);
+        let arc = test_sim_arc(state);
+
+        let raw = register_task(&mut arc.lock().unwrap().sim, Pid(11));
+
+        // Never ran -> documented fallback of CPU 0.
+        let cpu = arc.lock().unwrap().sim.current_cpu;
+        enter_test_sim(&arc, cpu);
+        let fallback = scx_bpf_task_cpu(raw);
+        exit_test_sim();
+        assert_eq!(fallback, 0, "never-run task must fall back to CPU 0");
+
+        // After recording a last CPU -> returns it.
+        arc.lock()
+            .unwrap()
+            .sim
+            .task_last_cpu
+            .insert(Pid(11), CpuId(3));
+        enter_test_sim(&arc, cpu);
+        let last = scx_bpf_task_cpu(raw);
+        exit_test_sim();
+        assert_eq!(last, 3, "must return the task's recorded last CPU");
+
+        free_task(&mut arc.lock().unwrap().sim, Pid(11));
+    }
+
+    /// `scx_bpf_task_cgroup(p)` returns NULL for a NULL task, and falls back to
+    /// the root cgroup for a task with no cgroup assigned.
+    #[test]
+    fn test_scx_bpf_task_cgroup_null_and_fallback() {
+        let _lock = SIM_LOCK.lock().unwrap();
+        let state = test_state(1);
+        let arc = test_sim_arc(state);
+
+        let raw = register_task(&mut arc.lock().unwrap().sim, Pid(21));
+
+        let cpu = arc.lock().unwrap().sim.current_cpu;
+        enter_test_sim(&arc, cpu);
+        // NULL task -> NULL (matches the kfunc's explicit null-guard).
+        let null_cg = scx_bpf_task_cgroup(ptr::null_mut(), 0);
+        // Unassigned task -> the root cgroup (documented fallback).
+        let resolved = scx_bpf_task_cgroup(raw, 0);
+        let root = unsafe { ffi::sim_get_root_cgroup() };
+        exit_test_sim();
+
+        assert!(null_cg.is_null(), "NULL task must yield NULL cgroup");
+        assert_eq!(
+            resolved, root,
+            "task with no cgroup must fall back to the root cgroup"
+        );
+
+        free_task(&mut arc.lock().unwrap().sim, Pid(21));
+    }
+
+    // -----------------------------------------------------------------------
+    // scx_bpf_dsq_peek — head-of-DSQ inspection without dequeue
+    // -----------------------------------------------------------------------
+
+    /// `scx_bpf_dsq_peek(dsq)` returns the raw pointer of the DSQ's head task
+    /// (without removing it), or NULL when the DSQ is empty.
+    #[test]
+    fn test_scx_bpf_dsq_peek() {
+        let _lock = SIM_LOCK.lock().unwrap();
+        let mut state = test_state(1);
+        state.dsqs.create(DsqId(200));
+        let arc = test_sim_arc(state);
+
+        // Empty DSQ -> NULL.
+        let cpu = arc.lock().unwrap().sim.current_cpu;
+        enter_test_sim(&arc, cpu);
+        let empty = scx_bpf_dsq_peek(200);
+        exit_test_sim();
+        assert!(empty.is_null(), "peek on empty DSQ must return NULL");
+
+        // Insert two tasks FIFO; head is the first inserted.
+        let head = register_task(&mut arc.lock().unwrap().sim, Pid(1));
+        let _tail = register_task(&mut arc.lock().unwrap().sim, Pid(2));
+        {
+            let mut g = arc.lock().unwrap();
+            g.sim.dsqs.insert_fifo(DsqId(200), Pid(1));
+            g.sim.dsqs.insert_fifo(DsqId(200), Pid(2));
+        }
+
+        enter_test_sim(&arc, cpu);
+        let peeked = scx_bpf_dsq_peek(200);
+        // Peek must not consume: length unchanged, repeated peek is stable.
+        let nr = scx_bpf_dsq_nr_queued(200);
+        let peeked_again = scx_bpf_dsq_peek(200);
+        exit_test_sim();
+
+        assert_eq!(peeked, head, "peek must return the FIFO head task");
+        assert_eq!(nr, 2, "peek must not remove the task");
+        assert_eq!(peeked_again, head, "repeated peek must be stable");
+
+        free_task(&mut arc.lock().unwrap().sim, Pid(1));
+        free_task(&mut arc.lock().unwrap().sim, Pid(2));
+    }
+
+    // -----------------------------------------------------------------------
+    // CPU perf / capacity topology helpers
+    // -----------------------------------------------------------------------
+
+    /// `scx_bpf_cpuperf_cur` returns SCX_CPUPERF_ONE (1024) until a level is
+    /// set, then the set level; `scx_bpf_cpuperf_set` stores it; out-of-range
+    /// CPUs read back 0. `scx_bpf_cpuperf_cap` is a constant 1024.
+    #[test]
+    fn test_scx_bpf_cpuperf_set_cur_cap() {
+        let _lock = SIM_LOCK.lock().unwrap();
+        let state = test_state(2);
+        let arc = test_sim_arc(state);
+
+        let cpu = arc.lock().unwrap().sim.current_cpu;
+        enter_test_sim(&arc, cpu);
+        // Default (never set) -> SCX_CPUPERF_ONE.
+        let default_cur = scx_bpf_cpuperf_cur(0);
+        // Capacity is the fixed maximum.
+        let cap = scx_bpf_cpuperf_cap(0);
+        // Set then read back.
+        scx_bpf_cpuperf_set(1, 512);
+        let set_cur = scx_bpf_cpuperf_cur(1);
+        // Out-of-range CPU -> 0.
+        let oob = scx_bpf_cpuperf_cur(99);
+        exit_test_sim();
+
+        assert_eq!(
+            default_cur, 1024,
+            "unset cpuperf_cur must be SCX_CPUPERF_ONE"
+        );
+        assert_eq!(cap, 1024, "cpuperf_cap must be SCX_CPUPERF_ONE");
+        assert_eq!(
+            set_cur, 512,
+            "cpuperf_cur must return the level set by cpuperf_set"
+        );
+        assert_eq!(oob, 0, "out-of-range CPU must read back 0");
+    }
+
+    /// `scx_bpf_nr_cpu_ids` reflects the configured CPU count.
+    #[test]
+    fn test_scx_bpf_nr_cpu_ids_reflects_topology() {
+        let _lock = SIM_LOCK.lock().unwrap();
+        for n in [1u32, 2, 8, 16] {
+            let arc = test_sim_arc(test_state(n));
+            let cpu = arc.lock().unwrap().sim.current_cpu;
+            enter_test_sim(&arc, cpu);
+            let got = scx_bpf_nr_cpu_ids();
+            exit_test_sim();
+            assert_eq!(got, n, "nr_cpu_ids must equal the CPU count");
+        }
+    }
 }
