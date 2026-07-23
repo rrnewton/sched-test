@@ -276,7 +276,8 @@ int scx_atq_nr_queued(void *atq __attribute__((unused)))
 }
 
 __weak
-u64 scx_atq_pop(void *atq __attribute__((unused)))
+u64 scx_atq_pop(void *atq __attribute__((unused)),
+		int hold __attribute__((unused)))
 {
 	return 0;
 }

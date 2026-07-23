@@ -311,11 +311,13 @@ static struct cell cells_arr[MAX_CELLS];
 /* debug_events: ARRAY, DEBUG_EVENTS_BUF_SIZE entries */
 static struct debug_event debug_events_arr[DEBUG_EVENTS_BUF_SIZE];
 
-/* update_timer: ARRAY, 1 entry */
-static struct update_timer update_timer_arr[1];
-
-/* cgrp_init_percpu_cpumask: PERCPU_ARRAY, MAX_CPUMASK_ENTRIES per CPU */
-static struct cpumask_entry cgrp_init_cpumask_arr[MAX_SIM_CPUS][MAX_CPUMASK_ENTRIES];
+/*
+ * NOTE: upstream commits 0f579b78 ("delete legacy BPF cell allocator") and
+ * b62f1bae ("make userspace the only cell-control path") removed the
+ * `update_timer` ARRAY map and the `cgrp_init_percpu_cpumask` PERCPU_ARRAY
+ * map (plus struct update_timer / cpumask_entry / MAX_CPUMASK_ENTRIES).
+ * Their static mirrors and map-lookup routing were removed here to match.
+ */
 
 /* task_ctxs: TASK_STORAGE, indexed by PID */
 static struct task_ctx task_ctx_arr[MAX_SIM_TASKS];
@@ -360,19 +362,6 @@ static void *mitosis_map_lookup_elem(void *map, const void *key)
 		if (idx >= DEBUG_EVENTS_BUF_SIZE)
 			return NULL;
 		return &debug_events_arr[idx];
-	}
-	if (map == (void *)&update_timer) {
-		if (idx >= 1)
-			return NULL;
-		return &update_timer_arr[idx];
-	}
-	if (map == &cgrp_init_percpu_cpumask) {
-		/* PERCPU_ARRAY: bpf_map_lookup_elem returns current CPU's entry */
-		int cpu = sim_bpf_get_smp_processor_id();
-		if (cpu < 0 || cpu >= MAX_SIM_CPUS ||
-		    idx >= MAX_CPUMASK_ENTRIES)
-			return NULL;
-		return &cgrp_init_cpumask_arr[cpu][idx];
 	}
 	/* Unknown map -- should not happen */
 	return NULL;
@@ -494,8 +483,6 @@ void mitosis_setup(unsigned int num_cpus)
 	memset(cell_cpumasks_arr, 0, sizeof(cell_cpumasks_arr));
 	memset(cells_arr, 0, sizeof(cells_arr));
 	memset(debug_events_arr, 0, sizeof(debug_events_arr));
-	memset(update_timer_arr, 0, sizeof(update_timer_arr));
-	memset(cgrp_init_cpumask_arr, 0, sizeof(cgrp_init_cpumask_arr));
 	memset(task_ctx_arr, 0, sizeof(task_ctx_arr));
 	memset(task_ctx_in_use, 0, sizeof(task_ctx_in_use));
 	memset(cgrp_storage_entries, 0, sizeof(cgrp_storage_entries));

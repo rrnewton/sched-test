@@ -1258,6 +1258,7 @@ fn test_periodic_workload() {
 /// configuration_seq != applied_configuration_seq and enters the
 /// cell reconfiguration logic when they differ.
 #[test]
+#[ignore = "mb sim-c923d6: upstream (0f579b78/b62f1bae) removed the BPF cell allocator, update_timer map, and configuration_seq global; this test drives the deleted timer/reconfig path. Re-enable after rewrite for userspace-only cell-control."]
 fn test_timer_reconfiguration_path() {
     let _lock = common::setup_test();
     let sched = DynamicScheduler::mitosis(4);
@@ -1351,6 +1352,7 @@ fn test_debug_events_enabled() {
 
 /// Exercise debug events + timer reconfiguration together.
 #[test]
+#[ignore = "mb sim-c923d6: upstream (0f579b78/b62f1bae) removed the BPF cell allocator, update_timer map, and configuration_seq global; this test drives the deleted timer/reconfig path. Re-enable after rewrite for userspace-only cell-control."]
 fn test_debug_events_with_timer_reconfig() {
     let _lock = common::setup_test();
     let sched = DynamicScheduler::mitosis(2);
@@ -1388,6 +1390,7 @@ fn test_debug_events_with_timer_reconfig() {
 
 /// Exercise SMT + pinned tasks + timer reconfiguration for combined path coverage.
 #[test]
+#[ignore = "mb sim-c923d6: upstream (0f579b78/b62f1bae) removed the BPF cell allocator, update_timer map, and configuration_seq global; this test drives the deleted timer/reconfig path. Re-enable after rewrite for userspace-only cell-control."]
 fn test_smt_pinned_timer_reconfig() {
     let _lock = common::setup_test();
     let sched = DynamicScheduler::mitosis(4);
@@ -1443,6 +1446,7 @@ fn test_smt_pinned_timer_reconfig() {
 
 /// Exercise overloaded CPUs with all features enabled for maximum branch coverage.
 #[test]
+#[ignore = "mb sim-c923d6: upstream (0f579b78/b62f1bae) removed the BPF cell allocator, update_timer map, and configuration_seq global; this test drives the deleted timer/reconfig path. Re-enable after rewrite for userspace-only cell-control."]
 fn test_overloaded_all_features() {
     let _lock = common::setup_test();
     let sched = DynamicScheduler::mitosis(2);
@@ -1742,6 +1746,7 @@ fn test_cpu_controller_enabled_pinned() {
 /// When CPU controller is enabled, the `maybe_refresh_cell` skips the
 /// cgroup-change check (line 573), but still checks `configuration_seq`.
 #[test]
+#[ignore = "mb sim-c923d6: upstream (0f579b78/b62f1bae) removed the BPF cell allocator, update_timer map, and configuration_seq global; this test drives the deleted timer/reconfig path. Re-enable after rewrite for userspace-only cell-control."]
 fn test_cpu_controller_enabled_timer_reconfig() {
     let _lock = common::setup_test();
     let sched = DynamicScheduler::mitosis(4);
@@ -2010,6 +2015,7 @@ fn test_vtime_cpu_controller_enabled() {
 /// This combines timer reconfig, debug events, SMT, and
 /// CPU controller enabled for maximum branch coverage.
 #[test]
+#[ignore = "mb sim-c923d6: upstream (0f579b78/b62f1bae) removed the BPF cell allocator, update_timer map, and configuration_seq global; this test drives the deleted timer/reconfig path. Re-enable after rewrite for userspace-only cell-control."]
 fn test_all_features_cpu_controller_enabled() {
     let _lock = common::setup_test();
     let sched = DynamicScheduler::mitosis(4);
@@ -2051,6 +2057,7 @@ fn test_all_features_cpu_controller_enabled() {
 /// Exercise many tasks with staggered starts to maximize timer
 /// interaction with various task lifecycle phases.
 #[test]
+#[ignore = "mb sim-c923d6: upstream (0f579b78/b62f1bae) removed the BPF cell allocator, update_timer map, and configuration_seq global; this test drives the deleted timer/reconfig path. Re-enable after rewrite for userspace-only cell-control."]
 fn test_staggered_many_tasks_timer() {
     let _lock = common::setup_test();
     let sched = DynamicScheduler::mitosis(4);
@@ -2169,6 +2176,7 @@ fn test_smt_cpu_controller_enabled() {
 /// Long-running simulation to exercise many timer firings at different
 /// configuration_seq values. Bumps seq higher to test convergence.
 #[test]
+#[ignore = "mb sim-c923d6: upstream (0f579b78/b62f1bae) removed the BPF cell allocator, update_timer map, and configuration_seq global; this test drives the deleted timer/reconfig path. Re-enable after rewrite for userspace-only cell-control."]
 fn test_timer_many_reconfigurations() {
     let _lock = common::setup_test();
     let sched = DynamicScheduler::mitosis(8);
@@ -2301,6 +2309,7 @@ fn test_many_debug_events() {
 /// Combine 33+ CPUs with cpu_controller_disabled=false, SMT, and timer reconfig
 /// to exercise dump paths with large cpumasks alongside other coverage targets.
 #[test]
+#[ignore = "mb sim-c923d6: upstream (0f579b78/b62f1bae) removed the BPF cell allocator, update_timer map, and configuration_seq global; this test drives the deleted timer/reconfig path. Re-enable after rewrite for userspace-only cell-control."]
 fn test_large_cpu_count_all_features() {
     let _lock = common::setup_test();
     let nr_cpus = 36;

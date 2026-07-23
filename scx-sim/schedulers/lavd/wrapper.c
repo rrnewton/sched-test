@@ -735,9 +735,9 @@ extern void sim_cgroup_registry_free(void);
 	scxsim_cgroup_bw_observe_reenqueue(0); \
 	_scxsim_re_rc; \
 })
-#define scx_cgroup_bw_cancel(taskc) ({ \
+#define scx_cgroup_bw_cancel(taskc, flags) ({ \
 	SCXSIM_CGROUP_BW_YIELD(scxsim_cgroup_bw_yield_cancel); \
-	scx_cgroup_bw_cancel((taskc)); \
+	scx_cgroup_bw_cancel((taskc), (flags)); \
 })
 #define scx_cgroup_bw_is_cgroup_throttled(cgrp_id) ({ \
 	SCXSIM_CGROUP_BW_YIELD(scxsim_cgroup_bw_yield_is_cgroup_throttled); \
@@ -1596,6 +1596,21 @@ int scxsim_cbw_snapshot_by_raw_cgrp(
  */
 static void lavd_register_cbw_maps(void)
 {
+	/*
+	 * Register the live scx_task_common field offsets with the sim_atq
+	 * substrate. sim_atq.c cannot include atq.h (BPF-only), so it relies
+	 * on runtime-registered offsets for the `atq` back-pointer and the
+	 * `holdcnt` hold counter. Upstream cd9c4600 inserted `int holdcnt`
+	 * before `atq`, shifting `atq` from offset 56 to 64; registering the
+	 * real offsetof() values here keeps the sim honest across such
+	 * layout changes. This is defined post-include so struct
+	 * scx_task_common is in scope.
+	 */
+	extern void sim_atq_set_taskc_atq_offset(unsigned long off);
+	extern void sim_atq_set_taskc_holdcnt_offset(unsigned long off);
+	sim_atq_set_taskc_atq_offset(__builtin_offsetof(struct scx_task_common, atq));
+	sim_atq_set_taskc_holdcnt_offset(__builtin_offsetof(struct scx_task_common, holdcnt));
+
 	cbw_replenish_timer_map_ptr = (void *)&replenish_timer;
 	cbw_accounting_timer_map_ptr = (void *)&accounting_timer;
 	__builtin_memset(cbw_replenish_timer_storage, 0,

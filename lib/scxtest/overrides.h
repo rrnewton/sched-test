@@ -47,8 +47,14 @@ unsigned long long scx_atq_create_internal(int fifo, unsigned long capacity);
 int scx_atq_insert(void *atq_ptr, unsigned long long taskc_ptr);
 int scx_atq_insert_vtime(void *atq, unsigned long long taskc_ptr, unsigned long long vtime);
 int scx_atq_nr_queued(void *atq);
-unsigned long long scx_atq_pop(void *atq);
+unsigned long long scx_atq_pop(void *atq, int hold);
 unsigned long long scx_atq_peek(void *atq);
+/* ATQ task-lifecycle API (upstream 2f085946 / cd9c4600); implemented in
+ * scx-sim/csrc/sim_atq.c, resolved by the scheduler .so via -rdynamic. */
+void scx_atq_task_hold(void *taskc);
+void scx_atq_task_drop(void *taskc);
+int scx_atq_task_detach(void *taskc);
+int scx_atq_task_fini(void *taskc);
 void *scx_task_alloc(struct task_struct *p);
 void scx_task_free(struct task_struct *p);
 #define scx_atq_create_size(fifo, capacity) scx_atq_create_internal((fifo), (capacity))

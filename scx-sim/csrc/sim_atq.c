@@ -107,19 +107,29 @@ struct sim_atq {
  *
  *   struct scx_task_common {
  *     struct rbnode node;     // 56
- *     scx_atq_t *atq;         // OFFSET 56
+ *     int holdcnt;            // OFFSET 56 (upstream cd9c4600)
+ *     scx_atq_t *atq;         // OFFSET 64 (was 56 before holdcnt)
  *     enum scx_task_throttle state;
  *   };
  *
- * Phase 2 wrapper.c should call `sim_atq_set_taskc_atq_offset(
- *   offsetof(struct scx_task_common, atq))` against the live
- * production header to keep the offset honest if rbnode ever grows.
+ * wrapper.c calls `sim_atq_set_taskc_atq_offset(offsetof(struct
+ * scx_task_common, atq))` and `sim_atq_set_taskc_holdcnt_offset(
+ * offsetof(struct scx_task_common, holdcnt))` from lavd_register_cbw_maps
+ * (post-include, so the production struct is in scope) to keep these
+ * offsets honest across struct-layout changes. The defaults below match
+ * the pinned scx submodule SHA as a safety net.
  */
-static unsigned long sim_taskc_atq_offset = 56;
+static unsigned long sim_taskc_atq_offset = 64;
+static unsigned long sim_taskc_holdcnt_offset = 56;
 
 void sim_atq_set_taskc_atq_offset(unsigned long off)
 {
 	sim_taskc_atq_offset = off;
+}
+
+void sim_atq_set_taskc_holdcnt_offset(unsigned long off)
+{
+	sim_taskc_holdcnt_offset = off;
 }
 
 /* Read/write the back-pointer at the registered offset. */
@@ -136,6 +146,38 @@ static inline void *sim_atq_taskc_get_atq(void *taskc)
 		return NULL;
 	return *(void **)((char *)taskc + sim_taskc_atq_offset);
 }
+
+/*
+ * Mirror production scx_atq_task_hold(): bump the popped task's holdcnt.
+ * Production's scx_atq_pop(atq, hold=true) increments holdcnt so the task
+ * stays pinned off-queue until the paired scx_atq_task_drop() runs. The
+ * drop is a static-inline in atq.h that executes natively in the compiled
+ * cgroup_bw code, so the sim MUST perform the matching increment here or
+ * the drops drive holdcnt negative and scx_atq_task_detach()'s
+ * `while (holdcnt > 0)` wait observes an inconsistent count.
+ */
+static inline void sim_atq_taskc_hold(void *taskc)
+{
+	if (!taskc)
+		return;
+	*(int *)((char *)taskc + sim_taskc_holdcnt_offset) += 1;
+}
+
+/* Mirror production's scx_atq_task_drop(): decrement the task's holdcnt. */
+static inline void sim_atq_taskc_drop(void *taskc)
+{
+	if (!taskc)
+		return;
+	*(int *)((char *)taskc + sim_taskc_holdcnt_offset) -= 1;
+}
+
+/*
+ * SCX_ATQ_DEAD sentinel (atq.h enum scx_atq_consts::SCX_ATQ_DEAD = 0x1).
+ * scx_atq_task_detach() latches this into taskc->atq so the task can never
+ * be re-queued. sim_atq.c cannot include atq.h (BPF-only), so mirror the
+ * value locally.
+ */
+#define SIM_ATQ_DEAD ((void *)(unsigned long)0x1)
 
 /*
  * Grow the entries[] array if needed. Doubles capacity from a base of
@@ -245,7 +287,7 @@ int scx_atq_insert_vtime(void *atq, void *taskc, unsigned long long vtime)
 	return scx_atq_insert_vtime_unlocked(atq, taskc, vtime);
 }
 
-unsigned long long scx_atq_pop(void *atq_raw)
+unsigned long long scx_atq_pop(void *atq_raw, int hold)
 {
 	struct sim_atq *a = (struct sim_atq *)atq_raw;
 	void *taskc;
@@ -258,6 +300,10 @@ unsigned long long scx_atq_pop(void *atq_raw)
 		memmove(&a->entries[0], &a->entries[1],
 			(size_t)a->size * sizeof(struct sim_atq_entry));
 	}
+	/* Match production: hold the popped task if requested (see
+	 * sim_atq_taskc_hold). */
+	if (hold)
+		sim_atq_taskc_hold(taskc);
 	sim_atq_taskc_set_atq(taskc, NULL);
 	return (unsigned long long)(uintptr_t)taskc;
 }
@@ -286,7 +332,7 @@ int scx_atq_cancel(void *taskc)
 	if (!taskc)
 		return 0;
 	a = (struct sim_atq *)sim_atq_taskc_get_atq(taskc);
-	if (!a)
+	if (!a || a == (struct sim_atq *)SIM_ATQ_DEAD)
 		return 0;
 	for (i = 0; i < a->size; i++) {
 		if (a->entries[i].taskc == taskc) {
@@ -302,6 +348,63 @@ int scx_atq_cancel(void *taskc)
 	}
 	/* Race-loser path in production. Single-threaded sim never hits this. */
 	return -ENOENT;
+}
+
+/*
+ * ATQ task-lifecycle API (upstream commits 2f085946 "add DEAD state and
+ * detach/fini operations" and cd9c4600 "add task hold and drop helpers").
+ * In production these live in atq.h (hold/drop as static-inline) and
+ * atq.bpf.c (detach/fini as __weak), all under #ifdef __BPF__ -- so they
+ * are NOT compiled into scxsim's userspace build and must be provided here
+ * as the kernel ATQ substrate. cgroup_bw.bpf.c (compiled into the scheduler
+ * .so) resolves these via dlopen + -rdynamic. Semantics mirror production;
+ * the single-threaded sim collapses the lock/hold-wait loops to no-ops.
+ */
+void scx_atq_task_hold(void *taskc)
+{
+	sim_atq_taskc_hold(taskc);
+}
+
+void scx_atq_task_drop(void *taskc)
+{
+	sim_atq_taskc_drop(taskc);
+}
+
+/*
+ * Detach a dying task: unlink it from whatever atq it sits in, then latch
+ * SCX_ATQ_DEAD so it can never be queued again. Production then spins until
+ * holdcnt drops to 0; the single-threaded sim has no concurrent holders, so
+ * holdcnt is already balanced by the paired hold/drop calls and no wait is
+ * needed.
+ */
+int scx_atq_task_detach(void *taskc)
+{
+	void *atq;
+
+	if (!taskc)
+		return 0;
+	atq = sim_atq_taskc_get_atq(taskc);
+	if (atq && atq != SIM_ATQ_DEAD)
+		scx_atq_cancel(taskc); /* removes entry, clears atq back-ptr */
+	sim_atq_taskc_set_atq(taskc, SIM_ATQ_DEAD);
+	return 0;
+}
+
+/*
+ * Cancel a task's atq membership while keeping it reusable. Returns 1 if this
+ * caller removed the task, 0 if it was not queued (or already dying).
+ */
+int scx_atq_task_fini(void *taskc)
+{
+	void *atq;
+
+	if (!taskc)
+		return 0;
+	atq = sim_atq_taskc_get_atq(taskc);
+	if (!atq || atq == SIM_ATQ_DEAD)
+		return 0;
+	scx_atq_cancel(taskc); /* removes entry, clears atq back-ptr */
+	return 1;
 }
 
 int scx_atq_destroy(void *atq_raw)
