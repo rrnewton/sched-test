@@ -377,3 +377,58 @@ fn test_error_messages_are_informative() {
         other => panic!("expected ErrorCgroupExhausted, got {other:?}"),
     }
 }
+
+// ===========================================================================
+// 6. Loud aborts on unrecoverable setup / construction errors.
+//    Complements section 1 (a scheduler that *runs* and self-aborts via
+//    scx_bpf_error) with the cases where the harness cannot even bring a
+//    scheduler up, and where a self-contradictory config is rejected at
+//    construction. These exercise the "assertion failure handling" side of the
+//    No-Silent-Failures contract: the abort must be loud AND name the fault.
+//    None of these are covered by error_handling.rs (topology/cgroup panics).
+// ===========================================================================
+
+/// A scheduler `.so` that cannot be loaded (missing file) must abort loudly at
+/// construction, and the panic must name the offending path — the closest
+/// black-box analogue of "the scheduler failed to come up". A silent
+/// null-scheduler here would be the worst kind of silent failure.
+#[test]
+#[should_panic(expected = "failed to load")]
+fn test_scheduler_load_failure_panics_informatively() {
+    // No SIM_LOCK: this panics inside the loader before any global sim state
+    // is touched.
+    let _ = DynamicScheduler::load("/nonexistent/path/libscx_ghost_scheduler.so", "ghost", 1);
+}
+
+/// A self-contradictory CPU preemption window (`acquire <= release`) is a
+/// configuration bug the builder must reject at construction via an assertion
+/// whose message explains the ordering it expects.
+#[test]
+#[should_panic(expected = "cpu_acquire must come after cpu_release")]
+fn test_inverted_preempt_window_panics() {
+    let _ = Scenario::builder()
+        .cpus(2)
+        // acquire_at_ns == release_at_ns violates the strict ordering.
+        .cpu_preempt(CpuId(0), 10_000_000, 10_000_000)
+        .task(task(1, vec![Phase::Run(5_000_000)]))
+        .duration_ms(50)
+        .build();
+}
+
+/// Constructing a multi-domain LAVD with fewer than two domains is nonsensical
+/// (one domain is just plain LAVD); the constructor assertion must abort with a
+/// message naming the minimum.
+#[test]
+#[should_panic(expected = "at least 2 domains")]
+fn test_lavd_multi_domain_too_few_domains_panics() {
+    let _ = DynamicScheduler::lavd_multi_domain(4, 1);
+}
+
+/// Requesting more domains than CPUs is unsatisfiable; the constructor
+/// assertion must abort and name both counts so the misconfiguration is
+/// obvious.
+#[test]
+#[should_panic(expected = "must be >=")]
+fn test_lavd_multi_domain_more_domains_than_cpus_panics() {
+    let _ = DynamicScheduler::lavd_multi_domain(2, 4);
+}
