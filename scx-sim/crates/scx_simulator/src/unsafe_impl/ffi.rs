@@ -84,6 +84,12 @@ extern "C" {
     pub fn scx_task_data(p: *mut c_void) -> *mut c_void;
     pub fn scx_task_free(p: *mut c_void);
 
+    // Test-only fault injector for scx_task_alloc (scx GitHub #3564
+    // reproducer). When nonzero, scx_task_alloc() returns NULL for the
+    // task whose PID matches. Default 0. Defined in sim_sdt_stubs.c. See
+    // the safe wrapper `set_task_alloc_fail_pid`.
+    pub static mut sim_sdt_fail_pid: i32;
+
     // Cgroup allocation and management (implemented in sim_task.c)
     pub fn sim_cgroup_alloc(cgid: u64, level: u32, parent: *mut c_void) -> *mut c_void;
     pub fn sim_cgroup_free(cgrp: *mut c_void);
@@ -155,6 +161,27 @@ pub fn reset_task_state() {
         sim_task_reset();
         sim_sdt_reset();
     }
+}
+
+/// Arm/disarm the `scx_task_alloc()` fault injector (scx GitHub #3564
+/// reproducer).
+///
+/// Pass a task PID to make `scx_task_alloc()` return NULL for that task —
+/// simulating the real BPF-arena / SDT-storage allocation failure that
+/// drives `scx_lavd`'s `lavd_init_task` into
+/// `scx_bpf_error("task_ctx_stor first lookup failed")` + `-ENOMEM`. Pass
+/// 0 to disable (the default).
+///
+/// Test-only. Production runs never arm this, so `scx_task_alloc()`
+/// behaves identically; the C-side check is inside the
+/// `sim_rbc_pause()`/`resume()` window, so it is RBC/determinism-neutral
+/// when disabled. Callers must hold the global sim lock (as all
+/// simulator tests do).
+pub fn set_task_alloc_fail_pid(pid: i32) {
+    // SAFETY: `sim_sdt_fail_pid` is a plain C `int` global in
+    // sim_sdt_stubs.c. Writes are serialized by the simulator's global
+    // test lock; no pointers involved.
+    unsafe { sim_sdt_fail_pid = pid }
 }
 
 /// Mark a CPU present in the all-CPUs cpumask.
