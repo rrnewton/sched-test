@@ -3320,3 +3320,298 @@ fn test_mitosis_cpuset_change_detection() {
 // TODO(sim-llc): Add proper LLC topology support to the simulator to test
 // llc_aware.bpf.h code paths.
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Coverage gap closure: config-gated functions (sim-31d4c7)
+//  - slice_shrinking.bpf.h: slice_shrink_apply, slice_shrink_limit,
+//    slice_shrink_on_enqueue, slice_shrink_on_running (4)
+//  - mitosis.bpf.c: select_pinned_cpu, enqueue_pinned_cpu, update_pinned_dsq (3)
+//  Total ceiling: 54/93=58.1% -> 61/93=65.6% substrate-blocked ceiling
+// ---------------------------------------------------------------------------
+
+/// Exercise multi-CPU-pinned DSQ path with dynamic_affinity_cpu_selection=true.
+/// A task whose allowed_cpus has weight>1 (multi-CPU) and whose DSQ is a
+/// per-CPU DSQ (all_cell_cpus_allowed=false) hits:
+///   mitosis_select_cpu: dynamic_affinity_cpu_selection branch ->
+///     select_pinned_cpu -> update_pinned_dsq
+///   mitosis_enqueue: dynamic_affinity branch -> enqueue_pinned_cpu ->
+///     update_pinned_dsq
+/// This covers 3 previously-dark functions.
+#[test]
+fn test_mitosis_dynamic_affinity_multicpu_pinned_dsq() {
+    let _lock = common::setup_test();
+    let nr_cpus = 4u32;
+    let sched = DynamicScheduler::mitosis(nr_cpus);
+    unsafe {
+        set_mitosis_bool(&sched, b"dynamic_affinity_cpu_selection\0", true);
+        // also enable slice shrinking helpers transitively visible but off here
+    }
+
+    // Multiple tasks pinned to a 2-CPU subset {0,1} with weight>1
+    // to trigger dynamic affinity balancing and per-CPU DSQ migration.
+    let scenario = Scenario::builder()
+        .cpus(nr_cpus)
+        .task(TaskDef {
+            name: "mc1".into(),
+            pid: Pid(1),
+            nice: 0,
+            behavior: TaskBehavior {
+                phases: vec![Phase::Run(5_000_000), Phase::Sleep(2_000_000)],
+                repeat: RepeatMode::Forever,
+            },
+            start_time_ns: 0,
+            mm_id: None,
+            // weight=2 multi-CPU pin -> all_cell_cpus_allowed=false
+            allowed_cpus: Some(vec![CpuId(0), CpuId(1)]),
+            parent_pid: None,
+            cgroup_name: None,
+            task_flags: 0,
+            migration_disabled: 0,
+        })
+        .task(TaskDef {
+            name: "mc2".into(),
+            pid: Pid(2),
+            nice: 0,
+            behavior: TaskBehavior {
+                phases: vec![Phase::Run(5_000_000), Phase::Sleep(2_000_000)],
+                repeat: RepeatMode::Forever,
+            },
+            start_time_ns: 0,
+            mm_id: None,
+            allowed_cpus: Some(vec![CpuId(0), CpuId(1)]),
+            parent_pid: None,
+            cgroup_name: None,
+            task_flags: 0,
+            migration_disabled: 0,
+        })
+        .task(TaskDef {
+            name: "mc3".into(),
+            pid: Pid(3),
+            nice: 0,
+            behavior: TaskBehavior {
+                phases: vec![Phase::Run(10_000_000)],
+                repeat: RepeatMode::Forever,
+            },
+            start_time_ns: 0,
+            mm_id: None,
+            allowed_cpus: Some(vec![CpuId(0), CpuId(1)]),
+            parent_pid: None,
+            cgroup_name: None,
+            task_flags: 0,
+            migration_disabled: 0,
+        })
+        .task(TaskDef {
+            name: "free".into(),
+            pid: Pid(4),
+            nice: 0,
+            behavior: TaskBehavior {
+                phases: vec![Phase::Run(10_000_000)],
+                repeat: RepeatMode::Forever,
+            },
+            start_time_ns: 0,
+            mm_id: None,
+            allowed_cpus: None,
+            parent_pid: None,
+            cgroup_name: None,
+            task_flags: 0,
+            migration_disabled: 0,
+        })
+        .duration_ms(200)
+        .build();
+
+    let trace = Simulator::new(sched).run(scenario);
+    trace.dump();
+
+    for pid in 1..=4 {
+        assert!(
+            trace.total_runtime(Pid(pid)) > 0,
+            "task {pid} got no runtime"
+        );
+    }
+
+    // Multi-CPU-pinned tasks must stay within their allowed set {0,1}
+    let allowed: std::collections::HashSet<CpuId> = [CpuId(0), CpuId(1)].into();
+    for event in trace.events() {
+        if let TraceKind::TaskScheduled { pid } = &event.kind {
+            if *pid == Pid(1) || *pid == Pid(2) || *pid == Pid(3) {
+                assert!(
+                    allowed.contains(&event.cpu),
+                    "multi-CPU-pinned task pid={} scheduled on wrong CPU {:?}, allowed {:?}",
+                    pid.0,
+                    event.cpu,
+                    allowed
+                );
+            }
+        }
+    }
+}
+
+/// Exercise slice-shrinking path.
+/// Enable enable_slice_shrinking=true plus dynamic_affinity to oversubscribe
+/// a pinned-CPU DSQ. Covers slice_shrinking.bpf.h (4 funcs):
+///   slice_shrink_limit, slice_shrink_apply,
+///   slice_shrink_on_enqueue (via enqueue of partially-pinned waiter),
+///   slice_shrink_on_running (via running() observing queued waiter).
+#[test]
+fn test_mitosis_slice_shrinking() {
+    let _lock = common::setup_test();
+    let nr_cpus = 4u32;
+    let sched = DynamicScheduler::mitosis(nr_cpus);
+    unsafe {
+        set_mitosis_bool(&sched, b"dynamic_affinity_cpu_selection\0", true);
+        set_mitosis_bool(&sched, b"enable_slice_shrinking\0", true);
+    }
+
+    // Oversubscribe CPUs {0,1}: 6 tasks pinned/multi-pinned to {0,1}
+    // while a free task also runs. Creates queue pressure where
+    // pinned waiters arrive while a runner holds the CPU -> shrink.
+    let scenario = Scenario::builder()
+        .cpus(nr_cpus)
+        .task(TaskDef {
+            name: "pin0".into(),
+            pid: Pid(1),
+            nice: 0,
+            behavior: TaskBehavior {
+                phases: vec![Phase::Run(1_000_000), Phase::Sleep(500_000)],
+                repeat: RepeatMode::Forever,
+            },
+            start_time_ns: 0,
+            mm_id: None,
+            allowed_cpus: Some(vec![CpuId(0)]),
+            parent_pid: None,
+            cgroup_name: None,
+            task_flags: 0,
+            migration_disabled: 0,
+        })
+        .task(TaskDef {
+            name: "pin0_b".into(),
+            pid: Pid(2),
+            nice: 0,
+            behavior: TaskBehavior {
+                phases: vec![Phase::Run(1_000_000), Phase::Sleep(500_000)],
+                repeat: RepeatMode::Forever,
+            },
+            start_time_ns: 0,
+            mm_id: None,
+            allowed_cpus: Some(vec![CpuId(0)]),
+            parent_pid: None,
+            cgroup_name: None,
+            task_flags: 0,
+            migration_disabled: 0,
+        })
+        .task(TaskDef {
+            name: "pin1".into(),
+            pid: Pid(3),
+            nice: 0,
+            behavior: TaskBehavior {
+                phases: vec![Phase::Run(1_000_000), Phase::Sleep(500_000)],
+                repeat: RepeatMode::Forever,
+            },
+            start_time_ns: 0,
+            mm_id: None,
+            allowed_cpus: Some(vec![CpuId(1)]),
+            parent_pid: None,
+            cgroup_name: None,
+            task_flags: 0,
+            migration_disabled: 0,
+        })
+        .task(TaskDef {
+            name: "pin1_b".into(),
+            pid: Pid(4),
+            nice: 0,
+            behavior: TaskBehavior {
+                phases: vec![Phase::Run(1_000_000), Phase::Sleep(500_000)],
+                repeat: RepeatMode::Forever,
+            },
+            start_time_ns: 0,
+            mm_id: None,
+            allowed_cpus: Some(vec![CpuId(1)]),
+            parent_pid: None,
+            cgroup_name: None,
+            task_flags: 0,
+            migration_disabled: 0,
+        })
+        .task(TaskDef {
+            name: "mc01".into(),
+            pid: Pid(5),
+            nice: 0,
+            behavior: TaskBehavior {
+                phases: vec![Phase::Run(2_000_000), Phase::Sleep(1_000_000)],
+                repeat: RepeatMode::Forever,
+            },
+            start_time_ns: 0,
+            mm_id: None,
+            allowed_cpus: Some(vec![CpuId(0), CpuId(1)]),
+            parent_pid: None,
+            cgroup_name: None,
+            task_flags: 0,
+            migration_disabled: 0,
+        })
+        .task(TaskDef {
+            name: "mc01_b".into(),
+            pid: Pid(6),
+            nice: 0,
+            behavior: TaskBehavior {
+                phases: vec![Phase::Run(2_000_000), Phase::Sleep(1_000_000)],
+                repeat: RepeatMode::Forever,
+            },
+            start_time_ns: 0,
+            mm_id: None,
+            allowed_cpus: Some(vec![CpuId(0), CpuId(1)]),
+            parent_pid: None,
+            cgroup_name: None,
+            task_flags: 0,
+            migration_disabled: 0,
+        })
+        .task(TaskDef {
+            name: "free".into(),
+            pid: Pid(7),
+            nice: 0,
+            behavior: TaskBehavior {
+                phases: vec![Phase::Run(10_000_000)],
+                repeat: RepeatMode::Forever,
+            },
+            start_time_ns: 0,
+            mm_id: None,
+            allowed_cpus: None,
+            parent_pid: None,
+            cgroup_name: None,
+            task_flags: 0,
+            migration_disabled: 0,
+        })
+        .duration_ms(300)
+        .build();
+
+    let trace = Simulator::new(sched).run(scenario);
+    trace.dump();
+
+    for pid in 1..=7 {
+        assert!(
+            trace.total_runtime(Pid(pid)) > 0,
+            "task {pid} got no runtime"
+        );
+    }
+
+    // Single-CPU pinned tasks must stay on their assigned CPU
+    for event in trace.events() {
+        if let TraceKind::TaskScheduled { pid } = &event.kind {
+            if *pid == Pid(1) || *pid == Pid(2) {
+                assert_eq!(event.cpu, CpuId(0), "pin0 ran on wrong CPU");
+            }
+            if *pid == Pid(3) || *pid == Pid(4) {
+                assert_eq!(event.cpu, CpuId(1), "pin1 ran on wrong CPU");
+            }
+        }
+    }
+
+    // Ensure we had sustained scheduling pressure (slice shrink opp)
+    let total_scheds = trace
+        .events()
+        .iter()
+        .filter(|e| matches!(e.kind, TraceKind::TaskScheduled { .. }))
+        .count();
+    assert!(
+        total_scheds >= 50,
+        "expected heavy scheduling for shrink path, got {total_scheds} schedules"
+    );
+}
