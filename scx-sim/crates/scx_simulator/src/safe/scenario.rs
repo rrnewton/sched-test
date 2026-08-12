@@ -655,6 +655,9 @@ pub struct Scenario {
     pub smt_threads_per_core: u32,
     /// CPUs per LLC domain. 0 = single domain. Used to assign `llc_id` to CPUs.
     pub cpus_per_llc: u32,
+    /// CPUs per NUMA node. 0 = single node. Used to assign `node_id` to CPUs,
+    /// which is what the engine's `scx_bpf_cpu_node()` reports.
+    pub cpus_per_node: u32,
     pub tasks: Vec<TaskDef>,
     /// Cgroup definitions (excluding root, which always exists).
     pub cgroups: Vec<CgroupDef>,
@@ -775,6 +778,8 @@ pub struct ScenarioBuilder {
     /// CPUs per LLC domain. 0 = all CPUs in one domain (default).
     /// E.g., cpus_per_llc=12 with nr_cpus=48 creates 4 LLC domains.
     cpus_per_llc: u32,
+    /// E.g., cpus_per_node=8 with nr_cpus=16 creates 2 NUMA nodes.
+    cpus_per_node: u32,
     tasks: Vec<TaskDef>,
     cgroups: Vec<CgroupDef>,
     duration_ns: TimeNs,
@@ -816,6 +821,7 @@ impl Scenario {
             nr_cpus: 1,
             smt_threads_per_core: 1,
             cpus_per_llc: 0,
+            cpus_per_node: 0,
             tasks: Vec::new(),
             cgroups: Vec::new(),
             duration_ns: 100_000_000, // 100ms default
@@ -877,6 +883,23 @@ impl ScenarioBuilder {
     /// Default: 0 (all CPUs in a single LLC domain).
     pub fn cpus_per_llc(mut self, cpus: u32) -> Self {
         self.cpus_per_llc = cpus;
+        self
+    }
+
+    /// Set the number of CPUs per NUMA node.
+    ///
+    /// E.g., `cpus_per_node(8)` with 16 CPUs creates 2 nodes: CPUs 0-7 on
+    /// node 0, CPUs 8-15 on node 1. This drives `SimCpu.node_id`, which is
+    /// what the engine's `scx_bpf_cpu_node()` returns to every scheduler.
+    ///
+    /// A node must be a union of whole LLCs (`cpus_per_node` divisible by
+    /// `cpus_per_llc`); `build()` asserts it. Real hardware never splits an
+    /// LLC across nodes, and a scheduler that relies on that would misbehave
+    /// for our reason rather than its own.
+    ///
+    /// Default: 0 (all CPUs in a single node).
+    pub fn cpus_per_node(mut self, cpus: u32) -> Self {
+        self.cpus_per_node = cpus;
         self
     }
 
@@ -1468,10 +1491,33 @@ impl ScenarioBuilder {
                 self.cpus_per_llc
             );
         }
+        if self.cpus_per_node > 0 {
+            assert!(
+                self.nr_cpus.is_multiple_of(self.cpus_per_node),
+                "nr_cpus ({}) must be divisible by cpus_per_node ({})",
+                self.nr_cpus,
+                self.cpus_per_node
+            );
+            // A NUMA node is a union of whole LLCs on every machine we model.
+            // Splitting an LLC across nodes would make a scheduler that relies
+            // on that invariant misbehave for OUR reason, not its own — the
+            // resulting bug would be un-attributable. Reject it at build time
+            // rather than silently simulating impossible hardware.
+            if self.cpus_per_llc > 0 {
+                assert!(
+                    self.cpus_per_node.is_multiple_of(self.cpus_per_llc),
+                    "cpus_per_node ({}) must be a multiple of cpus_per_llc ({}): \
+                     a NUMA node must contain whole LLCs, never a fraction of one",
+                    self.cpus_per_node,
+                    self.cpus_per_llc
+                );
+            }
+        }
         Scenario {
             nr_cpus: self.nr_cpus,
             smt_threads_per_core: self.smt_threads_per_core,
             cpus_per_llc: self.cpus_per_llc,
+            cpus_per_node: self.cpus_per_node,
             tasks: self.tasks,
             cgroups: self.cgroups,
             duration_ns: self.duration_ns,

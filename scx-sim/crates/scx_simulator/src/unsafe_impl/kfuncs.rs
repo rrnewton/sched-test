@@ -2457,6 +2457,50 @@ pub extern "C" fn scx_bpf_now() -> u64 {
     })
 }
 
+/// `scx_bpf_cpu_node()`: map a CPU to its NUMA node id.
+///
+/// This is a KERNEL kfunc (`scheds/include/scx/common.bpf.h`), so the engine
+/// owns it. It reads `SimCpu.node_id` — the single source of truth, assigned
+/// once from `Scenario.cpus_per_node` when the engine builds the CPU array —
+/// which means every scheduler in the process gets the same answer for the
+/// same CPU. Before this existed, `scx_cosmos` and `scx_layered` each carried
+/// a *private* CPU→node map in their wrapper, so "which node is CPU 5 on" had
+/// two independent answers that nothing reconciled.
+///
+/// Out-of-range CPUs return node 0, matching the kernel's behaviour for a
+/// CPU with no NUMA affinity rather than inventing a node.
+#[no_mangle]
+pub extern "C" fn scx_bpf_cpu_node(cpu: i32) -> i32 {
+    crate::preempt::set_current_kfunc("cpu_node");
+    crate::interleave::maybe_yield();
+    with_sim(kfunc_cost::TRIVIAL, |sim| {
+        let idx = cpu as usize;
+        let node = if cpu >= 0 && idx < sim.cpus.len() {
+            sim.cpus[idx].node_id
+        } else {
+            0
+        };
+        node as i32
+    })
+}
+
+/// Number of NUMA nodes in the simulated topology.
+///
+/// NOT a kfunc. In production `nr_node_ids` is a rodata global that a
+/// scheduler's *userspace* half reads from the machine topology and writes
+/// into BPF before attach. A scx-sim wrapper plays that userspace role, so it
+/// calls this to learn the topology the engine built rather than being told a
+/// node count by its Rust constructor and hoping the two agree.
+///
+/// Derived from `SimCpu.node_id`, so it cannot disagree with
+/// `scx_bpf_cpu_node()`.
+#[no_mangle]
+pub extern "C" fn sim_topology_nr_nodes() -> u32 {
+    with_sim(kfunc_cost::TRIVIAL, |sim| {
+        sim.cpus.iter().map(|c| c.node_id).max().unwrap_or(0) + 1
+    })
+}
+
 /// Simulated rq->clock_task: wall clock minus cumulative IRQ time.
 ///
 /// In the kernel, rq->clock_task = rq->clock - cumulative IRQ/steal time.
@@ -4248,6 +4292,56 @@ mod tests {
         exit_test_sim();
 
         assert_eq!(now, 42_000_000);
+    }
+
+    // -----------------------------------------------------------------------
+    // NUMA topology
+    // -----------------------------------------------------------------------
+
+    /// `scx_bpf_cpu_node()` reports the node the engine assigned, so every
+    /// scheduler in the process gets one consistent answer per CPU.
+    #[test]
+    fn test_scx_bpf_cpu_node_reports_engine_topology() {
+        let _lock = SIM_LOCK.lock().unwrap();
+        let mut state = test_state(8);
+        // Two nodes of four, as `Scenario.cpus_per_node(4)` would produce.
+        for (i, cpu) in state.cpus.iter_mut().enumerate() {
+            cpu.node_id = (i as u32) / 4;
+        }
+        state.current_cpu = CpuId(0);
+        let arc = test_sim_arc(state);
+        let cpu = arc.lock().unwrap().sim.current_cpu;
+
+        enter_test_sim(&arc, cpu);
+        let nodes: Vec<i32> = (0..8).map(|c| scx_bpf_cpu_node(c)).collect();
+        let nr_nodes = sim_topology_nr_nodes();
+        // Out of range must not invent a node, and must not panic.
+        let oob = scx_bpf_cpu_node(99);
+        let negative = scx_bpf_cpu_node(-1);
+        exit_test_sim();
+
+        assert_eq!(nodes, vec![0, 0, 0, 0, 1, 1, 1, 1]);
+        assert_eq!(nr_nodes, 2);
+        assert_eq!(oob, 0);
+        assert_eq!(negative, 0);
+    }
+
+    /// The default (no `cpus_per_node`) is a single node — not "no answer".
+    #[test]
+    fn test_scx_bpf_cpu_node_defaults_to_single_node() {
+        let _lock = SIM_LOCK.lock().unwrap();
+        let mut state = test_state(4);
+        state.current_cpu = CpuId(0);
+        let arc = test_sim_arc(state);
+        let cpu = arc.lock().unwrap().sim.current_cpu;
+
+        enter_test_sim(&arc, cpu);
+        let nodes: Vec<i32> = (0..4).map(|c| scx_bpf_cpu_node(c)).collect();
+        let nr_nodes = sim_topology_nr_nodes();
+        exit_test_sim();
+
+        assert_eq!(nodes, vec![0, 0, 0, 0]);
+        assert_eq!(nr_nodes, 1);
     }
 
     #[test]

@@ -651,6 +651,76 @@ impl Trace {
         total
     }
 
+    /// Per-CPU busy time (nanoseconds): how long each CPU had a task on it.
+    ///
+    /// Same interval walk as [`Trace::total_runtime`], but keyed on the CPU
+    /// the event was recorded on rather than the task. Open intervals (a task
+    /// still running when the simulation ends) are not counted, exactly as in
+    /// `total_runtime`, so the two agree.
+    ///
+    /// Returns a vector indexed by CPU id, sized to the highest CPU seen in
+    /// the trace.
+    pub fn cpu_busy_ns(&self) -> Vec<TimeNs> {
+        let mut busy: Vec<TimeNs> = Vec::new();
+        // Per-CPU "task started running here at T". A task can only be on one
+        // CPU at a time, but two CPUs run concurrently, so this must be keyed
+        // per CPU rather than a single scalar.
+        let mut running_since: Vec<Option<TimeNs>> = Vec::new();
+
+        let ensure = |v: &mut Vec<TimeNs>, s: &mut Vec<Option<TimeNs>>, idx: usize| {
+            if v.len() <= idx {
+                v.resize(idx + 1, 0);
+                s.resize(idx + 1, None);
+            }
+        };
+
+        for event in &self.events {
+            let idx = event.cpu.0 as usize;
+            match &event.kind {
+                TraceKind::TaskScheduled { .. } => {
+                    ensure(&mut busy, &mut running_since, idx);
+                    running_since[idx] = Some(event.time_ns);
+                }
+                TraceKind::TaskPreempted { .. }
+                | TraceKind::TaskYielded { .. }
+                | TraceKind::TaskSlept { .. }
+                | TraceKind::TaskCompleted { .. } => {
+                    ensure(&mut busy, &mut running_since, idx);
+                    if let Some(start) = running_since[idx].take() {
+                        busy[idx] += event.time_ns.saturating_sub(start);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        busy
+    }
+
+    /// Per-NUMA-node busy time (nanoseconds), folded from [`Trace::cpu_busy_ns`].
+    ///
+    /// `node_of` maps a CPU id to its node id — pass the same mapping the
+    /// engine used (`Scenario.cpus_per_node`), e.g.
+    /// `|cpu| cpu.0 / cpus_per_node`.
+    ///
+    /// This is the observability half of NUMA modelling: it is what turns "the
+    /// scheduler made a cross-node placement decision" from invisible into
+    /// something a test can assert on. Nothing here computes or asserts a
+    /// balance target — the numbers are a pure readout of where tasks actually
+    /// ran, so they are derived from the scheduler's own decisions.
+    pub fn node_busy_ns(&self, node_of: impl Fn(CpuId) -> u32) -> Vec<TimeNs> {
+        let per_cpu = self.cpu_busy_ns();
+        let mut per_node: Vec<TimeNs> = Vec::new();
+        for (cpu_idx, busy) in per_cpu.iter().enumerate() {
+            let node = node_of(CpuId(cpu_idx as u32)) as usize;
+            if per_node.len() <= node {
+                per_node.resize(node + 1, 0);
+            }
+            per_node[node] += *busy;
+        }
+        per_node
+    }
+
     /// Count the number of times a task was scheduled.
     pub fn schedule_count(&self, pid: Pid) -> usize {
         self.events

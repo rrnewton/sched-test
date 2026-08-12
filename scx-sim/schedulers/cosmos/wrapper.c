@@ -294,28 +294,25 @@ static void *cosmos_map_lookup(void *map, const void *key)
 #include "cosmos_main_patched.c"
 
 /*
- * scx_bpf_cpu_node(): map a CPU to its NUMA node id.
+ * scx_bpf_cpu_node() is NOT defined here any more.
  *
  * Upstream sched-ext/scx 36d589bb ("scx_cosmos: Enable full built-in
  * NUMA-aware idle CPU selection") introduced calls to scx_bpf_cpu_node()
- * behind __COMPAT_scx_bpf_cpu_node(). Because the cosmos wrapper defines
+ * behind __COMPAT_scx_bpf_cpu_node(). Because this wrapper defines
  * bpf_ksym_exists()==1 (see top of file), the COMPAT macro calls the kfunc
- * unconditionally — so the simulator must provide it, or the call jumps
- * through the NULL weak __ksym symbol and SIGSEGVs (test_numa_topology).
+ * unconditionally, so the simulator must provide it or the call jumps
+ * through the NULL weak __ksym and SIGSEGVs (test_numa_topology).
  *
- * Resolve the node from the wrapper's cpu_node_map (populated by
- * cosmos_configure_numa()); fall back to node 0 when the CPU is unmapped
- * (NUMA disabled, or a single-node topology). bpf_map_lookup_elem is the
- * cosmos_map_lookup override defined above, so this stays consistent with
- * the rest of the wrapper's map handling.
+ * It is now provided by the ENGINE (kfuncs.rs `scx_bpf_cpu_node`), reading
+ * `SimCpu.node_id` from `Scenario.cpus_per_node`. That is the correct owner:
+ * scx_bpf_cpu_node is a kernel kfunc, the kernel owns the CPU->node map, and
+ * every scheduler in the process must get the same answer for the same CPU.
+ * This wrapper previously carried a PRIVATE cpu_node_map, so "which node is
+ * CPU 5 on" had two independent answers that nothing reconciled.
+ *
+ * To give COSMOS a multi-node topology, set `.cpus_per_node()` on the
+ * Scenario. `cosmos_configure_numa()` below no longer owns node identity.
  */
-s32 scx_bpf_cpu_node(s32 cpu)
-{
-	u32 key = (u32)cpu;
-	u32 *node = bpf_map_lookup_elem(&cpu_node_map, &key);
-
-	return node ? (s32)*node : 0;
-}
 
 /*
  * Static per-CPU context array, defined after the scheduler source
@@ -457,10 +454,20 @@ void cosmos_setup(unsigned int num_cpus)
 }
 
 /*
- * Configure NUMA topology after setup.
- * Populates cpu_node_map with sequential grouping:
- * CPUs [0, cpus_per_node) → node 0, etc.
- * Enables NUMA-aware scheduling in COSMOS.
+ * Enable COSMOS's NUMA-aware paths.
+ *
+ * This is the wrapper acting as COSMOS's USERSPACE half: in production the
+ * Rust side reads the machine topology and writes `numa_enabled` /
+ * `nr_node_ids` into BPF rodata before attach. That is all this does.
+ *
+ * It populates COSMOS's own `cpu_node_map` (which COSMOS's cpu_node() reads)
+ * and sets its rodata globals. The KERNEL's view of node identity —
+ * `scx_bpf_cpu_node()` — is owned by the engine, not here.
+ *
+ * CALLER CONTRACT: `nr_nodes` must match the Scenario's `cpus_per_node`
+ * partition, i.e. nr_nodes == nr_cpus / cpus_per_node. If it does not, COSMOS
+ * is told there are N nodes while every CPU reports node 0, and its NUMA
+ * paths run against a topology that does not exist.
  */
 void cosmos_configure_numa(unsigned int num_cpus, unsigned int nr_nodes)
 {
@@ -469,6 +476,18 @@ void cosmos_configure_numa(unsigned int num_cpus, unsigned int nr_nodes)
 	if (nr_nodes <= 1)
 		return;  /* leave numa_enabled=false */
 
+	/*
+	 * `cpu_node_map` is COSMOS's OWN map, declared in its BPF source and
+	 * read by COSMOS's own cpu_node() (cosmos_main_patched.c). In
+	 * production COSMOS's userspace fills it from the machine topology, so
+	 * filling it here is this wrapper correctly playing that role — it is
+	 * NOT a reimplementation of a kernel facility. (The kernel facility is
+	 * scx_bpf_cpu_node(), which the engine now owns; see above.)
+	 *
+	 * The grouping below is deliberately the same rule the engine applies
+	 * to `Scenario.cpus_per_node`, so COSMOS's map and the engine's kfunc
+	 * agree CPU-for-CPU whenever the caller honours the contract.
+	 */
 	cpus_per_node = num_cpus / nr_nodes;
 	for (cpu = 0; cpu < num_cpus; cpu++) {
 		node = cpu / cpus_per_node;

@@ -1416,6 +1416,18 @@ impl<S: Scheduler> Simulator<S> {
             }
         }
 
+        // Assign NUMA node IDs. The kernel owns the CPU→node map, so the
+        // engine owns it here; `scx_bpf_cpu_node()` reads it back out and
+        // every scheduler gets the same answer. `Scenario::build()` has
+        // already checked that a node contains whole LLCs.
+        // `SimCpu.node_id` is the SINGLE source of truth: the kfunc reads it
+        // back out of the live sim state, so there is no second copy to drift.
+        if let Some(cpus_per_node) = std::num::NonZeroU32::new(scenario.cpus_per_node) {
+            for i in 0..nr_cpus {
+                cpus[i as usize].node_id = i / cpus_per_node.get();
+            }
+        }
+
         // Initialize all CPUs as idle in the C cpumasks
         for i in 0..nr_cpus {
             ffi::cpumask_set_all(i as i32);

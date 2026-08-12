@@ -232,7 +232,16 @@ fn test_cosmos_per_node_dsq_routing() {
     // per-node shared DSQ (the vtime/deadline path) rather than per-CPU queues.
     sched.cosmos_set_cpu_util(nr_cpus, 1024);
 
-    let mut b = Scenario::builder().cpus(nr_cpus).seed(42).instant_timing();
+    // The engine owns the CPU→node map (`scx_bpf_cpu_node()`), so the scenario
+    // must declare the same partition COSMOS was told about via
+    // `cosmos_with_numa`. Without this the engine reports every CPU on node 0
+    // while COSMOS believes there are two, and its per-node DSQ ids are
+    // computed against a topology that does not exist.
+    let mut b = Scenario::builder()
+        .cpus(nr_cpus)
+        .cpus_per_node(cpus_per_node)
+        .seed(42)
+        .instant_timing();
     // `tasks_per_node` tasks per node, all pinned to their node's CPUs and
     // near-always runnable, so each node's CPUs cannot absorb all its tasks and
     // enqueues fall through to that node's shared DSQ.

@@ -71,6 +71,16 @@ pub struct SimCpu {
     /// migration penalty: cross-LLC migrations incur higher cache/TLB
     /// warming costs than intra-LLC migrations. Default: 0 (single domain).
     pub llc_id: u32,
+    /// NUMA node ID.
+    ///
+    /// CPUs on the same socket/memory-controller share a `node_id`. This is
+    /// the engine's answer to `scx_bpf_cpu_node()`, which is a KERNEL kfunc:
+    /// the kernel owns the CPU→node map, so the engine owns it here and every
+    /// scheduler sees the same answer. Default: 0 (single node).
+    ///
+    /// A node is always a union of whole LLCs — real hardware never splits an
+    /// LLC across nodes, and `Scenario` enforces that.
+    pub node_id: u32,
 }
 
 impl SimCpu {
@@ -90,6 +100,7 @@ impl SimCpu {
             irq_stolen_ns: 0,
             irq_cumulative_ns: 0,
             llc_id: 0,
+            node_id: 0,
         }
     }
 

@@ -832,6 +832,7 @@ pub fn load_rtapp(json_str: &str, nr_cpus: u32) -> Result<Scenario, RtAppError> 
         nr_cpus,
         smt_threads_per_core: 1,
         cpus_per_llc: 0,
+        cpus_per_node: 0,
         tasks: all_tasks,
         cgroups,
         duration_ns,
