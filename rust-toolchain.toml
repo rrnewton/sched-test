@@ -24,4 +24,9 @@
 # around a version mismatch by editing CI.
 [toolchain]
 channel = "1.97.1"
-components = ["clippy", "rustfmt"]
+# llvm-tools is required by validate.sh's `cargo llvm-cov nextest` gate. Declare
+# every component the build needs: pinning the toolchain makes the component set
+# explicit too, and anything left undeclared turns into an on-demand
+# `rustup component add` at gate time — a network fetch in the middle of a
+# validation run, which fails closed on a restricted network.
+components = ["clippy", "rustfmt", "llvm-tools"]
