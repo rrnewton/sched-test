@@ -15,6 +15,7 @@ pub mod process;
 pub mod semaphore;
 pub mod spinner;
 pub mod spinner_utilization;
+pub mod cgroup_tree;
 
 // Re-exports at module/crate root for macro $crate:: path resolution.
 // In Buck, this module IS the crate root, so $crate::__converge works.
