@@ -27,7 +27,7 @@
 //!
 //! [`check_watchdog`]: (engine-internal)
 
-use scx_simulator::scenario::ScenarioBuilder;
+use scx_simulator::ScenarioBuilder;
 use scx_simulator::*;
 
 mod common;

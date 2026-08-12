@@ -23,6 +23,9 @@ coverage-out/
 # Allow coverage CSV history to be tracked
 !data/
 !data/coverage.csv
+# Rust library-coverage ratchet baseline (committed; raise-only). No always-on
+# history CSV — the ratchet measures + prints each run to avoid commit churn.
+!data/rust_coverage_baseline.csv
 
 # Benchmark HTML dashboards and logs (generated, not tracked)
 data/benchmarks/*/*.html

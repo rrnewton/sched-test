@@ -7,10 +7,17 @@
 //! cannot be overridden by inner `#[allow(unsafe_code)]` in submodules.
 #![forbid(unsafe_code)]
 
+// Dormant parallel/race + preemptive-path support types (PRNG, WorkerState,
+// YieldReason, WorkerCounter, ...): consumed only by engine_ring/interleave and
+// the preempt PreemptRing, all dormant in the sequential engine.
+#[allow(dead_code)]
 pub mod atomic_types;
 pub mod bpf_trace;
 pub mod cgroup;
 pub mod cpu;
+// Deterministic-iteration map utility, currently exercised only by its own unit
+// tests; retained as a determinism primitive (the crate's reason for being).
+#[allow(dead_code)]
 pub mod det_hashmap;
 pub mod dsq;
 pub mod engine;

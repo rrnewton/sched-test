@@ -2,9 +2,9 @@
 //!
 //! Run with: cargo test test_slice_boost_debug --test slice_boost_debug -- --nocapture
 
-use scx_simulator::probes::{LavdMonitor, LavdProbes};
 use scx_simulator::ProbePoint;
 use scx_simulator::*;
+use scx_simulator::{LavdMonitor, LavdProbes};
 
 mod common;
 

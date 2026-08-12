@@ -45,7 +45,7 @@ type NamedSchedFactory = (&'static str, fn(u32) -> DynamicScheduler);
 /// True when a hardware RBC counter can actually be created and counts — the
 /// same probe the engine uses to decide whether to charge RBC overhead.
 fn pmu_available() -> bool {
-    scx_simulator::perf::try_create_rbc_counter().is_some()
+    scx_simulator::try_create_rbc_counter().is_some()
 }
 
 /// A saturated all-CPU-bound workload: `2 * nr_cpus` forever-running tasks,

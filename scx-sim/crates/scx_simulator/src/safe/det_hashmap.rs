@@ -21,22 +21,8 @@ use std::hash::Hash;
 ///
 /// All lookup operations delegate directly to the inner HashMap with O(1)
 /// performance. Iteration methods sort keys before returning, making them
-/// O(n log n) but deterministic.
-///
-/// # Example
-///
-/// ```
-/// use scx_simulator::det_hashmap::DetHashMap;
-///
-/// let mut map: DetHashMap<i32, &str> = DetHashMap::new();
-/// map.insert(3, "three");
-/// map.insert(1, "one");
-/// map.insert(2, "two");
-///
-/// // Iteration is always in sorted key order
-/// let keys: Vec<_> = map.iter_sorted().map(|(k, _)| *k).collect();
-/// assert_eq!(keys, vec![1, 2, 3]);
-/// ```
+/// O(n log n) but deterministic. (Sorted-iteration behavior is covered by the
+/// `test_sorted_iteration` unit test below; `DetHashMap` is crate-internal.)
 #[derive(Debug, Clone)]
 pub struct DetHashMap<K, V>(HashMap<K, V>);
 

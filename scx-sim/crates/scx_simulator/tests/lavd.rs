@@ -1,5 +1,5 @@
-use scx_simulator::probes::{LavdMonitor, LavdProbes};
 use scx_simulator::*;
+use scx_simulator::{LavdMonitor, LavdProbes};
 
 #[macro_use]
 mod common;
@@ -8834,17 +8834,17 @@ fn test_lavd_migration_disabled_kworker_scenario() {
     for i in 21..=24 {
         // Wake the kworker after doing some work
         let phases = vec![
-            scx_simulator::task::Phase::Run(500_000),     // 0.5ms
-            scx_simulator::task::Phase::Wake(Pid(1)),     // Wake kworker
-            scx_simulator::task::Phase::Sleep(2_000_000), // 2ms sleep
+            scx_simulator::Phase::Run(500_000),     // 0.5ms
+            scx_simulator::Phase::Wake(Pid(1)),     // Wake kworker
+            scx_simulator::Phase::Sleep(2_000_000), // 2ms sleep
         ];
         builder = builder.task(TaskDef {
             name: format!("waker_{i}"),
             pid: Pid(i),
             nice: 0,
-            behavior: scx_simulator::task::TaskBehavior {
+            behavior: scx_simulator::TaskBehavior {
                 phases,
-                repeat: scx_simulator::task::RepeatMode::Forever,
+                repeat: scx_simulator::RepeatMode::Forever,
             },
             start_time_ns: (i as u64 - 21) * 500_000, // Stagger start times
             mm_id: None,
@@ -8960,13 +8960,13 @@ fn test_lavd_pinned_task_cpumask_respected() {
             nice: 0,
             behavior: {
                 let phases = vec![
-                    scx_simulator::task::Phase::Run(300_000),
-                    scx_simulator::task::Phase::Wake(Pid(1)),
-                    scx_simulator::task::Phase::Sleep(3_000_000),
+                    scx_simulator::Phase::Run(300_000),
+                    scx_simulator::Phase::Wake(Pid(1)),
+                    scx_simulator::Phase::Sleep(3_000_000),
                 ];
-                scx_simulator::task::TaskBehavior {
+                scx_simulator::TaskBehavior {
                     phases,
-                    repeat: scx_simulator::task::RepeatMode::Forever,
+                    repeat: scx_simulator::RepeatMode::Forever,
                 }
             },
             start_time_ns: 100_000,
@@ -8999,7 +8999,7 @@ fn test_lavd_pinned_task_cpumask_respected() {
         .filter(|e| {
             matches!(
                 e.kind,
-                scx_simulator::trace::TraceKind::SetNextTask { pid } if pid == Pid(1)
+                scx_simulator::TraceKind::SetNextTask { pid } if pid == Pid(1)
             )
         })
         .collect();

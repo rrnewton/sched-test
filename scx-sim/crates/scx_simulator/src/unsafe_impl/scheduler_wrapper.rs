@@ -75,6 +75,9 @@ impl<S: Scheduler> SchedulerWrapper<S> {
     }
 
     /// Consume the wrapper and return the inner scheduler.
+    // Foundational safe-wrapper boundary, not yet wired into the engine;
+    // exercised by this module's tests (symmetric consume of `new`).
+    #[allow(dead_code)]
     pub fn into_inner(self) -> S {
         self.inner
     }

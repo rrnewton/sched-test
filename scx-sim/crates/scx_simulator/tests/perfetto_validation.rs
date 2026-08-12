@@ -71,7 +71,7 @@ fn rich_scenario(nr_cpus: u32) -> Scenario {
 
 /// Count `TaskScheduled` events in the in-memory trace (the slice-begin
 /// source of truth).
-fn scheduled_count(trace: &trace::Trace) -> usize {
+fn scheduled_count(trace: &Trace) -> usize {
     trace
         .events()
         .iter()
@@ -80,7 +80,7 @@ fn scheduled_count(trace: &trace::Trace) -> usize {
 }
 
 /// Validate the Chrome-JSON output of `trace` for a run on `nr_cpus` CPUs.
-fn validate_json(trace: &trace::Trace, nr_cpus: u32, label: &str) {
+fn validate_json(trace: &Trace, nr_cpus: u32, label: &str) {
     let mut buf = Vec::new();
     trace
         .write_perfetto_json(&mut buf)
@@ -242,7 +242,7 @@ fn validate_json(trace: &trace::Trace, nr_cpus: u32, label: &str) {
 }
 
 /// Validate the protobuf output of `trace`.
-fn validate_pb(trace: &trace::Trace, label: &str) {
+fn validate_pb(trace: &Trace, label: &str) {
     let mut buf = Vec::new();
     trace
         .write_perfetto_pb(&mut buf)

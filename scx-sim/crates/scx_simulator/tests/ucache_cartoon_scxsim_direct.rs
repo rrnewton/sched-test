@@ -21,8 +21,8 @@
 //! misclassifies the high-wake-rate writer as more latency-critical and
 //! steers it away from IRQ CPUs — protecting the wrong thread type.
 
-use scx_simulator::probes::{LavdMonitor, LavdProbes};
 use scx_simulator::*;
+use scx_simulator::{LavdMonitor, LavdProbes};
 
 #[macro_use]
 mod common;
