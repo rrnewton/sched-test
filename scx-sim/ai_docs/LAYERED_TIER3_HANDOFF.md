@@ -368,3 +368,78 @@ a separate project from the Tier-3 control loop. Tier 3 can be completed
 without them, and completing Tier 3 will not reach them. If reproducing
 S692395 becomes the goal, file and size it as a NUMA-substrate task — do not
 let it be absorbed into "finish Tier 3".
+
+---
+
+## 9. Tier-3 capability statement (completion)
+
+Same shape as the Tier-2 audit: for each claim, is it exercised by a test that
+would FAIL if the behaviour broke, or does it merely run?
+
+### What the loop genuinely does
+
+| Capability | Verdict | Proof |
+|---|---|---|
+| Periodic userspace CPU reallocation on a cadence | **sabotage-proven** | dropping the engine's periodic re-arm fails `userspace_control_reallocates_cpus_from_idle_to_busy_layer` |
+| Runs upstream's REAL allocator | **sabotage-proven** | `alloc.rs` compiled verbatim; its ~80 upstream tests run in our suite; a vendored-helper drift guard compares against upstream at test time |
+| Runs upstream's REAL core-growth ordering | **sabotage-proven** | collapsing every layer to layer 0's ordering fails `upstream_linear_and_reverse_choose_different_freed_cores` |
+| Whole-core allocation under SMT | **sabotage-proven** | releasing half a core fails `smt_core_transfer_moves_whole_cores_only` |
+| `growth_denied` correct and attributed to the right layer | **sabotage-proven, non-circularly** | swapping attribution between layers fails the asymmetric spec-oracle while the symmetric enabled-vs-disabled test passes |
+| Serialized view and BPF kptr masks agree | exercised | both read and compared in the reallocation and SMT tests |
+
+### What it approximates
+
+- **`calc_raw_demands` is re-implemented**, not linked. It depends on
+  `main.rs` state that cannot be compiled here. It is kept deliberately thin;
+  the policy it feeds (`unified_alloc`) is upstream's real code.
+- **Utilisation input** is an EWMA over `cpu_ctx.layer_usages` with upstream's
+  100ms half-life, driven by the simulator's own runtime accounting rather
+  than by real hardware counters.
+
+### What it cannot do — loud, not silent
+
+These abort with a clear message rather than degrading:
+
+- **`CpuSetSpread` / `CpuSetSpreadReverse` / `CpuSetSpreadRandom`** — scxsim
+  has no cgroup-cpuset substrate.
+- **`StickyDynamic` on multiple LLCs** — needs production's runtime
+  LLC-trading loop.
+- **Resizing an explicitly pinned layer** (`with_cpus`) — refused by design.
+- **Full `layer_core_growth` policy beyond flat Linear** — mb sim-juru9.
+
+### Known behavioural limitation, faithfully reproduced
+
+With SMT, a layer at 2 cores whose target is 1 core **cannot shrink**:
+CPU-space dampening (`4 - ceil(2/2) = 3`) then `div_ceil(au)` rounds back to
+2 cores. This is upstream's behaviour, verified against
+`main.rs::refresh_cpumasks()`, and is pinned by
+`smt_allocation_keeps_whole_cores_and_hits_the_shrink_fixed_point` so a
+simulator-side "fix" would fail loudly as a divergence. mb sim-klue5.
+
+### Is `growth_denied` sufficient for the NUMA acceptance criterion?
+
+**No — necessary but not sufficient.** The criterion is that
+`xnuma_bucket_refill` and `xnuma_gate_charge` actually EXECUTE. Reading
+`main.bpf.c::xnuma_gate()` (line 1170) and `main.rs::xnuma_check_active()`
+(line 1872), three things are required and only one exists:
+
+1. **`growth_denied` per (layer, node)** — DONE. It is condition 3 of the 3
+   that make a node a migration source in `xnuma_check_active()`, and it is
+   now exposed and proven correct.
+2. **Userspace must WRITE the resulting rate** into
+   `layers[].node[src].xnuma[dst].rate`. We never do — `grep xnuma` across
+   `crates/` and `schedulers/layered/wrapper.c` returns nothing. The field is
+   zeroed BSS, and `xnuma_gate()` treats `rate == 0` as "deny" and returns
+   **before** reaching `xnuma_bucket_refill()`. So today the refill path is
+   unreachable no matter what `growth_denied` says.
+3. **Engine NUMA substrate**, so `src_nid != dst_nid` can ever hold.
+   `xnuma_gate()`'s first guard returns early when they are equal, and
+   `xnuma_gate_charge` only fires when a task starts on a different node than
+   its previous CPU. This is `f5415f8` on `agent/deps` (`SimCpu.node_id`,
+   `Scenario::cpus_per_node`, engine-owned `scx_bpf_cpu_node()`), which is
+   **not on this branch**.
+
+So the NUMA work is unblocked on the signal it was waiting for, but two
+concrete pieces remain, in this order: land the engine NUMA substrate, then
+add the userspace rate-write. Only then can a workload drive cross-node
+migration and make the two functions execute. Neither is Tier-3 scope.
