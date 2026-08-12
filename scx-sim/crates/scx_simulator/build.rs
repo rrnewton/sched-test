@@ -267,6 +267,7 @@ fn main() {
         "scx/scheds/rust/scx_mitosis/src/bpf",  // mitosis wrapper transitive include
         "scx/scheds/rust/scx_cosmos/src/bpf",   // cosmos wrapper transitive include
         "scx/scheds/rust/scx_tickless/src/bpf", // tickless wrapper transitive include
+        "scx/scheds/rust/scx_layered/src/bpf",  // layered wrapper transitive include
         // scx submodule headers used by ALL schedulers via include_paths above
         "scx/scheds/include",
         "scx/scheds/vmlinux",

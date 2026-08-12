@@ -3961,16 +3961,21 @@ impl<S: Scheduler> Simulator<S> {
             start_rbc(&mut s.sim);
             let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
             #[allow(unused_assignments)]
-            let mut handled = false;
+            let mut ret = None;
             sim_callback!(s, guard, sim_arc, cpu, {
-                handled = self
+                ret = self
                     .scheduler
                     .task_yield(TaskPtr::new(raw), OptionalPtr::null());
             });
             let s = &mut *guard;
+            let handled = ret.is_some();
             if !handled {
-                // Kernel fallback in yield_task_scx() when ops.yield is
-                // absent or declines: the task forfeits the rest of its slice.
+                // Kernel fallback: yield_task_scx() zeroes the slice ONLY
+                // when the scheduler has no ops.yield. When it does, the
+                // callback's return value is discarded for a plain
+                // sched_yield() — so a scheduler that returns false (as
+                // scx_layered always does) must not have its slice zeroed
+                // behind its back.
                 crate::ffi::task_set_slice(raw, 0);
             }
             s.sim

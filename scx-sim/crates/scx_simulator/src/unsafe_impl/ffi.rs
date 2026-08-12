@@ -12,6 +12,8 @@
 use std::ffi::c_void;
 use std::path::Path;
 
+use crate::layered::LayerSpec;
+
 // ---------------------------------------------------------------------------
 // task_struct accessors (implemented in csrc/sim_task.c)
 // ---------------------------------------------------------------------------
@@ -498,15 +500,20 @@ pub trait Scheduler {
     ///
     /// Mirrors the kernel's `yield_task_scx()`: `to` is NULL for a plain
     /// `sched_yield()` (the only form the simulator delivers today;
-    /// `yield_to()` is not modelled). Returns whether the scheduler handled
-    /// the yield. When there is no `ops.yield` — or it returns `false` — the
-    /// kernel zeroes `p->scx.slice` itself, so the default here returns
-    /// `false` and the engine applies that fallback.
+    /// `yield_to()` is not modelled).
+    ///
+    /// Returns `None` when the scheduler has no `ops.yield`, in which case
+    /// the kernel zeroes `p->scx.slice` itself and the engine must do the
+    /// same. `Some(ret)` is the callback's return value; note that
+    /// `yield_task_scx()` DISCARDS it for a plain `sched_yield()` — it only
+    /// matters for `yield_to()`, which the simulator does not deliver. So a
+    /// scheduler returning `false` (scx_layered always does) must NOT have
+    /// its slice zeroed behind its back.
     ///
     /// # Safety
     /// Calls into C code. `from` must be a valid task_struct pointer.
-    unsafe fn task_yield(&self, _from: *mut c_void, _to: *mut c_void) -> bool {
-        false
+    unsafe fn task_yield(&self, _from: *mut c_void, _to: *mut c_void) -> Option<bool> {
+        None
     }
 
     /// A task's weight changed (ops.set_weight). Optional.
@@ -1094,6 +1101,178 @@ impl DynamicScheduler {
     pub fn mitosis(nr_cpus: u32) -> Self {
         let dir = env!("SCHEDULER_SO_DIR");
         Self::load(&format!("{dir}/libscx_mitosis.so"), "mitosis", nr_cpus)
+    }
+
+    /// Load the scx_layered scheduler, configured for `nr_cpus` CPUs.
+    ///
+    /// scx_layered partitions tasks into *layers* matched by comm / cgroup /
+    /// nice / pid rules, each with its own CPU set, slice, preemption policy
+    /// and per-(layer, LLC) DSQs.
+    ///
+    /// `layered_setup()` (called during load) establishes a flat topology —
+    /// one LLC, one NUMA node, no SMT — and a single catch-all OPEN layer, so
+    /// this constructor alone gives a runnable scheduler. That configuration
+    /// exercises very little of layered's actual policy; use
+    /// [`DynamicScheduler::layered_with_topology`] and
+    /// [`DynamicScheduler::layered_layers`] to build a multi-layer scheduler
+    /// on real topology.
+    ///
+    /// # Limitation: static CPU allocation
+    /// Production scx_layered runs a userspace control loop that continuously
+    /// re-allocates CPUs between layers. The simulator has no model for a
+    /// userspace control loop, so the allocation is computed once before
+    /// `ops.init` and held fixed for the run. Layer growth/shrink paths are
+    /// therefore not exercised.
+    pub fn layered(nr_cpus: u32) -> Self {
+        let dir = env!("SCHEDULER_SO_DIR");
+        Self::load(&format!("{dir}/libscx_layered.so"), "layered", nr_cpus)
+    }
+
+    /// Load scx_layered on a topology matching the `Scenario`'s.
+    ///
+    /// The arguments must agree with the `Scenario` the simulator will run:
+    /// `cpus_per_llc` with [`ScenarioBuilder::cpus_per_llc`] and
+    /// `threads_per_core` with [`ScenarioBuilder::smt`]. The scheduler must
+    /// observe the same machine the engine simulates.
+    ///
+    /// `nr_numa_nodes` has no engine counterpart — scxsim models LLCs and SMT
+    /// siblings but has no NUMA concept and no inter-node distance cost — so
+    /// it is a harness-supplied grouping over LLCs that exists to exercise
+    /// layered's cross-node code paths. This mirrors the existing
+    /// [`DynamicScheduler::cosmos_with_numa`] precedent.
+    ///
+    /// [`ScenarioBuilder::cpus_per_llc`]: crate::scenario::ScenarioBuilder::cpus_per_llc
+    /// [`ScenarioBuilder::smt`]: crate::scenario::ScenarioBuilder::smt
+    pub fn layered_with_topology(
+        nr_cpus: u32,
+        cpus_per_llc: u32,
+        nr_numa_nodes: u32,
+        threads_per_core: u32,
+    ) -> Self {
+        assert!(nr_cpus > 0, "nr_cpus must be positive");
+        assert!(
+            cpus_per_llc == 0 || nr_cpus.is_multiple_of(cpus_per_llc),
+            "nr_cpus ({nr_cpus}) must be divisible by cpus_per_llc ({cpus_per_llc})"
+        );
+        assert!(
+            threads_per_core > 0 && nr_cpus.is_multiple_of(threads_per_core),
+            "nr_cpus ({nr_cpus}) must be divisible by threads_per_core ({threads_per_core})"
+        );
+        let sched = Self::layered(nr_cpus);
+        type SetTopologyFn = unsafe extern "C" fn(u32, u32, u32, u32);
+        // SAFETY: Symbol resolved from a `.so` built by our build system.
+        unsafe {
+            let sym: libloading::Symbol<SetTopologyFn> = sched
+                ._lib
+                .get(b"layered_set_topology")
+                .expect("layered_set_topology not found");
+            (sym)(nr_cpus, cpus_per_llc, nr_numa_nodes, threads_per_core);
+        }
+        sched
+    }
+
+    /// Replace scx_layered's default single catch-all layer with `specs`.
+    ///
+    /// Plays the role of scx_layered's userspace layer-config parsing: each
+    /// [`LayerSpec`] is published into the BPF `layers[]` array exactly as
+    /// `main.rs::init_layers()` does. Must be called after construction and
+    /// before `Simulator::run()`, because `ops.init` finalises the layer table.
+    ///
+    /// # Panics
+    /// Panics if `specs` is empty, exceeds `MAX_LAYERS` (16), or contains a
+    /// match kind the simulator cannot honestly configure (see
+    /// [`LayerMatch`]).
+    pub fn layered_layers(&self, specs: &[LayerSpec]) {
+        assert!(!specs.is_empty(), "need at least one layer");
+        type ResetFn = unsafe extern "C" fn();
+        type AddLayerFn = unsafe extern "C" fn(
+            *const i8,
+            i32,
+            i32,
+            i32,
+            i32,
+            u32,
+            u64,
+            u64,
+            u64,
+            i32,
+            i32,
+        ) -> i32;
+        type AddMatchFn = unsafe extern "C" fn(u32, u32, i32, *const i8, i64, i32) -> i32;
+        type SetNrOrsFn = unsafe extern "C" fn(u32, u32) -> i32;
+        type SetCpusFn = unsafe extern "C" fn(u32, *const u64, u32) -> i32;
+
+        // SAFETY: Symbols resolved from a `.so` built by our build system.
+        // Every string is kept alive across its call via the owned CString.
+        unsafe {
+            let reset: libloading::Symbol<ResetFn> = self
+                ._lib
+                .get(b"layered_reset_layers")
+                .expect("layered_reset_layers not found");
+            let add_layer: libloading::Symbol<AddLayerFn> = self
+                ._lib
+                .get(b"layered_add_layer")
+                .expect("layered_add_layer not found");
+            let add_match: libloading::Symbol<AddMatchFn> = self
+                ._lib
+                .get(b"layered_add_layer_match")
+                .expect("layered_add_layer_match not found");
+            let set_nr_ors: libloading::Symbol<SetNrOrsFn> = self
+                ._lib
+                .get(b"layered_set_layer_nr_match_ors")
+                .expect("layered_set_layer_nr_match_ors not found");
+            let set_cpus: libloading::Symbol<SetCpusFn> = self
+                ._lib
+                .get(b"layered_set_layer_cpus")
+                .expect("layered_set_layer_cpus not found");
+
+            (reset)();
+            for spec in specs {
+                let name = std::ffi::CString::new(spec.name.as_str())
+                    .expect("layer name must not contain NUL");
+                let id = (add_layer)(
+                    name.as_ptr(),
+                    spec.kind as i32,
+                    spec.preempt as i32,
+                    spec.preempt_first as i32,
+                    spec.exclusive as i32,
+                    spec.weight,
+                    spec.slice_ns,
+                    spec.min_exec_ns,
+                    spec.max_exec_ns,
+                    spec.growth_algo as i32,
+                    spec.protected as i32,
+                );
+                assert!(id >= 0, "layered_add_layer failed for {:?}", spec.name);
+                let id = id as u32;
+
+                for (or_id, ands) in spec.matches.iter().enumerate() {
+                    for m in ands {
+                        let (kind, s, i) = m.to_ffi();
+                        let cstr = s.map(|s| {
+                            std::ffi::CString::new(s).expect("match string must not contain NUL")
+                        });
+                        let ptr = cstr.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
+                        let rc = (add_match)(id, or_id as u32, kind, ptr, i, m.exclude() as i32);
+                        assert_eq!(rc, 0, "layered_add_layer_match({m:?}) failed with rc={rc}");
+                    }
+                }
+                // An OR group with zero AND rules is the catch-all; it has no
+                // match call to grow `nr_match_ors`, so publish the count
+                // explicitly or the layer would match nothing at all.
+                let rc = (set_nr_ors)(id, spec.matches.len() as u32);
+                assert_eq!(rc, 0, "layered_set_layer_nr_match_ors failed with rc={rc}");
+
+                if let Some(cpus) = &spec.cpus {
+                    let mut words = [0u64; 8];
+                    for c in cpus {
+                        words[(c.0 / 64) as usize] |= 1u64 << (c.0 % 64);
+                    }
+                    let rc = (set_cpus)(id, words.as_ptr(), words.len() as u32);
+                    assert_eq!(rc, 0, "layered_set_layer_cpus failed with rc={rc}");
+                }
+            }
+        }
     }
 
     /// Load the scx_lavd scheduler, configured for `nr_cpus` CPUs.
@@ -1702,11 +1881,8 @@ impl Scheduler for DynamicScheduler {
         }
     }
 
-    unsafe fn task_yield(&self, from: *mut c_void, to: *mut c_void) -> bool {
-        match self.ops.task_yield {
-            Some(f) => f(from, to),
-            None => false,
-        }
+    unsafe fn task_yield(&self, from: *mut c_void, to: *mut c_void) -> Option<bool> {
+        self.ops.task_yield.map(|f| f(from, to))
     }
 
     unsafe fn set_weight(&self, p: *mut c_void, weight: u32) {

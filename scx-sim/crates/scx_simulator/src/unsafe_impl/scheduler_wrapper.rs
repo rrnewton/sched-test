@@ -195,12 +195,13 @@ impl<S: Scheduler> SchedulerWrapper<S> {
 
     /// A task called `sched_yield()` (`ops.yield`).
     ///
-    /// `to` is null for a plain `sched_yield()`. Returns whether the
-    /// scheduler handled the yield; `false` means the caller must apply the
-    /// kernel's fallback of zeroing `p->scx.slice`.
+    /// `to` is null for a plain `sched_yield()`. `None` means the scheduler
+    /// has no `ops.yield`, so the caller must apply the kernel's fallback of
+    /// zeroing `p->scx.slice`; `Some` is the callback's return value, which
+    /// `yield_task_scx()` discards for a plain yield.
     ///
     /// Named `task_yield` because `yield` is a reserved Rust keyword.
-    pub fn task_yield(&self, from: TaskPtr, to: OptionalPtr) -> bool {
+    pub fn task_yield(&self, from: TaskPtr, to: OptionalPtr) -> Option<bool> {
         // SAFETY: `from` is guaranteed non-null by `TaskPtr::new`; `to` is
         // allowed to be null per the trait contract.
         unsafe { self.inner.task_yield(from.as_raw(), to.as_raw()) }
