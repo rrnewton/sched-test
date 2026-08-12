@@ -3,6 +3,7 @@ libbpf/
 PKGBUILD
 target
 build/
+build-ubsan/
 *.swp
 .cache/
 .vscode/
