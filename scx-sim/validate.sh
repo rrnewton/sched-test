@@ -91,7 +91,33 @@ command -v cargo-llvm-cov >/dev/null 2>&1 || {
     echo "       Install: cargo install cargo-llvm-cov && rustup component add llvm-tools-preview" >&2
     exit 1
 }
-cargo llvm-cov nextest --workspace --no-fail-fast --no-report
+# CARGO_PROFILE_DEV_DEBUG=line-tables-only: the instrumented tree is what
+# exhausts the GitHub runner's disk. Measured on this exact sequence with a
+# fresh target dir:
+#
+#   after clippy --all-targets ......   667 MB
+#   after build --no-default-features   2.1 GB
+#   after llvm-cov nextest ..........  30 GB   (debug/ 2.1 GB + llvm-cov-target/ 28 GB)
+#
+# against 32 GB free on the runner after its cleanup step -- so the job died
+# with SIGBUS in ld, which is what a linker mmap'ing its output onto a full
+# filesystem gets, rather than a clean ENOSPC. The cost is one tree, not two:
+# clippy --all-targets never links the 85 test executables, so target/debug
+# contributes only ~2 GB here.
+#
+# Dropping full DWARF for this build alone takes llvm-cov-target/ from 28 GB to
+# 16 GB, i.e. peak ~18 GB, and costs the gate NOTHING: LLVM source-based
+# coverage carries its line information in __llvm_covmap, not in DWARF. Verified
+# by comparing `cargo llvm-cov report --summary-only` between the two profiles --
+# byte-identical (36006 regions / 76.44%, 2414 functions / 73.78%, 24182 lines /
+# 74.91%).
+#
+# Scoped to this invocation on purpose rather than set in Cargo.toml: a plain
+# `cargo test` / lldb session keeps full debuginfo, so local debuggability is
+# unaffected. Running `cargo llvm-cov` by hand without this variable will
+# rebuild its tree once (different profile fingerprint).
+CARGO_PROFILE_DEV_DEBUG=line-tables-only \
+    cargo llvm-cov nextest --workspace --no-fail-fast --no-report
 
 echo ""
 echo "=== Running doc-tests ==="
