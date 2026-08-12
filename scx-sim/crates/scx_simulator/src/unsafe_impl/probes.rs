@@ -289,6 +289,7 @@ pub struct LayeredProbes {
     nr_layers_fn: unsafe extern "C" fn() -> u32,
     layer_nr_cpus_fn: unsafe extern "C" fn(u32) -> u32,
     layer_has_cpu_fn: unsafe extern "C" fn(u32, u32) -> i32,
+    layer_bpf_has_cpu_fn: unsafe extern "C" fn(u32, u32) -> i32,
     layer_nr_tasks_fn: unsafe extern "C" fn(u32) -> u64,
     layer_stat_fn: unsafe extern "C" fn(u32, u32) -> u64,
     global_stat_fn: unsafe extern "C" fn(u32) -> u64,
@@ -338,6 +339,10 @@ impl LayeredProbes {
                 ),
                 layer_has_cpu_fn: resolve!(
                     b"layered_probe_layer_has_cpu",
+                    unsafe extern "C" fn(u32, u32) -> i32
+                ),
+                layer_bpf_has_cpu_fn: resolve!(
+                    b"layered_probe_layer_bpf_has_cpu",
                     unsafe extern "C" fn(u32, u32) -> i32
                 ),
                 layer_nr_tasks_fn: resolve!(
@@ -402,6 +407,12 @@ impl LayeredProbes {
     pub fn layer_has_cpu(&self, layer_id: u32, cpu: CpuId) -> bool {
         // SAFETY: both indices are bounds-checked C-side.
         unsafe { (self.layer_has_cpu_fn)(layer_id, cpu.0) != 0 }
+    }
+
+    /// Whether the real BPF kptr cpumask contains `cpu` after refresh.
+    pub fn layer_bpf_has_cpu(&self, layer_id: u32, cpu: CpuId) -> bool {
+        // SAFETY: both indices are bounds-checked C-side.
+        unsafe { (self.layer_bpf_has_cpu_fn)(layer_id, cpu.0) != 0 }
     }
 
     /// `layer->nr_tasks` — how many tasks scx_layered currently places in it.

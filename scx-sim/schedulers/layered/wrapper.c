@@ -22,12 +22,11 @@
  *
  * WHAT IT DELIBERATELY DOES NOT DO (documented divergences, not stubs)
  * -------------------------------------------------------------------
- * 1. STATIC CPU ALLOCATION. Production re-runs `refresh_cpumasks()` on a
- *    timer, growing and shrinking each layer's CPU set from live
- *    utilisation. The simulator has no model for a userspace control loop,
- *    so the allocation is computed once, before ops.init, and held fixed.
- *    Layer growth/shrink code paths are therefore not exercised. Tracked
- *    as a substrate task, NOT worked around by faking the loop.
+ * 1. CPU REALLOCATION. The optional Tier-3 userspace loop measures the real
+ *    BPF usage counters and periodically republishes masks through the same
+ *    BPF_PROG_RUN tail as production. Its first increment is deliberately
+ *    limited to flat, non-SMT Linear growth; unsupported configurations are
+ *    rejected before a run instead of being approximated.
  * 2. NUMA. The scxsim engine models LLCs and SMT siblings but has no NUMA
  *    concept at all, so `nr_numa_nodes` is a harness-supplied grouping over
  *    LLCs with no simulated distance cost. Same shape as the existing
@@ -777,6 +776,17 @@ int layered_probe_layer_has_cpu(unsigned int layer_id, unsigned int cpu)
 		  (1 << (cpu % 8)));
 }
 
+/* Is `cpu` in the real BPF kptr cpumask rebuilt by refresh_cpumasks()? */
+int layered_probe_layer_bpf_has_cpu(unsigned int layer_id, unsigned int cpu)
+{
+	struct bpf_cpumask *mask;
+
+	if (layer_id >= nr_layers || cpu >= MAX_CPUS)
+		return 0;
+	mask = layered_layer_cpumasks[layer_id].cpumask;
+	return mask && bpf_cpumask_test_cpu(cpu, (const struct cpumask *)mask);
+}
+
 /* Per-layer task count (`layer->nr_tasks`), maintained by switch_to_layer(). */
 unsigned long long layered_probe_layer_nr_tasks(unsigned int layer_id)
 {
@@ -795,6 +805,19 @@ unsigned long long layered_probe_layer_stat(unsigned int layer_id, unsigned int 
 		return 0;
 	for (cpu = 0; cpu < layered_nr_sim_cpus && cpu < LAYERED_MAX_SIM_CPUS; cpu++)
 		total += layered_cpu_ctxs[cpu].lstats[layer_id][stat_id];
+	return total;
+}
+
+/* Cumulative runtime (ns) for one layer usage class, summed across CPUs. */
+unsigned long long layered_probe_layer_usage(unsigned int layer_id, unsigned int usage_id)
+{
+	unsigned long long total = 0;
+	u32 cpu;
+
+	if (layer_id >= nr_layers || usage_id >= NR_LAYER_USAGES)
+		return 0;
+	for (cpu = 0; cpu < layered_nr_sim_cpus && cpu < LAYERED_MAX_SIM_CPUS; cpu++)
+		total += layered_cpu_ctxs[cpu].layer_usages[layer_id][usage_id];
 	return total;
 }
 
@@ -1485,6 +1508,82 @@ static void layered_publish_layer_cpus(u32 id, u32 nr_cpus)
 	layer->refresh_cpus = 1;
 }
 
+/* Run the post-mask BPF_PROG_RUN steps shared by init and periodic refresh. */
+static int layered_refresh_published_cpumasks(bool init)
+{
+	u32 id, node, i;
+	int ret;
+
+	refresh_layer_cpumasks(NULL);
+	for (node = 0; node < nr_nodes && node < MAX_NUMA_NODES; node++) {
+		struct refresh_node_ctx_arg arg;
+
+		memset(&arg, 0, sizeof(arg));
+		arg.node_id = node;
+		arg.init = init;
+		if (init) {
+			for (i = 0; i < nr_llcs && i < MAX_LLCS; i++) {
+				if (llc_numa_id_map[i] == node)
+					arg.llcs[arg.nr_llcs++] = i;
+			}
+		}
+		for (id = 0; id < nr_layers && id < MAX_LAYERS; id++) {
+			if (layers[id].node[node].nr_cpus == 0)
+				arg.empty_layer_ids[arg.nr_empty_layer_ids++] = id;
+		}
+		ret = refresh_node_ctx(&arg);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
+/*
+ * Publish masks computed by the Rust userspace control loop, then execute the
+ * real BPF syscall programs that production drives with BPF_PROG_RUN.
+ */
+int layered_apply_layer_cpumasks(const unsigned long long *words,
+				 unsigned int input_nr_layers,
+				 unsigned int nr_words)
+{
+	u32 id, w;
+	u32 allocated = 0;
+	bool fully_allocated;
+	bool updated = false;
+
+	if (!words || input_nr_layers != nr_layers || nr_words > MAX_CPUS / 64)
+		return -EINVAL;
+
+	for (id = 0; id < nr_layers; id++) {
+		bool changed = false;
+
+		for (w = 0; w < nr_words; w++) {
+			if (layered_layer_cpu_words[id][w] !=
+			    words[id * nr_words + w])
+				changed = true;
+		}
+		if (changed) {
+			memset(layered_layer_cpu_words[id], 0,
+			       sizeof(layered_layer_cpu_words[id]));
+			for (w = 0; w < nr_words; w++)
+				layered_layer_cpu_words[id][w] =
+					words[id * nr_words + w];
+			layered_publish_layer_cpus(id, layered_nr_sim_cpus);
+			updated = true;
+		}
+		if (layers[id].kind != LAYER_KIND_OPEN)
+			allocated += layers[id].nr_cpus;
+	}
+
+	fully_allocated = allocated >= layered_nr_sim_cpus;
+	for (id = 0; id < nr_layers; id++) {
+		if (layers[id].kind != LAYER_KIND_OPEN)
+			layers[id].fully_allocated = fully_allocated;
+	}
+
+	return updated ? layered_refresh_published_cpumasks(false) : 0;
+}
+
 /*
  * Derive the rodata layer summaries scx_layered's userspace computes:
  * the per-kind layer counts, the weight-ordered iteration order, and the
@@ -1757,7 +1856,7 @@ void layered_setup(unsigned int num_cpus)
  */
 int layered_init(void)
 {
-	u32 id, node, i;
+	u32 id;
 	int ret;
 
 	/* Pre-init: finalize the layer table and the static CPU allocation. */
@@ -1770,30 +1869,5 @@ int layered_init(void)
 	if (ret)
 		return ret;
 
-	/* Post-attach: publish the layer cpumasks into the BPF kptrs. */
-	refresh_layer_cpumasks(NULL);
-
-	/* Post-attach: tell each node which layers have no CPUs on it. */
-	for (node = 0; node < nr_nodes && node < MAX_NUMA_NODES; node++) {
-		struct refresh_node_ctx_arg arg;
-
-		memset(&arg, 0, sizeof(arg));
-		arg.node_id = node;
-		arg.init = 1;
-		arg.nr_llcs = 0;
-		for (i = 0; i < nr_llcs && i < MAX_LLCS; i++) {
-			if (llc_numa_id_map[i] == node)
-				arg.llcs[arg.nr_llcs++] = i;
-		}
-		arg.nr_empty_layer_ids = 0;
-		for (id = 0; id < nr_layers && id < MAX_LAYERS; id++) {
-			if (layers[id].node[node].nr_cpus == 0)
-				arg.empty_layer_ids[arg.nr_empty_layer_ids++] = id;
-		}
-		ret = refresh_node_ctx(&arg);
-		if (ret)
-			return ret;
-	}
-
-	return 0;
+	return layered_refresh_published_cpumasks(true);
 }

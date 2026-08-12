@@ -15,7 +15,8 @@ Tier 3 and the conventions you must not break.
 ## 1. Where things stand
 
 Tier 2 is done and audited (see the *Tier-2 audit* table in
-`LAYERED_SUPPORT.md`). Tier 3 is one commit in.
+`LAYERED_SUPPORT.md`). Tier 3 now has its first behaviour-changing increment:
+periodic live reallocation for a source-guarded one-LLC/no-SMT `Linear` subset.
 
 | Commit | Contents |
 |---|---|
@@ -26,13 +27,14 @@ Tier 2 is done and audited (see the *Tier-2 audit* table in
 | `12d4157` | LLC topology proven to reach DSQ selection |
 | `e012423` | Tier-2 audit recorded; SMT gap filed |
 | `9052aec` | **Tier 3 step 1:** scx_layered's real allocator compiled in |
+| `TBD` | **Tier 3 step 2:** periodic control event, measured usage, flat Linear reallocation, real BPF refresh |
 
-Suite: **1117 tests pass, 14 skipped.** `cargo fmt --check` and
-`cargo clippy --all-targets --workspace -D warnings` clean. Worktree clean.
+Pre-step-2 baseline: **1117 tests pass, 14 skipped.** Replace this paragraph
+with the post-commit validation result before handing off.
 
 `validate.sh` exits 1 at the mypy gate on a **pre-existing** bug unrelated to
 this work: `scripts/typecheck.sh` resolves `mypy` from `PATH`
-(`~/.local/bin/mypy`) but `pip` from `.venv`, so stubs land where mypy cannot
+(`mypy` found on `PATH`) but `pip` from `.venv`, so stubs land where mypy cannot
 see them. Fixed on main by `f0acf58`, which is not an ancestor of this branch.
 `.venv/bin/mypy --strict` passes. Do not "fix" it here — you will conflict on
 rebase.
@@ -44,29 +46,24 @@ rebase.
 Be blunt with yourself about this, because the branch looks further along
 than it is.
 
-Tier 3 = the userspace CPU-reallocation control loop: ~2500 lines of
+Full Tier 3 = the userspace CPU-reallocation control loop: ~2500 lines of
 `alloc.rs` + ~1300 lines of `layer_core_growth.rs`, plus the periodic
 `BPF_PROG_RUN` refresh cadence that applies their output.
 
 | Piece | State |
 |---|---|
 | `alloc.rs` (~2500 lines) — the water-fill allocator | **linked and running**, with its own 80 tests |
-| `layer_core_growth.rs` (~1300 lines) — growth algorithms / core ordering | **not started.** Needs `scx_utils::Topology` + `CpuPool` from upstream `lib.rs`; neither is linkable today. Unassessed. |
-| Periodic control hook in the engine | **not started** (mb sim-lqyu9) |
-| Utilisation measurement feeding the loop | **not started** |
-| `calc_raw_demands` glue | **not started** |
-| Anything driving reallocation during a run | **not started** |
+| `layer_core_growth.rs` (~1300 lines) — growth algorithms / core ordering | **Narrow subset only.** One-LLC/no-SMT Linear is specialized from the upstream formula and source-guarded; every other mode is rejected. Full module integration remains. |
+| Periodic control hook in the engine | **done.** Generic optional scheduler userspace event; no events for schedulers that do not opt in. |
+| Utilisation measurement feeding the loop | **done for owned/open CPU time.** Reads cumulative real `cpu_ctx.layer_usages` and applies production's 100ms EWMA shape. |
+| Target/demand glue | **done for the narrow subset.** util band, cpus range, shrink dampening, single-node demand into real `unified_alloc`. Peak util, membw and pinned-util priority remain. |
+| Driving BPF reallocation during a run | **done.** Changed masks are serialized, then real `refresh_layer_cpumasks` and `refresh_node_ctx` execute. |
 
-So: **one of five pieces, and it is the one that happened to be linkable.**
-No CPU is reallocated during a simulation yet. The static-allocation
-limitation documented for Tier 2 is still fully in force, and
-`LAYERED_SUPPORT.md` still correctly says so. Do not describe layered as
-"Tier 3 in progress" to anyone expecting behaviour change — describe it as
-"Tier 3 foundation landed, loop not built".
-
-The honest fraction is perhaps 15-20% of Tier 3 by effort, and the
-unassessed `layer_core_growth.rs` dependency is the biggest remaining
-unknown — see §7.
+The first observable Tier-3 behaviour now exists, but this is not full Tier
+3. Describe it as "flat Linear Tier-3 control landed; topology-aware growth
+and advanced sizing remain." The largest remaining policy boundary is full
+`layer_core_growth.rs` integration; NUMA behavioural modelling is explicitly
+outside this Tier-3 task.
 
 ## 2. The Tier-3 design, and the one decision that matters
 
@@ -101,66 +98,47 @@ hand-transcription error (`for &i` → `for &idx`) on its very first run.
 
 ### What remains
 
-The loop itself. In production it is `main.rs::refresh_cpumasks()`
-(line ~3739). Its shape:
+Production's `main.rs::refresh_cpumasks()` (line ~3739) has this shape:
 
 ```
   measure per-layer utilisation
       -> calc_raw_demands()            (main.rs:3202) -> Vec<LayerDemand>
-      -> unified_alloc()               (alloc.rs:366) -> Vec<LayerAlloc>   [DONE: linked]
+      -> unified_alloc()               (alloc.rs:366) -> Vec<LayerAlloc>
       -> grow/shrink each layer's cpumask per node
       -> update_bpf_layer_cpumask()    sets layer->cpus/nr_cpus/refresh_cpus
       -> BPF_PROG_RUN refresh_layer_cpumasks
       -> refresh_node_ctx() per node
 ```
 
-Everything after `unified_alloc` **already exists in our wrapper** — it is
-exactly what `layered_init()` does once at startup today
-(`schedulers/layered/wrapper.c`: `layered_publish_layer_cpus`,
-`refresh_layer_cpumasks(NULL)`, the `refresh_node_ctx` loop). Making it
-periodic is largely a matter of extracting that tail into a callable
-`layered_reallocate()` and driving it.
+The narrow implementation now follows that full chain. The generic engine
+event runs every configured period; `layered_probe_layer_usage` reads the
+real counters; `LayeredControl` computes targets and calls real
+`unified_alloc`; `layered_apply_layer_cpumasks` publishes only changed masks
+and runs the real syscall programs.
 
-So the remaining work is three pieces:
+The next increments, in priority order:
 
-**(a) A periodic userspace hook in the engine** — the substrate filed as
-**mb sim-lqyu9**. A `Scenario`-level hook that runs a Rust closure at a
-configured period during the simulation with access to the loaded
-`DynamicScheduler`. Model it on the existing timed-event plumbing:
-`Scenario::task_rename` (added in `1fe2cea`) is the smallest complete
-worked example — `TaskRenameEvent` struct, builder method, `EventKind`
-variant, seeding loop in `run_internal`, per-CPU-clock match arm, and a
-handler. Copy that shape.
+1. Integrate upstream `layer_core_growth.rs` (or a pure upstream refactor)
+   so Reverse/Topo/RoundRobin/Sticky and topology-aware selection execute
+   without a local policy copy. The current flat Linear specialization has a
+   source drift guard and rejects every other algorithm.
+2. Add pinned-util demand priority. On one node it matters when demand
+   exceeds capacity, even though there is no placement choice between nodes.
+3. Add optional peak-util and memory-bandwidth sizing only when their real
+   inputs exist. Do not synthesize PMU values.
+4. Consider SMT allocation units after the real growth module is linked.
 
-Keep the boundary honest: the closure plays **userspace**. It may read
-scheduler state and write scheduler *config*. It must not make scheduling
-decisions — those stay in the BPF.
+NUMA behaviour is not on this list. It belongs to the separate S692395
+substrate goal (`xnuma_gate`, `xnuma_gate_charge`, `xnuma_bucket_refill`).
 
-**(b) Utilisation measurement.** `calc_raw_demands` needs per-layer CPU
-usage. layered already maintains it in `cpu_ctx.layer_usages[layer]
-[NR_LAYER_USAGES]`, summed across CPUs. Add a probe next to the existing
-`layered_probe_layer_stat` (`wrapper.c`) — the pattern is already there.
-This is real measured data from the scheduler's own counters, which is what
-makes the loop faithful rather than synthetic.
+### Behavioural proof now landed
 
-**(c) The glue between (b) and `unified_alloc`.** `calc_raw_demands` itself
-(main.rs:3202) is ~65 lines and depends on main.rs state, so it will need
-reproducing rather than linking. **Flag this honestly in the commit** — it is
-the one genuinely re-implemented piece, and it should be kept as thin as
-possible, with the policy left in `unified_alloc`.
-
-### Suggested first Tier-3 increment
-
-Do not attempt the whole loop at once. The smallest thing that is genuinely
-Tier 3 and provable:
-
-> Two layers, one busy and one idle, on a fixed CPU count. After N control
-> iterations, the busy layer's `nr_cpus` must have **grown** and the idle
-> layer's **shrunk**, relative to the static allocation.
-
-Prove it with a negative control: the identical workload with the control
-loop disabled must leave both layers at their initial allocation. Without
-that arm the test proves nothing (see §4).
+The identical busy/idle workload stays at `(2, 2)` with control disabled and
+reaches `(3, 1)` with control enabled. The test also compares the serialized
+mask against the real BPF kptr cpumask. Sabotaging only periodic
+`refresh_layer_cpumasks` leaves serialized `(3, 1)` but BPF `(2, 2)`, and the
+test fails. This is stronger than checking `layer->nr_cpus`, which would pass
+even if BPF never consumed the update.
 
 ---
 
