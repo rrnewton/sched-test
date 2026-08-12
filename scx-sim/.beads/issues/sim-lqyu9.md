@@ -1,10 +1,11 @@
 ---
 title: 'scxsim: model userspace scheduler control loops (scx_layered CPU reallocation)'
-status: open
+status: closed
 priority: 2
 issue_type: task
 created_at: 2026-08-12T15:27:39.388546458+00:00
-updated_at: 2026-08-12T15:27:39.388546458+00:00
+updated_at: 2026-08-12T20:32:28.507524377+00:00
+closed_at: 2026-08-12T20:32:28.507524266+00:00
 ---
 
 # Description
