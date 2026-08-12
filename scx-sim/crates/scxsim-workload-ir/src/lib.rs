@@ -33,6 +33,8 @@
 #![forbid(unsafe_code)]
 
 pub mod fidelity;
+#[cfg(feature = "ingest")]
+pub mod ingest;
 pub mod ir;
 pub mod lower;
 pub mod pretty;
@@ -40,6 +42,8 @@ pub mod source;
 pub mod units;
 
 pub use fidelity::{Approximation, Cause, Fidelity, FidelityReport};
+#[cfg(feature = "ingest")]
+pub use ingest::{to_scenario, IngestError};
 pub use ir::{
     Bandwidth, Cgroup, CpuSet, CpuSetDisplay, Mutation, Phase, Probe, Repeat, SchedPolicy, Task,
     TimedMutation, Topology, ValidationError, WorkloadIr,

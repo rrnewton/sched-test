@@ -7,6 +7,15 @@ description = "Restricted workload IR shared between ktstr and scx-sim, plus the
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
+# Optional: only the IR -> Scenario ingestion needs the simulator itself. Kept
+# behind a feature so a consumer that only wants the IR + lowering (ktstr's
+# DSL PR, which must stay scx-sim-free) does not pull in the BPF build.
+scx_simulator = { path = "../scx_simulator", optional = true, default-features = false }
+
+[features]
+default = []
+ingest = ["dep:scx_simulator"]
 
 [dev-dependencies]
 serde_json = "1"
+scx_simulator = { path = "../scx_simulator", default-features = false }

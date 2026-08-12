@@ -941,6 +941,7 @@ dependencies = [
 name = "scxsim-workload-ir"
 version = "0.1.0"
 dependencies = [
+ "scx_simulator",
  "serde",
  "serde_json",
 ]
