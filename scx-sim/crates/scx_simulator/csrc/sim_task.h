@@ -43,6 +43,12 @@ void *sim_task_get_cpus_ptr(struct task_struct *p);
 unsigned int sim_task_get_scx_flags(struct task_struct *p);
 void sim_task_set_scx_flags(struct task_struct *p, unsigned int flags);
 
+/* p->scx.runnable_at, in JIFFIES (not nanoseconds) — matches the kernel,
+ * which stamps it in scx_runnable(). Read by schedulers to measure queueing
+ * delay (e.g. scx_layered antistall). */
+unsigned long long sim_task_get_runnable_at(struct task_struct *p);
+void sim_task_set_runnable_at(struct task_struct *p, unsigned long long jiffies);
+
 /* Root cgroup for simulator cgroup modeling.
  * Returns a pointer to the global root cgroup (struct cgroup *). */
 void *sim_get_root_cgroup(void);

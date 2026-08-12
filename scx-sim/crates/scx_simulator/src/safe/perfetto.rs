@@ -607,6 +607,21 @@ pub(crate) fn write_json(trace: &Trace, writer: &mut impl Write) -> std::io::Res
                 "name": "ops.enable", "cat": "structop", "s": "t",
                 "args": { "pid": pid.0 }
             }),
+            TraceKind::SetWeight { pid, weight } => json!({
+                "ph": "i", "pid": cpu, "tid": pid.0, "ts": ts,
+                "name": "ops.set_weight", "cat": "structop", "s": "t",
+                "args": { "pid": pid.0, "weight": weight }
+            }),
+            TraceKind::Disable { pid } => json!({
+                "ph": "i", "pid": cpu, "tid": pid.0, "ts": ts,
+                "name": "ops.disable", "cat": "structop", "s": "t",
+                "args": { "pid": pid.0 }
+            }),
+            TraceKind::TaskYield { pid, handled } => json!({
+                "ph": "i", "pid": cpu, "tid": pid.0, "ts": ts,
+                "name": "ops.yield", "cat": "structop", "s": "t",
+                "args": { "pid": pid.0, "handled": handled }
+            }),
             TraceKind::SetCpumask { pid, cpumask_hex } => json!({
                 "ph": "i", "pid": cpu, "tid": pid.0, "ts": ts,
                 "name": "ops.set_cpumask", "cat": "structop", "s": "t",

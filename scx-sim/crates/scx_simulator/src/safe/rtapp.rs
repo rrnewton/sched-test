@@ -9,6 +9,7 @@
 //! - `sleep` — fixed-duration sleep (mapped to [`Phase::Sleep`])
 //! - `suspend` — self-suspend until resumed (mapped to `Phase::Sleep(u64::MAX)`)
 //! - `resume` — wake another task (mapped to [`Phase::Wake`])
+//! - `yield` — call `sched_yield()` (mapped to [`Phase::Yield`])
 //! - `timer` — periodic timer (approximated as `Phase::Sleep(period)`)
 //! - `priority` — nice value
 //! - `loop` — repetition control
@@ -194,6 +195,12 @@ fn parse_events(
                     .get(target_name)
                     .ok_or_else(|| RtAppError::UnresolvedResume(target_name.to_string()))?;
                 phases.push(Phase::Wake(*target_pid));
+            }
+            "yield" => {
+                // rt-app calls sched_yield() once per loop iteration for a
+                // `yield` event; the JSON value is parsed but ignored (verified
+                // by strace: `"yield": 1` and `"yield": 7` both yield once).
+                phases.push(Phase::Yield);
             }
             unsupported => {
                 warn!(

@@ -202,6 +202,25 @@ void *sim_task_get_cpus_ptr(struct task_struct *p)
 	return (void *)p->cpus_ptr;
 }
 
+/*
+ * p->scx.runnable_at — the jiffies timestamp at which the task last became
+ * runnable, written by the kernel in scx_runnable() and cleared (to -1) when
+ * the task starts running. Schedulers read it to measure queueing delay;
+ * scx_layered's antistall (get_delay_sec()) is the canonical consumer.
+ *
+ * Without this the field stays 0 for the whole run and every task looks
+ * infinitely delayed, so antistall fires spuriously from the first dispatch.
+ */
+u64 sim_task_get_runnable_at(struct task_struct *p)
+{
+	return p->scx.runnable_at;
+}
+
+void sim_task_set_runnable_at(struct task_struct *p, u64 jiffies)
+{
+	p->scx.runnable_at = jiffies;
+}
+
 u32 sim_task_get_scx_flags(struct task_struct *p)
 {
 	return p->scx.flags;

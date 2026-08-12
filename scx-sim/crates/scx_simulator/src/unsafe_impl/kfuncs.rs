@@ -2693,6 +2693,30 @@ pub extern "C" fn sim_bpf_ktime_get_ns() -> u64 {
     bpf_ktime_get_ns()
 }
 
+/// Simulated `CONFIG_HZ`. Must agree with `engine::TICK_INTERVAL_NS`
+/// (4ms → 250Hz) — the scheduler sees one tick per jiffy, as in the kernel.
+pub const CONFIG_HZ: u64 = 1_000_000_000 / crate::engine::TICK_INTERVAL_NS;
+
+/// Convert a simulated nanosecond timestamp to jiffies.
+///
+/// Single source of truth for the ns↔jiffies relationship, shared by the
+/// engine (which stamps `p->scx.runnable_at` in jiffies, like the kernel's
+/// `scx_runnable()`) and by scheduler wrappers overriding `bpf_jiffies64()`.
+pub const fn ns_to_jiffies(ns: u64) -> u64 {
+    ns / crate::engine::TICK_INTERVAL_NS
+}
+
+/// `bpf_jiffies64()` — the kernel helper returning the current jiffies count.
+///
+/// `bpf_helper_defs.h` declares this as a static function pointer initialised
+/// to the raw helper number, so calling it unoverridden jumps to a bogus
+/// address. Wrappers redirect it here. Derived from the same per-CPU local
+/// clock as `bpf_ktime_get_ns()` so the two never disagree.
+#[no_mangle]
+pub extern "C" fn sim_bpf_jiffies64() -> u64 {
+    ns_to_jiffies(bpf_ktime_get_ns())
+}
+
 // RCU stubs -- no-op in simulator
 #[no_mangle]
 pub extern "C" fn bpf_rcu_read_lock() {}
@@ -2703,6 +2727,23 @@ pub extern "C" fn bpf_rcu_read_unlock() {}
 // Task reference stubs
 #[no_mangle]
 pub extern "C" fn bpf_task_release(_p: *mut c_void) {}
+
+/// `bpf_task_acquire(p)` — take a reference on a task and return it.
+///
+/// The kernel bumps `p->rcu_users` and returns NULL if the task is already
+/// dying. The simulator owns every `task_struct` for the whole run (they are
+/// allocated by `sim_task_alloc` at fixture load and freed at teardown), so
+/// there is no refcount to bump and no window in which a live task pointer
+/// can become invalid mid-callback. Returning `p` unchanged is therefore the
+/// faithful answer, not a stub: the paired `bpf_task_release` is likewise a
+/// no-op, so acquire/release stay balanced.
+///
+/// Used by scx_layered's `tp_cgroup_attach_task` hook to pin the thread-group
+/// leader while it walks the group.
+#[no_mangle]
+pub extern "C" fn bpf_task_acquire(p: *mut c_void) -> *mut c_void {
+    p
+}
 
 /// Get the current task's task_struct pointer (for the CPU we're running on).
 ///

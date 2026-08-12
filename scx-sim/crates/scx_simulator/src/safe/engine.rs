@@ -428,7 +428,12 @@ const SCX_WAKE_SYNC: u64 = 16;
 const SCX_DEQ_SLEEP: u64 = 1;
 
 /// Tick interval in nanoseconds (4ms, matching HZ=250).
-const TICK_INTERVAL_NS: TimeNs = 4_000_000;
+///
+/// `kfuncs::CONFIG_HZ` and `kfuncs::ns_to_jiffies` derive the simulated
+/// jiffies rate from this, so schedulers that read `p->scx.runnable_at` or
+/// call `bpf_jiffies64()` observe a tick rate consistent with the ticks the
+/// engine actually delivers.
+pub(crate) const TICK_INTERVAL_NS: TimeNs = 4_000_000;
 
 /// Maximum dispatch loop iterations (matches kernel SCX_DSP_MAX_LOOPS).
 /// TODO(sim-b825e): Use this to implement dispatch loop exhaustion detection.
@@ -2240,6 +2245,21 @@ impl<S: Scheduler> Simulator<S> {
                 .map(|&pid| (pid, s.tasks[&pid].raw()))
                 .collect();
             for &(pid, raw) in &task_raws {
+                // The kernel tears a task down as scx_disable_task() (which
+                // invokes ops.disable) followed by ops.exit_task. Keep that
+                // order: scx_layered's layered_disable() drops the task's
+                // layer membership that layered_exit_task() then frees.
+                debug!(pid = pid.0, "enter:structop disable");
+                start_rbc(&mut s.sim);
+                let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
+                sim_callback!(s, s, sim_arc, cpu, {
+                    self.scheduler.disable(TaskPtr::new(raw));
+                });
+                s.sim
+                    .trace
+                    .record(__local_t, cpu, TraceKind::Disable { pid });
+                charge_sched_time(&mut s.sim, CpuId(0), "disable");
+
                 debug!(pid = pid.0, "enter:structop exit_task");
                 start_rbc(&mut s.sim);
                 let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
@@ -3641,6 +3661,10 @@ impl<S: Scheduler> Simulator<S> {
             // Only set if not already set (kernel semantics: only reset when task runs).
             if task.runnable_at_ns.is_none() {
                 task.runnable_at_ns = Some(s.sim.clock);
+                // Mirror it into `p->scx.runnable_at` the way the kernel's
+                // scx_runnable() does, in JIFFIES. Schedulers read the field
+                // directly to measure queueing delay (scx_layered antistall).
+                ffi::task_set_runnable_at(task.raw(), ffi::ns_to_jiffies(s.sim.clock));
             }
         }
 
@@ -3963,8 +3987,20 @@ impl<S: Scheduler> Simulator<S> {
         let original_slice = task.get_slice();
 
         // Advance to the next phase
-        let has_next = task.advance_phase();
-        let next_phase = task.current_phase().cloned();
+        let mut has_next = task.advance_phase();
+        let mut next_phase = task.current_phase().cloned();
+
+        // A `Phase::Yield` is instantaneous: the task calls sched_yield() and
+        // stays runnable. Consume every consecutive Yield here and remember
+        // that we owe the scheduler an ops.yield call, which the kernel makes
+        // from yield_task_scx() BEFORE the task is put back (i.e. before
+        // ops.stopping).
+        let mut nr_yields = 0u32;
+        while has_next && matches!(next_phase, Some(Phase::Yield)) {
+            nr_yields += 1;
+            has_next = task.advance_phase();
+            next_phase = task.current_phase().cloned();
+        }
 
         // Stop the running task
         let still_runnable = has_next && matches!(next_phase, Some(Phase::Run(_)));
@@ -3985,6 +4021,39 @@ impl<S: Scheduler> Simulator<S> {
         // Set slice to reflect consumed time (used by stopping() for vtime)
         let remaining_slice = original_slice.saturating_sub(time_consumed);
         crate::ffi::task_set_slice(raw, remaining_slice);
+
+        // sched_yield(): the kernel runs yield_task_scx() -> ops.yield on the
+        // *current* task, after its runtime has been accounted and before it
+        // is put back (ops.stopping). Delivered here so the callback sees the
+        // real remaining slice and its own write to `p->scx.slice` (scx_layered
+        // deducts `yield_step_ns`) survives into ops.stopping.
+        for _ in 0..nr_yields {
+            // Re-borrow per iteration: `sim_callback!` drops and re-acquires
+            // `guard`, so a borrow taken outside the loop cannot span it.
+            let s = &mut *guard;
+            set_ops_context(&mut s.sim, OpsContext::None);
+            debug!(pid = pid.0, "enter:structop yield");
+            start_rbc(&mut s.sim);
+            let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
+            #[allow(unused_assignments)]
+            let mut handled = false;
+            sim_callback!(s, guard, sim_arc, cpu, {
+                handled = self
+                    .scheduler
+                    .task_yield(TaskPtr::new(raw), OptionalPtr::null());
+            });
+            let s = &mut *guard;
+            if !handled {
+                // Kernel fallback in yield_task_scx() when ops.yield is
+                // absent or declines: the task forfeits the rest of its slice.
+                crate::ffi::task_set_slice(raw, 0);
+            }
+            s.sim
+                .trace
+                .record(__local_t, cpu, TraceKind::TaskYield { pid, handled });
+            charge_sched_time(&mut s.sim, cpu, "yield");
+        }
+        let s = &mut *guard;
 
         // Update sum_exec_runtime: task consumed time_consumed ns on-CPU
         {
@@ -4100,6 +4169,12 @@ impl<S: Scheduler> Simulator<S> {
             info!(task = task_name.as_str(), pid = pid.0, "COMPLETED");
         } else {
             match next_phase {
+                // Consumed by the `nr_yields` loop above, which only exits
+                // with a non-Yield phase or with `has_next == false` (handled
+                // by the `if` branch). Assert rather than silently ignore.
+                Some(Phase::Yield) => unreachable!(
+                    "Phase::Yield should have been consumed before dispatching next_phase"
+                ),
                 Some(Phase::Sleep(sleep_ns)) => {
                     let task = s.tasks.get_mut(&pid).unwrap();
                     task.state = TaskState::Sleeping;
@@ -4179,6 +4254,22 @@ impl<S: Scheduler> Simulator<S> {
                         // Process chained Wake phases (e.g. wake A, wake B, run)
                         loop {
                             match task.current_phase() {
+                                // A Yield reached from the wake chain has no
+                                // running slice to forfeit — the task is
+                                // already off-CPU here. ops.yield is only
+                                // delivered for a Yield that directly follows
+                                // a Run (see the `nr_yields` loop above).
+                                Some(Phase::Yield) => {
+                                    if !task.advance_phase() {
+                                        task.state = TaskState::Exited;
+                                        s.sim.trace.record(
+                                            local_t,
+                                            cpu,
+                                            TraceKind::TaskCompleted { pid },
+                                        );
+                                        break;
+                                    }
+                                }
                                 Some(Phase::Wake(next_target)) => {
                                     let next_target = *next_target;
                                     s.events.push(
@@ -4787,6 +4878,10 @@ impl<S: Scheduler> Simulator<S> {
         task.prev_cpu = cpu;
         // Clear runnable_at_ns: task is now running (watchdog reset).
         task.runnable_at_ns = None;
+        // Same for the scheduler-visible `p->scx.runnable_at`. The kernel
+        // clears it in scx_running(); leaving a stale jiffies stamp behind
+        // would make a running task look permanently queued.
+        ffi::task_set_runnable_at(task.raw(), 0);
         s.sim.cpus[cpu.0 as usize].current_task = Some(pid);
         s.sim.cpus[cpu.0 as usize].prev_task = None;
         // Reset IRQ stolen time for this new run period.
@@ -4841,6 +4936,25 @@ impl<S: Scheduler> Simulator<S> {
                 .trace
                 .record(__local_t, cpu, TraceKind::Enable { pid });
             charge_sched_time(&mut s.sim, cpu, "enable");
+
+            // The kernel's scx_enable_task() publishes the task's weight to
+            // the scheduler immediately after ops.enable. Schedulers that
+            // implement ops.set_weight (scx_layered) never see the weight
+            // otherwise, because the simulator has no nice(2) primitive to
+            // drive reweight_task_scx().
+            let weight = ffi::task_get_scx_weight(raw);
+            set_ops_context(&mut s.sim, OpsContext::Enable);
+            debug!(pid = pid.0, weight, "enter:structop set_weight");
+            start_rbc(&mut s.sim);
+            let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
+            sim_callback!(s, guard, sim_arc, cpu, {
+                self.scheduler.set_weight(TaskPtr::new(raw), weight);
+            });
+            let s = &mut *guard;
+            s.sim
+                .trace
+                .record(__local_t, cpu, TraceKind::SetWeight { pid, weight });
+            charge_sched_time(&mut s.sim, cpu, "set_weight");
         }
 
         // Call running
@@ -5020,7 +5134,14 @@ impl<S: Scheduler> Simulator<S> {
                         return;
                     }
                 }
-                Some(Phase::Sleep(_)) => {
+                // Sleep is already satisfied by the time we get here (this
+                // runs on the wake path). Yield is instantaneous and only has
+                // an effect while the task is on-CPU — a Yield reached from
+                // here (e.g. first phase, or straight after a Sleep) has no
+                // running slice to forfeit, so it is simply skipped. Yields
+                // that follow a Run are delivered to ops.yield in
+                // `handle_task_phase_complete`.
+                Some(Phase::Sleep(_)) | Some(Phase::Yield) => {
                     if !task.advance_phase() {
                         task.state = TaskState::Exited;
                         sim.trace.record(
