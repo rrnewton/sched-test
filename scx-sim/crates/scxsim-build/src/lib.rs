@@ -787,6 +787,62 @@ mod tests {
         );
     }
 
+    /// Every fluent `with_*` setter overrides exactly its own field and leaves the
+    /// rest at `new()`'s defaults, and the setters compose in a chain.
+    ///
+    /// These are the embedder-facing constructors: an embedder that cannot use the
+    /// bundled manifest builds its `SchedulerDefinition` through this chain, so a
+    /// setter writing the wrong field would silently mis-build that embedder's `.so`
+    /// (wrong include set, unstripped const, a dropped source patch) rather than
+    /// fail loudly. Pinned here because the standalone build never exercises them —
+    /// it reads `SCHEDULERS` directly.
+    #[test]
+    fn fluent_setters_override_only_their_own_field() {
+        let base = SchedulerDefinition::new("x");
+        assert!(base.strip_const, "new() defaults strip_const = true");
+        assert!(base.scx_bpf_dir, "new() defaults scx_bpf_dir = true");
+        assert!(
+            !base.extra_local_include,
+            "new() defaults extra_local_include = false"
+        );
+        assert!(base.source_patches.is_empty(), "new() has no patches");
+
+        let patches = vec![("find".to_string(), "replace".to_string())];
+        let patched = SchedulerDefinition::new("x").with_source_patches(patches.clone());
+        assert_eq!(patched.source_patches, patches);
+        assert!(patched.strip_const, "unrelated field untouched");
+        assert!(patched.scx_bpf_dir, "unrelated field untouched");
+
+        let stripped = SchedulerDefinition::new("x").with_strip_const(false);
+        assert!(!stripped.strip_const);
+        assert!(stripped.scx_bpf_dir, "unrelated field untouched");
+
+        let no_bpf_dir = SchedulerDefinition::new("x").with_scx_bpf_dir(false);
+        assert!(!no_bpf_dir.scx_bpf_dir);
+        assert!(no_bpf_dir.strip_const, "unrelated field untouched");
+
+        let local_inc = SchedulerDefinition::new("x").with_extra_local_include(true);
+        assert!(local_inc.extra_local_include);
+        assert!(local_inc.strip_const, "unrelated field untouched");
+
+        // Chained: the `simple` profile (local source, no scx bpf dir) plus a patch.
+        let chained = SchedulerDefinition::new("simple")
+            .with_strip_const(false)
+            .with_scx_bpf_dir(false)
+            .with_extra_local_include(true)
+            .with_source_patches(patches.clone())
+            .with_rodata(vec![("nr_cpu_ids".to_string(), ConfigValue::NumCpus)]);
+        assert_eq!(chained.name, "simple");
+        assert!(!chained.strip_const);
+        assert!(!chained.scx_bpf_dir);
+        assert!(chained.extra_local_include);
+        assert_eq!(chained.source_patches, patches);
+        assert_eq!(
+            chained.rodata,
+            vec![("nr_cpu_ids".to_string(), ConfigValue::NumCpus)]
+        );
+    }
+
     /// `scx_include_paths` with `None` returns exactly the scx-derived `-I` dirs
     /// in the order the standalone build.rs used inline, excluding `<scx_root>/lib`
     /// (build_schedulers appends that -- double-add hazard) and the caller's
