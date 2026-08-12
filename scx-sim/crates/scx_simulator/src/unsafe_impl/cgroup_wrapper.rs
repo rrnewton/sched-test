@@ -118,6 +118,20 @@ impl SimCgroupHandle {
         Self { raw }
     }
 
+    /// Publish the cgroup's directory-entry name into `cgrp->kn->name`.
+    ///
+    /// This is what a BPF scheduler walks to reconstruct the cgroup path
+    /// (scx_layered's `format_cgrp_path()` → `MATCH_CGROUP_*` rules), so a
+    /// cgroup created without a name is invisible to path matching.
+    /// Interior NULs truncate the name, as they would a C string.
+    pub fn set_name(&self, name: &str) {
+        let cstr = std::ffi::CString::new(name).unwrap_or_default();
+        // SAFETY: `self.raw` came from `sim_cgroup_alloc`, whose kernfs_node
+        // carries co-allocated name storage. The C side copies out of `cstr`
+        // before returning, so it need not outlive the call.
+        unsafe { ffi::sim_cgroup_set_name(self.raw, cstr.as_ptr()) }
+    }
+
     /// Return the raw pointer for passing to FFI scheduler ops.
     ///
     /// The pointer is valid for the lifetime of this handle.

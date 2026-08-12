@@ -675,6 +675,16 @@ pub(crate) enum EventKind {
         to_cgroup: String,
         cpu: CpuId,
     },
+    /// A task renames itself (`prctl(PR_SET_NAME)`).
+    ///
+    /// `cpu` is the CPU where the rename is initiated. In the kernel,
+    /// `__set_task_comm()` runs in process context on the renaming task's
+    /// CPU, and fires the `task_rename` BTF tracepoint.
+    TaskRename {
+        pid: Pid,
+        new_comm: String,
+        cpu: CpuId,
+    },
     /// A cgroup is created at runtime.
     ///
     /// `cpu` is the CPU where the creation is initiated. In the kernel,
@@ -2049,6 +2059,18 @@ impl<S: Scheduler> Simulator<S> {
             );
         }
 
+        // Seed task rename events
+        for re in &scenario.task_rename_events {
+            s.events.push(
+                re.at_ns,
+                EventKind::TaskRename {
+                    pid: re.pid,
+                    new_comm: re.new_comm.clone(),
+                    cpu: CpuId(0),
+                },
+            );
+        }
+
         // Seed cgroup lifecycle events
         for ce in &scenario.cgroup_create_events {
             s.events.push(
@@ -2545,6 +2567,7 @@ impl<S: Scheduler> Simulator<S> {
             | EventKind::KickDelivered { cpu, .. }
             | EventKind::TimerFired { cpu, .. }
             | EventKind::CgroupMigrate { cpu, .. }
+            | EventKind::TaskRename { cpu, .. }
             | EventKind::CgroupCreate { cpu, .. }
             | EventKind::CgroupDestroy { cpu, .. } => {
                 s.sim.advance_cpu_clock(*cpu);
@@ -2625,6 +2648,11 @@ impl<S: Scheduler> Simulator<S> {
             } => {
                 drop(guard);
                 self.handle_cgroup_migrate(pid, &from_cgroup, &to_cgroup, sim_arc, monitor);
+                guard = sim_arc.lock().unwrap();
+            }
+            EventKind::TaskRename { pid, new_comm, cpu } => {
+                drop(guard);
+                self.handle_task_rename(pid, &new_comm, cpu, sim_arc);
                 guard = sim_arc.lock().unwrap();
             }
             EventKind::CgroupCreate { event, .. } => {
@@ -3143,6 +3171,34 @@ impl<S: Scheduler> Simulator<S> {
         self.try_dispatch_and_run(cpu, sim_arc, monitor);
     }
 
+    /// Handle a task rename (`prctl(PR_SET_NAME)`).
+    ///
+    /// The kernel's `__set_task_comm()` writes the new name into `p->comm`
+    /// and then fires the `task_rename` BTF tracepoint. Both halves matter:
+    /// a scheduler that classifies by name needs the new `comm` visible
+    /// *before* it is told to re-classify (scx_layered's `tp_task_rename`
+    /// sets `refresh_layer`, and the re-match reads `p->comm`).
+    fn handle_task_rename(&self, pid: Pid, new_comm: &str, cpu: CpuId, sim_arc: &SimArc) {
+        let mut guard = sim_arc.lock().unwrap();
+        let s = &mut *guard;
+        let raw = match s.tasks.get(&pid) {
+            Some(t) => t.raw(),
+            None => return,
+        };
+        info!(pid = pid.0, comm = new_comm, "TASK RENAME");
+
+        let comm = std::ffi::CString::new(new_comm).unwrap_or_default();
+        ffi::task_set_comm(raw, &comm);
+
+        start_rbc(&mut s.sim);
+        sim_callback!(s, guard, sim_arc, cpu, {
+            self.scheduler.tp_task_rename(TaskPtr::new(raw), &comm);
+        });
+        let s = &mut *guard;
+        charge_sched_time(&mut s.sim, cpu, "tp_task_rename");
+        flush_staged_events(&mut s.sim, &mut s.events);
+    }
+
     /// Handle a cgroup migration: move a task between cgroups.
     ///
     /// In the kernel, this is triggered by writing a PID to cgroup.procs.
@@ -3228,6 +3284,19 @@ impl<S: Scheduler> Simulator<S> {
             },
         );
         charge_sched_time(&mut s.sim, cpu, "cgroup_move");
+
+        // The kernel also fires the `cgroup_attach_task` BTF tracepoint here.
+        // Schedulers whose grouping follows the DEFAULT cgroup hierarchy
+        // rather than the CPU controller hook that instead of ops.cgroup_move
+        // (scx_layered does), so a scheduler that only sees cgroup_move would
+        // never re-evaluate membership on a migration.
+        let to_path = std::ffi::CString::new(to_name).unwrap_or_default();
+        sim_callback!(s, guard, sim_arc, cpu, {
+            self.scheduler
+                .tp_cgroup_attach_task(TaskPtr::new(to_raw), &to_path, TaskPtr::new(raw));
+        });
+        let s = &mut *guard;
+        charge_sched_time(&mut s.sim, cpu, "tp_cgroup_attach_task");
 
         // --- sched_change_end: re-enqueue if was queued ---
         if was_queued {

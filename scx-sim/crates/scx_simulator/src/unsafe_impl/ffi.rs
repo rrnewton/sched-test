@@ -99,6 +99,7 @@ extern "C" {
     pub fn sim_cgroup_alloc(cgid: u64, level: u32, parent: *mut c_void) -> *mut c_void;
     pub fn sim_cgroup_free(cgrp: *mut c_void);
     pub fn sim_cgroup_get_kn_id(cgrp: *mut c_void) -> u64;
+    pub fn sim_cgroup_set_name(cgrp: *mut c_void, name: *const i8);
     pub fn sim_cgroup_set_cpuset(cgrp: *mut c_void, cpus: *const u32, nr_cpus: u32);
     pub fn sim_task_set_cgroup(p: *mut c_void, cgrp: *mut c_void);
     pub fn sim_task_get_cgroup(p: *mut c_void) -> *mut c_void;
@@ -299,6 +300,15 @@ pub fn task_set_mm(raw: *mut c_void, mm: *mut c_void) {
 pub fn task_set_real_parent(child: *mut c_void, parent: *mut c_void) {
     // SAFETY: Both pointers must be valid task_struct pointers.
     unsafe { sim_task_set_real_parent(child, parent) }
+}
+
+/// Set `p->comm` on a raw task_struct (truncated to 15 chars + NUL, as the
+/// kernel's `__set_task_comm()` does).
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn task_set_comm(raw: *mut c_void, comm: &std::ffi::CStr) {
+    // SAFETY: The caller guarantees `raw` is a valid task_struct pointer;
+    // `comm` is NUL-terminated and borrowed for the duration of the call.
+    unsafe { sim_task_set_comm(raw, comm.as_ptr()) }
 }
 
 /// Set the cgroup pointer on a raw task_struct.
@@ -552,6 +562,35 @@ pub trait Scheduler {
     /// Calls into C code. `p` must be a valid task_struct pointer.
     unsafe fn set_weight(&self, _p: *mut c_void, _weight: u32) {}
 
+    /// Deliver the `tp_btf/cgroup_attach_task` BTF tracepoint. Optional.
+    ///
+    /// Not a `struct_ops` callback — schedulers whose grouping follows the
+    /// DEFAULT cgroup hierarchy rather than the CPU controller attach here
+    /// instead of using `ops.cgroup_move` (scx_layered does exactly this).
+    /// Resolved by the `<prefix>_tp_cgroup_attach_task` symbol, like
+    /// `futex_hook`; schedulers without it get the no-op default.
+    ///
+    /// # Safety
+    /// Calls into C code. `cgrp` and `leader` must be valid pointers and
+    /// `cgrp_path` a valid NUL-terminated string.
+    unsafe fn tp_cgroup_attach_task(
+        &self,
+        _cgrp: *mut c_void,
+        _cgrp_path: *const i8,
+        _leader: *mut c_void,
+    ) {
+    }
+
+    /// Deliver the `tp_btf/task_rename` BTF tracepoint. Optional.
+    ///
+    /// A rename can change which comm-based rule a task matches, so
+    /// scx_layered re-evaluates layer membership here.
+    ///
+    /// # Safety
+    /// Calls into C code. `p` must be a valid task_struct pointer and
+    /// `new_comm` a valid NUL-terminated string.
+    unsafe fn tp_task_rename(&self, _p: *mut c_void, _new_comm: *const i8) {}
+
     /// A task is leaving SCX control (ops.disable). Optional.
     ///
     /// The kernel calls `scx_disable_task()` — and hence `ops.disable` —
@@ -802,6 +841,10 @@ type YieldFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> bool;
 type SetWeightFn = unsafe extern "C" fn(*mut c_void, u32);
 /// `<prefix>_disable(p)` (ops.disable).
 type DisableFn = unsafe extern "C" fn(*mut c_void);
+/// `<prefix>_tp_cgroup_attach_task(cgrp, cgrp_path, leader)` — BTF tracepoint.
+type TpCgroupAttachTaskFn = unsafe extern "C" fn(*mut c_void, *const i8, *mut c_void);
+/// `<prefix>_tp_task_rename(p, new_comm)` — BTF tracepoint.
+type TpTaskRenameFn = unsafe extern "C" fn(*mut c_void, *const i8);
 type DumpFn = unsafe extern "C" fn(*mut c_void);
 type DumpTaskFn = unsafe extern "C" fn(*mut c_void, *mut c_void);
 type UpdateIdleFn = unsafe extern "C" fn(i32, bool);
@@ -943,6 +986,8 @@ struct SchedOps {
     task_yield: Option<YieldFn>,
     set_weight: Option<SetWeightFn>,
     disable: Option<DisableFn>,
+    tp_cgroup_attach_task: Option<TpCgroupAttachTaskFn>,
+    tp_task_rename: Option<TpTaskRenameFn>,
     dump: Option<DumpFn>,
     dump_task: Option<DumpTaskFn>,
     update_idle: Option<UpdateIdleFn>,
@@ -1533,6 +1578,28 @@ impl DynamicScheduler {
         }
     }
 
+    /// Configure scx_layered's antistall watchdog.
+    ///
+    /// `enable` and `sec` mirror the production `--disable-antistall` and
+    /// `--antistall-sec` options. `timer_interval_ns` overrides the antistall
+    /// scan period, which production hardcodes at 15s — shortening it is a
+    /// **simulation accelerator**, letting a test reach the scan without
+    /// simulating 15 seconds; pass `None` to keep the production interval.
+    ///
+    /// Must be called after construction and before `Simulator::run()`,
+    /// because `start_layered_timers()` reads the interval during `ops.init`.
+    pub fn layered_set_antistall(&self, enable: bool, sec: u64, timer_interval_ns: Option<u64>) {
+        type SetAntistallFn = unsafe extern "C" fn(i32, u64, u64);
+        // SAFETY: Symbol resolved from a `.so` built by our build system.
+        unsafe {
+            let sym: libloading::Symbol<SetAntistallFn> = self
+                ._lib
+                .get(b"layered_set_antistall")
+                .expect("layered_set_antistall not found");
+            (sym)(enable as i32, sec, timer_interval_ns.unwrap_or(0));
+        }
+    }
+
     /// Load the scx_lavd scheduler, configured for `nr_cpus` CPUs.
     ///
     /// LAVD (Latency-criticality Aware Virtual Deadline) is a production
@@ -1922,6 +1989,10 @@ impl DynamicScheduler {
             set_weight: try_get!("set_weight")
                 .map(|p| std::mem::transmute::<*const (), SetWeightFn>(p)),
             disable: try_get!("disable").map(|p| std::mem::transmute::<*const (), DisableFn>(p)),
+            tp_cgroup_attach_task: try_get!("tp_cgroup_attach_task")
+                .map(|p| std::mem::transmute::<*const (), TpCgroupAttachTaskFn>(p)),
+            tp_task_rename: try_get!("tp_task_rename")
+                .map(|p| std::mem::transmute::<*const (), TpTaskRenameFn>(p)),
             dump: try_get!("dump").map(|p| std::mem::transmute::<*const (), DumpFn>(p)),
             dump_task: try_get!("dump_task")
                 .map(|p| std::mem::transmute::<*const (), DumpTaskFn>(p)),
@@ -1996,7 +2067,12 @@ impl DynamicScheduler {
             "stopping",
         ];
         // Optional ops — include only when present in the loaded .so
-        let optional: [(&str, bool); 25] = [
+        let optional: [(&str, bool); 27] = [
+            (
+                "tp_cgroup_attach_task",
+                self.ops.tp_cgroup_attach_task.is_some(),
+            ),
+            ("tp_task_rename", self.ops.tp_task_rename.is_some()),
             ("yield", self.ops.task_yield.is_some()),
             ("set_weight", self.ops.set_weight.is_some()),
             ("disable", self.ops.disable.is_some()),
@@ -2168,6 +2244,23 @@ impl Scheduler for DynamicScheduler {
     unsafe fn disable(&self, p: *mut c_void) {
         if let Some(f) = self.ops.disable {
             f(p);
+        }
+    }
+
+    unsafe fn tp_cgroup_attach_task(
+        &self,
+        cgrp: *mut c_void,
+        cgrp_path: *const i8,
+        leader: *mut c_void,
+    ) {
+        if let Some(f) = self.ops.tp_cgroup_attach_task {
+            f(cgrp, cgrp_path, leader);
+        }
+    }
+
+    unsafe fn tp_task_rename(&self, p: *mut c_void, new_comm: *const i8) {
+        if let Some(f) = self.ops.tp_task_rename {
+            f(p, new_comm);
         }
     }
 

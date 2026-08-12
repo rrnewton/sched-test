@@ -42,13 +42,14 @@ fn trace_signature(trace: &Trace) -> String {
 
 /// The supported schedulers, as `(name, factory)` pairs. `simple` ignores the
 /// CPU count; the rest take it.
-fn schedulers() -> [(&'static str, SchedFactory); 5] {
+fn schedulers() -> [(&'static str, SchedFactory); 6] {
     [
         ("simple", |_n| DynamicScheduler::simple()),
         ("lavd", DynamicScheduler::lavd),
         ("cosmos", DynamicScheduler::cosmos),
         ("mitosis", DynamicScheduler::mitosis),
         ("tickless", DynamicScheduler::tickless),
+        ("layered", DynamicScheduler::layered),
     ]
 }
 
