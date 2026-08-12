@@ -799,6 +799,32 @@ fn run(args: &RunArgs) -> Result<(), RunError> {
         scenario.wait_debugger = true;
     }
 
+    // Reject a warmup window that swallows the whole run.
+    //
+    // TraceStats only counts events with `time_ns >= warmup_ns`, so when the
+    // warmup reaches the end of the run EVERY statistic filters to zero --
+    // while `Total time slices` (a separate, unfiltered engine counter) still
+    // reports the full count. The result is a confident-looking summary of all
+    // zeros next to a large slice count, and an all-zero metrics CSV. That is
+    // a silent failure of the kind scx-sim/CLAUDE.md forbids: it reads as a
+    // measurement rather than a misconfiguration, and it cost one RC-blocker
+    // investigation filed against the wrong subsystem.
+    //
+    // warmup == duration is included: it leaves a zero-length measurement
+    // window. A zero warmup can never filter anything, so it is always fine.
+    if scenario.warmup_ns > 0 && scenario.warmup_ns >= scenario.duration_ns {
+        return Err(format!(
+            "warmup ({:.3}ms) must be shorter than the run duration ({:.3}ms): \
+             statistics only count events after the warmup window, so this \
+             would report 0 schedules and 0 durations for every task while \
+             'Total time slices' still showed the full count. \
+             Shorten --warmup-ms or lengthen --end-time.",
+            scenario.warmup_ns as f64 / 1e6,
+            scenario.duration_ns as f64 / 1e6,
+        )
+        .into());
+    }
+
     // Handle --determinism-check mode
     if args.determinism_check {
         return run_determinism_check(args, scenario);
