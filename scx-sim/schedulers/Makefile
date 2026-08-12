@@ -39,9 +39,58 @@ SO_TARGETS := $(foreach s,$(SCHEDS),$(BUILD_DIR)/libscx_$(s).so)
 # kfuncs (e.g. sim_bpf_get_smp_processor_id) without C declarations.
 # These symbols are resolved at dlopen time via -rdynamic.
 # Clang 21+ treats implicit function declarations as hard errors.
+#
+# -Wconditional-uninitialized: BPF/C UB fidelity. See
+# ai_docs/BPF_UB_FIDELITY_POLICY.md for the full per-UB-class policy.
+# Short version: the kernel verifier REJECTS an uninitialised REGISTER read
+# ("R%d !read_ok", verifier.c) but ALLOWS an uninitialised STACK read for
+# privileged loaders (allow_uninit_stack = CAP_PERFMON), and every scx
+# scheduler loads privileged. Which one a given uninitialised C variable
+# becomes is a register-allocation decision that differs between the BPF
+# target and the x86-64 target scxsim compiles for, so the C source is the
+# only place we can catch the whole class.
+#
+# This specific flag is load-bearing: plain -Wall and -Wuninitialized do NOT
+# catch the known real instance (scx_layered match_substr reading `y` before
+# assignment); only -Wconditional-uninitialized does. It carries a false
+# positive rate against the bpf_for()/can_loop() macro shape, so it is a
+# WARNING, never -Werror — the source it inspects is vendored upstream scx
+# and must not break on every submodule bump.
 CFLAGS_BASE := -fPIC -DSCX_BPF_UNITTEST -g -O2 \
                -Wno-unused-parameter -Wno-unknown-attributes \
-               -Wno-implicit-function-declaration
+               -Wno-implicit-function-declaration \
+               -Wconditional-uninitialized
+
+# --- UB probe support (opt-in via SCX_SIM_UB_PROBE=1) ---
+#
+# Turns the UB classes where BPF and C DISAGREE into loud, deterministic
+# aborts at the exact faulting site, instead of silent wrong answers. This is
+# an exaggerated-diagnostics mode under Twin Design Principle 2: opt-in,
+# never the default, because the default must match production and the
+# production kernel does not abort on any of these.
+#
+#   integer-divide-by-zero  BPF defines x/0 -> 0 and x%0 -> x; C says UB.
+#                           csrc/sim_sigfpe.c recovers the VALUE, but cannot
+#                           undo optimisations clang already made on the
+#                           assumption that the divisor is nonzero, so
+#                           trapping is the only sound detection.
+#   shift-exponent          BPF masks variable shifts (DST OP (SRC & 63) /
+#                           ((u32)SRC & 31), kernel/bpf/core.c); C says UB.
+#   signed-integer-overflow BPF wraps two's-complement; C says UB.
+#
+# -ftrivial-auto-var-init=pattern makes any surviving uninitialised read
+# produce an obviously-bogus 0xAA.. value rather than a plausible one.
+# DELIBERATELY NOT =zero: zero substitutes one plausible-looking value for
+# the kernel's unconstrained garbage, so a divergence looks like a correct
+# answer. Zero HIDES this bug class; pattern EXPOSES it.
+ifeq ($(SCX_SIM_UB_PROBE),1)
+CFLAGS_UB := -ftrivial-auto-var-init=pattern \
+             -fsanitize=integer-divide-by-zero,shift-exponent,signed-integer-overflow \
+             -fsanitize-trap=integer-divide-by-zero,shift-exponent,signed-integer-overflow
+$(info scx-sim/schedulers: UB PROBE MODE ON — traps on BPF/C UB divergence, NOT production-fidelity)
+else
+CFLAGS_UB :=
+endif
 
 # --- Coverage support (opt-in via SCX_SIM_COVERAGE=1) ---
 ifeq ($(SCX_SIM_COVERAGE),1)
@@ -52,7 +101,7 @@ CFLAGS_COV :=
 LDFLAGS_SO := -shared -nostdlib
 endif
 
-CFLAGS := $(CFLAGS_BASE) $(CFLAGS_COV)
+CFLAGS := $(CFLAGS_BASE) $(CFLAGS_COV) $(CFLAGS_UB)
 
 # --- scx cgroup_bw API version detection ---
 #
@@ -316,6 +365,13 @@ e9-rip-trampoline: $(E9_RIP_TRAMPOLINE_BIN)
 # Create build directory
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
+
+# --- Variable introspection ---
+# `make print-CFLAGS_BASE` prints one variable's expanded value. Used by
+# scripts/check_ub_fidelity.sh to assert the UB-policy flags are really in the
+# compile line rather than merely mentioned in a comment.
+print-%:
+	@echo '$($*)'
 
 # Include generated dependency files for incremental rebuilds
 -include $(wildcard $(BUILD_DIR)/*.d)
