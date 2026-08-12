@@ -1,6 +1,10 @@
 # scx_layered support in scxsim
 
-Status: **supported** (Tier 2 — multi-layer on real topology).
+Status: **supported** (Tier 2 — multi-layer on real topology), with one
+documented asterisk: SMT topology is published and verified correct, but its
+effect on placement is not behaviourally tested (mb sim-u4the). Every other
+Tier-2 criterion is covered by a test that fails when the behaviour breaks —
+see *Tier-2 audit* at the end.
 Added by tg `layered-support-implement`, 2026-08-12.
 
 `scx_layered` is the sixth scheduler scxsim runs, after `simple`, `lavd`,
@@ -205,3 +209,27 @@ without the userspace join/leave protocol there is nothing to drive it.
 `per_cpu_isolation`, `scheduling_invariants`, `scheduler_comparison` and
 `examples_matrix` — so it is held to the same general invariants as the
 other five schedulers.
+
+## Tier-2 audit
+
+Asked for explicitly during review: for each Tier-2 criterion, is it
+exercised by a test that would FAIL if the behaviour broke, or does it merely
+compile and run?
+
+| Criterion | Verdict | Evidence |
+|---|---|---|
+| Multi-layer | genuinely exercised | 4 matching tests assert specific per-task `layer_id`. Sabotaging `layered_add_layer_match()` to install no rules fails 9 tests. |
+| LLC topology | genuinely exercised | `llc_topology_drives_dsq_selection`: tasks pinned into LLC 0 vs LLC 1 land on different DSQs (`0x40000000` / `0x40000001`); flat-topology control arm requires all on one DSQ. |
+| NUMA topology | publication only, inherently | the engine has no NUMA concept and no distance cost, so there is no observable consequence to assert on. Documented divergence #2, not a closable test gap. |
+| SMT topology | **publication only** | `__sibling_cpu[]` is asserted correct/-1, but no test shows SMT changing a placement decision. mb sim-u4the. |
+| comm matching | genuinely exercised | see Multi-layer. |
+| cgroup matching | genuinely exercised | `cgroup_prefix_match_routes_tasks_by_cgroup_path`, `cgroup_suffix_and_contains_match` drive the real `format_cgrp_path()` + `match_prefix_suffix()`/`match_substr()`; both fail under the matching sabotage. |
+| antistall timer | genuinely exercised | `GSTAT_ANTISTALL` = 589 with `--antistall-sec 0`, 0 with `--antistall-sec 3600` on the identical workload. |
+| `ops.dump` | genuinely exercised | asserts on emitted text; the "no surviving conversion spec" assertion caught a real formatter bug (`%+lldms`). |
+
+Two tests were found overclaiming during this audit and corrected:
+`topology_seen_by_scheduler_matches_the_engine` compared the wrapper against
+a re-derivation of its own input rather than against the engine (renamed and
+its comment corrected, with the behavioural test added alongside), and the
+dump test's spec check originally looked for two hardcoded specs and would
+have missed the bug it was written to catch.
