@@ -22,6 +22,7 @@ pub mod det_hashmap;
 pub mod dsq;
 pub mod engine;
 pub mod fmt;
+pub mod layered;
 pub mod monitor;
 pub mod perf;
 pub(crate) mod perfetto;

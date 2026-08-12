@@ -250,9 +250,11 @@ pub enum TraceKind {
     /// `ops.disable` — task is leaving scheduler control. Fired immediately
     /// before `ops.exit_task`, as the kernel's teardown path does.
     Disable { pid: Pid },
-    /// `ops.yield` — task called `sched_yield()`. `handled` is the callback's
-    /// return: `false` means the engine applied the kernel's fallback of
-    /// zeroing `p->scx.slice`.
+    /// `ops.yield` — task called `sched_yield()`. `handled` records whether
+    /// the loaded scheduler implements `ops.yield`; when it does not, the
+    /// engine applied the kernel's fallback of zeroing `p->scx.slice`.
+    /// (`yield_task_scx()` discards the callback's own return value for a
+    /// plain yield, so it is deliberately not what is recorded here.)
     TaskYield { pid: Pid, handled: bool },
 
     // ----- Task affinity structop (TOP-7: affinity parity) -----

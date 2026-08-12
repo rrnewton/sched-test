@@ -65,6 +65,7 @@ pub(crate) use safe::cpu;
 pub(crate) use safe::dsq;
 pub(crate) use safe::engine;
 pub(crate) use safe::fmt;
+pub(crate) use safe::layered;
 pub(crate) use safe::monitor;
 pub(crate) use safe::perf;
 pub(crate) use safe::perfetto;
@@ -123,6 +124,7 @@ pub use safe::bpf_trace::{
     BpfEventKind, BpfTrace, BpfTraceEvent, TraceComparisonResult, TraceDifferences,
 };
 pub use safe::fmt::{FmtN, FmtTs, SimFormat};
+pub use safe::layered::{LayerGrowthAlgo, LayerKind, LayerMatch, LayerSpec, DEFAULT_LAYER_WEIGHT};
 pub use safe::monitor::{Monitor, ProbeContext, ProbePoint};
 pub use safe::perf::PmuEvent;
 pub use safe::perf::RbcCounter;
