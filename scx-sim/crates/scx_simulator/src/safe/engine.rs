@@ -1310,42 +1310,60 @@ macro_rules! sim_callback {
     };
 }
 
+/// Check for stalled runnable tasks (watchdog).
+///
+/// Iterates all tasks and checks if any Runnable task has been waiting
+/// longer than the timeout. Returns the stall with the lowest PID for
+/// determinism (HashMap iteration order is non-deterministic).
+///
+/// Free function rather than an associated fn: it never used the
+/// `Simulator<S>` type parameter, and lifting it out makes the
+/// throttle-awareness contrast tests below able to call it directly.
+pub(crate) fn check_watchdog(
+    tasks: &HashMap<Pid, SimTask>,
+    task_to_cgid: &HashMap<Pid, crate::cgroup::CgroupId>,
+    throttled_cgids: &std::collections::HashSet<u64>,
+    current_time: TimeNs,
+    timeout_ns: TimeNs,
+) -> Option<ExitKind> {
+    let mut worst: Option<(Pid, TimeNs)> = None;
+    for task in tasks.values() {
+        // A task in a cgroup the cgroup_bw library currently reports as
+        // throttled is parked in that cgroup's BTQ by policy, not starved.
+        // Real Linux/SCX DEQUEUES such a task; the simulator keeps it in
+        // TaskState::Runnable because TaskState has no parked variant, so
+        // without this check the watchdog charges deliberate cpu.max
+        // throttling as starvation and reports a stall that is not a stall.
+        if task_to_cgid
+            .get(&task.pid)
+            .is_some_and(|cgid| throttled_cgids.contains(&cgid.0))
+        {
+            continue;
+        }
+        if matches!(task.state, TaskState::Runnable) {
+            if let Some(runnable_at) = task.runnable_at_ns {
+                let runnable_for = current_time.saturating_sub(runnable_at);
+                if runnable_for > timeout_ns {
+                    // Pick the lowest PID for deterministic error reporting.
+                    let dominated = worst.map(|(pid, _)| task.pid < pid).unwrap_or(true);
+                    if dominated {
+                        worst = Some((task.pid, runnable_for));
+                    }
+                }
+            }
+        }
+    }
+    worst.map(|(pid, runnable_for_ns)| ExitKind::ErrorStall {
+        pid,
+        runnable_for_ns,
+    })
+}
+
 impl<S: Scheduler> Simulator<S> {
     pub fn new(scheduler: S) -> Self {
         Simulator {
             scheduler: SchedulerWrapper::new(scheduler),
         }
-    }
-
-    /// Check for stalled runnable tasks (watchdog).
-    ///
-    /// Iterates all tasks and checks if any Runnable task has been waiting
-    /// longer than the timeout. Returns the stall with the lowest PID for
-    /// determinism (HashMap iteration order is non-deterministic).
-    fn check_watchdog(
-        tasks: &HashMap<Pid, SimTask>,
-        current_time: TimeNs,
-        timeout_ns: TimeNs,
-    ) -> Option<ExitKind> {
-        let mut worst: Option<(Pid, TimeNs)> = None;
-        for task in tasks.values() {
-            if matches!(task.state, TaskState::Runnable) {
-                if let Some(runnable_at) = task.runnable_at_ns {
-                    let runnable_for = current_time.saturating_sub(runnable_at);
-                    if runnable_for > timeout_ns {
-                        // Pick the lowest PID for deterministic error reporting.
-                        let dominated = worst.map(|(pid, _)| task.pid < pid).unwrap_or(true);
-                        if dominated {
-                            worst = Some((task.pid, runnable_for));
-                        }
-                    }
-                }
-            }
-        }
-        worst.map(|(pid, runnable_for_ns)| ExitKind::ErrorStall {
-            pid,
-            runnable_for_ns,
-        })
     }
 
     /// Call the scheduler's enqueue callback with proper state tracking.
@@ -1658,6 +1676,7 @@ impl<S: Scheduler> Simulator<S> {
             events,
             cgroup_registry,
             task_to_cgid: HashMap::new(),
+            throttled_cgids: std::collections::HashSet::new(),
         }));
         // Install the Arc in ENGINE_SIM_ARC so enter_sim can propagate it
         // to SIM_ARC for kfuncs and cgroup callbacks.
@@ -2503,8 +2522,13 @@ impl<S: Scheduler> Simulator<S> {
             }
             EventKind::Tick { cpu } => {
                 if let Some(timeout) = watchdog_timeout {
-                    if let Some(stall_error) = Self::check_watchdog(&s.tasks, s.sim.clock, timeout)
-                    {
+                    if let Some(stall_error) = check_watchdog(
+                        &s.tasks,
+                        &s.task_to_cgid,
+                        &s.throttled_cgids,
+                        s.sim.clock,
+                        timeout,
+                    ) {
                         return Some(stall_error);
                     }
                 }
@@ -2665,6 +2689,16 @@ impl<S: Scheduler> Simulator<S> {
                 })
                 .unwrap_or_default();
             let now_ns = s.sim.cpus[cpu.0 as usize].local_clock;
+            // Refresh the watchdog's view of which cgroups are throttled from
+            // the library's own state. This is the authoritative source -- the
+            // same `cgx->is_throttled` the lib acts on -- rather than a value
+            // the simulator models independently. Refreshed every fire_timer,
+            // i.e. once per replenish period.
+            s.throttled_cgids = cbw_after
+                .iter()
+                .filter(|snap| snap.is_throttled != 0)
+                .map(|snap| snap.cgid)
+                .collect();
             let events = crate::cgroup_bw_replenish::diff_snapshots(&cbw_before, &cbw_after);
             // For each cgroup that just replenished AND is no longer
             // throttled (`keep_throttled == false`), drain any tasks the
@@ -4972,6 +5006,97 @@ impl<S: Scheduler> Simulator<S> {
 
 #[cfg(test)]
 mod tests {
+
+    // ---- watchdog throttle-awareness (tg `fix-watchdog-throttle-blind`) ----
+    //
+    // Contrast tests for the ONE behavioural change: a task whose cgroup the
+    // cgroup_bw library reports as throttled must not be charged as starved,
+    // while a task starving for any other reason still must be. Asserting the
+    // pair matters -- a change that merely stopped the watchdog firing would be
+    // strictly worse than the throttle-blindness it replaces.
+    mod watchdog_throttle_awareness {
+        use super::*;
+        use crate::cgroup::CgroupId;
+        use std::collections::{HashMap, HashSet};
+
+        /// One task, Runnable and well past the timeout, in cgroup 7.
+        fn starving_task_in_cgroup_7() -> (HashMap<Pid, SimTask>, HashMap<Pid, CgroupId>) {
+            let def = crate::task::TaskDef {
+                name: "starver".to_string(),
+                pid: Pid(2),
+                nice: 0,
+                behavior: crate::task::TaskBehavior {
+                    phases: vec![],
+                    repeat: crate::task::RepeatMode::Once,
+                },
+                start_time_ns: 0,
+                mm_id: None,
+                allowed_cpus: None,
+                parent_pid: None,
+                cgroup_name: None,
+                task_flags: 0,
+                migration_disabled: 0,
+            };
+            let mut t = SimTask::new(&def, 1);
+            t.state = TaskState::Runnable;
+            t.runnable_at_ns = Some(0);
+            let mut tasks = HashMap::new();
+            tasks.insert(Pid(2), t);
+            let mut map = HashMap::new();
+            map.insert(Pid(2), CgroupId(7));
+            (tasks, map)
+        }
+
+        #[test]
+        fn fires_for_genuine_starvation_when_cgroup_is_not_throttled() {
+            let (tasks, task_to_cgid) = starving_task_in_cgroup_7();
+            let none_throttled = HashSet::new();
+            let got = check_watchdog(
+                &tasks,
+                &task_to_cgid,
+                &none_throttled,
+                200_000_000,
+                100_000_000,
+            );
+            assert!(
+                matches!(got, Some(ExitKind::ErrorStall { pid: Pid(2), .. })),
+                "a runnable task past the timeout in an UNTHROTTLED cgroup is real \
+                 starvation and must still fire; got {got:?}"
+            );
+        }
+
+        #[test]
+        fn does_not_fire_when_the_cgroup_is_bandwidth_throttled() {
+            let (tasks, task_to_cgid) = starving_task_in_cgroup_7();
+            // Same task, same elapsed time -- only the library's throttle state differs.
+            let throttled: HashSet<u64> = [7u64].into_iter().collect();
+            let got = check_watchdog(&tasks, &task_to_cgid, &throttled, 200_000_000, 100_000_000);
+            assert!(
+                got.is_none(),
+                "a task parked in its cgroup's BTQ by cpu.max is withheld by policy, \
+                 not starved, and must NOT be reported as a stall; got {got:?}"
+            );
+        }
+
+        #[test]
+        fn a_throttled_sibling_cgroup_does_not_mask_a_real_stall() {
+            // Guards the obvious regression: exempting throttled cgroups must be
+            // per-task, not a global mute.
+            let (tasks, task_to_cgid) = starving_task_in_cgroup_7();
+            let other_cgroup_throttled: HashSet<u64> = [9u64].into_iter().collect();
+            let got = check_watchdog(
+                &tasks,
+                &task_to_cgid,
+                &other_cgroup_throttled,
+                200_000_000,
+                100_000_000,
+            );
+            assert!(
+                matches!(got, Some(ExitKind::ErrorStall { pid: Pid(2), .. })),
+                "throttling cgroup 9 must not exempt a starving task in cgroup 7; got {got:?}"
+            );
+        }
+    }
     use super::*;
 
     #[test]
