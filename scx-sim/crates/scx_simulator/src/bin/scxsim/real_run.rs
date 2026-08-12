@@ -588,6 +588,7 @@ pub fn scenario_to_rtapp_json(scenario: &scx_simulator::Scenario) -> Result<Stri
         // Use numbered suffixes for duplicate event types (run0, run1, etc.)
         let mut run_idx = 0;
         let mut sleep_idx = 0;
+        let mut yield_idx = 0;
 
         for phase in &task.behavior.phases {
             match phase {
@@ -621,6 +622,20 @@ pub fn scenario_to_rtapp_json(scenario: &scx_simulator::Scenario) -> Result<Stri
                     if let Some(target_name) = pid_to_name.get(&target_pid.0) {
                         task_obj.insert("resume".into(), json!(*target_name));
                     }
+                }
+                Phase::Yield => {
+                    // rt-app's `yield` event calls sched_yield() once per loop
+                    // iteration; its JSON value is parsed but ignored (verified
+                    // by strace against ~/bin/rt-app: `"yield": 1` and
+                    // `"yield": 7` both produce exactly one sched_yield per
+                    // iteration, and omitting the key produces none).
+                    let key = if yield_idx == 0 {
+                        "yield".into()
+                    } else {
+                        format!("yield{yield_idx}")
+                    };
+                    task_obj.insert(key, json!(1));
+                    yield_idx += 1;
                 }
             }
         }

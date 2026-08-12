@@ -45,6 +45,10 @@ extern "C" {
     pub fn sim_task_get_scx_flags(p: *mut c_void) -> u32;
     pub fn sim_task_set_scx_flags(p: *mut c_void, flags: u32);
 
+    // p->scx.runnable_at, in JIFFIES (kernel scx_runnable/scx_running semantics)
+    pub fn sim_task_get_runnable_at(p: *mut c_void) -> u64;
+    pub fn sim_task_set_runnable_at(p: *mut c_void, jiffies: u64);
+
     // Execution time accounting (se.sum_exec_runtime)
     pub fn sim_task_get_sum_exec_runtime(p: *mut c_void) -> u64;
     pub fn sim_task_set_sum_exec_runtime(p: *mut c_void, ns: u64);
@@ -231,6 +235,41 @@ pub fn task_set_sum_exec_runtime(raw: *mut c_void, ns: u64) {
 pub fn task_get_sum_exec_runtime(raw: *mut c_void) -> u64 {
     // SAFETY: The caller guarantees `raw` is a valid task_struct pointer.
     unsafe { sim_task_get_sum_exec_runtime(raw) }
+}
+
+/// Convert a simulated nanosecond timestamp to jiffies.
+///
+/// Re-exported here so `safe/` callers (which cannot `use` the
+/// `unsafe_impl::kfuncs` module directly in an `unsafe` context) get the same
+/// conversion the C side sees via `bpf_jiffies64()`.
+pub fn ns_to_jiffies(ns: crate::types::TimeNs) -> u64 {
+    crate::kfuncs::ns_to_jiffies(ns)
+}
+
+/// Set `p->scx.runnable_at` (in JIFFIES) on a raw task_struct.
+///
+/// Mirrors the kernel: `scx_runnable()` stamps the current jiffies,
+/// `scx_running()` clears it. Schedulers read the field to measure how long a
+/// task has been queued.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn task_set_runnable_at(raw: *mut c_void, jiffies: u64) {
+    // SAFETY: The caller guarantees `raw` is a valid task_struct pointer.
+    unsafe { sim_task_set_runnable_at(raw, jiffies) }
+}
+
+/// Get `p->scx.runnable_at` (in JIFFIES) from a raw task_struct.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn task_get_runnable_at(raw: *mut c_void) -> u64 {
+    // SAFETY: The caller guarantees `raw` is a valid task_struct pointer.
+    unsafe { sim_task_get_runnable_at(raw) }
+}
+
+/// Get `p->scx.weight` from a raw task_struct — the weight the kernel hands
+/// to `ops.set_weight`.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn task_get_scx_weight(raw: *mut c_void) -> u32 {
+    // SAFETY: The caller guarantees `raw` is a valid task_struct pointer.
+    unsafe { sim_task_get_scx_weight(raw) }
 }
 
 /// Set the `mm` pointer on a raw task_struct.
@@ -454,6 +493,41 @@ pub trait Scheduler {
     /// # Safety
     /// Calls into C code. `p` must be a valid task_struct pointer.
     unsafe fn set_cpumask(&self, _p: *mut c_void, _cpumask: *const c_void) {}
+
+    /// A task called `sched_yield()` (ops.yield). Optional.
+    ///
+    /// Mirrors the kernel's `yield_task_scx()`: `to` is NULL for a plain
+    /// `sched_yield()` (the only form the simulator delivers today;
+    /// `yield_to()` is not modelled). Returns whether the scheduler handled
+    /// the yield. When there is no `ops.yield` — or it returns `false` — the
+    /// kernel zeroes `p->scx.slice` itself, so the default here returns
+    /// `false` and the engine applies that fallback.
+    ///
+    /// # Safety
+    /// Calls into C code. `from` must be a valid task_struct pointer.
+    unsafe fn task_yield(&self, _from: *mut c_void, _to: *mut c_void) -> bool {
+        false
+    }
+
+    /// A task's weight changed (ops.set_weight). Optional.
+    ///
+    /// The kernel calls this from `scx_enable_task()` (once, with the task's
+    /// initial weight) and from `reweight_task_scx()` when nice changes.
+    ///
+    /// # Safety
+    /// Calls into C code. `p` must be a valid task_struct pointer.
+    unsafe fn set_weight(&self, _p: *mut c_void, _weight: u32) {}
+
+    /// A task is leaving SCX control (ops.disable). Optional.
+    ///
+    /// The kernel calls `scx_disable_task()` — and hence `ops.disable` —
+    /// immediately before `ops.exit_task` on the teardown path. Distinct from
+    /// `exit_task`: `disable` can also fire when a live task switches away
+    /// from the SCX class, which the simulator does not model.
+    ///
+    /// # Safety
+    /// Calls into C code. `p` must be a valid task_struct pointer.
+    unsafe fn disable(&self, _p: *mut c_void) {}
 
     /// Dump scheduler state for debugging (ops.dump). Optional.
     /// # Safety
@@ -687,6 +761,12 @@ type QuiescentFn = unsafe extern "C" fn(*mut c_void, u64);
 type DequeueFn = unsafe extern "C" fn(*mut c_void, u64);
 type TickFn = unsafe extern "C" fn(*mut c_void);
 type SetCpumaskFn = unsafe extern "C" fn(*mut c_void, *const c_void);
+/// `<prefix>_yield(from, to) -> bool` (ops.yield).
+type YieldFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> bool;
+/// `<prefix>_set_weight(p, weight)` (ops.set_weight).
+type SetWeightFn = unsafe extern "C" fn(*mut c_void, u32);
+/// `<prefix>_disable(p)` (ops.disable).
+type DisableFn = unsafe extern "C" fn(*mut c_void);
 type DumpFn = unsafe extern "C" fn(*mut c_void);
 type DumpTaskFn = unsafe extern "C" fn(*mut c_void, *mut c_void);
 type UpdateIdleFn = unsafe extern "C" fn(i32, bool);
@@ -824,6 +904,9 @@ struct SchedOps {
     dequeue: Option<DequeueFn>,
     tick: Option<TickFn>,
     set_cpumask: Option<SetCpumaskFn>,
+    task_yield: Option<YieldFn>,
+    set_weight: Option<SetWeightFn>,
+    disable: Option<DisableFn>,
     dump: Option<DumpFn>,
     dump_task: Option<DumpTaskFn>,
     update_idle: Option<UpdateIdleFn>,
@@ -1387,6 +1470,12 @@ impl DynamicScheduler {
             tick: try_get!("tick").map(|p| std::mem::transmute::<*const (), TickFn>(p)),
             set_cpumask: try_get!("set_cpumask")
                 .map(|p| std::mem::transmute::<*const (), SetCpumaskFn>(p)),
+            // `yield` is a Rust keyword, so the trait method is
+            // `task_yield`, but the C symbol keeps the upstream ops name.
+            task_yield: try_get!("yield").map(|p| std::mem::transmute::<*const (), YieldFn>(p)),
+            set_weight: try_get!("set_weight")
+                .map(|p| std::mem::transmute::<*const (), SetWeightFn>(p)),
+            disable: try_get!("disable").map(|p| std::mem::transmute::<*const (), DisableFn>(p)),
             dump: try_get!("dump").map(|p| std::mem::transmute::<*const (), DumpFn>(p)),
             dump_task: try_get!("dump_task")
                 .map(|p| std::mem::transmute::<*const (), DumpTaskFn>(p)),
@@ -1461,7 +1550,10 @@ impl DynamicScheduler {
             "stopping",
         ];
         // Optional ops — include only when present in the loaded .so
-        let optional: [(&str, bool); 21] = [
+        let optional: [(&str, bool); 24] = [
+            ("yield", self.ops.task_yield.is_some()),
+            ("set_weight", self.ops.set_weight.is_some()),
+            ("disable", self.ops.disable.is_some()),
             ("enable", self.ops.enable.is_some()),
             ("runnable", self.ops.runnable.is_some()),
             ("init_task", self.ops.init_task.is_some()),
@@ -1607,6 +1699,25 @@ impl Scheduler for DynamicScheduler {
     unsafe fn set_cpumask(&self, p: *mut c_void, cpumask: *const c_void) {
         if let Some(f) = self.ops.set_cpumask {
             f(p, cpumask);
+        }
+    }
+
+    unsafe fn task_yield(&self, from: *mut c_void, to: *mut c_void) -> bool {
+        match self.ops.task_yield {
+            Some(f) => f(from, to),
+            None => false,
+        }
+    }
+
+    unsafe fn set_weight(&self, p: *mut c_void, weight: u32) {
+        if let Some(f) = self.ops.set_weight {
+            f(p, weight);
+        }
+    }
+
+    unsafe fn disable(&self, p: *mut c_void) {
+        if let Some(f) = self.ops.disable {
+            f(p);
         }
     }
 
