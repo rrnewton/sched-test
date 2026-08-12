@@ -73,7 +73,7 @@ fn new_sched(label: &str, cpus: u32) -> DynamicScheduler {
 }
 
 /// Run `label` on `cpus` CPUs with `scenario`, asserting a clean exit.
-fn run(label: &str, cpus: u32, scenario: Scenario) -> trace::Trace {
+fn run(label: &str, cpus: u32, scenario: Scenario) -> Trace {
     let trace = Simulator::new(new_sched(label, cpus)).run(scenario);
     assert!(
         !trace.has_error(),
@@ -133,7 +133,12 @@ const DURATION_MS: u64 = 150;
 //    execution, where the CPU's clock resets to ~0 for the run epoch. We allow
 //    a single such reset per CPU, and only to a near-zero value; any other
 //    backward step is a real clock regression and fails.
-//    (lavd/cosmos probe the clock heavily; simple never calls it.)
+//    Only lavd is covered. cosmos does NOT call scx_bpf_now() at all -- it
+//    reads time via bpf_ktime_get_ns() (zero occurrences of scx_bpf_now in
+//    scx_cosmos/src/bpf/main.bpf.c). This test used to assert cosmos called
+//    it, and passed only because the wrapper's hand-written scx_pmu_* stubs
+//    called scx_bpf_now() to fabricate PMU counter values -- it was measuring
+//    the simulator's own stub, not the scheduler. simple never calls it.
 // ---------------------------------------------------------------------------
 
 /// A backward clock step is only tolerated if it lands here (init→run epoch
@@ -143,7 +148,7 @@ const EPOCH_RESET_CEILING_NS: u64 = 100_000;
 #[test]
 fn test_now_returns_monotonic_per_cpu_clock() {
     let _lock = common::setup_test();
-    for label in ["lavd", "cosmos"] {
+    for label in ["lavd"] {
         let trace = run(label, 4, mixed(4, 8, 1));
 
         let mut saw_now = false;
@@ -297,8 +302,12 @@ fn test_create_dsq_return_code_and_node() {
 fn test_kick_cpu_targets_valid_cpu() {
     let _lock = common::setup_test();
     let cpus = 4u32;
-    for label in ["lavd", "cosmos"] {
-        let trace = run(label, cpus, hogs(cpus, 8, 5));
+    // lavd kicks under saturation (preemption-driven); cosmos only issues
+    // SCX_KICK_IDLE, so it needs an idle CPU to exist before it kicks at all.
+    // See idle_cpu_selection::test_wakeup_kick_cpu_paths for why cosmos is no
+    // longer expected to kick on a saturated 8/4 workload.
+    for (label, nr_tasks) in [("lavd", 8), ("cosmos", 2)] {
+        let trace = run(label, cpus, hogs(cpus, nr_tasks, 5));
 
         let mut kicks = 0usize;
         for e in trace.events() {
@@ -311,10 +320,7 @@ fn test_kick_cpu_targets_valid_cpu() {
                 );
             }
         }
-        assert!(
-            kicks > 0,
-            "[{label}] scheduler issued no scx_bpf_kick_cpu under contention"
-        );
+        assert!(kicks > 0, "[{label}] scheduler issued no scx_bpf_kick_cpu");
     }
 }
 
@@ -330,7 +336,7 @@ fn test_kick_cpu_targets_valid_cpu() {
 // ---------------------------------------------------------------------------
 
 /// Highest CPU id named anywhere in the trace (event site + helper returns).
-fn max_cpu_referenced(trace: &trace::Trace) -> u32 {
+fn max_cpu_referenced(trace: &Trace) -> u32 {
     let mut m = 0u32;
     for e in trace.events() {
         m = m.max(e.cpu.0);
@@ -345,7 +351,7 @@ fn max_cpu_referenced(trace: &trace::Trace) -> u32 {
 }
 
 /// Distinct CPUs a task actually ran on.
-fn distinct_cpus_used(trace: &trace::Trace) -> BTreeSet<u32> {
+fn distinct_cpus_used(trace: &Trace) -> BTreeSet<u32> {
     trace
         .events()
         .iter()
@@ -492,7 +498,7 @@ fn test_dsq_move_to_local_consume_conservation() {
 fn test_task_cgroup_null_pointer_contract() {
     let _lock = common::setup_test();
     // extern "C" kfunc, safe to call; NULL in ⇒ NULL out, no sim context used.
-    let ret = kfuncs::scx_bpf_task_cgroup(std::ptr::null_mut::<c_void>(), 0);
+    let ret = scx_bpf_task_cgroup(std::ptr::null_mut::<c_void>(), 0);
     assert!(
         ret.is_null(),
         "scx_bpf_task_cgroup(NULL) must return NULL, got {ret:?}"

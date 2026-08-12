@@ -7,8 +7,16 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-/// Path to the rt-app binary.
-const RTAPP_BIN: &str = "/home/newton/bin/rt-app";
+/// Resolve the rt-app binary path. `SCXSIM_RTAPP_BIN` overrides it; otherwise
+/// it defaults to `$HOME/bin/rt-app` (the documented build location) so the
+/// source carries no hardcoded username. Used for the host-side existence check
+/// and the command run inside the VM (virtme-ng preserves `$HOME`).
+fn rtapp_bin() -> String {
+    std::env::var("SCXSIM_RTAPP_BIN").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_default();
+        format!("{home}/bin/rt-app")
+    })
+}
 
 /// Path to the workspace directory inside the VM (mounted from host CWD).
 const VM_WORKSPACE: &str = "/usr/workspace";
@@ -220,6 +228,10 @@ fn build_inner_cmd(
     let workload_arg = shell_escape(&workload_abs.to_string_lossy());
     let pre_hook = hook_command("pre-hook", pre_hook_path);
     let post_hook = hook_command("post-hook", post_hook_path);
+    // Shell-escaped for embedding in the in-VM command line (like workload_arg);
+    // the path is user-overridable via SCXSIM_RTAPP_BIN, so a space/metachar in
+    // it must not word-split the taskset/exec line.
+    let rtapp_bin = shell_escape(&rtapp_bin());
     let setup_env = setup_env(
         scheduler,
         sched_bin,
@@ -246,7 +258,7 @@ fn build_inner_cmd(
                  sleep 1\n\
                  {pre_hook}\
                  echo '=== Running rt-app ==='\n\
-                 taskset -c {workload_cpus} {RTAPP_BIN} {workload_arg}\n\
+                 taskset -c {workload_cpus} {rtapp_bin} {workload_arg}\n\
                  echo '=== rt-app completed ==='\n\
                  {post_hook}\
                  kill -INT $TRACER_PID 2>/dev/null || true\n\
@@ -275,7 +287,7 @@ fn build_inner_cmd(
                  sleep 1\n\
                  {pre_hook}\
                  echo '=== Running rt-app ==='\n\
-                 taskset -c {workload_cpus} {RTAPP_BIN} {workload_arg}\n\
+                 taskset -c {workload_cpus} {rtapp_bin} {workload_arg}\n\
                  echo '=== rt-app completed ==='\n\
                  {post_hook}\
                  sleep 1\n\
@@ -296,7 +308,7 @@ fn build_inner_cmd(
                  sleep 1\n\
                  {pre_hook}\
                  echo '=== Running rt-app ==='\n\
-                 {RTAPP_BIN} {workload_arg}\n\
+                 {rtapp_bin} {workload_arg}\n\
                  echo '=== rt-app completed ==='\n\
                  {post_hook}\
                 kill $SCHED_PID 2>/dev/null || true\n\
@@ -318,8 +330,11 @@ fn validate_prerequisites(
     }
 
     // Check rt-app
-    if !Path::new(RTAPP_BIN).exists() {
-        return Err(format!("rt-app not found at {RTAPP_BIN}"));
+    let rtapp_bin = rtapp_bin();
+    if !Path::new(&rtapp_bin).exists() {
+        return Err(format!(
+            "rt-app not found at {rtapp_bin} (override with SCXSIM_RTAPP_BIN)"
+        ));
     }
 
     // Check scheduler binary
@@ -500,6 +515,7 @@ fn setup_env(
         TraceMode::BpfTrace => "bpftrace",
     };
     let scheduler_args = scheduler_args.unwrap_or("");
+    let rtapp_bin = rtapp_bin();
     format!(
         "export SCXSIM_SCHEDULER={scheduler}\n\
          export SCXSIM_SCHED_BIN={sched_bin}\n\
@@ -512,7 +528,7 @@ fn setup_env(
         sched_bin = shell_escape(&sched_bin.to_string_lossy()),
         scheduler_args = shell_escape(scheduler_args),
         workload = shell_escape(&workload.to_string_lossy()),
-        rtapp_bin = shell_escape(RTAPP_BIN),
+        rtapp_bin = shell_escape(&rtapp_bin),
         trace_mode = shell_escape(trace_mode),
     )
 }
@@ -551,7 +567,7 @@ fn command_exists(cmd: &str) -> bool {
 /// simulation testing.
 #[allow(dead_code)]
 pub fn scenario_to_rtapp_json(scenario: &scx_simulator::Scenario) -> Result<String, String> {
-    use scx_simulator::task::Phase;
+    use scx_simulator::Phase;
     use serde_json::{json, Map, Value};
 
     let duration_secs = (scenario.duration_ns / 1_000_000_000) as i64;
@@ -710,6 +726,9 @@ mod tests {
 
     #[test]
     fn vm_inner_command_plumbs_scheduler_args_and_hooks() {
+        // Pin the rt-app path so the assertion is deterministic and carries no
+        // machine-specific path; also exercises the SCXSIM_RTAPP_BIN override.
+        std::env::set_var("SCXSIM_RTAPP_BIN", "/tmp/test-rt-app");
         let cmd = build_inner_cmd(
             "lavd",
             Path::new("/tmp/scx_lavd"),
@@ -729,7 +748,7 @@ mod tests {
         assert!(cmd.contains("'/tmp/scx_lavd' --enable-cpu-bw --verbose &"));
         assert!(cmd.contains("echo '=== Running pre-hook ==='\n'/tmp/pre hook.sh'"));
         assert!(cmd.contains("echo '=== Running rt-app ==='"));
-        assert!(cmd.contains("/home/newton/bin/rt-app '/tmp/r3_mimic.json'"));
+        assert!(cmd.contains("'/tmp/test-rt-app' '/tmp/r3_mimic.json'"));
         assert!(cmd.contains("echo '=== Running post-hook ==='\n'/tmp/post hook.sh'"));
 
         let pre_idx = cmd.find("=== Running pre-hook ===").unwrap();

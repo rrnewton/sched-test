@@ -107,7 +107,7 @@ fn all_output_formats_valid_across_schedulers() {
 
         // --- structops JSONL ---
         let mut jsonl_buf = Vec::new();
-        scx_simulator::structops_jsonl::write_jsonl(&trace, &mut jsonl_buf)
+        scx_simulator::write_jsonl(&trace, &mut jsonl_buf)
             .unwrap_or_else(|e| panic!("{name}: write_jsonl failed: {e}"));
         let jsonl = String::from_utf8(jsonl_buf).expect("jsonl utf8");
         let mut n_lines = 0;
@@ -132,7 +132,7 @@ fn trace_stats_summary_fields_complete() {
     let (scenario, pids) = small_scenario(nr);
     let trace = Simulator::new(DynamicScheduler::lavd(nr)).run(scenario);
 
-    let stats = scx_simulator::stats::TraceStats::from_trace(&trace);
+    let stats = scx_simulator::TraceStats::from_trace(&trace);
 
     // Duration is recorded and positive.
     assert!(stats.duration_ns > 0, "stats.duration_ns not populated");
@@ -185,7 +185,7 @@ fn output_written_to_files_roundtrip() {
     // Write structops JSONL to a file.
     {
         let mut f = std::fs::File::create(&jsonl_path).expect("create jsonl file");
-        scx_simulator::structops_jsonl::write_jsonl(&trace, &mut f).expect("write jsonl");
+        scx_simulator::write_jsonl(&trace, &mut f).expect("write jsonl");
     }
 
     // Both files exist and are non-empty.

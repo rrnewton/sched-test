@@ -36,7 +36,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 
-use scx_simulator::probes::{LavdMonitor, LavdProbes};
+use scx_simulator::{LavdMonitor, LavdProbes};
 use scx_simulator::{Monitor, ProbeContext};
 
 use scx_simulator::*;

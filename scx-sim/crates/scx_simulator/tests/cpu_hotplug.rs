@@ -122,7 +122,7 @@ fn update_idle_true_after(trace: &Trace, cpu: CpuId, at: u64) -> bool {
 }
 
 /// Build a `cpus`-CPU scenario oversubscribed with `ntasks` forever-hogs.
-fn oversubscribed(cpus: u32, ntasks: u32) -> scenario::ScenarioBuilder {
+fn oversubscribed(cpus: u32, ntasks: u32) -> ScenarioBuilder {
     let mut b = Scenario::builder().cpus(cpus);
     for i in 0..ntasks {
         b = b.add_task(&format!("h{i}"), 0, hog());

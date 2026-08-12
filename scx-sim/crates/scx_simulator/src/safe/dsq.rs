@@ -75,27 +75,6 @@ impl Dsq {
         self.vtime_entries.insert((vtime, order), pid);
     }
 
-    /// Pop the highest-priority task.
-    ///
-    /// For PRIQ DSQs, returns the lowest-vtime task.
-    /// For FIFO DSQs, returns the head of the queue.
-    /// Resets mode to Empty when the last task is removed.
-    pub fn pop(&mut self) -> Option<Pid> {
-        let result = match self.mode {
-            DsqMode::Priq => {
-                let (&key, &pid) = self.vtime_entries.iter().next()?;
-                self.vtime_entries.remove(&key);
-                Some(pid)
-            }
-            DsqMode::Fifo => self.fifo_entries.pop_front(),
-            DsqMode::Empty => None,
-        };
-        if self.is_empty() {
-            self.mode = DsqMode::Empty;
-        }
-        result
-    }
-
     /// Pop the first task matching a predicate, in priority order.
     ///
     /// Like `pop`, but skips tasks for which `predicate` returns false.
@@ -218,18 +197,6 @@ impl DsqManager {
         if let Some(dsq) = self.dsqs.get_mut(&dsq_id) {
             dsq.insert_vtime(pid, vtime);
         }
-    }
-
-    /// Move the head task from a DSQ to a CPU's local DSQ.
-    /// Returns true if a task was moved.
-    pub fn move_to_local(&mut self, dsq_id: DsqId, cpu: &mut SimCpu) -> bool {
-        if let Some(dsq) = self.dsqs.get_mut(&dsq_id) {
-            if let Some(pid) = dsq.pop() {
-                cpu.local_dsq.push_back(pid);
-                return true;
-            }
-        }
-        false
     }
 
     /// Move the first task matching a predicate from a DSQ to a CPU's local DSQ.

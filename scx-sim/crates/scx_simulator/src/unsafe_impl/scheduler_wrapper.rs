@@ -75,6 +75,9 @@ impl<S: Scheduler> SchedulerWrapper<S> {
     }
 
     /// Consume the wrapper and return the inner scheduler.
+    // Foundational safe-wrapper boundary, not yet wired into the engine;
+    // exercised by this module's tests (symmetric consume of `new`).
+    #[allow(dead_code)]
     pub fn into_inner(self) -> S {
         self.inner
     }
@@ -288,6 +291,17 @@ impl<S: Scheduler> SchedulerWrapper<S> {
         // SAFETY: `slot` is a small integer; the scheduler's wrapper.c
         // dispatches based on it.
         unsafe { self.inner.fire_timer(slot as u32) }
+    }
+
+    /// Run the scheduler's userspace-side post-attach setup, if it exports
+    /// one (`<prefix>_post_init`). Called once, immediately after ops.init.
+    ///
+    /// scx_tickless arms its periodic BPF timer from a syscall program its
+    /// Rust userspace invokes after ops.init has created the timers; this is
+    /// where scxsim plays that role. No-op for schedulers without the hook.
+    pub fn post_init(&self) {
+        // SAFETY: No arguments; the wrapper's hook takes and returns nothing.
+        unsafe { self.inner.post_init() }
     }
 
     /// Deliver a simulated futex transition (`op` = FUTEX_* command, `ret` =

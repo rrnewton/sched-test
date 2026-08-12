@@ -18,9 +18,10 @@ use std::collections::HashMap;
 
 use crate::trace::{Trace, TraceKind};
 use crate::types::{CpuId, DsqId, Pid, TimeNs};
+use serde::{Deserialize, Serialize};
 
 /// Summary statistics for a distribution of values.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DistributionStats {
     /// Number of samples.
     pub count: usize,
@@ -87,7 +88,7 @@ impl DistributionStats {
 }
 
 /// Per-task statistics computed from a trace.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TaskStats {
     /// PID of the task.
     pub pid: Pid,
@@ -132,7 +133,7 @@ pub fn percentile(sorted: &[TimeNs], p: f64) -> TimeNs {
 }
 
 /// Per-CPU statistics computed from a trace.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CpuStats {
     /// CPU ID.
     pub cpu: CpuId,
@@ -149,7 +150,7 @@ pub struct CpuStats {
 }
 
 /// Global trace statistics.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TraceStats {
     /// Per-task statistics.
     pub tasks: HashMap<Pid, TaskStats>,
@@ -157,6 +158,10 @@ pub struct TraceStats {
     pub cpus: HashMap<CpuId, CpuStats>,
     /// Total simulation duration.
     pub duration_ns: TimeNs,
+    /// Warmup window copied from the trace. Events before this time are
+    /// excluded from every count above; retained so reporters can tell
+    /// "nothing happened" apart from "everything was filtered out".
+    pub warmup_ns: TimeNs,
     /// Number of DsqInsert events (FIFO).
     pub dsq_insert_count: usize,
     /// Number of DsqInsertVtime events (vtime-ordered).
@@ -178,6 +183,7 @@ impl TraceStats {
     pub fn from_trace(trace: &Trace) -> Self {
         let mut stats = TraceStats::default();
         let warmup = trace.warmup_ns();
+        stats.warmup_ns = warmup;
 
         // Track last events for interval computation
         let mut task_last_scheduled: HashMap<Pid, TimeNs> = HashMap::new();
@@ -380,10 +386,33 @@ impl TraceStats {
         stats
     }
 
+    /// True when the trace had task activity but the warmup window excluded
+    /// all of it, so every statistic below reads zero.
+    ///
+    /// Task entries are created for any `TaskScheduled` event, warmup or not,
+    /// so a non-empty task map whose every `schedule_count` is zero means the
+    /// events existed and were filtered — not that nothing ran.
+    pub fn all_activity_filtered_by_warmup(&self) -> bool {
+        self.warmup_ns > 0
+            && !self.tasks.is_empty()
+            && self.tasks.values().all(|t| t.schedule_count == 0)
+    }
+
     /// Print a summary report to stdout.
     pub fn print_summary(&self) {
         println!("\n=== Trace Statistics ===\n");
         println!("Duration: {:.3}ms", self.duration_ns as f64 / 1_000_000.0);
+        // Never let an all-zero report pass as a measurement. The CLI rejects
+        // warmup >= duration up front, but scenarios built through the library
+        // or loaded from JSON bypass that check and reach here.
+        if self.all_activity_filtered_by_warmup() {
+            println!(
+                "\n*** WARNING: every recorded event fell inside the {:.3}ms warmup window, \
+                 so all counts below are 0 by construction, NOT a measurement of zero activity. \
+                 Shorten the warmup or lengthen the run. ***",
+                self.warmup_ns as f64 / 1_000_000.0,
+            );
+        }
         println!();
 
         println!("--- Per-Task Statistics ---");
@@ -571,7 +600,7 @@ impl TraceStats {
 }
 
 /// Comparison between two traces (real vs simulated).
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct TraceComparison {
     /// Statistics from the baseline trace (typically real).
     pub baseline: TraceStats,
@@ -629,6 +658,32 @@ impl TraceComparison {
 mod tests {
     use super::*;
 
+    /// The result/stats types round-trip through serde so an embedder
+    /// (ktstr) can persist + diff run outputs. Single-entry maps keep the JSON
+    /// key order stable for the string-equality round-trip assertion, and
+    /// exercise serde_json's handling of the newtype map keys (Pid/CpuId/DsqId).
+    #[test]
+    fn trace_stats_serde_round_trip() {
+        let mut stats = TraceStats {
+            duration_ns: 5_000_000,
+            dsq_insert_count: 7,
+            ..Default::default()
+        };
+        let ts = TaskStats {
+            pid: Pid(42),
+            schedule_count: 3,
+            ..Default::default()
+        };
+        stats.tasks.insert(Pid(42), ts);
+        stats.cpus.insert(CpuId(0), CpuStats::default());
+        stats.dsq_dispatch_histogram.insert(DsqId(0), 2);
+
+        let json = serde_json::to_string(&stats).expect("serialize TraceStats");
+        let back: TraceStats = serde_json::from_str(&json).expect("deserialize TraceStats");
+        let json2 = serde_json::to_string(&back).expect("re-serialize TraceStats");
+        assert_eq!(json, json2, "TraceStats serde round-trip not stable");
+    }
+
     #[test]
     fn test_distribution_stats_empty() {
         let stats = DistributionStats::new();
@@ -676,5 +731,55 @@ mod tests {
         stats2.add(200);
         // CV = stddev/mean * 100
         assert!(stats2.cv_percent() > 30.0);
+    }
+
+    /// Regression for rc-issue-scxsim-stats-zero: a warmup that covers the
+    /// whole run zeroes every statistic while the engine's unfiltered slice
+    /// counter still reports activity. The all-zero report must be
+    /// distinguishable from a genuine zero-activity run.
+    #[test]
+    fn test_all_activity_filtered_by_warmup() {
+        let scheduled = |pid: i32| TaskStats {
+            pid: Pid(pid),
+            ..Default::default()
+        };
+
+        // Tasks present, every schedule_count 0, warmup set -> filtered.
+        let mut filtered = TraceStats {
+            warmup_ns: 5_000_000_000,
+            ..Default::default()
+        };
+        filtered.tasks.insert(Pid(1), scheduled(1));
+        filtered.tasks.insert(Pid(2), scheduled(2));
+        assert!(filtered.all_activity_filtered_by_warmup());
+
+        // Same shape but zero warmup: nothing can have been filtered, so the
+        // zeros are a real (if empty) measurement.
+        let mut no_warmup = TraceStats::default();
+        no_warmup.tasks.insert(Pid(1), scheduled(1));
+        assert!(!no_warmup.all_activity_filtered_by_warmup());
+
+        // Any task with activity means the warmup did not swallow the run.
+        let mut partial = TraceStats {
+            warmup_ns: 1_000_000,
+            ..Default::default()
+        };
+        partial.tasks.insert(Pid(1), scheduled(1));
+        partial.tasks.insert(
+            Pid(2),
+            TaskStats {
+                pid: Pid(2),
+                schedule_count: 7,
+                ..Default::default()
+            },
+        );
+        assert!(!partial.all_activity_filtered_by_warmup());
+
+        // No tasks at all: genuinely nothing ran, not a filtering artifact.
+        let empty = TraceStats {
+            warmup_ns: 5_000_000_000,
+            ..Default::default()
+        };
+        assert!(!empty.all_activity_filtered_by_warmup());
     }
 }

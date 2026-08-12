@@ -2,7 +2,7 @@
  * sim_wrapper.h - Wrapper header for compiling BPF schedulers as userspace C
  *
  * This header must be included BEFORE the scheduler's .bpf.c file.
- * It sets up the test infrastructure from lib/scxtest/, includes
+ * It sets up the test infrastructure from scxtest/, includes
  * common.bpf.h (to set its header guard), then overrides BPF macros
  * to produce regular C functions callable from the simulator.
  */
@@ -74,26 +74,18 @@
 #define bpf_probe_read_kernel(dst, sz, src) \
 	({ __builtin_memset((dst), 0, (sz)); (long)(-14); })
 
-extern void *bpf_kptr_xchg_impl(void **kptr, void *new_val);
-#undef bpf_kptr_xchg
-#define bpf_kptr_xchg(kptr, val) \
-	bpf_kptr_xchg_impl((void **)(kptr), (void *)(val))
-
 /*
- * Time helpers: bpf_ktime_get_ns returns simulated clock (just 0 for now).
- * These are frequently used by schedulers for time comparisons.
+ * RCU read-side critical sections are no-ops in the single-threaded
+ * deterministic simulator (no concurrent reclaim). bpf_rcu_read_lock/unlock
+ * are real BPF kfuncs declared __ksym in common.bpf.h; overrides.c provides a
+ * weak no-op fallback, but defining the macro here elides every call site
+ * uniformly and before any scheduler's <lib/cleanup.bpf.h> RAII guards (which
+ * reference them). Replaces the former per-scheduler copies in mitosis/lavd.
  */
-extern unsigned long long sim_bpf_ktime_get_ns(void);
-#undef bpf_ktime_get_ns
-#define bpf_ktime_get_ns() sim_bpf_ktime_get_ns()
-
-/*
- * bpf_get_smp_processor_id: return current CPU id.
- * Already provided by sim_bpf_get_smp_processor_id in the simulator.
- */
-extern unsigned int sim_bpf_get_smp_processor_id(void);
-#undef bpf_get_smp_processor_id
-#define bpf_get_smp_processor_id() sim_bpf_get_smp_processor_id()
+#undef bpf_rcu_read_lock
+#define bpf_rcu_read_lock() ((void)0)
+#undef bpf_rcu_read_unlock
+#define bpf_rcu_read_unlock() ((void)0)
 
 /*
  * bpf_this_cpu_ptr / bpf_per_cpu_ptr: per-CPU variable access.
@@ -124,14 +116,12 @@ extern unsigned int sim_bpf_get_smp_processor_id(void);
 #define bpf_core_type_size(type) sizeof(type)
 
 /*
- * bpf_get_current_task_btf: BPF helper returning current task_struct *.
- * In bpf_helper_defs.h, it's a static function pointer initialized to NULL.
- * Override to call the Rust kfunc via -rdynamic. The Rust binary exports
- * bpf_get_current_task_btf as #[no_mangle] extern "C".
+ * bpf_get_current_task_btf_kfunc: Rust kfunc (#[no_mangle], resolved via
+ * -rdynamic at dlopen) returning the current task_struct *. Backs the
+ * bpf_get_current_task() macro above; the bpf_get_current_task_btf() override
+ * itself is provided later (sim_bpf_get_current_task_btf).
  */
 extern void *bpf_get_current_task_btf_kfunc(void);
-#undef bpf_get_current_task_btf
-#define bpf_get_current_task_btf() ((struct task_struct *)bpf_get_current_task_btf_kfunc())
 
 /*
  * bpf_probe_read_kernel_str — userspace stub.
@@ -190,45 +180,21 @@ extern u64 sim_bpf_ktime_get_ns(void);
 extern void *sim_dsq_iter_begin(u64 dsq_id, u64 flags);
 extern void *sim_dsq_iter_next(void);
 
-static __always_inline int sim_bpf_iter_scx_dsq_new(struct bpf_iter_scx_dsq *it,
-						    u64 dsq_id, u64 flags)
-{
-	u64 *opaque = (u64 *)it;
-
-	opaque[0] = (u64)(unsigned long)sim_dsq_iter_begin(dsq_id, flags);
-	opaque[1] = 1;
-	return 0;
-}
-
-static __always_inline struct task_struct *
-sim_bpf_iter_scx_dsq_next(struct bpf_iter_scx_dsq *it)
-{
-	u64 *opaque = (u64 *)it;
-
-	if (opaque[1]) {
-		opaque[1] = 0;
-		return (struct task_struct *)(unsigned long)opaque[0];
-	}
-
-	return (struct task_struct *)sim_dsq_iter_next();
-}
-
-static __always_inline void
-sim_bpf_iter_scx_dsq_destroy(struct bpf_iter_scx_dsq *it)
-{
-	while (sim_bpf_iter_scx_dsq_next(it))
-		;
-}
-
+/*
+ * DSQ iterator glue. bpf_for_each(scx_dsq, ...) takes the ADDRESS of
+ * bpf_iter_scx_dsq_destroy (a cleanup() attribute, a no-paren reference), so a
+ * function-like macro cannot satisfy it -- the concrete, address-takeable
+ * functions live in csrc/sim_dsq_iter_glue.c, compiled into every .so. Declare
+ * them here so all wrappers resolve the same symbols, both for the direct
+ * new()/next() calls and the cleanup destroy address-take. The #undef clears
+ * the helper-id pointer constants bpf_helper_defs.h defines for these names.
+ */
 #undef bpf_iter_scx_dsq_new
-#define bpf_iter_scx_dsq_new(it, dsq_id, flags) \
-	sim_bpf_iter_scx_dsq_new((it), (dsq_id), (flags))
-
 #undef bpf_iter_scx_dsq_next
-#define bpf_iter_scx_dsq_next(it) sim_bpf_iter_scx_dsq_next((it))
-
 #undef bpf_iter_scx_dsq_destroy
-#define bpf_iter_scx_dsq_destroy(it) sim_bpf_iter_scx_dsq_destroy((it))
+extern int bpf_iter_scx_dsq_new(struct bpf_iter_scx_dsq *it, u64 dsq_id, u64 flags);
+extern struct task_struct *bpf_iter_scx_dsq_next(struct bpf_iter_scx_dsq *it);
+extern void bpf_iter_scx_dsq_destroy(struct bpf_iter_scx_dsq *it);
 
 /*
  * Undo BPF CO-RE enum variable macros from enums.autogen.bpf.h.
@@ -329,6 +295,47 @@ extern s32 sim_scx_bpf_select_cpu_and(struct task_struct *p, s32 prev_cpu,
  */
 #define scx_bpf_task_cgroup(p) __sim_task_cgroup((void *)(p), 0)
 #define __COMPAT_scx_bpf_task_cgroup(p) __sim_task_cgroup((void *)(p), 0)
+
+/*
+ * The simulator always runs select_cpu before enqueue, so the enqueue CPU is
+ * always selected. Folded here from the per-scheduler wrappers (mitosis/cosmos/
+ * lavd all defined this identically). Must follow the common.bpf.h include above
+ * so it shadows the compat.bpf.h static inline at scheduler call sites.
+ */
+#undef __COMPAT_is_enq_cpu_selected
+#define __COMPAT_is_enq_cpu_selected(enq_flags) (true)
+
+/*
+ * __COMPAT_scx_bpf_dsq_peek -- route directly to the simulator's scx_bpf_dsq_peek
+ * kfunc (resolved from the Rust binary at dlopen) instead of the compat
+ * fall-through to bpf_iter_scx_dsq_* ksym-probing. Folded here from the
+ * per-scheduler wrappers (mitosis/cosmos/lavd were identical).
+ */
+extern struct task_struct *scx_bpf_dsq_peek(u64 dsq_id);
+#define __COMPAT_scx_bpf_dsq_peek(dsq_id) scx_bpf_dsq_peek(dsq_id)
+
+/*
+ * is_migration_disabled: the simulator sets task_struct::migration_disabled
+ * explicitly (no BPF trampoline prolog exists to spuriously bump it), so
+ * migration_disabled > 0 unambiguously means migration-disabled. Folded here
+ * from the per-scheduler wrappers (mitosis/cosmos/lavd defined this
+ * identically). Must follow the common.bpf.h include above so it shadows the
+ * common.bpf.h static inline at scheduler call sites.
+ *
+ * Without this override the inline gates on bpf_core_field_exists(
+ * p->migration_disabled), which the simulator forces to 0 (see
+ * __builtin_preserve_field_info above), so the inline returns false for every
+ * task -- a scheduler that calls is_migration_disabled with no override (e.g.
+ * tickless) would treat migration_disabled >= 1 tasks as migratable. This
+ * override corrects that.
+ *
+ * Tests that should also reflect real-kernel behavior (where the inline treats
+ * migration_disabled == 1 as the ambiguous BPF-prolog case) should set
+ * migration_disabled >= 2 to model an unambiguously migration-disabled task.
+ */
+extern unsigned short sim_task_get_migration_disabled(struct task_struct *p);
+#undef is_migration_disabled
+#define is_migration_disabled(p) (sim_task_get_migration_disabled(p) > 0)
 
 /*
  * Override BPF_STRUCT_OPS to produce regular C functions.

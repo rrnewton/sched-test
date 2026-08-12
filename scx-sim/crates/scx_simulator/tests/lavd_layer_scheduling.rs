@@ -24,8 +24,8 @@
 //! scheduler-side changes, per the No-Stub / "model the kernel, not the
 //! scheduler" rules in `scx-sim/CLAUDE.md`.
 
-use scx_simulator::probes::{LavdMonitor, LavdProbes};
 use scx_simulator::*;
+use scx_simulator::{LavdMonitor, LavdProbes};
 
 mod common;
 

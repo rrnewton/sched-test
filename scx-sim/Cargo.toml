@@ -3,6 +3,10 @@ members = [
     "crates/scx_simulator",
     "crates/scx_perf",
     "crates/scx_cgroup_tree",
+    "crates/scxsim-build",
+    "crates/embed_harness",
+    "crates/scxsim-workload-ir",
+    "crates/scxsim-calibration",
 ]
 resolver = "2"
 

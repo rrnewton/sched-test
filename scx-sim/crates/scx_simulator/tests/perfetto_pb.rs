@@ -53,7 +53,7 @@ mod common;
 
 /// Build the same tiny scenario both tests use, run the simulator,
 /// return the trace.
-fn build_smoke_trace() -> trace::Trace {
+fn build_smoke_trace() -> Trace {
     let scenario = Scenario::builder()
         .cpus(2)
         .instant_timing()
@@ -287,21 +287,43 @@ fn test_perfetto_pb_roundtrip_wprof_compatible() {
 /// ingester-side schema invariant. This test catches that regression
 /// class by going through the actual ingester.
 ///
-/// **Skip behavior:** if `trace_processor_shell` is not on `$PATH`
-/// the test logs a warning and returns. We don't want to make it a
-/// hard dependency in stripped CI sandboxes, but on developer
-/// machines (where it's available at `~/bin/trace_processor_shell`)
-/// it provides the strongest end-to-end guarantee.
+/// **Skip behavior, and the asymmetry it creates — read before trusting a
+/// green CI run of this test.** If `trace_processor_shell` is not on `$PATH`
+/// or in `~/bin`, this test returns early and is reported as PASSED. The
+/// GitHub Actions workflow installs only clang / llvm / libelf / xxd /
+/// markdown / zlib, so **in CI this test has never actually executed** — it
+/// contributes a pass to the suite total while asserting nothing. On a
+/// developer machine that has the binary it does run, and provides the
+/// strongest end-to-end guarantee available.
+///
+/// So the coverage runs BACKWARDS from the usual assumption: local runs more
+/// than CI here, exactly like the ASLR gate that skipped whenever
+/// `target/release/scxsim` was absent (CI never builds release, so CI never
+/// ran it while developers with a stale binary did).
+///
+/// Two ways to close it, in preference order:
+///  1. Install `trace_processor_shell` in the workflow and set
+///     `SCXSIM_REQUIRE_TRACE_PROCESSOR=1` there, which turns the skip below
+///     into a hard failure so the test can never silently vanish again.
+///  2. Failing that, run it locally before trusting any Perfetto change.
 #[test]
 fn test_perfetto_pb_ingestible_by_trace_processor() {
     let _lock = common::setup_test();
 
+    let require = std::env::var_os("SCXSIM_REQUIRE_TRACE_PROCESSOR").is_some();
     let tp = match find_trace_processor() {
         Some(p) => p,
         None => {
+            assert!(
+                !require,
+                "SCXSIM_REQUIRE_TRACE_PROCESSOR is set but trace_processor_shell \
+                 was not found on $PATH or in ~/bin — refusing to skip silently"
+            );
             eprintln!(
                 "SKIP: trace_processor_shell not found on $PATH or in ~/bin; \
-                 install Perfetto's trace_processor_shell to enable this test"
+                 install Perfetto's trace_processor_shell to enable this test. \
+                 NOTE: this test is being counted as PASSED without running. \
+                 Set SCXSIM_REQUIRE_TRACE_PROCESSOR=1 to make this a failure."
             );
             return;
         }
@@ -318,7 +340,7 @@ fn test_perfetto_pb_ingestible_by_trace_processor() {
     let expected_oncpu_slices = trace
         .events()
         .iter()
-        .filter(|e| matches!(e.kind, trace::TraceKind::TaskScheduled { .. }))
+        .filter(|e| matches!(e.kind, TraceKind::TaskScheduled { .. }))
         .count();
     assert!(
         expected_oncpu_slices > 0,

@@ -551,6 +551,51 @@ Do not let `mirror/<branch>` drift from `origin/<branch>` silently. If only the
 fork is writable or upstream auth fails, push to `mirror` only and explicitly
 record the auth gap in the task/PR notes.
 
+### You own your PR until it lands — no languishing work
+
+Owner policy, standing (2026-08-12). Finishing the code is not finishing the
+task. The flow is:
+
+    work -> commit as you go -> rename off `agent/*` -> push (origin AND
+    mirror) -> open PR against `integration` -> (optional reviewer-agent
+    pass) -> LAND IT -> PUSH THE MIRROR AGAIN
+
+- **AFTER MERGING A PR, PUSH THE MIRROR EXPLICITLY.** This is the step the
+  flow above hides, and it catches everyone exactly once. Merging on GitHub
+  writes the merge commit to **origin only** — `rrnewton/sched-test` is not a
+  GitHub-native mirror, so nothing propagates. Lockstep is automatic for your
+  *branch* pushes and NOT automatic for the *merge*. The moment your PR goes
+  green-and-merged, `mirror/integration` is behind by exactly your merge
+  commit, and nothing tells you:
+
+      with-proxy git fetch origin integration
+      with-proxy git push mirror FETCH_HEAD:refs/heads/integration
+      # then prove it, do not assume it:
+      for r in origin mirror; do \
+        echo "$r $(with-proxy git ls-remote $r refs/heads/integration | awk '{print $1}')"; done
+
+  Observed 2026-08-12 on PR #69: origin `841a3c8`, mirror still `80f9d78`
+  immediately after the merge. Found only because the SHAs were compared;
+  "I pushed both remotes earlier" was true and irrelevant.
+- **OWN YOUR PR UNTIL IT LANDS.** Do not hand back a branch and walk away.
+- **NEVER LEAVE UNCOMMITTED CHANGES LOCALLY.** Commit as you go; WIP messages
+  are fine. Committing is not a claim that the work is done.
+- **BEFORE GOING IDLE OR FINISHING:** worktree clean, work pushed, PR open or
+  landed — and say so explicitly in your final note.
+
+Pause for the owner only to land something RED, to rewrite shared history, or
+to change the scx submodule pin. Everything else you land.
+
+This does not relax anything above: `agent/*` names are local scratch and must
+be renamed before any push, both remotes stay in lockstep, PRs target
+`integration` rather than `main`, and an scx pin that is not an ancestor of
+upstream `main` is never committed.
+
+Note the interaction with the testing rule above: "do not push untested code"
+still stands and is not an exception to this. It means *test it, then push* —
+run the tests yourself, install what you need. It does not mean park the
+branch and wait.
+
 Issue Tracking
 ========================================
 

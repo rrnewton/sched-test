@@ -14,6 +14,9 @@
 # --- Paths (overridable by build.rs) ---
 SIMULATOR_DIR ?= ..
 ROOT_DIR      ?= $(SIMULATOR_DIR)/..
+# C substrate vendored into the scx_simulator crate (build.rs overrides these).
+CSRC_DIR      ?= $(SIMULATOR_DIR)/crates/scx_simulator/csrc
+SCXTEST_DIR   ?= $(SIMULATOR_DIR)/crates/scx_simulator/scxtest
 BUILD_DIR     ?= build
 
 # CC defaults to 'cc' (gcc) in Make, but this code requires clang.
@@ -45,14 +48,63 @@ CFLAGS_BASE := -fPIC -DSCX_BPF_UNITTEST -g -O2 \
 
 # --- Coverage support (opt-in via SCX_SIM_COVERAGE=1) ---
 ifeq ($(SCX_SIM_COVERAGE),1)
-CFLAGS_COV := -fprofile-instr-generate -fcoverage-mapping
-LDFLAGS_SO := -shared -fprofile-instr-generate
+CFLAGS_COV  := -fprofile-instr-generate -fcoverage-mapping
+LDFLAGS_COV := -fprofile-instr-generate
 else
-CFLAGS_COV :=
-LDFLAGS_SO := -shared -nostdlib
+CFLAGS_COV  :=
+LDFLAGS_COV :=
 endif
 
-CFLAGS := $(CFLAGS_BASE) $(CFLAGS_COV)
+# --- UndefinedBehaviorSanitizer (opt-in via SCX_SIM_UBSAN=1) ---
+#
+# Why: these .so files are BPF scheduler source compiled as ordinary
+# userspace C. BPF and C do not agree on everything, and where the C
+# standard says "undefined" the compiler is free to miscompile silently.
+# UBSan turns that silence into a diagnostic with a file:line.
+#
+# -fno-sanitize-recover=all IS LOAD-BEARING, DO NOT DROP IT. By default
+# UBSan prints "runtime error: ..." and CONTINUES, and the process still
+# exits 0. A gate built that way reports failures and passes anyway --
+# measured, not assumed: an injected shift-out-of-bounds printed its
+# diagnostic and the run still exited 0. With no-recover the first hit
+# aborts and the exit status is non-zero, so callers actually fail.
+#
+# Deliberately added to CFLAGS and NOT to CFLAGS_BASE. That is what keeps
+# sim_sigfpe.c, sim_rbc_trampoline.c and sim_deterministic_mem.c
+# uninstrumented, for exactly the reasons they are already excluded from
+# coverage: sim_sigfpe.c decodes x86 div at RIP and breaks if instruction
+# layout shifts, and the other two are branchless/hot-path by design.
+#
+# Linking: the default build is -nostdlib, which cannot host a sanitizer
+# runtime, so UBSan swaps it for the shared runtime. -shared-libsan is
+# required because the Rust host binary that dlopens these is NOT
+# sanitized, so the .so must carry its own runtime reference. The rpath
+# is computed from the compiler at build time rather than written down,
+# so no machine-specific path enters this file.
+#
+# CAVEAT -- do not combine with RBC replay. UBSan inserts conditional
+# branches, and this project counts retired conditional branches for
+# deterministic replay. A trace recorded from a UBSan build will not
+# replay against a non-UBSan build. Use UBSan to find UB, not to record.
+ifeq ($(SCX_SIM_UBSAN),1)
+CFLAGS_UBSAN  := -fsanitize=undefined -fno-sanitize-recover=all
+LDFLAGS_UBSAN := -fsanitize=undefined -shared-libsan \
+                 -Wl,-rpath,$(shell $(CC) -print-runtime-dir)
+else
+CFLAGS_UBSAN  :=
+LDFLAGS_UBSAN :=
+endif
+
+# -nostdlib is only correct when nothing needs a runtime. Coverage and UBSan
+# each bring one, and they compose, so decide from both rather than letting
+# whichever block is written last silently win.
+ifeq ($(strip $(LDFLAGS_COV)$(LDFLAGS_UBSAN)),)
+LDFLAGS_SO := -shared -nostdlib
+else
+LDFLAGS_SO := -shared $(LDFLAGS_COV) $(LDFLAGS_UBSAN)
+endif
+
+CFLAGS := $(CFLAGS_BASE) $(CFLAGS_COV) $(CFLAGS_UBSAN)
 
 # --- scx cgroup_bw API version detection ---
 #
@@ -107,8 +159,17 @@ CFLAGS += $(CFLAGS_BPF_API)
 # do not change behavior.
 CFLAGS += -DSCXSIM_PHASE2_REAL_CGROUP_BW=1
 
-INCLUDES := -I$(SIMULATOR_DIR)/csrc \
-            -I$(ROOT_DIR)/lib/scxtest \
+# Per-scheduler wrapper.c files include scx library sources via relative paths
+# like "../../scx/lib/ravg.bpf.c" that anchor on the schedulers/ directory (two
+# real levels above the scx submodule: schedulers -> scx-sim -> repo-root/scx).
+# -I$(SIMULATOR_DIR)/schedulers makes that resolve. (Previously this anchored on
+# scx-sim/csrc, before csrc moved into the scx_simulator crate; scheds/include
+# cannot substitute because it is a symlink into the submodule, so `../../`
+# traverses the target.) A future generic wrapper generation replaces these
+# fragile relative includes with a stable -I.
+INCLUDES := -I$(CSRC_DIR) \
+            -I$(SCXTEST_DIR) \
+            -I$(SIMULATOR_DIR)/schedulers \
             -I$(ROOT_DIR)/scheds/include \
             -I$(ROOT_DIR)/scheds/include/lib \
             -I$(ROOT_DIR)/scheds/vmlinux \
@@ -122,9 +183,9 @@ INCLUDES := -I$(SIMULATOR_DIR)/csrc \
 # the SDT hash table state, allowing sim_sdt_reset() to work correctly.
 # overrides.c is included to provide weak stubs that the linker can use
 # if the main binary's strong definitions aren't found (they should be).
-SHARED_SRCS := $(SIMULATOR_DIR)/csrc/sim_bpf_stubs.c \
-               $(SIMULATOR_DIR)/csrc/sim_sigfpe.c \
-               $(ROOT_DIR)/lib/scxtest/overrides.c
+SHARED_SRCS := $(CSRC_DIR)/sim_bpf_stubs.c \
+               $(CSRC_DIR)/sim_sigfpe.c \
+               $(SCXTEST_DIR)/overrides.c
 
 # --- Per-scheduler config ---
 # Each scheduler can define EXTRA_CFLAGS_<name> and EXTRA_INCLUDES_<name>
@@ -140,7 +201,7 @@ E9PATCH ?= $(or $(wildcard $(SIMULATOR_DIR)/third_party/e9patch/e9patch),$(shell
 
 # --- Build rules ---
 
-.PHONY: all clean e9 e9-rip-trampoline $(SCHEDS)
+.PHONY: all clean ubsan e9 e9-rip-trampoline $(SCHEDS)
 
 ifeq ($(BPF_INCLUDE),)
 all:
@@ -156,6 +217,20 @@ $(foreach s,$(SCHEDS),$(eval $(s): $(BUILD_DIR)/libscx_$(s).so))
 clean:
 	rm -rf $(BUILD_DIR)
 
+# Build every scheduler with UBSan into a SEPARATE build dir, so the
+# instrumented .so files never get mistaken for the normal ones (they are not
+# interchangeable: see the RBC-replay caveat above).
+#
+# Run them with:
+#     scxsim run ... --scheduler-file <dir>/build-ubsan/libscx_<name>.so
+#
+# A hit aborts the run with a non-zero exit and a file:line diagnostic. If you
+# see "runtime error:" but a zero exit, -fno-sanitize-recover=all has been
+# dropped and the gate is no longer a gate.
+ubsan:
+	@$(MAKE) --no-print-directory SCX_SIM_UBSAN=1 BUILD_DIR=$(BUILD_DIR)-ubsan all
+	@echo "UBSan schedulers in $(BUILD_DIR)-ubsan (not interchangeable with $(BUILD_DIR))"
+
 # --- Object compilation ---
 
 # Per-scheduler wrapper.c -> <name>_wrapper.o
@@ -168,7 +243,7 @@ endef
 
 # Per-scheduler sim_bpf_stubs.c -> <name>_sim_bpf_stubs.o
 define STUBS_RULE
-$(BUILD_DIR)/$(1)_sim_bpf_stubs.o: $(SIMULATOR_DIR)/csrc/sim_bpf_stubs.c | $(BUILD_DIR)
+$(BUILD_DIR)/$(1)_sim_bpf_stubs.o: $(CSRC_DIR)/sim_bpf_stubs.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(INCLUDES) $(EXTRA_INCLUDES_$(1)) $(EXTRA_CFLAGS_$(1)) \
 		-MMD -MF $(BUILD_DIR)/$(1)_sim_bpf_stubs.d \
 		-c -o $$@ $$<
@@ -181,7 +256,7 @@ endef
 # instruction layout around div, causing the handler to miscalculate lengths
 # and jump to invalid addresses.
 define SIGFPE_RULE
-$(BUILD_DIR)/$(1)_sim_sigfpe.o: $(SIMULATOR_DIR)/csrc/sim_sigfpe.c | $(BUILD_DIR)
+$(BUILD_DIR)/$(1)_sim_sigfpe.o: $(CSRC_DIR)/sim_sigfpe.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS_BASE) \
 		-MMD -MF $(BUILD_DIR)/$(1)_sim_sigfpe.d \
 		-c -o $$@ $$<
@@ -189,7 +264,7 @@ endef
 
 # Per-scheduler overrides.c -> <name>_overrides.o
 define OVERRIDES_RULE
-$(BUILD_DIR)/$(1)_overrides.o: $(ROOT_DIR)/lib/scxtest/overrides.c | $(BUILD_DIR)
+$(BUILD_DIR)/$(1)_overrides.o: $(SCXTEST_DIR)/overrides.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(INCLUDES) $(EXTRA_INCLUDES_$(1)) $(EXTRA_CFLAGS_$(1)) \
 		-MMD -MF $(BUILD_DIR)/$(1)_overrides.d \
 		-c -o $$@ $$<
@@ -200,7 +275,7 @@ endef
 # NOTE: compiled WITHOUT coverage flags — the trampoline is called on every
 # instrumented Jcc and must have minimal overhead.
 define RBC_TRAMPOLINE_RULE
-$(BUILD_DIR)/$(1)_sim_rbc_trampoline.o: $(SIMULATOR_DIR)/csrc/sim_rbc_trampoline.c | $(BUILD_DIR)
+$(BUILD_DIR)/$(1)_sim_rbc_trampoline.o: $(CSRC_DIR)/sim_rbc_trampoline.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS_BASE) \
 		-MMD -MF $(BUILD_DIR)/$(1)_sim_rbc_trampoline.d \
 		-c -o $$@ $$<
@@ -212,7 +287,7 @@ endef
 # NOTE: compiled WITHOUT $(INCLUDES) to avoid vmlinux.h conflicts.
 # NOTE: compiled WITHOUT coverage flags — these are hot-path memory ops.
 define DETERMINISTIC_MEM_RULE
-$(BUILD_DIR)/$(1)_sim_deterministic_mem.o: $(SIMULATOR_DIR)/csrc/sim_deterministic_mem.c | $(BUILD_DIR)
+$(BUILD_DIR)/$(1)_sim_deterministic_mem.o: $(CSRC_DIR)/sim_deterministic_mem.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS_BASE) \
 		-MMD -MF $(BUILD_DIR)/$(1)_sim_deterministic_mem.d \
 		-c -o $$@ $$<
@@ -260,9 +335,9 @@ $(foreach s,$(SCHEDS),$(eval $(call SO_RULE,$(s))))
 # Usage: make e9  (requires e9tool; builds _e9.so for all schedulers)
 
 E9COMPILE ?= $(SIMULATOR_DIR)/third_party/e9patch/e9compile.sh
-E9_TRAMPOLINE_SRC := $(SIMULATOR_DIR)/csrc/e9_rbc_trampoline.c
+E9_TRAMPOLINE_SRC := $(CSRC_DIR)/e9_rbc_trampoline.c
 E9_TRAMPOLINE_BIN := $(BUILD_DIR)/e9_rbc_trampoline
-E9_RIP_TRAMPOLINE_SRC := $(SIMULATOR_DIR)/csrc/e9_rip_trampoline.c
+E9_RIP_TRAMPOLINE_SRC := $(CSRC_DIR)/e9_rip_trampoline.c
 E9_RIP_TRAMPOLINE_BIN := $(BUILD_DIR)/e9_rip_trampoline
 
 # Build the trampoline binary using e9compile.sh (must run from e9patch dir

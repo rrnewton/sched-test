@@ -38,12 +38,12 @@ fn task(name: &str, pid: i32, nice: i8, behavior: TaskBehavior) -> TaskDef {
     }
 }
 
-fn count(trace: &trace::Trace, pred: impl Fn(&TraceKind) -> bool) -> usize {
+fn count(trace: &Trace, pred: impl Fn(&TraceKind) -> bool) -> usize {
     trace.events().iter().filter(|e| pred(&e.kind)).count()
 }
 
 /// Distinct DSQ ids that tasks were *inserted* into (DsqInsert/DsqInsertVtime).
-fn distinct_insert_dsqs(trace: &trace::Trace) -> BTreeSet<u64> {
+fn distinct_insert_dsqs(trace: &Trace) -> BTreeSet<u64> {
     trace
         .events()
         .iter()
@@ -57,7 +57,7 @@ fn distinct_insert_dsqs(trace: &trace::Trace) -> BTreeSet<u64> {
 }
 
 /// Max queue length observed over every non-builtin DSQ that was inserted into.
-fn max_dsq_length_any(trace: &trace::Trace) -> usize {
+fn max_dsq_length_any(trace: &Trace) -> usize {
     distinct_insert_dsqs(trace)
         .into_iter()
         .filter_map(|d| trace.max_dsq_length(DsqId(d)))
@@ -82,7 +82,7 @@ fn hogs(cpus: u32, n: i32, seed: u32) -> Scenario {
     b.duration_ms(150).build()
 }
 
-fn run(label: &str, cpus: u32, scenario: Scenario) -> trace::Trace {
+fn run(label: &str, cpus: u32, scenario: Scenario) -> Trace {
     let sched = match label {
         "simple" => DynamicScheduler::simple(),
         "lavd" => DynamicScheduler::lavd(cpus),

@@ -12,3 +12,15 @@ char sim_arena_buf[SIM_ARENA_SIZE]
 
 /* Current allocation offset into sim_arena_buf. */
 unsigned long sim_arena_offset;
+
+/*
+ * Floor below which sim_arena_reset() will not reclaim; see sim_arena.h.
+ * Zero until the engine calls sim_arena_mark_persistent(), so a build that
+ * never marks behaves exactly as before.
+ */
+unsigned long sim_arena_floor;
+
+void sim_arena_mark_persistent(void)
+{
+	sim_arena_floor = sim_arena_offset;
+}
