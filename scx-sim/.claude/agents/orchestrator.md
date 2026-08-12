@@ -246,7 +246,9 @@ Before starting:
 When done:
 - Run: ./validate.sh (must pass)
 - Commit with message referencing sim-XXXXX
-- Do NOT push — leave the commit on work/3
+- Rename off `agent/*`, push (origin AND mirror), open the PR against
+  `integration`, and LAND IT. Do not leave the commit sitting locally —
+  see the shipping protocol in the harness CLAUDE.md.
 ```
 
 After Sub-Agent Completion
