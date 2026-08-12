@@ -1,0 +1,27 @@
+# Pin the Rust toolchain for every cargo workspace in this repo.
+#
+# Why this file exists: without it the toolchain floats with whatever each
+# machine happens to have, and the clippy LINT SET floats with it. CI runs
+# `cargo clippy -- -D warnings`, so a lint that exists in one version and not
+# another turns identical source into a pass on one machine and a hard failure
+# on the other.
+#
+# That is not hypothetical. `clippy::for_kv_map` in
+# scx-sim/crates/scx_cgroup_tree/src/lib.rs was clean on a local 1.96 and a
+# `-D warnings` error on CI's 1.97 — the CI job had been red since at least
+# 2026-08-04 for a reason that no amount of local validation could surface,
+# because local validation was structurally incapable of seeing it.
+#
+# rustup resolves this file by searching upward from the working directory, so
+# one file at the repo root covers all three workspaces (scx-sim/, repm/,
+# schtest/rust/) and keeps them from drifting apart from each other as well as
+# from CI. The GitHub workflows do not install a toolchain of their own — they
+# use the runner's rustup — so this pin governs CI too.
+#
+# Bumping this is a deliberate, reviewable act: raise the version here, run
+# `cargo clippy --all-targets --workspace -- -D warnings` in each workspace,
+# fix whatever the new lint set finds, and land it as one change. Do not work
+# around a version mismatch by editing CI.
+[toolchain]
+channel = "1.97.1"
+components = ["clippy", "rustfmt"]
