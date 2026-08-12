@@ -58,6 +58,14 @@ jobs:
       - name: Install cargo-nextest
         run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
+      # validate.sh has a `cargo llvm-cov nextest` gate and correctly refuses to
+      # run without this rather than skipping, so CI has to supply it or the job
+      # dies before any test runs. Prebuilt binary, same idiom as nextest above;
+      # `cargo install` would compile it on every run. The llvm-tools component
+      # it needs comes from rust-toolchain.toml.
+      - name: Install cargo-llvm-cov
+        run: curl -LsSf https://github.com/taiki-e/cargo-llvm-cov/releases/latest/download/cargo-llvm-cov-x86_64-unknown-linux-gnu.tar.gz | tar xzf - -C ${CARGO_HOME:-~/.cargo}/bin
+
       - uses: actions/cache@v4
         with:
           path: |
