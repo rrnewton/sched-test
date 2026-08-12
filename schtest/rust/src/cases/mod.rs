@@ -4,10 +4,8 @@
 // This source code is licensed under the BSD-style license found in the
 // LICENSE file in the root directory of this source tree.
 
-use crate::workloads;
-
+use crate::workloads::benchmark::BenchArgs;
 use anyhow::Result;
-use workloads::benchmark::BenchArgs;
 
 #[derive(Debug)]
 pub struct Test {
@@ -28,7 +26,7 @@ macro_rules! test {
     ($name:expr, $func:ident, ($($param:expr),+ $(,)?), $constraints:ident) => {
         $(
             inventory::submit! {
-                $crate::Test {
+                $crate::cases::Test {
                     name: || format!("{}/{}", $name, $param),
                     test_fn: |c| $func(c, $param),
                     constraints: || $constraints($param),
@@ -39,7 +37,7 @@ macro_rules! test {
     ($name:expr, $func:ident, ($($param:expr),+ $(,)?)) => {
         $(
             inventory::submit! {
-                $crate::Test {
+                $crate::cases::Test {
                     name: || format!("{}/{}", $name, $param),
                     test_fn: |c| $func(c, $param),
                     constraints: || Ok(()),
@@ -49,7 +47,7 @@ macro_rules! test {
     };
     ($name:expr, $func:ident, $constraints:ident) => {
         inventory::submit! {
-            $crate::Test {
+            $crate::cases::Test {
                 name: || $name.to_string(),
                 test_fn: || $func(),
                 constraints: || $constraints(),
@@ -58,7 +56,7 @@ macro_rules! test {
     };
     ($name:expr, $func:ident) => {
         inventory::submit! {
-            $crate::Test {
+            $crate::cases::Test {
                 name: || $name.to_string(),
                 test_fn: || $func(),
                 constraints: || Ok(())
@@ -72,7 +70,7 @@ macro_rules! benchmark {
     ($name:expr, $func:ident, ($($param:expr),+ $(,)?), $constraints:ident) => {
         $(
             inventory::submit! {
-               $crate::Benchmark {
+                $crate::cases::Benchmark {
                     name: || format!("{}/{}", $name, $param),
                     test_fn: |c| $func(c, $param),
                     constraints: || $constraints($param),
@@ -83,7 +81,7 @@ macro_rules! benchmark {
     ($name:expr, $func:ident, ($($param:expr),+ $(,)?)) => {
         $(
             inventory::submit! {
-               $crate::Benchmark {
+                $crate::cases::Benchmark {
                     name: || format!("{}/{}", $name, $param),
                     test_fn: |c| $func(c, $param),
                     constraints: || Ok(()),
@@ -93,7 +91,7 @@ macro_rules! benchmark {
     };
     ($name:expr, $func:ident, (), $constraints:ident) => {
         inventory::submit! {
-           $crate::Benchmark {
+            $crate::cases::Benchmark {
                 name: || $name.to_string(),
                 test_fn: |c| $func(c),
                 constraints: || $constraints(),
@@ -102,7 +100,7 @@ macro_rules! benchmark {
     };
     ($name:expr, $func:ident, ()) => {
         inventory::submit! {
-            $crate::Benchmark {
+            $crate::cases::Benchmark {
                 name: || $name.to_string(),
                 test_fn: |c| $func(c),
                 constraints: || Ok(()),
@@ -112,9 +110,12 @@ macro_rules! benchmark {
 }
 
 pub mod basic;
+pub mod cgroup_tree;
 pub mod fairness;
+pub mod irq_accounting;
+pub mod irq_common;
+pub mod irq_migration;
 pub mod latency;
-pub mod timedwakeups_lowutil;
 pub mod topology;
 
 inventory::collect!(Test);
