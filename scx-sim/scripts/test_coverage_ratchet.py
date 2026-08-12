@@ -65,6 +65,58 @@ class GateFailures(unittest.TestCase):
         self.assertTrue(all("not measured" in m for m in failures))
 
 
+class EnvironmentAwareBaseline(unittest.TestCase):
+    """The floor must depend on whether the machine HAS the hardware.
+
+    scx_perf is a PMU abstraction layer whose tests self-skip without a PMU, so
+    a single floor means two different things on two machines -- the same class
+    of bug as a lint set that floats per host. Both numbers stay committed: the
+    PMU floor is still enforced where a PMU exists, so the PMU-only paths do not
+    stop being measured anywhere.
+    """
+
+    def _csv(self, body: str) -> Path:
+        import tempfile
+
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".csv", delete=False, newline=""
+        )
+        handle.write(body)
+        handle.close()
+        self.addCleanup(lambda: Path(handle.name).unlink(missing_ok=True))
+        return Path(handle.name)
+
+    BOTH = (
+        "crate,coverage_pct,coverage_pct_nopmu\n"
+        "scx_simulator,73.5,\n"
+        "scx_perf,78.4,32.5\n"
+    )
+
+    def test_pmu_host_gets_the_hardware_floor(self):
+        got = cr.read_baseline(self._csv(self.BOTH), has_pmu=True)
+        self.assertEqual(got["scx_perf"], 78.4)
+
+    def test_nopmu_host_gets_the_reachable_floor(self):
+        got = cr.read_baseline(self._csv(self.BOTH), has_pmu=False)
+        self.assertEqual(got["scx_perf"], 32.5)
+
+    def test_blank_nopmu_cell_means_hardware_independent(self):
+        """A crate with no nopmu entry is held to the SAME floor everywhere."""
+        with_pmu = cr.read_baseline(self._csv(self.BOTH), has_pmu=True)
+        without = cr.read_baseline(self._csv(self.BOTH), has_pmu=False)
+        self.assertEqual(with_pmu["scx_simulator"], 73.5)
+        self.assertEqual(without["scx_simulator"], 73.5)
+
+    def test_legacy_single_column_csv_still_reads(self):
+        """A CSV predating the nopmu column must not break either environment."""
+        legacy = self._csv("crate,coverage_pct\nscx_perf,78.4\n")
+        self.assertEqual(cr.read_baseline(legacy, has_pmu=True)["scx_perf"], 78.4)
+        self.assertEqual(cr.read_baseline(legacy, has_pmu=False)["scx_perf"], 78.4)
+
+    def test_probe_returns_a_bool_and_does_not_raise(self):
+        self.assertIsInstance(cr.pmu_available(), bool)
+
+
 class RaiseOnlyBaseline(unittest.TestCase):
     def test_raises_when_higher(self) -> None:
         measured = _at(1000, 900)  # 90.0%
