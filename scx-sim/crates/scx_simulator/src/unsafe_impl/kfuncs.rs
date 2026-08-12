@@ -3032,10 +3032,10 @@ pub extern "C" fn scx_bpf_kick_cpu(cpu: i32, flags: u64) {
 }
 
 // ---------------------------------------------------------------------------
-// Dump kfuncs — no-op stubs for scheduler debug output
+// Dump kfuncs — scheduler debug output capture
 // ---------------------------------------------------------------------------
 
-/// Dump debug text. No-op in the simulator (debug output is not modeled).
+/// Format scheduler debug text into the simulator's per-run dump buffer.
 #[no_mangle]
 pub extern "C" fn scx_bpf_dump_bstr(fmt: *const i8, data: *const u64, data_sz: u32) {
     if fmt.is_null() {
