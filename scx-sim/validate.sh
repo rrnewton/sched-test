@@ -53,7 +53,12 @@ echo "  No unsafe code found in $SAFE_DIR — OK"
 
 echo ""
 echo "=== Running cargo clippy ==="
-cargo clippy --all -- -D warnings
+# --all-targets matters: plain `cargo clippy --all` lints only lib and bin
+# targets (4 here), silently skipping all 69 test targets plus the bench and
+# example. That made this gate WEAKER than the pre-commit hook, which has always
+# used --all-targets, and it is how clippy::manual_checked_ops sat unnoticed in
+# tests/csv_experiment.rs: CI structurally could not see test code.
+cargo clippy --all-targets --workspace -- -D warnings
 
 echo ""
 echo "=== Running cargo nextest ==="
