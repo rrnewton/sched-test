@@ -261,11 +261,14 @@ fn oversubscribed_run_starves_nobody() {
 // Topology
 // ---------------------------------------------------------------------------
 
-/// The scheduler must observe the same LLC layout the engine simulates.
-/// `layered_with_topology` is the only way it learns the topology, so a
-/// mismatch here means every LLC-affinity decision layered makes is wrong.
+/// The topology the wrapper publishes must match the layout it was asked
+/// for. This is an arithmetic check on the publication step only — it
+/// compares against a re-derivation of the same inputs, so it would NOT
+/// catch a `Scenario` and a `layered_with_topology` that were configured
+/// inconsistently. `llc_topology_drives_dsq_selection` below is the test
+/// that proves the published map actually reaches layered's decisions.
 #[test]
-fn topology_seen_by_scheduler_matches_the_engine() {
+fn topology_published_to_scheduler_matches_requested_layout() {
     let _lock = common::setup_test();
     const NR_CPUS: u32 = 8;
     const CPUS_PER_LLC: u32 = 4;
@@ -280,12 +283,13 @@ fn topology_seen_by_scheduler_matches_the_engine() {
         .duration_ms(100)
         .build();
 
-    // Cross-check against the engine's own per-CPU llc_id before running.
+    // The engine assigns llc_id = cpu / cpus_per_llc (engine.rs build_cpus);
+    // the wrapper must publish the same mapping for the same input.
     for cpu in 0..NR_CPUS {
         assert_eq!(
             probes.cpu_llc(CpuId(cpu)),
             cpu / CPUS_PER_LLC,
-            "scheduler disagrees with the engine about cpu {cpu}'s LLC"
+            "wrapper published the wrong LLC for cpu {cpu}"
         );
     }
     assert_eq!(probes.nr_llcs(), NR_CPUS / CPUS_PER_LLC);
@@ -296,6 +300,86 @@ fn topology_seen_by_scheduler_matches_the_engine() {
     let sim = Simulator::new(sched);
     let t = sim.run(scenario);
     assert_eq!(t.exit_kind(), &ExitKind::Normal);
+}
+
+/// The published LLC map must actually reach layered's DSQ decisions.
+///
+/// layered stamps each CPU's fallback DSQ id as `hi_fb_dsq_id(llc_id)` in
+/// `create_llc()`, so a task's DSQ id carries the LLC of the CPU it was
+/// placed on in its low bits. Tasks pinned into LLC 0 and LLC 1 must
+/// therefore land on *different* DSQs.
+///
+/// The flat-topology arm is the control: with one LLC covering all 8 CPUs,
+/// the identical workload must put every task on the SAME DSQ. Without it
+/// this test would pass on any two DSQ ids that happened to differ.
+#[test]
+fn llc_topology_drives_dsq_selection() {
+    let _lock = common::setup_test();
+
+    // Six CPU-bound tasks, three pinned into each half of the machine.
+    fn workload(cpus_per_llc: u32) -> Scenario {
+        let mut b = Scenario::builder()
+            .cpus(8)
+            .detect_bpf_errors()
+            .cpus_per_llc(cpus_per_llc);
+        for (i, cpus) in [
+            (1, vec![CpuId(0), CpuId(1)]),
+            (2, vec![CpuId(0), CpuId(1)]),
+            (3, vec![CpuId(0), CpuId(1)]),
+            (4, vec![CpuId(4), CpuId(5)]),
+            (5, vec![CpuId(4), CpuId(5)]),
+            (6, vec![CpuId(4), CpuId(5)]),
+        ] {
+            b = b.task(pinned_task(
+                &format!("t{i}"),
+                Pid(i),
+                workloads::cpu_bound(500_000_000),
+                cpus,
+            ));
+        }
+        b.duration_ms(300).build()
+    }
+
+    // Two LLCs of 4 CPUs: the two pinned groups sit in different LLCs.
+    let sched = DynamicScheduler::layered_with_topology(8, 4, 1, 1);
+    let probes = LayeredProbes::new(&sched);
+    let sim = Simulator::new(sched);
+    let t = sim.run(workload(4));
+    assert_eq!(t.exit_kind(), &ExitKind::Normal);
+
+    let llc0: Vec<u64> = (1..=3).map(|p| probes.task_dsq(Pid(p))).collect();
+    let llc1: Vec<u64> = (4..=6).map(|p| probes.task_dsq(Pid(p))).collect();
+    assert!(
+        llc0.iter().all(|d| *d == llc0[0]),
+        "tasks pinned within one LLC should share a DSQ, got {llc0:x?}"
+    );
+    assert!(
+        llc1.iter().all(|d| *d == llc1[0]),
+        "tasks pinned within one LLC should share a DSQ, got {llc1:x?}"
+    );
+    assert_ne!(
+        llc0[0], llc1[0],
+        "tasks in different LLCs landed on the same DSQ (0x{:x}) — the \
+         published LLC map is not reaching layered's DSQ selection",
+        llc0[0]
+    );
+    // The LLC index is the low bits of the DSQ id (DSQ_ID_LLC_MASK).
+    assert_eq!(llc0[0] & 0xffff, 0, "expected LLC 0 in the DSQ id");
+    assert_eq!(llc1[0] & 0xffff, 1, "expected LLC 1 in the DSQ id");
+    drop(sim);
+
+    // Control: one LLC over all 8 CPUs. Same workload, same pinning — every
+    // task must now share a DSQ.
+    let flat = DynamicScheduler::layered_with_topology(8, 8, 1, 1);
+    let flat_probes = LayeredProbes::new(&flat);
+    let flat_sim = Simulator::new(flat);
+    let ft = flat_sim.run(workload(8));
+    assert_eq!(ft.exit_kind(), &ExitKind::Normal);
+    let all: Vec<u64> = (1..=6).map(|p| flat_probes.task_dsq(Pid(p))).collect();
+    assert!(
+        all.iter().all(|d| *d == all[0]),
+        "with a single LLC every task must share a DSQ, got {all:x?}"
+    );
 }
 
 /// With SMT enabled the scheduler must know each CPU's sibling; without it,
