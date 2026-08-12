@@ -1,5 +1,9 @@
 # scx_layered support in scxsim
 
+Tier 3 (the userspace CPU-reallocation control loop) is in progress — see
+`LAYERED_TIER3_HANDOFF.md`. scx_layered's real allocator is already compiled
+in; the periodic loop that drives it is not yet built.
+
 Status: **supported** (Tier 2 — multi-layer on real topology), with one
 documented asterisk: SMT topology is published and verified correct, but its
 effect on placement is not behaviourally tested (mb sim-u4the). Every other
