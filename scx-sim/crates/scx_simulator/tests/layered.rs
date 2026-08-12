@@ -359,11 +359,27 @@ fn upstream_linear_and_reverse_choose_different_freed_cores() {
     );
 }
 
-/// Production allocates in physical-core units when SMT is enabled. Force a
-/// 6+2 transfer on four 2-thread cores and verify neither the serialized mask
-/// nor the BPF kptr mask ever contains half a core.
+/// With SMT the allocator works in whole physical cores, and no layer may
+/// ever hold half a core — a half-core allocation would let two layers share
+/// an SMT pair, which is precisely what `excl` layers exist to prevent.
+///
+/// This test also pins down a NON-OBVIOUS upstream behaviour that an earlier
+/// version of it got wrong by assuming the intuitive answer. With
+/// `alloc_unit == 2`, a layer sitting at 4 CPUs (2 cores) whose target is
+/// 2 CPUs can NEVER shrink:
+///
+///   dampened = 4 - ceil((4-2)/2) = 3 CPUs      (main.rs shrink dampening)
+///   units    = ceil(3 / 2)       = 2 cores     (calc_raw_demands rounds UP)
+///   allocated                    = 4 CPUs      -> unchanged, fixed point
+///
+/// So the 6/2 split the layer specs ask for is unreachable from an even 4/4
+/// start, and the honest assertion is that the split stays 4/4 while every
+/// core stays whole. Both halves matter: the first records real upstream
+/// behaviour, the second is the invariant worth guarding. Confirmed against
+/// `main.rs::refresh_cpumasks()`, which uses the same CPU-space dampening and
+/// the same `target.div_ceil(au)`; filed as mb sim-3wq7t.
 #[test]
-fn userspace_control_reallocates_whole_smt_cores() {
+fn smt_allocation_keeps_whole_cores_and_hits_the_shrink_fixed_point() {
     let _lock = common::setup_test();
     let sched = DynamicScheduler::layered_with_topology(8, 4, 1, 2);
     sched.layered_layers(&[
@@ -390,7 +406,16 @@ fn userspace_control_reallocates_whole_smt_cores() {
     let sim = Simulator::new(sched);
     let trace = sim.run(scenario);
     assert_eq!(trace.exit_kind(), &ExitKind::Normal);
-    assert_eq!((probes.layer_nr_cpus(0), probes.layer_nr_cpus(1)), (6, 2));
+
+    // The shrink fixed point, not the requested 6/2.
+    assert_eq!(
+        (probes.layer_nr_cpus(0), probes.layer_nr_cpus(1)),
+        (4, 4),
+        "expected the CPU-space-dampening / core-rounding fixed point"
+    );
+
+    // The invariant that must hold regardless: no half cores, in either the
+    // serialized view or the BPF kptr mask the refresh tail rebuilt.
     for layer in 0..2 {
         for first in (0..8).step_by(2) {
             let serialized = (
@@ -403,9 +428,16 @@ fn userspace_control_reallocates_whole_smt_cores() {
             );
             assert_eq!(
                 serialized.0, serialized.1,
-                "layer {layer} split core {first}"
+                "layer {layer} holds half of core {first} (serialized)"
             );
-            assert_eq!(bpf, serialized, "BPF refresh diverged for core {first}");
+            assert_eq!(
+                bpf.0, bpf.1,
+                "layer {layer} holds half of core {first} (BPF kptr)"
+            );
+            assert_eq!(
+                serialized, bpf,
+                "serialized and BPF masks disagree on core {first} for layer {layer}"
+            );
         }
     }
 }
@@ -1502,5 +1534,91 @@ fn task_rename_out_of_a_matching_name_relayers_back() {
         1,
         "after renaming away from batch* the task must fall back to the \
          catch-all layer"
+    );
+}
+
+/// External-oracle check on `growth_denied`, with DELIBERATELY ASYMMETRIC
+/// inputs.
+///
+/// `growth_denied_is_real_per_node_allocation_outcome` above contrasts the
+/// cadence enabled against disabled. That is a PRESENCE check: with the loop
+/// off nothing runs, so `false/0` is trivially true and the contrast proves
+/// only that the loop executed. It is also SYMMETRIC — both layers are
+/// saturated and both are denied — so it would still pass if the
+/// implementation attributed each layer's denial to the other. Neither
+/// weakness is visible from a green run.
+///
+/// This test predicts the answer from the SCENARIO SPEC alone, before running
+/// anything, and makes the two layers differ:
+///
+///   `hot`  — 4 always-runnable tasks on a 4-CPU box, so its measured
+///            utilization saturates and `unpinned_cpus_needed = util/0.9`
+///            always exceeds the CPUs it holds. It wants to grow, and with
+///            every CPU already spoken for it cannot. Predict: DENIED.
+///   `cold` — one task asleep ~99% of the time AND a spec-set floor of one
+///            CPU, so `unpinned_cpus_needed = 0.01/0.9 = 0.011` never exceeds
+///            the >=1 CPU it holds. It never wants to grow.
+///            Predict: NOT DENIED.
+///
+/// The floor is load-bearing and was discovered by this test failing: without
+/// it the saturated layer drives `cold` to zero CPUs, and a 1% duty cycle DOES
+/// exceed zero, so `cold` is correctly denied as well. The first version of
+/// this oracle asserted `cold == 0` without the floor and was simply wrong
+/// about the scenario, not about the code.
+///
+/// Asserting on the cumulative counts rather than the instantaneous flag
+/// keeps it independent of which pass happens to land last. The asymmetry is
+/// the point: swapping the two layers' denials breaks this test, while a
+/// symmetric conservation law over the same run would survive the swap and
+/// prove nothing.
+#[test]
+fn growth_denied_matches_a_prediction_made_from_the_scenario_spec() {
+    let _lock = common::setup_test();
+    let sched = DynamicScheduler::layered(4);
+    sched.layered_layers(&[
+        LayerSpec::new("hot", LayerKind::Grouped)
+            .with_match(LayerMatch::CommPrefix("hot".into()))
+            .with_util_range(0.8, 0.9),
+        LayerSpec::new("cold", LayerKind::Grouped)
+            .with_or(Vec::new())
+            .with_util_range(0.8, 0.9)
+            // The floor is what creates the asymmetry, and it is spec-set:
+            // without it the saturated layer squeezes `cold` to ZERO CPUs, at
+            // which point even a 1% duty cycle exceeds the zero unpinned CPUs
+            // it holds, so `cold` is legitimately denied too and the
+            // prediction collapses to symmetric. Verified: without this line
+            // cold ends at 0 CPUs and records 6 denials.
+            .with_cpus_range(1, 4),
+    ]);
+    sched.layered_enable_control_loop(100_000_000);
+    let probes = LayeredProbes::new(&sched);
+
+    let mut b = Scenario::builder().cpus(4).detect_bpf_errors();
+    for i in 0..4 {
+        b = b.add_task(&format!("hot_{i}"), 0, hog());
+    }
+    // ~1% duty cycle: measured utilization stays far below one CPU.
+    b = b.add_task("cold_a", 0, workloads::periodic(1_000_000, 100_000_000));
+    let sim = Simulator::new(sched);
+    let trace = sim.run(b.duration_ms(800).build());
+    assert_eq!(trace.exit_kind(), &ExitKind::Normal);
+
+    // The oracle's premise, asserted rather than assumed: if the floor did
+    // not hold, this test would silently be proving something else.
+    assert!(
+        probes.layer_nr_cpus(1) >= 1,
+        "cold lost its spec-set CPU floor, so the prediction below no longer follows"
+    );
+    let hot = probes.growth_denied_count(0, 0);
+    let cold = probes.growth_denied_count(1, 0);
+    assert!(
+        hot > 0,
+        "the saturated layer must have been denied growth at least once, got {hot}"
+    );
+    assert_eq!(
+        cold, 0,
+        "the ~idle layer never wants to grow, so it must never be denied; \
+         got {cold}. A non-zero value here means denial is being attributed \
+         to the wrong layer, or `wanted` is not actually reading utilization."
     );
 }
