@@ -21,7 +21,19 @@ Owner policy, standing (2026-08-12). **There should be no languishing work.**
 
     work -> commit as you go -> rename off `agent/*` -> push (origin AND
     mirror) -> open PR against `integration` -> (optional reviewer pass)
-    -> LAND IT
+    -> LAND IT -> PUSH THE MIRROR AGAIN
+
+**Merging a PR on GitHub updates ORIGIN ONLY.** `rrnewton/sched-test` is not a
+GitHub-native mirror, so the merge commit does not propagate: the moment your
+PR merges, `mirror/integration` is behind by exactly that commit, silently.
+Pushing both remotes earlier does not cover it — that was your branch, this is
+the merge. After landing:
+
+    with-proxy git fetch origin integration
+    with-proxy git push mirror FETCH_HEAD:refs/heads/integration
+
+Then compare the two SHAs with `git ls-remote` rather than assuming. Details
+and the worked example are in `scx-sim/CLAUDE.md`.
 
 Never leave uncommitted changes locally, and before going idle or finishing,
 confirm in your final note that the worktree is clean, the work is pushed, and
