@@ -152,9 +152,31 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y clang llvm libelf-dev
 
-      - name: Install Rust toolchain
+      # Honour //rust-toolchain.toml (1.97.1 + clippy/rustfmt/llvm-tools) the same
+      # way the other five workflows do: install nothing, let cargo/rustup resolve
+      # the pin from the file. `rustup show active-toolchain` both triggers the
+      # install and PRINTS which toolchain won, so the log proves the pin took
+      # effect rather than leaving it to be assumed.
+      #
+      # The previous `dtolnay/rust-toolchain@stable` was not actually defeating
+      # the pin -- validate2 verified that the action does `rustup toolchain
+      # install` + `rustup default`, and a rust-toolchain.toml outranks the
+      # DEFAULT toolchain; it never sets RUSTUP_TOOLCHAIN, which is the one thing
+      # that would win. Credit to them for checking rather than assuming. It is
+      # removed anyway because "@stable" reads as unpinned to anyone
+      # spot-checking, and this workflow was the only one of six doing something
+      # different.
+      #
+      # Do NOT reintroduce a variant that exports RUSTUP_TOOLCHAIN or runs
+      # `rustup override set`: either would silently take this job off the pin
+      # while every other workflow stayed on it, reviving the per-machine clippy
+      # drift the pin exists to prevent, in the workflow least likely to be
+      # watched.
+      - name: Show the pinned Rust toolchain
         if: steps.check.outputs.has_changes == 'true'
-        uses: dtolnay/rust-toolchain@stable
+        run: |
+          rustup show active-toolchain
+          cargo --version && cargo clippy --version
 
       - name: Install cargo-nextest
         if: steps.check.outputs.has_changes == 'true'
