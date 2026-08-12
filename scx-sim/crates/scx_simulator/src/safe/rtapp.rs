@@ -637,7 +637,7 @@ fn extract_irq_gen_timing(obj: &Map<String, Value>) -> Result<(u64, u64), RtAppE
 /// # Example
 ///
 /// ```rust,no_run
-/// use scx_simulator::rtapp::load_rtapp;
+/// use scx_simulator::load_rtapp;
 ///
 /// let json = r#"{
 ///     "global": { "duration": 1 },

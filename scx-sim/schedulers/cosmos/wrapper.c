@@ -12,121 +12,8 @@
 #include "sim_wrapper.h"
 #include "sim_task.h"
 
-/*
- * COSMOS-specific macro overrides (defined after sim_wrapper.h,
- * before main.bpf.c).
- */
-
-/*
- * Enable scx_bpf_select_cpu_and — implemented in the simulator.
- * With flat_idle_scan=false, COSMOS will use this instead of flat scan.
- */
-#undef bpf_ksym_exists
-#define bpf_ksym_exists(sym) (1)
-
-/*
- * The simulator always calls select_cpu before enqueue, so the
- * CPU is always selected.
- */
-#undef __COMPAT_is_enq_cpu_selected
-#define __COMPAT_is_enq_cpu_selected(enq_flags) (true)
-
-/*
- * __COMPAT_scx_bpf_dsq_peek -- route directly to the simulator's export.
- * This avoids falling through to bpf_iter_scx_dsq_* weak symbols when
- * COSMOS peeks into a shared DSQ.
- */
-extern struct task_struct *scx_bpf_dsq_peek(u64 dsq_id);
-#define __COMPAT_scx_bpf_dsq_peek(dsq_id) scx_bpf_dsq_peek(dsq_id)
-
-/*
- * bpf_iter_scx_dsq_*: bpf_for_each(scx_dsq, ...) uses a cleanup() destructor,
- * so COSMOS needs concrete function symbols, not just macro rewrites.
- */
-extern void *sim_dsq_iter_begin(u64 dsq_id, u64 flags);
-extern void *sim_dsq_iter_next(void);
-
-#undef bpf_iter_scx_dsq_new
-int bpf_iter_scx_dsq_new(struct bpf_iter_scx_dsq *it, u64 dsq_id, u64 flags)
-{
-	u64 *opaque = (u64 *)it;
-
-	opaque[0] = (u64)(unsigned long)sim_dsq_iter_begin(dsq_id, flags);
-	opaque[1] = 1;
-	return 0;
-}
-
-#undef bpf_iter_scx_dsq_next
-struct task_struct *bpf_iter_scx_dsq_next(struct bpf_iter_scx_dsq *it)
-{
-	u64 *opaque = (u64 *)it;
-
-	if (opaque[1]) {
-		opaque[1] = 0;
-		return (struct task_struct *)(unsigned long)opaque[0];
-	}
-
-	return (struct task_struct *)sim_dsq_iter_next();
-}
-
-#undef bpf_iter_scx_dsq_destroy
-void bpf_iter_scx_dsq_destroy(struct bpf_iter_scx_dsq *it)
-{
-	while (bpf_iter_scx_dsq_next(it))
-		;
-}
-
-/*
- * is_migration_disabled: use the simulator's task_struct accessor.
- *
- * The kernel's is_migration_disabled() checks p->migration_disabled with
- * special handling for migration_disabled == 1 (ambiguous because BPF
- * prolog increments it). In the simulator, we use a simpler check:
- * migration_disabled > 0 means disabled.
- */
-extern unsigned short sim_task_get_migration_disabled(struct task_struct *p);
-#undef is_migration_disabled
-#define is_migration_disabled(p) (sim_task_get_migration_disabled(p) > 0)
-
-/*
- * Override __COMPAT_scx_bpf_cpu_curr to return actual running tasks.
- *
- * The default sim_wrapper.h override returns NULL, which makes
- * is_cpu_idle() always return false (with scx_bpf_error).
- * We need proper idle detection for deferred wakeups and PMU routing.
- *
- * For idle CPUs (scx_bpf_cpu_curr returns NULL), we return a synthetic
- * idle task with PF_IDLE set so is_cpu_idle() returns true.
- */
-extern struct task_struct *scx_bpf_cpu_curr(int cpu);
-static struct task_struct sim_idle_task;
-static bool sim_idle_task_init;
-
-static struct task_struct *cosmos_cpu_curr(int cpu)
-{
-	struct task_struct *p = scx_bpf_cpu_curr(cpu);
-	if (p)
-		return p;
-	/* Return synthetic idle task for idle CPUs */
-	if (!sim_idle_task_init) {
-		__builtin_memset(&sim_idle_task, 0, sizeof(sim_idle_task));
-		sim_idle_task.flags = PF_IDLE;
-		sim_idle_task_init = true;
-	}
-	return &sim_idle_task;
-}
-#undef __COMPAT_scx_bpf_cpu_curr
-#define __COMPAT_scx_bpf_cpu_curr(cpu) cosmos_cpu_curr(cpu)
-
-/*
- * Route bpf_map_lookup_percpu_elem to a static cpu_ctx array.
- * Forward-declared here; defined after the scheduler source since
- * struct cpu_ctx is defined there.
- */
+/* Simulator CPU count; sizes the per-CPU map registration (SCX_REGISTER_PERCPU). */
 #define MAX_SIM_CPUS 128
-static struct cpu_ctx *cosmos_lookup_percpu_elem(int cpu);
-#undef bpf_map_lookup_percpu_elem
-#define bpf_map_lookup_percpu_elem(map, key, cpu) cosmos_lookup_percpu_elem(cpu)
 
 /*
  * Simulated PMU kfunc stubs.
@@ -240,42 +127,11 @@ int scx_pmu_read(struct task_struct *p, u64 event, u64 *value, bool clear)
 }
 
 /*
- * BPF timer overrides for deferred wakeups.
- *
- * bpf_timer_set_callback stores the callback pointer.
- * bpf_timer_start calls sim_timer_start() (Rust kfunc) to schedule
- * a TimerFired event in the simulator's event queue.
- * cosmos_fire_timer() invokes the stored callback from the engine.
+ * bpf_map_lookup_elem override: route COSMOS map lookups to the test-map
+ * registry (the simulator's stand-in for kernel BPF maps).
  */
-static int (*cosmos_timer_cb)(void *, int *, struct bpf_timer *);
-static struct bpf_timer *cosmos_timer_ptr;
-static void *cosmos_timer_map;
-
-extern void sim_timer_start(unsigned long long nsecs);
-
-#undef bpf_timer_set_callback
-#define bpf_timer_set_callback(timer, cb) \
-	(cosmos_timer_cb = (typeof(cosmos_timer_cb))(cb), \
-	 cosmos_timer_ptr = (struct bpf_timer *)(timer), 0)
-
-#undef bpf_timer_start
-#define bpf_timer_start(timer, nsecs, flags) \
-	(sim_timer_start(nsecs), 0)
-
-/*
- * Static wakeup_timer backing storage.
- * The struct bpf_timer inside is opaque to us — we just need to provide
- * memory for bpf_map_lookup_elem to return. The bpf_timer fields aren't
- * accessed; our macros intercept bpf_timer_init/set_callback/start.
- * Size is generous to accommodate any struct wakeup_timer layout.
- */
-static char sim_wakeup_timer_buf[256];
-static void *wakeup_timer_map_ptr;
-
 static void *cosmos_map_lookup(void *map, const void *key)
 {
-	if (map == wakeup_timer_map_ptr && wakeup_timer_map_ptr != NULL)
-		return sim_wakeup_timer_buf;
 	return scx_test_map_lookup_elem(map, key);
 }
 #undef bpf_map_lookup_elem
@@ -286,22 +142,29 @@ static void *cosmos_map_lookup(void *map, const void *key)
  * common.bpf.h is already included (header guard set), so our
  * BPF_STRUCT_OPS and SCX_OPS_DEFINE overrides are in effect.
  *
- * We include a patched copy of main.bpf.c (generated by config.mk)
- * that guards against division-by-zero in update_freq(). BPF
- * division-by-zero returns 0; native C crashes with SIGFPE.
+ * We include a patched copy of main.bpf.c that guards against
+ * division-by-zero in update_freq(). BPF division-by-zero returns 0;
+ * native C crashes with SIGFPE. The patched copy is generated into OUT_DIR
+ * by build_schedulers (and into this dir by the legacy config.mk/make path).
+ * The ANGLE include resolves it via -I (-I<OUT_DIR> for the cargo build,
+ * -I<this dir> for make) rather than the includer's directory, so a stale
+ * gitignored source-tree copy never shadows the freshly generated one and an
+ * embedder can build cosmos from a read-only copy of sim.
  */
 #include "intf.h"
-#include "cosmos_main_patched.c"
+#include <cosmos_main_patched.c>
+
 
 /*
  * scx_bpf_cpu_node(): map a CPU to its NUMA node id.
  *
  * Upstream sched-ext/scx 36d589bb ("scx_cosmos: Enable full built-in
  * NUMA-aware idle CPU selection") introduced calls to scx_bpf_cpu_node()
- * behind __COMPAT_scx_bpf_cpu_node(). Because the cosmos wrapper defines
- * bpf_ksym_exists()==1 (see top of file), the COMPAT macro calls the kfunc
- * unconditionally — so the simulator must provide it, or the call jumps
- * through the NULL weak __ksym symbol and SIGSEGVs (test_numa_topology).
+ * behind __COMPAT_scx_bpf_cpu_node(). That COMPAT macro calls the kfunc when
+ * bpf_ksym_exists(scx_bpf_cpu_node) holds; because this wrapper defines
+ * scx_bpf_cpu_node (below), libbpf's !!sym is true, so the macro calls it — the
+ * simulator must provide it (this function), or the call would jump through a
+ * NULL weak __ksym symbol and SIGSEGV (test_numa_topology).
  *
  * Resolve the node from the wrapper's cpu_node_map (populated by
  * cosmos_configure_numa()); fall back to node 0 when the CPU is unmapped
@@ -318,30 +181,12 @@ s32 scx_bpf_cpu_node(s32 cpu)
 }
 
 /*
- * Static per-CPU context array, defined after the scheduler source
- * so that struct cpu_ctx is available.
+ * Register the COSMOS BPF maps with the test-map registry. task_ctx_stor
+ * (TASK_STORAGE) and cpu_node_map (HASH) are create-on-demand; node_ctx_stor
+ * (ARRAY) is kernel-preallocated, so it is pre-seeded with zeroed entries that
+ * init_node() looks up during cosmos_init(); cpu_ctx_stor (PERCPU_ARRAY, one
+ * entry per CPU) is likewise seeded.
  */
-static struct cpu_ctx percpu_ctx[MAX_SIM_CPUS];
-
-static struct cpu_ctx *cosmos_lookup_percpu_elem(int cpu)
-{
-	if (cpu < 0 || cpu >= MAX_SIM_CPUS)
-		return NULL;
-	return &percpu_ctx[cpu];
-}
-
-/*
- * Register the COSMOS BPF maps with the test map infrastructure.
- *
- * task_ctx_stor (TASK_STORAGE), node_ctx_stor (ARRAY), and cpu_node_map (HASH)
- * are registered here; cpu_ctx_stor (PERCPU_ARRAY) is handled by the static
- * array above.
- */
-static struct scx_test_map task_ctx_map;
-static struct scx_test_map node_ctx_test_map;
-static struct scx_test_map cpu_node_test_map;
-static struct scx_test_map cpu_util_test_map;
-static struct scx_test_map gpu_pid_test_map;
 /*
  * gpu_pid_map is registered lazily by cosmos_add_gpu_task() rather than in
  * cosmos_register_maps(), so runs without GPU tasks (the common case) do not
@@ -352,105 +197,60 @@ static struct scx_test_map gpu_pid_test_map;
  * scheduler observes identical behaviour either way — an empty/absent gpu_pid_map
  * both make gpu_node_by_pid() return -ENOENT. This flag is reset per run in
  * cosmos_register_maps() (which scx_test_map_clear_all()s the whole registry).
+ *
+ * The other maps moved to the generic SCX_REGISTER_* macros (which own their
+ * descriptors internally); gpu_pid_map keeps a caller-named descriptor because
+ * it is registered from cosmos_add_gpu_task(), not from cosmos_register_maps().
  */
+static struct scx_test_map gpu_pid_test_map;
 static bool gpu_pid_map_registered;
 
+/*
+ * Register the COSMOS BPF maps with the test map infrastructure.
+ */
 void cosmos_register_maps(void)
 {
-	u32 node, cpu;
-	struct node_ctx zero_node = {};
-	u64 zero_util = 0;
-
 	scx_test_map_clear_all();
 	gpu_pid_map_registered = false;
 
-	INIT_SCX_TEST_MAP_FROM_TASK_STORAGE(&task_ctx_map, task_ctx_stor);
-	scx_test_map_register(&task_ctx_map, &task_ctx_stor);
+	SCX_REGISTER_STORAGE(task_ctx_stor);
 
 	/*
 	 * cpu_util_map (BPF_MAP_TYPE_ARRAY): per-CPU user utilization in
 	 * [0..1024], written periodically by cosmos userspace (main.rs poll
-	 * loop) and read by is_cpu_busy(). Back it with zeroed entries so the
-	 * scheduler can always look it up; cosmos_set_cpu_util() lets tests
-	 * play userspace's role and drive the busy/deadline-mode path.
+	 * loop) and read by is_cpu_busy(). Pre-seeded so the scheduler can
+	 * always look it up; cosmos_set_cpu_util() lets tests play userspace's
+	 * role and drive the busy/deadline-mode path.
 	 */
-	INIT_SCX_TEST_MAP(&cpu_util_test_map, cpu_util_map);
-	scx_test_map_register(&cpu_util_test_map, &cpu_util_map);
-	for (cpu = 0; cpu < cpu_util_test_map.max_entries; cpu++)
-		bpf_map_update_elem(&cpu_util_map, &cpu, &zero_util, 0);
+	SCX_REGISTER_ARRAY(cpu_util_map, true);
 
-	/*
-	 * ARRAY maps are preallocated in the kernel. Seed zeroed entries here so
-	 * init_node() can always look up node_ctx_stor during cosmos_init().
-	 */
-	INIT_SCX_TEST_MAP(&node_ctx_test_map, node_ctx_stor);
-	scx_test_map_register(&node_ctx_test_map, &node_ctx_stor);
-	for (node = 0; node < node_ctx_test_map.max_entries; node++)
-		bpf_map_update_elem(&node_ctx_stor, &node, &zero_node, 0);
-
-	INIT_SCX_TEST_MAP(&cpu_node_test_map, cpu_node_map);
-	scx_test_map_register(&cpu_node_test_map, &cpu_node_map);
+	SCX_REGISTER_ARRAY(node_ctx_stor, true);
+	SCX_REGISTER_ARRAY(cpu_node_map, false);
+	SCX_REGISTER_PERCPU(cpu_ctx_stor, true);
 
 	/*
 	 * Upstream scx_cosmos dropped deferred CPU wakeups and removed the
 	 * `wakeup_timer` object (sched-ext/scx 79f892807cff "Deprecate deferred
 	 * CPU wakeup" + 225b98c0 "Remove unused wakeup_timer"). COSMOS now has
-	 * no BPF timer, so there is nothing to wire up here. The timer override
-	 * infrastructure above (cosmos_timer_cb/_ptr/_map, sim_wakeup_timer_buf)
-	 * stays harmlessly dormant: cosmos_timer_cb is never set, so
-	 * cosmos_fire_timer() is a no-op and cosmos_map_lookup() falls through
-	 * to the normal map lookup (wakeup_timer_map_ptr stays NULL).
+	 * no BPF timer, so there is nothing to wire up here and no
+	 * cosmos_fire_timer symbol is emitted; the Rust side resolves
+	 * `fire_timer` with try_get! into an Option, so its absence is expected
+	 * (ffi.rs `fire_timer: Option<FireTimerFn>`).
 	 */
 }
 
 /*
- * Fire the stored BPF timer callback.
- * Called from the Rust engine when a TimerFired event is processed.
- *
- * Phase 1 BPF infra scale-up items 1+2 (tg
- * `scxsim-bpf-infra-scale-up-phase1`): the engine now passes a `slot`
- * id so multi-timer schedulers (LAVD post-Phase-1, Phase-2 compiled-in
- * cgroup_bw library) can dispatch to the right callback. COSMOS is a
- * single-timer scheduler (only `wakeup_timer`); it ignores `slot` and
- * always fires its only timer. The single arg is required by the new
- * FFI signature `FireTimerFn = unsafe extern "C" fn(u32)` so the
- * symbol resolves.
- */
-void cosmos_fire_timer(unsigned int slot)
-{
-	int key = 0;
-	(void)slot;
-	if (cosmos_timer_cb && cosmos_timer_ptr)
-		cosmos_timer_cb(cosmos_timer_map, &key, cosmos_timer_ptr);
-}
-
-/*
  * Combined setup function called from Rust before cosmos_init().
- * Sets global variables to disable complex features, registers maps,
- * and enables CPU 0 in the primary domain.
+ * Registers maps and enables CPU 0 in the primary domain; the config globals are
+ * written before run by the manifest apply_rodata path (scheduler_manifest.rs
+ * cosmos.runtime.rodata), not here. num_cpus is unused (cosmos has no
+ * CPU-count-derived rodata) but kept for the generic {prefix}_setup signature.
  */
 void cosmos_setup(unsigned int num_cpus)
 {
 	struct cpu_arg arg = { .cpu_id = 0 };
 
-	smt_enabled = true;
-	/*
-	 * Upstream scx_cosmos deprecated the SMT-avoidance toggle and made it
-	 * unconditional (sched-ext/scx 9278fb1e "Deprecate SMT avoidance
-	 * option"), removing the `avoid_smt` BPF global. SMT contention is now
-	 * always avoided, so there is no knob to set here.
-	 */
-	primary_all = true;
-	flat_idle_scan = false;
-	preferred_idle_scan = false;
-	cpufreq_enabled = true;
-	numa_enabled = false;
-	nr_node_ids = 1;
-	mm_affinity = true;
-	perf_config = 1;  /* Enable PMU tracking (any non-zero value) */
-	slice_ns = 20000000;   /* 20ms */
-	slice_lag = 20000000;  /* 20ms */
-	busy_threshold = 1;   /* system "not busy" → flat idle scan path */
+	(void)num_cpus;
 
 	cosmos_register_maps();
 	enable_primary_cpu(&arg);

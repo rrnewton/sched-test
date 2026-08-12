@@ -319,7 +319,14 @@ fn main() {
     // Pin to a single CPU to avoid cross-core migration noise.
     pin_to_cpu(0);
 
-    let config = PmuConfig::detect().expect("CPU not supported for PMU counting");
+    let config = PmuConfig::detect().unwrap_or_else(|| {
+        if cfg!(target_arch = "x86_64") {
+            panic!("CPU not supported for PMU counting (no CPUID vendor/family match)");
+        }
+        // PmuConfig::detect() always returns None off x86_64: CPUID detection and
+        // the rdpmc counter read this tool relies on are x86-only.
+        panic!("measure_skid requires x86_64 (PMU CPUID detection + rdpmc are x86-only)");
+    });
 
     let events_to_measure: &[PmuEvent] = match filter {
         EventFilter::Rbc => &[PmuEvent::RetiredBranchConditional],

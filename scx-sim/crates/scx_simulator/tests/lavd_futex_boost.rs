@@ -17,8 +17,8 @@
 //! Attribution: `handle_futex_op` skips if target pid is not running on any CPU.
 //! Tests pin holders and use start_time_ns delays to guarantee attribution.
 
-use scx_simulator::probes::{LavdMonitor, LavdProbes};
 use scx_simulator::*;
+use scx_simulator::{LavdMonitor, LavdProbes};
 
 mod common;
 

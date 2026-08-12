@@ -18,9 +18,10 @@ use std::collections::HashMap;
 
 use crate::trace::{Trace, TraceKind};
 use crate::types::{CpuId, DsqId, Pid, TimeNs};
+use serde::{Deserialize, Serialize};
 
 /// Summary statistics for a distribution of values.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DistributionStats {
     /// Number of samples.
     pub count: usize,
@@ -87,7 +88,7 @@ impl DistributionStats {
 }
 
 /// Per-task statistics computed from a trace.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TaskStats {
     /// PID of the task.
     pub pid: Pid,
@@ -132,7 +133,7 @@ pub fn percentile(sorted: &[TimeNs], p: f64) -> TimeNs {
 }
 
 /// Per-CPU statistics computed from a trace.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CpuStats {
     /// CPU ID.
     pub cpu: CpuId,
@@ -149,7 +150,7 @@ pub struct CpuStats {
 }
 
 /// Global trace statistics.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TraceStats {
     /// Per-task statistics.
     pub tasks: HashMap<Pid, TaskStats>,
@@ -571,7 +572,7 @@ impl TraceStats {
 }
 
 /// Comparison between two traces (real vs simulated).
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct TraceComparison {
     /// Statistics from the baseline trace (typically real).
     pub baseline: TraceStats,
@@ -628,6 +629,32 @@ impl TraceComparison {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The result/stats types round-trip through serde so an embedder
+    /// (ktstr) can persist + diff run outputs. Single-entry maps keep the JSON
+    /// key order stable for the string-equality round-trip assertion, and
+    /// exercise serde_json's handling of the newtype map keys (Pid/CpuId/DsqId).
+    #[test]
+    fn trace_stats_serde_round_trip() {
+        let mut stats = TraceStats {
+            duration_ns: 5_000_000,
+            dsq_insert_count: 7,
+            ..Default::default()
+        };
+        let ts = TaskStats {
+            pid: Pid(42),
+            schedule_count: 3,
+            ..Default::default()
+        };
+        stats.tasks.insert(Pid(42), ts);
+        stats.cpus.insert(CpuId(0), CpuStats::default());
+        stats.dsq_dispatch_histogram.insert(DsqId(0), 2);
+
+        let json = serde_json::to_string(&stats).expect("serialize TraceStats");
+        let back: TraceStats = serde_json::from_str(&json).expect("deserialize TraceStats");
+        let json2 = serde_json::to_string(&back).expect("re-serialize TraceStats");
+        assert_eq!(json, json2, "TraceStats serde round-trip not stable");
+    }
 
     #[test]
     fn test_distribution_stats_empty() {

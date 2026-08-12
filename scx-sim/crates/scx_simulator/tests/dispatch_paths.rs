@@ -17,7 +17,7 @@ mod common;
 
 /// Run `make()` under each scheduler on `cpus` CPUs, assert no error, and hand
 /// the trace to `check`. One C scheduler instance is alive at a time.
-fn for_each_scheduler(cpus: u32, make: impl Fn() -> Scenario, check: impl Fn(&trace::Trace, &str)) {
+fn for_each_scheduler(cpus: u32, make: impl Fn() -> Scenario, check: impl Fn(&Trace, &str)) {
     for label in ["simple", "lavd", "cosmos"] {
         let sched = match label {
             "simple" => DynamicScheduler::simple(),
@@ -52,7 +52,7 @@ fn task(name: &str, pid: i32, nice: i8, behavior: TaskBehavior) -> TaskDef {
 }
 
 /// Count trace events matching a `TraceKind` predicate.
-fn count(trace: &trace::Trace, pred: impl Fn(&TraceKind) -> bool) -> usize {
+fn count(trace: &Trace, pred: impl Fn(&TraceKind) -> bool) -> usize {
     trace.events().iter().filter(|e| pred(&e.kind)).count()
 }
 

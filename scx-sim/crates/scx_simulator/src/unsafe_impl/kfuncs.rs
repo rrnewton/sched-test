@@ -167,6 +167,8 @@ impl OpsContext {
 pub struct PendingDispatch {
     pub pid: Pid,
     pub dsq_id: DsqId,
+    #[allow(dead_code)]
+    // dormant: parallel-dispatch / replay / preemptive path, inert in the sequential engine
     pub enq_flags: u64,
     pub vtime: Option<Vtime>,
 }
@@ -488,6 +490,8 @@ pub struct SimulatorState {
     /// Native concurrency backend configuration (None = disabled).
     /// When set, workers run truly concurrently with real locks and
     /// window-based clock throttling instead of token-ring serialization.
+    #[allow(dead_code)]
+    // dormant: parallel-dispatch / replay / preemptive path, inert in the sequential engine
     pub native_concurrent: Option<NativeConcurrentConfig>,
     /// SHARED-MUTABLE: Tasks that the engine eagerly removed from BPF
     /// scheduler queues (via `ops.dequeue` + `ops.quiescent`) when their
@@ -677,6 +681,7 @@ impl SimulatorState {
             .is_some_and(|c| c.is_idle() && c.local_dsq.is_empty())
     }
 
+    #[allow(dead_code)] // dormant: parallel-dispatch / replay / preemptive path, inert in the sequential engine
     pub fn find_any_idle_cpu(&self) -> Option<CpuId> {
         self.cpus
             .iter()
@@ -1178,6 +1183,7 @@ pub(crate) fn get_engine_sim_arc() -> Option<SimArc> {
 /// # Safety
 /// The caller must ensure `state` remains valid and unaliased for the
 /// duration between `enter_sim` and `exit_sim`.
+#[allow(dead_code)] // dormant: parallel-dispatch / replay / preemptive path, inert in the sequential engine
 pub unsafe fn enter_sim(state: &mut SimulatorState, cpu: CpuId) {
     state.current_cpu = cpu;
     set_sim_clock(state.cpus[cpu.0 as usize].local_clock, Some(cpu));
@@ -1209,6 +1215,7 @@ pub unsafe fn enter_sim(state: &mut SimulatorState, cpu: CpuId) {
 /// **Not safe for concurrent paths** where another worker may already
 /// hold the token after `finish()`. Use [`exit_sim_no_clear_ops`] in
 /// those cases and clear `ops_context` manually before `finish()`.
+#[allow(dead_code)] // dormant: parallel-dispatch / replay / preemptive path, inert in the sequential engine
 pub fn exit_sim() {
     // Restore per-callback context from CALLBACK_CTX back to SimulatorState.
     // The yield functions may have saved/restored CALLBACK_CTX across token
@@ -1248,6 +1255,7 @@ pub fn exit_sim() {
 /// `None` from the old worker would clobber the new worker's value,
 /// causing the PMU signal handler to record `ops=none` instead of the
 /// true callback context.
+#[allow(dead_code)] // dormant: parallel-dispatch / replay / preemptive path, inert in the sequential engine
 pub fn exit_sim_no_clear_ops() {
     // Sync CALLBACK_CTX back (same as exit_sim but without clearing ops_context).
     if let Some(ctx) = get_callback_ctx() {
@@ -2494,6 +2502,27 @@ pub extern "C" fn sim_bpf_get_smp_processor_id() -> u32 {
     with_sim(kfunc_cost::TRIVIAL, |sim| sim.current_cpu.0)
 }
 
+/// Light, panic-free current-CPU accessor for the generic C map layer.
+///
+/// Reads the per-callback identity context directly (a plain `Cell::get` via
+/// `get_callback_ctx`) — NO `SIM_ARC` lock, NO `maybe_yield`, NO RBC counter
+/// management. Unlike `sim_bpf_get_smp_processor_id` (which does all three and
+/// panics when `SIM_ARC` is not installed), this is safe to call from inside
+/// the RBC-guarded `scx_test_map_lookup_elem` hot path without perturbing
+/// determinism, and never panics.
+///
+/// Returns `u32::MAX` when there is no callback context (scheduler setup or
+/// test scaffolding), where a per-CPU plain lookup has no defined "current
+/// CPU"; the C caller treats that sentinel as "no slot" and returns NULL.
+/// Used to resolve `bpf_map_lookup_elem` on a PERCPU map to the current CPU's
+/// slot (kernel semantics).
+#[no_mangle]
+pub extern "C" fn sim_current_cpu_or_none() -> u32 {
+    get_callback_ctx()
+        .map(|c| c.current_cpu.0)
+        .unwrap_or(u32::MAX)
+}
+
 /// Returns 1 if the current CPU is in hardirq context, 0 otherwise.
 #[no_mangle]
 pub extern "C" fn sim_bpf_in_hardirq() -> u32 {
@@ -2706,10 +2735,16 @@ pub extern "C" fn bpf_get_current_task_btf_kfunc() -> *mut c_void {
     bpf_get_current_task_btf()
 }
 
-/// Get the task running on a given CPU.
+/// Get the task running on a given CPU. For an in-range CPU this returns the
+/// current task, or the synthetic idle task (`idle_task_raw`, PF_IDLE) when the
+/// CPU is idle -- matching the kernel, whose `scx_bpf_cpu_curr` returns
+/// `cpu_rq(cpu)->curr` (the idle task on an idle CPU, never NULL). Returns NULL
+/// only for an out-of-range CPU (the kernel's invalid-cpu path).
 ///
-/// Needed as a linkable symbol for compat paths, even though
-/// `__COMPAT_scx_bpf_cpu_curr` is overridden to a macro returning NULL.
+/// Backs `__COMPAT_scx_bpf_cpu_curr` (compat.bpf.h): that compat helper calls
+/// this kfunc whenever `scx_bpf_cpu_curr` resolves as a symbol — which it always
+/// does in the simulator (defined here, exported via -rdynamic) — so the compat
+/// path resolves to this implementation.
 #[no_mangle]
 pub extern "C" fn scx_bpf_cpu_curr(cpu: i32) -> *mut c_void {
     with_sim(kfunc_cost::SIMPLE, |sim| {
@@ -2722,7 +2757,9 @@ pub extern "C" fn scx_bpf_cpu_curr(cpu: i32) -> *mut c_void {
                 return raw as *mut c_void;
             }
         }
-        ptr::null_mut()
+        // In-range idle CPU: return the synthetic idle task (PF_IDLE), matching
+        // the kernel's rq->idle. NULL is reserved for the out-of-range case above.
+        sim.idle_task_raw
     })
 }
 
@@ -3044,7 +3081,7 @@ pub extern "C" fn bpf_cgroup_release(_cgrp: *mut c_void) {}
 //
 // The C entry points -- `scx_test_cgrp_storage_get`,
 // `scx_test_task_storage_get`, `scx_test_map_lookup_percpu_elem`,
-// `scx_test_cgrp_storage_delete`, `scx_test_map_delete_elem` -- are
+// `scx_test_cgrp_storage_delete`, `scx_storage_delete` -- are
 // the same ones that scheduler wrapper.c files install via macro
 // `#define`; the kfuncs.rs versions below provide the strong symbols
 // resolved at .so load time when a wrapper has NOT installed an
@@ -3072,7 +3109,7 @@ extern "C" {
         value: *mut c_void,
         flags: u64,
     ) -> *mut c_void;
-    fn scx_test_map_delete_elem(map: *mut c_void, key: *const c_void) -> i32;
+    fn scx_storage_delete(map: *mut c_void, key: *const c_void) -> i32;
     fn scx_test_map_lookup_percpu_elem(
         map: *mut c_void,
         key: *const c_void,
@@ -3162,7 +3199,7 @@ pub extern "C" fn bpf_task_storage_delete(map: *mut c_void, task: *mut c_void) -
     if map.is_null() {
         return -2; // -ENOENT
     }
-    let rc = unsafe { scx_test_map_delete_elem(map, &task as *const _ as *const c_void) };
+    let rc = unsafe { scx_storage_delete(map, &task as *const _ as *const c_void) };
     if rc == 0 {
         0
     } else {
@@ -4429,6 +4466,12 @@ mod tests {
 
         let raw = register_task(&mut arc.lock().unwrap().sim, Pid(5));
         arc.lock().unwrap().sim.cpus[1].current_task = Some(Pid(5));
+        // An in-range idle CPU returns the synthetic idle task (PF_IDLE),
+        // matching the kernel's rq->idle. The real engine installs this at init
+        // (engine.rs); test_state leaves it null, so install a real one here so
+        // the idle assertion below actually guards (not a null==null false-pass).
+        let idle_raw = crate::ffi::alloc_idle_task();
+        arc.lock().unwrap().sim.idle_task_raw = idle_raw;
 
         let cpu = arc.lock().unwrap().sim.current_cpu;
         enter_test_sim(&arc, cpu);
@@ -4438,10 +4481,14 @@ mod tests {
         exit_test_sim();
 
         assert_eq!(p, raw);
-        assert!(idle.is_null());
+        // In-range idle CPU -> the synthetic idle task, not NULL.
+        assert_eq!(idle, idle_raw);
+        // Out-of-range CPU -> NULL (the kernel's invalid-cpu path).
         assert!(oob.is_null());
 
         free_task(&mut arc.lock().unwrap().sim, Pid(5));
+        // SAFETY: idle_raw came from alloc_idle_task and is unused after this.
+        unsafe { crate::ffi::free_task_raw(idle_raw) };
     }
 
     // -----------------------------------------------------------------------

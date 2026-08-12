@@ -39,19 +39,19 @@ fn task(name: &str, pid: i32, nice: i8, behavior: TaskBehavior) -> TaskDef {
     }
 }
 
-fn count(trace: &trace::Trace, pred: impl Fn(&TraceKind) -> bool) -> usize {
+fn count(trace: &Trace, pred: impl Fn(&TraceKind) -> bool) -> usize {
     trace.events().iter().filter(|e| pred(&e.kind)).count()
 }
 
-fn update_idle_count(trace: &trace::Trace) -> usize {
+fn update_idle_count(trace: &Trace) -> usize {
     count(trace, |k| matches!(k, TraceKind::UpdateIdle { .. }))
 }
 
-fn kick_count(trace: &trace::Trace) -> usize {
+fn kick_count(trace: &Trace) -> usize {
     count(trace, |k| matches!(k, TraceKind::KickCpu { .. }))
 }
 
-fn cpus_used(trace: &trace::Trace) -> usize {
+fn cpus_used(trace: &Trace) -> usize {
     trace
         .events()
         .iter()

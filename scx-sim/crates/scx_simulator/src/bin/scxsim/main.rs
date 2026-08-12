@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
 
-use scx_simulator::scenario::{parse_duration_ns, parse_seed};
 use scx_simulator::{
     compare_checkpoints, compute_so_hash, discover_schedulers, drain_determinism_checkpoints,
     drain_preemption_records, enable_determinism_mode, enable_preemption_collection, load_rtapp,
@@ -12,6 +11,7 @@ use scx_simulator::{
     Phase, PmuEvent, PreemptMode, PreemptionTrace, PreemptiveConfig, RepeatMode, Scenario,
     SimFormat, Simulator, TaskBehavior, TraceMetadata, TraceStats, SIM_LOCK,
 };
+use scx_simulator::{parse_duration_ns, parse_seed};
 
 mod real_run;
 mod sched_config;
@@ -904,7 +904,7 @@ fn derive_e9_scheduler_path(base_path: &Path) -> Result<PathBuf, String> {
 ///
 /// Returns the path to the `_e9rip.so` on success.
 fn create_e9rip_scheduler(base_so_path: &Path, trace_file: &Path) -> Result<PathBuf, String> {
-    use scx_simulator::backend::e9patch;
+    use scx_simulator::e9patch;
     use std::io::BufReader;
 
     // Check if a cached _e9rip.so already exists.
@@ -1024,13 +1024,13 @@ fn replay_simulation(args: &ReplayArgs) -> Result<(), String> {
     // Must happen BEFORE loading the _e9.so (the instrumented Jcc
     // instructions access the fixed address during DT_INIT).
     if use_e9_replay {
-        scx_simulator::preempt::mmap_shared_rbc();
+        scx_simulator::mmap_shared_rbc();
     }
 
     // Map the RIP shared state page if e9patch RIP mode is detected.
     // Must happen BEFORE loading the _e9rip.so.
     if use_e9_rip_mode {
-        scx_simulator::backend::e9patch::mmap_rip_shared();
+        scx_simulator::e9patch::mmap_rip_shared();
         eprintln!("replay: detected break_on=insn trace, using e9patch RIP mode");
     }
 
@@ -1183,7 +1183,7 @@ fn run_determinism_check(args: &RunArgs, scenario: Scenario) -> Result<(), RunEr
 
     // Map the shared RBC state page BEFORE loading the _e9.so.
     if use_e9 {
-        scx_simulator::preempt::mmap_shared_rbc();
+        scx_simulator::mmap_shared_rbc();
     }
 
     // Run 1: collect checkpoints
@@ -1298,7 +1298,7 @@ fn run_simulation(args: &RunArgs, scenario: Scenario) -> Result<(), RunError> {
     // Map the shared RBC state page BEFORE loading the _e9.so — the e9-
     // instrumented .so accesses this address during DT_INIT.
     if use_e9 {
-        scx_simulator::preempt::mmap_shared_rbc();
+        scx_simulator::mmap_shared_rbc();
     }
 
     let sched = load_scheduler(
@@ -1359,7 +1359,7 @@ fn run_simulation(args: &RunArgs, scenario: Scenario) -> Result<(), RunError> {
     if let Some(path) = &args.structops_jsonl {
         let mut file = std::fs::File::create(path)
             .map_err(|e| format!("failed to create {}: {e}", path.display()))?;
-        scx_simulator::structops_jsonl::write_jsonl(&trace, &mut file)
+        scx_simulator::write_jsonl(&trace, &mut file)
             .map_err(|e| format!("failed to write structops jsonl: {e}"))?;
         eprintln!("wrote structops jsonl trace to {}", path.display());
     }

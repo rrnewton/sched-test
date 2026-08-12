@@ -73,7 +73,7 @@ fn new_sched(label: &str, cpus: u32) -> DynamicScheduler {
 }
 
 /// Run `label` on `cpus` CPUs with `scenario`, asserting a clean exit.
-fn run(label: &str, cpus: u32, scenario: Scenario) -> trace::Trace {
+fn run(label: &str, cpus: u32, scenario: Scenario) -> Trace {
     let trace = Simulator::new(new_sched(label, cpus)).run(scenario);
     assert!(
         !trace.has_error(),
@@ -330,7 +330,7 @@ fn test_kick_cpu_targets_valid_cpu() {
 // ---------------------------------------------------------------------------
 
 /// Highest CPU id named anywhere in the trace (event site + helper returns).
-fn max_cpu_referenced(trace: &trace::Trace) -> u32 {
+fn max_cpu_referenced(trace: &Trace) -> u32 {
     let mut m = 0u32;
     for e in trace.events() {
         m = m.max(e.cpu.0);
@@ -345,7 +345,7 @@ fn max_cpu_referenced(trace: &trace::Trace) -> u32 {
 }
 
 /// Distinct CPUs a task actually ran on.
-fn distinct_cpus_used(trace: &trace::Trace) -> BTreeSet<u32> {
+fn distinct_cpus_used(trace: &Trace) -> BTreeSet<u32> {
     trace
         .events()
         .iter()
@@ -492,7 +492,7 @@ fn test_dsq_move_to_local_consume_conservation() {
 fn test_task_cgroup_null_pointer_contract() {
     let _lock = common::setup_test();
     // extern "C" kfunc, safe to call; NULL in ⇒ NULL out, no sim context used.
-    let ret = kfuncs::scx_bpf_task_cgroup(std::ptr::null_mut::<c_void>(), 0);
+    let ret = scx_bpf_task_cgroup(std::ptr::null_mut::<c_void>(), 0);
     assert!(
         ret.is_null(),
         "scx_bpf_task_cgroup(NULL) must return NULL, got {ret:?}"

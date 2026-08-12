@@ -15,6 +15,11 @@ use std::path::Path;
 // ---------------------------------------------------------------------------
 // task_struct accessors (implemented in csrc/sim_task.c)
 // ---------------------------------------------------------------------------
+// These `extern "C"` decls bind C symbols (several are in the EXPORTED_SYMS
+// dlopen kfunc-export contract); rustc sees no Rust caller for some, so dead_code
+// is allowed at the BLOCK level only -- the lint stays live over the module's
+// Rust public API (the bulk of this file).
+#[allow(dead_code)]
 extern "C" {
     pub fn sim_task_alloc() -> *mut c_void;
     pub fn sim_task_free(p: *mut c_void);
@@ -186,6 +191,8 @@ pub fn test_and_clear_cpu_idle(cpu: i32) -> bool {
 ///
 /// Returns a raw pointer that must eventually be freed with
 /// [`free_task_raw`].
+// Test-only helper (wraps sim_task_alloc + PF_IDLE); no non-test caller.
+#[allow(dead_code)]
 pub fn alloc_idle_task() -> *mut c_void {
     // SAFETY: sim_task_alloc returns a heap-allocated, zeroed task_struct.
     // sim_task_set_flags sets a u32 field on the struct.
@@ -201,6 +208,8 @@ pub fn alloc_idle_task() -> *mut c_void {
 ///
 /// # Safety
 /// `p` must have been obtained from `sim_task_alloc` and not yet freed.
+// Test-only helper (the symmetric free for alloc_idle_task); no non-test caller.
+#[allow(dead_code)]
 pub unsafe fn free_task_raw(p: *mut c_void) {
     sim_task_free(p);
 }
@@ -914,6 +923,64 @@ pub fn discover_schedulers(dir: &Path) -> Vec<SchedulerInfo> {
     schedulers
 }
 
+/// Errors from the fallible scheduler-load entry points
+/// ([`DynamicScheduler::try_load`], [`DynamicScheduler::try_load_with_definition`]).
+///
+/// The infallible [`DynamicScheduler::load`] / [`DynamicScheduler::load_with_definition`]
+/// wrappers `panic!` on these (correct for the standalone binary, per No Silent
+/// Failures); an embedder calls the `try_*` forms and handles the error instead of
+/// taking a process abort across the FFI boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoadError {
+    /// The `.so` file could not be opened (dlopen failure).
+    LibraryOpen {
+        /// Path that failed to open.
+        path: String,
+        /// Underlying dynamic-linker error message.
+        message: String,
+    },
+    /// No bundled scheduler definition matches the requested prefix.
+    UnknownPrefix {
+        /// The prefix with no matching bundled definition.
+        prefix: String,
+    },
+    /// A mandatory ops symbol is absent from the `.so`.
+    MissingOp {
+        /// The fully-qualified symbol name that was not found.
+        symbol: String,
+        /// Underlying dynamic-linker error message.
+        message: String,
+    },
+    /// A declared rodata config global is absent from the `.so`.
+    MissingRodataGlobal {
+        /// The config global name that was not found.
+        name: String,
+        /// The scheduler prefix whose `.so` was missing the global.
+        prefix: String,
+    },
+}
+
+impl std::fmt::Display for LoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LoadError::LibraryOpen { path, message } => {
+                write!(f, "failed to load {path}: {message}")
+            }
+            LoadError::UnknownPrefix { prefix } => {
+                write!(f, "no scheduler definition for prefix `{prefix}`")
+            }
+            LoadError::MissingOp { symbol, message } => {
+                write!(f, "{symbol} not found: {message}")
+            }
+            LoadError::MissingRodataGlobal { name, prefix } => {
+                write!(f, "rodata global `{name}` not found in {prefix}.so")
+            }
+        }
+    }
+}
+
+impl std::error::Error for LoadError {}
+
 /// A scheduler loaded dynamically from a `.so` shared library.
 ///
 /// Each instance owns a `libloading::Library` handle. When the
@@ -941,15 +1008,133 @@ impl DynamicScheduler {
         self._lib.get(name).ok()
     }
 
-    /// Load a scheduler from a `.so` file.
+    /// Read a `u64` BPF global from the loaded `.so` by symbol name.
+    ///
+    /// Returns `None` if the symbol is absent. Observes scheduler counters
+    /// (e.g. dispatch tallies) for tests and inspection. The scheduler's
+    /// counters are declared `volatile u64`, so the read is volatile. The named
+    /// symbol must be a `u64` global; a symbol of a different type/size yields
+    /// an unspecified value.
+    pub fn read_u64_global(&self, name: &str) -> Option<u64> {
+        // SAFETY: get_symbol resolves `name` to the address of a u64 global; the
+        // returned Symbol borrows &self, keeping the library mapped for the
+        // read. Contract: `name` is a u64 global.
+        unsafe {
+            self.get_symbol::<*const u64>(name.as_bytes())
+                .map(|sym| std::ptr::read_volatile(*sym))
+        }
+    }
+
+    /// Write a `bool` BPF config global in the loaded `.so` by symbol name.
+    ///
+    /// Returns `None` if the symbol is absent (mirrors [`Self::read_u64_global`]).
+    /// Sets a scheduler `const volatile` config global (e.g.
+    /// `enable_slice_shrinking`) BEFORE `run`; this is the kernel-faithful analog
+    /// of libbpf patching the `.rodata` map before `BPF_PROG_LOAD` (the value is
+    /// fixed before the scheduler program executes, never mutated mid-run). The
+    /// named symbol must be a `bool` global — a symbol of a different width
+    /// corrupts adjacent memory.
+    pub fn write_bool_global(&self, name: &str, value: bool) -> Option<()> {
+        // SAFETY: get_symbol resolves `name` to the address of a bool global; the
+        // returned Symbol borrows &self, keeping the library mapped for the
+        // write. The .so strips `const` (-Dconst=) so the symbol is a writable
+        // global; `volatile` on it matches write_volatile. Contract: `name` is a
+        // bool global.
+        unsafe {
+            self.get_symbol::<*mut bool>(name.as_bytes())
+                .map(|sym| std::ptr::write_volatile(*sym, value))
+        }
+    }
+
+    /// Write a `u32` BPF config global. See [`Self::write_bool_global`] for the
+    /// pre-`run` rodata contract; `name` must be a `u32` global.
+    pub fn write_u32_global(&self, name: &str, value: u32) -> Option<()> {
+        // SAFETY: as `write_bool_global`; contract: `name` is a u32 global.
+        unsafe {
+            self.get_symbol::<*mut u32>(name.as_bytes())
+                .map(|sym| std::ptr::write_volatile(*sym, value))
+        }
+    }
+
+    /// Write a `u64` BPF config global. See [`Self::write_bool_global`] for the
+    /// pre-`run` rodata contract; `name` must be a `u64` global.
+    pub fn write_u64_global(&self, name: &str, value: u64) -> Option<()> {
+        // SAFETY: as `write_bool_global`; contract: `name` is a u64 global.
+        unsafe {
+            self.get_symbol::<*mut u64>(name.as_bytes())
+                .map(|sym| std::ptr::write_volatile(*sym, value))
+        }
+    }
+
+    /// Write a `u8` BPF config global. See [`Self::write_bool_global`] for the
+    /// pre-`run` rodata contract; `name` must be a `u8` global (a u32/u64 write
+    /// would overrun the 1-byte symbol into adjacent rodata).
+    pub fn write_u8_global(&self, name: &str, value: u8) -> Option<()> {
+        // SAFETY: as `write_bool_global`; contract: `name` is a u8 global.
+        unsafe {
+            self.get_symbol::<*mut u8>(name.as_bytes())
+                .map(|sym| std::ptr::write_volatile(*sym, value))
+        }
+    }
+
+    /// Load a bundled scheduler `.so` by `prefix` (the standalone path).
     ///
     /// - `path`: path to the `.so` file
-    /// - `prefix`: symbol prefix (e.g., "simple" or "tickless")
+    /// - `prefix`: scheduler name / symbol prefix (e.g. "simple", "tickless")
     /// - `nr_cpus`: passed to `{prefix}_setup()` if the symbol exists
+    ///
+    /// Resolves the bundled definition for `prefix` and delegates to
+    /// [`load_with_definition`](Self::load_with_definition). An unknown prefix
+    /// panics rather than silently skipping config (No Silent Failures); the
+    /// build's manifest<->dir cross-check guarantees every bundled
+    /// `libscx_<name>.so` has a matching definition, so the standalone path
+    /// never hits this panic.
+    pub fn load(path: &str, prefix: &str, nr_cpus: u32) -> Self {
+        // Keep the "failed to load {path}" prefix: it is the only place the
+        // offending .so path appears, and panic_recovery.rs asserts on it.
+        Self::try_load(path, prefix, nr_cpus)
+            .unwrap_or_else(|e| panic!("failed to load {path}: {e}"))
+    }
+
+    /// Fallible form of [`load`](Self::load): resolve the bundled definition for
+    /// `prefix` and load, returning [`LoadError`] instead of panicking. This is
+    /// the entry an embedder uses when it wants to recover from a bad `.so`.
+    pub fn try_load(path: &str, prefix: &str, nr_cpus: u32) -> Result<Self, LoadError> {
+        let def = scxsim_build::standalone_definitions()
+            .into_iter()
+            .find(|d| d.name == prefix)
+            .ok_or_else(|| LoadError::UnknownPrefix {
+                prefix: prefix.to_owned(),
+            })?;
+        Self::try_load_with_definition(path, &def, nr_cpus)
+    }
+
+    /// Load a scheduler `.so` and apply a supplied `SchedulerDefinition` -- the
+    /// generic core both the standalone `load` and an embedder drive. The
+    /// definition carries the ops prefix (`def.name`) and the rodata config and
+    /// has no dependency on the bundled `SCHEDULERS` const, so an embedder can
+    /// load a scheduler the bundled set never knew about.
     ///
     /// Mandatory ops (`init`, `select_cpu`, etc.) panic if missing.
     /// Optional ops (`runnable`, `init_task`) become `None` if missing.
-    pub fn load(path: &str, prefix: &str, nr_cpus: u32) -> Self {
+    pub fn load_with_definition(
+        path: &str,
+        def: &scxsim_build::SchedulerDefinition,
+        nr_cpus: u32,
+    ) -> Self {
+        Self::try_load_with_definition(path, def, nr_cpus).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// Fallible form of [`load_with_definition`](Self::load_with_definition):
+    /// load the `.so` and apply `def`, returning [`LoadError`] instead of
+    /// panicking. An embedder uses this so a bad `.so` / missing symbol is a
+    /// recoverable error rather than a process abort across the FFI boundary.
+    pub fn try_load_with_definition(
+        path: &str,
+        def: &scxsim_build::SchedulerDefinition,
+        nr_cpus: u32,
+    ) -> Result<Self, LoadError> {
+        let prefix = def.name.as_str();
         // SAFETY: The .so is built by our build system from known-safe C source.
         // Use RTLD_NOW for eager binding so all PLT entries are resolved at
         // load time. Without this, lazy PLT resolution during simulation adds
@@ -960,7 +1145,10 @@ impl DynamicScheduler {
                 libloading::os::unix::RTLD_NOW | libloading::os::unix::RTLD_LOCAL,
             )
         }
-        .unwrap_or_else(|e| panic!("failed to load {path}: {e}"))
+        .map_err(|e| LoadError::LibraryOpen {
+            path: path.to_owned(),
+            message: e.to_string(),
+        })?
         .into();
 
         // Probe for {prefix}_setup -- call it if present
@@ -976,28 +1164,66 @@ impl DynamicScheduler {
 
         // SAFETY: The library contains the expected ops symbols with
         // correct signatures (built by our build system).
-        let ops = unsafe { Self::load_ops(&lib, prefix) };
-        Self {
+        let ops = unsafe { Self::try_load_ops(&lib, prefix)? };
+        let sched = Self {
             _lib: lib,
             ops,
             prefix: prefix.to_owned(),
             so_path: path.to_owned(),
+        };
+        // Apply the definition's rodata (config globals) before run -- the
+        // kernel-faithful analog of patching .rodata before BPF_PROG_LOAD, and
+        // before any ops body runs.
+        sched.try_apply_rodata(&def.rodata, nr_cpus)?;
+        Ok(sched)
+    }
+
+    /// Write the supplied config globals (`rodata`) into the loaded `.so`, before
+    /// any ops body runs.
+    ///
+    /// `ConfigValue::NumCpus` resolves to `nr_cpus`. Returns
+    /// [`LoadError::MissingRodataGlobal`] if a declared global is absent from the
+    /// `.so` -- a definition/scheduler mismatch is a bug, never a silent skip.
+    fn try_apply_rodata(
+        &self,
+        rodata: &[(String, scxsim_build::ConfigValue)],
+        nr_cpus: u32,
+    ) -> Result<(), LoadError> {
+        use scxsim_build::ConfigValue;
+        for (name, value) in rodata {
+            let written = match value {
+                ConfigValue::Bool(b) => self.write_bool_global(name, *b),
+                ConfigValue::U8(v) => self.write_u8_global(name, *v),
+                ConfigValue::U32(v) => self.write_u32_global(name, *v),
+                ConfigValue::U64(v) => self.write_u64_global(name, *v),
+                ConfigValue::NumCpus => self.write_u32_global(name, nr_cpus),
+            };
+            if written.is_none() {
+                return Err(LoadError::MissingRodataGlobal {
+                    name: name.clone(),
+                    prefix: self.prefix.clone(),
+                });
+            }
         }
+        Ok(())
     }
 
     /// Load the scx_simple scheduler.
+    #[cfg(feature = "standalone")]
     pub fn simple() -> Self {
         let dir = env!("SCHEDULER_SO_DIR");
         Self::load(&format!("{dir}/libscx_simple.so"), "simple", 1)
     }
 
     /// Load the scx_tickless scheduler, configured for `nr_cpus` CPUs.
+    #[cfg(feature = "standalone")]
     pub fn tickless(nr_cpus: u32) -> Self {
         let dir = env!("SCHEDULER_SO_DIR");
         Self::load(&format!("{dir}/libscx_tickless.so"), "tickless", nr_cpus)
     }
 
     /// Load the scx_cosmos scheduler, configured for `nr_cpus` CPUs.
+    #[cfg(feature = "standalone")]
     pub fn cosmos(nr_cpus: u32) -> Self {
         let dir = env!("SCHEDULER_SO_DIR");
         Self::load(&format!("{dir}/libscx_cosmos.so"), "cosmos", nr_cpus)
@@ -1008,6 +1234,7 @@ impl DynamicScheduler {
     /// Mitosis is a dynamic affinity scheduler that assigns cgroups to
     /// cells with discrete CPU sets. In the simulator, all tasks belong
     /// to the root cgroup (cell 0).
+    #[cfg(feature = "standalone")]
     pub fn mitosis(nr_cpus: u32) -> Self {
         let dir = env!("SCHEDULER_SO_DIR");
         Self::load(&format!("{dir}/libscx_mitosis.so"), "mitosis", nr_cpus)
@@ -1019,6 +1246,7 @@ impl DynamicScheduler {
     /// scheduler that combines virtual deadline ordering with latency
     /// criticality tracking. In the simulator, complex features like
     /// cgroup bandwidth, autopilot, and core compaction are disabled.
+    #[cfg(feature = "standalone")]
     pub fn lavd(nr_cpus: u32) -> Self {
         let dir = env!("SCHEDULER_SO_DIR");
         Self::load(&format!("{dir}/libscx_lavd.so"), "lavd", nr_cpus)
@@ -1032,6 +1260,7 @@ impl DynamicScheduler {
     /// `try_to_steal_task`, `force_to_steal_task`).
     ///
     /// `nr_cpus` must be >= `nr_domains` and `nr_domains` must be >= 2.
+    #[cfg(feature = "standalone")]
     pub fn lavd_multi_domain(nr_cpus: u32, nr_domains: u32) -> Self {
         assert!(nr_domains >= 2, "need at least 2 domains");
         assert!(
@@ -1209,6 +1438,7 @@ impl DynamicScheduler {
     ///
     /// CPUs are grouped sequentially into `nr_nodes` NUMA nodes.
     /// `nr_cpus` must be divisible by `nr_nodes`.
+    #[cfg(feature = "standalone")]
     pub fn cosmos_with_numa(nr_cpus: u32, nr_nodes: u32) -> Self {
         assert!(nr_nodes > 0);
         assert!(nr_cpus >= nr_nodes);
@@ -1338,17 +1568,21 @@ impl DynamicScheduler {
 
     /// Look up scheduler ops function pointers from the loaded library.
     ///
-    /// Mandatory symbols panic if missing. Optional symbols become `None`.
+    /// A missing mandatory symbol returns [`LoadError::MissingOp`]. Optional
+    /// symbols become `None`.
     ///
     /// # Safety
     /// The library must contain the expected symbols with correct signatures.
-    unsafe fn load_ops(lib: &libloading::Library, prefix: &str) -> SchedOps {
+    unsafe fn try_load_ops(lib: &libloading::Library, prefix: &str) -> Result<SchedOps, LoadError> {
         macro_rules! get {
             ($name:expr) => {{
                 let sym_name = format!("{}_{}", prefix, $name);
-                let sym: libloading::Symbol<*const ()> = lib
-                    .get(sym_name.as_bytes())
-                    .unwrap_or_else(|e| panic!("{sym_name} not found: {e}"));
+                let sym: libloading::Symbol<*const ()> =
+                    lib.get(sym_name.as_bytes())
+                        .map_err(|e| LoadError::MissingOp {
+                            symbol: sym_name.clone(),
+                            message: e.to_string(),
+                        })?;
                 // Copy the raw pointer out — it's valid as long as _lib lives.
                 *sym
             }};
@@ -1363,7 +1597,7 @@ impl DynamicScheduler {
             }};
         }
 
-        SchedOps {
+        Ok(SchedOps {
             init: std::mem::transmute::<*const (), InitFn>(get!("init")),
             select_cpu: std::mem::transmute::<*const (), SelectCpuFn>(get!("select_cpu")),
             enqueue: std::mem::transmute::<*const (), EnqueueFn>(get!("enqueue")),
@@ -1442,7 +1676,7 @@ impl DynamicScheduler {
                 .get::<*const ()>(b"scxsim_cgroup_bw_budget_remaining")
                 .ok()
                 .map(|sym| std::mem::transmute::<*const (), CgroupBwBudgetRemainingFn>(*sym)),
-        }
+        })
     }
 
     /// Return the list of defined ops callback names (without prefix).
@@ -1760,6 +1994,55 @@ mod tests {
     type IterNewFn = unsafe extern "C" fn(*mut c_void, u64, u64) -> i32;
     type IterNextFn = unsafe extern "C" fn(*mut c_void) -> *mut c_void;
     type IterDestroyFn = unsafe extern "C" fn(*mut c_void);
+
+    /// No Silent Failures: loading a scheduler whose prefix has no bundled
+    /// definition must PANIC, not silently skip its rodata config (the prior
+    /// behavior). The definition is resolved before the `.so` is opened, so the
+    /// bogus path is never touched.
+    #[test]
+    #[should_panic(expected = "no scheduler definition for prefix")]
+    fn load_unknown_prefix_panics() {
+        let _ = DynamicScheduler::load("/nonexistent/libscx_bogus.so", "bogus_scheduler_xyz", 1);
+    }
+
+    /// The fallible twin returns `Err(UnknownPrefix)` instead of panicking --
+    /// the embed path's recoverable-error contract. The definition is resolved
+    /// before the `.so` is opened, so the bogus path is never touched.
+    #[test]
+    fn try_load_unknown_prefix_returns_err() {
+        // matches! (not unwrap_err) so we don't require Debug on the Ok type.
+        let result =
+            DynamicScheduler::try_load("/nonexistent/libscx_bogus.so", "bogus_scheduler_xyz", 1);
+        assert!(matches!(result, Err(LoadError::UnknownPrefix { .. })));
+    }
+
+    /// A real definition with a nonexistent `.so` returns `Err(LibraryOpen)`
+    /// from the embed entry rather than aborting the process at the dlopen.
+    #[test]
+    fn try_load_with_definition_bad_path_returns_err() {
+        let def = scxsim_build::standalone_definitions()
+            .into_iter()
+            .find(|d| d.name == "simple")
+            .expect("bundled `simple` definition");
+        let result =
+            DynamicScheduler::try_load_with_definition("/nonexistent/libscx_simple.so", &def, 1);
+        assert!(matches!(result, Err(LoadError::LibraryOpen { .. })));
+    }
+
+    /// A definition declaring a rodata global the `.so` lacks returns
+    /// `Err(MissingRodataGlobal)` from the embed entry, not a panic. Loads the
+    /// real `libscx_simple.so` (so load + ops succeed) and fails only at rodata.
+    #[test]
+    fn try_load_with_definition_missing_rodata_global_returns_err() {
+        let dir = env!("SCHEDULER_SO_DIR");
+        let path = format!("{dir}/libscx_simple.so");
+        let def = scxsim_build::SchedulerDefinition::new("simple").with_rodata(vec![(
+            "__no_such_global_xyz__".to_string(),
+            scxsim_build::ConfigValue::U32(0),
+        )]);
+        let result = DynamicScheduler::try_load_with_definition(&path, &def, 1);
+        assert!(matches!(result, Err(LoadError::MissingRodataGlobal { .. })));
+    }
 
     #[test]
     fn mitosis_exports_dsq_iterator_symbols() {

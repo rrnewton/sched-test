@@ -5,18 +5,23 @@
 //! (timestamps) provide self-documenting code without the boilerplate
 //! of implementing arithmetic traits.
 
+use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// Dispatch queue identifier. Wraps u64 with kernel bit-flag conventions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct DsqId(pub u64);
 
 /// Process identifier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord, Serialize, Deserialize,
+)]
 pub struct Pid(pub i32);
 
 /// CPU identifier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default, Serialize, Deserialize,
+)]
 pub struct CpuId(pub u32);
 
 impl DsqId {
@@ -49,7 +54,7 @@ impl DsqId {
 ///
 /// Tasks with the same `MmId` share an address space (threads in the same
 /// process). Used by COSMOS's `is_wake_affine()` to co-locate related tasks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MmId(pub u32);
 
 /// Bitflags for `scx_bpf_kick_cpu` matching kernel `scx_kick_flags`.
@@ -86,7 +91,7 @@ pub type TimeNs = u64;
 /// Ordering uses wrapping comparison (like the kernel's `time_before64`),
 /// so `Vtime(u64::MAX)` compares as less than `Vtime(0)` when they are
 /// within half the u64 range of each other.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Vtime(pub u64);
 
 impl PartialOrd for Vtime {
