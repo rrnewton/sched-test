@@ -1,0 +1,12 @@
+[package]
+name = "scxsim-workload-ir"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Restricted workload IR shared between ktstr and scx-sim, plus the lowering from ktstr's declarative op vocabulary onto it"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"
