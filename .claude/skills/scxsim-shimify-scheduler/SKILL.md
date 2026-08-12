@@ -9,9 +9,21 @@ You are bringing a sched_ext scheduler (`scx/scheds/rust/scx_<name>/`) up
 inside scxsim so its **real BPF logic executes** under simulation.
 
 This skill was distilled immediately after `scx_layered` was brought up end to
-end, with six wrappers in the tree (`simple`, `lavd`, `mitosis`, `cosmos`,
-`tickless`, `layered`) to separate what is general from what was
-scheduler-specific. Everything in the trap catalogue cost someone real time.
+end. **Five** wrappers are in the tree — `cosmos`, `lavd`, `mitosis`,
+`simple`, `tickless` — auto-discovered by the Makefile from `*/wrapper.c`:
+
+```make
+SCHEDS := $(patsubst %/wrapper.c,%,$(wildcard */wrapper.c))
+```
+
+so a new directory containing a `wrapper.c` is all it takes to be built.
+(`layered` is a sixth, but it lives on an unlanded branch; where this document
+cites it, that is where to look.) Comparing across them is what separates the
+general from the scheduler-specific. Everything in the trap catalogue cost
+someone real time.
+
+This skill is the reconciliation of two independently written versions — see
+the closing note for what came from where.
 
 ---
 
@@ -96,7 +108,43 @@ fix were committed separately, so the recorded pin did not build.)
 
 ---
 
-## 2. Phase 0 — the compile spike. Do this FIRST.
+## 2. The include-order mechanic — read this before reasoning about any compat branch
+
+This single fact resolves most "why is this compat branch behaving like that"
+questions, it is not obvious from reading any one file, and getting it wrong
+produced a **false P0** in Aug 2026.
+
+```
+wrapper.c
+  #include "sim_wrapper.h"
+      └── #include <scx/common.bpf.h>
+              └── common.bpf.h:1143  #include "compat.bpf.h"   <-- parsed HERE
+  #undef  bpf_ksym_exists          <-- wrapper's own overrides run AFTER
+  #define bpf_ksym_exists(sym) ...
+  #include "<scheduler>.bpf.c"     <-- re-includes common.bpf.h; header
+                                       guard already set, so it is SKIPPED
+```
+
+`compat.bpf.h` is fully parsed inside `sim_wrapper.h`, **before** any override
+in `wrapper.c`. Therefore:
+
+| compat construct | when `bpf_ksym_exists` binds | affected by a wrapper override? |
+|---|---|---|
+| `static inline` **function** (`__COMPAT_scx_bpf_cpu_curr`, `__COMPAT_scx_bpf_dsq_peek`, `scx_bpf_dsq_insert`, `scx_bpf_task_set_slice`, `scx_bpf_task_set_dsq_vtime`, `__COMPAT_scx_bpf_reenqueue_local_from_anywhere`, `__COMPAT_has_generic_reenq`, `scx_bpf_dsq_reenq`) | at parse time, inside `sim_wrapper.h` | **NO — immune** |
+| **macro** (`__COMPAT_scx_bpf_cpu_node`, `__COMPAT_scx_bpf_*_node`, `__COMPAT_HAS_scx_bpf_select_cpu_and`, `scx_bpf_dsq_move*`, `__COMPAT_bpf_cpumask_populate`, …) | at the call site in the `.bpf.c` | **YES** |
+
+Consequence: a wrapper-level `#define bpf_ksym_exists(sym) (0)` can look like
+it disables everything while actually changing nothing, because the constructs
+that scheduler happens to use are all inline functions. Empirically, `cosmos`
+forces the macro to `1` and its built `.so` still carries **43 `GLOB_DAT`
+relocations** — i.e. dozens of genuine runtime tests survived the override
+untouched.
+
+**Do not reason about this from the `#define`. Verify from the binary (§3.1).**
+
+---
+
+## 3. Phase 0 — the compile spike. Do this FIRST.
 
 **This is the highest-value hour of the whole job.** It converts an unknown
 into a bounded gap list, and it routinely refutes the plan. For `scx_layered`
@@ -173,6 +221,53 @@ Record the spike result before proceeding — the count is your estimate.
 > Copy the override block from `schedulers/layered/wrapper.c`. Note the
 > `bpf_printk` case specifically: it is usually behind `if (debug)`, so the
 > scheduler runs fine until someone turns debugging on.
+
+### 3.1 Verify what actually compiled — relocations, not `#define`s
+
+Reading the source that was *supposed* to produce a behaviour is not evidence.
+Read the binary.
+
+```sh
+objdump -R <sched>.so | grep GLOB_DAT     # genuine runtime test survived
+objdump -R <sched>.so | grep JUMP_SLOT    # symbol is actually called
+objdump -d <sched>.so                     # read the branch itself
+```
+
+Interpretation:
+
+- **`GLOB_DAT` on the symbol** → the compiler emitted a real NULL test; the
+  genuine capability check is in the binary.
+- **`JUMP_SLOT` but no `GLOB_DAT`** → the test was folded to a constant.
+  Someone overrode it, or the symbol is locally defined so the compiler proved
+  it non-NULL (check for a `W`/`T` definition in the same `.so`).
+
+A correctly-compiled genuine test looks like this:
+
+```
+<__COMPAT_scx_bpf_cpu_curr>:
+  cmpq $0x0,0xad58(%rip)        # <scx_bpf_cpu_curr>   <-- runtime NULL test
+  jne  4b0 <scx_bpf_cpu_curr@plt>                      <-- modern path
+  call 320 <scx_bpf_cpu_rq@plt>                        <-- legacy fallback
+```
+
+Both branches present, plus a `cmpq` against the GOT slot, = genuine.
+
+> **Gotcha that has bitten twice, and it applies to the spike above:**
+> `nm -D --undefined-only` (and `nm -u`) **hide symbols that are defined
+> locally** in the object. Grepping only undefined symbols makes a fallback
+> look absent when it is sitting right there. Use plain `nm -D`, **plus**
+> `objdump -R`, **plus** the disassembly. Never conclude from one of the three.
+
+**Regression-check a shim change** — an inert change diffs to nothing:
+
+```sh
+for so in <out>/schedulers/*.so; do
+  objdump -R "$so" | awk '/GLOB_DAT|JUMP_SLOT/{print $2, $3}' | sort \
+    > /tmp/$(basename $so).before
+done
+# ... make your change, rebuild ...
+diff /tmp/libscx_<name>.so.before /tmp/libscx_<name>.so.after
+```
 >
 > **Find them by grep, not by linker:**
 > ```bash
@@ -184,41 +279,85 @@ Record the spike result before proceeding — the count is your estimate.
 
 ---
 
-## 3. Phase 1 — the per-scheduler decision table
+## 4. Phase 1 — the per-scheduler decision table
 
 These four differ **per scheduler**. Getting one wrong costs a day. Decide
 each deliberately and write the reasoning in a comment.
 
-### 3.1 `bpf_ksym_exists()` — do NOT force it reflexively
+### 4.1 Kernel capability: never fake `bpf_ksym_exists` — provide the symbol
 
-`compat.bpf.h` gates modern-vs-legacy kfunc paths on weak-symbol presence.
-The tree contains all three answers, and all three are correct *for their
-scheduler*:
+`bpf_ksym_exists(sym)` is libbpf's `!!sym` on a `__weak` symbol. `__weak`
+survives into this native build (`lib/scxtest/scx_test.h:6` maps it to
+`__attribute__((weak))`), so it is a **genuine runtime NULL check** against
+what the process actually provides:
 
-| Scheduler | Choice | Why |
-|---|---|---|
-| mitosis | forced `0` | avoids `scx_bpf_select_cpu_and`, which it does not need |
-| cosmos | forced `1` | *wants* `scx_bpf_select_cpu_and` |
-| **layered** | **not forced** | needs both answers simultaneously |
+- symbols the simulator binary exports — `#[no_mangle]` in `kfuncs.rs`,
+  resolved into the `.so` at `dlopen` time via `-rdynamic`; plus
+- symbols the scheduler's own `wrapper.c` defines.
 
-layered is the instructive case: `scx_bpf_cpu_curr` and
-`scx_bpf_reenqueue_local___v2___compat` **are** exported by scxsim (so the
-modern paths must run), while `scx_bpf_task_set_slice___new` is **not** (so
-that one must fall back to the direct `p->scx.*` write scxsim supports).
-Forcing `1` makes the second group jump through a NULL weak symbol; forcing
-`0` makes the first group take a dead fallback (`scx_bpf_reenqueue_local___v1`
-is NULL → SIGSEGV).
+**That set IS the capability table.** It is ground truth by construction and
+cannot drift the way a hand-maintained list would. Inspect it:
 
-**Default: leave it alone** and let the real weak-symbol test decide. Only
-force it if you can name the specific symbol you are steering and have
-checked the other consumers. Enumerate them:
-
-```bash
-grep -n 'bpf_ksym_exists' ../scheds/include/scx/compat.bpf.h
-grep -n '__COMPAT_\|scx_bpf_' $SRC/*.c | sort -u | head -40
+```sh
+nm -D --defined-only target/debug/scxsim | awk '{print $3}' | sort -u
 ```
 
-### 3.2 `cleanup.bpf.h` RAII — native or neutralised?
+#### The rule
+
+> To make a modern path run, **provide the symbol** — do not fake the test.
+
+Export the kfunc from `kfuncs.rs`, or define it in that scheduler's
+`wrapper.c`. The genuine test then answers TRUE by itself, and *keeps*
+answering correctly as upstream moves.
+
+`cosmos/wrapper.c` is the worked example: it needs
+`__COMPAT_scx_bpf_cpu_node()` to take the modern branch, so it **defines
+`scx_bpf_cpu_node()`** against its own `cpu_node_map`. The real test finds the
+symbol and returns true — no lie required.
+
+#### Why forcing the constant is wrong
+
+`bpf_ksym_exists` is consulted for ~31 different symbols. A blanket `#define`
+answers for **all of them at once** to fix the one that motivated it:
+
+- Forcing `0` sends every macro-form capability down its legacy branch,
+  including ones the simulator fully supports.
+- Forcing `1` asserts that symbols the simulator does **not** export do exist.
+  Each such call then jumps through a NULL weak `__ksym` and SIGSEGVs the
+  moment its guard condition goes true.
+
+Both are fake values standing in for a real capability test — the No-Stub
+Rule's core prohibition. And an unexplained forced constant is
+indistinguishable from a stub to the next reader.
+
+Remember §2: because the inline-function compat constructs bind before any
+wrapper override, a blanket force frequently does not even achieve the thing
+it was written for. It is simultaneously too broad and ineffective.
+
+#### What the existing wrappers do, and how to read it
+
+| Scheduler | Choice | Read it as |
+|---|---|---|
+| mitosis | forces `0` | legacy, historical; only reaches macro-form constructs |
+| cosmos | forces `1` | historical — but note cosmos *also* does the right thing by defining `scx_bpf_cpu_node()`, which is what actually makes its modern branch work |
+| layered | **not forced** | the pattern to copy |
+
+layered is the instructive case for why a blanket force cannot be right:
+`scx_bpf_cpu_curr` and `scx_bpf_reenqueue_local___v2___compat` **are** exported
+by scxsim (so the modern paths must run), while `scx_bpf_task_set_slice___new`
+is **not** (so that one must fall back to the direct `p->scx.*` write). Forcing
+`1` makes the second group jump through a NULL weak symbol; forcing `0` makes
+the first group take a dead fallback (`scx_bpf_reenqueue_local___v1` is NULL →
+SIGSEGV). No single constant is correct for both groups — which is the general
+case, not a layered quirk.
+
+**Default: leave it alone.** If you genuinely need an override, make it **per
+symbol**, never blanket, and put the reason in the code next to it, stating
+what breaks without it. A reader must be able to tell your override from a stub
+without running `git log`. Then confirm from the binary (§3.1) that you changed
+what you thought you changed.
+
+### 4.2 `cleanup.bpf.h` RAII — native or neutralised?
 
 `__free(...)`, `no_free_ptr()`, `scoped_guard()`, `DEFINE_GUARD` are
 `__attribute__((cleanup))`, which **works natively in userspace C**.
@@ -232,7 +371,7 @@ neutralise a specific macro when its destructor calls something scxsim cannot
 provide, and say which one in the comment. Blanket-neutralising because
 mitosis did is how you silently disable a scheduler's cleanup paths.
 
-### 3.3 Source patching — assume NOT needed
+### 4.3 Source patching — assume NOT needed
 
 * **cosmos:** needs a `sed`'d `main.bpf.c` (BPF division-by-zero returns 0;
   native C raises SIGFPE) — generated by a rule in `config.mk`.
@@ -242,7 +381,7 @@ Patching is a last resort and a documented divergence. Try unpatched first.
 If you do patch, generate it from the pristine source in `config.mk` (never
 edit the submodule) and comment exactly which BPF-vs-C semantic forced it.
 
-### 3.4 `bpf_for_each(scx_dsq, ...)`
+### 4.4 `bpf_for_each(scx_dsq, ...)`
 
 The iterator uses a `cleanup()` destructor, so macro rewrites are not enough
 — it needs **concrete symbols**. Copy the three-function block
@@ -250,7 +389,7 @@ The iterator uses a `cleanup()` destructor, so macro rewrites are not enough
 
 ---
 
-## 4. Phase 2 — the wrapper
+## 5. Phase 2 — the wrapper
 
 `schedulers/<name>/wrapper.c` + `config.mk`. The Makefile auto-discovers any
 subdirectory containing `wrapper.c`; there is no enum to extend and
@@ -270,7 +409,7 @@ be in effect before the scheduler source is included:
 1. `#include "sim_wrapper.h"`, `"sim_task.h"`
 2. externs (libc, `sim_*` entry points)
 3. `__kconfig` globals the scheduler declares (`CONFIG_HZ`, …)
-4. **helper macro overrides** (§2 warning box)
+4. **helper macro overrides** (§3 warning box)
 5. map-routing forward declarations + `#undef`/`#define`
 6. timer routing
 7. concrete `bpf_iter_scx_dsq_*`
@@ -312,6 +451,26 @@ int <name>_init(void) {
 }
 ```
 
+### Config globals: prefer DISABLING to ENABLING
+
+Set from a `<sched>_setup()` the engine calls before `<sched>_init()`.
+
+> Prefer *disabling* what the engine cannot model (`no_freq_scaling = true`)
+> over *enabling* a feature it cannot really support.
+
+Enabling one means the scheduler's genuine "feature off" path never runs, and
+whatever the substrate feeds it is a fabricated input. That is precisely how
+the cosmos PMU violation in §0 came about: `perf_config = 1` forced the
+PMU-enabled branch, so the honest no-PMU path became unreachable.
+`lavd/wrapper.c` is the model to copy — it *declares* its limits
+(`is_smt_active = false`, `nr_llcs = 1`) instead of hiding them.
+
+### Keep `sim_wrapper.h` authoritative
+
+Anything every scheduler needs belongs there, not copy-pasted per wrapper.
+Three wrappers answering the same question three different ways is what made
+the Aug 2026 capability confusion possible in the first place.
+
 ### Add read-only probes
 
 Export `<name>_probe_*` functions reading real scheduler state
@@ -325,7 +484,7 @@ a test instead of silently mis-configuring everything.
 
 ---
 
-## 5. Phase 3 — Rust side
+## 6. Phase 3 — Rust side
 
 * `unsafe_impl/ffi.rs`: `DynamicScheduler::<name>(nr_cpus)` plus
   topology/config constructors. Optional ops resolve via `try_get!`, so a
@@ -375,7 +534,7 @@ start (or it matches doc-comment mentions) and give it a self-test.
 
 ---
 
-## 6. Phase 4 — tests, and the proof standard
+## 7. Phase 4 — tests, and the proof standard
 
 > **A passing test that would pass anyway proves nothing.**
 
@@ -419,7 +578,7 @@ Add the scheduler to the cross-scheduler suites (`determinism`,
 
 ---
 
-## 7. Phase 5 — report honestly, in tiers
+## 8. Phase 5 — report honestly, in tiers
 
 Use the tier framing and **do not inflate**:
 
@@ -452,12 +611,12 @@ report trustworthy.
 
 ---
 
-## 8. Trap catalogue
+## 9. Trap catalogue
 
-1. **`bpf_helper_defs.h` helpers link cleanly and SIGSEGV when called.** §2.
-2. **`bpf_ksym_exists()` must not be forced reflexively.** §3.1.
+1. **`bpf_helper_defs.h` helpers link cleanly and SIGSEGV when called.** §3.
+2. **Never fake `bpf_ksym_exists` — provide the symbol instead.** §4.1.
 3. **Static arrays back the maps deliberately** — `reallocarray()` dangles
-   held pointers. §4.
+   held pointers. §5.
 4. **A huge `struct` in BSS must never be wholesale `memset`.**
    layered's `layers[]` is ~165 MB; clear only the scalar tail.
 5. **Probe structs hold raw fn pointers into the `.so`.** Keep the
@@ -482,7 +641,7 @@ report trustworthy.
 
 ---
 
-## 9. Portability: you do NOT need a build-time fetch
+## 10. Portability: you do NOT need a build-time fetch
 
 Everything required to shim an scx scheduler is already vendored:
 
@@ -511,12 +670,38 @@ submodule bump will silently reuse a stale `.so`.
 
 ---
 
-## 10. Definition of done
+## 11. Commit discipline — this failed twice in one day
+
+Two agents were each found holding substantial, finished-or-nearly-finished
+work **uncommitted** in their worktrees: one with ~499 lines of Tier-3
+implementation, one with a three-file P0 No-Stub fix. Neither was careless.
+Both were waiting for the work to feel "finished", and "finished" kept
+receding.
+
+Uncommitted work in a worktree is **the highest loss-risk state in this
+setup**. A worktree cleanup or machine loss destroys it with no recovery, and
+— worse — a branch-level inventory cannot even see it, so nobody knows it is
+at risk. Committed work on a branch survives worktree removal, because refs
+and objects live in the shared git dir.
+
+> **RULE: commit early and often on your own branch. WIP messages are fine.
+> Commit BEFORE any long-running measurement or build.**
+>
+> Committing is not a claim that the work is done — *pushing* and *closing*
+> are. It costs nothing and has already nearly cost us twice.
+
+**Corollary for the orchestrator, stated here so agents can hold them to it:**
+do not leave an agent running for long stretches without asking whether
+anything is uncommitted.
+
+---
+
+## 12. Definition of done
 
 - [ ] Compile spike run; gap list recorded before any wrapper was written.
 - [ ] Every `bpf_*` helper the scheduler calls is accounted for **by grep**,
       not only by `nm -u`.
-- [ ] Each §3 decision made deliberately, with the reasoning in a comment.
+- [ ] Each §4 decision made deliberately, with the reasoning in a comment.
 - [ ] No invented values anywhere; real libraries compiled in, not shimmed.
 - [ ] Tests use `.detect_bpf_errors()`; each behavioural claim has a negative
       control or sabotage proof.
@@ -528,3 +713,40 @@ submodule bump will silently reuse a stale `.so`.
 - [ ] Beads filed for every divergence and substrate gap.
 - [ ] Worktree clean; no scx pin committed; nothing depends on uncommitted
       state.
+- [ ] Nothing of value left uncommitted at any pause point (§11).
+- [ ] Every claim about a compat branch confirmed from the binary (§3.1), not
+      from the `#define` that was supposed to produce it.
+
+---
+
+## Provenance
+
+Reconciled from two independently written versions (the coordinator
+commissioned the skill twice; the second author correctly found no existing
+file because the first lived on an unlanded branch).
+
+**From the process/traps version** (written by the agent that shim-ified
+`scx_layered` end to end): the No-Stub Rule leading §0 with the forbidden
+shapes ranked by how convincing they look and both category-1 failures written
+as recognisable shapes; the compile spike as the highest-leverage first step;
+the `bpf_helper_defs.h` raw-helper-number trap; the per-scheduler decision
+table (RAII, source patching, DSQ iterators); the wrapper/Rust/test/reporting
+phases; the proof standard (negative control and sabotage); the tier framing;
+the 11-entry trap catalogue; the portability finding.
+
+**From the capability version:** §2 in its entirety — the include-order
+mechanic, `common.bpf.h:1143`, and the inline-function-vs-macro table that
+explains why a wrapper override often changes nothing; §3.1 in its entirety —
+the `GLOB_DAT` vs `JUMP_SLOT` relocation method, the disassembly signature of
+a genuine test, the `nm --undefined-only` gotcha, and the before/after
+relocation diff; the §4.1 rule *provide the symbol, do not fake the test* with
+cosmos's `scx_bpf_cpu_node()` as the worked example and the ~31-symbol
+blast-radius argument; the config-globals prefer-disabling rule; and
+`sim_wrapper.h` authoritative.
+
+Corrected during reconciliation: the claim that six wrappers are in the tree —
+there are **five**, with `layered` on an unlanded branch. Verified against
+`integration`. The two versions' `bpf_ksym_exists` guidance also disagreed in
+emphasis; the capability version's rule is stronger and now leads, with the
+per-wrapper table retained as historical reading rather than as a
+recommendation.
