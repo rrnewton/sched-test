@@ -1094,7 +1094,7 @@ impl RandResources {
             }
         };
 
-        let max_cpu = constraints.num_cpus.saturating_sub(1).max(0);
+        let max_cpu = constraints.num_cpus.saturating_sub(1);
         let max_memory = constraints.total_memory_bytes;
 
         let mut resources = Resources::default();
