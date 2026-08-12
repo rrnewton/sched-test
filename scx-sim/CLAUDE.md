@@ -558,8 +558,25 @@ task. The flow is:
 
     work -> commit as you go -> rename off `agent/*` -> push (origin AND
     mirror) -> open PR against `integration` -> (optional reviewer-agent
-    pass) -> LAND IT
+    pass) -> LAND IT -> PUSH THE MIRROR AGAIN
 
+- **AFTER MERGING A PR, PUSH THE MIRROR EXPLICITLY.** This is the step the
+  flow above hides, and it catches everyone exactly once. Merging on GitHub
+  writes the merge commit to **origin only** — `rrnewton/sched-test` is not a
+  GitHub-native mirror, so nothing propagates. Lockstep is automatic for your
+  *branch* pushes and NOT automatic for the *merge*. The moment your PR goes
+  green-and-merged, `mirror/integration` is behind by exactly your merge
+  commit, and nothing tells you:
+
+      with-proxy git fetch origin integration
+      with-proxy git push mirror FETCH_HEAD:refs/heads/integration
+      # then prove it, do not assume it:
+      for r in origin mirror; do \
+        echo "$r $(with-proxy git ls-remote $r refs/heads/integration | awk '{print $1}')"; done
+
+  Observed 2026-08-12 on PR #69: origin `841a3c8`, mirror still `80f9d78`
+  immediately after the merge. Found only because the SHAs were compared;
+  "I pushed both remotes earlier" was true and irrelevant.
 - **OWN YOUR PR UNTIL IT LANDS.** Do not hand back a branch and walk away.
 - **NEVER LEAVE UNCOMMITTED CHANGES LOCALLY.** Commit as you go; WIP messages
   are fine. Committing is not a claim that the work is done.
