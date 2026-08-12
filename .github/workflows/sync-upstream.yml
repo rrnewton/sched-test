@@ -19,19 +19,38 @@ on:
 permissions:
   contents: read
 
-# Default source branch for the sync. Change this when the simulator
-# lands on main (or use the workflow_dispatch input to override).
+# Default source branch for the sync. sched-test is all-INTEGRATION: the
+# development tip is `integration`, not `main`. Override per-run with the
+# workflow_dispatch `source_branch` input.
 env:
-  DEFAULT_SOURCE_BRANCH: simulator.v3
-  SUCCESS_BRANCH: simulator-next
+  DEFAULT_SOURCE_BRANCH: integration
+  SUCCESS_BRANCH: sync-upstream-next
 
 jobs:
   sync-upstream:
     runs-on: ubuntu-latest
+    # Replaces the claude-code-action `timeout_minutes` input, which @v1 rejects.
+    timeout-minutes: 60
     permissions:
       contents: write
 
     steps:
+      - name: Require the Anthropic API key
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "::error::ANTHROPIC_API_KEY is not set on ${{ github.repository }}." \
+                 "This workflow is only supported on facebookexperimental/sched-test," \
+                 "which is the only repo holding the secret. If this fired on the" \
+                 "rrnewton/sched-test mirror, the workflow should be disabled there" \
+                 "rather than given a key." \
+                 "Symptom when unguarded: claude-code-action falls back to OIDC and dies with" \
+                 "'Could not fetch an OIDC token ... add id-token: write', which misleadingly" \
+                 "looks like a permissions bug rather than a missing secret."
+            exit 1
+          fi
+
       - name: Determine source branch
         id: config
         run: |
@@ -85,9 +104,32 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b $WORK_BRANCH
 
-          # Update submodule to latest upstream main
+          # Update the submodule to upstream main, REPLAYING any local commits
+          # carried on the pin. The pin is routinely NOT an ancestor of upstream
+          # (e.g. `lib/cgroup_bw: add scxsim targeted yield hooks`); a bare
+          # `git checkout origin/main` here silently discards those commits.
           cd scx
-          git checkout origin/main
+          PIN=$(git rev-parse HEAD)
+          if git merge-base --is-ancestor "$PIN" origin/main; then
+            echo "::notice::scx pin is an ancestor of upstream main; fast-forwarding."
+            git checkout --detach origin/main
+          else
+            LOCAL=$(git rev-list --count origin/main.."$PIN")
+            echo "::notice::scx pin carries $LOCAL local commit(s); rebasing onto upstream main."
+            git log --oneline origin/main.."$PIN"
+            git checkout --detach "$PIN"
+            if ! git rebase --onto origin/main $(git merge-base "$PIN" origin/main) "$PIN"; then
+              git rebase --abort || true
+              echo "::error::Local scx commits do not rebase cleanly onto upstream main." \
+                   "Refusing to drop them. Resolve this submodule pin by hand."
+              exit 1
+            fi
+            REPLAYED=$(git rev-list --count origin/main..HEAD)
+            if [ "$REPLAYED" -ne "$LOCAL" ]; then
+              echo "::error::Expected $LOCAL local commit(s) after rebase, found $REPLAYED. Refusing to proceed."
+              exit 1
+            fi
+          fi
           cd ..
           git add scx
           git commit -m "$(cat <<EOF
@@ -150,8 +192,7 @@ jobs:
 
             Follow the skill instructions completely: analyze changes, fix builds,
             run validate.sh, and report your final status.
-          max_turns: 100
-          timeout_minutes: 60
+          claude_args: "--max-turns 100"
 
       - name: Push and handle result
         if: steps.check.outputs.has_changes == 'true'
