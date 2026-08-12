@@ -14,6 +14,9 @@
 # --- Paths (overridable by build.rs) ---
 SIMULATOR_DIR ?= ..
 ROOT_DIR      ?= $(SIMULATOR_DIR)/..
+# C substrate vendored into the scx_simulator crate (build.rs overrides these).
+CSRC_DIR      ?= $(SIMULATOR_DIR)/crates/scx_simulator/csrc
+SCXTEST_DIR   ?= $(SIMULATOR_DIR)/crates/scx_simulator/scxtest
 BUILD_DIR     ?= build
 
 # CC defaults to 'cc' (gcc) in Make, but this code requires clang.
@@ -156,8 +159,17 @@ CFLAGS += $(CFLAGS_BPF_API)
 # do not change behavior.
 CFLAGS += -DSCXSIM_PHASE2_REAL_CGROUP_BW=1
 
-INCLUDES := -I$(SIMULATOR_DIR)/csrc \
-            -I$(ROOT_DIR)/lib/scxtest \
+# Per-scheduler wrapper.c files include scx library sources via relative paths
+# like "../../scx/lib/ravg.bpf.c" that anchor on the schedulers/ directory (two
+# real levels above the scx submodule: schedulers -> scx-sim -> repo-root/scx).
+# -I$(SIMULATOR_DIR)/schedulers makes that resolve. (Previously this anchored on
+# scx-sim/csrc, before csrc moved into the scx_simulator crate; scheds/include
+# cannot substitute because it is a symlink into the submodule, so `../../`
+# traverses the target.) A future generic wrapper generation replaces these
+# fragile relative includes with a stable -I.
+INCLUDES := -I$(CSRC_DIR) \
+            -I$(SCXTEST_DIR) \
+            -I$(SIMULATOR_DIR)/schedulers \
             -I$(ROOT_DIR)/scheds/include \
             -I$(ROOT_DIR)/scheds/include/lib \
             -I$(ROOT_DIR)/scheds/vmlinux \
@@ -171,9 +183,9 @@ INCLUDES := -I$(SIMULATOR_DIR)/csrc \
 # the SDT hash table state, allowing sim_sdt_reset() to work correctly.
 # overrides.c is included to provide weak stubs that the linker can use
 # if the main binary's strong definitions aren't found (they should be).
-SHARED_SRCS := $(SIMULATOR_DIR)/csrc/sim_bpf_stubs.c \
-               $(SIMULATOR_DIR)/csrc/sim_sigfpe.c \
-               $(ROOT_DIR)/lib/scxtest/overrides.c
+SHARED_SRCS := $(CSRC_DIR)/sim_bpf_stubs.c \
+               $(CSRC_DIR)/sim_sigfpe.c \
+               $(SCXTEST_DIR)/overrides.c
 
 # --- Per-scheduler config ---
 # Each scheduler can define EXTRA_CFLAGS_<name> and EXTRA_INCLUDES_<name>
@@ -217,7 +229,7 @@ endef
 
 # Per-scheduler sim_bpf_stubs.c -> <name>_sim_bpf_stubs.o
 define STUBS_RULE
-$(BUILD_DIR)/$(1)_sim_bpf_stubs.o: $(SIMULATOR_DIR)/csrc/sim_bpf_stubs.c | $(BUILD_DIR)
+$(BUILD_DIR)/$(1)_sim_bpf_stubs.o: $(CSRC_DIR)/sim_bpf_stubs.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(INCLUDES) $(EXTRA_INCLUDES_$(1)) $(EXTRA_CFLAGS_$(1)) \
 		-MMD -MF $(BUILD_DIR)/$(1)_sim_bpf_stubs.d \
 		-c -o $$@ $$<
@@ -230,7 +242,7 @@ endef
 # instruction layout around div, causing the handler to miscalculate lengths
 # and jump to invalid addresses.
 define SIGFPE_RULE
-$(BUILD_DIR)/$(1)_sim_sigfpe.o: $(SIMULATOR_DIR)/csrc/sim_sigfpe.c | $(BUILD_DIR)
+$(BUILD_DIR)/$(1)_sim_sigfpe.o: $(CSRC_DIR)/sim_sigfpe.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS_BASE) \
 		-MMD -MF $(BUILD_DIR)/$(1)_sim_sigfpe.d \
 		-c -o $$@ $$<
@@ -238,7 +250,7 @@ endef
 
 # Per-scheduler overrides.c -> <name>_overrides.o
 define OVERRIDES_RULE
-$(BUILD_DIR)/$(1)_overrides.o: $(ROOT_DIR)/lib/scxtest/overrides.c | $(BUILD_DIR)
+$(BUILD_DIR)/$(1)_overrides.o: $(SCXTEST_DIR)/overrides.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) $(INCLUDES) $(EXTRA_INCLUDES_$(1)) $(EXTRA_CFLAGS_$(1)) \
 		-MMD -MF $(BUILD_DIR)/$(1)_overrides.d \
 		-c -o $$@ $$<
@@ -249,7 +261,7 @@ endef
 # NOTE: compiled WITHOUT coverage flags — the trampoline is called on every
 # instrumented Jcc and must have minimal overhead.
 define RBC_TRAMPOLINE_RULE
-$(BUILD_DIR)/$(1)_sim_rbc_trampoline.o: $(SIMULATOR_DIR)/csrc/sim_rbc_trampoline.c | $(BUILD_DIR)
+$(BUILD_DIR)/$(1)_sim_rbc_trampoline.o: $(CSRC_DIR)/sim_rbc_trampoline.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS_BASE) \
 		-MMD -MF $(BUILD_DIR)/$(1)_sim_rbc_trampoline.d \
 		-c -o $$@ $$<
@@ -261,7 +273,7 @@ endef
 # NOTE: compiled WITHOUT $(INCLUDES) to avoid vmlinux.h conflicts.
 # NOTE: compiled WITHOUT coverage flags — these are hot-path memory ops.
 define DETERMINISTIC_MEM_RULE
-$(BUILD_DIR)/$(1)_sim_deterministic_mem.o: $(SIMULATOR_DIR)/csrc/sim_deterministic_mem.c | $(BUILD_DIR)
+$(BUILD_DIR)/$(1)_sim_deterministic_mem.o: $(CSRC_DIR)/sim_deterministic_mem.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS_BASE) \
 		-MMD -MF $(BUILD_DIR)/$(1)_sim_deterministic_mem.d \
 		-c -o $$@ $$<
@@ -309,9 +321,9 @@ $(foreach s,$(SCHEDS),$(eval $(call SO_RULE,$(s))))
 # Usage: make e9  (requires e9tool; builds _e9.so for all schedulers)
 
 E9COMPILE ?= $(SIMULATOR_DIR)/third_party/e9patch/e9compile.sh
-E9_TRAMPOLINE_SRC := $(SIMULATOR_DIR)/csrc/e9_rbc_trampoline.c
+E9_TRAMPOLINE_SRC := $(CSRC_DIR)/e9_rbc_trampoline.c
 E9_TRAMPOLINE_BIN := $(BUILD_DIR)/e9_rbc_trampoline
-E9_RIP_TRAMPOLINE_SRC := $(SIMULATOR_DIR)/csrc/e9_rip_trampoline.c
+E9_RIP_TRAMPOLINE_SRC := $(CSRC_DIR)/e9_rip_trampoline.c
 E9_RIP_TRAMPOLINE_BIN := $(BUILD_DIR)/e9_rip_trampoline
 
 # Build the trampoline binary using e9compile.sh (must run from e9patch dir

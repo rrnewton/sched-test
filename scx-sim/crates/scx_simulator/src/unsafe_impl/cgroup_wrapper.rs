@@ -354,6 +354,9 @@ impl CssIterGuard {
     /// Useful when only the root itself should appear in the iteration.
     /// Both pre-order and post-order buffers are populated identically
     /// (single-element traversal is the same in either order).
+    // Exercised by this module's tests; a single-root CSS-iter constructor kept
+    // alongside `prepare` for completeness.
+    #[allow(dead_code)]
     pub fn prepare_single(root: CgroupPtr) -> Self {
         Self::prepare(root, &[root], &[root])
     }

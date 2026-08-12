@@ -53,7 +53,7 @@ mod common;
 
 /// Build the same tiny scenario both tests use, run the simulator,
 /// return the trace.
-fn build_smoke_trace() -> trace::Trace {
+fn build_smoke_trace() -> Trace {
     let scenario = Scenario::builder()
         .cpus(2)
         .instant_timing()
@@ -318,7 +318,7 @@ fn test_perfetto_pb_ingestible_by_trace_processor() {
     let expected_oncpu_slices = trace
         .events()
         .iter()
-        .filter(|e| matches!(e.kind, trace::TraceKind::TaskScheduled { .. }))
+        .filter(|e| matches!(e.kind, TraceKind::TaskScheduled { .. }))
         .count();
     assert!(
         expected_oncpu_slices > 0,

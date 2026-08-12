@@ -1,0 +1,9 @@
+[package]
+name = "scxsim-build"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Build-time scheduler .so compilation plus the declarative per-scheduler manifest, shared by scx_simulator's build script and embedders."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }

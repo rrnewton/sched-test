@@ -9,11 +9,10 @@
  * BPF schedulers declare globals as "const volatile" (patched by the
  * BPF loader). Stripping const makes them writable from Rust.
  *
- * Map strategy: BPF ARRAY maps pre-allocate all entries (zeroed).
- * The scx_test_map infrastructure uses sparse dynamic storage with a
- * void** indexing bug for values > 8 bytes. We bypass it entirely
- * by using static arrays for all ARRAY/PERCPU_ARRAY maps and a
- * PID-indexed array for task storage.
+ * Map strategy: all maps use the generic scx_test_map registry
+ * (mitosis_register_maps): ARRAY / PERCPU_ARRAY maps are registered and
+ * pre-seeded so per-index lookups always hit; TASK_STORAGE / CGRP_STORAGE
+ * use the registry's object-identity-keyed, per-slot-stable storage.
  */
 #include "sim_wrapper.h"
 #include "sim_task.h"
@@ -25,156 +24,28 @@ extern void *memset(void *s, int c, unsigned long n);
  * Macro overrides (defined after sim_wrapper.h, before mitosis.bpf.c)
  * ---------------------------------------------------------------------------*/
 
-/*
- * Force scx_bpf_select_cpu_dfl fallback -- avoids needing
- * scx_bpf_select_cpu_and which isn't implemented in the simulator.
- */
-#undef bpf_ksym_exists
-#define bpf_ksym_exists(sym) (0)
-
-/*
- * The simulator always calls select_cpu before enqueue, so the
- * CPU is always selected.
- */
-#undef __COMPAT_is_enq_cpu_selected
-#define __COMPAT_is_enq_cpu_selected(enq_flags) (true)
-
-/*
- * __COMPAT_scx_bpf_dsq_peek -- route directly to the simulator's export.
- * This avoids taking the ksym-probing path when the scheduler asks for
- * lockless DSQ peek support.
- */
-extern struct task_struct *scx_bpf_dsq_peek(u64 dsq_id);
-#define __COMPAT_scx_bpf_dsq_peek(dsq_id) scx_bpf_dsq_peek(dsq_id)
-
-/*
- * bpf_iter_scx_dsq_*: bpf_for_each(scx_dsq, ...) uses a cleanup() destructor,
- * so mitosis needs concrete function symbols, not just macro rewrites.
- */
-extern void *sim_dsq_iter_begin(u64 dsq_id, u64 flags);
-extern void *sim_dsq_iter_next(void);
-
-#undef bpf_iter_scx_dsq_new
-int bpf_iter_scx_dsq_new(struct bpf_iter_scx_dsq *it, u64 dsq_id, u64 flags)
-{
-	u64 *opaque = (u64 *)it;
-
-	opaque[0] = (u64)(unsigned long)sim_dsq_iter_begin(dsq_id, flags);
-	opaque[1] = 1;
-	return 0;
-}
-
-#undef bpf_iter_scx_dsq_next
-struct task_struct *bpf_iter_scx_dsq_next(struct bpf_iter_scx_dsq *it)
-{
-	u64 *opaque = (u64 *)it;
-
-	if (opaque[1]) {
-		opaque[1] = 0;
-		return (struct task_struct *)(unsigned long)opaque[0];
-	}
-
-	return (struct task_struct *)sim_dsq_iter_next();
-}
-
-#undef bpf_iter_scx_dsq_destroy
-void bpf_iter_scx_dsq_destroy(struct bpf_iter_scx_dsq *it)
-{
-	while (bpf_iter_scx_dsq_next(it))
-		;
-}
-
-/*
- * is_migration_disabled: use the simulator's task_struct accessor.
- *
- * The kernel's is_migration_disabled() checks p->migration_disabled with
- * special handling for migration_disabled == 1 (ambiguous because BPF
- * prolog increments it). In the simulator, we use a simpler check:
- * migration_disabled > 0 means disabled.
- */
-extern unsigned short sim_task_get_migration_disabled(struct task_struct *p);
-#undef is_migration_disabled
-#define is_migration_disabled(p) (sim_task_get_migration_disabled(p) > 0)
-
 /* ---------------------------------------------------------------------------
- * Per-CPU context override
+ * Map access: all 8 mitosis maps use the generic scx_test_map registry.
  *
- * Route bpf_map_lookup_percpu_elem to a static cpu_ctx array.
- * Forward-declared here; defined after the scheduler source since
- * struct cpu_ctx is defined there.
- * ---------------------------------------------------------------------------*/
-static struct cpu_ctx *mitosis_lookup_percpu_elem(int cpu);
-#undef bpf_map_lookup_percpu_elem
-#define bpf_map_lookup_percpu_elem(map, key, cpu) mitosis_lookup_percpu_elem(cpu)
-
-/* ---------------------------------------------------------------------------
- * bpf_map_lookup_elem override
- *
- * Routes all ARRAY map lookups to static arrays, bypassing the
- * scx_test_map infrastructure entirely. This avoids a void** stride
- * bug in scx_test_map_lookup_elem for values > 8 bytes.
- * ---------------------------------------------------------------------------*/
-static void *mitosis_map_lookup_elem(void *map, const void *key);
-#undef bpf_map_lookup_elem
-#define bpf_map_lookup_elem(map, key) mitosis_map_lookup_elem(map, key)
-
-/* ---------------------------------------------------------------------------
- * Task storage override
- *
- * Override bpf_task_storage_get to use a PID-indexed static array
- * instead of the scx_test_map infrastructure.
- * ---------------------------------------------------------------------------*/
-static void *mitosis_task_storage_get(void *map, void *task, void *value,
-				      unsigned long flags);
-#undef bpf_task_storage_get
-#define bpf_task_storage_get(map, task, value, flags) \
-	mitosis_task_storage_get(map, task, value, flags)
-
-/* ---------------------------------------------------------------------------
- * Cgroup storage override
- *
- * bpf_cgroup_from_id, bpf_cgroup_ancestor, and scx_bpf_task_cgroup are
- * now handled by the simulator's general kfuncs. Only per-cgroup local
- * storage needs a scheduler-specific override.
+ * bpf_map_lookup_elem / bpf_map_lookup_percpu_elem / bpf_task_storage_get /
+ * bpf_cgrp_storage_get resolve to the scx_test_map.h macros (the latter two
+ * are object-identity keyed). The maps are registered + the ARRAY/PERCPU
+ * ones pre-seeded in mitosis_register_maps() below, called from mitosis_setup
+ * before mitosis_init. The former bespoke static-array overrides (a PID-indexed
+ * task array, per-map static ARRAY buffers, a cgroup-pointer scan) are gone --
+ * the generic registry now provides per-index ARRAY storage, current-CPU PERCPU
+ * resolution, and pointer-identity + per-slot-stable task/cgroup storage.
  * ---------------------------------------------------------------------------*/
 
-/*
- * bpf_cgrp_storage_get: per-cgroup local storage.
- * Not overridden by scx_test_map.h, so we provide our own
- * implementation keyed by cgroup pointer.
- */
-static void *mitosis_cgrp_storage_get(void *map, void *cgrp, void *value,
-				      unsigned long flags);
-#undef bpf_cgrp_storage_get
-#define bpf_cgrp_storage_get(map, cgrp, value, flags) \
-	mitosis_cgrp_storage_get(map, cgrp, value, flags)
-
 /* ---------------------------------------------------------------------------
- * BPF timer overrides
- *
- * bpf_timer_set_callback stores the callback pointer.
- * bpf_timer_start calls sim_timer_start() (Rust kfunc) to schedule
- * a TimerFired event in the simulator's event queue.
- * mitosis_fire_timer() invokes the stored callback from the engine.
+ * BPF timer overrides: the generic slot-table in csrc/sim_timer.h. Mitosis is
+ * a single-timer scheduler, so its one timer lands in slot 0 (first-fit) --
+ * behavior-identical to the former slot-less sim_timer_start (which is
+ * sim_timer_start_slot(0, ...)). mitosis_fire_timer (below) forwards the
+ * engine's TimerFired to the generic scxsim_fire_timer. Must follow
+ * sim_wrapper.h (for struct bpf_timer + the bpf_timer_* helper macros).
  * ---------------------------------------------------------------------------*/
-static int (*mitosis_timer_cb)(void *, int *, struct bpf_timer *);
-static struct bpf_timer *mitosis_timer_ptr;
-static void *mitosis_timer_map;
-
-extern void sim_timer_start(unsigned long long nsecs);
-
-#undef bpf_timer_init
-#define bpf_timer_init(timer, map, flags) \
-	(mitosis_timer_map = (void *)(map), 0)
-
-#undef bpf_timer_set_callback
-#define bpf_timer_set_callback(timer, cb) \
-	(mitosis_timer_cb = (typeof(mitosis_timer_cb))(cb), \
-	 mitosis_timer_ptr = (struct bpf_timer *)(timer), 0)
-
-#undef bpf_timer_start
-#define bpf_timer_start(timer, nsecs, flags) \
-	(sim_timer_start(nsecs), 0)
+#include "sim_timer.h"
 
 /* ---------------------------------------------------------------------------
  * RAII cleanup neutralization
@@ -192,16 +63,6 @@ extern void sim_timer_start(unsigned long long nsecs);
  * override them with our neutralized versions.
  * ---------------------------------------------------------------------------*/
 
-/*
- * RCU read lock stubs - must be defined before cleanup.bpf.h since it
- * references them. The simulator doesn't have real RCU.
- */
-#undef bpf_rcu_read_lock
-#define bpf_rcu_read_lock() ((void)0)
-
-#undef bpf_rcu_read_unlock
-#define bpf_rcu_read_unlock() ((void)0)
-
 /* Include cleanup.bpf.h to let it define its RAII framework first.
  * Upstream moved cleanup.bpf.h from scx_mitosis/src/bpf/ to
  * scheds/include/lib/. Use angle-bracket include to find it via
@@ -218,24 +79,11 @@ extern void sim_timer_start(unsigned long long nsecs);
 #undef no_free_ptr
 #define no_free_ptr(p) (p)
 
-/* bpf_kptr_xchg: atomically exchange pointer, return old value */
-static inline void *sim_kptr_xchg(void **kptr, void *new_val) {
-	void *old = *kptr;
-	*kptr = new_val;
-	return old;
-}
-#undef bpf_kptr_xchg
-#define bpf_kptr_xchg(kptr, val) sim_kptr_xchg((void **)(kptr), (void *)(val))
-
-/* Cgroup acquire/release - simulator doesn't do reference counting */
-static inline struct cgroup *sim_cgroup_acquire(struct cgroup *cgrp) {
-	return cgrp;
-}
-#undef bpf_cgroup_acquire
-#define bpf_cgroup_acquire(cgrp) sim_cgroup_acquire(cgrp)
-
-#undef bpf_cgroup_release
-#define bpf_cgroup_release(cgrp) ((void)0)
+/*
+ * Cgroup acquire/release (no reference counting in the sim) are the generic
+ * weak stubs in csrc/sim_bpf_stubs.c (acquire=identity, release=no-op),
+ * shared by every .so. No per-scheduler override needed here.
+ */
 
 /*
  * bpf_iter_css_*: the simulator's compare tests only exercise the root
@@ -289,163 +137,42 @@ void bpf_iter_css_destroy(struct bpf_iter_css *it)
  * ---------------------------------------------------------------------------*/
 
 /*
- * Static arrays for all maps.
+ * Map registration.
  *
- * BPF ARRAY maps pre-allocate all entries (zeroed at map creation).
- * We model this with static BSS arrays, which are zero-initialized
- * by the C runtime. The mitosis_setup() function re-zeroes them
- * so the scheduler can be re-loaded within the same process.
+ * Register every mitosis BPF map with the generic scx_test_map registry and
+ * pre-seed the ARRAY / PERCPU_ARRAY maps. The kernel pre-allocates ARRAY
+ * entries (zeroed); mitosis's lookups scx_bpf_error() on a NULL miss, so the
+ * full key range must exist up front. TASK_STORAGE / CGRP_STORAGE are
+ * create-on-demand, keyed by object identity (the pointer-identity +
+ * per-slot-stable storage backend). Called from mitosis_setup() before
+ * mitosis_init(); scx_test_map_clear_all() gives clean state on re-load.
  */
 #define MAX_SIM_CPUS 128
-#define MAX_SIM_TASKS 4096
 
-/* cpu_ctxs: PERCPU_ARRAY, 1 entry per CPU */
-static struct cpu_ctx percpu_ctx[MAX_SIM_CPUS];
-
-/* cell_cpumasks: ARRAY, MAX_CELLS entries */
-static struct cell_cpumask_wrapper cell_cpumasks_arr[MAX_CELLS];
-
-/* cells: ARRAY, MAX_CELLS entries */
-static struct cell cells_arr[MAX_CELLS];
-
-/* debug_events: ARRAY, DEBUG_EVENTS_BUF_SIZE entries */
-static struct debug_event debug_events_arr[DEBUG_EVENTS_BUF_SIZE];
-
-/*
- * NOTE: upstream commits 0f579b78 ("delete legacy BPF cell allocator") and
- * b62f1bae ("make userspace the only cell-control path") removed the
- * `update_timer` ARRAY map and the `cgrp_init_percpu_cpumask` PERCPU_ARRAY
- * map (plus struct update_timer / cpumask_entry / MAX_CPUMASK_ENTRIES).
- * Their static mirrors and map-lookup routing were removed here to match.
- */
-
-/* task_ctxs: TASK_STORAGE, indexed by PID */
-static struct task_ctx task_ctx_arr[MAX_SIM_TASKS];
-static bool task_ctx_in_use[MAX_SIM_TASKS];
-
-/* ---------------------------------------------------------------------------
- * Per-CPU context lookup
- * ---------------------------------------------------------------------------*/
-
-static struct cpu_ctx *mitosis_lookup_percpu_elem(int cpu)
+static void mitosis_register_maps(void)
 {
-	if (cpu < 0 || cpu >= MAX_SIM_CPUS)
-		return NULL;
-	return &percpu_ctx[cpu];
-}
+	scx_test_map_clear_all();
 
-/* ---------------------------------------------------------------------------
- * Map lookup: route each map to its static array
- * ---------------------------------------------------------------------------*/
+	/* ARRAY maps: register + pre-seed [0..max_entries) with zeroed values. */
+	SCX_REGISTER_ARRAY(debug_events, true);
+	SCX_REGISTER_ARRAY(cells, true);
+	SCX_REGISTER_ARRAY(cell_cpumasks, true);
 
-static void *mitosis_map_lookup_elem(void *map, const void *key)
-{
-	u32 idx = *(const u32 *)key;
+	/* PERCPU_ARRAY maps: per-CPU storage + pre-seed every key on every CPU. */
+	SCX_REGISTER_PERCPU(cpu_ctxs, true);
 
-	if (map == &cpu_ctxs) {
-		int cpu = sim_bpf_get_smp_processor_id();
-		if (cpu < 0 || cpu >= MAX_SIM_CPUS)
-			return NULL;
-		return &percpu_ctx[cpu];
-	}
-	if (map == &cell_cpumasks) {
-		if (idx >= MAX_CELLS)
-			return NULL;
-		return &cell_cpumasks_arr[idx];
-	}
-	if (map == &cells) {
-		if (idx >= MAX_CELLS)
-			return NULL;
-		return &cells_arr[idx];
-	}
-	if (map == &debug_events) {
-		if (idx >= DEBUG_EVENTS_BUF_SIZE)
-			return NULL;
-		return &debug_events_arr[idx];
-	}
-	/* Unknown map -- should not happen */
-	return NULL;
-}
+	/*
+	 * NOTE: upstream commits 0f579b78 ("delete legacy BPF cell allocator")
+	 * and b62f1bae ("make userspace the only cell-control path") removed the
+	 * `update_timer` ARRAY map and the `cgrp_init_percpu_cpumask`
+	 * PERCPU_ARRAY map (plus struct update_timer / cpumask_entry /
+	 * MAX_CPUMASK_ENTRIES). Their registrations were dropped here to match
+	 * the scx pin; registering them would not compile.
+	 */
 
-/* ---------------------------------------------------------------------------
- * Task storage: PID-indexed static array
- * ---------------------------------------------------------------------------*/
-
-#ifndef BPF_LOCAL_STORAGE_GET_F_CREATE
-#define BPF_LOCAL_STORAGE_GET_F_CREATE (1ULL << 0)
-#endif
-
-static void *mitosis_task_storage_get(void *map, void *task, void *value,
-				      unsigned long flags)
-{
-	struct task_struct *p = (struct task_struct *)task;
-	int pid;
-
-	(void)map;
-	(void)value;
-
-	if (!p)
-		return NULL;
-
-	pid = p->pid;
-	if (pid < 0 || pid >= MAX_SIM_TASKS)
-		return NULL;
-
-	if (task_ctx_in_use[pid])
-		return &task_ctx_arr[pid];
-
-	if (flags & BPF_LOCAL_STORAGE_GET_F_CREATE) {
-		task_ctx_in_use[pid] = true;
-		memset(&task_ctx_arr[pid], 0, sizeof(struct task_ctx));
-		return &task_ctx_arr[pid];
-	}
-
-	return NULL;
-}
-
-/*
- * Cgroup storage: simple array mapping cgroup pointers to cgrp_ctx values.
- * Since we only have the root cgroup, a small array suffices.
- */
-#define MAX_CGRP_STORAGE_ENTRIES 64
-
-struct mitosis_cgrp_storage_entry {
-	void *cgrp;
-	struct cgrp_ctx ctx;
-	bool in_use;
-};
-
-static struct mitosis_cgrp_storage_entry
-	cgrp_storage_entries[MAX_CGRP_STORAGE_ENTRIES];
-
-static void *mitosis_cgrp_storage_get(void *map, void *cgrp, void *value,
-				      unsigned long flags)
-{
-	int i;
-	(void)map;
-	(void)value;
-
-	/* Look up existing entry */
-	for (i = 0; i < MAX_CGRP_STORAGE_ENTRIES; i++) {
-		if (cgrp_storage_entries[i].in_use &&
-		    cgrp_storage_entries[i].cgrp == cgrp)
-			return &cgrp_storage_entries[i].ctx;
-	}
-
-	/* Create if requested */
-	if (flags & BPF_LOCAL_STORAGE_GET_F_CREATE) {
-		for (i = 0; i < MAX_CGRP_STORAGE_ENTRIES; i++) {
-			if (!cgrp_storage_entries[i].in_use) {
-				cgrp_storage_entries[i].in_use = true;
-				cgrp_storage_entries[i].cgrp = cgrp;
-				memset(&cgrp_storage_entries[i].ctx, 0,
-				       sizeof(struct cgrp_ctx));
-				return &cgrp_storage_entries[i].ctx;
-			}
-		}
-	}
-
-	return NULL;
+	/* TASK_STORAGE / CGRP_STORAGE: register; create-on-demand, identity-keyed. */
+	SCX_REGISTER_STORAGE(task_ctxs);
+	SCX_REGISTER_STORAGE(cgrp_ctxs);
 }
 
 /* ---------------------------------------------------------------------------
@@ -462,45 +189,59 @@ static void *mitosis_cgrp_storage_get(void *map, void *cgrp, void *value,
  * ---------------------------------------------------------------------------*/
 void mitosis_fire_timer(unsigned int slot)
 {
-	int key = 0;
-	(void)slot;
-	if (mitosis_timer_cb && mitosis_timer_ptr)
-		mitosis_timer_cb(mitosis_timer_map, &key, mitosis_timer_ptr);
+	/* The Rust engine resolves the per-scheduler "mitosis_fire_timer" symbol;
+	 * forward to the generic dispatcher (csrc/sim_timer.h). */
+	scxsim_fire_timer(slot);
+}
+
+/* ---------------------------------------------------------------------------
+ * mitosis_sum_cstat: host-side test observation of a per-cell stat counter.
+ *
+ * cpu_ctxs is a PERCPU_ARRAY (single key 0); each CPU's struct cpu_ctx holds
+ * u64 cstats[MAX_CELLS][NR_CSTATS] (intf.h). cstat_inc accumulates per (cell,
+ * cpu), so the host-visible total for a stat index is the sum over all cells
+ * and all CPUs. Summing every cell avoids assuming which cell a task lands in.
+ * Lets a test observe e.g. CSTAT_SLICE_SHRINK_* firing, which is not visible in
+ * the event trace (slice_shrink_apply writes p->scx.slice + bumps the counter).
+ * Mirrors the host-context map access the setup seed loop already performs.
+ * ---------------------------------------------------------------------------*/
+u64 mitosis_sum_cstat(u32 idx)
+{
+	const u32 key0 = 0;
+	u64 sum = 0;
+	int cpu;
+	u32 cell;
+
+	if (idx >= NR_CSTATS)
+		return 0;
+	for (cpu = 0; cpu < (int)nr_possible_cpus && cpu < (int)MAX_SIM_CPUS; cpu++) {
+		struct cpu_ctx *cctx =
+			scx_test_map_lookup_percpu_elem(&cpu_ctxs, &key0, cpu);
+		if (!cctx)
+			continue;
+		for (cell = 0; cell < (u32)MAX_CELLS; cell++)
+			sum += cctx->cstats[cell][idx];
+	}
+	return sum;
 }
 
 /* ---------------------------------------------------------------------------
  * Setup function called from Rust before mitosis_init().
  *
- * Sets global variables, populates the all_cpus bitmask, and clears
- * all static map arrays so the scheduler starts with clean state.
+ * Registers + pre-seeds the maps, clears timer state, and populates the
+ * all_cpus bitmask. The config globals are written before run by the manifest
+ * apply_rodata path (scheduler_manifest.rs mitosis.runtime.rodata), not here.
  * ---------------------------------------------------------------------------*/
 void mitosis_setup(unsigned int num_cpus)
 {
 	unsigned int i;
 
-	/* Clear all static map arrays */
-	memset(percpu_ctx, 0, sizeof(percpu_ctx));
-	memset(cell_cpumasks_arr, 0, sizeof(cell_cpumasks_arr));
-	memset(cells_arr, 0, sizeof(cells_arr));
-	memset(debug_events_arr, 0, sizeof(debug_events_arr));
-	memset(task_ctx_arr, 0, sizeof(task_ctx_arr));
-	memset(task_ctx_in_use, 0, sizeof(task_ctx_in_use));
-	memset(cgrp_storage_entries, 0, sizeof(cgrp_storage_entries));
+	/* Register + pre-seed all maps via the generic scx_test_map registry
+	 * (replaces the former static-array zeroing). */
+	mitosis_register_maps();
 
 	/* Clear timer state from previous runs */
-	mitosis_timer_cb = NULL;
-	mitosis_timer_ptr = NULL;
-	mitosis_timer_map = NULL;
-
-	/* Set globals to safe simulator values */
-	nr_possible_cpus = num_cpus;
-	smt_enabled = false;
-	slice_ns = 20000000;   /* 20ms */
-	root_cgid = 1;
-	debug_events_enabled = false;
-	exiting_task_workaround_enabled = false;
-	cpu_controller_disabled = true;
-	reject_multicpu_pinning = false;
+	scxsim_timer_reset();
 
 	/* Populate all_cpus bitmask for each simulated CPU */
 	memset((void *)all_cpus, 0, sizeof(all_cpus));

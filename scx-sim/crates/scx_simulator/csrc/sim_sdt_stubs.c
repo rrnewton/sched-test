@@ -6,7 +6,7 @@
  * we use malloc and a simple hash table keyed by task_struct pointer.
  *
  * These are strong definitions that override the __weak stubs in
- * lib/scxtest/overrides.c.
+ * scxtest/overrides.c (vendored in this crate).
  *
  * This file does NOT include vmlinux.h or BPF headers to avoid type
  * conflicts. It only needs opaque pointers and basic types.

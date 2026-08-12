@@ -93,7 +93,7 @@ pub struct CgroupCpusetChangeEvent {
 }
 
 /// Type of interrupt to simulate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum IrqType {
     /// Hardware interrupt (top half). Sets `bpf_in_hardirq()=true`.
     HardIrq,
@@ -119,7 +119,10 @@ pub struct IrqEvent {
 /// A userspace-lock futex transition the scheduler can observe, as delivered
 /// by the kernel's futex tracepoint/fexit. This is what LAVD's `lock.bpf.c`
 /// keys its lock-holder boosting off of. See `ai_docs/FUTEX_SIM_DESIGN.md`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// serde: mirrors IrqType above. PR #2 made the trace/result types
+// (De)Serialize, and TraceEvent carries a FutexOp, so this enum has to
+// derive them too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum FutexOp {
     /// A contended `futex_wait` returned success — the task acquired the lock.
     /// Delivered to the scheduler as `FUTEX_WAIT` with `ret == 0`, which boosts

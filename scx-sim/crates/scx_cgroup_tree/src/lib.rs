@@ -450,7 +450,7 @@ fn compute_sibling_fractions(tree: &CGroupTreeNode, all_stats: &mut [NodeStats])
         node_to_index.insert(stat.node_id, idx);
     }
 
-    for (_parent_id, child_ids) in parent_map.iter() {
+    for child_ids in parent_map.values() {
         if child_ids.len() <= 1 {
             continue;
         }

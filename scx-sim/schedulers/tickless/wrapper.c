@@ -11,12 +11,16 @@
  */
 #include "sim_wrapper.h"
 #include "sim_task.h"
+#include "sim_kconfig_defaults.h"
 
 /*
  * CONFIG_HZ: __kconfig extern referenced by tickless. In the kernel,
- * this resolves to the HZ config value. Default to 250 for simulation.
+ * this resolves to the HZ config value. Default 250 for simulation; an embedder
+ * overrides via -DSIM_CONFIG_HZ (see sim_kconfig_defaults.h). Reachable only when
+ * tick_freq is 0 (`tick_freq ? : CONFIG_HZ`); the tickless manifest sets
+ * tick_freq=250, so CONFIG_HZ is the fallback.
  */
-unsigned int CONFIG_HZ = 250;
+unsigned int CONFIG_HZ = SIM_CONFIG_HZ;
 
 /* Include tickless interface header, then the scheduler source.
  * common.bpf.h is already included (header guard set), so our
@@ -31,34 +35,25 @@ unsigned int CONFIG_HZ = 250;
  * used by bpf_map_lookup_elem / bpf_task_storage_get. This function
  * should be called before tickless_init().
  */
-static struct scx_test_map task_ctx_map;
-static struct scx_test_map cpu_ctx_map;
-
 void tickless_register_maps(void)
 {
 	scx_test_map_clear_all();
 
-	INIT_SCX_TEST_MAP_FROM_TASK_STORAGE(&task_ctx_map, task_ctx_stor);
-	scx_test_map_register(&task_ctx_map, &task_ctx_stor);
-
-	INIT_SCX_TEST_MAP(&cpu_ctx_map, cpu_ctx_stor);
-	scx_test_map_register(&cpu_ctx_map, &cpu_ctx_stor);
+	SCX_REGISTER_STORAGE(task_ctx_stor);
+	SCX_REGISTER_ARRAY(cpu_ctx_stor, false);
 }
 
 /*
  * Combined setup function called from Rust before tickless_init().
- * Sets global variables, registers maps, and enables CPU 0.
+ * Registers maps and enables CPU 0; the config globals (nr_cpu_ids/smt_enabled/
+ * slice_ns/tick_freq) are written before run by the generic manifest
+ * apply_rodata path (scheduler_manifest.rs tickless.runtime.rodata), not here.
  * struct cpu_arg is defined in intf.h (included above).
  */
 void tickless_setup(unsigned int num_cpus)
 {
 	unsigned int i;
 	struct cpu_arg arg = { .cpu_id = 0 };
-
-	nr_cpu_ids = num_cpus;
-	smt_enabled = false;
-	slice_ns = 20000000;  /* 20ms default slice */
-	tick_freq = 250;
 
 	for (i = 0; i < num_cpus && i < 1024; i++)
 		preferred_cpus[i] = i;

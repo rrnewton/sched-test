@@ -25,7 +25,7 @@ mod common;
 fn for_each_scheduler(
     cpus: u32,
     make_scenario: impl Fn() -> Scenario,
-    check: impl Fn(&trace::Trace, &str),
+    check: impl Fn(&Trace, &str),
 ) {
     for label in ["simple", "lavd", "cosmos"] {
         let sched = match label {
@@ -62,7 +62,7 @@ fn task(name: &str, pid: i32, nice: i8, start_time_ns: TimeNs, behavior: TaskBeh
 }
 
 /// True if the trace contains a `TaskCompleted` event for `pid`.
-fn completed(trace: &trace::Trace, pid: Pid) -> bool {
+fn completed(trace: &Trace, pid: Pid) -> bool {
     trace
         .events()
         .iter()
