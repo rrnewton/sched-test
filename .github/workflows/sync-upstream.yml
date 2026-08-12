@@ -23,8 +23,9 @@ permissions:
 # development tip is `integration`, not `main`. Override per-run with the
 # workflow_dispatch `source_branch` input.
 env:
+  # sched-test is all-INTEGRATION: nothing lands on main (unresolved fbsource
+  # import problems), so the sync bases on and targets `integration`.
   DEFAULT_SOURCE_BRANCH: integration
-  SUCCESS_BRANCH: sync-upstream-next
 
 jobs:
   sync-upstream:
@@ -33,6 +34,7 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: write
+      pull-requests: write   # the success path raises a PR against integration
 
     steps:
       - name: Require the Anthropic API key
@@ -196,22 +198,36 @@ jobs:
 
       - name: Push and handle result
         if: steps.check.outputs.has_changes == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # gh pr create needs this explicitly
         run: |
           # Check if the last commit message indicates success
           LAST_MSG=$(git log -1 --pretty=%B)
 
           if echo "$LAST_MSG" | grep -qi "Status: SUCCESS"; then
-            echo "::notice::Sync successful! Updating ${{ env.SUCCESS_BRANCH }}"
+            echo "::notice::Sync successful! Opening a PR against ${{ steps.config.outputs.source_branch }}"
 
-            # Push work branch for reference
+            # Push the dated work branch and raise a PR. Deliberately NOT a
+            # force-push to a standing branch: the previous shape force-pushed
+            # `simulator-next`, a branch nothing consumes, from `simulator.v3`,
+            # a March-2026 branch nothing consumes -- so even a SUCCESSFUL sync
+            # delivered nowhere. And the target must never be force-pushed
+            # directly: `integration` is the branch every agent lands onto.
+            # A PR is the only shape that both reaches integration and keeps a
+            # human in the loop for a submodule bump that can break the build.
             git push origin $WORK_BRANCH
+            gh pr create \
+              --base "${{ steps.config.outputs.source_branch }}" \
+              --head "$WORK_BRANCH" \
+              --title "scx: sync submodule to upstream ${{ steps.check.outputs.latest_short }}" \
+              --body "Automated nightly sync of the \`scx\` submodule.
 
-            # Update the success branch
-            git branch -f ${{ env.SUCCESS_BRANCH }} HEAD
-            git push origin ${{ env.SUCCESS_BRANCH }} --force
+            Previous: ${{ steps.check.outputs.current_commit }}
+            New:      ${{ steps.check.outputs.latest_commit }}
+            Upstream commits absorbed: ${{ steps.check.outputs.commit_count }}
 
-            # Clean up work branch
-            git push origin --delete $WORK_BRANCH || true
+            Any local commits carried on the pin were rebased onto upstream main and
+            the replayed count verified; the job fails closed rather than dropping them."
           else
             echo "::warning::Sync incomplete or failed."
 
