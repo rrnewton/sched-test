@@ -377,7 +377,7 @@ fn upstream_linear_and_reverse_choose_different_freed_cores() {
 /// core stays whole. Both halves matter: the first records real upstream
 /// behaviour, the second is the invariant worth guarding. Confirmed against
 /// `main.rs::refresh_cpumasks()`, which uses the same CPU-space dampening and
-/// the same `target.div_ceil(au)`; filed as mb sim-3wq7t.
+/// the same `target.div_ceil(au)`; filed as mb sim-klue5.
 #[test]
 fn smt_allocation_keeps_whole_cores_and_hits_the_shrink_fixed_point() {
     let _lock = common::setup_test();
