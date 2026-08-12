@@ -14,7 +14,8 @@
 #
 # Prerequisites:
 #   - scx_mitosis built:  cargo build -p scx_mitosis (from repo root)
-#   - rt-app installed:   ~/bin/rt-app
+#   - rt-app installed:   on $PATH, or pinned via $SCXSIM_RTAPP_BIN,
+#                         or at ~/bin/rt-app (see: make check-deps)
 #   - bpftrace installed: system package
 set -euo pipefail
 
@@ -28,7 +29,9 @@ NR_CPUS="${3:-4}"
 OUTFILE="${SCX_REAL_TRACE:-/tmp/scx_real_trace.log}"
 
 SCHED_BIN="$REPO_ROOT/target/debug/scx_${SCHEDULER}"
-RTAPP_BIN="${HOME}/bin/rt-app"
+# Same resolution order as scxsim's real_run.rs and `make check-deps`:
+# $SCXSIM_RTAPP_BIN, then $PATH, then ~/bin/rt-app.
+RTAPP_BIN="${SCXSIM_RTAPP_BIN:-$(command -v rt-app || echo "${HOME}/bin/rt-app")}"
 BPFTRACE_SCRIPT="$SCRIPT_DIR/trace_scx_ops.bt"
 
 # --- Validation ---
@@ -39,7 +42,8 @@ if [[ ! -x "$SCHED_BIN" ]]; then
 fi
 if ! command -v "$RTAPP_BIN" &>/dev/null; then
     echo "ERROR: rt-app not found at $RTAPP_BIN"
-    echo "Build it from ~/playground/rt-app (see CLAUDE.md)"
+    echo "Build it from https://github.com/scheduler-tools/rt-app, then put it"
+    echo "on \$PATH or set \$SCXSIM_RTAPP_BIN. See: make check-deps"
     exit 1
 fi
 if ! command -v bpftrace &>/dev/null; then

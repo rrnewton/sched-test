@@ -12,56 +12,33 @@ if [ -z "$PYTHON_FILES" ]; then
     exit 0
 fi
 
-# Find mypy and its stub dependencies — install if missing.
+# Resolve mypy and its stubs from ONE environment: the project venv.
 #
-# mypy and pip MUST be picked from the same environment: the stub check
-# below asks $PIP_CMD whether pandas-stubs is installed, and that answer
-# is only meaningful for the interpreter $MYPY_CMD actually runs under.
-# Preferring a PATH `mypy` while probing `.venv/bin/pip` reports
-# "stubs present" and then fails with "Library stubs not installed for
-# pandas" — a silent env mismatch. So: if a .venv exists, it wins for
-# BOTH; otherwise fall back to PATH for both.
-MYPY_DEPS=(mypy pandas-stubs)
-MYPY_CMD=""
-PIP_CMD=""
-if [ -d .venv ]; then
-    PIP_CMD=".venv/bin/pip"
-    if [ -x .venv/bin/mypy ]; then
-        MYPY_CMD=".venv/bin/mypy"
-    fi
-else
-    if command -v pip &>/dev/null; then
-        PIP_CMD="pip"
-    fi
-    if command -v mypy &>/dev/null; then
-        MYPY_CMD="mypy"
-    fi
-fi
+# mypy and pip must come from the same place. The stub check below asks pip
+# whether pandas-stubs is installed, and that answer is only meaningful for
+# the interpreter mypy actually runs under. Preferring a PATH `mypy` while
+# probing `.venv/bin/pip` reports "stubs present" and then fails with
+# "Library stubs not installed for pandas" — a silent env mismatch.
+#
+# The venv is also the only portable place to install into: the system pip
+# on Meta dev boxes refuses every install ("direct installs are not allowed
+# on the Production system paths"), so auto-installing via PATH pip fails
+# with a wall of unrelated text. Creating and populating the venv is
+# `make install-deps`' job; this script only reports what is missing.
+MYPY_CMD=".venv/bin/mypy"
+PIP_CMD=".venv/bin/pip"
 
-HAVE_PANDAS_STUBS=false
-if [ -n "$PIP_CMD" ] && $PIP_CMD show pandas-stubs &>/dev/null; then
-    HAVE_PANDAS_STUBS=true
-fi
+missing=()
+[ -x "$MYPY_CMD" ] || missing+=(mypy)
+{ [ -x "$PIP_CMD" ] && "$PIP_CMD" show pandas-stubs &>/dev/null; } || missing+=(pandas-stubs)
 
-if [ -z "$MYPY_CMD" ] || [ "$HAVE_PANDAS_STUBS" = false ]; then
-    echo "mypy or required type stubs not found — installing..."
-    if [ -n "$PIP_CMD" ]; then
-        $PIP_CMD install "${MYPY_DEPS[@]}" >&2
-        # Re-resolve from the SAME environment we just installed into.
-        if [ "$PIP_CMD" = ".venv/bin/pip" ]; then
-            MYPY_CMD=".venv/bin/mypy"
-        else
-            MYPY_CMD="mypy"
-        fi
-        if ! [ -x "$MYPY_CMD" ] && ! command -v "$MYPY_CMD" &>/dev/null; then
-            echo "ERROR: installed ${MYPY_DEPS[*]} via $PIP_CMD but $MYPY_CMD is still not runnable." >&2
-            exit 1
-        fi
-    else
-        echo "ERROR: mypy/type stubs not found and no pip available to install them." >&2
-        echo "  Install manually: pip install ${MYPY_DEPS[*]} (or .venv/bin/pip install ${MYPY_DEPS[*]})" >&2
-        exit 1
-    fi
+if [ ${#missing[@]} -gt 0 ]; then
+    echo "ERROR: Python type-check dependencies missing from .venv: ${missing[*]}" >&2
+    echo "  Install with:  make install-deps" >&2
+    echo "  Or directly:   python3 -m venv .venv && .venv/bin/pip install mypy pandas-stubs" >&2
+    echo "  (Checked $PWD/.venv — a PATH mypy is deliberately NOT used, because" >&2
+    echo "   its stub set would not match the interpreter pip reports on.)" >&2
+    exit 1
 fi
 
 echo "=== Running Python type checks (mypy --strict) ==="

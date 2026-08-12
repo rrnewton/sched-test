@@ -124,7 +124,21 @@ git submodule update --init --recursive
 cd scx-sim
 ```
 
-### 4. Build
+### 4. Check dependencies
+
+```bash
+make check-deps     # what is present, what is missing, how to install it
+make install-deps   # install everything installable without root
+```
+
+`check-deps` lists every dependency with the path it was found at, and for
+anything missing prints a copy-pasteable install command. `install-deps`
+handles the ones that do not need root: the Python venv (mypy, pandas-stubs,
+plotly, pandas), `cargo-nextest`, rustfmt/clippy, e9patch, `gh`, and an OSS
+LLVM toolchain under `~/opt` for coverage builds. `validate.sh` runs
+`check-deps` first and refuses to start if a required dependency is missing.
+
+### 5. Build
 
 ```bash
 cargo build --release -p scx_simulator --bin scxsim
@@ -134,7 +148,7 @@ The build script also compiles the scheduler `.so` libraries
 (`libscx_simple.so`, `libscx_lavd.so`, …) as a side effect — no
 separate `make -C schedulers` step is required.
 
-### 5. Run a simulation
+### 6. Run a simulation
 
 ```bash
 target/release/scxsim run -s simple --cpus 4 --duration 100ms \

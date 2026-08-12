@@ -7,8 +7,16 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-/// Path to the rt-app binary.
-const RTAPP_BIN: &str = "/home/newton/bin/rt-app";
+/// Env var that pins the rt-app binary, overriding discovery.
+const RTAPP_BIN_ENV: &str = "SCXSIM_RTAPP_BIN";
+
+/// Fallback rt-app location, relative to `$HOME`.
+///
+/// This is the dev-box convention documented in `scx-sim/CLAUDE.md`
+/// ("Common tools already available"), not a hard-coded absolute path —
+/// it must never bake in a specific username. `make check-deps` reports
+/// rt-app using the same three-step order as [`rtapp_bin`].
+const RTAPP_HOME_RELATIVE: &str = "bin/rt-app";
 
 /// Path to the workspace directory inside the VM (mounted from host CWD).
 const VM_WORKSPACE: &str = "/usr/workspace";
@@ -217,6 +225,7 @@ fn build_inner_cmd(
         String::new()
     };
     let scheduler_cmd = scheduler_command(sched_bin, scheduler_args);
+    let rtapp_bin = shell_escape(&rtapp_bin().to_string_lossy());
     let workload_arg = shell_escape(&workload_abs.to_string_lossy());
     let pre_hook = hook_command("pre-hook", pre_hook_path);
     let post_hook = hook_command("post-hook", post_hook_path);
@@ -246,7 +255,7 @@ fn build_inner_cmd(
                  sleep 1\n\
                  {pre_hook}\
                  echo '=== Running rt-app ==='\n\
-                 taskset -c {workload_cpus} {RTAPP_BIN} {workload_arg}\n\
+                 taskset -c {workload_cpus} {rtapp_bin} {workload_arg}\n\
                  echo '=== rt-app completed ==='\n\
                  {post_hook}\
                  kill -INT $TRACER_PID 2>/dev/null || true\n\
@@ -275,7 +284,7 @@ fn build_inner_cmd(
                  sleep 1\n\
                  {pre_hook}\
                  echo '=== Running rt-app ==='\n\
-                 taskset -c {workload_cpus} {RTAPP_BIN} {workload_arg}\n\
+                 taskset -c {workload_cpus} {rtapp_bin} {workload_arg}\n\
                  echo '=== rt-app completed ==='\n\
                  {post_hook}\
                  sleep 1\n\
@@ -296,7 +305,7 @@ fn build_inner_cmd(
                  sleep 1\n\
                  {pre_hook}\
                  echo '=== Running rt-app ==='\n\
-                 {RTAPP_BIN} {workload_arg}\n\
+                 {rtapp_bin} {workload_arg}\n\
                  echo '=== rt-app completed ==='\n\
                  {post_hook}\
                 kill $SCHED_PID 2>/dev/null || true\n\
@@ -318,8 +327,13 @@ fn validate_prerequisites(
     }
 
     // Check rt-app
-    if !Path::new(RTAPP_BIN).exists() {
-        return Err(format!("rt-app not found at {RTAPP_BIN}"));
+    let rtapp = rtapp_bin();
+    if !rtapp.exists() {
+        return Err(format!(
+            "rt-app not found at {} — put rt-app on $PATH or set ${RTAPP_BIN_ENV} \
+             (see: make check-deps)",
+            rtapp.display()
+        ));
     }
 
     // Check scheduler binary
@@ -512,7 +526,7 @@ fn setup_env(
         sched_bin = shell_escape(&sched_bin.to_string_lossy()),
         scheduler_args = shell_escape(scheduler_args),
         workload = shell_escape(&workload.to_string_lossy()),
-        rtapp_bin = shell_escape(RTAPP_BIN),
+        rtapp_bin = shell_escape(&rtapp_bin().to_string_lossy()),
         trace_mode = shell_escape(trace_mode),
     )
 }
@@ -531,6 +545,30 @@ fn hook_command(label: &str, hook: Option<&Path>) -> String {
 }
 
 /// Check if a command exists in PATH.
+/// Resolve the rt-app binary, in this order:
+///
+/// 1. `$SCXSIM_RTAPP_BIN`, if set.
+/// 2. `rt-app` on `$PATH`.
+/// 3. `$HOME/bin/rt-app`.
+///
+/// Returns the last candidate unresolved if none exist, so the caller's
+/// existence check can report a concrete path in its error message.
+fn rtapp_bin() -> PathBuf {
+    if let Some(pinned) = std::env::var_os(RTAPP_BIN_ENV) {
+        return PathBuf::from(pinned);
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join("rt-app");
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    let home = std::env::var_os("HOME").unwrap_or_default();
+    PathBuf::from(home).join(RTAPP_HOME_RELATIVE)
+}
+
 fn command_exists(cmd: &str) -> bool {
     Command::new("which")
         .arg(cmd)
@@ -729,7 +767,10 @@ mod tests {
         assert!(cmd.contains("'/tmp/scx_lavd' --enable-cpu-bw --verbose &"));
         assert!(cmd.contains("echo '=== Running pre-hook ==='\n'/tmp/pre hook.sh'"));
         assert!(cmd.contains("echo '=== Running rt-app ==='"));
-        assert!(cmd.contains("/home/newton/bin/rt-app '/tmp/r3_mimic.json'"));
+        // rt-app is resolved at runtime, so assert on the resolved path
+        // rather than baking a machine-specific one into the test.
+        let expected_rtapp = shell_escape(&rtapp_bin().to_string_lossy());
+        assert!(cmd.contains(&format!("{expected_rtapp} '/tmp/r3_mimic.json'")));
         assert!(cmd.contains("echo '=== Running post-hook ==='\n'/tmp/post hook.sh'"));
 
         let pre_idx = cmd.find("=== Running pre-hook ===").unwrap();

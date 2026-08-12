@@ -7,7 +7,21 @@
 PYTHON := $(or $(wildcard .venv/bin/python3),python3)
 
 .PHONY: benchmark benchmark-perf install-e9patch rebuild-schedulers \
-        test-examples
+        test-examples check-deps install-deps
+
+# Report every external dependency scx-sim needs, where it was found, and
+# for anything missing, a copy-pasteable install command. Exits non-zero if
+# a REQUIRED dependency is missing. validate.sh runs this first, so a
+# missing dependency produces an explicit message instead of a confusing
+# downstream failure. See scripts/deps.sh for the dependency table.
+check-deps:
+	@./scripts/deps.sh check
+
+# Install everything scx-sim needs that can be installed without root.
+# Anything that genuinely needs a system package manager is printed as a
+# command to run rather than run automatically.
+install-deps:
+	@./scripts/deps.sh install
 
 benchmark:
 	$(PYTHON) scripts/benchmark.py run
