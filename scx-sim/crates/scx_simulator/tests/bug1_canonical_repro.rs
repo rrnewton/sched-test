@@ -279,9 +279,11 @@ fn parse_token_after(line: &str, key: &str) -> Option<String> {
 // Whether is_throttled==1 is genuinely-correct new behavior (update assertion)
 // or a scxsim accounting gap vs the new period_budget semantics (fix engine) is
 // tracked in minibeads sim-560f79.
+// Un-ignored 2026-08-12: the throttle state this test asserts was being masked
+// by check_watchdog reporting deliberate cgroup-bandwidth throttling as
+// starvation (exit 42). Integration 37f7f8a fixed that, after which this test
+// passes; verified 20/20 consecutive runs before removing the #[ignore].
 #[test]
-#[ignore = "scx upstream cgroup_bw rewrite changed end-of-run throttle state; \
-            re-validate cpu-bw-stall-bug hypothesis — see mb sim-560f79"]
 fn test_bug1_canonical_subprocess_reproduces_throttle() {
     let _lock = common::setup_test();
 
@@ -387,7 +389,16 @@ fn test_bug1_canonical_subprocess_deterministic_10_reps() {
 // full per-SHA fingerprint matrix and methodology.)
 // ---------------------------------------------------------------------------
 
+// SKIP DISPOSITION: needs a per-SHA binary cache that neither CI nor a fresh
+// clone has. Until 2026-08-12 this was a plain #[test]: with
+// SCXSIM_BIN_CACHE_DIR unset it printed a "skipping" line, returned, and was
+// counted as PASSED — a test asserting nothing, indistinguishable from a real
+// pass in the suite total. #[ignore] makes that honest. Build the cache with
+// experiments/bug1_scx_version_matrix_20260512/build_per_hash.sh, point
+// SCXSIM_BIN_CACHE_DIR at it, and run with --run-ignored all.
 #[test]
+#[ignore = "requires a per-SHA libscx_lavd.so cache via SCXSIM_BIN_CACHE_DIR \
+            (build_per_hash.sh); absent in CI and in a fresh clone"]
 fn test_bug1_canonical_per_sha_discrimination() {
     let _lock = common::setup_test();
 

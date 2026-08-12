@@ -339,7 +339,14 @@ Done.
 /// 2. Run with BPF tracing: `cargo run -p scxsim -- vm-run --bpf-trace workloads/two_runners.json`
 /// 3. This creates bpf_trace.log in the current directory
 /// 4. Re-run this test to parse and analyze the real trace
+// SKIP DISPOSITION: needs a real bpf_trace.log captured from a live VM run,
+// which CI cannot produce and a fresh clone does not have. Until 2026-08-12
+// this was a plain #[test]: with the file absent it printed a "Skipping" block,
+// returned, and was counted as PASSED. #[ignore] makes that honest. To run it,
+// generate the trace per the instructions in the body and use --run-ignored all.
 #[test]
+#[ignore = "requires a captured bpf_trace.log in the crate directory \
+            (see body for how to generate); absent in CI and in a fresh clone"]
 fn test_load_real_bpf_trace() {
     // Look for a real trace file in the project root
     let trace_path = Path::new("bpf_trace.log");
@@ -404,7 +411,12 @@ fn test_load_real_bpf_trace() {
 ///
 /// Prerequisites:
 /// - Generate bpf_trace.log using: cargo run -p scxsim -- vm-run --bpf-trace -s lavd workloads/two_runners.json
+// SKIP DISPOSITION: same missing artifact as test_load_real_bpf_trace above --
+// a captured bpf_trace.log. Was a plain #[test] that returned early and counted
+// as PASSED when the file was absent.
 #[test]
+#[ignore = "requires a captured bpf_trace.log in the crate directory \
+            (vm-run --bpf-trace); absent in CI and in a fresh clone"]
 fn test_full_real_vs_sim_comparison() {
     let _lock = common::setup_test();
 
