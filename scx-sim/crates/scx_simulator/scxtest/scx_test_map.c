@@ -1,6 +1,11 @@
+/* dladdr() is a GNU extension; must precede every include. Used by
+ * scx_test_map_clear_all() to scope the clear to the calling scheduler. */
+#define _GNU_SOURCE
+
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <dlfcn.h>
 
 #include <linux/bpf.h>
 
@@ -53,28 +58,114 @@ static struct scx_map_type *scx_map_types = NULL;
 static int scx_map_types_count = 0;
 
 /*
- * Reset all map registries.
+ * Identity of the mapped object (a scheduler `.so`, or the main binary)
+ * containing @addr, or NULL when it cannot be determined.
  *
- * This must be called before re-registering maps (e.g. when a scheduler
- * .so is reloaded) to prevent stale entries from pointing to unmapped
- * memory after dlclose/dlopen cycles.
+ * `dli_fbase` is the object's load address, which is a stable identity for
+ * "which object is this". dladdr fills it for ANY address inside a mapped
+ * segment, including data with no matching symbol (where `dli_sname` is NULL)
+ * — which is the case here, since every registry key is the address of a
+ * `struct bpf_map` global inside a scheduler `.so`.
+ */
+static const void *scx_owning_object(const void *addr)
+{
+	Dl_info info;
+
+	if (!addr)
+		return NULL;
+	if (dladdr(addr, &info) == 0)
+		return NULL;
+	return info.dli_fbase;
+}
+
+/*
+ * Drop the CALLING scheduler's map registrations.
+ *
+ * Called at the top of each `<sched>_register_maps()` so a scheduler gets
+ * clean state when its `.so` is re-loaded, without stale entries pointing
+ * into memory that dlclose has unmapped.
+ *
+ * SCOPED TO THE CALLER, deliberately. The registry lives in the main binary
+ * (scxtest is linked into the host and reached from each `.so` through the
+ * -rdynamic / --undefined export contract), so it is SHARED by every loaded
+ * scheduler. Clearing it wholesale means the second scheduler loaded in a
+ * process destroys the first one's registrations.
+ *
+ * That is not hypothetical: DynamicScheduler::load calls `{prefix}_setup()`
+ * at CONSTRUCTION time, so a test that builds two schedulers in one
+ * expression — e.g.
+ *   [("lavd", DynamicScheduler::lavd(n), ..), ("cosmos", DynamicScheduler::cosmos(n), ..)]
+ * — registers lavd, then lets cosmos wipe it, and lavd's later init fails with
+ * `get_cpu_ctx_id() == NULL` -> -ESRCH. That regressed
+ * cpu_migration::test_migration_under_high_contention and both
+ * kick_cpu_behavior kick tests.
+ *
+ * Scoping is safe because entries are keyed by `map_ptr`, the address of a
+ * map global inside one specific `.so`: two objects can never produce the
+ * same key, so one scheduler's entries are always disjoint from another's.
+ *
+ * If the owning object cannot be determined we fall back to the old
+ * clear-everything behaviour rather than clearing nothing — leaving stale
+ * entries that point into an unmapped `.so` would be the more dangerous
+ * failure.
  *
  * Does NOT free map keys/values — those belong to the scx_test_map
  * structs inside the .so and are managed by the caller.
  */
 void scx_test_map_clear_all(void)
 {
-	free(scx_map_entries);
-	scx_map_entries = NULL;
-	scx_map_entries_count = 0;
+	/* Return address = the caller's code, i.e. the .so whose
+	 * <sched>_register_maps() is running. */
+	const void *owner = scx_owning_object(__builtin_return_address(0));
+	int i, kept;
 
-	free(scx_percpu_map_entries);
-	scx_percpu_map_entries = NULL;
-	scx_percpu_map_entries_count = 0;
+	if (!owner) {
+		free(scx_map_entries);
+		scx_map_entries = NULL;
+		scx_map_entries_count = 0;
 
-	free(scx_map_types);
-	scx_map_types = NULL;
-	scx_map_types_count = 0;
+		free(scx_percpu_map_entries);
+		scx_percpu_map_entries = NULL;
+		scx_percpu_map_entries_count = 0;
+
+		free(scx_map_types);
+		scx_map_types = NULL;
+		scx_map_types_count = 0;
+		return;
+	}
+
+	for (i = 0, kept = 0; i < scx_map_entries_count; i++) {
+		if (scx_owning_object(scx_map_entries[i].map_ptr) == owner)
+			continue;
+		scx_map_entries[kept++] = scx_map_entries[i];
+	}
+	scx_map_entries_count = kept;
+	if (kept == 0) {
+		free(scx_map_entries);
+		scx_map_entries = NULL;
+	}
+
+	for (i = 0, kept = 0; i < scx_percpu_map_entries_count; i++) {
+		if (scx_owning_object(scx_percpu_map_entries[i].map_ptr) == owner)
+			continue;
+		scx_percpu_map_entries[kept++] = scx_percpu_map_entries[i];
+	}
+	scx_percpu_map_entries_count = kept;
+	if (kept == 0) {
+		free(scx_percpu_map_entries);
+		scx_percpu_map_entries = NULL;
+	}
+
+	for (i = 0, kept = 0; i < scx_map_types_count; i++) {
+		if (scx_owning_object(scx_map_types[i].map_ptr) == owner)
+			continue;
+		scx_map_types[kept++] = scx_map_types[i];
+	}
+	scx_map_types_count = kept;
+	if (kept == 0) {
+		free(scx_map_types);
+		scx_map_types = NULL;
+	}
 }
 
 static void scx_regsiter_map_type(void *map_ptr, int map_type)
