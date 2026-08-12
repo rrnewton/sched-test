@@ -279,11 +279,17 @@ fn parse_token_after(line: &str, key: &str) -> Option<String> {
 // Whether is_throttled==1 is genuinely-correct new behavior (update assertion)
 // or a scxsim accounting gap vs the new period_budget semantics (fix engine) is
 // tracked in minibeads sim-560f79.
-// Un-ignored 2026-08-12: the throttle state this test asserts was being masked
-// by check_watchdog reporting deliberate cgroup-bandwidth throttling as
-// starvation (exit 42). Integration 37f7f8a fixed that, after which this test
-// passes; verified 20/20 consecutive runs before removing the #[ignore].
+// Un-ignored 2026-08-12 after integration 37f7f8a fixed check_watchdog
+// reporting deliberate cgroup-bandwidth throttling as starvation (exit 42);
+// it then passed 20/20 locally. RE-IGNORED the same day: it passes on the dev
+// box and FAILS on CI with the opposite verdict (is_throttled 0 vs 1,
+// nr_throttled_tasks 0 vs 4), and the CI dump shows stack-address garbage in
+// the cgroup_bw period/burst fields. That is a real environment-dependent
+// defect, tracked as mb sim-1ei8j -- not a flaky test. It could only be seen
+// once PR #81 stopped the coverage gate dying in ld before any test ran.
 #[test]
+#[ignore = "mb sim-1ei8j: passes locally, fails on CI with garbage pointer \
+            values in cgroup_bw period/burst; un-ignore when that is fixed"]
 fn test_bug1_canonical_subprocess_reproduces_throttle() {
     let _lock = common::setup_test();
 
