@@ -18,11 +18,23 @@
  */
 
 /*
- * Enable scx_bpf_select_cpu_and — implemented in the simulator.
- * With flat_idle_scan=false, COSMOS will use this instead of flat scan.
+ * bpf_ksym_exists is NOT overridden here -- see the capability policy in
+ * sim_wrapper.h. The genuine weak-symbol test answers per symbol.
+ *
+ * This used to be forced to 1 so COSMOS would take the modern
+ * scx_bpf_select_cpu_and path. It no longer needs to be: every capability
+ * COSMOS actually reaches through a macro-form compat construct resolves
+ * TRUE under the real test anyway --
+ *   scx_bpf_select_cpu_and___compat, scx_bpf_get_idle_cpumask_node,
+ *   scx_bpf_get_idle_smtmask_node, scx_bpf_pick_idle_cpu_node
+ *     -> exported by the simulator binary (kfuncs.rs, via -rdynamic)
+ *   scx_bpf_cpu_node
+ *     -> defined by this wrapper below (see its comment)
+ * so the answers are identical to the old forced 1, but they now stay
+ * correct by construction if upstream adds a capability the simulator
+ * does NOT provide. Under the old blanket 1, such a symbol would have
+ * been called unconditionally through a NULL weak __ksym and SIGSEGV'd.
  */
-#undef bpf_ksym_exists
-#define bpf_ksym_exists(sym) (1)
 
 /*
  * The simulator always calls select_cpu before enqueue, so the

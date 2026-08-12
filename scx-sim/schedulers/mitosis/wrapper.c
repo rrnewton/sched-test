@@ -26,11 +26,19 @@ extern void *memset(void *s, int c, unsigned long n);
  * ---------------------------------------------------------------------------*/
 
 /*
- * Force scx_bpf_select_cpu_dfl fallback -- avoids needing
- * scx_bpf_select_cpu_and which isn't implemented in the simulator.
+ * bpf_ksym_exists is NOT overridden here -- see the capability policy in
+ * sim_wrapper.h. The genuine weak-symbol test answers per symbol.
+ *
+ * This used to be forced to 0 to "avoid needing scx_bpf_select_cpu_and
+ * which isn't implemented in the simulator". That reason was stale twice
+ * over: the simulator exports scx_bpf_select_cpu_and now, and mitosis no
+ * longer references it at all (it has its own mitosis_select_cpu ops
+ * callback). Removing the override changes no compiled branch -- verified
+ * by objdump before and after -- because every capability mitosis reaches
+ * is either a static inline compat function (immune to a wrapper override;
+ * see the include-order note in sim_wrapper.h) or is overridden per-symbol
+ * just below.
  */
-#undef bpf_ksym_exists
-#define bpf_ksym_exists(sym) (0)
 
 /*
  * The simulator always calls select_cpu before enqueue, so the

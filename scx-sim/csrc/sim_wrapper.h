@@ -45,6 +45,66 @@
 #include <scx/common.bpf.h>
 
 /*
+ * =========================================================================
+ * Kernel-capability policy: bpf_ksym_exists()
+ * =========================================================================
+ *
+ * ONE answer to "does the kernel have this kfunc", for every scheduler.
+ * Do NOT redefine bpf_ksym_exists() in a wrapper.c. See the rules below.
+ *
+ * THE CAPABILITY TABLE IS NOT A LIST -- IT IS THE EXPORTED SYMBOL SET.
+ *
+ * libbpf's bpf_ksym_exists(sym) is `!!sym` on a __weak symbol. `__weak`
+ * survives into this native build (lib/scxtest/scx_test.h:6 maps it to
+ * __attribute__((weak))), so the test is a genuine runtime NULL check
+ * against whatever the process actually provides:
+ *
+ *   - symbols the simulator binary exports (#[no_mangle] in kfuncs.rs,
+ *     resolved into the .so at dlopen time via -rdynamic), plus
+ *   - symbols the scheduler's own wrapper.c defines.
+ *
+ * That set IS the capability table, and it cannot drift out of sync with
+ * reality the way a hand-maintained list would. To inspect it:
+ *
+ *   nm -D --defined-only target/debug/scxsim | awk '{print $3}' | sort -u
+ *   objdump -R <sched>.so | grep GLOB_DAT   # a genuine test was compiled
+ *
+ * A GLOB_DAT relocation on the symbol means the runtime test survived.
+ * If the symbol is called with no GLOB_DAT, the test was folded to a
+ * constant -- i.e. somebody overrode it.
+ *
+ * HOW TO MAKE A MODERN PATH RUN: PROVIDE THE SYMBOL, DO NOT FAKE THE TEST.
+ *
+ * If a scheduler should take the modern branch, export the kfunc from
+ * kfuncs.rs or define it in that scheduler's wrapper.c. The genuine test
+ * then answers TRUE on its own, and keeps answering correctly as upstream
+ * moves. Forcing the constant instead is a fake value standing in for a
+ * real capability test -- the No-Stub Rule in scx-sim/CLAUDE.md -- and it
+ * answers for ALL ~31 ksym-tested symbols at once, not just the one that
+ * motivated it. cosmos/wrapper.c:312 (scx_bpf_cpu_node) is the pattern to
+ * copy: provide the symbol, let the real test find it.
+ *
+ * INCLUDE-ORDER GOTCHA -- READ THIS BEFORE DEBUGGING A COMPAT BRANCH.
+ *
+ * common.bpf.h:1143 includes compat.bpf.h, and this header includes
+ * common.bpf.h above. So compat.bpf.h is fully parsed HERE, before any
+ * wrapper.c gets to run its own #undef/#define. Consequently:
+ *
+ *   - compat constructs that are STATIC INLINE FUNCTIONS (e.g.
+ *     __COMPAT_scx_bpf_cpu_curr, __COMPAT_scx_bpf_dsq_peek,
+ *     scx_bpf_dsq_insert, scx_bpf_task_set_slice) bake in whatever
+ *     bpf_ksym_exists meant AT THIS POINT. A later wrapper #define
+ *     CANNOT change them.
+ *   - only compat constructs that are MACROS expand at the call site in
+ *     the scheduler's .bpf.c, i.e. after wrapper.c, and are affected.
+ *
+ * This is why a wrapper-level override appears to do nothing for some
+ * capabilities and everything for others. Verify with objdump, not by
+ * reading the #define.
+ */
+#define SCXSIM_KSYM_EXISTS(sym) bpf_ksym_exists(sym)
+
+/*
  * The simulator does not provide the kernel's numeric iterator kfuncs
  * (bpf_iter_num_new/next/destroy) that back bpf_for(). In userspace we do
  * not need verifier proofs, so translate bpf_for() into a plain C loop.

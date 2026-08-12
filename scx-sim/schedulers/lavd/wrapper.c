@@ -89,17 +89,28 @@
 #define bpf_get_current_pid_tgid() (((u64)SIM_CBW_LOADER_TGID) << 32)
 
 /*
- * bpf_ksym_exists -- kernel symbol existence check.
- * Return 0 (absent) to disable kfunc probing paths.
+ * bpf_ksym_exists is NOT overridden here -- see the capability policy in
+ * sim_wrapper.h. The genuine weak-symbol test answers per symbol.
+ *
+ * This used to be forced to 0 to "disable kfunc probing paths". Removing
+ * it changes no compiled branch: LAVD reaches no macro-form compat
+ * construct that consults bpf_ksym_exists (verified by objdump before and
+ * after), and the static inline ones were never affected by the override
+ * in the first place -- see the include-order note in sim_wrapper.h.
  */
-#undef bpf_ksym_exists
-#define bpf_ksym_exists(sym) (0)
 
 /*
- * __COMPAT_scx_bpf_dsq_peek -- override the compat wrapper to directly
- * call scx_bpf_dsq_peek which is implemented in kfuncs.rs. The compat
- * wrapper normally falls through to bpf_iter_scx_dsq_* when bpf_ksym_exists
- * returns 0, but those iterators aren't implemented in the simulator.
+ * __COMPAT_scx_bpf_dsq_peek -- call scx_bpf_dsq_peek (kfuncs.rs) directly.
+ *
+ * Belt-and-braces, kept deliberately: the upstream compat wrapper is a
+ * static inline function, so it already binds the GENUINE test and, since
+ * the simulator exports scx_bpf_dsq_peek, already resolves to this same
+ * kfunc. This #define pins that outcome so LAVD can never fall through to
+ * bpf_iter_scx_dsq_*, which the simulator does not implement.
+ *
+ * (The previous comment here attributed the fall-through risk to the
+ * forced bpf_ksym_exists(0) above. That was a misreading -- the inline
+ * wrapper was never affected by that override.)
  */
 extern struct task_struct *scx_bpf_dsq_peek(u64 dsq_id);
 #define __COMPAT_scx_bpf_dsq_peek(dsq_id) scx_bpf_dsq_peek(dsq_id)
