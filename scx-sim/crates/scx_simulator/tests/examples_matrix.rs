@@ -26,8 +26,8 @@ use scx_simulator::*;
 
 mod common;
 
-/// The three schedulers under test. `simple` takes no CPU count; `lavd`/`cosmos`
-/// are constructed with the scenario's CPU count.
+/// The schedulers under test. `simple` takes no CPU count; the others are
+/// constructed with the scenario's CPU count.
 const SCHEDULERS: [&str; 4] = ["simple", "lavd", "cosmos", "layered"];
 
 /// CPUs to run every example with (examples are authored for `--cpus 4`).

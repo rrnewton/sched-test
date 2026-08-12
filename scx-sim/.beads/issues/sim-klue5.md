@@ -4,7 +4,7 @@ status: open
 priority: 2
 issue_type: task
 created_at: 2026-08-12T21:10:36.026876893+00:00
-updated_at: 2026-08-12T21:10:36.026876893+00:00
+updated_at: 2026-08-12T22:08:02.929922044+00:00
 ---
 
 # Description
@@ -43,3 +43,7 @@ explicitly so a future "fix" to the simulator that makes 6/2 reachable will
 fail loudly as a divergence from upstream.
 
 Worth reporting upstream. Not blocking Tier 3.
+
+# Notes
+
+Test renamed to smt_allocation_hits_the_shrink_fixed_point (the whole-core half moved to smt_core_transfer_moves_whole_cores_only, which forces a real transfer first).

@@ -373,13 +373,21 @@ fn upstream_linear_and_reverse_choose_different_freed_cores() {
 ///   allocated                    = 4 CPUs      -> unchanged, fixed point
 ///
 /// So the 6/2 split the layer specs ask for is unreachable from an even 4/4
-/// start, and the honest assertion is that the split stays 4/4 while every
-/// core stays whole. Both halves matter: the first records real upstream
-/// behaviour, the second is the invariant worth guarding. Confirmed against
-/// `main.rs::refresh_cpumasks()`, which uses the same CPU-space dampening and
-/// the same `target.div_ceil(au)`; filed as mb sim-klue5.
+/// start, and the honest assertion is that the split stays 4/4. Confirmed
+/// against `main.rs::refresh_cpumasks()`, which uses the same CPU-space
+/// dampening and the same `target.div_ceil(au)`; filed as mb sim-klue5.
+///
+/// This test does NOT carry the whole-core invariant, even though a
+/// no-half-cores assertion would pass here. Sitting at the fixed point is
+/// exactly the condition under which the shrink and grow loops never execute,
+/// so such an assertion would be satisfied by the untouched initial
+/// allocation and would survive a sabotage that releases half a core. The
+/// invariant is proven by `smt_core_transfer_moves_whole_cores_only`, which
+/// first forces a real transfer and asserts it happened. What IS worth
+/// asserting here is that the serialized userspace mask and the BPF kptr mask
+/// agree — that is a property of publication, not of the loops.
 #[test]
-fn smt_allocation_keeps_whole_cores_and_hits_the_shrink_fixed_point() {
+fn smt_allocation_hits_the_shrink_fixed_point() {
     let _lock = common::setup_test();
     let sched = DynamicScheduler::layered_with_topology(8, 4, 1, 2);
     sched.layered_layers(&[
@@ -414,29 +422,14 @@ fn smt_allocation_keeps_whole_cores_and_hits_the_shrink_fixed_point() {
         "expected the CPU-space-dampening / core-rounding fixed point"
     );
 
-    // The invariant that must hold regardless: no half cores, in either the
-    // serialized view or the BPF kptr mask the refresh tail rebuilt.
+    // Publication consistency: the mask userspace serialized and the kptr
+    // mask the BPF refresh tail rebuilt from it must describe the same set.
     for layer in 0..2 {
-        for first in (0..8).step_by(2) {
-            let serialized = (
-                probes.layer_has_cpu(layer, CpuId(first)),
-                probes.layer_has_cpu(layer, CpuId(first + 1)),
-            );
-            let bpf = (
-                probes.layer_bpf_has_cpu(layer, CpuId(first)),
-                probes.layer_bpf_has_cpu(layer, CpuId(first + 1)),
-            );
+        for cpu in 0..8 {
             assert_eq!(
-                serialized.0, serialized.1,
-                "layer {layer} holds half of core {first} (serialized)"
-            );
-            assert_eq!(
-                bpf.0, bpf.1,
-                "layer {layer} holds half of core {first} (BPF kptr)"
-            );
-            assert_eq!(
-                serialized, bpf,
-                "serialized and BPF masks disagree on core {first} for layer {layer}"
+                probes.layer_has_cpu(layer, CpuId(cpu)),
+                probes.layer_bpf_has_cpu(layer, CpuId(cpu)),
+                "serialized and BPF kptr masks disagree on cpu {cpu} for layer {layer}"
             );
         }
     }
@@ -663,6 +656,16 @@ fn llc_topology_drives_dsq_selection() {
 
 /// With SMT enabled the scheduler must know each CPU's sibling; without it,
 /// `__sibling_cpu` must be -1 so layered's exclusive-layer logic short-circuits.
+///
+/// Scope, stated because the obvious stronger claim is not what this makes:
+/// the SMT-on arm checks the published map is a well-formed pairing (an
+/// involution, no self-pairing, no CPU out of range), NOT that it matches the
+/// engine's core layout. Asserting `sibling(0) == 1` against a hand-written
+/// expectation would only restate this test's own input — the engine's
+/// `build_cpus` layout is not consulted, so an engine that paired CPUs
+/// differently would not be caught here. The SMT-off arm is the load-bearing
+/// half and is a genuine behavioural discriminator: -1 is what makes
+/// layered's exclusive-layer path short-circuit.
 #[test]
 fn smt_siblings_are_published_only_when_smt_is_on() {
     let _lock = common::setup_test();
@@ -680,11 +683,117 @@ fn smt_siblings_are_published_only_when_smt_is_on() {
 
     let smt = DynamicScheduler::layered_with_topology(4, 0, 1, 2);
     let smt_probes = LayeredProbes::new(&smt);
-    // The engine lays siblings out as consecutive pairs.
-    assert_eq!(smt_probes.sibling_cpu(CpuId(0)), 1);
-    assert_eq!(smt_probes.sibling_cpu(CpuId(1)), 0);
-    assert_eq!(smt_probes.sibling_cpu(CpuId(2)), 3);
-    assert_eq!(smt_probes.sibling_cpu(CpuId(3)), 2);
+    for cpu in 0..4 {
+        let sib = smt_probes.sibling_cpu(CpuId(cpu));
+        assert!(
+            (0..4).contains(&sib),
+            "cpu {cpu} has out-of-range sibling {sib} with SMT on"
+        );
+        assert_ne!(sib, cpu as i32, "cpu {cpu} is its own SMT sibling");
+        assert_eq!(
+            smt_probes.sibling_cpu(CpuId(sib as u32)),
+            cpu as i32,
+            "sibling relation is not symmetric: {cpu} -> {sib} -> {}",
+            smt_probes.sibling_cpu(CpuId(sib as u32))
+        );
+    }
+}
+
+/// The userspace control loop and the scheduler must partition the machine
+/// into the SAME nodes.
+///
+/// The loop indexes per-node usage arrays that the wrapper lays out, so two
+/// independent clamps of the requested node count would have it reading a
+/// different partition than the scheduler writes — silently, and only on
+/// topologies big enough to trip the difference. 8 LLCs / 8 nodes is such a
+/// topology: this failed with 4 != 8 while the Rust side re-derived the
+/// count instead of adopting the wrapper's.
+#[test]
+fn control_loop_and_scheduler_agree_on_the_node_partition() {
+    let _lock = common::setup_test();
+
+    for (nr_cpus, cpus_per_llc, requested) in [(16, 2, 8), (16, 2, 32), (8, 4, 2), (4, 0, 1)] {
+        let sched = DynamicScheduler::layered_with_topology(nr_cpus, cpus_per_llc, requested, 1);
+        let probes = LayeredProbes::new(&sched);
+        assert_eq!(
+            sched.layered_nr_numa_nodes(),
+            probes.nr_nodes(),
+            "control loop and scheduler disagree on node count for \
+             {nr_cpus} CPUs / {cpus_per_llc} per LLC / {requested} requested"
+        );
+        // Every CPU must land in a node the loop actually iterates.
+        for cpu in 0..nr_cpus {
+            assert!(
+                probes.cpu_node(CpuId(cpu)) < sched.layered_nr_numa_nodes(),
+                "cpu {cpu} is in node {} but the loop only walks {} nodes",
+                probes.cpu_node(CpuId(cpu)),
+                sched.layered_nr_numa_nodes()
+            );
+        }
+        // `probes` holds raw fn pointers into `sched`'s dlopen'd .so, so it
+        // must not outlive it. Both go out of scope together at the end of
+        // this iteration.
+    }
+}
+
+/// An OPEN layer must get only the UNALLOCATED CPUs, not the whole machine.
+///
+/// `main.rs::refresh_cpumasks()` ends with "Give the rest to the open layers"
+/// (main.rs:4065-4085), handing an open layer `available_cpus & allowed_cpus`
+/// — the free pool. `layer->cpus` bounds `pick_idle_cpu()`'s search, so an
+/// open layer holding every CPU would poach idle CPUs that upstream reserves
+/// for the confined layer sitting on them.
+#[test]
+fn an_open_layer_gets_only_the_cpus_no_confined_layer_holds() {
+    let _lock = common::setup_test();
+    const NR_CPUS: u32 = 8;
+
+    let sched = DynamicScheduler::layered_with_topology(NR_CPUS, 0, 1, 1);
+    sched.layered_layers(&[
+        LayerSpec::new("confined", LayerKind::Confined)
+            .with_match(LayerMatch::CommPrefix("work".into()))
+            .with_weight(100),
+        LayerSpec::catch_all("open"),
+    ]);
+    let probes = LayeredProbes::new(&sched);
+    // The static allocation is computed in ops.init, so it must run.
+    let sim = Simulator::new(sched);
+    let mut b = Scenario::builder().cpus(NR_CPUS).detect_bpf_errors();
+    for i in 1..=4 {
+        b = b.task(TaskDef {
+            name: format!("work{i}"),
+            allowed_cpus: None,
+            ..pinned_task("", Pid(i), hog(), Vec::new())
+        });
+    }
+    let t = sim.run(b.duration_ms(100).build());
+    assert_eq!(t.exit_kind(), &ExitKind::Normal);
+
+    let confined: Vec<u32> = (0..NR_CPUS)
+        .filter(|&c| probes.layer_has_cpu(0, CpuId(c)))
+        .collect();
+    let open: Vec<u32> = (0..NR_CPUS)
+        .filter(|&c| probes.layer_has_cpu(1, CpuId(c)))
+        .collect();
+
+    // Premise: without a real confined allocation the disjointness below
+    // would hold vacuously.
+    assert!(
+        !confined.is_empty() && confined.len() < NR_CPUS as usize,
+        "confined layer must hold some but not all CPUs, got {confined:?}"
+    );
+    for &c in &confined {
+        assert!(
+            !open.contains(&c),
+            "cpu {c} is held by the confined layer yet also handed to the \
+             open layer; open={open:?} confined={confined:?}"
+        );
+    }
+    assert_eq!(
+        confined.len() + open.len(),
+        NR_CPUS as usize,
+        "every CPU should be allocated exactly once; open={open:?} confined={confined:?}"
+    );
 }
 
 /// A multi-LLC, multi-node, SMT run must complete cleanly — this is the
@@ -1625,12 +1734,13 @@ fn growth_denied_matches_a_prediction_made_from_the_scenario_spec() {
 
 /// Whole-core allocation, on a path that ACTUALLY MOVES A CORE.
 ///
-/// `smt_allocation_keeps_whole_cores_and_hits_the_shrink_fixed_point` asserts
-/// the no-half-core invariant, but it sits at the fixed point: `to_free` is
+/// `smt_allocation_hits_the_shrink_fixed_point` used to carry the
+/// no-half-core invariant, but it sits at the fixed point: `to_free` is
 /// zero, so the core-granular shrink and grow loops never execute and the
-/// invariant is never put at risk. Sabotaging those loops to release a single
+/// invariant was never put at risk. Sabotaging those loops to release a single
 /// thread instead of a whole core left all 32 tests green — the assertion was
-/// unreachable. This test exists because of that.
+/// unreachable. This test exists because of that, and that assertion has since
+/// been removed from the fixed-point test so only this one carries it.
 ///
 /// Construction, chosen so a transfer is possible at all under SMT:
 ///   - 8 CPUs = 4 cores, `alloc_unit` 2.
@@ -1654,7 +1764,7 @@ fn smt_core_transfer_moves_whole_cores_only() {
             // = 1 core). `with_cpus` cannot be used here: the control loop
             // refuses to resize an explicitly pinned layer, which is correct
             // and is itself asserted by
-            // `cpuset_growth_is_rejected_instead_of_approximated`.
+            // `pinned_layer_growth_is_rejected_instead_of_silently_resized`.
             .with_weight(100),
         LayerSpec::new("idle", LayerKind::Grouped)
             .with_or(Vec::new())

@@ -9,18 +9,24 @@ You are bringing a sched_ext scheduler (`scx/scheds/rust/scx_<name>/`) up
 inside scxsim so its **real BPF logic executes** under simulation.
 
 This skill was distilled immediately after `scx_layered` was brought up end to
-end. **Five** wrappers are in the tree — `cosmos`, `lavd`, `mitosis`,
-`simple`, `tickless` — auto-discovered by the Makefile from `*/wrapper.c`:
+end. **Six** wrappers are in the tree — `cosmos`, `lavd`, `layered`,
+`mitosis`, `simple`, `tickless` — auto-discovered by the Makefile from
+`*/wrapper.c`:
 
 ```make
 SCHEDS := $(patsubst %/wrapper.c,%,$(wildcard */wrapper.c))
 ```
 
 so a new directory containing a `wrapper.c` is all it takes to be built.
-(`layered` is a sixth, but it lives on an unlanded branch; where this document
-cites it, that is where to look.) Comparing across them is what separates the
-general from the scheduler-specific. Everything in the trap catalogue cost
-someone real time.
+Comparing across them is what separates the general from the
+scheduler-specific. Everything in the trap catalogue cost someone real time.
+
+Do not take the count on faith — it was wrong in an earlier revision of this
+file. Check it:
+
+```sh
+ls -d scx-sim/schedulers/*/wrapper.c | wc -l
+```
 
 This skill is the reconciliation of two independently written versions — see
 the closing note for what came from where.
@@ -342,14 +348,30 @@ it was written for. It is simultaneously too broad and ineffective.
 | cosmos | forces `1` | historical — but note cosmos *also* does the right thing by defining `scx_bpf_cpu_node()`, which is what actually makes its modern branch work |
 | layered | **not forced** | the pattern to copy |
 
-layered is the instructive case for why a blanket force cannot be right:
-`scx_bpf_cpu_curr` and `scx_bpf_reenqueue_local___v2___compat` **are** exported
-by scxsim (so the modern paths must run), while `scx_bpf_task_set_slice___new`
-is **not** (so that one must fall back to the direct `p->scx.*` write). Forcing
-`1` makes the second group jump through a NULL weak symbol; forcing `0` makes
-the first group take a dead fallback (`scx_bpf_reenqueue_local___v1` is NULL →
-SIGSEGV). No single constant is correct for both groups — which is the general
-case, not a layered quirk.
+layered is the instructive case for why a blanket force cannot be right. As
+of this writing, `nm -D --defined-only target/debug/scxsim` says:
+
+| symbol | exported by scxsim? | consequence |
+|---|---|---|
+| `scx_bpf_cpu_curr` | **yes** | modern path must run |
+| `scx_bpf_dsq_peek` | **yes** | modern path must run |
+| `scx_bpf_reenqueue_local___v1` | **yes** | legacy fallback is safe to take |
+| `scx_bpf_reenqueue_local___v2___compat` | **yes** | modern path must run |
+| `scx_bpf_task_set_slice___new` | **no** | must fall back to a direct `p->scx.*` write |
+| `scx_bpf_task_set_dsq_vtime___new` | **no** | same |
+| `scx_bpf_cpu_node` | **no** (except where a wrapper defines it — cosmos does) | must fall back |
+
+Forcing `1` makes every symbol in the "no" rows jump through a NULL weak
+symbol and SIGSEGV; forcing `0` sends the "yes" rows down legacy paths the
+simulator supports perfectly well. No single constant is correct for both
+groups — which is the general case, not a layered quirk.
+
+**Re-derive that table from the binary, do not trust it.** An earlier revision
+of this file asserted `scx_bpf_reenqueue_local___v1` was NULL and would
+SIGSEGV; `nm` shows it as a defined text symbol, and always did. That error is
+the exact failure this section and §3 exist to prevent — reasoning about
+capabilities from source rather than reading them out of what was built. If
+this skill can make that mistake, so can you.
 
 **Default: leave it alone.** If you genuinely need an override, make it **per
 symbol**, never blanket, and put the reason in the code next to it, stating
@@ -545,8 +567,8 @@ Always set `.detect_bpf_errors()` so a `scx_bpf_error` fails the test.
 mechanism must engage and once where it must not:
 
 ```
---antistall-sec 0     -> GSTAT_ANTISTALL == 589   (engaged)
---antistall-sec 3600  -> GSTAT_ANTISTALL == 0     (identical workload)
+layered_set_antistall(true, 0, ..)    -> GSTAT_ANTISTALL == 589  (engaged)
+layered_set_antistall(true, 3600, ..) -> GSTAT_ANTISTALL == 0    (identical workload)
 ```
 The second arm *is* the test. Without it you are asserting on a counter that
 might increment unconditionally.
@@ -744,9 +766,15 @@ cosmos's `scx_bpf_cpu_node()` as the worked example and the ~31-symbol
 blast-radius argument; the config-globals prefer-disabling rule; and
 `sim_wrapper.h` authoritative.
 
-Corrected during reconciliation: the claim that six wrappers are in the tree —
-there are **five**, with `layered` on an unlanded branch. Verified against
-`integration`. The two versions' `bpf_ksym_exists` guidance also disagreed in
-emphasis; the capability version's rule is stronger and now leads, with the
-per-wrapper table retained as historical reading rather than as a
-recommendation.
+Corrected during reconciliation: a wrapper-count claim that had been wrong in
+both directions. It is **six** including `layered`, which landed with PR #64;
+an intermediate revision said five on the basis that `layered` was unlanded,
+which was true when written and stale by the time it merged. Hence the
+`ls | wc -l` check above rather than a number to trust. The two versions'
+`bpf_ksym_exists` guidance also disagreed in emphasis; the capability
+version's rule is stronger and now leads, with the per-wrapper table retained
+as historical reading rather than as a recommendation.
+
+Corrected during the PR #64 pre-land review: the claim that
+`scx_bpf_reenqueue_local___v1` is NULL and SIGSEGVs. It is exported by
+`kfuncs.rs` and has a unit test. Replaced with a table read out of `nm`.

@@ -1458,11 +1458,14 @@ impl DynamicScheduler {
     /// on real topology.
     ///
     /// # Optional userspace control loop
-    /// CPU allocation remains static unless
-    /// [`DynamicScheduler::layered_enable_control_loop`] is called. The first
-    /// Tier-3 increment supports live reallocation only for one harness NUMA
-    /// node, no SMT, and Linear growth; unsupported configurations fail when
-    /// enabling the loop.
+    /// CPU allocation remains static — a weight-proportional slice computed
+    /// once before `ops.init` — unless
+    /// [`DynamicScheduler::layered_enable_control_loop`] is called. The loop
+    /// reallocates live from measured usage on multi-LLC, multi-node and SMT
+    /// topologies, running upstream's own `alloc.rs` and
+    /// `layer_core_growth.rs`. Configurations it cannot honestly serve
+    /// (`CpuSetSpread*`, multi-LLC `StickyDynamic`, an explicitly pinned
+    /// layer) fail when enabling the loop rather than being approximated.
     pub fn layered(nr_cpus: u32) -> Self {
         let dir = env!("SCHEDULER_SO_DIR");
         Self::load(&format!("{dir}/libscx_layered.so"), "layered", nr_cpus)
@@ -1508,21 +1511,33 @@ impl DynamicScheduler {
             "an SMT core may not cross an LLC boundary"
         );
         let sched = Self::layered(nr_cpus);
-        type SetTopologyFn = unsafe extern "C" fn(u32, u32, u32, u32);
+        type SetTopologyFn = unsafe extern "C" fn(u32, u32, u32, u32) -> u32;
         // SAFETY: Symbol resolved from a `.so` built by our build system.
-        unsafe {
+        let effective_nodes = unsafe {
             let sym: libloading::Symbol<SetTopologyFn> = sched
                 ._lib
                 .get(b"layered_set_topology")
                 .expect("layered_set_topology not found");
-            (sym)(nr_cpus, cpus_per_llc, nr_numa_nodes, threads_per_core);
-        }
+            (sym)(nr_cpus, cpus_per_llc, nr_numa_nodes, threads_per_core)
+        };
+        // The wrapper clamps the requested node count against MAX_NUMA_NODES
+        // and the LLC count, and returns what it actually published. Adopt
+        // that rather than re-deriving it here: the control loop indexes
+        // per-node usage arrays laid out by the wrapper, so two independent
+        // clamps would let us read a node partition the scheduler does not
+        // share — silently, and only on topologies large enough to trip the
+        // difference.
+        assert!(
+            effective_nodes > 0,
+            "layered_set_topology rejected nr_cpus={nr_cpus} (exceeds the \
+             wrapper's LAYERED_MAX_SIM_CPUS); no topology was published"
+        );
         {
             let mut userspace = sched.layered_userspace.lock().unwrap();
             let state = userspace.as_mut().expect("layered userspace state missing");
             state.cpus_per_llc = cpus_per_llc;
             state.nr_llcs = nr_cpus.div_ceil(cpus_per_llc);
-            state.nr_numa_nodes = nr_numa_nodes.clamp(1, state.nr_llcs.min(4));
+            state.nr_numa_nodes = effective_nodes;
             state.threads_per_core = threads_per_core;
         }
         sched
@@ -1634,6 +1649,25 @@ impl DynamicScheduler {
         let state = userspace.as_mut().expect("layered userspace state missing");
         state.specs = specs.to_vec();
         state.control = None;
+    }
+
+    /// The node count the userspace control loop indexes its per-node usage
+    /// arrays by.
+    ///
+    /// Must equal `LayeredProbes::nr_nodes()`, the count the scheduler itself
+    /// sees. They are the same number by construction — this returns what
+    /// [`Self::layered_with_topology`] adopted from the wrapper — and
+    /// `control_loop_and_scheduler_agree_on_the_node_partition` holds it
+    /// there.
+    ///
+    /// # Panics
+    /// Panics if this is not an scx_layered scheduler.
+    pub fn layered_nr_numa_nodes(&self) -> u32 {
+        let userspace = self.layered_userspace.lock().unwrap();
+        userspace
+            .as_ref()
+            .expect("not an scx_layered scheduler")
+            .nr_numa_nodes
     }
 
     /// Enable scx_layered's periodic userspace CPU-reallocation loop.

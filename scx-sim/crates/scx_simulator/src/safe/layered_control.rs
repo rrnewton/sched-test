@@ -564,6 +564,46 @@ mod tests {
         LayeredControl::new(100_000_000, 4, 4, 1, 1, vec![spec]);
     }
 
+    /// The loop cannot resize a layer whose CPU set userspace pinned
+    /// explicitly, so it must refuse rather than quietly resize it anyway.
+    #[test]
+    #[should_panic(expected = "cannot resize explicitly pinned layer")]
+    fn pinned_layer_growth_is_rejected_instead_of_silently_resized() {
+        let mut spec = LayerSpec::new("pinned", LayerKind::Grouped).with_util_range(0.8, 0.9);
+        spec.cpus = Some(vec![crate::CpuId(0), crate::CpuId(1)]);
+        LayeredControl::new(100_000_000, 4, 4, 1, 1, vec![spec]);
+    }
+
+    /// `StickyDynamic` needs production's runtime LLC-trading loop, which only
+    /// has anything to trade when there is more than one LLC. Single-LLC is
+    /// therefore accepted and multi-LLC refused — assert both halves, since a
+    /// blanket refusal would also satisfy the refusal half alone.
+    #[test]
+    fn sticky_dynamic_is_refused_on_multiple_llcs_and_allowed_on_one() {
+        let spec = || {
+            let mut s = LayerSpec::new("sticky", LayerKind::Grouped).with_util_range(0.8, 0.9);
+            s.growth_algo = LayerGrowthAlgo::StickyDynamic;
+            s
+        };
+        // One LLC covering all 4 CPUs: nothing to trade, so it is allowed.
+        LayeredControl::new(100_000_000, 4, 4, 1, 1, vec![spec()]);
+
+        // Two LLCs of 2: must refuse.
+        let err = std::panic::catch_unwind(|| {
+            LayeredControl::new(100_000_000, 4, 2, 1, 1, vec![spec()]);
+        })
+        .expect_err("StickyDynamic on 2 LLCs must be refused, not approximated");
+        let msg = err
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| err.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        assert!(
+            msg.contains("StickyDynamic on multiple LLCs"),
+            "refused for the wrong reason: {msg}"
+        );
+    }
+
     /// The policy is compiled from this exact file. Guard the virtual cgroup
     /// boundary too: a future direct host filesystem read must fail here
     /// instead of making simulation results machine-dependent.

@@ -2,8 +2,11 @@
 
 **For:** the next agent (codex 5.6) picking this up cold.
 **From:** tg `layered-tier3-drive`, 2026-08-12.
-**Branch:** `feat/layered-support` in `worktrees/layered`. Not pushed.
-**Base:** rebased cleanly onto `integration` `2bf12ea` (local/origin/mirror).
+**Status:** SUPERSEDED as a handoff — Tier 3 was completed by the original
+agent after the codex handoff was aborted. Kept as the Tier-3 design record
+and capability statement (§9 is the authoritative capability statement).
+Sections describing "what remains" are historical unless marked otherwise.
+**Branch:** `feat/layered-support`, landed into `integration` via PR #64.
 **scx submodule:** pinned at the committed gitlink `59c30bae`. Do **not**
 commit a pin bump.
 
@@ -31,7 +34,7 @@ periodic live reallocation for a source-guarded one-LLC/no-SMT `Linear` subset.
 | `8a1416a` | **Tier 3 step 2:** periodic control, measured usage, flat Linear reallocation, real BPF refresh |
 | `9b60292` | one-LLC support fence lint cleanup |
 
-Suite: **1122 tests pass, 14 skipped.** `./validate.sh` passes after the
+Suite: **1129 tests pass, 14 skipped.** `./validate.sh` passes after the
 rebase, including fmt, clippy with warnings denied, nextest, doc tests, stress
 smoke tests, and `mypy --strict`. It reports only its standard optional skips:
 e9-instrumented schedulers, e9 stress mode, and the absent release-only ASLR
@@ -51,7 +54,7 @@ Full Tier 3 = the userspace CPU-reallocation control loop: ~2500 lines of
 | Piece | State |
 |---|---|
 | `alloc.rs` (~2500 lines) — the water-fill allocator | **linked and running**, with its own 80 tests |
-| `layer_core_growth.rs` (~1300 lines) — growth algorithms / core ordering | **Narrow subset only.** One-LLC/no-SMT Linear is specialized from the upstream formula and source-guarded; every other mode is rejected. Full module integration remains. |
+| `layer_core_growth.rs` (~1300 lines) — growth algorithms / core ordering | **linked and running**, compiled verbatim via the `scx_layered_growth` crate. 12 of 16 `LayerGrowthAlgo` variants execute upstream's real ordering; the 3 `CpuSetSpread*` and multi-LLC `StickyDynamic` are refused. Unlike `alloc.rs`, upstream's own 43 tests in this file do NOT run — the crate shims the whole `scx_utils` namespace, so they cannot compile. |
 | Periodic control hook in the engine | **done.** Generic optional scheduler userspace event; no events for schedulers that do not opt in. |
 | Utilisation measurement feeding the loop | **done for owned/open CPU time.** Reads cumulative real `cpu_ctx.layer_usages` and applies production's 100ms EWMA shape. |
 | Target/demand glue | **done for the narrow subset.** util band, cpus range, shrink dampening, single-node demand into real `unified_alloc`. Peak util, membw and pinned-util priority remain. |
@@ -116,10 +119,11 @@ and runs the real syscall programs.
 
 The next increments, in priority order:
 
-1. Integrate upstream `layer_core_growth.rs` (or a pure upstream refactor)
-   so Reverse/Topo/RoundRobin/Sticky and topology-aware selection execute
-   without a local policy copy. The current flat Linear specialization has a
-   source drift guard and rejects every other algorithm.
+1. ~~Integrate upstream `layer_core_growth.rs`~~ **DONE** — linked verbatim
+   via the `scx_layered_growth` crate; Reverse/Topo/RoundRobin/Sticky and
+   topology-aware selection all execute upstream's own code. What remains is
+   getting upstream's 43 in-file tests to run, which needs the crate to stop
+   shimming `scx_utils`.
 2. Add pinned-util demand priority. On one node it matters when demand
    exceeds capacity, even though there is no placement choice between nodes.
 3. Add optional peak-util and memory-bandwidth sizing only when their real
@@ -250,7 +254,8 @@ These are the traps already paid for. None are guessable from the code.
 - Work only in `worktrees/layered`. Never write in `sched-test1`.
 - Do **not** commit an scx submodule pin.
 - No host-specific absolute paths in committed files.
-- **Do not push** — the feature branch name needs review first.
+- ~~Do not push~~ — superseded: under the owner's standing policy every agent
+  owns its branch through to a landed PR.
 - Do not self-close the tg task.
 - File beads for out-of-scope findings. Relevant ones from this work:
   `sim-lqyu9` (userspace control-loop substrate — implemented by step 2),
@@ -264,14 +269,14 @@ These are the traps already paid for. None are guessable from the code.
 
 | Path | Role |
 |---|---|
-| `schedulers/layered/wrapper.c` | plays scx_layered's userspace; publishes topology + layers, exports probes. ~1500 lines. |
+| `schedulers/layered/wrapper.c` | plays scx_layered's userspace; publishes topology + layers, exports probes. ~2000 lines. |
 | `crates/scx_simulator/src/safe/layered.rs` | `LayerSpec`/`LayerMatch`/`LayerKind` — the layer-config API. |
 | `crates/scx_simulator/src/safe/layered_alloc.rs` | vendored `largest_remainder` + provenance. |
 | `crates/scx_simulator/src/safe/mod.rs` | declares `layered_alloc_upstream` via `#[path]`. |
 | `crates/scx_simulator/src/unsafe_impl/ffi.rs` | `DynamicScheduler::layered*` constructors and config entry points. |
 | `crates/scx_simulator/src/unsafe_impl/probes.rs` | `LayeredProbes` — read-only scheduler state. |
 | `crates/scx_simulator/src/safe/engine.rs` | event loop; where a periodic hook goes. |
-| `crates/scx_simulator/tests/layered.rs` | 27 Tier-1/2 tests. |
+| `crates/scx_simulator/tests/layered.rs` | 35 Tier-1/2/3 tests. |
 | `crates/scx_simulator/tests/layered_alloc.rs` | allocator drift guard + entry-point tests. |
 
 Build: `cargo build --workspace`. Test: `cargo nextest run --workspace`.
@@ -295,11 +300,13 @@ The most expensive knowledge to re-derive. Each cost real time.
    (`bpf_skel.rs` / `bpf_intf.rs`), needing a full BPF build (bpftool +
    clang BPF target) at scxsim build time, plus libbpf-rs, nvml-wrapper,
    fb_procfs and inotify. Compiling the pure algorithm modules directly is
-   the only tractable route. **This is also why `layer_core_growth.rs` is
-   not linked** — unlike `alloc.rs` it needs `scx_utils::Topology`,
-   `CpuPool` and `bpf_intf`, all behind that wall. Assess it before
-   promising a date: it may need `CpuPool` vendored the way
-   `largest_remainder` was, or may not be worth linking at all.
+   the only tractable route. This was originally why `layer_core_growth.rs`
+   looked unlinkable — unlike `alloc.rs` it needs `scx_utils::Topology`,
+   `CpuPool` and `bpf_intf`, all behind that wall. **Resolved:** the
+   `scx_layered_growth` crate supplies those containers itself
+   (`extern crate self as scx_utils`) and compiles the upstream file verbatim
+   on top. The cost of that trick is that upstream's own tests in the file
+   cannot compile against the shim.
 
 3. **Hand-copying upstream code does not survive review.** The vendored
    `largest_remainder` was transcribed by hand and silently differed
@@ -405,7 +412,10 @@ These abort with a clear message rather than degrading:
 - **`StickyDynamic` on multiple LLCs** — needs production's runtime
   LLC-trading loop.
 - **Resizing an explicitly pinned layer** (`with_cpus`) — refused by design.
-- **Full `layer_core_growth` policy beyond flat Linear** — mb sim-juru9.
+
+Not on this list, because it is NOT a limitation: full `layer_core_growth`
+runs. mb sim-juru9 tracked the old flat-Linear specialization and is closed by
+this work.
 
 ### Known behavioural limitation, faithfully reproduced
 
@@ -413,7 +423,7 @@ With SMT, a layer at 2 cores whose target is 1 core **cannot shrink**:
 CPU-space dampening (`4 - ceil(2/2) = 3`) then `div_ceil(au)` rounds back to
 2 cores. This is upstream's behaviour, verified against
 `main.rs::refresh_cpumasks()`, and is pinned by
-`smt_allocation_keeps_whole_cores_and_hits_the_shrink_fixed_point` so a
+`smt_allocation_hits_the_shrink_fixed_point` so a
 simulator-side "fix" would fail loudly as a divergence. mb sim-klue5.
 
 ### Is `growth_denied` sufficient for the NUMA acceptance criterion?

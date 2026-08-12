@@ -24,9 +24,13 @@
  * -------------------------------------------------------------------
  * 1. CPU REALLOCATION. The optional Tier-3 userspace loop measures the real
  *    BPF usage counters and periodically republishes masks through the same
- *    BPF_PROG_RUN tail as production. Its first increment is deliberately
- *    limited to flat, non-SMT Linear growth; unsupported configurations are
- *    rejected before a run instead of being approximated.
+ *    BPF_PROG_RUN tail as production. It runs upstream's real `alloc.rs`
+ *    and `layer_core_growth.rs` on multi-LLC / multi-node / SMT topologies.
+ *    `calc_raw_demands` is the one reimplemented piece; `CpuSetSpread*`,
+ *    multi-LLC `StickyDynamic` and resizing an explicitly pinned layer are
+ *    rejected before a run instead of being approximated. WITHOUT the loop
+ *    the allocation is a weight-proportional slice computed once, where
+ *    production would size from measured utilization.
  * 2. NUMA. The scxsim engine models LLCs and SMT siblings but has no NUMA
  *    concept at all, so `nr_numa_nodes` is a harness-supplied grouping over
  *    LLCs with no simulated distance cost. Same shape as the existing
@@ -1502,24 +1506,48 @@ int layered_set_layer_cpus(unsigned int layer_id, const unsigned long long *word
  * Compute the static CPU allocation for every layer that did not get an
  * explicit set, then publish it into `struct layer`.
  *
- * OPEN layers may run anywhere by definition, so they get every CPU.
- * GROUPED / CONFINED layers get a contiguous, weight-proportional slice —
- * the steady state scx_layered's allocator converges toward for a uniform
- * workload, computed once instead of continuously. Every layer is guaranteed
- * at least one CPU so no layer's DSQ can be permanently unservable.
+ * EVERY auto-allocated layer, open included, gets a contiguous
+ * weight-proportional slice — the steady state scx_layered's allocator
+ * converges toward for a uniform workload, computed once instead of
+ * continuously. Each is guaranteed at least one CPU so no layer's DSQ can be
+ * permanently unservable. Open layers then additionally absorb whatever the
+ * split left unassigned.
+ *
+ * The load-bearing property is that an open layer does NOT hold a CPU some
+ * other layer was allocated. `main.rs::refresh_cpumasks()` ends with "Give
+ * the rest to the open layers" (main.rs:4065-4085), handing an open layer
+ * `cpu_pool.available_cpus() & allowed_cpus` — the UNALLOCATED pool, never
+ * the whole machine. That matters here because `layer->cpus` and
+ * `nr_llc_cpus` bound `pick_idle_cpu()`'s search: an open layer given every
+ * CPU poaches idle CPUs upstream reserves for the layer sitting on them.
+ *
+ * Where this still differs from production, and why: upstream sizes the
+ * non-open layers from measured UTILIZATION and hands open layers the
+ * genuine remainder, so an idle confined layer leaves a large free pool.
+ * A static allocation has no utilization to read, so it substitutes weight
+ * — which is what the Tier-3 control loop in `layered_control.rs` replaces
+ * as soon as it is enabled, using real per-layer usage.
+ *
+ * With a single catch-all open layer — the default `layered_setup()`
+ * installs — the split gives it everything, which is also what upstream's
+ * fully-available pool gives it. The two agree exactly in that case.
  */
 static void layered_auto_allocate_cpus(u32 nr_cpus)
 {
+	bool allocated[MAX_CPUS] = {};
 	u32 total_weight = 0, assigned = 0, id, cpu;
+	bool any_open = false;
 
 	for (id = 0; id < nr_layers; id++) {
-		if (layered_layer_cpus_explicit[id])
-			continue;
-		if (layers[id].kind == LAYER_KIND_OPEN) {
-			for (cpu = 0; cpu < nr_cpus; cpu++)
-				layered_layer_set_cpu(id, cpu);
+		if (layered_layer_cpus_explicit[id]) {
+			/* Explicit sets hold their CPUs out of the pool. */
+			for (cpu = 0; cpu < nr_cpus && cpu < MAX_CPUS; cpu++)
+				if (layered_layer_test_cpu(id, cpu))
+					allocated[cpu] = true;
 			continue;
 		}
+		if (layers[id].kind == LAYER_KIND_OPEN)
+			any_open = true;
 		total_weight += layers[id].weight;
 	}
 	if (!total_weight)
@@ -1528,8 +1556,7 @@ static void layered_auto_allocate_cpus(u32 nr_cpus)
 	for (id = 0; id < nr_layers; id++) {
 		u32 share;
 
-		if (layered_layer_cpus_explicit[id] ||
-		    layers[id].kind == LAYER_KIND_OPEN)
+		if (layered_layer_cpus_explicit[id])
 			continue;
 
 		share = (nr_cpus * layers[id].weight) / total_weight;
@@ -1538,9 +1565,24 @@ static void layered_auto_allocate_cpus(u32 nr_cpus)
 		if (assigned + share > nr_cpus)
 			share = assigned < nr_cpus ? nr_cpus - assigned : 1;
 
-		for (cpu = 0; cpu < share; cpu++)
-			layered_layer_set_cpu(id, (assigned + cpu) % nr_cpus);
+		for (cpu = 0; cpu < share; cpu++) {
+			u32 c = (assigned + cpu) % nr_cpus;
+
+			layered_layer_set_cpu(id, c);
+			if (c < MAX_CPUS)
+				allocated[c] = true;
+		}
 		assigned += share;
+	}
+
+	/* "Give the rest to the open layers." */
+	for (id = 0; any_open && id < nr_layers; id++) {
+		if (layered_layer_cpus_explicit[id] ||
+		    layers[id].kind != LAYER_KIND_OPEN)
+			continue;
+		for (cpu = 0; cpu < nr_cpus && cpu < MAX_CPUS; cpu++)
+			if (!allocated[cpu])
+				layered_layer_set_cpu(id, cpu);
 	}
 }
 
@@ -1601,6 +1643,36 @@ static int layered_refresh_published_cpumasks(bool init)
 }
 
 /*
+ * Tell BPF whether every CPU is spoken for, mirroring the block at the end of
+ * `main.rs::refresh_cpumasks()` (main.rs:3966-3978).
+ *
+ * `pick_idle_cpu()` reads this: a GROUPED layer with `idle_confined` set is
+ * allowed onto other layers' unprotected idle CPUs once there is nowhere left
+ * to grow (main.bpf.c:1455-1457). Leaving it false — as the static Tier-2
+ * path did before this was hoisted out of the control loop — silently
+ * withholds that fallback on a saturated machine.
+ *
+ * Two details are upstream's and deliberate: the sum runs over ALL layers
+ * including open ones (open layers absorb the free pool, so a fully-absorbed
+ * pool genuinely means no room to grow), and the flag is written only to
+ * non-open layers.
+ */
+static void layered_publish_fully_allocated(void)
+{
+	u32 allocated = 0, id;
+	bool fully_allocated;
+
+	for (id = 0; id < nr_layers; id++)
+		allocated += layers[id].nr_cpus;
+
+	fully_allocated = allocated >= layered_nr_sim_cpus;
+	for (id = 0; id < nr_layers; id++) {
+		if (layers[id].kind != LAYER_KIND_OPEN)
+			layers[id].fully_allocated = fully_allocated;
+	}
+}
+
+/*
  * Publish masks computed by the Rust userspace control loop, then execute the
  * real BPF syscall programs that production drives with BPF_PROG_RUN.
  */
@@ -1609,8 +1681,6 @@ int layered_apply_layer_cpumasks(const unsigned long long *words,
 				 unsigned int nr_words)
 {
 	u32 id, w;
-	u32 allocated = 0;
-	bool fully_allocated;
 	bool updated = false;
 
 	if (!words || input_nr_layers != nr_layers || nr_words > MAX_CPUS / 64)
@@ -1633,15 +1703,9 @@ int layered_apply_layer_cpumasks(const unsigned long long *words,
 			layered_publish_layer_cpus(id, layered_nr_sim_cpus);
 			updated = true;
 		}
-		if (layers[id].kind != LAYER_KIND_OPEN)
-			allocated += layers[id].nr_cpus;
 	}
 
-	fully_allocated = allocated >= layered_nr_sim_cpus;
-	for (id = 0; id < nr_layers; id++) {
-		if (layers[id].kind != LAYER_KIND_OPEN)
-			layers[id].fully_allocated = fully_allocated;
-	}
+	layered_publish_fully_allocated();
 
 	return updated ? layered_refresh_published_cpumasks(false) : 0;
 }
@@ -1732,14 +1796,24 @@ static void layered_finalize_layer_rodata(void)
  * Publish the topology tables. Callable from Rust after load and before
  * Simulator::run(); `layered_setup()` calls it with a flat 1-LLC / 1-node /
  * no-SMT layout so the scheduler is usable without any extra configuration.
+ *
+ * Returns the EFFECTIVE node count after clamping, which the caller must
+ * adopt as its own view of the node partition. Returning it is what keeps
+ * the two views from diverging: the Rust control loop indexes per-node
+ * usage arrays that this function lays out, so a caller that kept its
+ * requested value would silently read a different partition than the one
+ * the scheduler sees.
  */
-void layered_set_topology(unsigned int nr_cpus, unsigned int cpus_per_llc,
-			  unsigned int nr_numa_nodes, unsigned int threads_per_core)
+unsigned int layered_set_topology(unsigned int nr_cpus, unsigned int cpus_per_llc,
+				  unsigned int nr_numa_nodes,
+				  unsigned int threads_per_core)
 {
 	u32 cpu, llc, node, total_llcs;
 
+	/* 0 = rejected, nothing published. The caller must treat this as fatal
+	 * rather than proceed against whatever topology was there before. */
 	if (nr_cpus == 0 || nr_cpus > LAYERED_MAX_SIM_CPUS)
-		return;
+		return 0;
 	if (cpus_per_llc == 0)
 		cpus_per_llc = nr_cpus;
 	if (nr_numa_nodes == 0)
@@ -1828,6 +1902,8 @@ void layered_set_topology(unsigned int nr_cpus, unsigned int cpus_per_llc,
 		if (fallback_cpus[n] == 0)
 			fallback_cpus[n] = cpu;
 	}
+
+	return nr_numa_nodes;
 }
 
 /*
@@ -1928,6 +2004,7 @@ int layered_init(void)
 	layered_auto_allocate_cpus(layered_nr_sim_cpus);
 	for (id = 0; id < nr_layers; id++)
 		layered_publish_layer_cpus(id, layered_nr_sim_cpus);
+	layered_publish_fully_allocated();
 	layered_finalize_layer_rodata();
 
 	ret = layered_bpf_init();

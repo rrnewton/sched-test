@@ -2279,25 +2279,39 @@ impl<S: Scheduler> Simulator<S> {
         // Call exit_task for each task (mirrors kernel scheduler unload)
         {
             let cpu = s.sim.current_cpu;
-            let task_raws: Vec<(Pid, *mut c_void)> = shutdown_pids
+            let task_raws: Vec<(Pid, *mut c_void, bool)> = shutdown_pids
                 .iter()
-                .map(|&pid| (pid, s.tasks[&pid].raw()))
+                .map(|&pid| {
+                    let t = &s.tasks[&pid];
+                    (pid, t.raw(), t.enabled)
+                })
                 .collect();
-            for &(pid, raw) in &task_raws {
+            for &(pid, raw, enabled) in &task_raws {
                 // The kernel tears a task down as scx_disable_task() (which
                 // invokes ops.disable) followed by ops.exit_task. Keep that
                 // order: scx_layered's layered_disable() drops the task's
                 // layer membership that layered_exit_task() then frees.
-                debug!(pid = pid.0, "enter:structop disable");
-                start_rbc(&mut s.sim);
-                let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
-                sim_callback!(s, s, sim_arc, cpu, {
-                    self.scheduler.disable(TaskPtr::new(raw));
-                });
-                s.sim
-                    .trace
-                    .record(__local_t, cpu, TraceKind::Disable { pid });
-                charge_sched_time(&mut s.sim, CpuId(0), "disable");
+                //
+                // scx_disable_task() fires ops.disable only for a task in
+                // SCX_TASK_ENABLED — the state ops.enable moved it into.
+                // `enabled` is that bit here (set at the same point we call
+                // ops.enable). A task that never ran must NOT get a disable
+                // it was never enabled for: schedulers are entitled to
+                // assume the callbacks pair, and layered_disable() would be
+                // dropping layer membership that layered_enable() never
+                // established.
+                if enabled {
+                    debug!(pid = pid.0, "enter:structop disable");
+                    start_rbc(&mut s.sim);
+                    let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
+                    sim_callback!(s, s, sim_arc, cpu, {
+                        self.scheduler.disable(TaskPtr::new(raw));
+                    });
+                    s.sim
+                        .trace
+                        .record(__local_t, cpu, TraceKind::Disable { pid });
+                    charge_sched_time(&mut s.sim, CpuId(0), "disable");
+                }
 
                 debug!(pid = pid.0, "enter:structop exit_task");
                 start_rbc(&mut s.sim);
@@ -4993,12 +5007,26 @@ impl<S: Scheduler> Simulator<S> {
         let cross_llc = migrated
             && s.sim.cpus[task.prev_cpu.0 as usize].llc_id != s.sim.cpus[cpu.0 as usize].llc_id;
         task.prev_cpu = cpu;
-        // Clear runnable_at_ns: task is now running (watchdog reset).
+        // Task is now running. `runnable_at_ns == None` is this engine's
+        // SCX_TASK_RESET_RUNNABLE_AT: the next transition to runnable stamps
+        // a fresh time rather than keeping the old one.
+        //
+        // `p->scx.runnable_at` is deliberately NOT written here. The kernel
+        // does not clear it either — `set_next_task_scx()` calls
+        // `clr_task_runnable(p, true)`, which only sets
+        // SCX_TASK_RESET_RUNNABLE_AT and leaves the field holding the past
+        // jiffies at which this run episode became runnable
+        // (kernel/sched/ext: clr_task_runnable / set_task_runnable). What
+        // stops the timeout watchdog seeing a running task as stalled is the
+        // `list_del_init()` off rq->scx.runnable_list, not a sentinel value.
+        //
+        // The value matters: scx_layered's `get_delay_sec()` computes
+        // `(jiffies_now - runnable_at) / CONFIG_HZ` whenever
+        // `time_before(runnable_at, jiffies_now)`. Writing 0 here made every
+        // running task report a delay of the entire uptime; writing
+        // (u64)-1 would make it report none. Leaving the real past stamp is
+        // what yields the true wakeup-to-run latency the kernel exposes.
         task.runnable_at_ns = None;
-        // Same for the scheduler-visible `p->scx.runnable_at`. The kernel
-        // clears it in scx_running(); leaving a stale jiffies stamp behind
-        // would make a running task look permanently queued.
-        ffi::task_set_runnable_at(task.raw(), 0);
         s.sim.cpus[cpu.0 as usize].current_task = Some(pid);
         s.sim.cpus[cpu.0 as usize].prev_task = None;
         // Reset IRQ stolen time for this new run period.
