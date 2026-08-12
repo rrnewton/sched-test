@@ -48,14 +48,63 @@ CFLAGS_BASE := -fPIC -DSCX_BPF_UNITTEST -g -O2 \
 
 # --- Coverage support (opt-in via SCX_SIM_COVERAGE=1) ---
 ifeq ($(SCX_SIM_COVERAGE),1)
-CFLAGS_COV := -fprofile-instr-generate -fcoverage-mapping
-LDFLAGS_SO := -shared -fprofile-instr-generate
+CFLAGS_COV  := -fprofile-instr-generate -fcoverage-mapping
+LDFLAGS_COV := -fprofile-instr-generate
 else
-CFLAGS_COV :=
-LDFLAGS_SO := -shared -nostdlib
+CFLAGS_COV  :=
+LDFLAGS_COV :=
 endif
 
-CFLAGS := $(CFLAGS_BASE) $(CFLAGS_COV)
+# --- UndefinedBehaviorSanitizer (opt-in via SCX_SIM_UBSAN=1) ---
+#
+# Why: these .so files are BPF scheduler source compiled as ordinary
+# userspace C. BPF and C do not agree on everything, and where the C
+# standard says "undefined" the compiler is free to miscompile silently.
+# UBSan turns that silence into a diagnostic with a file:line.
+#
+# -fno-sanitize-recover=all IS LOAD-BEARING, DO NOT DROP IT. By default
+# UBSan prints "runtime error: ..." and CONTINUES, and the process still
+# exits 0. A gate built that way reports failures and passes anyway --
+# measured, not assumed: an injected shift-out-of-bounds printed its
+# diagnostic and the run still exited 0. With no-recover the first hit
+# aborts and the exit status is non-zero, so callers actually fail.
+#
+# Deliberately added to CFLAGS and NOT to CFLAGS_BASE. That is what keeps
+# sim_sigfpe.c, sim_rbc_trampoline.c and sim_deterministic_mem.c
+# uninstrumented, for exactly the reasons they are already excluded from
+# coverage: sim_sigfpe.c decodes x86 div at RIP and breaks if instruction
+# layout shifts, and the other two are branchless/hot-path by design.
+#
+# Linking: the default build is -nostdlib, which cannot host a sanitizer
+# runtime, so UBSan swaps it for the shared runtime. -shared-libsan is
+# required because the Rust host binary that dlopens these is NOT
+# sanitized, so the .so must carry its own runtime reference. The rpath
+# is computed from the compiler at build time rather than written down,
+# so no machine-specific path enters this file.
+#
+# CAVEAT -- do not combine with RBC replay. UBSan inserts conditional
+# branches, and this project counts retired conditional branches for
+# deterministic replay. A trace recorded from a UBSan build will not
+# replay against a non-UBSan build. Use UBSan to find UB, not to record.
+ifeq ($(SCX_SIM_UBSAN),1)
+CFLAGS_UBSAN  := -fsanitize=undefined -fno-sanitize-recover=all
+LDFLAGS_UBSAN := -fsanitize=undefined -shared-libsan \
+                 -Wl,-rpath,$(shell $(CC) -print-runtime-dir)
+else
+CFLAGS_UBSAN  :=
+LDFLAGS_UBSAN :=
+endif
+
+# -nostdlib is only correct when nothing needs a runtime. Coverage and UBSan
+# each bring one, and they compose, so decide from both rather than letting
+# whichever block is written last silently win.
+ifeq ($(strip $(LDFLAGS_COV)$(LDFLAGS_UBSAN)),)
+LDFLAGS_SO := -shared -nostdlib
+else
+LDFLAGS_SO := -shared $(LDFLAGS_COV) $(LDFLAGS_UBSAN)
+endif
+
+CFLAGS := $(CFLAGS_BASE) $(CFLAGS_COV) $(CFLAGS_UBSAN)
 
 # --- scx cgroup_bw API version detection ---
 #
@@ -152,7 +201,7 @@ E9PATCH ?= $(or $(wildcard $(SIMULATOR_DIR)/third_party/e9patch/e9patch),$(shell
 
 # --- Build rules ---
 
-.PHONY: all clean e9 e9-rip-trampoline $(SCHEDS)
+.PHONY: all clean ubsan e9 e9-rip-trampoline $(SCHEDS)
 
 ifeq ($(BPF_INCLUDE),)
 all:
@@ -167,6 +216,20 @@ $(foreach s,$(SCHEDS),$(eval $(s): $(BUILD_DIR)/libscx_$(s).so))
 
 clean:
 	rm -rf $(BUILD_DIR)
+
+# Build every scheduler with UBSan into a SEPARATE build dir, so the
+# instrumented .so files never get mistaken for the normal ones (they are not
+# interchangeable: see the RBC-replay caveat above).
+#
+# Run them with:
+#     scxsim run ... --scheduler-file <dir>/build-ubsan/libscx_<name>.so
+#
+# A hit aborts the run with a non-zero exit and a file:line diagnostic. If you
+# see "runtime error:" but a zero exit, -fno-sanitize-recover=all has been
+# dropped and the gate is no longer a gate.
+ubsan:
+	@$(MAKE) --no-print-directory SCX_SIM_UBSAN=1 BUILD_DIR=$(BUILD_DIR)-ubsan all
+	@echo "UBSan schedulers in $(BUILD_DIR)-ubsan (not interchangeable with $(BUILD_DIR))"
 
 # --- Object compilation ---
 

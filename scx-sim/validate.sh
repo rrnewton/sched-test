@@ -171,25 +171,47 @@ echo ""
 echo "=== Running ASLR stability test ==="
 # The ASLR test needs a release binary (it tests the re-exec path).
 RELEASE_BIN="target/release/scxsim"
-if [ -x "$RELEASE_BIN" ]; then
-    ./scripts/test_aslr.sh "$RELEASE_BIN"
-else
-    echo "  (skipped: $RELEASE_BIN not found; run: cargo build --release)"
-    record_skip "ASLR stability test (release binary not found)"
+# Build it rather than skipping. Whether this binary happens to be lying around
+# is a property of the developer's last command, not of the tree, so skipping on
+# its absence made the ASLR gate run on some machines and not others -- and CI,
+# which never builds release, would silently never run it at all.
+if [ ! -x "$RELEASE_BIN" ]; then
+    echo "  ($RELEASE_BIN not found — building it; the gate runs either way)"
+    cargo build --release -p scx_simulator --bin scxsim
 fi
+./scripts/test_aslr.sh "$RELEASE_BIN"
 
 echo ""
 ./scripts/typecheck.sh
 
-echo ""
-echo "=== All checks passed ==="
-
+# A skipped check is a FAILURE, not a footnote.
+#
+# CI runs this exact script (.github/workflows/simulator.yml runs `bash
+# validate.sh`), so the commands are identical by construction and the only way
+# local and CI can disagree is if one of them quietly ran less than the other.
+# This block used to print "All checks passed", warn about the skips, and exit
+# 0 -- so a run that never executed the ASLR gate was indistinguishable from a
+# run that passed it. "validate.sh is green" has to mean "CI will be green",
+# and it cannot mean that while green is reachable without running everything.
+#
+# There is deliberately NO opt-out. An env var that turns a skip back into a
+# zero exit would mean "validate.sh is green" depends on whether someone set
+# it -- which is the same silent-divergence this whole change exists to remove,
+# reintroduced as a flag. If something is missing, install it; every skip
+# message above names the command that fixes it.
 if [ ${#SKIPPED[@]} -gt 0 ]; then
     echo ""
     echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-    echo "!!! WARNING: The following checks were SKIPPED:"
+    echo "!!! The following checks were SKIPPED:"
     for skip in "${SKIPPED[@]}"; do
         echo "!!!   - $skip"
     done
     echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    echo ""
+    echo "ERROR: validate.sh is incomplete — ${#SKIPPED[@]} check(s) did not run,"
+    echo "       so this result says nothing about whether CI will pass."
+    exit 1
 fi
+
+echo ""
+echo "=== All checks passed ==="
