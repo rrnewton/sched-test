@@ -174,7 +174,7 @@ pub unsafe fn run_spinner_with_shutdown(
     verbose: bool,
 ) -> BenchmarkResults {
     use std::sync::atomic::Ordering;
-    
+
     let worker_start = Instant::now();
     let mut count: u64 = 0;
     let mut slices = Vec::new();
