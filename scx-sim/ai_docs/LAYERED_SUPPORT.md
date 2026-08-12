@@ -94,6 +94,7 @@ All of it is scheduler-agnostic and reusable:
 | `bpf_cpumask_full`, `bpf_task_acquire` | Two missing kfuncs. |
 | `cgrp->kn->name` | Cgroups had no directory-entry name, so any scheduler reconstructing a cgroup path saw an empty string. Now set from `CgroupDef::name`. |
 | `tp_btf` delivery | Generic optional `tp_cgroup_attach_task` / `tp_task_rename` hooks, resolved by symbol prefix like `futex_hook`. |
+| `scx_bpf_dump_bstr` capture | Was a no-op that discarded every scheduler's `ops.dump` output, making a faulting dump and a no-op dump indistinguishable. Now formats the BPF `bstr` ABI (`%[-+ #0][width][l\|ll]{d,i,u,x,s,c}`) into a per-run buffer readable via `kfuncs::dump_buffer_take()`. Benefits every scheduler's dump path. |
 | `Scenario::task_rename` | A `prctl(PR_SET_NAME)` event, so the rename tracepoint has something to deliver. |
 
 ### Two traps worth remembering
@@ -186,7 +187,15 @@ without the userspace join/leave protocol there is nothing to drive it.
   `LSTAT_YIELD_IGNORE`; `ops.disable` drops layer membership; `ops.dump`
   runs over a multi-layer, multi-LLC config.
 - **Antistall** — the timer fires and re-arms; disabling it stops the
-  re-arm after one fire.
+  re-arm after one fire; and, on a workload where a task's affinity excludes
+  every CPU of its confined layer, antistall actually *consumes* the delayed
+  DSQ (`GSTAT_ANTISTALL` > 0) with `--antistall-sec 0`, while the identical
+  workload with a one-hour threshold leaves the counter at zero. The paired
+  control is the point — without it the test would pass on a counter that
+  increments unconditionally.
+- **`ops.dump`** — asserts on the text layered actually emits (every layer
+  name, both fallback DSQs, and no unformatted printf spec surviving), not
+  merely that the dump does not fault.
 - **tp_btf** — cgroup migration and task rename both re-layer the task, in
   both directions. All four were verified non-vacuous by disabling the
   delivery call and confirming they fail.

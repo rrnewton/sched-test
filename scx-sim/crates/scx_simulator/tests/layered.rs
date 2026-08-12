@@ -834,6 +834,74 @@ fn antistall_timer_fires_and_rearms() {
     );
 }
 
+/// Firing the callback is not the same as antistall *doing* anything, so this
+/// drives the mechanism to an observable effect.
+///
+/// A task whose affinity ({2,3}) excludes every CPU of its confined layer
+/// ({0,1}) cannot be placed on a layer DSQ, so it queues on a fallback DSQ
+/// that the layer's own CPUs are not draining — exactly the starvation
+/// antistall exists to break. With eight competing hogs and
+/// `--antistall-sec 0`, `antistall_set()` must flag a CPU for the delayed DSQ
+/// and `antistall_consume()` must then drain it, bumping `GSTAT_ANTISTALL`.
+///
+/// The paired assertion is the point: the SAME workload with a one-hour
+/// `antistall_sec` must leave the counter at zero. Without that control the
+/// test would pass on a counter that increments unconditionally.
+#[test]
+fn antistall_consumes_a_delayed_dsq_only_past_the_delay_threshold() {
+    let _lock = common::setup_test();
+
+    fn run(antistall_sec: u64) -> (u64, u64) {
+        let sched = DynamicScheduler::layered(4);
+        sched.layered_layers(&[
+            LayerSpec::new("pinned", LayerKind::Confined)
+                .with_match(LayerMatch::CommPrefix("pin".into()))
+                .with_cpus(vec![CpuId(0), CpuId(1)]),
+            LayerSpec::catch_all("rest"),
+        ]);
+        // 50ms scan period (production hardcodes 15s) purely so the scan runs
+        // often enough within a 4s simulated run.
+        sched.layered_set_antistall(true, antistall_sec, Some(50_000_000));
+        let probes = LayeredProbes::new(&sched);
+
+        let mut b = Scenario::builder()
+            .cpus(4)
+            .detect_bpf_errors()
+            .task(pinned_task(
+                "pin_offside",
+                Pid(1),
+                workloads::cpu_bound(4_000_000_000),
+                vec![CpuId(2), CpuId(3)],
+            ));
+        for i in 0..8 {
+            b = b.add_task(&format!("hog{i}"), 0, workloads::cpu_bound(4_000_000_000));
+        }
+        let sim = Simulator::new(sched);
+        let t = sim.run(b.duration_ms(4000).build());
+        assert_eq!(t.exit_kind(), &ExitKind::Normal);
+        (
+            probes.timer_fires(),
+            probes.global_stat(GlobalStat::Antistall),
+        )
+    }
+
+    let (fires_hot, antistall_hot) = run(0);
+    assert!(fires_hot > 0, "the antistall scan never ran");
+    assert!(
+        antistall_hot > 0,
+        "antistall never consumed a delayed DSQ even with --antistall-sec 0; \
+         the scan ran ({fires_hot} times) but had no effect"
+    );
+
+    let (fires_cold, antistall_cold) = run(3600);
+    assert!(fires_cold > 0, "the antistall scan never ran (control)");
+    assert_eq!(
+        antistall_cold, 0,
+        "antistall fired despite a one-hour delay threshold — the counter is \
+         not actually gated on task delay"
+    );
+}
+
 /// With antistall disabled the callback still runs (the timer is armed
 /// unconditionally) but `antistall_scan()` returns 0 immediately, which stops
 /// the re-arm — so it fires exactly once.
@@ -866,12 +934,12 @@ fn disabled_antistall_stops_rearming_after_one_fire() {
 // ops.dump
 // ---------------------------------------------------------------------------
 
-/// `ops.dump` walks every layer, its per-LLC DSQs and both fallback DSQs. It
-/// only runs on scheduler exit/error, so the engine's shutdown dump is the
-/// only thing that exercises it — assert it does so without faulting on a
-/// non-trivial multi-layer, multi-LLC configuration.
+/// `ops.dump` walks every layer, its per-LLC DSQs and both fallback DSQs, and
+/// builds its per-match headers with `bpf_snprintf`. Assert on the text it
+/// actually emits, not merely that it does not fault: a no-op dump and a
+/// working dump are otherwise indistinguishable.
 #[test]
-fn ops_dump_runs_over_a_multi_layer_config() {
+fn ops_dump_emits_every_layer_and_both_fallback_dsqs() {
     let _lock = common::setup_test();
     let sched = DynamicScheduler::layered_with_topology(4, 2, 2, 1);
     sched.layered_layers(&[
@@ -896,6 +964,44 @@ fn ops_dump_runs_over_a_multi_layer_config() {
     let sim = Simulator::new(sched);
     let t = sim.run(scenario);
     assert_eq!(t.exit_kind(), &ExitKind::Normal);
+
+    let dump = scx_simulator::kfuncs::dump_buffer_take();
+    assert!(!dump.is_empty(), "ops.dump produced no output at all");
+    for layer in ["batch", "iface", "rest"] {
+        assert!(
+            dump.contains(layer),
+            "ops.dump never mentioned layer {layer:?}; it did not walk every \
+             layer.\n--- dump ---\n{dump}"
+        );
+    }
+    // Both per-LLC fallback DSQs are dumped by name.
+    assert!(
+        dump.contains("HI_") && dump.contains("LO_FALLBACK"),
+        "ops.dump did not report the hi/lo fallback DSQs.\n--- dump ---\n{dump}"
+    );
+    // No conversion specifier may survive into the output. This is the
+    // assertion that matters: a formatter that silently passes through the
+    // specs it does not understand looks identical to a working one until you
+    // check. (It caught a missing `+` flag, which left `%+lldms` in the dump.)
+    let leftovers: Vec<&str> = dump
+        .split('%')
+        .skip(1)
+        .filter(|tail| {
+            tail.chars()
+                .take_while(|c| "-+ #0123456789l".contains(*c))
+                .count()
+                < tail.len()
+                && tail
+                    .chars()
+                    .find(|c| !"-+ #0123456789l".contains(*c))
+                    .is_some_and(|c| "diuxscp".contains(c))
+        })
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "unformatted printf specs leaked into the dump — scx_bpf_dump_bstr \
+         formatting is incomplete: {leftovers:?}\n--- dump ---\n{dump}"
+    );
 }
 
 // ---------------------------------------------------------------------------

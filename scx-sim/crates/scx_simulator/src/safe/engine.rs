@@ -1409,6 +1409,9 @@ impl<S: Scheduler> Simulator<S> {
         // registered during scheduler setup() which happens before run_internal().
         // Clearing maps here would break map lookups in the scheduler.
         ffi::reset_task_state();
+        // ops.dump output accumulates in a thread-local; start each run empty
+        // so a test reads only its own dump.
+        kfuncs::dump_buffer_reset();
 
         let nr_cpus = scenario.nr_cpus;
         let smt = scenario.smt_threads_per_core;
