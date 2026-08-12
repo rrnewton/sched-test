@@ -30,10 +30,10 @@ pub enum LayerKind {
 
 /// How userspace grows a layer's CPU set — `enum layer_growth_algo`.
 ///
-/// The periodic Tier-3 control loop currently implements only `Linear` on a
-/// flat, non-SMT topology and rejects the other values rather than silently
-/// approximating them. Without that opt-in loop, this only affects the value
-/// published into `layer->growth_algo`.
+/// The periodic Tier-3 control loop executes the matching implementation from
+/// upstream `layer_core_growth.rs`. Algorithms that require simulator
+/// substrate which does not exist (`CpuSetSpread*`, and multi-LLC
+/// `StickyDynamic` trading) are rejected rather than approximated.
 ///
 /// [`DynamicScheduler::layered`]: crate::ffi::DynamicScheduler::layered
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,10 +45,32 @@ pub enum LayerGrowthAlgo {
     Linear = 1,
     /// Grow from the highest CPU id downward.
     Reverse = 2,
+    /// Random core selection within each node.
+    Random = 3,
     /// Grow in topology order (core, then LLC, then node).
     Topo = 4,
     /// Round-robin across LLCs.
     RoundRobin = 5,
+    /// Prefer big cores.
+    BigLittle = 6,
+    /// Prefer little cores.
+    LittleBig = 7,
+    /// Equal per-node allocation with linear intra-node order.
+    NodeSpread = 8,
+    /// Equal per-node allocation with reverse intra-node order.
+    NodeSpreadReverse = 9,
+    /// Equal per-node allocation with random intra-node order.
+    NodeSpreadRandom = 10,
+    /// Interleave cores across cgroup cpuset domains.
+    CpuSetSpread = 11,
+    /// Reverse-interleave cores across cgroup cpuset domains.
+    CpuSetSpreadReverse = 12,
+    /// Randomly interleave cores across cgroup cpuset domains.
+    CpuSetSpreadRandom = 13,
+    /// Random node, LLC, and core order.
+    RandomTopo = 14,
+    /// Dynamically trade whole LLCs between layers.
+    StickyDynamic = 15,
 }
 
 /// One match rule — a variant of scx_layered's `LayerMatch`.
@@ -200,6 +222,11 @@ pub struct LayerSpec {
     pub max_exec_ns: TimeNs,
     /// Growth algorithm published into `layer->growth_algo`.
     pub growth_algo: LayerGrowthAlgo,
+    /// Preferred NUMA nodes for topology-aware growth. These are harness
+    /// topology groups; scxsim does not model NUMA distance or memory cost.
+    pub nodes: Vec<usize>,
+    /// Preferred LLCs for topology-aware growth.
+    pub llcs: Vec<usize>,
     /// Match rules, as a list of OR groups whose members are ANDed.
     /// An empty outer list — or a single empty inner group — is the catch-all
     /// that matches every task.
@@ -227,6 +254,8 @@ impl LayerSpec {
             min_exec_ns: 0,
             max_exec_ns: 0,
             growth_algo: LayerGrowthAlgo::Linear,
+            nodes: Vec::new(),
+            llcs: Vec::new(),
             matches: Vec::new(),
             cpus: None,
         }
@@ -276,6 +305,24 @@ impl LayerSpec {
     /// Size a grouped layer from owned plus open CPU time, as production can.
     pub fn with_open_cputime(mut self, include: bool) -> Self {
         self.util_includes_open_cputime = include;
+        self
+    }
+
+    /// Select the real upstream core-growth algorithm.
+    pub fn with_growth_algo(mut self, growth_algo: LayerGrowthAlgo) -> Self {
+        self.growth_algo = growth_algo;
+        self
+    }
+
+    /// Prefer or restrict growth to the listed harness NUMA-node groups.
+    pub fn with_nodes(mut self, nodes: Vec<usize>) -> Self {
+        self.nodes = nodes;
+        self
+    }
+
+    /// Prefer the listed LLC ids for topology-aware growth.
+    pub fn with_llcs(mut self, llcs: Vec<usize>) -> Self {
+        self.llcs = llcs;
         self
     }
 
