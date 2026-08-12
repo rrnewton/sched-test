@@ -120,6 +120,22 @@ CARGO_PROFILE_DEV_DEBUG=line-tables-only \
     cargo llvm-cov nextest --workspace --no-fail-fast --no-report
 
 echo ""
+echo "=== Running feature-gated tests (not reachable from --workspace) ==="
+# `cargo nextest --workspace` builds with DEFAULT features, so any target with
+# required-features is silently never built. scxsim-workload-ir's
+# sched_basic_proportional is exactly that: required-features = ["ingest"],
+# which loads a real scheduler .so and RUNS a lowered ktstr scenario. Measured:
+# the package exposes 39 tests by default and 55 with the feature on, so 16
+# tests -- including the only end-to-end ktstr-on-simulator check -- had never
+# executed anywhere.
+#
+# Run as its own invocation rather than adding --all-features to the coverage
+# gate above: that gate feeds the ratchet, and turning on every optional feature
+# workspace-wide would move the coverage numbers it enforces for reasons
+# unrelated to anyone's change.
+cargo nextest run -p scxsim-workload-ir --features ingest --no-fail-fast
+
+echo ""
 echo "=== Running doc-tests ==="
 # nextest cannot run doctests, so they stay a separate run (the one sanctioned
 # `cargo test` use). Doctest-covered lines are not counted by the ratchet below.
