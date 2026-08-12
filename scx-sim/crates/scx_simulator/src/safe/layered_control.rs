@@ -261,7 +261,11 @@ impl LayeredControl {
             .map(|(idx, &(target, min))| {
                 let current = snapshot.cpu_masks[idx].iter().filter(|&&set| set).count();
                 if target < current {
-                    (current - (current - target).div_ceil(2), min)
+                    // Mirrors main.rs::refresh_cpumasks(): shrink only halfway
+                    // per cycle, but never below `min`. The `.max(min)` is
+                    // upstream's and was missing here.
+                    let dampened = current - (current - target).div_ceil(2);
+                    (dampened.max(min), min)
                 } else {
                     (target, min)
                 }
@@ -579,13 +583,20 @@ mod tests {
             "upstream growth added or removed a host /sys path: {sys_paths:?}"
         );
         assert!(sys_paths[0].contains("WalkDir::new(\"/sys/fs/cgroup\")"));
+        // Compare TRIMMED lines: the property being guarded is which `fs::`
+        // calls upstream makes, not how they are indented. Pinning the
+        // indentation makes the guard fail on a pure reformat, which trains
+        // readers to "fix" it by pasting in whatever upstream now says —
+        // exactly the reflex that would wave through a real new host read.
         let fs_calls: Vec<&str> = upstream
             .lines()
+            .map(str::trim)
             .filter(|line| line.contains("fs::"))
             .collect();
         assert_eq!(
             fs_calls,
-            ["                if let Ok(content) = fs::read_to_string(entry.path()) {"]
+            ["if let Ok(content) = fs::read_to_string(entry.path()) {"],
+            "upstream growth changed its filesystem access; review before updating this guard"
         );
 
         let adapter_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
