@@ -264,7 +264,7 @@ impl ActualizedCGroupTree {
         }
 
         // For each parent, compute sibling statistics
-        for (_parent_id, child_ids) in parent_map.iter() {
+        for child_ids in parent_map.values() {
             // Skip if only one child (no siblings)
             if child_ids.len() <= 1 {
                 continue;
