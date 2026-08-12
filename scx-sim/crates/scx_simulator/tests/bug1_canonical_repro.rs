@@ -279,17 +279,32 @@ fn parse_token_after(line: &str, key: &str) -> Option<String> {
 // Whether is_throttled==1 is genuinely-correct new behavior (update assertion)
 // or a scxsim accounting gap vs the new period_budget semantics (fix engine) is
 // tracked in minibeads sim-560f79.
-// Un-ignored 2026-08-12 after integration 37f7f8a fixed check_watchdog
-// reporting deliberate cgroup-bandwidth throttling as starvation (exit 42);
-// it then passed 20/20 locally. RE-IGNORED the same day: it passes on the dev
-// box and FAILS on CI with the opposite verdict (is_throttled 0 vs 1,
-// nr_throttled_tasks 0 vs 4), and the CI dump shows stack-address garbage in
-// the cgroup_bw period/burst fields. That is a real environment-dependent
-// defect, tracked as mb sim-1ei8j -- not a flaky test. It could only be seen
-// once PR #81 stopped the coverage gate dying in ld before any test ran.
+// Ignored pending mb sim-560f79 / mb sim-1ei8j. This is a DOCUMENTED OPEN
+// QUESTION, not a silent skip: end-of-run is_throttled is 0 on a dev box and
+// 1 on CI for the same commit, fixture and flags.
+//
+// History, because it has moved twice: sim-560f79 recorded it as
+// deterministically 1 after the June cgroup_bw rewrite. It was un-ignored on
+// 2026-08-12 once integration 37f7f8a fixed check_watchdog reporting
+// deliberate bandwidth throttling as starvation, after which it passed 20/20
+// locally -- and CI could not contradict that, because the coverage gate was
+// dying in ld before any test ran. Fixing that (PR #81) let CI run it, and it
+// failed there.
+//
+// Ruled out by experiment: host CPU count (316/4/2 via taskset), ASLR (on and
+// off), and repetition (20 runs) -- 0 every time locally. Remaining hypothesis
+// is toolchain codegen (CI: rustc 1.97.1 + Ubuntu clang; dev: 1.96.0 + clang
+// 18.1.8), which would make it kin to the upstream match_substr uninitialised
+// read (mb sim-hyr11). Not confirmed.
+//
+// The stack-address garbage in the CI dump's period/burst is a RED HERRING: an
+// upstream printf arity bug in one line of cbw_dump_cgroup_tree (mb sim-uv2ir),
+// diagnostic-only. The is_throttled value itself is printed by a separately
+// well-formed call and is trustworthy.
 #[test]
-#[ignore = "mb sim-1ei8j: passes locally, fails on CI with garbage pointer \
-            values in cgroup_bw period/burst; un-ignore when that is fixed"]
+#[ignore = "mb sim-560f79 / mb sim-1ei8j: end-of-run is_throttled is 0 on a \
+            dev box and 1 on CI for the same commit; open question, not a \
+            silent skip. Un-ignore when that is resolved."]
 fn test_bug1_canonical_subprocess_reproduces_throttle() {
     let _lock = common::setup_test();
 
