@@ -694,6 +694,39 @@ and objects live in the shared git dir.
 do not leave an agent running for long stretches without asking whether
 anything is uncommitted.
 
+### …and committing is only half of it: you own your PR until it lands
+
+Owner policy, standing (2026-08-12). **There should be no languishing work.**
+The same inventory that found the two uncommitted worktrees above also found
+**eight branches holding completed work that had been committed but never
+pushed** — including the ONLY copy of a category-1 No-Stub fix
+(`scx_bpf_dump_bstr`) while its broken no-op counterpart was running live on
+`integration`, and a toolchain pin that fixed a CI failure another agent was
+simultaneously chasing. Committing solved the loss-risk problem and replaced
+it with an invisibility problem.
+
+    work -> commit as you go -> rename off `agent/*` -> push (origin AND
+    mirror) -> open PR against `integration` -> (optional reviewer-agent
+    pass) -> LAND IT
+
+> **RULE: you own your PR until it lands.** Do not hand back a branch and walk
+> away. Pause for a reviewer-agent pass when warranted, then land it yourself.
+>
+> **Before going idle or finishing:** worktree clean, work pushed, PR open or
+> landed — and say so explicitly in your final note.
+
+Pause for the owner only to land something **red**, to rewrite shared history,
+or to change the **scx pin**. Everything else you land.
+
+None of this relaxes the surrounding rules: `agent/*` names are local scratch
+and get renamed before any push, sched-test pushes go to `origin` AND `mirror`
+in lockstep, PRs target `integration` rather than `main`, and an scx pin that
+is not an ancestor of upstream `main` is never committed.
+
+**Second corollary for the orchestrator:** do not tell an agent "commit but do
+not push" or "report before landing". That instruction is what produced the
+eight-branch pile, and it is discontinued.
+
 ---
 
 ## 12. Definition of done
@@ -716,6 +749,12 @@ anything is uncommitted.
 - [ ] Nothing of value left uncommitted at any pause point (§11).
 - [ ] Every claim about a compat branch confirmed from the binary (§3.1), not
       from the `#define` that was supposed to produce it.
+- [ ] Branch renamed off `agent/*` and **pushed** — to `origin` AND `mirror`,
+      in lockstep (§11).
+- [ ] PR opened against `integration`, and **landed** — or, if it is parked,
+      the final note says why and names what unblocks it (§11).
+- [ ] Final note states explicitly: worktree clean, work pushed, PR open or
+      landed.
 
 ---
 
