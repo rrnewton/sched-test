@@ -327,10 +327,10 @@ fn contention_scenario(rng: &mut Rng, nr_cpus: u32) -> Scenario {
 
 /// Stress test for LAVD scheduler with random scenarios.
 ///
-/// This test is ignored by default - run with `cargo test -- --ignored` or
-/// via `./bug_finding/stress.sh`.
+/// Deterministic by default: `get_seed()` returns 42 unless `STRESS_SEED`
+/// overrides it. Sweep other seeds with
+/// `STRESS_SEED=<n> cargo nextest run -p scx_simulator --test stress`.
 #[test]
-#[ignore]
 fn stress_random_lavd() {
     let _lock = common::setup_test();
     let seed = get_seed();
@@ -378,10 +378,10 @@ fn stress_random_lavd() {
 
 /// Stress test for Mitosis scheduler with random scenarios.
 ///
-/// This test is ignored by default - run with `cargo test -- --ignored` or
-/// via `./bug_finding/stress.sh`.
+/// Deterministic by default: `get_seed()` returns 42 unless `STRESS_SEED`
+/// overrides it. Sweep other seeds with
+/// `STRESS_SEED=<n> cargo nextest run -p scx_simulator --test stress`.
 #[test]
-#[ignore]
 fn stress_random_mitosis() {
     let _lock = common::setup_test();
     let seed = get_seed();
@@ -427,10 +427,10 @@ fn stress_random_mitosis() {
 
 /// Stress test for Simple scheduler with random scenarios.
 ///
-/// This test is ignored by default - run with `cargo test -- --ignored` or
-/// via `./bug_finding/stress.sh`.
+/// Deterministic by default: `get_seed()` returns 42 unless `STRESS_SEED`
+/// overrides it. Sweep other seeds with
+/// `STRESS_SEED=<n> cargo nextest run -p scx_simulator --test stress`.
 #[test]
-#[ignore]
 fn stress_random_simple() {
     let _lock = common::setup_test();
     let seed = get_seed();
