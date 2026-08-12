@@ -387,7 +387,7 @@ fn check_bpf_error(state: &mut SimulatorState, ignore: bool) -> Option<ExitKind>
 }
 
 /// How the simulation terminated.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ExitKind {
     /// Simulation ran to completion (duration exhausted).
     Normal,
@@ -1308,6 +1308,37 @@ macro_rules! sim_callback {
         kfuncs::clear_callback_ctx();
         // Caller must rebind: let $s = &mut *$guard;
     };
+}
+
+impl Simulator<ffi::DynamicScheduler> {
+    /// Read a `u64` BPF global from the loaded scheduler by symbol name.
+    ///
+    /// Returns `None` if the symbol is absent. Callable after `run` (the
+    /// scheduler `.so` stays mapped). Delegates to the loaded
+    /// `DynamicScheduler`'s global read.
+    pub fn read_u64_global(&self, name: &str) -> Option<u64> {
+        self.scheduler.inner().read_u64_global(name)
+    }
+
+    /// Write a `bool` scheduler config global by symbol name (e.g.
+    /// `enable_slice_shrinking`). Returns `None` if absent. Set scheduler config
+    /// BEFORE `run` — the faithful analog of libbpf patching `.rodata` before
+    /// program load. Delegates to the loaded `DynamicScheduler`.
+    pub fn write_bool_global(&self, name: &str, value: bool) -> Option<()> {
+        self.scheduler.inner().write_bool_global(name, value)
+    }
+
+    /// Write a `u32` scheduler config global by symbol name. See
+    /// [`Self::write_bool_global`]. Delegates to the loaded `DynamicScheduler`.
+    pub fn write_u32_global(&self, name: &str, value: u32) -> Option<()> {
+        self.scheduler.inner().write_u32_global(name, value)
+    }
+
+    /// Write a `u64` scheduler config global by symbol name. See
+    /// [`Self::write_bool_global`]. Delegates to the loaded `DynamicScheduler`.
+    pub fn write_u64_global(&self, name: &str, value: u64) -> Option<()> {
+        self.scheduler.inner().write_u64_global(name, value)
+    }
 }
 
 /// Check for stalled runnable tasks (watchdog).

@@ -165,6 +165,10 @@ impl SimTask {
     }
 
     /// Read the task's dsq_vtime from the C task_struct.
+    // Unused on the sequential path (unlike the sibling `get_slice`); the
+    // SimTaskHandle counterpart is dormant too (that safe accessor API is not
+    // yet wired into the engine). Kept for SimTask get/set symmetry.
+    #[allow(dead_code)]
     pub fn get_dsq_vtime(&self) -> Vtime {
         // SAFETY: `self.raw` is non-null and valid (invariant of SimTask).
         Vtime(unsafe { ffi::sim_task_get_dsq_vtime(self.raw) })

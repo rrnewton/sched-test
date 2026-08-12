@@ -224,6 +224,7 @@ pub(crate) struct PreemptionRecordStore {
 }
 
 impl PreemptionRecordStore {
+    #[allow(dead_code)] // dormant: parallel-dispatch / replay / preemptive path, inert in the sequential engine
     pub(crate) fn new() -> Self {
         // Initialize all slots to zero using a const array.
         let records: Box<[AtomicU64; MAX_PREEMPTION_RECORDS * RECORD_FIELDS]> = (0
@@ -280,6 +281,7 @@ impl PreemptionRecordStore {
     /// Zeros the count so new records overwrite old slots. The underlying
     /// `AtomicU64` array is not cleared — stale data is harmless because
     /// `drain()` only reads up to `count`.
+    #[allow(dead_code)] // dormant: parallel-dispatch / replay / preemptive path, inert in the sequential engine
     pub(crate) fn reset(&self) {
         self.count.store(0, SeqCst);
     }
@@ -809,6 +811,7 @@ static STRUCTOP_GLOBAL_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Seed the thread-local structop counters with base offsets from previous
 /// dispatch rounds. Call on each worker thread after `install()`.
+#[allow(dead_code)] // dormant: parallel-dispatch / replay / preemptive path, inert in the sequential engine
 pub fn seed_structop(base: &StructopInfo) {
     STRUCTOP_CPU_COUNT.with(|c| c.set(base.cpu_count));
     STRUCTOP_RBC_TOTAL.with(|c| c.set(base.rbc_total));
@@ -954,6 +957,7 @@ pub fn maybe_begin_structop(in_ops: bool) {
 }
 
 /// Reset the per-worker structop counters (call when a worker finishes).
+#[allow(dead_code)] // dormant: parallel-dispatch / replay / preemptive path, inert in the sequential engine
 pub fn reset_structop_cpu_count() {
     STRUCTOP_CPU_COUNT.with(|c| c.set(0));
     STRUCTOP_RBC_TOTAL.with(|c| c.set(0));
@@ -966,6 +970,7 @@ pub fn reset_structop_cpu_count() {
 }
 
 /// Reset global structop count (call between dispatch rounds).
+#[allow(dead_code)] // dormant: parallel-dispatch / replay / preemptive path, inert in the sequential engine
 pub fn reset_structop_globals() {
     STRUCTOP_GLOBAL_COUNT.store(0, SeqCst);
 }
@@ -979,6 +984,7 @@ pub fn set_current_kfunc(name: &'static str) {
 }
 
 /// Read the current kfunc name.
+#[allow(dead_code)] // dormant: parallel-dispatch / replay / preemptive path, inert in the sequential engine
 pub fn current_kfunc_name() -> &'static str {
     CURRENT_KFUNC_NAME.with(|c| c.get())
 }
@@ -1099,6 +1105,8 @@ pub fn compute_so_hash_from_path(path: &str) -> u64 {
 /// `PreemptRing` retains only instrumentation and timeslice generation.
 pub struct PreemptRing {
     /// Total number of workers.
+    #[allow(dead_code)]
+    // dormant: parallel-dispatch / replay / preemptive path, inert in the sequential engine
     total: usize,
     /// Timeslice PRNG (async-signal-safe, see [`TimeslicePrng`]).
     timeslice: TimeslicePrng,
@@ -1115,6 +1123,7 @@ impl PreemptRing {
     ///
     /// # Panics
     /// Panics if `total` is 0 or exceeds 64.
+    #[allow(dead_code)] // dormant: parallel-dispatch / replay / preemptive path, inert in the sequential engine
     pub fn new(total: usize, seed: u32) -> Self {
         assert!(
             total > 0 && total <= 64,
@@ -1204,11 +1213,13 @@ impl PreemptRing {
     ///
     /// Returns records sorted by sequence number. Call this after the
     /// simulation completes to verify determinism.
+    #[allow(dead_code)] // dormant: parallel-dispatch / replay / preemptive path, inert in the sequential engine
     pub fn preemption_records(&self) -> Vec<PreemptionRecord> {
         self.preemption_records.drain()
     }
 
     /// Total number of workers.
+    #[allow(dead_code)] // dormant: replay/preemptive path, inert in the sequential engine
     pub fn total(&self) -> usize {
         self.total
     }
@@ -1222,6 +1233,7 @@ impl PreemptRing {
     /// # Safety contract
     ///
     /// All workers must be parked (not executing) when this is called.
+    #[allow(dead_code)] // dormant: replay/preemptive path, inert in the sequential engine
     pub fn reset(&self, seed: u32) {
         self.timeslice.reseed(seed);
         self.signal_preempt_count.store(0, SeqCst);
@@ -2005,6 +2017,7 @@ impl ReplayCursor {
     }
 
     /// Whether there are no targets.
+    #[allow(dead_code)] // dormant: parallel-dispatch / replay / preemptive path, inert in the sequential engine
     pub fn is_empty(&self) -> bool {
         self.targets.is_empty()
     }
@@ -2223,6 +2236,7 @@ pub static REPLAY_OVERSHOT: AtomicBool = AtomicBool::new(false);
 /// Reset replay overshoot / warning state for a new replay attempt.
 ///
 /// Call before each retry in the outer replay loop.
+#[allow(dead_code)] // dormant: parallel-dispatch / replay / preemptive path, inert in the sequential engine
 pub fn reset_replay_state() {
     REPLAY_PMU_WARNING_SHOWN.store(false, SeqCst);
     REPLAY_OVERSHOT.store(false, SeqCst);
@@ -2737,6 +2751,7 @@ pub fn set_e9_replay_yield() {
 }
 
 /// Unmap the shared RBC state page.
+#[allow(dead_code)] // dormant: parallel-dispatch / replay / preemptive path, inert in the sequential engine
 pub fn munmap_shared_rbc() {
     // SAFETY: E9_SHARED_ADDR was mapped by `mmap_shared_rbc()`.
     // Unmapped exactly once here during e9patch teardown.

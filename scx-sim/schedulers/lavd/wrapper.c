@@ -10,6 +10,7 @@
  */
 #include "sim_wrapper.h"
 #include "sim_task.h"
+#include "sim_kconfig_defaults.h"
 
 
 /*
@@ -57,13 +58,6 @@
 #define bpf_ringbuf_submit(data, flags) do {} while(0)
 
 /*
- * bpf_per_cpu_ptr -- kernel per-CPU variables don't exist in the
- * simulator. Return NULL so callers skip the code path.
- */
-#undef bpf_per_cpu_ptr
-#define bpf_per_cpu_ptr(ptr, cpu) ((typeof(ptr))0)
-
-/*
  * Reserved PID for the simulator's synthetic "loader" task — the stand-in
  * for the scx_lavd userspace loader process. Upstream cgroup_bw
  * (sched-ext/scx a52f85e3 "lib/cgroup_bw: resolve root cgroup through the
@@ -89,59 +83,6 @@
 #define bpf_get_current_pid_tgid() (((u64)SIM_CBW_LOADER_TGID) << 32)
 
 /*
- * bpf_ksym_exists -- kernel symbol existence check.
- * Return 0 (absent) to disable kfunc probing paths.
- */
-#undef bpf_ksym_exists
-#define bpf_ksym_exists(sym) (0)
-
-/*
- * __COMPAT_scx_bpf_dsq_peek -- override the compat wrapper to directly
- * call scx_bpf_dsq_peek which is implemented in kfuncs.rs. The compat
- * wrapper normally falls through to bpf_iter_scx_dsq_* when bpf_ksym_exists
- * returns 0, but those iterators aren't implemented in the simulator.
- */
-extern struct task_struct *scx_bpf_dsq_peek(u64 dsq_id);
-#define __COMPAT_scx_bpf_dsq_peek(dsq_id) scx_bpf_dsq_peek(dsq_id)
-
-/*
- * bpf_iter_scx_dsq_*: bpf_for_each(scx_dsq, ...) uses a cleanup() destructor,
- * so lavd needs concrete function symbols, not just macro rewrites.
- */
-extern void *sim_dsq_iter_begin(u64 dsq_id, u64 flags);
-extern void *sim_dsq_iter_next(void);
-
-#undef bpf_iter_scx_dsq_new
-int bpf_iter_scx_dsq_new(struct bpf_iter_scx_dsq *it, u64 dsq_id, u64 flags)
-{
-	u64 *opaque = (u64 *)it;
-
-	opaque[0] = (u64)(unsigned long)sim_dsq_iter_begin(dsq_id, flags);
-	opaque[1] = 1;
-	return 0;
-}
-
-#undef bpf_iter_scx_dsq_next
-struct task_struct *bpf_iter_scx_dsq_next(struct bpf_iter_scx_dsq *it)
-{
-	u64 *opaque = (u64 *)it;
-
-	if (opaque[1]) {
-		opaque[1] = 0;
-		return (struct task_struct *)(unsigned long)opaque[0];
-	}
-
-	return (struct task_struct *)sim_dsq_iter_next();
-}
-
-#undef bpf_iter_scx_dsq_destroy
-void bpf_iter_scx_dsq_destroy(struct bpf_iter_scx_dsq *it)
-{
-	while (bpf_iter_scx_dsq_next(it))
-		;
-}
-
-/*
  * __builtin_memcpy_inline fallback for non-Clang or older versions.
  */
 #ifndef __has_builtin
@@ -150,28 +91,6 @@ void bpf_iter_scx_dsq_destroy(struct bpf_iter_scx_dsq *it)
 #if !__has_builtin(__builtin_memcpy_inline)
 #define __builtin_memcpy_inline(dst, src, sz) __builtin_memcpy(dst, src, sz)
 #endif
-
-/*
- * The simulator always calls select_cpu before enqueue.
- */
-#undef __COMPAT_is_enq_cpu_selected
-#define __COMPAT_is_enq_cpu_selected(enq_flags) (true)
-
-/*
- * is_migration_disabled: use the simulator's task_struct accessor.
- *
- * The kernel's is_migration_disabled() checks p->migration_disabled with
- * special handling for migration_disabled == 1 (ambiguous because BPF
- * prolog increments it). In the simulator, we don't run actual BPF code,
- * so we use a simpler check: migration_disabled > 0 means disabled.
- *
- * For production bug reproduction (sim-7cc89), set migration_disabled >= 2
- * on the task to model a task that was already migration-disabled before
- * entering the scheduler callback.
- */
-extern unsigned short sim_task_get_migration_disabled(struct task_struct *p);
-#undef is_migration_disabled
-#define is_migration_disabled(p) (sim_task_get_migration_disabled(p) > 0)
 
 /*
  * scx_clock_task / scx_clock_pelt override.
@@ -191,117 +110,23 @@ extern u64 sim_scx_clock_task(u32 cpu);
 #define MAX_SIM_CPUS 128
 
 /*
- * Forward declaration for per-CPU lookup.
- * Defined after LAVD source since struct cpu_ctx is needed.
+ * BPF timer machinery is the generic slot-table in csrc/sim_timer.h (8-slot
+ * first-fit keyed by (struct bpf_timer *)): LAVD's update_timer (slot 0,
+ * registered first) and the compiled-in cgroup_bw cbw_replenish_timer
+ * share it. lavd_fire_timer (below) forwards the engine's
+ * EventKind::TimerFired { slot } to the generic scxsim_fire_timer.
+ * Must be included AFTER sim_wrapper.h (for struct bpf_timer + the bpf_timer_*
+ * helper macros it overrides).
  */
-static struct cpu_ctx *lavd_lookup_percpu_elem(int cpu);
-#undef bpf_map_lookup_percpu_elem
-#define bpf_map_lookup_percpu_elem(map, key, cpu) lavd_lookup_percpu_elem(cpu)
+#include "sim_timer.h"
 
 /*
- * BPF timer overrides for periodic system stat updates AND for any
- * additional timer the cgroup_bw library compiled in by Phase 2 will
- * arm (e.g. `cbw_replenish_timer`).
- *
- * Phase 1 BPF infra scale-up items 1+2 (tg
- * `scxsim-bpf-infra-scale-up-phase1`, design doc section Phase 1 items
- * 1+2): replaces the prior single global timer state with a fixed
- * `LAVD_MAX_BPF_TIMERS = 8` slot table keyed by `(struct bpf_timer *)`.
- *
- * Slot allocation policy: `bpf_timer_init(timer, map, flags)` finds
- * the first free slot whose `timer_ptr` is NULL, claims it for the
- * supplied `(struct bpf_timer *)`, and records the timer's map.
- * `bpf_timer_set_callback(timer, cb)` and
- * `bpf_timer_start(timer, nsecs, flags)` look up the slot for the
- * supplied `timer` and update / fire it. `lavd_fire_timer(slot)`
- * dispatches the engine's `EventKind::TimerFired { slot }` to the
- * right callback.
- *
- * Slot 0 is the conventional update_timer slot; subsequent slots are
- * assigned in init order. The table is reset by `lavd_register_maps`
- * so consecutive simulation runs start with a clean slate (matches
- * the existing single-timer determinism guarantee).
- *
- * This MUST stay <= the Rust-side `MAX_BPF_TIMERS` constant in
- * `unsafe_impl/kfuncs.rs`. If LAVD ever needs more, bump both and
- * add a build-time assertion.
+ * Map lookup override. With the cgroup_bw flagship compiled in, lavd_map_lookup
+ * short-circuits the cbw replenish/accounting timer maps to static single-entry
+ * storage (defined post-include); everything else -- including cpu_ctx_stor and
+ * update_timer, now on the generic test-map registry -- falls through to
+ * scx_test_map_lookup_elem.
  */
-#define LAVD_MAX_BPF_TIMERS 8
-
-struct lavd_timer_slot {
-	struct bpf_timer *timer_ptr; /* NULL = unused slot */
-	int (*timer_cb)(void *, int *, struct bpf_timer *);
-	void *timer_map;
-};
-
-static struct lavd_timer_slot lavd_timer_table[LAVD_MAX_BPF_TIMERS];
-
-extern void sim_timer_start(unsigned long long nsecs);
-extern void sim_timer_start_slot(unsigned int slot, unsigned long long nsecs);
-
-/*
- * Find or assign a slot for the given (struct bpf_timer *).
- *
- * Returns the slot index in [0, LAVD_MAX_BPF_TIMERS), or -1 on
- * exhaustion (which means LAVD_MAX_BPF_TIMERS / MAX_BPF_TIMERS is too
- * low for the workload -- bump them in lockstep).
- */
-static int lavd_timer_slot_for(struct bpf_timer *timer)
-{
-	int i;
-	for (i = 0; i < LAVD_MAX_BPF_TIMERS; i++) {
-		if (lavd_timer_table[i].timer_ptr == timer)
-			return i;
-	}
-	for (i = 0; i < LAVD_MAX_BPF_TIMERS; i++) {
-		if (!lavd_timer_table[i].timer_ptr) {
-			lavd_timer_table[i].timer_ptr = timer;
-			return i;
-		}
-	}
-	return -1;
-}
-
-#undef bpf_timer_init
-#define bpf_timer_init(timer, map, flags) \
-	({ \
-		int _s = lavd_timer_slot_for((struct bpf_timer *)(timer)); \
-		if (_s >= 0) lavd_timer_table[_s].timer_map = (void *)(map); \
-		0; \
-	})
-
-#undef bpf_timer_set_callback
-#define bpf_timer_set_callback(timer, cb) \
-	({ \
-		int _s = lavd_timer_slot_for((struct bpf_timer *)(timer)); \
-		if (_s >= 0) \
-			lavd_timer_table[_s].timer_cb = \
-				(typeof(lavd_timer_table[0].timer_cb))(cb); \
-		0; \
-	})
-
-#undef bpf_timer_start
-#define bpf_timer_start(timer, nsecs, flags) \
-	({ \
-		int _s = lavd_timer_slot_for((struct bpf_timer *)(timer)); \
-		if (_s >= 0) sim_timer_start_slot((unsigned int)_s, (nsecs)); \
-		0; \
-	})
-
-/*
- * Map lookup override.
- *
- * LAVD uses bpf_map_lookup_elem for two maps:
- *   cpu_ctx_stor (PERCPU_ARRAY) -- routed to our static per-CPU array
- *   update_timer (ARRAY)        -- routed to static backing storage
- *
- * Pointers are set in lavd_register_maps() after the source is included.
- */
-static void *lavd_cpu_ctx_stor_ptr;
-static void *lavd_update_timer_map_ptr;
-static char lavd_update_timer_buf[256];
-
-extern unsigned int sim_bpf_get_smp_processor_id(void);
 
 /*
  * Forward declaration -- definition after LAVD source where struct cpu_ctx
@@ -311,31 +136,6 @@ static void *lavd_map_lookup(void *map, const void *key);
 
 #undef bpf_map_lookup_elem
 #define bpf_map_lookup_elem(map, key) lavd_map_lookup((void *)(map), key)
-
-/*
- * __COMPAT_scx_bpf_cpu_curr override.
- * Return actual running task or a synthetic idle task.
- */
-extern struct task_struct *scx_bpf_cpu_curr(int cpu);
-static struct task_struct sim_lavd_idle_task;
-static bool sim_lavd_idle_init;
-
-static struct task_struct *lavd_cpu_curr(int cpu)
-{
-	struct task_struct *p = scx_bpf_cpu_curr(cpu);
-	if (p)
-		return p;
-	if (!sim_lavd_idle_init) {
-		__builtin_memset(&sim_lavd_idle_task, 0,
-				 sizeof(sim_lavd_idle_task));
-		sim_lavd_idle_task.flags = PF_IDLE;
-		sim_lavd_idle_init = true;
-	}
-	return &sim_lavd_idle_task;
-}
-
-#undef __COMPAT_scx_bpf_cpu_curr
-#define __COMPAT_scx_bpf_cpu_curr(cpu) lavd_cpu_curr(cpu)
 
 /*
  * Division-by-zero protection: provided by sim_sigfpe.c (separate TU
@@ -369,9 +169,16 @@ unsigned long hw_pressure;
  * In BPF, this resolves to the kernel config; in simulation it's a
  * regular weak symbol. Without a definition, the weak symbol resolves
  * to address 0x0 in the -nostdlib .so, causing a SIGSEGV on access.
- * Set to false — the simulator doesn't model NO_HZ_IDLE.
+ * Default false (simulator doesn't model NO_HZ_IDLE) via a TENTATIVE
+ * definition -- giving it an explicit `= 0` would reorder lavd's .bss and change
+ * the .so bytes, so the standalone build keeps the bare declaration. An embedder
+ * enables lavd's sys_stat idle-drift branch with -DSIM_CONFIG_NO_HZ_IDLE=1.
  */
+#ifdef SIM_CONFIG_NO_HZ_IDLE
+bool CONFIG_NO_HZ_IDLE = SIM_CONFIG_NO_HZ_IDLE;
+#else
 bool CONFIG_NO_HZ_IDLE;
+#endif
 
 /*
  * bpf_probe_read_kernel override for LAVD.
@@ -490,7 +297,7 @@ static RAVG_FN_ATTRS int ravg_from_arena(struct ravg_data *to, struct ravg_data 
  * Guard the header include since common.bpf.h is already included.
  */
 #define __SCX_RAVG_BPF_H__  /* prevent ravg.h re-include */
-#include "../../scx/lib/ravg.bpf.c"
+#include "ravg.bpf.c"  /* resolved via -I<scx_root>/lib */
 
 /*
  * =================================================================
@@ -796,11 +603,6 @@ extern void sim_cgroup_registry_free(void);
  * =================================================================
  */
 
-/*
- * Per-CPU context array and map lookup (struct cpu_ctx now available).
- */
-static struct cpu_ctx percpu_ctx[MAX_SIM_CPUS];
-
 #ifdef SCXSIM_PHASE2_REAL_CGROUP_BW
 /*
  * Phase 2: forward decls for cgroup_bw library timer-map short-circuit
@@ -816,14 +618,6 @@ extern void *cbw_accounting_timer_map_ptr;
 
 static void *lavd_map_lookup(void *map, const void *key)
 {
-	if (map == lavd_cpu_ctx_stor_ptr && lavd_cpu_ctx_stor_ptr) {
-		int cpu = sim_bpf_get_smp_processor_id();
-		if (cpu >= 0 && cpu < MAX_SIM_CPUS)
-			return &percpu_ctx[cpu];
-		return NULL;
-	}
-	if (map == lavd_update_timer_map_ptr && lavd_update_timer_map_ptr)
-		return lavd_update_timer_buf;
 #ifdef SCXSIM_PHASE2_REAL_CGROUP_BW
 	/* Phase 2: cgroup_bw library timer maps short-circuit to static
 	 * single-entry storage so `bpf_map_lookup_elem(&replenish_timer,
@@ -839,20 +633,8 @@ static void *lavd_map_lookup(void *map, const void *key)
 }
 
 /*
- * Per-CPU context lookup (definition after struct cpu_ctx is available).
- */
-static struct cpu_ctx *lavd_lookup_percpu_elem(int cpu)
-{
-	if (cpu < 0 || cpu >= MAX_SIM_CPUS)
-		return NULL;
-	return &percpu_ctx[cpu];
-}
-
-/*
  * Register BPF maps with the test map infrastructure.
  */
-static struct scx_test_map cpu_ctx_test_map;
-
 #ifdef SCXSIM_PHASE2_REAL_CGROUP_BW
 /*
  * Phase 2 BPF map glue: register cgroup_bw's 5 maps so that
@@ -875,7 +657,6 @@ static struct scx_test_map cbw_cgrp_test_map;
 static struct scx_test_map cbw_cgrp_llc_test_map;
 static struct scx_test_map cbw_replenish_timer_test_map;
 static struct scx_test_map cbw_accounting_timer_test_map;
-static struct scx_percpu_test_map *cbw_tree_levels_test_map;
 
 /* Static backing for the single-entry ARRAY maps so
  * `bpf_map_lookup_elem(&replenish_timer, &key=0)` returns a real
@@ -889,8 +670,7 @@ char cbw_replenish_timer_storage[256] __attribute__((aligned(16)));
 char cbw_accounting_timer_storage[256] __attribute__((aligned(16)));
 
 /* Pointers used by lavd_map_lookup() to short-circuit the cgroup_bw
- * timer maps to the static backing arrays above (mirrors how
- * `lavd_update_timer_map_ptr` short-circuits LAVD's own update_timer).
+ * timer maps to the static backing arrays above.
  * Defined here for visibility to lavd_map_lookup; populated by
  * lavd_register_maps which runs AFTER cgroup_bw.bpf.c is included
  * (so `&replenish_timer` / `&accounting_timer` are in scope). */
@@ -902,11 +682,8 @@ void lavd_register_maps(void)
 {
 	scx_test_map_clear_all();
 
-	INIT_SCX_TEST_MAP(&cpu_ctx_test_map, cpu_ctx_stor);
-	scx_test_map_register(&cpu_ctx_test_map, &cpu_ctx_stor);
-
-	lavd_cpu_ctx_stor_ptr = (void *)&cpu_ctx_stor;
-	lavd_update_timer_map_ptr = (void *)&update_timer;
+	SCX_REGISTER_PERCPU(cpu_ctx_stor, true);
+	SCX_REGISTER_ARRAY(update_timer, true);
 
 	/*
 	 * Phase 1 BPF infra scale-up items 1+2: clear the multi-timer
@@ -915,7 +692,7 @@ void lavd_register_maps(void)
 	 * (struct bpf_timer *) might reuse a stale slot's callback,
 	 * destroying determinism.
 	 */
-	__builtin_memset(lavd_timer_table, 0, sizeof(lavd_timer_table));
+	scxsim_timer_reset();
 
 	/*
 	 * Phase 2: cgroup_bw's BPF maps live in cgroup_bw.bpf.c which is
@@ -943,15 +720,9 @@ static void lavd_register_cbw_maps(void);
  */
 void lavd_fire_timer(unsigned int slot)
 {
-	int key = 0;
-	if (slot >= LAVD_MAX_BPF_TIMERS)
-		return;
-	if (lavd_timer_table[slot].timer_cb && lavd_timer_table[slot].timer_ptr) {
-		lavd_timer_table[slot].timer_cb(
-			lavd_timer_table[slot].timer_map,
-			&key,
-			lavd_timer_table[slot].timer_ptr);
-	}
+	/* The Rust engine resolves the per-scheduler "lavd_fire_timer" symbol;
+	 * forward to the generic dispatcher (csrc/sim_timer.h). */
+	scxsim_fire_timer(slot);
 }
 
 /*
@@ -1095,11 +866,10 @@ struct cgroup *bpf_cgroup_ancestor(struct cgroup *cgrp, int level)
 	return NULL;
 }
 
-/* Cgroup reference release -- no-op */
-void bpf_cgroup_release(struct cgroup *cgrp)
-{
-	(void)cgrp;
-}
+/*
+ * Cgroup reference release (no-op in the sim) is the generic weak stub in
+ * csrc/sim_bpf_stubs.c, shared by every .so. No per-scheduler override here.
+ */
 
 /*
  * =================================================================
@@ -1387,10 +1157,6 @@ extern void sim_bpf_iter_css_destroy(struct bpf_iter_css *it);
 #undef cast_user
 #define cast_user(ptr) /* nop */
 
-/* RCU read lock no-ops. */
-#define bpf_rcu_read_lock()   ((void)0)
-#define bpf_rcu_read_unlock() ((void)0)
-
 /* CO-RE field existence: scxsim's task_struct (from vmlinux.h) is the
  * real kernel layout, so every field cgroup_bw probes via
  * `bpf_core_field_exists` is in fact present. Override to return 1.
@@ -1482,7 +1248,7 @@ int topo_cpu_to_llc_id(u32 cpu) { (void)cpu; return 0; }
 #define scx_static_alloc(bytes, alignment) \
 	(sim_arena_calloc((unsigned long)(bytes)))
 #endif
-#include "../../scx/lib/cgroup_bw.bpf.c"
+#include "cgroup_bw.bpf.c"  /* resolved via -I<scx_root>/lib */
 #undef scx_static_alloc
 #undef scxsim_cbw_yield
 
@@ -1704,19 +1470,14 @@ static void lavd_register_cbw_maps(void)
 	__builtin_memset(cbw_throttled_cgroup_ids, 0,
 			 sizeof(cbw_throttled_cgroup_ids));
 
-	/* CGRP_STORAGE: keyed by struct cgroup *, value = scx_cgroup_ctx.
-	 * BPF_MAP_TYPE_CGRP_STORAGE has no max_entries field; use the
-	 * TASK_STORAGE-style init then explicitly bump max_entries to
-	 * CBW_NR_CGRP_MAX (the production cgroup_bw library's own ceiling
-	 * defined in lib/cgroup_bw.bpf.c). The default 100-slot limit
-	 * baked into INIT_SCX_TEST_MAP_FROM_TASK_STORAGE is too low for
-	 * the cpu-bw-stall-bug stress matrix (test_lavd_cgroup_exhaustion_stress
-	 * creates 100 cgroups + root + helpers > 100 -> -ENOMEM). Matching
-	 * the library's own ceiling makes scxsim's cgroup-storage capacity
-	 * mirror what the kernel allows for cgroup_bw consumers. */
-	INIT_SCX_TEST_MAP_FROM_TASK_STORAGE(&cbw_cgrp_test_map, cbw_cgrp_map);
-	cbw_cgrp_test_map.max_entries = 2048; /* CBW_NR_CGRP_MAX from cgroup_bw.bpf.c */
-	scx_test_map_register(&cbw_cgrp_test_map, &cbw_cgrp_map);
+	/* HASH keyed by u64 cgrp_id (BPF_MAP_TYPE_HASH, lib/cgroup_bw.bpf.c),
+	 * accessed via bpf_map_lookup_elem(&cbw_cgrp_map, &cgrp_id) -- NOT
+	 * cgroup-pointer storage. INIT_SCX_TEST_MAP derives key_size=sizeof(u64)=8
+	 * and max_entries=CBW_NR_CGRP_MAX (2048, the library ceiling) from the decl,
+	 * so no override is needed (test_lavd_cgroup_exhaustion_stress needs the full
+	 * 2048). Registered into the named cbw_cgrp_test_map so the introspection
+	 * probe below can read .nr/.keys. */
+	SCX_REGISTER_ARRAY_INTO(cbw_cgrp_test_map, cbw_cgrp_map);
 
 	/* HASH: keyed by cgroup_llc_id, value = scx_cgroup_llc_ctx.
 	 *
@@ -1756,54 +1517,19 @@ static void lavd_register_cbw_maps(void)
 	 * Regression test: tests/cgroup_llc_id_padding_codegen.rs
 	 * proves the padding-uninit behavior in clang 18 vs 22 and
 	 * verifies the fix. */
-	INIT_SCX_TEST_MAP(&cbw_cgrp_llc_test_map, cbw_cgrp_llc_map);
-	cbw_cgrp_llc_test_map.key_size =
+	SCX_REGISTER_ARRAY_INTO_KEYSZ(cbw_cgrp_llc_test_map, cbw_cgrp_llc_map,
 		sizeof(((struct cgroup_llc_id *)0)->cgrp_id) +
-		sizeof(((struct cgroup_llc_id *)0)->llc_id);
-	scx_test_map_register(&cbw_cgrp_llc_test_map, &cbw_cgrp_llc_map);
+		sizeof(((struct cgroup_llc_id *)0)->llc_id));
 
-	/* PERCPU_ARRAY tree_levels_map: keyed by u32, value = struct tree_levels.
-	 * Allocate per-CPU storage; MAX_SIM_CPUS is the simulator ceiling. */
-	cbw_tree_levels_test_map = scx_alloc_percpu_test_map(MAX_SIM_CPUS);
-	INIT_SCX_PERCPU_TEST_MAP(cbw_tree_levels_test_map, tree_levels_map);
-	scx_register_percpu_test_map(cbw_tree_levels_test_map,
-				     &tree_levels_map);
-
-	/*
-	 * SEED the PERCPU_ARRAY entry. Phase 2 Stage E (tg
-	 * `investigate-scxsim-engine-throttles-before-scheduler-cgroup-bw`):
-	 * scxsim's scx_test_map storage for PERCPU_ARRAY does not
-	 * pre-allocate slots the way the kernel does -- nr starts at 0
-	 * and only grows via map_update_elem. The cgroup_bw library
-	 * never updates tree_levels_map (it's read-only after init from
-	 * its perspective), so without seeding bpf_map_lookup_elem
-	 * returns NULL for key=0, get_clean_tree_levels() returns NULL,
-	 * cbw_update_runtime_total_sloppy() returns -ENOMEM, and the
-	 * accounting -> throttle chain is severed. The library's per-LLC
-	 * runtime_total accumulator (~tens of µs at probe time) is never
-	 * promoted to cgx->runtime_total_sloppy, so is_throttled never
-	 * flips and per-SHA discrimination is impossible.
-	 *
-	 * Seed entry [key=0, value=zeroed struct tree_levels] for every
-	 * CPU. tree_levels_map has max_entries=1 in the library
-	 * declaration; we only need key=0.
-	 *
-	 * This is the root cause identified in tg note "MAJOR FINDING
-	 * 2026-05-13" -- scxsim's percpu-array-storage seeding gap, not
-	 * a key-padding issue.
-	 */
-	{
-		struct tree_levels zero_tl;
-		const u32 zero_key = 0;
-		int cpu;
-
-		__builtin_memset(&zero_tl, 0, sizeof(zero_tl));
-		for (cpu = 0; cpu < (int)MAX_SIM_CPUS; cpu++) {
-			scx_test_map_update_percpu_elem(&tree_levels_map,
-							&zero_key, &zero_tl,
-							cpu, /*BPF_ANY=*/0);
-		}
-	}
+	/* PERCPU_ARRAY tree_levels_map (u32 key, max_entries=1): register +
+	 * pre-seed key 0 on every CPU. The cgroup_bw library reads tree_levels_map
+	 * key 0 but never updates it, so without the seed bpf_map_lookup_elem returns
+	 * NULL -> get_clean_tree_levels() NULL -> cbw_update_runtime_total_sloppy()
+	 * -ENOMEM -> the accounting->throttle chain is severed (the percpu-array
+	 * seeding gap, not a key-padding issue). SCX_REGISTER_PERCPU's pre_seed seeds
+	 * [0..max_entries=1) per CPU, reproducing the former explicit key-0 per-CPU
+	 * seed. Not host-probed, so the hidden descriptor is fine. */
+	SCX_REGISTER_PERCPU(tree_levels_map, true);
 }
 
 /*
@@ -1954,7 +1680,7 @@ struct scxsim_cbw_probe_result {
 	long long              consumed_count_pre;   /* probe counter */
 	void                  *cgrp_ptr;             /* cgrp pointer the probe got */
 	int                    cbw_cgrp_map_nr;      /* number of entries in cbw_cgrp_map */
-	void                  *cbw_cgrp_map_first_key;/* keys[0] (= first stored cgrp ptr) */
+	void                  *cbw_cgrp_map_first_key;/* keys[0] (= first stored u64 cgrp_id) */
 	int                    cbw_cgrp_llc_map_nr;
 };
 
@@ -2021,9 +1747,10 @@ int scxsim_probe_cbw_state(unsigned long long cgrp_id, int llc_id,
 
 	out->cbw_cgrp_map_nr = cbw_cgrp_test_map.nr;
 	if (cbw_cgrp_test_map.nr > 0 && cbw_cgrp_test_map.keys) {
-		/* Each key is sizeof(struct cgroup *) = 8 bytes -- the
-		 * cgrp pointer that bpf_cgrp_storage_get's caller passed
-		 * (via &cgrp dereference). */
+		/* Each key is a u64 cgrp_id = 8 bytes -- cbw_cgrp_map is a
+		 * HASH keyed by cgroup id (bpf_map_lookup_elem(&cbw_cgrp_map,
+		 * &cgrp_id)), not cgroup-pointer storage; the 8-byte read is
+		 * the first stored cgrp_id. */
 		out->cbw_cgrp_map_first_key = *(void **)cbw_cgrp_test_map.keys;
 	}
 	out->cbw_cgrp_llc_map_nr = cbw_cgrp_llc_test_map.nr;
@@ -2057,29 +1784,20 @@ void lavd_setup(unsigned int num_cpus)
 	lavd_register_cbw_maps();
 #endif
 
-	/* Core globals */
-	nr_cpus_onln = num_cpus;
-	nr_cpu_ids = num_cpus;
-	nr_llcs = 1;
-	is_smt_active = false;
-
 	/*
-	 * Power mode: default to performance (matches --performance flag).
-	 * This keeps no_core_compaction=true and is_powersave_mode=false.
+	 * Mutable (plain-volatile) globals the scheduler overwrites at runtime
+	 * (do_set_power_profile / autopilot) -- NOT rodata, so they stay here as
+	 * setup-time initial values. The const-volatile config globals (nr_cpu_ids,
+	 * nr_llcs, is_smt_active, enable_cpu_bw, is_autopilot_on, no_wake_sync,
+	 * no_slice_boost, no_use_em, verbose) are written before run by the manifest
+	 * apply_rodata path (scheduler_manifest.rs lavd.runtime.rodata), not here.
 	 */
+	nr_cpus_onln = num_cpus;
 	power_mode = 0; /* LAVD_PM_PERFORMANCE */
 	is_powersave_mode = false;
-
-	/* Disable complex features for initial simulation */
-	enable_cpu_bw = false;
-	is_autopilot_on = false;
 	no_core_compaction = true;
 	no_freq_scaling = true;
 	no_preemption = false;
-	no_wake_sync = false;
-	no_slice_boost = false;
-	no_use_em = true; /* no kernel energy model in the simulator */
-	verbose = 0;
 
 	/* Per-CPU topology: uniform capacity, no big/little, no SMT */
 	for (cpu = 0; cpu < num_cpus && cpu < LAVD_CPU_ID_MAX; cpu++) {
@@ -2322,8 +2040,8 @@ void lavd_set_cgroup_bw_max(unsigned int max)
  * context — SIM_ARC is not installed, so any kfunc that reads the current CPU
  * id will panic. Upstream sched-ext/scx 66da81a3 ("scx_lavd: cache last
  * task_ctx lookup per CPU") changed get_task_ctx(p) to read the per-CPU
- * task_ctx cache via get_cpu_ctx(), which calls
- * sim_bpf_get_smp_processor_id() and therefore requires SIM_ARC. Probes must
+ * task_ctx cache via get_cpu_ctx(), which resolves the current CPU (through the
+ * generic per-CPU map lookup) and is valid only inside a callback. Probes must
  * not depend on the current CPU, so they call the underlying slowpath
  * directly with cpuc=NULL: a pure task-storage lookup (scx_task_data(p)) with
  * no per-CPU cache read/write.
@@ -2517,14 +2235,14 @@ u8 lavd_probe_ovrflw_cpumask_null(void)
 
 u8 lavd_probe_cpuc_is_online(int cpu)
 {
-	if (cpu < 0 || cpu >= MAX_SIM_CPUS)
-		return 0;
-	return (u8)percpu_ctx[cpu].is_online;
+	struct cpu_ctx *cctx = scx_test_map_lookup_percpu_elem(
+		(void *)&cpu_ctx_stor, &(u32){ 0 }, cpu);
+	return cctx ? (u8)cctx->is_online : 0;
 }
 
 u32 lavd_probe_cpuc_eff_cap(int cpu)
 {
-	if (cpu < 0 || cpu >= MAX_SIM_CPUS)
-		return 0;
-	return percpu_ctx[cpu].effective_capacity;
+	struct cpu_ctx *cctx = scx_test_map_lookup_percpu_elem(
+		(void *)&cpu_ctx_stor, &(u32){ 0 }, cpu);
+	return cctx ? cctx->effective_capacity : 0;
 }

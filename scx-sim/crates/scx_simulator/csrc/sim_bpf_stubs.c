@@ -18,6 +18,7 @@
 
 /* Use kern_types.h for basic types (u32, s32, etc.) */
 #include "kern_types.h"
+#include "sim_kconfig_defaults.h"
 #include <stdbool.h>
 #include <stddef.h>
 
@@ -280,23 +281,6 @@ bool bpf_cpumask_test_and_set_cpu(u32 cpu, struct bpf_cpumask *cpumask)
 	return was_set;
 }
 
-/* --- kptr exchange --- */
-
-/*
- * Atomic pointer exchange: reads old value and stores new value in a single
- * atomic operation. Required for correctness under preemptive interleaving
- * where a PMU signal can fire between a non-atomic read and write.
- *
- * __sync_lock_test_and_set compiles to XCHG on x86 (inherently locked).
- */
-void *bpf_kptr_xchg_impl(void **kptr, void *new_val)
-{
-	sim_rbc_pause();
-	void *old = __sync_lock_test_and_set(kptr, new_val);
-	sim_rbc_resume();
-	return old;
-}
-
 /*
  * scx_bpf_cpu_rq / scx_bpf_locked_rq: new kfuncs in common.bpf.h that
  * return a pointer to the CPU's runqueue. The simulator doesn't have real
@@ -334,15 +318,40 @@ struct cgroup *bpf_cgroup_from_id(u64 id)
 }
 
 /*
+ * bpf_cgroup_acquire / bpf_cgroup_release: cgroup refcount kfuncs. The
+ * single-threaded deterministic simulator models no cgroup refcounting, so
+ * acquire is the identity and release is a no-op. Weak FUNCTION stubs (not
+ * macros): bpf_experimental.h declares these extern __ksym, and a
+ * function-like macro would mangle that declaration (see
+ * schedulers/lavd/wrapper.c). Replace the former per-scheduler copies
+ * (mitosis's sim_cgroup_acquire macro pair, lavd's local bpf_cgroup_release
+ * fn).
+ */
+__attribute__((weak))
+struct cgroup *bpf_cgroup_acquire(struct cgroup *cgrp)
+{
+	return cgrp;
+}
+
+__attribute__((weak))
+void bpf_cgroup_release(struct cgroup *cgrp)
+{
+	(void)cgrp;
+}
+
+/*
  * LINUX_KERNEL_VERSION: __kconfig global declared in common.bpf.h.
  * With __kconfig stripped, it becomes a bare extern declaration.
- * Provide a definition so scheduler .so files link.
- * Value: 6.18.0 encoded as (major << 16 | minor << 8 | patch).
+ * Provide a definition so scheduler .so files link. Default 6.18.0 (encoded
+ * major << 16 | minor << 8 | patch); an embedder overrides via
+ * -DSIM_LINUX_KERNEL_VERSION (see sim_kconfig_defaults.h).
  */
-int LINUX_KERNEL_VERSION = 0x061200;
+int LINUX_KERNEL_VERSION = SIM_LINUX_KERNEL_VERSION;
 
 /*
  * CONFIG_PREEMPT_RCU: __kconfig __weak bool from common.bpf.h.
- * Set false — simulator doesn't model preempt RCU.
+ * Default false (simulator doesn't model preempt RCU); embedder overrides via
+ * -DSIM_CONFIG_PREEMPT_RCU. Paired with LINUX_KERNEL_VERSION in
+ * is_migration_disabled.
  */
-bool CONFIG_PREEMPT_RCU = false;
+bool CONFIG_PREEMPT_RCU = SIM_CONFIG_PREEMPT_RCU;
