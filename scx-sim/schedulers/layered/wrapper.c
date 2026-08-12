@@ -213,6 +213,7 @@ static int layered_perf_event_read_value(void *map, unsigned long long flags,
  * engine's slot-based timer queue; layered_fire_timer() below is the entry
  * point the engine calls when the TimerFired event pops.
  * ---------------------------------------------------------------------------*/
+static unsigned long long layered_timer_fires;
 static int (*layered_sim_timer_cb)(void *, int *, struct bpf_timer *);
 static void *layered_sim_timer_map;
 static struct bpf_timer *layered_sim_timer_ptr;
@@ -856,8 +857,94 @@ void layered_fire_timer(unsigned int slot)
 	int key = 0;
 
 	(void)slot;
-	if (layered_sim_timer_cb && layered_sim_timer_ptr)
+	if (layered_sim_timer_cb && layered_sim_timer_ptr) {
+		layered_timer_fires++;
 		layered_sim_timer_cb(layered_sim_timer_map, &key, layered_sim_timer_ptr);
+	}
+}
+
+/* How many times the antistall timer callback has run this simulation. */
+unsigned long long layered_probe_timer_fires(void)
+{
+	return layered_timer_fires;
+}
+
+/* ---------------------------------------------------------------------------
+ * tp_btf tracepoint delivery
+ *
+ * scx_layered attaches two BTF tracepoints outside the struct_ops surface.
+ * Both are real BPF programs that must run, so the wrapper exports plain-C
+ * entry points the engine can call at the corresponding simulated events.
+ *
+ * BPF_PROG() expands to `name(unsigned long long *ctx)` plus an inlined
+ * `____name(ctx, typed args...)` that casts out of the ctx array, so the
+ * shims below marshal a ctx array exactly as the kernel's BTF tracepoint
+ * trampoline does.
+ * ---------------------------------------------------------------------------*/
+
+/*
+ * tp_btf/cgroup_attach_task(cgrp, cgrp_path, leader, threadgroup).
+ *
+ * Fired when a task is moved into a cgroup. scx_layered uses it (rather than
+ * ops.cgroup_move) because layer membership follows the DEFAULT hierarchy,
+ * not the CPU controller's.
+ *
+ * `threadgroup` is always false here, and that is the faithful value: the
+ * simulator migrates one task at a time, never a whole thread group. It also
+ * matters for safety — the threadgroup path walks
+ * `leader->signal->thread_head`, and the simulated task_struct has no
+ * `signal`, so claiming a group move would dereference near-NULL. If the
+ * engine ever grows thread-group migration, `p->signal->thread_head` and
+ * `p->thread_node` have to be modelled first.
+ */
+void layered_tp_cgroup_attach_task(void *cgrp, const char *cgrp_path, void *leader)
+{
+	unsigned long long ctx[4];
+
+	ctx[0] = (unsigned long long)(unsigned long)cgrp;
+	ctx[1] = (unsigned long long)(unsigned long)cgrp_path;
+	ctx[2] = (unsigned long long)(unsigned long)leader;
+	ctx[3] = 0; /* threadgroup = false */
+	tp_cgroup_attach_task(ctx);
+}
+
+/*
+ * tp_btf/task_rename(p, buf).
+ *
+ * Fired when a task's comm changes. scx_layered marks the task for
+ * re-layering (a rename can change which comm-prefix rule matches) and parses
+ * the new name for an embedded SCXCMD join/leave command.
+ */
+void layered_tp_task_rename(void *p, const char *new_comm)
+{
+	unsigned long long ctx[2];
+
+	ctx[0] = (unsigned long long)(unsigned long)p;
+	ctx[1] = (unsigned long long)(unsigned long)new_comm;
+	tp_task_rename(ctx);
+}
+
+/*
+ * Configure antistall, mirroring scx_layered's `--disable-antistall` and
+ * `--antistall-sec` CLI options.
+ *
+ * @timer_interval_ns overrides `layered_timers[ANTISTALL_TIMER].interval_ns`,
+ * which production hardcodes at 15s. Shortening it is a SIMULATION
+ * ACCELERATOR, not a production configuration: it lets a test reach the
+ * antistall scan without simulating 15 seconds of wall-equivalent time. Pass
+ * 0 to keep the production interval.
+ *
+ * Must be called before Simulator::run(), because start_layered_timers()
+ * reads the interval during ops.init.
+ */
+void layered_set_antistall(int enable, unsigned long long sec,
+			   unsigned long long timer_interval_ns)
+{
+	enable_antistall = !!enable;
+	if (sec)
+		antistall_sec = sec;
+	if (timer_interval_ns)
+		layered_timers[ANTISTALL_TIMER].interval_ns = timer_interval_ns;
 }
 
 /* ---------------------------------------------------------------------------
@@ -1606,6 +1693,10 @@ void layered_setup(unsigned int num_cpus)
 	layered_sim_timer_cb = NULL;
 	layered_sim_timer_map = NULL;
 	layered_sim_timer_ptr = NULL;
+	layered_timer_fires = 0;
+	/* Restore the production antistall timer interval; a previous run in
+	 * this process may have shortened it via layered_set_antistall(). */
+	layered_timers[ANTISTALL_TIMER].interval_ns = 15ULL * NSEC_PER_SEC;
 
 	/* rodata defaults, mirroring scx_layered's Opts defaults (main.rs). */
 	debug = 0;

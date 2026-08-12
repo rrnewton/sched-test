@@ -40,6 +40,10 @@ static void sim_init_root_cgroup(void)
 
 	memset(&sim_root_kn, 0, sizeof(sim_root_kn));
 	sim_root_kn.id = 1; /* matches default root_cgid */
+	/* The root cgroup's directory name is empty in the kernel too; a
+	 * non-NULL empty string keeps bpf_probe_read_kernel_str() callers off
+	 * the NULL path. */
+	sim_root_kn.name = "";
 
 	memset(&sim_root_cgroup, 0, sizeof(sim_root_cgroup));
 	sim_root_cgroup.kn = &sim_root_kn;
@@ -328,6 +332,20 @@ struct scx_exit_task_args *sim_get_exit_task_args(void)
 	(sizeof(struct cgroup) + (CGROUP_ANCESTOR_MAX) * sizeof(struct cgroup *))
 
 /*
+ * The kernfs_node carries the cgroup's directory name (`kn->name`), which a
+ * BPF scheduler walks to reconstruct the cgroup path — scx_layered's
+ * format_cgrp_path() reads `cgrp->ancestors[level]->kn->name` at every level.
+ * The storage is allocated together with the node so it lives exactly as long
+ * as the cgroup and needs no separate free. Names longer than the buffer are
+ * truncated; that is well beyond anything scheduling decisions depend on.
+ */
+#define SIM_CGROUP_NAME_MAX 64
+struct sim_kernfs_node_with_name {
+	struct kernfs_node kn;
+	char name_buf[SIM_CGROUP_NAME_MAX];
+};
+
+/*
  * Allocate a new cgroup with the given ID and level.
  * parent is the parent cgroup's struct cgroup pointer (or NULL for root).
  */
@@ -341,7 +359,7 @@ void *sim_cgroup_alloc(u64 cgid, u32 level, void *parent)
 	if (!cgrp)
 		return NULL;
 
-	kn = calloc(1, sizeof(struct kernfs_node));
+	kn = calloc(1, sizeof(struct sim_kernfs_node_with_name));
 	if (!kn) {
 		free(cgrp);
 		return NULL;
@@ -354,8 +372,11 @@ void *sim_cgroup_alloc(u64 cgid, u32 level, void *parent)
 		return NULL;
 	}
 
-	/* Set up kernfs_node */
+	/* Set up kernfs_node. The name defaults to the co-allocated (zeroed,
+	 * hence empty) buffer so it is never NULL; sim_cgroup_set_name() fills
+	 * it in. */
 	kn->id = cgid;
+	kn->name = ((struct sim_kernfs_node_with_name *)kn)->name_buf;
 
 	/* Set up cgroup */
 	cgrp->kn = kn;
@@ -404,13 +425,38 @@ u64 sim_cgroup_get_kn_id(void *cgrp_ptr)
 	return cgrp->kn->id;
 }
 
+/*
+ * Set a cgroup's directory name (`cgrp->kn->name`).
+ *
+ * Only valid for cgroups from sim_cgroup_alloc(), whose kernfs_node carries
+ * co-allocated name storage. The root cgroup's static node is left alone —
+ * its name is "" in the kernel too, and format_cgrp_path() never reads it
+ * (the walk starts at level 1).
+ */
+void sim_cgroup_set_name(void *cgrp_ptr, const char *name)
+{
+	struct cgroup *cgrp = (struct cgroup *)cgrp_ptr;
+	struct sim_kernfs_node_with_name *knn;
+	int i;
+
+	if (!cgrp || !cgrp->kn || !name || cgrp == &sim_root_cgroup)
+		return;
+
+	knn = (struct sim_kernfs_node_with_name *)cgrp->kn;
+	for (i = 0; i < SIM_CGROUP_NAME_MAX - 1 && name[i]; i++)
+		knn->name_buf[i] = name[i];
+	knn->name_buf[i] = '\0';
+	cgrp->kn->name = knn->name_buf;
+}
+
 void sim_cgroup_free(void *cgrp_ptr)
 {
 	struct cgroup *cgrp = (struct cgroup *)cgrp_ptr;
 	if (!cgrp)
 		return;
 
-	/* Free the kernfs_node */
+	/* Free the kernfs_node (allocated as sim_kernfs_node_with_name, whose
+	 * first member is the kernfs_node, so the pointers coincide). */
 	if (cgrp->kn)
 		free(cgrp->kn);
 

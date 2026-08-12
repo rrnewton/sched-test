@@ -297,6 +297,7 @@ pub struct LayeredProbes {
     nr_llcs_fn: unsafe extern "C" fn() -> u32,
     nr_nodes_fn: unsafe extern "C" fn() -> u32,
     sibling_cpu_fn: unsafe extern "C" fn(u32) -> i32,
+    timer_fires_fn: unsafe extern "C" fn() -> u64,
 }
 
 /// scx_layered's "task belongs to no layer" sentinel (`MAX_LAYERS`).
@@ -358,6 +359,10 @@ impl LayeredProbes {
                 sibling_cpu_fn: resolve!(
                     b"layered_probe_sibling_cpu",
                     unsafe extern "C" fn(u32) -> i32
+                ),
+                timer_fires_fn: resolve!(
+                    b"layered_probe_timer_fires",
+                    unsafe extern "C" fn() -> u64
                 ),
             }
         }
@@ -445,6 +450,12 @@ impl LayeredProbes {
     pub fn sibling_cpu(&self, cpu: CpuId) -> i32 {
         // SAFETY: cpu is bounds-checked C-side.
         unsafe { (self.sibling_cpu_fn)(cpu.0) }
+    }
+
+    /// How many times the antistall timer callback has run.
+    pub fn timer_fires(&self) -> u64 {
+        // SAFETY: no arguments.
+        unsafe { (self.timer_fires_fn)() }
     }
 }
 

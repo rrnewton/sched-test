@@ -716,3 +716,354 @@ fn layered_runs_are_deterministic() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Cgroup-path matching
+// ---------------------------------------------------------------------------
+
+/// `MATCH_CGROUP_PREFIX` routes by the cgroup path scx_layered reconstructs
+/// from `cgrp->kn->name` up the ancestor chain. This exercises
+/// `util.bpf.c::format_cgrp_path()` and `match_prefix_suffix()` for real.
+#[test]
+fn cgroup_prefix_match_routes_tasks_by_cgroup_path() {
+    let _lock = common::setup_test();
+    let sched = DynamicScheduler::layered(4);
+    sched.layered_layers(&[
+        LayerSpec::new("batchcg", LayerKind::Open)
+            .with_match(LayerMatch::CgroupPrefix("batch".into())),
+        LayerSpec::catch_all("rest"),
+    ]);
+    let probes = LayeredProbes::new(&sched);
+
+    let scenario = Scenario::builder()
+        .cpus(4)
+        .detect_bpf_errors()
+        .cgroup("batchgrp", &[CpuId(0), CpuId(1), CpuId(2), CpuId(3)])
+        .cgroup("othergrp", &[CpuId(0), CpuId(1), CpuId(2), CpuId(3)])
+        .add_task_in_cgroup("a", 0, run_once(10_000_000), "batchgrp")
+        .add_task_in_cgroup("b", 0, run_once(10_000_000), "othergrp")
+        .duration_ms(200)
+        .build();
+    let sim = Simulator::new(sched);
+    let t = sim.run(scenario);
+    assert_eq!(t.exit_kind(), &ExitKind::Normal);
+
+    assert_eq!(
+        probes.task_layer(Pid(1)),
+        0,
+        "task in /batchgrp should match the cgroup-prefix layer"
+    );
+    assert_eq!(
+        probes.task_layer(Pid(2)),
+        1,
+        "task in /othergrp should fall through to the catch-all"
+    );
+}
+
+/// `MATCH_CGROUP_SUFFIX` and `MATCH_CGROUP_CONTAINS` use different
+/// `util.bpf.c` code paths (`match_prefix_suffix(.., true)` and
+/// `match_substr()`); cover both.
+#[test]
+fn cgroup_suffix_and_contains_match() {
+    let _lock = common::setup_test();
+    let sched = DynamicScheduler::layered(2);
+    sched.layered_layers(&[
+        LayerSpec::new("suffix", LayerKind::Open)
+            // format_cgrp_path() renders a level-1 cgroup as "<name>/".
+            .with_match(LayerMatch::CgroupSuffix("prod/".into())),
+        LayerSpec::new("contains", LayerKind::Open)
+            .with_match(LayerMatch::CgroupContains("mid".into())),
+        LayerSpec::catch_all("rest"),
+    ]);
+    let probes = LayeredProbes::new(&sched);
+
+    let scenario = Scenario::builder()
+        .cpus(2)
+        .detect_bpf_errors()
+        .cgroup("appprod", &[CpuId(0), CpuId(1)])
+        .cgroup("xmidy", &[CpuId(0), CpuId(1)])
+        .cgroup("plain", &[CpuId(0), CpuId(1)])
+        .add_task_in_cgroup("a", 0, run_once(5_000_000), "appprod")
+        .add_task_in_cgroup("b", 0, run_once(5_000_000), "xmidy")
+        .add_task_in_cgroup("c", 0, run_once(5_000_000), "plain")
+        .duration_ms(200)
+        .build();
+    let sim = Simulator::new(sched);
+    let t = sim.run(scenario);
+    assert_eq!(t.exit_kind(), &ExitKind::Normal);
+
+    assert_eq!(probes.task_layer(Pid(1)), 0, "appprod/ ends with prod/");
+    assert_eq!(probes.task_layer(Pid(2)), 1, "xmidy/ contains mid");
+    assert_eq!(probes.task_layer(Pid(3)), 2, "plain/ matches neither");
+}
+
+// ---------------------------------------------------------------------------
+// Antistall timer
+// ---------------------------------------------------------------------------
+
+/// scx_layered arms one BPF timer (ANTISTALL_TIMER) from `ops.init` and
+/// re-arms it from its own callback. Drive it with a shortened interval and
+/// assert the callback actually ran repeatedly — the callback body *is*
+/// `antistall_scan()`, so this proves the whole timer path executes.
+#[test]
+fn antistall_timer_fires_and_rearms() {
+    let _lock = common::setup_test();
+    let sched = DynamicScheduler::layered(2);
+    // 20ms scan period instead of the production 15s, so a 200ms run reaches
+    // it. Purely a simulation accelerator; antistall_sec stays at production's
+    // 3 seconds.
+    sched.layered_set_antistall(true, 3, Some(20_000_000));
+    let probes = LayeredProbes::new(&sched);
+
+    let scenario = Scenario::builder()
+        .cpus(2)
+        .detect_bpf_errors()
+        .add_task("a", 0, workloads::periodic(2_000_000, 5_000_000))
+        .add_task("b", 0, workloads::periodic(2_000_000, 5_000_000))
+        .duration_ms(200)
+        .build();
+    let sim = Simulator::new(sched);
+    let t = sim.run(scenario);
+    assert_eq!(t.exit_kind(), &ExitKind::Normal);
+
+    let fires = probes.timer_fires();
+    assert!(
+        fires >= 5,
+        "antistall timer should have fired repeatedly over 200ms at a 20ms \
+         period, got {fires}"
+    );
+}
+
+/// With antistall disabled the callback still runs (the timer is armed
+/// unconditionally) but `antistall_scan()` returns 0 immediately, which stops
+/// the re-arm — so it fires exactly once.
+#[test]
+fn disabled_antistall_stops_rearming_after_one_fire() {
+    let _lock = common::setup_test();
+    let sched = DynamicScheduler::layered(2);
+    sched.layered_set_antistall(false, 3, Some(20_000_000));
+    let probes = LayeredProbes::new(&sched);
+
+    let scenario = Scenario::builder()
+        .cpus(2)
+        .detect_bpf_errors()
+        .add_task("a", 0, workloads::periodic(2_000_000, 5_000_000))
+        .duration_ms(200)
+        .build();
+    let sim = Simulator::new(sched);
+    let t = sim.run(scenario);
+    assert_eq!(t.exit_kind(), &ExitKind::Normal);
+
+    assert_eq!(
+        probes.timer_fires(),
+        1,
+        "a disabled antistall scan returns 0 and must not re-arm"
+    );
+    assert_eq!(probes.global_stat(GlobalStat::Antistall), 0);
+}
+
+// ---------------------------------------------------------------------------
+// ops.dump
+// ---------------------------------------------------------------------------
+
+/// `ops.dump` walks every layer, its per-LLC DSQs and both fallback DSQs. It
+/// only runs on scheduler exit/error, so the engine's shutdown dump is the
+/// only thing that exercises it — assert it does so without faulting on a
+/// non-trivial multi-layer, multi-LLC configuration.
+#[test]
+fn ops_dump_runs_over_a_multi_layer_config() {
+    let _lock = common::setup_test();
+    let sched = DynamicScheduler::layered_with_topology(4, 2, 2, 1);
+    sched.layered_layers(&[
+        LayerSpec::new("batch", LayerKind::Grouped)
+            .with_match(LayerMatch::CommPrefix("batch".into()))
+            .with_weight(50),
+        LayerSpec::new("iface", LayerKind::Open)
+            .with_match(LayerMatch::NiceBelow(0))
+            .with_preempt(true),
+        LayerSpec::catch_all("rest"),
+    ]);
+
+    let scenario = Scenario::builder()
+        .cpus(4)
+        .detect_bpf_errors()
+        .cpus_per_llc(2)
+        .add_task("batch_a", 0, workloads::periodic(2_000_000, 5_000_000))
+        .add_task("iface_b", -5, workloads::periodic(500_000, 3_000_000))
+        .add_task("plain_c", 0, workloads::periodic(1_000_000, 4_000_000))
+        .duration_ms(200)
+        .build();
+    let sim = Simulator::new(sched);
+    let t = sim.run(scenario);
+    assert_eq!(t.exit_kind(), &ExitKind::Normal);
+}
+
+// ---------------------------------------------------------------------------
+// tp_btf/cgroup_attach_task
+// ---------------------------------------------------------------------------
+
+/// scx_layered tracks layer membership by the DEFAULT cgroup hierarchy, so it
+/// hooks `tp_btf/cgroup_attach_task` rather than `ops.cgroup_move`. Moving a
+/// task between cgroups must therefore re-evaluate its layer: a task that
+/// starts in a non-matching cgroup and is migrated into a matching one has to
+/// end up in the cgroup-matched layer.
+///
+/// Without the tracepoint the task would stay in whatever layer it was first
+/// assigned, so this is the test that proves the delivery path works end to
+/// end (engine event → wrapper shim → BPF_PROG ctx marshalling → the real
+/// `tp_cgroup_attach_task`).
+#[test]
+fn cgroup_migration_relayers_the_task_via_tp_btf() {
+    let _lock = common::setup_test();
+    let sched = DynamicScheduler::layered(2);
+    sched.layered_layers(&[
+        LayerSpec::new("prodcg", LayerKind::Open)
+            .with_match(LayerMatch::CgroupPrefix("prod".into())),
+        LayerSpec::catch_all("rest"),
+    ]);
+    let probes = LayeredProbes::new(&sched);
+
+    let all = [CpuId(0), CpuId(1)];
+    let scenario = Scenario::builder()
+        .cpus(2)
+        .detect_bpf_errors()
+        .cgroup("prodgrp", &all)
+        .cgroup("devgrp", &all)
+        // Starts in devgrp (catch-all), migrates into prodgrp mid-run.
+        .add_task_in_cgroup(
+            "mover",
+            0,
+            workloads::periodic(1_000_000, 3_000_000),
+            "devgrp",
+        )
+        .cgroup_migrate(Pid(1), "devgrp", "prodgrp", 50_000_000)
+        .duration_ms(200)
+        .build();
+    let sim = Simulator::new(sched);
+    let t = sim.run(scenario);
+    assert_eq!(t.exit_kind(), &ExitKind::Normal);
+
+    assert_eq!(
+        count(&t, |k| matches!(k, TraceKind::CgroupMove { .. })),
+        1,
+        "the migration should have happened"
+    );
+    assert_eq!(
+        probes.task_layer(Pid(1)),
+        0,
+        "after migrating into /prodgrp the task must be re-layered into the \
+         cgroup-prefix layer — tp_btf/cgroup_attach_task did not reach the \
+         scheduler"
+    );
+}
+
+/// The mirror image: migrating OUT of a matching cgroup must drop the task
+/// back to the catch-all. Guards against a one-way re-layering that only ever
+/// promotes.
+#[test]
+fn cgroup_migration_out_of_a_matching_cgroup_relayers_back() {
+    let _lock = common::setup_test();
+    let sched = DynamicScheduler::layered(2);
+    sched.layered_layers(&[
+        LayerSpec::new("prodcg", LayerKind::Open)
+            .with_match(LayerMatch::CgroupPrefix("prod".into())),
+        LayerSpec::catch_all("rest"),
+    ]);
+    let probes = LayeredProbes::new(&sched);
+
+    let all = [CpuId(0), CpuId(1)];
+    let scenario = Scenario::builder()
+        .cpus(2)
+        .detect_bpf_errors()
+        .cgroup("prodgrp", &all)
+        .cgroup("devgrp", &all)
+        .add_task_in_cgroup(
+            "mover",
+            0,
+            workloads::periodic(1_000_000, 3_000_000),
+            "prodgrp",
+        )
+        .cgroup_migrate(Pid(1), "prodgrp", "devgrp", 50_000_000)
+        .duration_ms(200)
+        .build();
+    let sim = Simulator::new(sched);
+    let t = sim.run(scenario);
+    assert_eq!(t.exit_kind(), &ExitKind::Normal);
+
+    assert_eq!(
+        probes.task_layer(Pid(1)),
+        1,
+        "after migrating out of /prodgrp the task must fall back to the \
+         catch-all layer"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// tp_btf/task_rename
+// ---------------------------------------------------------------------------
+
+/// scx_layered classifies by `p->comm`, so a rename can change which layer a
+/// task belongs to. The kernel signals that through the `task_rename` BTF
+/// tracepoint; scx_layered's handler sets `refresh_layer` and the next
+/// scheduling event re-matches.
+///
+/// Renaming a task from a non-matching to a matching name must move it.
+#[test]
+fn task_rename_relayers_the_task_via_tp_btf() {
+    let _lock = common::setup_test();
+    let sched = DynamicScheduler::layered(2);
+    sched.layered_layers(&[
+        LayerSpec::new("batch", LayerKind::Open).with_match(LayerMatch::CommPrefix("batch".into())),
+        LayerSpec::catch_all("rest"),
+    ]);
+    let probes = LayeredProbes::new(&sched);
+
+    let scenario = Scenario::builder()
+        .cpus(2)
+        .detect_bpf_errors()
+        .add_task("plain", 0, workloads::periodic(1_000_000, 3_000_000))
+        .task_rename(Pid(1), "batch_now", 50_000_000)
+        .duration_ms(200)
+        .build();
+    let sim = Simulator::new(sched);
+    let t = sim.run(scenario);
+    assert_eq!(t.exit_kind(), &ExitKind::Normal);
+
+    assert_eq!(
+        probes.task_layer(Pid(1)),
+        0,
+        "after renaming to batch_now the task must move into the \
+         comm-prefix layer — tp_btf/task_rename did not reach the scheduler"
+    );
+}
+
+/// The mirror image: renaming out of a matching name must drop the task back
+/// to the catch-all.
+#[test]
+fn task_rename_out_of_a_matching_name_relayers_back() {
+    let _lock = common::setup_test();
+    let sched = DynamicScheduler::layered(2);
+    sched.layered_layers(&[
+        LayerSpec::new("batch", LayerKind::Open).with_match(LayerMatch::CommPrefix("batch".into())),
+        LayerSpec::catch_all("rest"),
+    ]);
+    let probes = LayeredProbes::new(&sched);
+
+    let scenario = Scenario::builder()
+        .cpus(2)
+        .detect_bpf_errors()
+        .add_task("batch_x", 0, workloads::periodic(1_000_000, 3_000_000))
+        .task_rename(Pid(1), "plain_now", 50_000_000)
+        .duration_ms(200)
+        .build();
+    let sim = Simulator::new(sched);
+    let t = sim.run(scenario);
+    assert_eq!(t.exit_kind(), &ExitKind::Normal);
+
+    assert_eq!(
+        probes.task_layer(Pid(1)),
+        1,
+        "after renaming away from batch* the task must fall back to the \
+         catch-all layer"
+    );
+}

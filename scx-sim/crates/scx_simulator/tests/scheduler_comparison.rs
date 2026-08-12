@@ -64,6 +64,7 @@ fn make_scheduler(name: &str, nr_cpus: u32) -> DynamicScheduler {
         "simple" => DynamicScheduler::simple(),
         "lavd" => DynamicScheduler::lavd(nr_cpus),
         "cosmos" => DynamicScheduler::cosmos(nr_cpus),
+        "layered" => DynamicScheduler::layered(nr_cpus),
         other => panic!("unknown scheduler {other}"),
     }
 }
@@ -117,9 +118,9 @@ fn collect(trace: &Trace, nr_tasks: u32) -> Metrics {
     }
 }
 
-/// Run the shared workload under all three schedulers on `nr_cpus`.
+/// Run the shared workload under every compared scheduler on `nr_cpus`.
 fn run_all(nr_cpus: u32, nr_tasks: u32, duration_ms: u64) -> Vec<(&'static str, Metrics)> {
-    ["simple", "lavd", "cosmos"]
+    ["simple", "lavd", "cosmos", "layered"]
         .iter()
         .map(|&name| {
             let trace = Simulator::new(make_scheduler(name, nr_cpus)).run(workload(

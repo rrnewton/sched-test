@@ -187,6 +187,31 @@ impl<S: Scheduler> SchedulerWrapper<S> {
         unsafe { self.inner.disable(p.as_raw()) }
     }
 
+    /// Deliver the `tp_btf/cgroup_attach_task` BTF tracepoint.
+    ///
+    /// `cgrp_path` must be a valid NUL-terminated C string that outlives the
+    /// call; callers pass a borrowed `CString`.
+    pub fn tp_cgroup_attach_task(
+        &self,
+        cgrp: TaskPtr,
+        cgrp_path: &std::ffi::CStr,
+        leader: TaskPtr,
+    ) {
+        // SAFETY: both pointers are non-null by `TaskPtr::new`, and `cgrp_path`
+        // is NUL-terminated and borrowed for the duration of the call.
+        unsafe {
+            self.inner
+                .tp_cgroup_attach_task(cgrp.as_raw(), cgrp_path.as_ptr(), leader.as_raw())
+        }
+    }
+
+    /// Deliver the `tp_btf/task_rename` BTF tracepoint.
+    pub fn tp_task_rename(&self, p: TaskPtr, new_comm: &std::ffi::CStr) {
+        // SAFETY: `p` is non-null by `TaskPtr::new`, and `new_comm` is
+        // NUL-terminated and borrowed for the duration of the call.
+        unsafe { self.inner.tp_task_rename(p.as_raw(), new_comm.as_ptr()) }
+    }
+
     /// A task's weight was published to the scheduler (`ops.set_weight`).
     pub fn set_weight(&self, p: TaskPtr, weight: u32) {
         // SAFETY: `p` is guaranteed non-null by `TaskPtr::new`.

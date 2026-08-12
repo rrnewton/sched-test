@@ -27,7 +27,7 @@
 //! - JSON files with duplicate keys (common in rt-app) must be preprocessed
 //!   with rt-app's `workgen` script or use suffixed keys (`"run0"`, `"run1"`).
 //! - Unsupported events (`lock`, `unlock`, `wait`, `signal`, `broad`, `sync`,
-//!   `mem`, `iorun`, `yield`, `barrier`, `fork`) are skipped with a warning.
+//!   `mem`, `iorun`, `barrier`, `fork`) are skipped with a warning.
 //! - Phase-level `taskgroup` migration is not modeled.
 
 use std::collections::{BTreeSet, HashMap};
@@ -852,6 +852,7 @@ pub fn load_rtapp(json_str: &str, nr_cpus: u32) -> Result<Scenario, RtAppError> 
         hotplug_events: Vec::new(),
         cpu_preempt_events: Vec::new(),
         cgroup_migrate_events: Vec::new(),
+        task_rename_events: Vec::new(),
         cgroup_create_events: Vec::new(),
         cgroup_destroy_events: Vec::new(),
         cgroup_cpuset_change_events: Vec::new(),
