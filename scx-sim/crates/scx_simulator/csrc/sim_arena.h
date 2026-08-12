@@ -89,17 +89,46 @@ static inline void sim_arena_free(void *ptr)
 }
 
 /*
+ * Floor below which sim_arena_reset() will not reclaim.
+ *
+ * A scheduler's `<name>_setup()` runs ONCE, when the .so is dlopen'd, and
+ * may allocate objects the scheduler holds for its whole lifetime --
+ * tickless and cosmos both create their primary-CPU `bpf_cpumask` there via
+ * enable_primary_cpu(). Those allocations come out of this arena.
+ *
+ * Resetting the bump pointer all the way to 0 between runs therefore did two
+ * wrong things at once: it zeroed a live object the scheduler still pointed
+ * at, and it handed the same bytes out again to the next run's allocations.
+ * The visible symptom was that is_primary_cpu() returned false forever, so
+ * tickless never reached init_timer() and its entire timer path went
+ * unexecuted -- see mb sim-hfvmf.
+ *
+ * Recording a floor after setup keeps the determinism guarantee intact (the
+ * floor is fixed once the .so is loaded, so every run still starts its
+ * allocations at the same address) while leaving setup-time objects alone.
+ */
+extern unsigned long sim_arena_floor;
+
+/*
+ * Freeze everything allocated so far as scheduler-lifetime state.
+ *
+ * Called by the engine immediately after `<name>_setup()`. Idempotent.
+ */
+void sim_arena_mark_persistent(void);
+
+/*
  * Reset the arena for a new simulation run.
  *
- * Zeros the used portion and resets the bump pointer. This ensures
- * the next run's allocations return the same addresses as the first
- * run (since the bump pointer starts from the same position).
+ * Zeros the per-run portion and rewinds the bump pointer to the persistent
+ * floor, so the next run's allocations return the same addresses as the
+ * first run's while setup-time allocations survive.
  */
 static inline void sim_arena_reset(void)
 {
-	if (sim_arena_offset > 0)
-		__builtin_memset(sim_arena_buf, 0, sim_arena_offset);
-	sim_arena_offset = 0;
+	if (sim_arena_offset > sim_arena_floor)
+		__builtin_memset(sim_arena_buf + sim_arena_floor, 0,
+				 sim_arena_offset - sim_arena_floor);
+	sim_arena_offset = sim_arena_floor;
 }
 
 #endif /* SIM_ARENA_H */

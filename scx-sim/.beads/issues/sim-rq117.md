@@ -1,12 +1,13 @@
 ---
 title: tickless wrapper has no bpf_timer plumbing — bpf_timer_init would call absolute address 169
-status: open
+status: closed
 priority: 1
 issue_type: bug
 depends_on:
   sim-hfvmf: related
 created_at: 2026-08-12T14:50:35.568735707+00:00
-updated_at: 2026-08-12T22:07:33.141673259+00:00
+updated_at: 2026-08-12T22:30:34.878445878+00:00
+closed_at: 2026-08-12T22:30:34.878445707+00:00
 ---
 
 # Description

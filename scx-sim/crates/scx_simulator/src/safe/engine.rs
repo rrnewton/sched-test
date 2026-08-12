@@ -1734,6 +1734,16 @@ impl<S: Scheduler> Simulator<S> {
             });
             charge_sched_time(&mut s.sim, CpuId(0), "init");
             assert!(rc == 0, "scheduler init failed with rc={rc}");
+
+            // Userspace-side post-attach step, for schedulers that have one.
+            // scx_tickless arms its periodic timer from a syscall program its
+            // Rust userspace calls right after ops.init; without this the
+            // timer is created and never started (mb sim-rq117). No-op for
+            // schedulers that do not export the hook.
+            sim_callback!(s, s, sim_arc, cpu, {
+                self.scheduler.post_init();
+            });
+            charge_sched_time(&mut s.sim, CpuId(0), "post_init");
         }
 
         // Call cgroup_init for each cgroup (root first, then children in order).
