@@ -34,11 +34,20 @@
 
 pub mod fidelity;
 pub mod ir;
+pub mod lower;
+pub mod pretty;
+pub mod source;
 pub mod units;
 
 pub use fidelity::{Approximation, Cause, Fidelity, FidelityReport};
 pub use ir::{
-    Bandwidth, Cgroup, CpuSet, Mutation, Phase, Probe, Repeat, SchedPolicy, Task, TimedMutation,
-    Topology, ValidationError, WorkloadIr,
+    Bandwidth, Cgroup, CpuSet, CpuSetDisplay, Mutation, Phase, Probe, Repeat, SchedPolicy, Task,
+    TimedMutation, Topology, ValidationError, WorkloadIr,
+};
+pub use lower::{lower, LoweringError};
+pub use pretty::pretty;
+pub use source::{
+    SourceCgroupDef, SourceCpuset, SourceHold, SourceOp, SourceScenario, SourceStep,
+    SourceTopology, SourceWorkPhase, SourceWorkSpec, SourceWorkType,
 };
 pub use units::{CgroupName, CpuIndex, DurationNs, Nice, TaskId};

@@ -88,6 +88,29 @@ impl CpuSet {
     }
 }
 
+/// Display adapter for [`CpuSet`].
+///
+/// A wrapper rather than a `Display` impl on `CpuSet` itself: the IR's cpusets
+/// are symbolic (`Llc(0)`, `Partition{..}`) and only the backend can resolve
+/// them to CPU numbers, so rendering is a presentation concern that should not
+/// look like a canonical form.
+pub struct CpuSetDisplay<'a>(pub &'a CpuSet);
+
+impl std::fmt::Display for CpuSetDisplay<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            CpuSet::All => f.write_str("all"),
+            CpuSet::Llc(i) => write!(f, "llc{i}"),
+            CpuSet::NumaNode(i) => write!(f, "node{i}"),
+            CpuSet::Partition { index, of } => write!(f, "part{index}/{of}"),
+            CpuSet::Explicit(v) => {
+                let ids: Vec<String> = v.iter().map(|c| c.0.to_string()).collect();
+                write!(f, "{{{}}}", ids.join(","))
+            }
+        }
+    }
+}
+
 /// cgroup CPU bandwidth (`cpu.max`): `quota` per `period`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Bandwidth {
