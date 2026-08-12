@@ -3,6 +3,7 @@
 **For:** the next agent (codex 5.6) picking this up cold.
 **From:** tg `layered-tier3-drive`, 2026-08-12.
 **Branch:** `feat/layered-support` in `worktrees/layered`. Not pushed.
+**Base:** rebased cleanly onto `integration` `2bf12ea` (local/origin/mirror).
 **scx submodule:** pinned at the committed gitlink `59c30bae`. Do **not**
 commit a pin bump.
 
@@ -20,24 +21,21 @@ periodic live reallocation for a source-guarded one-LLC/no-SMT `Linear` subset.
 
 | Commit | Contents |
 |---|---|
-| `e3e2277` | substrate: `ops.yield`/`set_weight`/`disable`, jiffies, 2 kfuncs |
-| `633dca9` | scx_layered as the 6th scheduler |
-| `1fe2cea` | Tier-2 completion: cgroup matching, antistall, dump, tp_btf |
-| `f9d3f12` | antistall + dump tests made non-vacuous |
-| `12d4157` | LLC topology proven to reach DSQ selection |
-| `e012423` | Tier-2 audit recorded; SMT gap filed |
-| `9052aec` | **Tier 3 step 1:** scx_layered's real allocator compiled in |
-| `TBD` | **Tier 3 step 2:** periodic control event, measured usage, flat Linear reallocation, real BPF refresh |
+| `c9786db` | substrate: `ops.yield`/`set_weight`/`disable`, jiffies, 2 kfuncs |
+| `a50f61f` | scx_layered as the 6th scheduler |
+| `7e489e6` | Tier-2 completion: cgroup matching, antistall, dump, tp_btf |
+| `19cc392` | antistall + dump tests made non-vacuous |
+| `7f6061c` | LLC topology proven to reach DSQ selection |
+| `3c68cfd` | Tier-2 audit recorded; SMT gap filed |
+| `2b23577` | **Tier 3 step 1:** scx_layered's real allocator compiled in |
+| `8a1416a` | **Tier 3 step 2:** periodic control, measured usage, flat Linear reallocation, real BPF refresh |
+| `9b60292` | one-LLC support fence lint cleanup |
 
-Pre-step-2 baseline: **1117 tests pass, 14 skipped.** Replace this paragraph
-with the post-commit validation result before handing off.
-
-`validate.sh` exits 1 at the mypy gate on a **pre-existing** bug unrelated to
-this work: `scripts/typecheck.sh` resolves `mypy` from `PATH`
-(`mypy` found on `PATH`) but `pip` from `.venv`, so stubs land where mypy cannot
-see them. Fixed on main by `f0acf58`, which is not an ancestor of this branch.
-`.venv/bin/mypy --strict` passes. Do not "fix" it here — you will conflict on
-rebase.
+Suite: **1122 tests pass, 14 skipped.** `./validate.sh` passes after the
+rebase, including fmt, clippy with warnings denied, nextest, doc tests, stress
+smoke tests, and `mypy --strict`. It reports only its standard optional skips:
+e9-instrumented schedulers, e9 stress mode, and the absent release-only ASLR
+binary.
 
 ---
 
@@ -76,7 +74,7 @@ not glue. A re-implementation would be a fake approximation — same interface,
 plausible numbers, silently divergent exactly where the allocator is
 interesting. `scx-sim/CLAUDE.md` forbids that.
 
-This is already done (`9052aec`):
+This is already done (`2b23577`):
 
 - `safe/layered_alloc_upstream` **is** `scx_layered/src/alloc.rs`, compiled
   verbatim via `#[path]` from `safe/mod.rs`.
@@ -254,8 +252,9 @@ These are the traps already paid for. None are guessable from the code.
 - No host-specific absolute paths in committed files.
 - **Do not push** — the feature branch name needs review first.
 - Do not self-close the tg task.
-- File beads for out-of-scope findings. Open ones from this work:
-  `sim-lqyu9` (userspace control-loop substrate — the enabler for (a)),
+- File beads for out-of-scope findings. Relevant ones from this work:
+  `sim-lqyu9` (userspace control-loop substrate — implemented by step 2),
+  `sim-juru9` (full real `layer_core_growth` integration),
   `sim-u4the` (SMT placement effect untested), `sim-pf571` (cosmos still
   hand-writes `scx_pmu_*`), `sim-35uta` (thread groups).
 
@@ -276,7 +275,7 @@ These are the traps already paid for. None are guessable from the code.
 | `crates/scx_simulator/tests/layered_alloc.rs` | allocator drift guard + entry-point tests. |
 
 Build: `cargo build --workspace`. Test: `cargo nextest run --workspace`.
-Full gate: `./validate.sh` (see the mypy caveat in §1).
+Full gate: `./validate.sh`.
 
 ---
 
