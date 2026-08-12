@@ -1622,3 +1622,90 @@ fn growth_denied_matches_a_prediction_made_from_the_scenario_spec() {
          to the wrong layer, or `wanted` is not actually reading utilization."
     );
 }
+
+/// Whole-core allocation, on a path that ACTUALLY MOVES A CORE.
+///
+/// `smt_allocation_keeps_whole_cores_and_hits_the_shrink_fixed_point` asserts
+/// the no-half-core invariant, but it sits at the fixed point: `to_free` is
+/// zero, so the core-granular shrink and grow loops never execute and the
+/// invariant is never put at risk. Sabotaging those loops to release a single
+/// thread instead of a whole core left all 32 tests green — the assertion was
+/// unreachable. This test exists because of that.
+///
+/// Construction, chosen so a transfer is possible at all under SMT:
+///   - 8 CPUs = 4 cores, `alloc_unit` 2.
+///   - Weights put `busy` on 1 core and `idle` on 3 at start; their
+///     `cpus_range` targets pull the other way (busy 3 cores, idle 1).
+///   - idle's shrink clears the halving threshold — `6 - ceil((6-2)/2) = 4`
+///     CPUs = 2 cores — so it genuinely releases a core, unlike the 2-core to
+///     1-core case which is a fixed point (mb sim-klue5).
+///
+/// The transfer itself is asserted, so the test fails if the loops go idle.
+#[test]
+fn smt_core_transfer_moves_whole_cores_only() {
+    let _lock = common::setup_test();
+    let sched = DynamicScheduler::layered_with_topology(8, 8, 1, 2);
+    sched.layered_layers(&[
+        LayerSpec::new("busy", LayerKind::Grouped)
+            .with_match(LayerMatch::CommPrefix("busy".into()))
+            .with_util_range(0.8, 0.9)
+            .with_cpus_range(6, 6)
+            // Weight drives the INITIAL auto-allocation (8*100/400 = 2 CPUs
+            // = 1 core). `with_cpus` cannot be used here: the control loop
+            // refuses to resize an explicitly pinned layer, which is correct
+            // and is itself asserted by
+            // `cpuset_growth_is_rejected_instead_of_approximated`.
+            .with_weight(100),
+        LayerSpec::new("idle", LayerKind::Grouped)
+            .with_or(Vec::new())
+            .with_util_range(0.8, 0.9)
+            .with_cpus_range(2, 2)
+            // 8*300/400 = 6 CPUs = 3 cores initially.
+            .with_weight(300),
+    ]);
+    sched.layered_enable_control_loop(100_000_000);
+    let probes = LayeredProbes::new(&sched);
+    let scenario = Scenario::builder()
+        .cpus(8)
+        .smt(2)
+        .detect_bpf_errors()
+        .add_task("busy_a", 0, hog())
+        .add_task("busy_b", 0, hog())
+        .add_task("idle_a", 0, workloads::periodic(1_000_000, 100_000_000))
+        .duration_ms(500)
+        .build();
+    let sim = Simulator::new(sched);
+    let trace = sim.run(scenario);
+    assert_eq!(trace.exit_kind(), &ExitKind::Normal);
+
+    // A core really moved: without this the no-half-core assertions below are
+    // unreachable and would pass on a loop that did nothing.
+    let busy = probes.layer_nr_cpus(0);
+    assert!(
+        busy > 2,
+        "no core was transferred (busy still holds {busy} CPUs), so the \
+         whole-core assertions below would prove nothing"
+    );
+
+    for layer in 0..2 {
+        for first in (0..8).step_by(2) {
+            let serialized = (
+                probes.layer_has_cpu(layer, CpuId(first)),
+                probes.layer_has_cpu(layer, CpuId(first + 1)),
+            );
+            let bpf = (
+                probes.layer_bpf_has_cpu(layer, CpuId(first)),
+                probes.layer_bpf_has_cpu(layer, CpuId(first + 1)),
+            );
+            assert_eq!(
+                serialized.0, serialized.1,
+                "layer {layer} holds half of core {first} (serialized)"
+            );
+            assert_eq!(
+                bpf.0, bpf.1,
+                "layer {layer} holds half of core {first} (BPF kptr)"
+            );
+            assert_eq!(serialized, bpf, "views disagree on core {first}");
+        }
+    }
+}
