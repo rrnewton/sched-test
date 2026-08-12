@@ -577,11 +577,7 @@ fn csv_experiment_run() {
 
     // Create scheduler and optionally attach LAVD monitor
     let use_lavd = scheduler == "lavd";
-    let nr_domains = if cpus_per_llc > 0 {
-        nr_cpus / cpus_per_llc
-    } else {
-        1
-    };
+    let nr_domains = nr_cpus.checked_div(cpus_per_llc).unwrap_or(1);
 
     if print_header {
         println!("timestamp,mode,scheduler,condition,thread_type,thread_id,metric_name,percentile,value,unit,sample_count,rep,notes");
