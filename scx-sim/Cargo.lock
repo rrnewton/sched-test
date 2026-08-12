@@ -929,6 +929,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "scxsim-calibration"
+version = "0.1.0"
+dependencies = [
+ "scxsim-workload-ir",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "scxsim-workload-ir"
 version = "0.1.0"
 dependencies = [

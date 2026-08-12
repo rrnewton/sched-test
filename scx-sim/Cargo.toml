@@ -6,6 +6,7 @@ members = [
     "crates/scxsim-build",
     "crates/embed_harness",
     "crates/scxsim-workload-ir",
+    "crates/scxsim-calibration",
 ]
 resolver = "2"
 
