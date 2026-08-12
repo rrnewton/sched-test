@@ -93,6 +93,81 @@ fn run_reallocation_case(enable_control: bool) -> ((u32, u32), [Vec<bool>; 2]) {
     (serialized, bpf_masks)
 }
 
+/// Run the same fully contended two-layer workload with the control cadence
+/// enabled or disabled, and return the userspace growth-denial observations.
+fn run_growth_denied_case(enable_control: bool) -> [(bool, u64); 2] {
+    let sched = DynamicScheduler::layered(4);
+    sched.layered_layers(&[
+        LayerSpec::new("alpha", LayerKind::Grouped)
+            .with_match(LayerMatch::CommPrefix("alpha".into()))
+            .with_util_range(0.8, 0.9),
+        LayerSpec::new("beta", LayerKind::Grouped)
+            .with_or(Vec::new())
+            .with_util_range(0.8, 0.9),
+    ]);
+    if enable_control {
+        sched.layered_enable_control_loop(100_000_000);
+    }
+    let probes = LayeredProbes::new(&sched);
+    let scenario = Scenario::builder()
+        .cpus(4)
+        .detect_bpf_errors()
+        .add_task("alpha_a", 0, hog())
+        .add_task("alpha_b", 0, hog())
+        .add_task("beta_a", 0, hog())
+        .add_task("beta_b", 0, hog())
+        .duration_ms(800)
+        .build();
+    let sim = Simulator::new(sched);
+    let trace = sim.run(scenario);
+    assert_eq!(trace.exit_kind(), &ExitKind::Normal);
+    [0, 1].map(|layer| {
+        (
+            probes.growth_denied(layer, 0),
+            probes.growth_denied_count(layer, 0),
+        )
+    })
+}
+
+/// Force a single-core transfer and return the busy layer's final mask. The
+/// workload and all targets are identical; only the upstream growth algorithm
+/// differs.
+fn run_core_order_case(growth_algo: LayerGrowthAlgo) -> Vec<bool> {
+    let sched = DynamicScheduler::layered_with_topology(6, 2, 1, 1);
+    sched.layered_layers(&[
+        LayerSpec::new("busy", LayerKind::Grouped)
+            .with_match(LayerMatch::CommPrefix("busy".into()))
+            .with_util_range(0.8, 0.9)
+            .with_cpus_range(3, 3)
+            .with_growth_algo(growth_algo),
+        LayerSpec::new("idle_a", LayerKind::Grouped)
+            .with_match(LayerMatch::CommPrefix("idle_a".into()))
+            .with_util_range(0.8, 0.9)
+            .with_cpus_range(1, 1),
+        LayerSpec::new("idle_b", LayerKind::Grouped)
+            .with_or(Vec::new())
+            .with_util_range(0.8, 0.9)
+            .with_cpus_range(1, 1),
+    ]);
+    sched.layered_enable_control_loop(100_000_000);
+    let probes = LayeredProbes::new(&sched);
+    let scenario = Scenario::builder()
+        .cpus(6)
+        .cpus_per_llc(2)
+        .detect_bpf_errors()
+        .add_task("busy", 0, hog())
+        .add_task("idle_a", 0, workloads::periodic(1_000_000, 100_000_000))
+        .add_task("idle_b", 0, workloads::periodic(1_000_000, 100_000_000))
+        .duration_ms(350)
+        .build();
+    let sim = Simulator::new(sched);
+    let trace = sim.run(scenario);
+    assert_eq!(trace.exit_kind(), &ExitKind::Normal);
+    (0..6)
+        .map(|cpu| probes.layer_bpf_has_cpu(0, CpuId(cpu)))
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // ABI guard
 // ---------------------------------------------------------------------------
@@ -242,6 +317,96 @@ fn userspace_control_reallocates_cpus_from_idle_to_busy_layer() {
             bpf_counts, serialized,
             "{result_name} serialized masks were not installed into BPF kptr cpumasks"
         );
+    }
+}
+
+/// `growth_denied` must come from an actual allocation pass: under identical
+/// contention it becomes observable only with the cadence enabled. Both
+/// layers demand a third CPU but the real allocator can keep only the 2+2
+/// split, so neither layer gains a CPU and both are denied.
+#[test]
+fn growth_denied_is_real_per_node_allocation_outcome() {
+    let _lock = common::setup_test();
+    let disabled = run_growth_denied_case(false);
+    let enabled = run_growth_denied_case(true);
+
+    assert_eq!(disabled, [(false, 0), (false, 0)]);
+    for (layer, (current, count)) in enabled.into_iter().enumerate() {
+        assert!(current, "layer {layer} denial was not current at run end");
+        assert!(count > 0, "layer {layer} never recorded a denied pass");
+    }
+}
+
+/// A passing reallocation count would not prove layer_core_growth executes.
+/// With identical targets and topology, Linear must take freed core 3 while
+/// Reverse must take freed core 5. These masks come from the real BPF kptrs
+/// after the BPF_PROG_RUN refresh tail.
+#[test]
+fn upstream_linear_and_reverse_choose_different_freed_cores() {
+    let _lock = common::setup_test();
+    let linear = run_core_order_case(LayerGrowthAlgo::Linear);
+    let reverse = run_core_order_case(LayerGrowthAlgo::Reverse);
+
+    assert_eq!(linear.iter().filter(|&&cpu| cpu).count(), 3);
+    assert_eq!(reverse.iter().filter(|&&cpu| cpu).count(), 3);
+    assert!(
+        linear[3] && !linear[5],
+        "unexpected Linear mask: {linear:?}"
+    );
+    assert!(
+        reverse[5] && !reverse[3],
+        "unexpected Reverse mask: {reverse:?}"
+    );
+}
+
+/// Production allocates in physical-core units when SMT is enabled. Force a
+/// 6+2 transfer on four 2-thread cores and verify neither the serialized mask
+/// nor the BPF kptr mask ever contains half a core.
+#[test]
+fn userspace_control_reallocates_whole_smt_cores() {
+    let _lock = common::setup_test();
+    let sched = DynamicScheduler::layered_with_topology(8, 4, 1, 2);
+    sched.layered_layers(&[
+        LayerSpec::new("busy", LayerKind::Grouped)
+            .with_match(LayerMatch::CommPrefix("busy".into()))
+            .with_util_range(0.8, 0.9)
+            .with_cpus_range(6, 6),
+        LayerSpec::new("idle", LayerKind::Grouped)
+            .with_or(Vec::new())
+            .with_util_range(0.8, 0.9)
+            .with_cpus_range(2, 2),
+    ]);
+    sched.layered_enable_control_loop(100_000_000);
+    let probes = LayeredProbes::new(&sched);
+    let scenario = Scenario::builder()
+        .cpus(8)
+        .cpus_per_llc(4)
+        .smt(2)
+        .detect_bpf_errors()
+        .add_task("busy", 0, hog())
+        .add_task("idle", 0, workloads::periodic(1_000_000, 100_000_000))
+        .duration_ms(350)
+        .build();
+    let sim = Simulator::new(sched);
+    let trace = sim.run(scenario);
+    assert_eq!(trace.exit_kind(), &ExitKind::Normal);
+    assert_eq!((probes.layer_nr_cpus(0), probes.layer_nr_cpus(1)), (6, 2));
+    for layer in 0..2 {
+        for first in (0..8).step_by(2) {
+            let serialized = (
+                probes.layer_has_cpu(layer, CpuId(first)),
+                probes.layer_has_cpu(layer, CpuId(first + 1)),
+            );
+            let bpf = (
+                probes.layer_bpf_has_cpu(layer, CpuId(first)),
+                probes.layer_bpf_has_cpu(layer, CpuId(first + 1)),
+            );
+            assert_eq!(
+                serialized.0, serialized.1,
+                "layer {layer} split core {first}"
+            );
+            assert_eq!(bpf, serialized, "BPF refresh diverged for core {first}");
+        }
     }
 }
 
