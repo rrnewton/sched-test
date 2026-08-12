@@ -1509,11 +1509,7 @@ impl DynamicScheduler {
         {
             let mut userspace = sched.layered_userspace.lock().unwrap();
             let state = userspace.as_mut().expect("layered userspace state missing");
-            state.nr_llcs = if cpus_per_llc == 0 {
-                1
-            } else {
-                nr_cpus / cpus_per_llc
-            };
+            state.nr_llcs = nr_cpus.checked_div(cpus_per_llc).unwrap_or(1);
             state.nr_numa_nodes = nr_numa_nodes;
             state.threads_per_core = threads_per_core;
         }
