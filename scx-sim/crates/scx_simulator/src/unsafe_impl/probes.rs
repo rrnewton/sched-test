@@ -299,6 +299,8 @@ pub struct LayeredProbes {
     nr_nodes_fn: unsafe extern "C" fn() -> u32,
     sibling_cpu_fn: unsafe extern "C" fn(u32) -> i32,
     timer_fires_fn: unsafe extern "C" fn() -> u64,
+    growth_denied_fn: unsafe extern "C" fn(u32, u32) -> i32,
+    growth_denied_count_fn: unsafe extern "C" fn(u32, u32) -> u64,
 }
 
 /// scx_layered's "task belongs to no layer" sentinel (`MAX_LAYERS`).
@@ -368,6 +370,14 @@ impl LayeredProbes {
                 timer_fires_fn: resolve!(
                     b"layered_probe_timer_fires",
                     unsafe extern "C" fn() -> u64
+                ),
+                growth_denied_fn: resolve!(
+                    b"layered_probe_growth_denied",
+                    unsafe extern "C" fn(u32, u32) -> i32
+                ),
+                growth_denied_count_fn: resolve!(
+                    b"layered_probe_growth_denied_count",
+                    unsafe extern "C" fn(u32, u32) -> u64
                 ),
             }
         }
@@ -467,6 +477,19 @@ impl LayeredProbes {
     pub fn timer_fires(&self) -> u64 {
         // SAFETY: no arguments.
         unsafe { (self.timer_fires_fn)() }
+    }
+
+    /// Whether the latest userspace allocation pass denied this layer's
+    /// measured unpinned growth demand on `node_id`.
+    pub fn growth_denied(&self, layer_id: u32, node_id: u32) -> bool {
+        // SAFETY: both indices are bounds-checked C-side.
+        unsafe { (self.growth_denied_fn)(layer_id, node_id) != 0 }
+    }
+
+    /// Number of control iterations which produced `growth_denied`.
+    pub fn growth_denied_count(&self, layer_id: u32, node_id: u32) -> u64 {
+        // SAFETY: both indices are bounds-checked C-side.
+        unsafe { (self.growth_denied_count_fn)(layer_id, node_id) }
     }
 }
 

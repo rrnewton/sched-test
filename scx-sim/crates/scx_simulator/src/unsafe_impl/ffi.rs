@@ -1171,6 +1171,7 @@ pub struct DynamicScheduler {
 
 struct LayeredUserspaceState {
     nr_cpus: u32,
+    cpus_per_llc: u32,
     nr_llcs: u32,
     nr_numa_nodes: u32,
     threads_per_core: u32,
@@ -1365,6 +1366,7 @@ impl DynamicScheduler {
             so_path: path.to_owned(),
             layered_userspace: Mutex::new((prefix == "layered").then(|| LayeredUserspaceState {
                 nr_cpus,
+                cpus_per_llc: nr_cpus,
                 nr_llcs: 1,
                 nr_numa_nodes: 1,
                 threads_per_core: 1,
@@ -1496,6 +1498,15 @@ impl DynamicScheduler {
             threads_per_core > 0 && nr_cpus.is_multiple_of(threads_per_core),
             "nr_cpus ({nr_cpus}) must be divisible by threads_per_core ({threads_per_core})"
         );
+        let cpus_per_llc = if cpus_per_llc == 0 {
+            nr_cpus
+        } else {
+            cpus_per_llc
+        };
+        assert!(
+            cpus_per_llc.is_multiple_of(threads_per_core),
+            "an SMT core may not cross an LLC boundary"
+        );
         let sched = Self::layered(nr_cpus);
         type SetTopologyFn = unsafe extern "C" fn(u32, u32, u32, u32);
         // SAFETY: Symbol resolved from a `.so` built by our build system.
@@ -1509,8 +1520,9 @@ impl DynamicScheduler {
         {
             let mut userspace = sched.layered_userspace.lock().unwrap();
             let state = userspace.as_mut().expect("layered userspace state missing");
-            state.nr_llcs = nr_cpus.checked_div(cpus_per_llc).unwrap_or(1);
-            state.nr_numa_nodes = nr_numa_nodes;
+            state.cpus_per_llc = cpus_per_llc;
+            state.nr_llcs = nr_cpus.div_ceil(cpus_per_llc);
+            state.nr_numa_nodes = nr_numa_nodes.clamp(1, state.nr_llcs.min(4));
             state.threads_per_core = threads_per_core;
         }
         sched
@@ -1626,29 +1638,18 @@ impl DynamicScheduler {
 
     /// Enable scx_layered's periodic userspace CPU-reallocation loop.
     ///
-    /// The first landed increment intentionally supports only a flat,
-    /// non-SMT topology and `Linear` growth. Those restrictions make the
-    /// growth order exactly reproducible without approximating the still-
-    /// unlinked upstream `layer_core_growth.rs`; unsupported configurations
-    /// panic here rather than silently running a different policy.
+    /// Core and node ordering execute upstream `layer_core_growth.rs`.
+    /// Algorithms needing unavailable substrate fail here rather than
+    /// silently running a different policy.
     pub fn layered_enable_control_loop(&self, period_ns: u64) {
         let mut userspace = self.layered_userspace.lock().unwrap();
         let state = userspace.as_mut().expect("not an scx_layered scheduler");
-        assert_eq!(
-            state.nr_llcs, 1,
-            "Tier-3 control needs upstream core-growth integration before multi-LLC topology"
-        );
-        assert_eq!(
-            state.nr_numa_nodes, 1,
-            "Tier-3 control does not model NUMA; use one harness node"
-        );
-        assert_eq!(
-            state.threads_per_core, 1,
-            "Tier-3 control needs upstream core-growth integration before SMT"
-        );
         state.control = Some(LayeredControl::new(
             period_ns,
             state.nr_cpus as usize,
+            state.cpus_per_llc as usize,
+            state.nr_numa_nodes as usize,
+            state.threads_per_core as usize,
             state.specs.clone(),
         ));
     }
@@ -2284,13 +2285,23 @@ impl Scheduler for DynamicScheduler {
 
     unsafe fn userspace_control(&self) -> i32 {
         type UsageFn = unsafe extern "C" fn(u32, u32) -> u64;
+        type NodeUsageFn = unsafe extern "C" fn(u32, u32) -> u64;
         type HasCpuFn = unsafe extern "C" fn(u32, u32) -> i32;
         type ApplyFn = unsafe extern "C" fn(*const u64, u32, u32) -> i32;
+        type SetGrowthDeniedFn = unsafe extern "C" fn(u32, u32, i32, u64);
 
         let usage: libloading::Symbol<UsageFn> = self
             ._lib
             .get(b"layered_probe_layer_usage")
             .expect("layered_probe_layer_usage not found");
+        let node_usage: libloading::Symbol<NodeUsageFn> = self
+            ._lib
+            .get(b"layered_probe_layer_node_usage")
+            .expect("layered_probe_layer_node_usage not found");
+        let node_pinned_usage: libloading::Symbol<NodeUsageFn> = self
+            ._lib
+            .get(b"layered_probe_layer_node_pinned_usage")
+            .expect("layered_probe_layer_node_pinned_usage not found");
         let has_cpu: libloading::Symbol<HasCpuFn> = self
             ._lib
             .get(b"layered_probe_layer_has_cpu")
@@ -2299,15 +2310,34 @@ impl Scheduler for DynamicScheduler {
             ._lib
             .get(b"layered_apply_layer_cpumasks")
             .expect("layered_apply_layer_cpumasks not found");
+        let set_growth_denied: libloading::Symbol<SetGrowthDeniedFn> = self
+            ._lib
+            .get(b"layered_set_growth_denied")
+            .expect("layered_set_growth_denied not found");
 
         let mut userspace = self.layered_userspace.lock().unwrap();
         let state = userspace.as_mut().expect("not an scx_layered scheduler");
         let nr_layers = state.specs.len();
         let nr_cpus = state.nr_cpus as usize;
+        let nr_nodes = state.nr_numa_nodes as usize;
         let control = state.control.as_mut().expect("layered control not enabled");
         let snapshot = LayeredControlSnapshot {
             usages: (0..nr_layers)
                 .map(|layer| [usage(layer as u32, 0), usage(layer as u32, 1)])
+                .collect(),
+            node_usages: (0..nr_layers)
+                .map(|layer| {
+                    (0..nr_nodes)
+                        .map(|node| node_usage(layer as u32, node as u32))
+                        .collect()
+                })
+                .collect(),
+            node_pinned_usages: (0..nr_layers)
+                .map(|layer| {
+                    (0..nr_nodes)
+                        .map(|node| node_pinned_usage(layer as u32, node as u32))
+                        .collect()
+                })
                 .collect(),
             cpu_masks: (0..nr_layers)
                 .map(|layer| {
@@ -2319,19 +2349,34 @@ impl Scheduler for DynamicScheduler {
         };
         let previous_masks = snapshot.cpu_masks.clone();
         let update = control.step(snapshot);
-        if update.cpu_masks == previous_masks {
-            return 0;
-        }
-        let nr_words = nr_cpus.div_ceil(64);
-        let mut words = vec![0u64; nr_layers * nr_words];
-        for (layer, mask) in update.cpu_masks.iter().enumerate() {
-            for (cpu, &set) in mask.iter().enumerate() {
-                if set {
-                    words[layer * nr_words + cpu / 64] |= 1u64 << (cpu % 64);
+        let rc = if update.cpu_masks == previous_masks {
+            0
+        } else {
+            let nr_words = nr_cpus.div_ceil(64);
+            let mut words = vec![0u64; nr_layers * nr_words];
+            for (layer, mask) in update.cpu_masks.iter().enumerate() {
+                for (cpu, &set) in mask.iter().enumerate() {
+                    if set {
+                        words[layer * nr_words + cpu / 64] |= 1u64 << (cpu % 64);
+                    }
                 }
             }
+            apply(words.as_ptr(), nr_layers as u32, nr_words as u32)
+        };
+        if rc != 0 {
+            return rc;
         }
-        apply(words.as_ptr(), nr_layers as u32, nr_words as u32)
+        for layer in 0..nr_layers {
+            for node in 0..nr_nodes {
+                set_growth_denied(
+                    layer as u32,
+                    node as u32,
+                    update.growth_denied[layer][node] as i32,
+                    control.growth_denied_count(layer, node),
+                );
+            }
+        }
+        0
     }
 
     unsafe fn futex_op(&self, op: i32, ret: i64) -> i64 {

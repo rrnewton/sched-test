@@ -309,6 +309,9 @@ void bpf_iter_scx_dsq_destroy(struct bpf_iter_scx_dsq *it)
 
 /* cpu_ctxs: PERCPU_ARRAY(max_entries=1) — one struct cpu_ctx per CPU. */
 static struct cpu_ctx layered_cpu_ctxs[LAYERED_MAX_SIM_CPUS];
+/* Userspace allocation result, mirrored here only for read-only probes. */
+static bool layered_growth_denied[MAX_LAYERS][MAX_NUMA_NODES];
+static u64 layered_growth_denied_count[MAX_LAYERS][MAX_NUMA_NODES];
 
 /* node_data / llc_data: ARRAY maps, preallocated for every possible id. */
 static struct node_ctx layered_node_ctxs[MAX_NUMA_NODES];
@@ -819,6 +822,65 @@ unsigned long long layered_probe_layer_usage(unsigned int layer_id, unsigned int
 	for (cpu = 0; cpu < layered_nr_sim_cpus && cpu < LAYERED_MAX_SIM_CPUS; cpu++)
 		total += layered_cpu_ctxs[cpu].layer_usages[layer_id][usage_id];
 	return total;
+}
+
+/* Production Stats::read_layer_node_usages(), over the real BPF counters. */
+unsigned long long layered_probe_layer_node_usage(unsigned int layer_id,
+						  unsigned int node_id)
+{
+	unsigned long long total = 0;
+	u32 cpu, usage;
+
+	if (layer_id >= nr_layers || node_id >= nr_nodes)
+		return 0;
+	for (cpu = 0; cpu < layered_nr_sim_cpus && cpu < LAYERED_MAX_SIM_CPUS; cpu++) {
+		if (layered_cpu_ctxs[cpu].node_id != node_id)
+			continue;
+		for (usage = 0; usage <= LAYER_USAGE_SUM_UPTO; usage++)
+			total += layered_cpu_ctxs[cpu].layer_usages[layer_id][usage];
+	}
+	return total;
+}
+
+/* Production Stats::read_layer_node_pinned_usages(). */
+unsigned long long layered_probe_layer_node_pinned_usage(unsigned int layer_id,
+							 unsigned int node_id)
+{
+	unsigned long long total = 0;
+	u32 cpu;
+
+	if (layer_id >= nr_layers || node_id >= nr_nodes)
+		return 0;
+	for (cpu = 0; cpu < layered_nr_sim_cpus && cpu < LAYERED_MAX_SIM_CPUS; cpu++) {
+		if (layered_cpu_ctxs[cpu].node_id == node_id)
+			total += layered_cpu_ctxs[cpu].node_pinned_usage[layer_id];
+	}
+	return total;
+}
+
+/* Mirror the userspace-only signal so tests and reproducers can observe it. */
+void layered_set_growth_denied(unsigned int layer_id, unsigned int node_id,
+			       int denied, unsigned long long count)
+{
+	if (layer_id >= nr_layers || node_id >= nr_nodes)
+		return;
+	layered_growth_denied[layer_id][node_id] = !!denied;
+	layered_growth_denied_count[layer_id][node_id] = count;
+}
+
+int layered_probe_growth_denied(unsigned int layer_id, unsigned int node_id)
+{
+	if (layer_id >= nr_layers || node_id >= nr_nodes)
+		return 0;
+	return layered_growth_denied[layer_id][node_id];
+}
+
+unsigned long long layered_probe_growth_denied_count(unsigned int layer_id,
+						      unsigned int node_id)
+{
+	if (layer_id >= nr_layers || node_id >= nr_nodes)
+		return 0;
+	return layered_growth_denied_count[layer_id][node_id];
 }
 
 /* Sum of a global stat across all CPUs (see `enum global_stat_id`). */
@@ -1778,6 +1840,9 @@ void layered_setup(unsigned int num_cpus)
 {
 	/* Clear every static map array so a reloaded .so starts clean. */
 	memset(layered_cpu_ctxs, 0, sizeof(layered_cpu_ctxs));
+	memset(layered_growth_denied, 0, sizeof(layered_growth_denied));
+	memset(layered_growth_denied_count, 0,
+	       sizeof(layered_growth_denied_count));
 	memset(layered_node_ctxs, 0, sizeof(layered_node_ctxs));
 	memset(layered_llc_ctxs, 0, sizeof(layered_llc_ctxs));
 	memset(layered_layer_cpumasks, 0, sizeof(layered_layer_cpumasks));
