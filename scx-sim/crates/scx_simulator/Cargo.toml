@@ -14,6 +14,7 @@ perfetto_protos = "0.51"
 protobuf = "3"
 rand = { version = "0.8", features = ["small_rng"] }
 scx_perf = { path = "../scx_perf" }
+scx_layered_growth = { path = "../scx_layered_growth" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 toml = "0.8"

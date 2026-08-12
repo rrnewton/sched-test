@@ -4,6 +4,7 @@ members = [
     "crates/scx_perf",
     "crates/scx_cgroup_tree",
 ]
+exclude = ["crates/scx_layered_growth"]
 resolver = "2"
 
 [profile.release]
