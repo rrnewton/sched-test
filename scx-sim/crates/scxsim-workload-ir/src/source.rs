@@ -438,6 +438,13 @@ pub enum SourceHold {
     },
 }
 
+impl SourceHold {
+    /// Hold for the whole scenario duration — ktstr's `HoldSpec::FULL`, which is
+    /// defined there as `Frac(1.0)`. Named so a lowered scenario reads the same
+    /// as the ktstr source it came from.
+    pub const FULL: SourceHold = SourceHold::Frac(1.0);
+}
+
 /// ktstr's `Step`: setup, ops, then hold.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SourceStep {
