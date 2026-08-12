@@ -274,13 +274,6 @@ pub fn task_set_runnable_at(raw: *mut c_void, jiffies: u64) {
     unsafe { sim_task_set_runnable_at(raw, jiffies) }
 }
 
-/// Get `p->scx.runnable_at` (in JIFFIES) from a raw task_struct.
-#[allow(clippy::not_unsafe_ptr_arg_deref)]
-pub fn task_get_runnable_at(raw: *mut c_void) -> u64 {
-    // SAFETY: The caller guarantees `raw` is a valid task_struct pointer.
-    unsafe { sim_task_get_runnable_at(raw) }
-}
-
 /// Get `p->scx.weight` from a raw task_struct — the weight the kernel hands
 /// to `ops.set_weight`.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]

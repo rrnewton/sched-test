@@ -508,10 +508,6 @@ impl LayeredControl {
         masks
     }
 
-    pub fn growth_denied(&self, layer: usize, node: usize) -> bool {
-        self.growth_denied[layer][node]
-    }
-
     pub fn growth_denied_count(&self, layer: usize, node: usize) -> u64 {
         self.growth_denied_counts[layer][node]
     }

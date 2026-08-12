@@ -9,7 +9,7 @@
 //!    here covers the public entry point scxsim will drive).
 //! 2. That the one helper we had to vendor has not drifted from upstream.
 
-use scx_simulator::layered_alloc_upstream::{unified_alloc, LayerDemand};
+use scx_simulator::{unified_alloc, LayerDemand};
 
 /// Repo root, derived from the crate manifest rather than hardcoded.
 fn repo_root() -> std::path::PathBuf {

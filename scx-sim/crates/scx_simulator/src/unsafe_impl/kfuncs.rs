@@ -2703,7 +2703,7 @@ pub const CONFIG_HZ: u64 = 1_000_000_000 / crate::engine::TICK_INTERVAL_NS;
 /// engine (which stamps `p->scx.runnable_at` in jiffies, like the kernel's
 /// `scx_runnable()`) and by scheduler wrappers overriding `bpf_jiffies64()`.
 pub const fn ns_to_jiffies(ns: u64) -> u64 {
-    ns / crate::engine::TICK_INTERVAL_NS
+    ns / (1_000_000_000 / CONFIG_HZ)
 }
 
 /// `bpf_jiffies64()` — the kernel helper returning the current jiffies count.

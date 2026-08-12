@@ -9,7 +9,6 @@
 //! (`task_ctx.layer_id`, `layer->nr_cpus`, the `lstats`/`gstats` counters) via
 //! [`LayeredProbes`], or out of the engine's trace — never re-derived.
 
-use scx_simulator::probes::{GlobalStat, LayerStat, LayeredEnumProbe, LayeredProbes};
 use scx_simulator::*;
 
 #[macro_use]
@@ -1437,7 +1436,7 @@ fn ops_dump_emits_every_layer_and_both_fallback_dsqs() {
     let t = sim.run(scenario);
     assert_eq!(t.exit_kind(), &ExitKind::Normal);
 
-    let dump = scx_simulator::kfuncs::dump_buffer_take();
+    let dump = scx_simulator::dump_buffer_take();
     assert!(!dump.is_empty(), "ops.dump produced no output at all");
     for layer in ["batch", "iface", "rest"] {
         assert!(

@@ -109,9 +109,9 @@ fn test_set_weight_fires_once_per_task_right_after_enable() {
 fn test_set_weight_carries_cgroup_space_weight_for_nice_levels() {
     let _lock = common::setup_test();
     for (nice, expected) in [
-        (0i8, task::sched_weight_to_cgroup(task::nice_to_weight(0))),
-        (-5, task::sched_weight_to_cgroup(task::nice_to_weight(-5))),
-        (10, task::sched_weight_to_cgroup(task::nice_to_weight(10))),
+        (0i8, sched_weight_to_cgroup(nice_to_weight(0))),
+        (-5, sched_weight_to_cgroup(nice_to_weight(-5))),
+        (10, sched_weight_to_cgroup(nice_to_weight(10))),
     ] {
         let scenario = Scenario::builder()
             .cpus(1)
