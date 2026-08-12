@@ -941,8 +941,10 @@ void layered_set_antistall(int enable, unsigned long long sec,
 			   unsigned long long timer_interval_ns)
 {
 	enable_antistall = !!enable;
-	if (sec)
-		antistall_sec = sec;
+	/* `sec` is applied verbatim, including 0 — production accepts
+	 * `--antistall-sec 0`, and it is the only way a test can reach the
+	 * antistall path without simulating multiple seconds of delay. */
+	antistall_sec = sec;
 	if (timer_interval_ns)
 		layered_timers[ANTISTALL_TIMER].interval_ns = timer_interval_ns;
 }
