@@ -560,42 +560,40 @@ mod tests {
         LayeredControl::new(100_000_000, 4, 4, 1, 1, vec![spec]);
     }
 
-    /// Guard the source formula specialized by `linear_order()`. Compiling
-    /// all of upstream `layer_core_growth.rs` also requires its production
-    /// Topology/CpuPool types and remains the next Tier-3 increment.
+    /// The policy is compiled from this exact file. Guard the virtual cgroup
+    /// boundary too: a future direct host filesystem read must fail here
+    /// instead of making simulation results machine-dependent.
     #[test]
-    fn flat_linear_order_formula_has_not_drifted_upstream() {
+    fn upstream_growth_cannot_gain_unreviewed_host_sys_access() {
         let upstream_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../../scx/scheds/rust/scx_layered/src/layer_core_growth.rs");
         let upstream = std::fs::read_to_string(&upstream_path)
             .unwrap_or_else(|e| panic!("cannot read {}: {e}", upstream_path.display()));
-        let expected = normalize(
-            r#"
-            fn rotate_node_layer_offset(&self, vec: &mut [usize]) {
-                if vec.is_empty() {
-                    return;
-                }
-                let num_cores = vec.len();
-                let chunk = num_cores.div_ceil(self.layer_specs.len());
-                vec.rotate_right((chunk * self.layer_idx).min(num_cores));
-            }
-            "#,
+        let sys_paths: Vec<&str> = upstream
+            .lines()
+            .filter(|line| line.contains("\"/sys/"))
+            .collect();
+        assert_eq!(
+            sys_paths.len(),
+            1,
+            "upstream growth added or removed a host /sys path: {sys_paths:?}"
         );
-        let normalized = normalize(&upstream);
-        assert!(
-            normalized.contains(&expected),
-            "upstream Linear rotation changed; link/update layer_core_growth instead of silently drifting"
+        assert!(sys_paths[0].contains("WalkDir::new(\"/sys/fs/cgroup\")"));
+        let fs_calls: Vec<&str> = upstream
+            .lines()
+            .filter(|line| line.contains("fs::"))
+            .collect();
+        assert_eq!(
+            fs_calls,
+            ["                if let Ok(content) = fs::read_to_string(entry.path()) {"]
         );
-        assert!(
-            normalized.contains(&normalize(
-                "LayerGrowthAlgo::Linear => generator.grow_linear()"
-            )),
-            "upstream Linear no longer uses grow_linear"
-        );
-        assert!(
-            normalized.contains(&normalize("self.rotate_node_layer_offset(&mut order);")),
-            "upstream grow_linear no longer uses the guarded rotation"
-        );
+
+        let adapter_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../scx_layered_growth/src/lib.rs");
+        let adapter = std::fs::read_to_string(&adapter_path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", adapter_path.display()));
+        assert!(adapter.contains("extern crate self as walkdir;"));
+        assert!(adapter.contains("type IntoIter = std::iter::Empty<Self::Item>;"));
     }
 
     /// The target and dampening glue is specialized from `main.rs`, which
