@@ -370,10 +370,15 @@ fn test_bug1_canonical_subprocess_deterministic_10_reps() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 3: per-SHA discrimination (env-gated).
+// Test 3: per-SHA discrimination (requires a prebuilt binary cache).
 //
-// Skipped silently if SCXSIM_BIN_CACHE_DIR is unset. When set, points at
-// a directory laid out as
+// `#[ignore]`d rather than env-gated: it needs per-SHA .so files that only
+// exist after running the experiment's build script, which is a prebuilt
+// artifact rather than a property of the machine. Being #[ignore]d means it
+// shows up in the runner's skipped COUNT instead of silently reporting PASS
+// while asserting nothing (mb sim-hdsgn).
+//
+// SCXSIM_BIN_CACHE_DIR points at a directory laid out as
 //     <BIN_CACHE>/<short_sha>/libscx_lavd.so
 // produced by experiments/bug1_scx_version_matrix_20260512/build_per_hash.sh.
 //
@@ -388,18 +393,22 @@ fn test_bug1_canonical_subprocess_deterministic_10_reps() {
 // ---------------------------------------------------------------------------
 
 #[test]
+#[ignore = "needs a per-SHA libscx_lavd.so cache built by \
+            experiments/bug1_scx_version_matrix_20260512/build_per_hash.sh; point \
+            SCXSIM_BIN_CACHE_DIR at it and run with --run-ignored. See mb sim-hdsgn."]
 fn test_bug1_canonical_per_sha_discrimination() {
     let _lock = common::setup_test();
 
+    // This test is #[ignore]d, so reaching this line means it was explicitly
+    // requested. A missing cache is then a setup error, not a reason to pass.
     let cache = match std::env::var("SCXSIM_BIN_CACHE_DIR") {
         Ok(d) => PathBuf::from(d),
-        Err(_) => {
-            eprintln!(
-                "[bug1_canonical_subprocess] SCXSIM_BIN_CACHE_DIR not set; skipping per-SHA \
-                 discrimination test. Set it to the bin_cache_engine_throttle_fix dir to run."
-            );
-            return;
-        }
+        Err(_) => panic!(
+            "SCXSIM_BIN_CACHE_DIR is not set, but this test was explicitly requested \
+             (it is #[ignore]d by default). Point it at the \
+             bin_cache_engine_throttle_fix directory produced by \
+             experiments/bug1_scx_version_matrix_20260512/build_per_hash.sh."
+        ),
     };
 
     let cases: &[(&str, u32, &str)] = &[
@@ -444,33 +453,37 @@ fn test_bug1_canonical_per_sha_discrimination() {
     // distinct fingerprints. If at least 2 SHAs were exercised and they
     // all produced the SAME fingerprint, the engine-throttle-attribution
     // fix has regressed and per-SHA discrimination is broken.
-    if fps.len() >= 2 {
-        let first = &fps[0].1;
-        let all_same = fps.iter().all(|(_, fp)| fp == first);
-        assert!(
-            !all_same,
-            "per-SHA discrimination REGRESSED: {} cached SHAs all produced the same \
-             fingerprint {first:?}. The cgroup_bw library is no longer driving \
-             throttling differently per scx SHA.",
-            fps.len()
-        );
-        eprintln!(
-            "[bug1_canonical_subprocess] per-SHA discrimination OK: {} cached SHAs \
-             produced {} distinct fingerprints",
-            fps.len(),
-            fps.iter()
-                .map(|(_, f)| f)
-                .collect::<std::collections::BTreeSet<_>>()
-                .len()
-        );
-    } else {
-        eprintln!(
-            "[bug1_canonical_subprocess] only {} cached SHAs available; \
-             per-SHA discrimination NOT verified (need >= 2). Build the cache via \
-             experiments/bug1_scx_version_matrix_20260512/build_per_hash.sh.",
-            fps.len()
-        );
-    }
+    // A cache too sparse to compare means the test verified nothing. Fail
+    // rather than print a note and pass -- that was the old behaviour and it
+    // made the whole test vacuous whenever the cache was empty.
+    assert!(
+        fps.len() >= 2,
+        "per-SHA discrimination could not be verified: only {} of {} SHAs had a \
+         libscx_lavd.so under {}. Need at least 2 to compare. Build the cache via \
+         experiments/bug1_scx_version_matrix_20260512/build_per_hash.sh.",
+        fps.len(),
+        cases.len(),
+        cache.display()
+    );
+
+    let first = &fps[0].1;
+    let all_same = fps.iter().all(|(_, fp)| fp == first);
+    assert!(
+        !all_same,
+        "per-SHA discrimination REGRESSED: {} cached SHAs all produced the same \
+         fingerprint {first:?}. The cgroup_bw library is no longer driving \
+         throttling differently per scx SHA.",
+        fps.len()
+    );
+    eprintln!(
+        "[bug1_canonical_subprocess] per-SHA discrimination OK: {} cached SHAs \
+         produced {} distinct fingerprints",
+        fps.len(),
+        fps.iter()
+            .map(|(_, f)| f)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+    );
 }
 
 // ---------------------------------------------------------------------------

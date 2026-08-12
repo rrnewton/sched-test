@@ -26,6 +26,8 @@ use std::os::unix::io::RawFd;
 
 use perf_event_open_sys as perf;
 
+pub mod capability;
+
 /// fcntl constants not available in the libc crate.
 const F_SETOWN_EX: libc::c_int = 15;
 const F_SETSIG: libc::c_int = 10;
@@ -851,6 +853,11 @@ pub fn try_create_hw_breakpoint(addr: u64) -> Option<HwBreakpoint> {
 mod tests {
     use super::*;
 
+    /// Serializes the RBC timer tests that install a SIGSTKFLT handler.
+    /// `cargo nextest` runs each test in its own process so they cannot
+    /// collide there, but `cargo test` shares one process across threads.
+    static RBC_SIGNAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_pmu_detect() {
         // Just verify detection doesn't panic; it may return None on unsupported CPUs
@@ -862,42 +869,52 @@ mod tests {
         let config = match PmuConfig::detect() {
             Some(c) => c,
             None => {
-                eprintln!("skipping RBC test: unsupported CPU");
-                return;
+                return capability::absent(
+                    capability::PMU,
+                    "PmuConfig::detect() found no CPUID match",
+                )
             }
         };
 
         let counter = match RbcCounter::new(&config) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("skipping RBC test: {e}");
-                return;
+                return capability::absent(capability::PMU, &format!("RbcCounter::new failed: {e}"))
             }
         };
 
         // Basic lifecycle: reset -> enable -> disable -> read
         counter.reset().unwrap();
         counter.enable().unwrap();
-
-        // Do some work to generate conditional branches
-        let mut sum = 0u64;
-        for i in 0..1000 {
-            if i % 2 == 0 {
-                sum += i;
-            }
-        }
-        // Prevent optimization
-        std::hint::black_box(sum);
-
+        generate_branches(1_000);
         counter.disable().unwrap();
-        let count = counter.read().unwrap();
-        // Should have counted some conditional branches.
-        // In VMs/containers, PMU may be available but not actually counting.
-        if count == 0 {
-            eprintln!("skipping RBC assertion: counter reads 0 (likely VM/container)");
-            return;
+        let small = counter.read().unwrap();
+
+        // A counter can be creatable yet not actually count (observed in some
+        // VMs/containers). That is a capability gap, not a code defect, so it
+        // must be declared rather than silently tolerated.
+        if small == 0 {
+            return capability::absent(
+                capability::PMU,
+                "counter was created but read() returned 0 after 1k branches",
+            );
         }
-        assert!(count > 0, "expected non-zero RBC count, got {count}");
+
+        // `small > 0` is guaranteed by the gate above, so asserting it would be
+        // vacuous. Assert the property that actually distinguishes a working
+        // counter from a stuck one: it has to track the amount of work done.
+        counter.reset().unwrap();
+        counter.enable().unwrap();
+        generate_branches(100_000);
+        counter.disable().unwrap();
+        let large = counter.read().unwrap();
+
+        assert!(
+            large > small,
+            "RBC counter does not track workload: 100k branches read {large}, \
+             1k branches read {small} (a stuck or free-running counter would \
+             look like this)"
+        );
     }
 
     #[test]
@@ -916,7 +933,12 @@ mod tests {
     fn test_rbc_timer_signal_delivery() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
+        let _guard = RBC_SIGNAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
         static SIGNAL_RECEIVED: AtomicBool = AtomicBool::new(false);
+        SIGNAL_RECEIVED.store(false, Ordering::SeqCst);
 
         extern "C" fn handler(_signo: libc::c_int) {
             SIGNAL_RECEIVED.store(true, Ordering::SeqCst);
@@ -925,8 +947,10 @@ mod tests {
         let config = match PmuConfig::detect() {
             Some(c) => c,
             None => {
-                eprintln!("skipping RBC timer test: unsupported CPU");
-                return;
+                return capability::absent(
+                    capability::PMU,
+                    "PmuConfig::detect() found no CPUID match",
+                )
             }
         };
 
@@ -934,8 +958,7 @@ mod tests {
         let timer = match RbcTimer::new(&config, 100) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("skipping RBC timer test: {e}");
-                return;
+                return capability::absent(capability::PMU, &format!("RbcTimer::new failed: {e}"))
             }
         };
 
@@ -980,11 +1003,15 @@ mod tests {
             libc::sigaction(libc::SIGSTKFLT, &sa_default, std::ptr::null_mut());
         }
 
-        // In VMs/containers, the counter may not actually fire.
+        // A timer that never counts cannot overflow, so it cannot deliver the
+        // signal this test is about. Declare that as a capability gap rather
+        // than passing green.
         let count = timer.read().unwrap_or(0);
         if count == 0 {
-            eprintln!("skipping RBC timer signal assertion: counter reads 0 (likely VM/container)");
-            return;
+            return capability::absent(
+                capability::PMU,
+                "timer was created but read() returned 0 after 100k branches",
+            );
         }
 
         assert!(
@@ -993,39 +1020,107 @@ mod tests {
         );
     }
 
+    /// `set_period` must actually change the overflow rate.
+    ///
+    /// This test used to run a workload and then assert nothing at all
+    /// ("just verify it didn't crash"), so no possible regression in
+    /// `set_period` could fail it. It now compares signal delivery at a short
+    /// period against a period long enough that overflow cannot occur.
     #[test]
     fn test_rbc_timer_set_period() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let _guard = RBC_SIGNAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        static SIGNAL_COUNT: AtomicU64 = AtomicU64::new(0);
+
+        extern "C" fn handler(_signo: libc::c_int) {
+            SIGNAL_COUNT.fetch_add(1, Ordering::SeqCst);
+        }
+
         let config = match PmuConfig::detect() {
             Some(c) => c,
             None => {
-                eprintln!("skipping RBC timer period test: unsupported CPU");
-                return;
+                return capability::absent(
+                    capability::PMU,
+                    "PmuConfig::detect() found no CPUID match",
+                )
             }
         };
 
-        // Create with large period, then set a real one.
+        // Create with a period so large it cannot overflow during this test.
         let timer = match RbcTimer::new(&config, RbcTimer::DISABLE_SAMPLE_PERIOD) {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("skipping RBC timer period test: {e}");
-                return;
+                return capability::absent(capability::PMU, &format!("RbcTimer::new failed: {e}"))
             }
         };
 
-        timer.set_period(500).expect("set_period should succeed");
+        let sa = libc::sigaction {
+            sa_sigaction: handler as *const () as libc::sighandler_t,
+            sa_mask: unsafe { std::mem::zeroed() },
+            sa_flags: libc::SA_SIGINFO,
+            sa_restorer: None,
+        };
+        let ret = unsafe { libc::sigaction(libc::SIGSTKFLT, &sa, std::ptr::null_mut()) };
+        assert_eq!(ret, 0, "sigaction failed");
+
+        let tid = unsafe { libc::syscall(libc::SYS_gettid) } as libc::pid_t;
+        timer
+            .set_signal_delivery(tid, libc::SIGSTKFLT)
+            .expect("set_signal_delivery");
+
+        // Phase 1: the never-overflowing period the timer was created with.
+        SIGNAL_COUNT.store(0, Ordering::SeqCst);
         timer.reset().expect("reset");
         timer.enable().expect("enable");
-
-        let mut sum = 0u64;
-        for i in 0..1000u64 {
-            if i % 2 == 0 {
-                sum += i;
-            }
-        }
-        std::hint::black_box(sum);
-
+        generate_branches(200_000);
         timer.disable().expect("disable");
-        // Just verify it didn't crash; actual counting may not work in VMs.
+        let signals_long_period = SIGNAL_COUNT.load(Ordering::SeqCst);
+        let counted = timer.read().unwrap_or(0);
+
+        // Phase 2: same workload, short period set via the API under test.
+        timer.set_period(500).expect("set_period should succeed");
+        SIGNAL_COUNT.store(0, Ordering::SeqCst);
+        timer.reset().expect("reset");
+        timer.enable().expect("enable");
+        generate_branches(200_000);
+        timer.disable().expect("disable");
+        let signals_short_period = SIGNAL_COUNT.load(Ordering::SeqCst);
+
+        // Restore the default handler before asserting, so a failure here
+        // cannot leave SIGSTKFLT pointing at a dead test's handler.
+        let sa_default = libc::sigaction {
+            sa_sigaction: libc::SIG_DFL,
+            sa_mask: unsafe { std::mem::zeroed() },
+            sa_flags: 0,
+            sa_restorer: None,
+        };
+        unsafe {
+            libc::sigaction(libc::SIGSTKFLT, &sa_default, std::ptr::null_mut());
+        }
+
+        // A timer that never counts cannot overflow at any period.
+        if counted == 0 {
+            return capability::absent(
+                capability::PMU,
+                "timer was created but read() returned 0 after 200k branches",
+            );
+        }
+
+        assert_eq!(
+            signals_long_period, 0,
+            "timer overflowed {signals_long_period} times at DISABLE_SAMPLE_PERIOD, \
+             which is supposed to be unreachable within this workload"
+        );
+        assert!(
+            signals_short_period > 0,
+            "set_period(500) did not take effect: {counted} branches retired but \
+             the timer never overflowed (long-period phase saw \
+             {signals_long_period} signals)"
+        );
     }
 
     /// Helper: generate conditional branches to exercise PMU counters.
@@ -1039,19 +1134,23 @@ mod tests {
         std::hint::black_box(sum)
     }
 
-    /// Helper: create an RbcCounter or skip the test if unavailable.
-    fn make_counter_or_skip() -> Option<(PmuConfig, RbcCounter)> {
+    /// Helper: create an `RbcCounter`, or report the PMU as absent.
+    ///
+    /// Returns `None` only when the capability was declared missing via
+    /// [`capability::ALLOW_MISSING_ENV`]; otherwise it panics rather than
+    /// letting the caller pass vacuously.
+    fn make_counter_or_declare_absent() -> Option<(PmuConfig, RbcCounter)> {
         let config = match PmuConfig::detect() {
             Some(c) => c,
             None => {
-                eprintln!("skipping test: unsupported CPU");
+                capability::absent(capability::PMU, "PmuConfig::detect() found no CPUID match");
                 return None;
             }
         };
         let counter = match RbcCounter::new(&config) {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("skipping test: {e}");
+                capability::absent(capability::PMU, &format!("RbcCounter::new failed: {e}"));
                 return None;
             }
         };
@@ -1060,7 +1159,7 @@ mod tests {
 
     #[test]
     fn test_rdpmc_basic() {
-        let (_config, counter) = match make_counter_or_skip() {
+        let (_config, counter) = match make_counter_or_declare_absent() {
             Some(pair) => pair,
             None => return,
         };
@@ -1068,30 +1167,41 @@ mod tests {
         let handle = match counter.mmap_rdpmc() {
             Ok(h) => h,
             Err(e) => {
-                eprintln!("skipping rdpmc test: {e}");
-                return;
+                return capability::absent(capability::PMU, &format!("mmap_rdpmc failed: {e}"))
             }
         };
 
         counter.reset().unwrap();
         counter.enable().unwrap();
-
         generate_branches(10_000);
-
         counter.disable().unwrap();
+        let small = handle.read();
 
-        let count = handle.read();
-        // In VMs/containers, PMU may be available but not actually counting.
-        if count == 0 {
-            eprintln!("skipping rdpmc assertion: counter reads 0 (likely VM/container)");
-            return;
+        if small == 0 {
+            return capability::absent(
+                capability::PMU,
+                "rdpmc handle mapped but read() returned 0 after 10k branches",
+            );
         }
-        assert!(count > 0, "expected non-zero rdpmc count, got {count}");
+
+        // `small > 0` is guaranteed by the gate, so assert the property a
+        // stuck rdpmc mapping would violate: it must track further work.
+        counter.reset().unwrap();
+        counter.enable().unwrap();
+        generate_branches(200_000);
+        counter.disable().unwrap();
+        let large = handle.read();
+
+        assert!(
+            large > small,
+            "rdpmc read does not track workload: 200k branches read {large}, \
+             10k branches read {small}"
+        );
     }
 
     #[test]
     fn test_rdpmc_matches_read() {
-        let (_config, counter) = match make_counter_or_skip() {
+        let (_config, counter) = match make_counter_or_declare_absent() {
             Some(pair) => pair,
             None => return,
         };
@@ -1099,8 +1209,7 @@ mod tests {
         let handle = match counter.mmap_rdpmc() {
             Ok(h) => h,
             Err(e) => {
-                eprintln!("skipping rdpmc test: {e}");
-                return;
+                return capability::absent(capability::PMU, &format!("mmap_rdpmc failed: {e}"))
             }
         };
 
@@ -1115,8 +1224,10 @@ mod tests {
         let fd_val = counter.read().unwrap();
 
         if rdpmc_val == 0 && fd_val == 0 {
-            eprintln!("skipping rdpmc vs fd comparison: both read 0 (likely VM/container)");
-            return;
+            return capability::absent(
+                capability::PMU,
+                "both rdpmc and read(fd) returned 0 after 50k branches",
+            );
         }
 
         // Both readings are taken after disable, so they should be very close.
@@ -1157,8 +1268,10 @@ mod tests {
         let bp = match HwBreakpoint::new(target_addr, tid, libc::SIGTRAP) {
             Ok(bp) => bp,
             Err(e) => {
-                eprintln!("skipping HW breakpoint test: {e}");
-                return;
+                return capability::absent(
+                    capability::HW_BREAKPOINT,
+                    &format!("HwBreakpoint::new failed: {e}"),
+                )
             }
         };
 
@@ -1229,8 +1342,10 @@ mod tests {
         let bp = match HwBreakpoint::new(target_addr, tid, libc::SIGTRAP) {
             Ok(bp) => bp,
             Err(e) => {
-                eprintln!("skipping HW breakpoint signal test: {e}");
-                return;
+                return capability::absent(
+                    capability::HW_BREAKPOINT,
+                    &format!("HwBreakpoint::new failed: {e}"),
+                )
             }
         };
 
@@ -1263,13 +1378,15 @@ mod tests {
             libc::sigaction(libc::SIGTRAP, &sa_default, std::ptr::null_mut());
         }
 
-        if !BP_SIGNAL_RECEIVED.load(Ordering::SeqCst) {
-            eprintln!(
-                "skipping HW breakpoint signal info assertion: \
-                 no signal received (likely VM/container)"
-            );
-            return;
-        }
+        // Creating the breakpoint succeeded, so it must fire. This matches
+        // `test_hw_breakpoint_basic`, which has always asserted firing
+        // unconditionally: if debug registers silently do nothing on this
+        // machine, that test already fails, so gating here only hid the
+        // second half of the same signal.
+        assert!(
+            BP_SIGNAL_RECEIVED.load(Ordering::SeqCst),
+            "expected SIGTRAP from HW breakpoint at {target_addr:#x}"
+        );
 
         // Verify that the signal was delivered with a valid si_code.
         // TRAP_HWBKPT (4) indicates a hardware breakpoint/watchpoint.

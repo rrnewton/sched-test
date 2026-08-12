@@ -56,6 +56,32 @@ echo "=== Running cargo clippy ==="
 cargo clippy --all -- -D warnings
 
 echo ""
+echo "=== Probing test capabilities ==="
+# Some tests can only assert anything on a machine that has real hardware
+# (PMU counters, debug registers) or Perfetto's trace_processor_shell. Those
+# tests now FAIL rather than pass vacuously when the capability is missing
+# (mb sim-hdsgn), so an environment that genuinely lacks one has to declare
+# it. Probe here and declare only what is actually absent, which keeps
+# capability-less CI runners green without hiding anything: whatever ends up
+# in SCXSIM_ALLOW_MISSING_CAPS is printed below and each skip prints a
+# SCXSIM-CAPABILITY-SKIP line in the test output.
+MISSING_CAPS=$(cargo run -q -p scx_perf --example probe_caps 2>/dev/null | paste -sd, -)
+if [ -n "$MISSING_CAPS" ]; then
+    export SCXSIM_ALLOW_MISSING_CAPS="$MISSING_CAPS"
+    echo "  Capabilities MISSING on this machine: $MISSING_CAPS"
+    echo "  Exported SCXSIM_ALLOW_MISSING_CAPS=$MISSING_CAPS"
+    echo "  Affected tests print SCXSIM-CAPABILITY-SKIP instead of asserting."
+    # Feed each one into the end-of-run SKIPPED summary so a capability gap
+    # is reported in the same place as every other skipped check, rather
+    # than scrolling past in the nextest output.
+    for cap in ${MISSING_CAPS//,/ }; do
+        record_skip "tests requiring '$cap' (capability absent on this machine)"
+    done
+else
+    echo "  All test capabilities present; no capability skips expected."
+fi
+
+echo ""
 echo "=== Running cargo nextest ==="
 # --no-fail-fast: surface ALL failing tests in one CI run instead of
 # stopping at the first failure. Critical for diagnosing CI-vs-local

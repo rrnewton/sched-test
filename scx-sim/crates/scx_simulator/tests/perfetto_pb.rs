@@ -287,11 +287,13 @@ fn test_perfetto_pb_roundtrip_wprof_compatible() {
 /// ingester-side schema invariant. This test catches that regression
 /// class by going through the actual ingester.
 ///
-/// **Skip behavior:** if `trace_processor_shell` is not on `$PATH`
-/// the test logs a warning and returns. We don't want to make it a
-/// hard dependency in stripped CI sandboxes, but on developer
-/// machines (where it's available at `~/bin/trace_processor_shell`)
-/// it provides the strongest end-to-end guarantee.
+/// **Skip behavior:** `trace_processor_shell` is a required capability.
+/// If it is missing, this test fails loudly rather than passing while
+/// asserting nothing. An environment that genuinely cannot install it
+/// must declare that explicitly via
+/// `SCXSIM_ALLOW_MISSING_CAPS=trace_processor`; `validate.sh` probes for
+/// the binary and sets that automatically. See
+/// `scx_perf::capability` for the rationale.
 #[test]
 fn test_perfetto_pb_ingestible_by_trace_processor() {
     let _lock = common::setup_test();
@@ -299,11 +301,10 @@ fn test_perfetto_pb_ingestible_by_trace_processor() {
     let tp = match find_trace_processor() {
         Some(p) => p,
         None => {
-            eprintln!(
-                "SKIP: trace_processor_shell not found on $PATH or in ~/bin; \
-                 install Perfetto's trace_processor_shell to enable this test"
-            );
-            return;
+            return scx_perf::capability::absent(
+                scx_perf::capability::TRACE_PROCESSOR,
+                "trace_processor_shell not found on $PATH or in ~/bin",
+            )
         }
     };
 

@@ -11013,11 +11013,16 @@ fn test_lavd_dsq_length_queries() {
     let scenario = builder.duration_ms(50).build();
     let trace = Simulator::new(sched).run(scenario);
 
+    // This is a deterministic simulation, so "no samples" is not an
+    // environment-dependent outcome -- it would mean the DSQ sampling path
+    // stopped producing data, which is exactly the regression this test
+    // exists to catch. It used to return early here and pass.
     let samples = trace.dsq_samples();
-    if samples.is_empty() {
-        eprintln!("dsq_length_queries: no DSQ samples (LAVD may be using local DSQs only)");
-        return;
-    }
+    assert!(
+        !samples.is_empty(),
+        "expected DSQ samples from 8 cpu-bound tasks on 4 CPUs, got none; \
+         the DSQ sampling path produced no data"
+    );
 
     // Get a DSQ ID that has samples
     let dsq_id = samples[0].dsq_id;

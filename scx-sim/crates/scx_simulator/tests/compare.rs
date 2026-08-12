@@ -1,5 +1,3 @@
-use std::path::Path;
-
 use scx_simulator::*;
 
 mod common;
@@ -325,164 +323,28 @@ Done.
     );
 }
 
-/// Test loading a real BPF trace file if one exists.
-///
-/// This test looks for a bpf_trace.log file in the project root
-/// (produced by `vm-run --bpf-trace`) and parses it if found.
-///
-/// Run with: cargo test test_load_real_bpf_trace --test compare -- --nocapture
-///
-/// # Manual Testing Steps
-///
-/// To generate a real trace file:
-/// 1. Build the scheduler: `cargo build -p scx_lavd --release`
-/// 2. Run with BPF tracing: `cargo run -p scxsim -- vm-run --bpf-trace workloads/two_runners.json`
-/// 3. This creates bpf_trace.log in the current directory
-/// 4. Re-run this test to parse and analyze the real trace
-#[test]
-fn test_load_real_bpf_trace() {
-    // Look for a real trace file in the project root
-    let trace_path = Path::new("bpf_trace.log");
-
-    if !trace_path.exists() {
-        eprintln!("\n=== Skipping real BPF trace test ===");
-        eprintln!("No bpf_trace.log found in current directory.");
-        eprintln!();
-        eprintln!("To generate a real trace file:");
-        eprintln!("  1. Build the scheduler: cargo build -p scx_lavd --release");
-        eprintln!("  2. Run: cargo run -p scxsim -- vm-run --bpf-trace workloads/two_runners.json");
-        eprintln!("  3. Re-run this test to parse the trace.");
-        return;
-    }
-
-    eprintln!(
-        "\n=== Loading real BPF trace from {} ===\n",
-        trace_path.display()
-    );
-
-    let bpf_trace = BpfTrace::from_file(trace_path).expect("failed to parse bpf_trace.log");
-
-    eprintln!("Parsed {} events", bpf_trace.len());
-    eprintln!(
-        "Duration: {:.3}ms",
-        bpf_trace.duration_ns() as f64 / 1_000_000.0
-    );
-    eprintln!();
-
-    // List discovered tasks
-    eprintln!("Tasks discovered:");
-    let stats = bpf_trace.compute_stats();
-    for (pid, task_stats) in &stats.tasks {
-        let name = bpf_trace.task_name(*pid).unwrap_or("???");
-        eprintln!(
-            "  PID={} ({}): {} schedules, {} preempts, {} sleeps",
-            pid.0,
-            name,
-            task_stats.schedule_count,
-            task_stats.preempt_count,
-            task_stats.sleep_count
-        );
-    }
-    eprintln!();
-
-    // Print full stats
-    stats.print_summary();
-
-    // Basic sanity checks
-    assert!(!bpf_trace.is_empty(), "trace should not be empty");
-    assert!(bpf_trace.duration_ns() > 0, "trace should have duration");
-}
-
-/// Compare a real BPF trace with a simulated trace using the same workload.
-///
-/// This test demonstrates the full real-vs-simulated comparison workflow:
-/// 1. Load a real BPF trace from bpf_trace.log
-/// 2. Run the same workload (two_runners.json) in simulation
-/// 3. Compare statistics and identify realism gaps
-///
-/// Run with: cargo test test_full_real_vs_sim_comparison --test compare -- --nocapture
-///
-/// Prerequisites:
-/// - Generate bpf_trace.log using: cargo run -p scxsim -- vm-run --bpf-trace -s lavd workloads/two_runners.json
-#[test]
-fn test_full_real_vs_sim_comparison() {
-    let _lock = common::setup_test();
-
-    let trace_path = Path::new("bpf_trace.log");
-
-    if !trace_path.exists() {
-        eprintln!("\n=== Skipping full comparison test ===");
-        eprintln!("No bpf_trace.log found. Run with vm-run --bpf-trace first.");
-        return;
-    }
-
-    eprintln!("\n=== Full Real vs Simulated Comparison ===\n");
-
-    // Load real trace
-    let bpf_trace = BpfTrace::from_file(trace_path).expect("failed to parse bpf_trace.log");
-    eprintln!(
-        "Real trace: {} events, {:.3}ms duration",
-        bpf_trace.len(),
-        bpf_trace.duration_ns() as f64 / 1_000_000.0
-    );
-
-    // Run simulation with same workload
-    let json = include_str!("../workloads/two_runners.json");
-    let scenario = load_rtapp(json, 4).unwrap();
-    let sim_trace = Simulator::new(DynamicScheduler::lavd(4)).run(scenario);
-    let sim_stats = TraceStats::from_trace(&sim_trace);
-    eprintln!(
-        "Simulated trace: {} events, {:.3}ms duration\n",
-        sim_trace.events().len(),
-        sim_stats.duration_ns as f64 / 1_000_000.0
-    );
-
-    // Compare
-    let comparison = TraceComparisonResult::compare_bpf_vs_sim(&bpf_trace, &sim_stats);
-    comparison.print_report();
-
-    // Identify specific realism gaps
-    eprintln!("=== Realism Gap Detection ===\n");
-
-    // Gap 1: Spurious yields (simulated tasks yield more than real ones)
-    let sim_total_yields: usize = sim_stats.tasks.values().map(|t| t.yield_count).sum();
-    let real_total_preempts: usize = comparison
-        .baseline
-        .tasks
-        .values()
-        .map(|t| t.preempt_count)
-        .sum();
-    eprintln!(
-        "Gap 1 (Spurious Yields): sim yields={}, real preempts={}",
-        sim_total_yields, real_total_preempts
-    );
-
-    // Gap 2: Tick interval variance
-    let sim_tick_cv: f64 = sim_stats
-        .cpus
-        .values()
-        .filter(|c| c.tick_interval.count > 1)
-        .map(|c| c.tick_interval.cv_percent())
-        .sum::<f64>()
-        / sim_stats.cpus.len().max(1) as f64;
-    let real_tick_cv: f64 = comparison
-        .baseline
-        .cpus
-        .values()
-        .filter(|c| c.tick_interval.count > 1)
-        .map(|c| c.tick_interval.cv_percent())
-        .sum::<f64>()
-        / comparison.baseline.cpus.len().max(1) as f64;
-    eprintln!(
-        "Gap 2 (Tick Jitter): sim CV={:.1}%, real CV={:.1}%",
-        sim_tick_cv, real_tick_cv
-    );
-
-    // Gap 6: Run duration variance
-    eprintln!(
-        "Gap 6 (Timing Variance): ratio={:.2} (1.0 = matched, <0.1 = sim too deterministic)",
-        comparison.differences.run_duration_variance_ratio
-    );
-
-    eprintln!();
-}
+// ---------------------------------------------------------------------------
+// Removed: test_load_real_bpf_trace and test_full_real_vs_sim_comparison.
+//
+// Both gated on a `bpf_trace.log` in the test's working directory and returned
+// early when it was absent, which it always was -- nothing in the repo
+// produces that file into the crate root, and no CI job or script ever did.
+// They therefore reported PASS in every run anyone has ever done while
+// executing no assertions. `test_full_real_vs_sim_comparison` had no
+// assertions at all even on the never-taken path; it only printed a report.
+//
+// What they were meant to cover is already covered above with real
+// assertions on synthetic input:
+//   - BPF trace parsing / stats  -> test_bpf_trace_parsing
+//   - real-vs-simulated compare  -> test_bpf_vs_simulated_comparison
+//
+// To do the comparison against a genuine kernel trace by hand:
+//   1. cargo build -p scx_lavd --release
+//   2. cargo run -p scxsim -- vm-run --bpf-trace -s lavd workloads/two_runners.json
+//      (writes bpf_trace.log into the current directory)
+//   3. BpfTrace::from_file("bpf_trace.log") and feed it to
+//      TraceComparisonResult::compare_bpf_vs_sim, as test_bpf_vs_simulated_comparison
+//      does with synthetic data.
+//
+// See mb sim-hdsgn.
+// ---------------------------------------------------------------------------
