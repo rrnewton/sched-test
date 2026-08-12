@@ -212,3 +212,126 @@ fn test_node_fold_attributes_every_cpu_exactly_once() {
     }
     assert_eq!(per_node, expected, "node fold disagrees with a direct sum");
 }
+
+// ---------------------------------------------------------------------------
+// 3. External oracle — the only assertions here NOT derived from the run
+// ---------------------------------------------------------------------------
+//
+// Everything above this line validates the readout against something else the
+// same run produced: a fold against its own inputs, or one trace query against
+// another. That family of assertion is CIRCULAR — it holds whatever the
+// simulator does, including if the simulator is wrong. It catches a broken
+// fold; it cannot catch a broken engine, and it must not be mistaken for
+// evidence that the numbers are right.
+//
+// The tests below fix that by predicting the answer from the SCENARIO SPEC
+// alone — run/sleep durations and duration_ms, all declared inputs — and
+// comparing the measurement to that. If the engine mis-accounts runtime, these
+// fail; the ones above would not.
+
+/// Busy time on a single CPU is predictable from the task's duty cycle.
+///
+/// One task, `run_ns` busy then `sleep_ns` idle, forever, on one CPU with no
+/// contention and overhead disabled. Over `duration_ms` it completes
+/// `duration / (run + sleep)` whole cycles, so busy time is
+/// `cycles * run_ns` — computed here from the scenario inputs, never from the
+/// trace.
+#[test]
+fn test_cpu_busy_ns_matches_duty_cycle_oracle() {
+    let _lock = common::setup_test();
+    let (run_ns, sleep_ns, dur_ms) = (2_000_000u64, 8_000_000u64, 100u64);
+
+    let b = Scenario::builder()
+        .cpus(1)
+        .cpus_per_node(1)
+        .seed(42)
+        .instant_timing()
+        .add_task("solo", 0, run_sleep(run_ns, sleep_ns))
+        .duration_ms(dur_ms);
+    let trace = Simulator::new(DynamicScheduler::cosmos(1)).run(b.build());
+
+    let cycles = (dur_ms * 1_000_000) / (run_ns + sleep_ns);
+    let predicted = cycles * run_ns;
+    let measured: u64 = trace.cpu_busy_ns().iter().sum();
+
+    // EXACT. `duration_ms` is an exact multiple of the cycle, so no interval
+    // is left open and there is nothing legitimate to be slack about.
+    //
+    // An earlier version of this test allowed "one run-phase" of slack. That
+    // tolerance was +/-10% of the prediction here, which is wide enough to
+    // swallow the very error class the oracle exists to catch: a mutation that
+    // under-counted every interval by 10% passed. A tolerance picked for
+    // comfort rather than derived from a real source of variation is not a
+    // safeguard, it is a hole. If a future change makes this genuinely
+    // inexact, derive the bound from what actually varies — do not widen it
+    // until it goes green.
+    assert_eq!(
+        measured, predicted,
+        "busy time must equal the duty-cycle prediction \
+         ({cycles} cycles x {run_ns}ns run)"
+    );
+}
+
+/// Per-NODE busy time is attributed to the right node.
+///
+/// Two nodes of one CPU each, one task pinned to each node, with DIFFERENT
+/// duty cycles. Each node's busy time is predicted independently from its own
+/// task's spec. The loads are deliberately asymmetric: if the fold attributed
+/// node 1's time to node 0 the totals would still conserve — which is exactly
+/// what the conservation test above cannot see — but these per-node
+/// predictions would both fail.
+#[test]
+fn test_node_busy_ns_attribution_matches_oracle() {
+    let _lock = common::setup_test();
+    let dur_ms = 100u64;
+    // node 0: 20% duty. node 1: 50% duty. Asymmetric on purpose.
+    let node0 = (2_000_000u64, 8_000_000u64);
+    let node1 = (5_000_000u64, 5_000_000u64);
+
+    let mut b = Scenario::builder()
+        .cpus(2)
+        .cpus_per_node(1) // one CPU per node -> no contention, no migration
+        .seed(42)
+        .instant_timing();
+    for (pid, cpu, (run_ns, sleep_ns)) in [(1i32, 0u32, node0), (2, 1, node1)] {
+        b = b.task(TaskDef {
+            name: format!("n{cpu}"),
+            pid: Pid(pid),
+            nice: 0,
+            behavior: run_sleep(run_ns, sleep_ns),
+            start_time_ns: 0,
+            mm_id: None,
+            allowed_cpus: Some(vec![CpuId(cpu)]),
+            parent_pid: None,
+            cgroup_name: None,
+            task_flags: 0,
+            migration_disabled: 0,
+        });
+    }
+    let trace = Simulator::new(DynamicScheduler::cosmos(2)).run(b.duration_ms(dur_ms).build());
+    assert_eq!(trace.exit_kind(), &ExitKind::Normal);
+
+    let per_node = trace.node_busy_ns(|cpu| cpu.0);
+    assert_eq!(per_node.len(), 2, "expected two nodes");
+
+    for (node, (run_ns, sleep_ns)) in [(0usize, node0), (1, node1)] {
+        let cycles = (dur_ms * 1_000_000) / (run_ns + sleep_ns);
+        let predicted = cycles * run_ns;
+        let measured = per_node[node];
+        // Exact, for the same reason as above: whole cycles, nothing open.
+        assert_eq!(
+            measured, predicted,
+            "node {node}: busy time must equal its task's duty-cycle \
+             prediction ({cycles} cycles x {run_ns}ns run)"
+        );
+    }
+
+    // And the asymmetry itself must survive the fold: node 1 works more.
+    assert!(
+        per_node[1] > per_node[0],
+        "50%-duty node ({}) should be busier than the 20%-duty node ({}) — \
+         equal or inverted means the fold mixed the nodes up",
+        per_node[1],
+        per_node[0]
+    );
+}
