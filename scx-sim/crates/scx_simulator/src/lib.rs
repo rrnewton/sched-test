@@ -48,6 +48,7 @@ pub use safe::fmt;
 pub use safe::layered;
 pub use safe::layered_alloc;
 pub use safe::layered_alloc_upstream;
+pub use safe::layered_control;
 // scx_layered's alloc.rs does `use crate::largest_remainder;`. Re-exporting it
 // at the crate root is what lets the upstream source compile here unmodified.
 pub use safe::layered_alloc::largest_remainder;

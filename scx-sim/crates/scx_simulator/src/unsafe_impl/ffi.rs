@@ -11,8 +11,10 @@
 
 use std::ffi::c_void;
 use std::path::Path;
+use std::sync::Mutex;
 
 use crate::layered::LayerSpec;
+use crate::layered_control::{LayeredControl, LayeredControlSnapshot};
 
 // ---------------------------------------------------------------------------
 // task_struct accessors (implemented in csrc/sim_task.c)
@@ -483,6 +485,20 @@ pub trait Scheduler {
     /// # Safety
     /// Calls into C code.
     unsafe fn fire_timer(&self, _slot: u32) {}
+
+    /// Period of a scheduler's userspace control loop, if enabled.
+    fn userspace_control_period_ns(&self) -> Option<u64> {
+        None
+    }
+
+    /// Run one userspace control-loop iteration. Optional.
+    ///
+    /// # Safety
+    /// Implementations may call scheduler BPF_PROG_RUN entry points in the
+    /// dynamically loaded scheduler library.
+    unsafe fn userspace_control(&self) -> i32 {
+        0
+    }
 
     /// Deliver a simulated futex transition to the scheduler's real futex
     /// hooks (`op` = FUTEX_* command, `ret` = observed syscall return).
@@ -1062,6 +1078,17 @@ pub struct DynamicScheduler {
     prefix: String,
     /// Absolute path to the loaded `.so` file.
     so_path: String,
+    /// scx_layered's userspace-only state. `None` for every other scheduler.
+    layered_userspace: Mutex<Option<LayeredUserspaceState>>,
+}
+
+struct LayeredUserspaceState {
+    nr_cpus: u32,
+    nr_llcs: u32,
+    nr_numa_nodes: u32,
+    threads_per_core: u32,
+    specs: Vec<LayerSpec>,
+    control: Option<LayeredControl>,
 }
 
 impl DynamicScheduler {
@@ -1117,6 +1144,14 @@ impl DynamicScheduler {
             ops,
             prefix: prefix.to_owned(),
             so_path: path.to_owned(),
+            layered_userspace: Mutex::new((prefix == "layered").then(|| LayeredUserspaceState {
+                nr_cpus,
+                nr_llcs: 1,
+                nr_numa_nodes: 1,
+                threads_per_core: 1,
+                specs: vec![LayerSpec::catch_all("default")],
+                control: None,
+            })),
         }
     }
 
@@ -1162,12 +1197,12 @@ impl DynamicScheduler {
     /// [`DynamicScheduler::layered_layers`] to build a multi-layer scheduler
     /// on real topology.
     ///
-    /// # Limitation: static CPU allocation
-    /// Production scx_layered runs a userspace control loop that continuously
-    /// re-allocates CPUs between layers. The simulator has no model for a
-    /// userspace control loop, so the allocation is computed once before
-    /// `ops.init` and held fixed for the run. Layer growth/shrink paths are
-    /// therefore not exercised.
+    /// # Optional userspace control loop
+    /// CPU allocation remains static unless
+    /// [`DynamicScheduler::layered_enable_control_loop`] is called. The first
+    /// Tier-3 increment supports live reallocation only for one harness NUMA
+    /// node, no SMT, and Linear growth; unsupported configurations fail when
+    /// enabling the loop.
     pub fn layered(nr_cpus: u32) -> Self {
         let dir = env!("SCHEDULER_SO_DIR");
         Self::load(&format!("{dir}/libscx_layered.so"), "layered", nr_cpus)
@@ -1212,6 +1247,17 @@ impl DynamicScheduler {
                 .get(b"layered_set_topology")
                 .expect("layered_set_topology not found");
             (sym)(nr_cpus, cpus_per_llc, nr_numa_nodes, threads_per_core);
+        }
+        {
+            let mut userspace = sched.layered_userspace.lock().unwrap();
+            let state = userspace.as_mut().expect("layered userspace state missing");
+            state.nr_llcs = if cpus_per_llc == 0 {
+                1
+            } else {
+                nr_cpus / cpus_per_llc
+            };
+            state.nr_numa_nodes = nr_numa_nodes;
+            state.threads_per_core = threads_per_core;
         }
         sched
     }
@@ -1318,6 +1364,39 @@ impl DynamicScheduler {
                 }
             }
         }
+        let mut userspace = self.layered_userspace.lock().unwrap();
+        let state = userspace.as_mut().expect("layered userspace state missing");
+        state.specs = specs.to_vec();
+        state.control = None;
+    }
+
+    /// Enable scx_layered's periodic userspace CPU-reallocation loop.
+    ///
+    /// The first landed increment intentionally supports only a flat,
+    /// non-SMT topology and `Linear` growth. Those restrictions make the
+    /// growth order exactly reproducible without approximating the still-
+    /// unlinked upstream `layer_core_growth.rs`; unsupported configurations
+    /// panic here rather than silently running a different policy.
+    pub fn layered_enable_control_loop(&self, period_ns: u64) {
+        let mut userspace = self.layered_userspace.lock().unwrap();
+        let state = userspace.as_mut().expect("not an scx_layered scheduler");
+        assert_eq!(
+            state.nr_llcs, 1,
+            "Tier-3 control needs upstream core-growth integration before multi-LLC topology"
+        );
+        assert_eq!(
+            state.nr_numa_nodes, 1,
+            "Tier-3 control does not model NUMA; use one harness node"
+        );
+        assert_eq!(
+            state.threads_per_core, 1,
+            "Tier-3 control needs upstream core-growth integration before SMT"
+        );
+        state.control = Some(LayeredControl::new(
+            period_ns,
+            state.nr_cpus as usize,
+            state.specs.clone(),
+        ));
     }
 
     /// Configure scx_layered's antistall watchdog.
@@ -1923,6 +2002,66 @@ impl Scheduler for DynamicScheduler {
         if let Some(f) = self.ops.fire_timer {
             f(slot);
         }
+    }
+
+    fn userspace_control_period_ns(&self) -> Option<u64> {
+        self.layered_userspace
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|state| state.control.as_ref().map(LayeredControl::period_ns))
+    }
+
+    unsafe fn userspace_control(&self) -> i32 {
+        type UsageFn = unsafe extern "C" fn(u32, u32) -> u64;
+        type HasCpuFn = unsafe extern "C" fn(u32, u32) -> i32;
+        type ApplyFn = unsafe extern "C" fn(*const u64, u32, u32) -> i32;
+
+        let usage: libloading::Symbol<UsageFn> = self
+            ._lib
+            .get(b"layered_probe_layer_usage")
+            .expect("layered_probe_layer_usage not found");
+        let has_cpu: libloading::Symbol<HasCpuFn> = self
+            ._lib
+            .get(b"layered_probe_layer_has_cpu")
+            .expect("layered_probe_layer_has_cpu not found");
+        let apply: libloading::Symbol<ApplyFn> = self
+            ._lib
+            .get(b"layered_apply_layer_cpumasks")
+            .expect("layered_apply_layer_cpumasks not found");
+
+        let mut userspace = self.layered_userspace.lock().unwrap();
+        let state = userspace.as_mut().expect("not an scx_layered scheduler");
+        let nr_layers = state.specs.len();
+        let nr_cpus = state.nr_cpus as usize;
+        let control = state.control.as_mut().expect("layered control not enabled");
+        let snapshot = LayeredControlSnapshot {
+            usages: (0..nr_layers)
+                .map(|layer| [usage(layer as u32, 0), usage(layer as u32, 1)])
+                .collect(),
+            cpu_masks: (0..nr_layers)
+                .map(|layer| {
+                    (0..nr_cpus)
+                        .map(|cpu| has_cpu(layer as u32, cpu as u32) != 0)
+                        .collect()
+                })
+                .collect(),
+        };
+        let previous_masks = snapshot.cpu_masks.clone();
+        let update = control.step(snapshot);
+        if update.cpu_masks == previous_masks {
+            return 0;
+        }
+        let nr_words = nr_cpus.div_ceil(64);
+        let mut words = vec![0u64; nr_layers * nr_words];
+        for (layer, mask) in update.cpu_masks.iter().enumerate() {
+            for (cpu, &set) in mask.iter().enumerate() {
+                if set {
+                    words[layer * nr_words + cpu / 64] |= 1u64 << (cpu % 64);
+                }
+            }
+        }
+        apply(words.as_ptr(), nr_layers as u32, nr_words as u32)
     }
 
     unsafe fn futex_op(&self, op: i32, ret: i64) -> i64 {

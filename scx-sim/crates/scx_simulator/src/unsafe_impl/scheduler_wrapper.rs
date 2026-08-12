@@ -343,6 +343,18 @@ impl<S: Scheduler> SchedulerWrapper<S> {
         unsafe { self.inner.fire_timer(slot as u32) }
     }
 
+    /// Period of the scheduler's userspace control loop, when enabled.
+    pub fn userspace_control_period_ns(&self) -> Option<u64> {
+        self.inner.userspace_control_period_ns()
+    }
+
+    /// Run one userspace control iteration, including any BPF_PROG_RUN tail.
+    pub fn userspace_control(&self) -> i32 {
+        // SAFETY: The dynamic scheduler owns all control-loop state and the
+        // engine installs the same callback context used for scheduler code.
+        unsafe { self.inner.userspace_control() }
+    }
+
     /// Deliver a simulated futex transition (`op` = FUTEX_* command, `ret` =
     /// observed syscall return) to the scheduler's real futex hooks, returning
     /// the running task's scheduler flags for observation (`-1` if the

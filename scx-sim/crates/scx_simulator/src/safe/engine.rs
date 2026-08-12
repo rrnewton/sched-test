@@ -653,6 +653,12 @@ pub(crate) enum EventKind {
     /// dispatch to the right callback. Single-timer schedulers (mitosis,
     /// cosmos, the legacy LAVD path) all use `slot = 0`.
     TimerFired { cpu: CpuId, slot: u8 },
+    /// One iteration of an enabled scheduler userspace control loop.
+    ///
+    /// This is not a kernel scheduler callback: it models the userspace half
+    /// of hybrid schedulers such as scx_layered, including their BPF_PROG_RUN
+    /// configuration refresh. `cpu` supplies the syscall execution context.
+    UserspaceControl { cpu: CpuId },
     /// Periodic scheduler tick on a CPU.
     Tick { cpu: CpuId },
     /// A CPU goes offline (hotplug remove).
@@ -1949,6 +1955,14 @@ impl<S: Scheduler> Simulator<S> {
             }
         }
 
+        // Seed an optional scheduler userspace loop. Production scx_layered
+        // defaults to 100ms; the scheduler configuration owns the period so
+        // non-hybrid schedulers add no events at all.
+        if let Some(period_ns) = self.scheduler.userspace_control_period_ns() {
+            s.events
+                .push(period_ns, EventKind::UserspaceControl { cpu: CpuId(0) });
+        }
+
         // Schedule initial TaskWake events for all tasks
         for def in &scenario.tasks {
             // Initial wakes have no waker; use the task's initial prev_cpu
@@ -2509,6 +2523,7 @@ impl<S: Scheduler> Simulator<S> {
             | EventKind::StartRunning { cpu, .. }
             | EventKind::KickDelivered { cpu, .. }
             | EventKind::TimerFired { cpu, .. }
+            | EventKind::UserspaceControl { cpu }
             | EventKind::CgroupMigrate { cpu, .. }
             | EventKind::TaskRename { cpu, .. }
             | EventKind::CgroupCreate { cpu, .. }
@@ -2545,6 +2560,11 @@ impl<S: Scheduler> Simulator<S> {
             EventKind::TimerFired { cpu, slot } => {
                 drop(guard);
                 self.handle_timer_fired(cpu, slot, sim_arc, monitor);
+                guard = sim_arc.lock().unwrap();
+            }
+            EventKind::UserspaceControl { cpu } => {
+                drop(guard);
+                self.handle_userspace_control(cpu, sim_arc);
                 guard = sim_arc.lock().unwrap();
             }
             EventKind::Tick { cpu } => {
@@ -2818,6 +2838,26 @@ impl<S: Scheduler> Simulator<S> {
             let s = &mut *guard;
             flush_staged_events(&mut s.sim, &mut s.events);
         }
+    }
+
+    /// Run one userspace control iteration and maintain its periodic chain.
+    fn handle_userspace_control(&self, cpu: CpuId, sim_arc: &SimArc) {
+        let mut guard = sim_arc.lock().unwrap();
+        let s = &mut *guard;
+        let period_ns = self
+            .scheduler
+            .userspace_control_period_ns()
+            .expect("userspace control event without an enabled loop");
+        s.events.push(
+            s.sim.clock.saturating_add(period_ns),
+            EventKind::UserspaceControl { cpu },
+        );
+
+        let rc;
+        sim_callback!(s, guard, sim_arc, cpu, {
+            rc = self.scheduler.userspace_control();
+        });
+        assert_eq!(rc, 0, "scheduler userspace control iteration failed: {rc}");
     }
 
     /// Handle a periodic scheduler tick on a CPU.

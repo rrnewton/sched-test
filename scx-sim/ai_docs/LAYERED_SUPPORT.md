@@ -1,10 +1,14 @@
 # scx_layered support in scxsim
 
 Tier 3 (the userspace CPU-reallocation control loop) is in progress — see
-`LAYERED_TIER3_HANDOFF.md`. scx_layered's real allocator is already compiled
-in; the periodic loop that drives it is not yet built.
+`LAYERED_TIER3_HANDOFF.md`. The first behavioural increment now reallocates
+CPUs during a run on a deliberately narrow configuration: one LLC, one
+harness NUMA node, no SMT, and `Linear` growth. It measures the real BPF usage counters,
+runs upstream's real `unified_alloc()`, and executes the real BPF refresh
+programs. Broader topology/growth support is still outstanding.
 
-Status: **supported** (Tier 2 — multi-layer on real topology), with one
+Status: **supported** (Tier 2 — multi-layer on real topology, plus the
+opt-in flat-Linear Tier-3 increment), with one
 documented asterisk: SMT topology is published and verified correct, but its
 effect on placement is not behaviourally tested (mb sim-u4the). Every other
 Tier-2 criterion is covered by a test that fails when the behaviour breaks —
@@ -38,8 +42,9 @@ In production, scx_layered is driven by ~14.7k lines of Rust
 (`main.rs`, `alloc.rs`, `layer_core_growth.rs`) that compute topology
 tables, layer specifications and a continuously re-evaluated CPU
 allocation, and publish them into BPF rodata/bss/maps.
-`schedulers/layered/wrapper.c` plays exactly that role and nothing more.
-Every scheduling decision is made by the real BPF.
+`schedulers/layered/wrapper.c` and `safe/layered_control.rs` play the
+userspace role. Every scheduling decision is still made by the real BPF.
+The engine's generic userspace-control event supplies the periodic cadence.
 
 The wrapper publishes:
 
@@ -57,7 +62,8 @@ The wrapper publishes:
 The Rust entry points are `DynamicScheduler::layered`,
 `::layered_with_topology`, `::layered_layers` and `::layered_set_antistall`,
 with layer specs built from `LayerSpec` / `LayerMatch` / `LayerKind` in
-`safe/layered.rs`.
+`safe/layered.rs`. `::layered_enable_control_loop` opts into periodic
+reallocation and rejects unsupported topology/growth configurations.
 
 ### Map backing: static arrays, and why that is the faithful choice
 
@@ -75,6 +81,12 @@ reasoning as the mitosis wrapper.
 ## No stubs
 
 Per `scx-sim/CLAUDE.md`'s No-Stub Rule:
+
+- **The allocator is upstream's real `alloc.rs`.** It is compiled verbatim as
+  `layered_alloc_upstream`; its ~80 upstream tests run in scxsim. The flat
+  Linear core-order specialization is source-guarded against
+  `layer_core_growth.rs`, and every other growth mode is rejected rather than
+  approximated.
 
 - **`scx/lib/pmu.bpf.c` is compiled in**, not replaced by five hand-written
   `scx_pmu_*` bodies. (The cosmos wrapper currently hand-writes them — that
@@ -134,14 +146,14 @@ zeroed its slice behind its back. `Scheduler::task_yield` now returns
 
 These are real gaps, filed rather than hidden.
 
-1. **Static CPU allocation (the Tier-3 boundary).** Production re-runs
-   `refresh_cpumasks()` on a timer, growing and shrinking each layer's CPU
-   set from live utilisation. scxsim has no model for a userspace control
-   loop, so the allocation is computed once before `ops.init` and held fixed
-   for the run. Layer growth/shrink paths are therefore not exercised.
-   Layers get every CPU when open, or a contiguous weight-proportional slice
-   otherwise, unless a test pins them with `LayerSpec::with_cpus`.
-   *Mitosis has the same class of gap with its userspace cell-control path.*
+1. **Tier-3 is deliberately narrow.** The default remains the Tier-2 static
+   allocation (all CPUs for open layers, a weight-proportional slice for
+   non-open layers). Opting into the control loop adds live growth/shrink only
+   for one LLC, one harness node, no SMT, no explicit layer cpuset, and `Linear`
+   growth. Unsupported configurations fail at enable time. Full
+   `layer_core_growth.rs`, pinned-util demand, peak-util sizing, memory-
+   bandwidth sizing, and multi-node allocation remain follow-up work.
+   *Mitosis has the same class of userspace cell-control gap.*
 2. **NUMA is a harness-supplied grouping.** The engine models LLCs and SMT
    siblings but has no NUMA concept and no inter-node distance cost, so
    `nr_numa_nodes` groups LLCs purely so layered's cross-node code paths can
@@ -174,7 +186,7 @@ without the userspace join/leave protocol there is nothing to drive it.
 
 ## Tests
 
-`crates/scx_simulator/tests/layered.rs` — 25 tests. Every scenario sets
+`crates/scx_simulator/tests/layered.rs` — 28 tests. Every scenario sets
 `.detect_bpf_errors()`, so a `scx_bpf_error` (for instance layered's
 "didn't match any layer") fails the test rather than passing silently.
 
@@ -201,6 +213,11 @@ without the userspace join/leave protocol there is nothing to drive it.
   workload with a one-hour threshold leaves the counter at zero. The paired
   control is the point — without it the test would pass on a counter that
   increments unconditionally.
+- **Tier-3 control** — the identical asymmetric workload remains at `(2, 2)`
+  with the loop disabled and reaches `(3, 1)` with it enabled. The test reads
+  both serialized `layer->cpus` state and the real BPF kptr cpumasks. Removing
+  only the periodic BPF refresh makes it fail with BPF `(2, 2)` versus
+  serialized `(3, 1)`.
 - **`ops.dump`** — asserts on the text layered actually emits (every layer
   name, both fallback DSQs, and no unformatted printf spec surviving), not
   merely that the dump does not fault.

@@ -53,6 +53,46 @@ fn pinned_task(name: &str, pid: Pid, behavior: TaskBehavior, cpus: Vec<CpuId>) -
     }
 }
 
+/// Run the same asymmetric two-layer workload with the userspace control loop
+/// either enabled or disabled, returning both serialized userspace masks and
+/// the kptr cpumasks rebuilt by the real BPF refresh program.
+fn run_reallocation_case(enable_control: bool) -> ((u32, u32), [Vec<bool>; 2]) {
+    let sched = DynamicScheduler::layered(4);
+    sched.layered_layers(&[
+        LayerSpec::new("busy", LayerKind::Grouped)
+            .with_match(LayerMatch::CommPrefix("busy".into()))
+            .with_util_range(0.8, 0.9),
+        LayerSpec::new("idle", LayerKind::Grouped)
+            .with_or(Vec::new())
+            .with_util_range(0.8, 0.9),
+    ]);
+    if enable_control {
+        // Production's default scx_layered scheduling interval is 100ms.
+        sched.layered_enable_control_loop(100_000_000);
+    }
+    let probes = LayeredProbes::new(&sched);
+    let scenario = Scenario::builder()
+        .cpus(4)
+        .detect_bpf_errors()
+        .add_task("busy_a", 0, hog())
+        .add_task("busy_b", 0, hog())
+        .add_task("busy_c", 0, hog())
+        .add_task("busy_d", 0, hog())
+        .add_task("idle", 0, workloads::periodic(1_000_000, 100_000_000))
+        .duration_ms(700)
+        .build();
+    let sim = Simulator::new(sched);
+    let trace = sim.run(scenario);
+    assert_eq!(trace.exit_kind(), &ExitKind::Normal);
+    let serialized = (probes.layer_nr_cpus(0), probes.layer_nr_cpus(1));
+    let bpf_masks = [0, 1].map(|layer| {
+        (0..4)
+            .map(|cpu| probes.layer_bpf_has_cpu(layer, CpuId(cpu)))
+            .collect()
+    });
+    (serialized, bpf_masks)
+}
+
 // ---------------------------------------------------------------------------
 // ABI guard
 // ---------------------------------------------------------------------------
@@ -161,6 +201,48 @@ fn layer_enum_abi_matches_bpf() {
     );
     // Tests below assume MAX_LAYERS == 16 (the LAYERED_NO_LAYER sentinel).
     assert_eq!(p.enum_value(LayeredEnumProbe::MaxLayers), 16);
+}
+
+// ---------------------------------------------------------------------------
+// Tier 3: periodic userspace CPU reallocation
+// ---------------------------------------------------------------------------
+
+/// The busy layer must take CPUs from the idle layer only when the real
+/// userspace control cadence is enabled. The disabled arm is the negative
+/// control: without it, a static allocator that happened to start with an
+/// asymmetric split would make the enabled assertion pass vacuously.
+#[test]
+fn userspace_control_reallocates_cpus_from_idle_to_busy_layer() {
+    let _lock = common::setup_test();
+    let (disabled_counts, disabled_bpf_masks) = run_reallocation_case(false);
+    let (enabled_counts, enabled_bpf_masks) = run_reallocation_case(true);
+
+    assert_eq!(
+        disabled_counts,
+        (2, 2),
+        "disabled loop must preserve the static split"
+    );
+    assert!(
+        enabled_counts.0 > disabled_counts.0,
+        "busy layer did not grow with control enabled: disabled={disabled_counts:?}, enabled={enabled_counts:?}"
+    );
+    assert!(
+        enabled_counts.1 < disabled_counts.1,
+        "idle layer did not shrink with control enabled: disabled={disabled_counts:?}, enabled={enabled_counts:?}"
+    );
+    for (result_name, serialized, bpf_masks) in [
+        ("disabled", disabled_counts, disabled_bpf_masks),
+        ("enabled", enabled_counts, enabled_bpf_masks),
+    ] {
+        let bpf_counts = (
+            bpf_masks[0].iter().filter(|&&set| set).count() as u32,
+            bpf_masks[1].iter().filter(|&&set| set).count() as u32,
+        );
+        assert_eq!(
+            bpf_counts, serialized,
+            "{result_name} serialized masks were not installed into BPF kptr cpumasks"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

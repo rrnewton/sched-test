@@ -30,9 +30,10 @@ pub enum LayerKind {
 
 /// How userspace grows a layer's CPU set — `enum layer_growth_algo`.
 ///
-/// The simulator holds the allocation static (see
-/// [`DynamicScheduler::layered`]), so this only affects the value published
-/// into `layer->growth_algo`; it is here so layer specs round-trip faithfully.
+/// The periodic Tier-3 control loop currently implements only `Linear` on a
+/// flat, non-SMT topology and rejects the other values rather than silently
+/// approximating them. Without that opt-in loop, this only affects the value
+/// published into `layer->growth_algo`.
 ///
 /// [`DynamicScheduler::layered`]: crate::ffi::DynamicScheduler::layered
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,7 +167,7 @@ pub const DEFAULT_LAYER_WEIGHT: u32 = 100;
 /// Build with [`LayerSpec::new`] and the chaining setters; the defaults match
 /// scx_layered's own `LayerCommon` defaults (weight 100, inherit the global
 /// slice, linear growth, no preemption, not exclusive).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct LayerSpec {
     /// Layer name, as it appears in `ops.dump` output.
     pub name: String,
@@ -182,6 +183,14 @@ pub struct LayerSpec {
     pub protected: bool,
     /// Relative weight, used for the iteration order and the static CPU split.
     pub weight: u32,
+    /// Desired per-CPU utilization range used by scx_layered's userspace
+    /// reallocation loop. Required for grouped/confined layers when the loop
+    /// is enabled; open layers do not participate in allocation.
+    pub util_range: Option<(f64, f64)>,
+    /// Optional hard minimum/maximum CPU count for the userspace loop.
+    pub cpus_range: Option<(usize, usize)>,
+    /// Include time spent running on open CPUs when sizing this grouped layer.
+    pub util_includes_open_cputime: bool,
     /// Per-layer slice; 0 inherits the global `slice_ns`.
     pub slice_ns: TimeNs,
     /// Minimum execution time before a task can be preempted.
@@ -211,6 +220,9 @@ impl LayerSpec {
             exclusive: false,
             protected: false,
             weight: DEFAULT_LAYER_WEIGHT,
+            util_range: None,
+            cpus_range: None,
+            util_includes_open_cputime: false,
             slice_ns: 0,
             min_exec_ns: 0,
             max_exec_ns: 0,
@@ -241,6 +253,29 @@ impl LayerSpec {
     /// Set the layer weight.
     pub fn with_weight(mut self, weight: u32) -> Self {
         self.weight = weight;
+        self
+    }
+
+    /// Configure the utilization band used by the periodic CPU allocator.
+    pub fn with_util_range(mut self, low: f64, high: f64) -> Self {
+        assert!(
+            low >= 0.0 && low < high,
+            "invalid util range ({low}, {high})"
+        );
+        self.util_range = Some((low, high));
+        self
+    }
+
+    /// Clamp the periodic allocator to `min..=max` CPUs.
+    pub fn with_cpus_range(mut self, min: usize, max: usize) -> Self {
+        assert!(min <= max, "invalid CPU range ({min}, {max})");
+        self.cpus_range = Some((min, max));
+        self
+    }
+
+    /// Size a grouped layer from owned plus open CPU time, as production can.
+    pub fn with_open_cputime(mut self, include: bool) -> Self {
+        self.util_includes_open_cputime = include;
         self
     }
 
