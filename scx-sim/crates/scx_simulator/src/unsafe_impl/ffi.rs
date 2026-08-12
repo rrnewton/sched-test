@@ -128,6 +128,9 @@ extern "C" {
     // persist in the main binary across simulation runs.
     pub fn sim_task_reset();
     pub fn sim_sdt_reset();
+    /// Freeze everything allocated so far as scheduler-lifetime state, so
+    /// the per-run arena reset does not reclaim it. See csrc/sim_arena.h.
+    pub fn sim_arena_mark_persistent();
 
     // BPF map registry reset (implemented in scx_test_map.c).
     // Clears the thread-local map registration arrays to prevent
@@ -442,6 +445,21 @@ pub trait Scheduler {
     /// Calls into C code.
     unsafe fn fire_timer(&self, _slot: u32) {}
 
+    /// Run the scheduler's userspace-side post-attach setup, if it has any.
+    /// Optional.
+    ///
+    /// Some schedulers split attach across ops.init and a userspace step that
+    /// runs immediately after: scx_tickless arms its periodic BPF timer from
+    /// the `start_timer` SEC("syscall") program, which its Rust userspace
+    /// calls once ops.init has created the timers. Without an equivalent step
+    /// here the timer is initialised and never armed, so `sched_timerfn` never
+    /// fires and the scheduler's central mechanism does not run (mb
+    /// sim-rq117). A wrapper opts in by exporting `<prefix>_post_init`.
+    ///
+    /// # Safety
+    /// Calls into C code.
+    unsafe fn post_init(&self) {}
+
     /// Deliver a simulated futex transition to the scheduler's real futex
     /// hooks (`op` = FUTEX_* command, `ret` = observed syscall return).
     /// Returns the running task's scheduler flags for observation, or `-1`
@@ -688,6 +706,7 @@ type CpuReleaseFn = unsafe extern "C" fn(i32, *mut c_void);
 type ExitFn = unsafe extern "C" fn(*mut c_void);
 type SetupFn = unsafe extern "C" fn(u32);
 type FireTimerFn = unsafe extern "C" fn(u32);
+type PostInitFn = unsafe extern "C" fn();
 /// `<prefix>_futex_hook(op, ret) -> flags`: deliver a simulated futex
 /// transition to the scheduler's real futex hooks and return the running
 /// task's flags for observation. Only LAVD provides this.
@@ -828,6 +847,7 @@ struct SchedOps {
     cpu_release: Option<CpuReleaseFn>,
     exit: Option<ExitFn>,
     fire_timer: Option<FireTimerFn>,
+    post_init: Option<PostInitFn>,
     futex_op: Option<FutexHookFn>,
     quiescent: Option<QuiescentFn>,
     dequeue: Option<DequeueFn>,
@@ -1160,6 +1180,17 @@ impl DynamicScheduler {
                 let setup_fn: SetupFn = *sym;
                 setup_fn(nr_cpus);
             }
+
+            // `<prefix>_setup()` runs once, here, and may allocate objects the
+            // scheduler holds for its whole lifetime -- tickless and cosmos
+            // both create their primary-CPU bpf_cpumask in it. Those come out
+            // of the deterministic bump arena, which is reset before every
+            // run. Marking the current watermark as persistent stops that
+            // reset from zeroing them and from handing the same bytes to the
+            // next run's allocations. Without it is_primary_cpu() was false
+            // for the entire run, so tickless never reached init_timer() and
+            // its whole timer path went unexecuted (mb sim-hfvmf).
+            sim_arena_mark_persistent();
         }
 
         // SAFETY: The library contains the expected ops symbols with
@@ -1613,6 +1644,8 @@ impl DynamicScheduler {
             exit: try_get!("exit").map(|p| std::mem::transmute::<*const (), ExitFn>(p)),
             fire_timer: try_get!("fire_timer")
                 .map(|p| std::mem::transmute::<*const (), FireTimerFn>(p)),
+            post_init: try_get!("post_init")
+                .map(|p| std::mem::transmute::<*const (), PostInitFn>(p)),
             futex_op: try_get!("futex_hook")
                 .map(|p| std::mem::transmute::<*const (), FutexHookFn>(p)),
             quiescent: try_get!("quiescent")
@@ -1695,13 +1728,14 @@ impl DynamicScheduler {
             "stopping",
         ];
         // Optional ops — include only when present in the loaded .so
-        let optional: [(&str, bool); 21] = [
+        let optional: [(&str, bool); 22] = [
             ("enable", self.ops.enable.is_some()),
             ("runnable", self.ops.runnable.is_some()),
             ("init_task", self.ops.init_task.is_some()),
             ("cpu_release", self.ops.cpu_release.is_some()),
             ("exit", self.ops.exit.is_some()),
             ("fire_timer", self.ops.fire_timer.is_some()),
+            ("post_init", self.ops.post_init.is_some()),
             ("quiescent", self.ops.quiescent.is_some()),
             ("dequeue", self.ops.dequeue.is_some()),
             ("tick", self.ops.tick.is_some()),
@@ -1733,6 +1767,12 @@ impl DynamicScheduler {
 impl Scheduler for DynamicScheduler {
     unsafe fn init(&self) -> i32 {
         (self.ops.init)()
+    }
+
+    unsafe fn post_init(&self) {
+        if let Some(f) = self.ops.post_init {
+            f();
+        }
     }
 
     unsafe fn select_cpu(&self, p: *mut c_void, prev_cpu: i32, wake_flags: u64) -> i32 {

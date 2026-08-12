@@ -1,10 +1,11 @@
 ---
 title: Sim arena reset wipes cpumasks allocated during scheduler *_setup() (tickless + cosmos lose their primary CPU)
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-08-12T14:50:17.195371176+00:00
-updated_at: 2026-08-12T14:50:17.195371176+00:00
+updated_at: 2026-08-12T22:30:34.875411536+00:00
+closed_at: 2026-08-12T22:30:34.875411425+00:00
 ---
 
 # Description
