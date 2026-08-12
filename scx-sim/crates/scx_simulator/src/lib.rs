@@ -66,6 +66,11 @@ pub(crate) use safe::dsq;
 pub(crate) use safe::engine;
 pub(crate) use safe::fmt;
 pub(crate) use safe::layered;
+pub(crate) use safe::layered_alloc;
+pub(crate) use safe::layered_alloc_upstream;
+// scx_layered's alloc.rs does `use crate::largest_remainder;`. Re-exporting it
+// at the crate root is what lets the upstream source compile here unmodified.
+pub(crate) use safe::layered_alloc::largest_remainder;
 pub(crate) use safe::monitor;
 pub(crate) use safe::perf;
 pub(crate) use safe::perfetto;
