@@ -39,6 +39,35 @@ rebase.
 
 ---
 
+### How far into Tier 3 this actually is
+
+Be blunt with yourself about this, because the branch looks further along
+than it is.
+
+Tier 3 = the userspace CPU-reallocation control loop: ~2500 lines of
+`alloc.rs` + ~1300 lines of `layer_core_growth.rs`, plus the periodic
+`BPF_PROG_RUN` refresh cadence that applies their output.
+
+| Piece | State |
+|---|---|
+| `alloc.rs` (~2500 lines) — the water-fill allocator | **linked and running**, with its own 80 tests |
+| `layer_core_growth.rs` (~1300 lines) — growth algorithms / core ordering | **not started.** Needs `scx_utils::Topology` + `CpuPool` from upstream `lib.rs`; neither is linkable today. Unassessed. |
+| Periodic control hook in the engine | **not started** (mb sim-lqyu9) |
+| Utilisation measurement feeding the loop | **not started** |
+| `calc_raw_demands` glue | **not started** |
+| Anything driving reallocation during a run | **not started** |
+
+So: **one of five pieces, and it is the one that happened to be linkable.**
+No CPU is reallocated during a simulation yet. The static-allocation
+limitation documented for Tier 2 is still fully in force, and
+`LAYERED_SUPPORT.md` still correctly says so. Do not describe layered as
+"Tier 3 in progress" to anyone expecting behaviour change — describe it as
+"Tier 3 foundation landed, loop not built".
+
+The honest fraction is perhaps 15-20% of Tier 3 by effort, and the
+unassessed `layer_core_growth.rs` dependency is the biggest remaining
+unknown — see §7.
+
 ## 2. The Tier-3 design, and the one decision that matters
 
 Tier 3 = model the userspace control loop that continuously re-allocates CPUs
@@ -182,7 +211,28 @@ These are the traps already paid for. None are guessable from the code.
    apply the fallback". layered always returns `false`, so keying the
    fallback on the return would zero its slice behind its back.
 
-8. **The engine has no NUMA concept at all.** `nr_numa_nodes` is a
+8. **`scx_bpf_dump_bstr` used to be a no-op, and `ops.dump` was therefore
+   untestable.** It discarded every scheduler's dump output, so a dump that
+   faulted and a dump that did nothing looked identical, and the wrapper's
+   own `bpf_snprintf` was entirely unverified. It now formats the BPF `bstr`
+   ABI (`%[-+ #0][width][l|ll]{d,i,u,x,s,c}`) into a per-run thread-local
+   buffer, cleared by the engine at run start and readable via
+   `kfuncs::dump_buffer_take()`. This is substrate — it makes `ops.dump`
+   testable for *every* scheduler, not just layered. Its "no surviving
+   conversion spec" assertion in `tests/layered.rs` is what caught a missing
+   `+` flag in the formatter.
+
+9. **The antistall negative-control pattern — copy it.** Proving a watchdog
+   fires is easy to fake. The pattern that works: run the SAME workload
+   twice, once with the threshold set so the mechanism must engage and once
+   with it set so it must not, and assert the counter is non-zero in the
+   first and exactly zero in the second. Here that is
+   `--antistall-sec 0` -> `GSTAT_ANTISTALL` = 589 versus
+   `--antistall-sec 3600` -> 0. The second arm is the whole test: without it
+   you are asserting on a counter that might increment unconditionally. Use
+   the same shape for the control loop (loop enabled vs disabled).
+
+10. **The engine has no NUMA concept at all.** `nr_numa_nodes` is a
    harness-supplied grouping over LLCs with no distance cost. Tier 3's
    per-node allocation will therefore exercise `unified_alloc`'s multi-node
    paths without any simulated consequence to the placement. Say so; do not
@@ -249,3 +299,95 @@ These are the traps already paid for. None are guessable from the code.
 
 Build: `cargo build --workspace`. Test: `cargo nextest run --workspace`.
 Full gate: `./validate.sh` (see the mypy caveat in §1).
+
+---
+
+## 7. Things that did NOT work — do not rediscover these
+
+The most expensive knowledge to re-derive. Each cost real time.
+
+1. **`include!`ing `alloc.rs` fails.** The upstream file opens with `//!`
+   inner doc comments, legal only at the top of a module, so `include!`
+   produces a wall of `error[E0753]: expected outer doc comment`. Use
+   `#[path = "..."] pub mod ...;` — and declare it from a `mod.rs`, because
+   `#[path]` on a module declared inside `foo.rs` resolves relative to
+   `foo/`, a directory that does not exist here.
+
+2. **Depending on the whole `scx_layered` crate is a dead end.** Rejected by
+   inspection, not tried: its `lib.rs` pulls in the generated BPF skeleton
+   (`bpf_skel.rs` / `bpf_intf.rs`), needing a full BPF build (bpftool +
+   clang BPF target) at scxsim build time, plus libbpf-rs, nvml-wrapper,
+   fb_procfs and inotify. Compiling the pure algorithm modules directly is
+   the only tractable route. **This is also why `layer_core_growth.rs` is
+   not linked** — unlike `alloc.rs` it needs `scx_utils::Topology`,
+   `CpuPool` and `bpf_intf`, all behind that wall. Assess it before
+   promising a date: it may need `CpuPool` vendored the way
+   `largest_remainder` was, or may not be worth linking at all.
+
+3. **Hand-copying upstream code does not survive review.** The vendored
+   `largest_remainder` was transcribed by hand and silently differed
+   (`for &i` -> `for &idx`). Semantically identical; nothing would ever have
+   failed. Splice programmatically, and keep the drift guard.
+
+4. **A drift guard is only as good as its extractor.** The first version
+   searched for `pub fn <name>` anywhere and matched the *doc-comment
+   mention* in `layered_alloc.rs`, comparing documentation against code.
+   Anchor at line start and give the extractor its own self-test — a broken
+   extractor makes the guard vacuous.
+
+5. **`--antistall-sec 0` was unreachable at first.** `layered_set_antistall`
+   originally had `if (sec) antistall_sec = sec;`, so 0 silently kept the
+   production default of 3 and the hot arm could never be reached without
+   simulating multiple seconds of per-task delay. It now applies `sec`
+   verbatim (production accepts 0 too).
+
+6. **Do not build against scx pin `eba091e` from this branch.** The pin bump
+   and the matching `schedulers/mitosis/wrapper.c` fix were separated: at
+   `eba091e` upstream had removed `debug_events` / `DEBUG_EVENTS_BUF_SIZE`
+   while the committed mitosis wrapper still referenced them, so the build
+   dies on `mitosis_wrapper.o` before reaching layered. This branch builds
+   against the committed pin `59c30bae`. `validate2` has since committed the
+   fix as `db45c2c` and shown it backward-compatible with the old pin, so
+   after rebasing onto a base containing it either pin works — but
+   `db45c2c` is **not** an ancestor of this branch today.
+
+7. **`rfind` + `s[:idx] + new` truncates files.** A scripted edit that
+   spliced at the last match forgot to re-append the tail and silently
+   deleted four tests. `cargo nextest` stayed green throughout; the only
+   signal was the count dropping 1031 -> 1028. After any bulk scripted edit,
+   diff the test-name list against `HEAD`.
+
+8. **rustfmt rewrites string-literal line continuations.** A fixture using
+   `"...pub fn \` + newline + indentation was reformatted into literal
+   embedded spaces, breaking a matcher. Use `concat!()` for multi-line
+   fixtures whose exact bytes matter.
+
+---
+
+## 8. NUMA — related SEV, and explicitly NOT Tier 3
+
+**Do not conflate these.** Separate goals, separate substrate.
+
+The layered NUMA SEV is **S692395**. It lives in the cross-NUMA gating path:
+
+| Function | `main.bpf.c` |
+|---|---|
+| `xnuma_bucket_refill` | 1137 |
+| `xnuma_gate` | 1170 |
+| `xnuma_gate_charge` | 1201 |
+
+Those are exactly the three functions the coverage run reported unreachable,
+and the reason is structural rather than incidental: **the scxsim engine has
+no NUMA concept at all** — no per-CPU node id, no inter-node distance, no
+cost to a cross-node placement. `nr_numa_nodes` in the layered wrapper is a
+harness-supplied grouping over LLCs that exists only so layered's multi-node
+code paths can be entered; it has no simulated consequence.
+`xnuma_gate` and friends implement a token-bucket rate limit on cross-node
+migration, which cannot be meaningfully exercised until the engine models
+nodes as something a task can be placed *badly* relative to.
+
+Reaching those three functions therefore requires **engine NUMA substrate**,
+a separate project from the Tier-3 control loop. Tier 3 can be completed
+without them, and completing Tier 3 will not reach them. If reproducing
+S692395 becomes the goal, file and size it as a NUMA-substrate task — do not
+let it be absorbed into "finish Tier 3".
