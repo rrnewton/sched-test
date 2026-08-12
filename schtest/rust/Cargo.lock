@@ -1437,6 +1437,7 @@ dependencies = [
  "procfs",
  "quickcheck",
  "rand 0.9.4",
+ "regex",
  "rstest",
  "serde",
  "serde-error",
