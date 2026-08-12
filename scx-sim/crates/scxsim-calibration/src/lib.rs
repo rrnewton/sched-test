@@ -51,8 +51,15 @@
 
 pub mod report;
 pub mod sample;
+/// Deriving the compared quantities from a simulator `Trace`.
+///
+/// Feature-gated because it needs `scx_simulator`, which pulls in the BPF
+/// build; the definition of "calibrated" above does not.
+#[cfg(feature = "sim")]
+pub mod sim;
 pub mod units;
 pub mod verdict;
+pub mod vm;
 
 pub use report::{
     CalibrationRun, GapSeries, Metric, MetricResult, MetricSpec, NegativeControl, RunOutcome,
@@ -60,3 +67,7 @@ pub use report::{
 pub use sample::{DistributionComparison, PercentilePoint, Samples, DEFAULT_PERCENTILES};
 pub use units::{DurationNs, Hz, Quantity, Ratio, SampleCount, TimestampNs};
 pub use verdict::{compare, MinSamples, Tolerance, ToleranceKind, Verdict};
+pub use vm::{VmCgroup, VmRun, VmStats};
+
+#[cfg(feature = "sim")]
+pub use sim::SimRun;
