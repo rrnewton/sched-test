@@ -268,6 +268,11 @@ fn main() {
         "scx/scheds/rust/scx_cosmos/src/bpf",   // cosmos wrapper transitive include
         "scx/scheds/rust/scx_tickless/src/bpf", // tickless wrapper transitive include
         "scx/scheds/rust/scx_layered/src/bpf",  // layered wrapper transitive include
+        // scx_layered's Rust allocator, compiled into the crate verbatim by
+        // safe/layered_alloc_upstream (Tier-3 CPU reallocation). Watched so a
+        // submodule bump recompiles it and re-runs the vendored-helper drift
+        // guard in tests/layered_alloc.rs.
+        "scx/scheds/rust/scx_layered/src",
         // scx submodule headers used by ALL schedulers via include_paths above
         "scx/scheds/include",
         "scx/scheds/vmlinux",
