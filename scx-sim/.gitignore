@@ -38,3 +38,8 @@ benchmark_results.csv
 
 # Debug output (sweep results, ad-hoc investigation, etc.)
 debug/
+
+# Only ever built as a path dependency of the workspace (which owns the
+# real lockfile); this crate is workspace-excluded, so any `cargo` command run
+# from inside its directory drops a stray lock here and dirties the tree.
+crates/scx_layered_growth/Cargo.lock

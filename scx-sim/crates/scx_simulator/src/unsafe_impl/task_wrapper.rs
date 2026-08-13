@@ -149,6 +149,18 @@ impl SimTaskHandle {
         unsafe { ffi::sim_task_get_scx_flags(self.raw) }
     }
 
+    /// Set `p->scx.runnable_at`, in JIFFIES (kernel `scx_runnable()`).
+    pub fn set_runnable_at(&self, jiffies: u64) {
+        // SAFETY: `self.raw` is non-null and valid.
+        unsafe { ffi::sim_task_set_runnable_at(self.raw, jiffies) }
+    }
+
+    /// Read `p->scx.runnable_at`, in JIFFIES.
+    pub fn runnable_at(&self) -> u64 {
+        // SAFETY: `self.raw` is non-null and valid.
+        unsafe { ffi::sim_task_get_runnable_at(self.raw) }
+    }
+
     // ------------------------------------------------------------------
     // CPU affinity
     // ------------------------------------------------------------------
@@ -378,6 +390,19 @@ mod tests {
         let handle = SimTaskHandle::new();
         handle.set_migration_disabled(2);
         assert_eq!(handle.migration_disabled(), 2);
+    }
+
+    #[test]
+    fn test_runnable_at_roundtrip_and_defaults_zero() {
+        let _lock = SIM_LOCK.lock().unwrap();
+        let handle = SimTaskHandle::new();
+        // A freshly allocated task has never been runnable.
+        assert_eq!(handle.runnable_at(), 0);
+        handle.set_runnable_at(4_242);
+        assert_eq!(handle.runnable_at(), 4_242);
+        // scx_running() clears it.
+        handle.set_runnable_at(0);
+        assert_eq!(handle.runnable_at(), 0);
     }
 
     #[test]

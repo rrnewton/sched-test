@@ -587,6 +587,8 @@ fn csv_experiment_run() {
 
     // Create scheduler and optionally attach LAVD monitor
     let use_lavd = scheduler == "lavd";
+    // cpus_per_llc == 0 means "one flat domain"; checked_div gives exactly
+    // that fallback and keeps clippy::manual_checked_ops quiet.
     let nr_domains = nr_cpus.checked_div(cpus_per_llc).unwrap_or(1);
 
     if print_header {

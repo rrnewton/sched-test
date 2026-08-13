@@ -45,6 +45,7 @@ const SCHEDS: &[NamedSched] = &[
     ("cosmos", |n| DynamicScheduler::cosmos(n)),
     ("mitosis", |n| DynamicScheduler::mitosis(n)),
     ("tickless", |n| DynamicScheduler::tickless(n)),
+    ("layered", |n| DynamicScheduler::layered(n)),
 ];
 
 /// A CPU-bound hog pinned to a single CPU.

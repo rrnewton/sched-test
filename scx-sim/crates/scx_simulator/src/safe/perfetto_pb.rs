@@ -883,6 +883,45 @@ fn emit_event(trace: &Trace, ev: &crate::trace::TraceEvent, proto: &mut TracePro
                 anns,
             );
         }
+        TraceKind::SetWeight { pid, weight } => {
+            let anns = vec![
+                ann_int("pid", i64::from(pid.0)),
+                ann_int("weight", i64::from(*weight)),
+            ];
+            push_instant(
+                proto,
+                ts,
+                cpu_track_uuid(cpu),
+                "SCXSIM_STRUCTOP",
+                "ops.set_weight",
+                anns,
+            );
+        }
+        TraceKind::Disable { pid } => {
+            let anns = vec![ann_int("pid", i64::from(pid.0))];
+            push_instant(
+                proto,
+                ts,
+                cpu_track_uuid(cpu),
+                "SCXSIM_STRUCTOP",
+                "ops.disable",
+                anns,
+            );
+        }
+        TraceKind::TaskYield { pid, handled } => {
+            let anns = vec![
+                ann_int("pid", i64::from(pid.0)),
+                ann_int("handled", i64::from(*handled)),
+            ];
+            push_instant(
+                proto,
+                ts,
+                cpu_track_uuid(cpu),
+                "SCXSIM_STRUCTOP",
+                "ops.yield",
+                anns,
+            );
+        }
         TraceKind::SetCpumask { pid, cpumask_hex } => {
             let anns = vec![
                 ann_int("pid", i64::from(pid.0)),
@@ -1244,6 +1283,9 @@ fn event_pid(kind: &TraceKind) -> Option<Pid> {
         TraceKind::InitTask { pid, .. }
         | TraceKind::ExitTask { pid }
         | TraceKind::Enable { pid }
+        | TraceKind::SetWeight { pid, .. }
+        | TraceKind::Disable { pid }
+        | TraceKind::TaskYield { pid, .. }
         | TraceKind::SetCpumask { pid, .. }
         | TraceKind::HelperTaskCgroup { pid, .. }
         | TraceKind::HelperTaskCpu { pid, .. } => Some(*pid),
