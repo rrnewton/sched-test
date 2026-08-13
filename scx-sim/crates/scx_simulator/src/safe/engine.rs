@@ -4396,6 +4396,48 @@ impl<S: Scheduler> Simulator<S> {
                     s.sim.resolve_pending_dispatch(cpu);
 
                     let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
+                    // CHARGE AN EXPLICIT YIELD; DO NOT CHARGE A Run -> Run
+                    // BOUNDARY. `nr_yields` is the discriminator and this arm
+                    // serves both: an explicit `Phase::Yield` is consumed by the
+                    // loop above and lands here with `nr_yields > 0`, while a
+                    // Run phase simply followed by another Run phase lands here
+                    // with zero.
+                    //
+                    // THIS IS A DECISION, NOT AN OVERSIGHT — do not "fix" it by
+                    // stamping unconditionally. Four uncharged re-dispatch paths
+                    // were found and correctly charged (`handle_task_wake`,
+                    // `stop_and_reenqueue`, and the explicit-yield cases); this
+                    // is the one that must stay uncharged, for two reasons:
+                    //
+                    // 1. THE MODEL. `wakeup_latency_floor_ns` models the cost of
+                    //    getting a task ONTO a cpu — IPI, context switch, cache
+                    //    warming. A task crossing a Run -> Run phase boundary
+                    //    never left the cpu; the boundary is a scripting
+                    //    artifact of how the workload was written, not a kernel
+                    //    event. Charging it would add modelled latency to a
+                    //    dispatch the kernel would never have performed.
+                    // 2. THE MEASUREMENT IS SILENT. Charging it was tried and
+                    //    made no difference to the live-guest match: the
+                    //    calibration fixture crosses this boundary 9 times in
+                    //    ~1200 dispatches (it uses CONTINUOUS_RUN since
+                    //    676b42f), and cg_0 moved 2.720ms -> 2.591ms against a
+                    //    live 3.694ms, i.e. slightly further away and well
+                    //    inside noise. With the measurement silent the
+                    //    principled model wins, because it generalises to phase
+                    //    structures nobody has tested yet.
+                    //
+                    // An explicit yield is genuinely different: `sched_yield()`
+                    // makes the kernel run `yield_task_scx()` -> `ops.yield` and
+                    // put the task back on the queue, so its next dispatch
+                    // really does pay the path. `rundelay_tracking.rs`'s
+                    // `yield_redispatch_is_charged_the_modelled_kernel_cost`
+                    // pins that half, and it is what makes this distinction
+                    // visible rather than implicit.
+                    if nr_yields > 0 {
+                        if let Some(t) = s.tasks.get_mut(&pid) {
+                            t.enqueued_at_ns = Some(__local_t);
+                        }
+                    }
                     s.sim.trace.record(
                         __local_t,
                         cpu,
@@ -4483,6 +4525,16 @@ impl<S: Scheduler> Simulator<S> {
                                     let s = &mut *guard;
                                     s.sim.resolve_pending_dispatch(cpu);
                                     let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
+                                    // Same rule as the Run -> Run arm above, and
+                                    // for the same reason: a task that woke
+                                    // others and carried on never left the cpu.
+                                    // Charge only if an explicit yield was
+                                    // consumed on the way here.
+                                    if nr_yields > 0 {
+                                        if let Some(t) = s.tasks.get_mut(&pid) {
+                                            t.enqueued_at_ns = Some(__local_t);
+                                        }
+                                    }
                                     s.sim.trace.record(
                                         __local_t,
                                         cpu,
