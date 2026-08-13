@@ -104,13 +104,29 @@ pub enum Metric {
     /// enqueue-to-dispatch intervals. Each states its definition in full;
     /// they are the same physical quantity, which is what off-CPU time was not.
     ///
-    /// **On the first run measured, the agreement rests on the absolute arm.**
-    /// `sched_basic_proportional` puts two spinners on two dedicated CPUs, so
-    /// its true runqueue wait is a few milliseconds — below the 4 ms tick floor
-    /// that the absolute arm encodes. Both cgroups therefore fall outside the
-    /// 20% relative arm and pass on the floor alone. The bound is not the
-    /// problem and has not been touched; the fixture is uncontended. What this
-    /// metric needs to earn its relative arm is a scenario with real queueing.
+    /// **The bound REJECTS on the first run measured, and that is the result.**
+    /// On `sched_basic_proportional` the simulator reports ~150us of runqueue
+    /// wait against the guest's 3.694ms and 8.683ms — 25x and 58x low. cg_1
+    /// fails both arms (98.3% relative; 8.533ms against the 4ms absolute arm,
+    /// exceeding it by 2.1x) and is recorded as `Disagree`. cg_0 survives only
+    /// because its live value is small enough that the 4ms floor still covers a
+    /// 24.55x error, at 89% of that arm.
+    ///
+    /// The direction is the one the simulator's own construction predicts: no
+    /// IRQs, no timer ticks, no kernel threads, no host, and only the
+    /// scenario's tasks exist, so its scheduling delay is a FLOOR rather than
+    /// an estimate. This is the same missing-interference story as
+    /// [`Metric::OffCpuTime`] — but on a quantity that IS comparable across
+    /// backends, so it cannot be set aside as a definitional artefact.
+    ///
+    /// An earlier measurement of this metric agreed on both cgroups. It was
+    /// taken against a lowering defect that inserted voluntary yields into a
+    /// busy loop, producing 24029 phase-bound dispatches per task whose
+    /// fractional queueing summed to a spurious 6.007ms. Fixing the lowering
+    /// (`676b42f`) cut dispatches 39.8x and the simulated delay 39.9x with
+    /// them. The bound was not moved in either direction: it agreed when the
+    /// data was wrong and rejects now that it is right, which is the entire
+    /// reason for fixing it before the data existed.
     SchedulingDelay,
 }
 
