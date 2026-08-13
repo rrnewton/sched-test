@@ -147,7 +147,13 @@ artifact immediately before each run:
 | build | command exit | result |
 |---|---|---|
 | unpatched (pin) | 42 | `ExitKind::ErrorStall pid=4 runnable_for_ns=39879690773` — 39.88s |
-| patched (this patch applied) | 0 | ran to completion, no stall |
+| patched (this patch applied) | 0 | no stall at the default 30s watchdog |
+
+That patched row means "under 30 seconds", not "bounded". Probed with a 1s
+watchdog the same configuration waits **2.30s**, and the full quota gradient
+shows the patched wait still scaling as 1/quota — a ~17x constant-factor
+improvement, not a bound. See
+`experiments/scx3618_fix_efficacy_20260813/` in the harness repo.
 
 An incremental `cargo build --release` does pick the change up; no `clean` is
 needed. That was checked rather than assumed — the release `.so` flipped from
