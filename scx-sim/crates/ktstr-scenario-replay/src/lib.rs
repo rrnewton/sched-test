@@ -37,6 +37,13 @@
 //! latency in the sense ktstr measures them, and inventing correspondences would
 //! manufacture agreement rather than test for it.
 
+pub mod compare;
+
+pub use compare::{
+    compare, load_baseline, BaselineProvenance, CgroupComparison, Comparison, Mismatch,
+    ReadBaselineError, VmBaseline,
+};
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 

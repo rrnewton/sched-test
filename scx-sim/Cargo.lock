@@ -435,6 +435,7 @@ dependencies = [
  "scx_simulator",
  "scxsim-build",
  "scxsim-workload-ir",
+ "serde",
  "serde_json",
 ]
 
