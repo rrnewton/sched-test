@@ -67,44 +67,6 @@ fn wake_sleep(run_ns: u64, sleep_ns: u64) -> TaskBehavior {
     }
 }
 
-/// Max time from each pid's `LavdBailOnCgroupThrottle` to its next
-/// `TaskScheduled`. `None` for a pid that was parked and never ran again.
-fn bail_to_next_schedule(trace: &Trace) -> BTreeMap<u64, (u64, Option<u64>)> {
-    let mut pending: BTreeMap<u64, u64> = BTreeMap::new();
-    let mut worst: BTreeMap<u64, (u64, Option<u64>)> = BTreeMap::new();
-    for ev in trace.events() {
-        match &ev.kind {
-            TraceKind::LavdBailOnCgroupThrottle { pid, .. } => {
-                pending.entry(pid.0 as u64).or_insert(ev.time_ns);
-                worst.entry(pid.0 as u64).or_insert((0, None));
-            }
-            TraceKind::TaskScheduled { pid } => {
-                if let Some(t0) = pending.remove(&(pid.0 as u64)) {
-                    let d = ev.time_ns.saturating_sub(t0);
-                    let e = worst.entry(pid.0 as u64).or_insert((0, None));
-                    if d > e.0 {
-                        *e = (d, Some(d));
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    // Pids still parked at end of run: unbounded within the observation window.
-    for (pid, t0) in pending {
-        let e = worst.entry(pid).or_insert((0, None));
-        e.0 = e.0.max(
-            trace
-                .events()
-                .last()
-                .map_or(0, |l| l.time_ns)
-                .saturating_sub(t0),
-        );
-        e.1 = None;
-    }
-    worst
-}
-
 fn count_kind(trace: &Trace, pred: impl Fn(&TraceKind) -> bool) -> usize {
     trace.events().iter().filter(|e| pred(&e.kind)).count()
 }
@@ -179,18 +141,19 @@ fn report(label: &str, trace: &Trace) -> u64 {
         )
     });
     let replenish = count_kind(trace, |k| matches!(k, TraceKind::CgroupBwReplenish { .. }));
-    let waits = bail_to_next_schedule(trace);
-    let worst = waits.values().map(|(d, _)| *d).max().unwrap_or(0);
-    let never = waits.values().filter(|(_, r)| r.is_none()).count();
+    let m = StarvationMetrics::from_trace(trace);
     let sched = scheduled_per_pid(trace);
+    // Lead with the distribution. p50 against worst is what says "tail
+    // phenomenon"; a single number cannot, and the control is what answers
+    // "was the machine simply saturated?".
     eprintln!(
         "[{label}] exit={:?} bails={bails} throttled={throttles} replenish={replenish} \
-         worst_bail_to_sched={:.3}ms never_rescheduled={never} periods={:.1} sched_per_pid={sched:?}",
+         periods={:.1} {} sched_per_pid={sched:?}",
         trace.exit_kind(),
-        worst as f64 / 1e6,
         replenish as f64,
+        m.summary(),
     );
-    worst
+    m.worst_ns()
 }
 
 /// Exploratory probe. Prints the measurement across configurations; asserts
@@ -479,11 +442,7 @@ fn does_a_lower_watchdog_preserve_the_gradient() {
                 .duration_ms(240_000)
                 .build();
             let t = Simulator::new(lavd_cpu_bw(4)).run(sc);
-            let worst = bail_to_next_schedule(&t)
-                .values()
-                .map(|(d, _)| *d)
-                .max()
-                .unwrap_or(0);
+            let worst = StarvationMetrics::from_trace(&t).worst_ns();
             eprintln!(
                 "  watchdog={wd_s}s quota={quota_us}us -> worst_wait={:.2}s exit={:?}",
                 worst as f64 / 1e9,
@@ -539,11 +498,7 @@ fn does_noise_mask_the_pathology_or_prevent_it() {
     eprintln!("--- A: run length at DEFAULT noise (20% CV). grows=masking, plateaus=prevention");
     for d in [60_000u64, 240_000, 960_000] {
         let t = Simulator::new(lavd_cpu_bw(4)).run(scenario_with_noise2(125, d, 200_000, false));
-        let w = bail_to_next_schedule(&t)
-            .values()
-            .map(|(x, _)| *x)
-            .max()
-            .unwrap_or(0);
+        let w = StarvationMetrics::from_trace(&t).worst_ns();
         eprintln!(
             "    window={:>4}s  worst_wait={:>8.2}s",
             d / 1000,
@@ -553,11 +508,7 @@ fn does_noise_mask_the_pathology_or_prevent_it() {
     eprintln!("--- B: noise magnitude at a fixed 240s window. smooth=continuum, cliff=structural");
     for cv in [0u64, 10_000, 50_000, 100_000, 200_000] {
         let t = Simulator::new(lavd_cpu_bw(4)).run(scenario_with_noise2(125, 240_000, cv, false));
-        let w = bail_to_next_schedule(&t)
-            .values()
-            .map(|(x, _)| *x)
-            .max()
-            .unwrap_or(0);
+        let w = StarvationMetrics::from_trace(&t).worst_ns();
         eprintln!(
             "    cv={:>5.1}%  worst_wait={:>8.2}s",
             cv as f64 / 10_000.0,
@@ -575,11 +526,7 @@ fn is_it_noise_or_overhead() {
     for ovh in [false, true] {
         for cv in [0u64, 200_000] {
             let t = Simulator::new(lavd_cpu_bw(4)).run(scenario_with_noise2(125, 240_000, cv, ovh));
-            let w = bail_to_next_schedule(&t)
-                .values()
-                .map(|(x, _)| *x)
-                .max()
-                .unwrap_or(0);
+            let w = StarvationMetrics::from_trace(&t).worst_ns();
             eprintln!(
                 "    overhead={ovh:<5} cv={:>4.0}%  worst_wait={:>8.2}s",
                 cv as f64 / 10_000.0,

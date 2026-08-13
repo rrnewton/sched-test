@@ -141,6 +141,7 @@ pub use safe::layered_alloc_upstream::{unified_alloc, LayerDemand};
 pub use safe::monitor::{Monitor, ProbeContext, ProbePoint};
 pub use safe::perf::PmuEvent;
 pub use safe::perf::RbcCounter;
+pub use safe::starvation::{BailInterval, StarvationMetrics};
 // PR #2 made `safe`/`unsafe_impl` crate-internal. These two are part of the
 // tested surface (rbc_preemption.rs, scx_bpf_helpers.rs), so re-export them at
 // the root instead of widening the module visibility back out.

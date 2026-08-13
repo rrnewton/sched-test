@@ -38,6 +38,7 @@ pub(crate) mod perfetto;
 pub(crate) mod perfetto_pb;
 pub mod rtapp;
 pub mod scenario;
+pub mod starvation;
 pub mod stats;
 pub mod structops_jsonl;
 pub mod task;
