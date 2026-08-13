@@ -48,8 +48,16 @@ Earlier rounds of this investigation applied the patch into the submodule
 working tree and never committed it. The consequence was not a tidiness problem:
 **results were published without recording which side of the before/after was
 patched**, and at least one "unpatched" measurement was in fact patched. The
-conclusion drawn from it — that the fix does not bound the wait — was wrong and
-has been withdrawn. See PR sched-test#104.
+conclusion drawn from it — *"the fix engages but does not help"* — was wrong:
+the fix helps by ~17x. See PR sched-test#104.
+
+Worth stating precisely, because it is the sort of thing that gets remembered
+sloppily: that conclusion was **wrong about the thing it measured and
+accidentally right about a thing it did not**. The fix does help, so "does not
+help" was false. But it also does not *bound* the wait, which the later
+gradient established on evidence the original comparison never had. Being
+coincidentally near a true statement is not the same as having supported it,
+and the original claim gets no credit for it.
 
 So the rule this directory enforces is: *no before/after claim without a build
 state that a reader can reconstruct.*
