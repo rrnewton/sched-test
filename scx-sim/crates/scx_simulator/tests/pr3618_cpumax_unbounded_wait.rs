@@ -398,3 +398,99 @@ fn does_a_lower_watchdog_preserve_the_gradient() {
         }
     }
 }
+
+/// Does noise MASK the pathology or PREVENT it?
+///
+/// Masking: the accumulation still happens, jitter just spreads the timing so
+/// the worst wait grows more slowly — it should still GROW with run length.
+/// Prevention: the accumulation needs regular timing, so the wait PLATEAUS at
+/// some small bounded value no matter how long the run.
+fn scenario_with_noise2(quota_us: u64, duration_ms: u64, cv_ppm: u64, ovh: bool) -> Scenario {
+    let mut b = Scenario::builder()
+        .cpus(4)
+        .seed(42)
+        .overhead(ovh)
+        .noise_config(NoiseConfig {
+            enabled: cv_ppm > 0,
+            tick_jitter: cv_ppm > 0,
+            tick_jitter_stddev_ns: 2_000,
+            run_jitter: cv_ppm > 0,
+            run_jitter_cv_ppm: cv_ppm,
+        })
+        .cgroup_with_bandwidth(
+            "tight",
+            &[CpuId(0), CpuId(1), CpuId(2), CpuId(3)],
+            PERIOD_US,
+            quota_us,
+            0,
+        )
+        .add_task_in_cgroup("hog", 0, forever_run(2_000_000_000), "tight");
+    for i in 0..8 {
+        b = b.add_task_in_cgroup(
+            &format!("victim{i}"),
+            0,
+            wake_sleep(200_000, 1_000_000),
+            "tight",
+        );
+    }
+    b.add_task("competitor", 0, forever_run(2_000_000_000))
+        .watchdog_timeout_ns(None)
+        .duration_ms(duration_ms)
+        .build()
+}
+
+#[test]
+fn does_noise_mask_the_pathology_or_prevent_it() {
+    let _lock = common::setup_test();
+    eprintln!("--- A: run length at DEFAULT noise (20% CV). grows=masking, plateaus=prevention");
+    for d in [60_000u64, 240_000, 960_000] {
+        let t = Simulator::new(lavd_cpu_bw(4)).run(scenario_with_noise2(125, d, 200_000, false));
+        let w = bail_to_next_schedule(&t)
+            .values()
+            .map(|(x, _)| *x)
+            .max()
+            .unwrap_or(0);
+        eprintln!(
+            "    window={:>4}s  worst_wait={:>8.2}s",
+            d / 1000,
+            w as f64 / 1e9
+        );
+    }
+    eprintln!("--- B: noise magnitude at a fixed 240s window. smooth=continuum, cliff=structural");
+    for cv in [0u64, 10_000, 50_000, 100_000, 200_000] {
+        let t = Simulator::new(lavd_cpu_bw(4)).run(scenario_with_noise2(125, 240_000, cv, false));
+        let w = bail_to_next_schedule(&t)
+            .values()
+            .map(|(x, _)| *x)
+            .max()
+            .unwrap_or(0);
+        eprintln!(
+            "    cv={:>5.1}%  worst_wait={:>8.2}s",
+            cv as f64 / 10_000.0,
+            w as f64 / 1e9
+        );
+    }
+}
+
+/// Isolates the real variable: noise ALONE does not suppress it (42.18s at 20%
+/// CV with overhead off). The CLI difference must therefore be OVERHEAD, or an
+/// interaction between the two.
+#[test]
+fn is_it_noise_or_overhead() {
+    let _lock = common::setup_test();
+    for ovh in [false, true] {
+        for cv in [0u64, 200_000] {
+            let t = Simulator::new(lavd_cpu_bw(4)).run(scenario_with_noise2(125, 240_000, cv, ovh));
+            let w = bail_to_next_schedule(&t)
+                .values()
+                .map(|(x, _)| *x)
+                .max()
+                .unwrap_or(0);
+            eprintln!(
+                "    overhead={ovh:<5} cv={:>4.0}%  worst_wait={:>8.2}s",
+                cv as f64 / 10_000.0,
+                w as f64 / 1e9
+            );
+        }
+    }
+}
