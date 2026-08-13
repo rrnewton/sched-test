@@ -293,13 +293,29 @@ fn the_findings_as_first_measured() {
     // FINDING 1: the simulator models far too little off-CPU time. It has no
     // IRQs, no timer ticks and no competing guest work, so a task that never
     // sleeps is never off-CPU; the live spinners lose ~0.4% to interference.
-    assert_eq!(verdict(Metric::OffCpuTime, Some("cg_0")), Verdict::Disagree);
-    assert_eq!(verdict(Metric::OffCpuTime, Some("cg_1")), Verdict::Disagree);
+    for cg in ["cg_0", "cg_1"] {
+        assert_eq!(
+            verdict(Metric::OffCpuTime, Some(cg)),
+            Verdict::Disagree,
+            "{cg}: off-CPU time now AGREES with the guest. \
+             KNOWN-GAP TEST: this going red means the gap CLOSED. Invert this \
+             assertion to assert the property now holds. Do not delete it, and \
+             do not loosen the bound."
+        );
+    }
 
     // FINDING 2: zero migrations against the guest's 16. `simple` places each
     // task once and never rebalances. Attributable to the scheduler difference
     // as much as to the simulator — see the module header.
-    assert_eq!(verdict(Metric::Migrations, None), Verdict::Disagree);
+    assert_eq!(
+        verdict(Metric::Migrations, None),
+        Verdict::Disagree,
+        "migrations now AGREE with the guest — `simple` has started rebalancing, \
+         or the metric changed. \
+         KNOWN-GAP TEST: this going red means the gap CLOSED. Invert this \
+         assertion to assert the property now holds. Do not delete it, and do \
+         not loosen the bound."
+    );
 
     // Not comparable, for two different reasons — see the dedicated tests.
     assert_eq!(verdict(Metric::ContextSwitches, None), Verdict::NotMeasured);
