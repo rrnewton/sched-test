@@ -447,6 +447,22 @@ it is expected, *what to do* when it closes, and *what not to do*:
 /// make it pass (destroys the property that made it worth having).
 ```
 
+And the shape this template exists to prevent: **the finding must be in an
+assertion, not only in the comment.** A test that computes the interesting
+values and then discards them —
+
+```rust
+let lo = *seen.iter().min().unwrap();
+let hi = *seen.iter().max().unwrap();
+// Recorded fact, not a bound: at these quotas the wait converges ...
+let _ = (lo, hi);
+```
+
+— is green forever and protects nothing. Nobody has to delete it for the
+coverage to be absent; it was never there. If the comment states a property,
+assert the property; if it genuinely cannot be asserted yet, that is an
+abstention (below) and should say so in those terms.
+
 **4. The detector must be SOUND.** A known-gap test tells people to act on its
 red, so its red has to mean what it says. Derive the detector from the
 **mechanism**, not from an observable side-effect that can occur for other
@@ -477,6 +493,38 @@ worse than no detector**, because the convention tells people to act on it.
 Two ways to get soundness: assert on the mechanism (as the first assertion
 does), or make the fixture adversarial enough that coincidence is impossible —
 here, more tasks than the declared cpuset has CPUs.
+
+### Abstention is a near neighbour, and wants a different instruction
+
+The rules above cover **gap assertions**: the comparison is made, and the
+answer is "still disagrees". They do **not** fully cover **abstentions**: the
+comparison is declined outright, as with `Verdict::NotMeasured` in
+`context_switches_are_not_measured_because_the_populations_differ` and
+`wake_latency_is_not_measured_because_the_guest_did_not_measure_it`.
+
+Both say "this is not measuring what you think yet", and both go red when the
+situation improves. Rules 1–4 apply to abstentions unchanged. What differs is
+**what to do about the red**, so say this instead of rule 2's sentence:
+
+```
+KNOWN-ABSTENTION TEST: this going red means the metric became measurable.
+Supply the real bound and assert it. Do not weaken this to assert_ne!, and do
+not restore the abstention to make it pass.
+```
+
+The reason is that "invert" is not enough here. Inverting a gap assertion
+yields a real property (*the two sides now agree within X*). Inverting an
+abstention yields only *"it is measured now"* — which certifies nothing. The
+work the red is asking for is to decide what the comparison should assert now
+that it is possible, which is a bigger job than flipping a comparator, and
+`assert_ne!(NotMeasured)` is the tempting way to skip it.
+
+**Out of scope:** *pinning* tests such as
+`the_blind_mean_slice_bound_is_exactly_as_derived`, which assert a
+pre-registered tolerance has not been edited. They go red when someone changes
+the bound, not when a gap closes, and they already carry their own instruction
+(`Tolerance::widening()`). Different trigger, different remedy; do not rename
+them `known_gap_*`.
 
 ### Inverting is the default, not an absolute
 
