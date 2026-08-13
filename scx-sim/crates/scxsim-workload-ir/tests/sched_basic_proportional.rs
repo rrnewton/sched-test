@@ -326,22 +326,37 @@ fn cgroup_cpuset_confinement_is_observable_or_is_not() {
         }
     }
 
-    // THE FINDING, asserted rather than merely printed: the ingestion resolves
-    // the cgroup cpuset onto CgroupDef but never onto the member tasks'
-    // allowed_cpus, and nothing downstream confines them either.
+    // THE FINDING, asserted on the part that is DETERMINISTIC.
+    //
+    // An earlier version asserted that a placement violation must be OBSERVED,
+    // and that was wrong for exactly the reason this test warns about in the
+    // other direction: with two tasks on four CPUs, where they land is luck.
+    // They landed outside their cgroups' sets on one integration tip and
+    // inside them on the next, so the test went red without anything changing
+    // about confinement. Assert the structural fact instead — the cgroup
+    // cpuset never reaches the tasks — which holds every run.
     assert!(
         scenario.tasks.iter().all(|t| t.allowed_cpus.is_none()),
-        "premise of this characterization test: cgroup cpusets do not reach \
-         task allowed_cpus today",
+        "KNOWN GAP CLOSED? Cgroup cpusets now reach task allowed_cpus. That is \
+         the desired behaviour — delete this characterization test and replace \
+         it with a real confinement assertion. Tasks: {:#?}",
+        scenario.tasks,
     );
-    assert!(
-        !violations.is_empty(),
-        "KNOWN GAP CLOSED? Tasks are now confined to their cgroup's cpuset. \
-         That is the desired behaviour — delete this characterization test and \
-         replace it with a real confinement assertion.",
-    );
-    println!(
-        "CONFIRMED SCOPE-NARROWNESS GAP: cgroup cpusets do not confine tasks. {}",
-        violations.join("; ")
-    );
+
+    // Observed placement is reported, never asserted: whether an unconfined
+    // task happens to stray outside its cgroup's declared CPUs on any given
+    // run is chance, and a test that depends on chance is a test that will
+    // eventually lie in one direction or the other.
+    if violations.is_empty() {
+        println!(
+            "cgroup cpusets do not confine tasks (allowed_cpus is None for all); \
+             on THIS run every task happened to land inside its cgroup's \
+             declared set anyway — placement luck, not confinement"
+        );
+    } else {
+        println!(
+            "cgroup cpusets do not confine tasks; observed violations: {}",
+            violations.join("; ")
+        );
+    }
 }

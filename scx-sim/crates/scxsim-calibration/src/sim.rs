@@ -182,6 +182,50 @@ impl<'a> SimRun<'a> {
             .sum()
     }
 
+    /// Every on-CPU slice, as a distribution.
+    ///
+    /// A slice runs from a `TaskScheduled` to whichever of preempt / yield /
+    /// sleep / completion ends it. The distribution — not just its mean — is
+    /// needed because `Metric::MeanSliceLength`'s sample floor is only valid
+    /// while the coefficient of variation stays low: a bimodal mixture of
+    /// near-zero early exits and full slices can push the standard error of
+    /// the mean out to the whole tolerance, at which point a pass means
+    /// nothing. Callers are expected to report the CV alongside the mean.
+    pub fn slice_durations(&self) -> Samples {
+        let mut open: HashMap<Pid, u64> = HashMap::new();
+        let mut out: Vec<u64> = Vec::new();
+        let pids: Vec<Pid> = self.scenario.tasks.iter().map(|t| t.pid).collect();
+        for e in self.trace.events() {
+            match e.kind {
+                TraceKind::TaskScheduled { pid } if pids.contains(&pid) => {
+                    open.insert(pid, e.time_ns);
+                }
+                TraceKind::TaskPreempted { pid }
+                | TraceKind::TaskYielded { pid }
+                | TraceKind::TaskSlept { pid }
+                | TraceKind::TaskCompleted { pid }
+                    if pids.contains(&pid) =>
+                {
+                    if let Some(start) = open.remove(&pid) {
+                        out.push(e.time_ns.saturating_sub(start));
+                    }
+                }
+                _ => {}
+            }
+        }
+        Samples::from_nanos(out)
+    }
+
+    /// Mean on-CPU slice length: workload CPU time over dispatch count.
+    ///
+    /// `None` when nothing was dispatched — a mean of no slices is not zero,
+    /// it is undefined, and returning zero would let an empty run compare
+    /// against a live one.
+    pub fn mean_slice(&self) -> Option<DurationNs> {
+        let n = self.context_switches();
+        (n > 0).then(|| DurationNs(self.total_cpu_time().as_nanos() / n))
+    }
+
     /// Wake-to-run latencies: each `TaskWoke` to that task's next
     /// `TaskScheduled`.
     ///
