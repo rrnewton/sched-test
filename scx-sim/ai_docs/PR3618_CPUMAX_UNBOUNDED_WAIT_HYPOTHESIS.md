@@ -397,3 +397,69 @@ cheaper on the mild end. 30s is retained in the committed tests for fidelity to
 scx#3618's own claim, which is specifically about *the 30-second SCX
 runnable-task-stall watchdog*; a reader checking our result against the PR's
 wording should not have to reconcile a different threshold.
+
+---
+
+## Question A: NOT ANSWERED. The crash dataset cannot answer it, and here is the better question.
+
+**Status: unanswered.** Saying so plainly rather than producing a soft answer.
+
+### Why the asked-for query is not available
+
+The pinned crash buckets come from Scuba `atropos_events`. That dataset carries
+**no cgroup, quota, `cpu.max` or period columns** — the only CPU-related fields
+are `cpu_arch` and `cpu_arch_family`. So the specific join the question wants —
+quota distribution *on the crashing hosts*, same pinned window — cannot be done
+from the dataset that produced the crash counts. A different source (container
+inventory or Tupperware task specs) plus a host join would be needed, and I did
+not locate one within this task's budget.
+
+### The reframing, which is derivable without new telemetry and changes the question
+
+**The pathology is not driven by absolute quota. It is driven by the ratio of
+runnable demand to quota.** The repro's cgroup holds 1 always-runnable hog plus
+8 victims at a 200µs/1200µs duty cycle:
+
+```
+demand = 1.00 (hog) + 8 x 0.167 (victims) = 2.33 CPUs of runnable demand
+```
+
+Against that fixed demand:
+
+| quota /100ms | = CPUs | oversubscription | measured wait |
+|---|---|---|---|
+| 2ms | 0.020 | **117x** | 1.98s |
+| 1ms | 0.010 | **233x** | 4.98s |
+| 0.5ms | 0.005 | **467x** | 10.98s |
+| 0.25ms | 0.0025 | **933x** | 21.18s |
+| 0.125ms | 0.00125 | **1867x** | 40.28s |
+| 0.062ms | 0.00062 | **3763x** | 81.18s |
+
+So the right production question is **not** "does anything configure 0.125ms
+per 100ms" — which is obviously absurd, 1/800th of a CPU, and would make the
+finding a curiosity. It is:
+
+> **Do production cgroups run at 100x–2000x runnable-demand-to-quota
+> oversubscription?**
+
+That is a very different question and it is not obviously absurd. A container
+allocated 2 CPUs of quota, running a thread pool that puts 466 threads
+simultaneously runnable, sits at the same ~233x that produced a 4.98s wait
+here. Large thread pools inside throttled containers are a common shape.
+
+**This is a hypothesis about equivalence, not a demonstrated one.** I have not
+shown that 233x oversubscription at 2-CPU quota behaves like 233x at 0.01-CPU
+quota — absolute quota may matter independently, e.g. if a quota below one
+scheduling slice behaves qualitatively differently. **Testing that is cheap and
+is the obvious next step:** hold the ratio fixed and scale quota and demand
+together. If the wait tracks the ratio, the finding generalises to realistic
+quotas and the production question becomes answerable from thread-count data
+rather than from quota data.
+
+### What this means for the three outcomes
+
+None of the three can be selected yet. But the third — "production never goes
+near it, so this is a mechanism not an instance" — should **not** be concluded
+from the extremity of 0.125ms alone, because that number is an artefact of
+holding demand fixed at 2.33 CPUs. Until the ratio-equivalence test is run, the
+extremity of the quota is not evidence that the scenario is unrealistic.
