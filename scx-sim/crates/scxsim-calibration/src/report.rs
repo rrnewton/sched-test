@@ -28,7 +28,43 @@ use crate::verdict::{compare, MinSamples, Tolerance, Verdict};
 pub enum Metric {
     /// Per-task CPU time. VM `cpu_time_ns` vs sim `total_runtime(pid)`.
     CpuTime,
-    /// Per-task off-CPU time. VM `off_cpu_ns` vs sim (wall - runtime).
+    /// Per-task off-CPU time, `(wall - cpu) / wall` on both sides.
+    ///
+    /// **NOT COMPARABLE ACROSS BACKENDS AS DEFINED, and recorded via
+    /// [`MetricResult::not_comparable`] rather than evaluated.** Both sides
+    /// compute the same formula correctly; the formula does not mean the same
+    /// thing in the two places.
+    ///
+    /// Measured on `sched_basic_proportional`, the live guest's off-CPU time is
+    /// dominated by something that is not scheduling:
+    ///
+    /// ```text
+    /// cg_0   off_cpu 43.18 ms   run_delay 3.69 ms    91% is not runqueue waiting
+    /// cg_1   off_cpu 52.14 ms   run_delay 8.68 ms    83% is not runqueue waiting
+    /// ```
+    ///
+    /// `run_delay` (schedstat, runnable-but-not-running) is the
+    /// scheduler-attributable part and is 8-17% of the metric. The remainder is
+    /// finely distributed — `max_gap_ms` is 1 and 0, so there was no single
+    /// stall — and the guest separately measured the host stealing from it
+    /// (`host_dilation` 1.00063, "wall / delivered vCPU CPU time"). That is
+    /// virtualization overhead: VM exits, host preemption of the vCPU.
+    ///
+    /// The simulator has no host, no vCPU and no exits, so it has no
+    /// counterpart, and per this project's modelling charter it should not
+    /// acquire one — synthesising steal time to close a verdict would be
+    /// inventing behaviour.
+    ///
+    /// On the quantity both sides DO mean, they are close: sim off-CPU is
+    /// 6.0 ms against the guest's 3.69 / 8.68 ms of run_delay. The simulator
+    /// sits between the two cgroups. It is not 7x low on scheduling delay; it
+    /// was 7x low on a number that is mostly not scheduling delay.
+    ///
+    /// The metric that would capture the intent is scheduling delay itself
+    /// (guest `mean_run_delay_us` against a simulator runnable-but-not-running
+    /// figure). It is deliberately NOT added here: its tolerance would be
+    /// chosen by someone who has already seen both numbers, which is the thing
+    /// pre-registration exists to prevent. Filed instead.
     OffCpuTime,
     /// CPU occupancy, busy/elapsed. Dimensionless, so immune to unit-conversion
     /// error on either side — the strictest bound we can fairly demand.
@@ -269,6 +305,41 @@ impl MetricResult {
             samples,
             verdict,
             tolerance: spec.tolerance,
+        }
+    }
+
+    /// A metric BOTH backends produce but whose two numbers are not the same
+    /// physical quantity, recorded as [`Verdict::Inconclusive`] with the reason
+    /// in `at`.
+    ///
+    /// This is a distinct failure from [`Verdict::NotMeasured`], and conflating
+    /// them would lose the distinction that matters. NotMeasured means nobody
+    /// looked. This means both sides looked, both produced a number, and
+    /// comparing them would be comparing two different things and calling the
+    /// difference fidelity — the error the context-switches line already avoids
+    /// by refusing to feed a VM-wide count against a two-task one.
+    ///
+    /// Inconclusive rather than NotMeasured on purpose: it sits ABOVE Agree in
+    /// the severity lattice, so a run carrying one cannot fold to a clean pass.
+    /// A metric we cannot interpret must not read as a metric we verified.
+    ///
+    /// Both sides' values are still recorded. The point is to stop them being
+    /// subtracted, not to hide them.
+    pub fn not_comparable(
+        metric: Metric,
+        at: Option<String>,
+        sim: Option<Quantity>,
+        vm: Option<Quantity>,
+        samples: SampleCount,
+    ) -> Self {
+        MetricResult {
+            metric,
+            at,
+            sim,
+            vm,
+            samples,
+            verdict: Verdict::Inconclusive,
+            tolerance: metric.spec().tolerance,
         }
     }
 

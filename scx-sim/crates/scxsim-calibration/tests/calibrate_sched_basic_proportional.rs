@@ -137,7 +137,13 @@ fn calibrate() -> CalibrationRun {
             Some(Quantity::Duration(cg.cpu_time())),
             n,
         ));
-        run.record(MetricResult::evaluate(
+        // Off-CPU: RECORDED, NOT EVALUATED. Both sides compute
+        // (wall - cpu)/wall correctly and the two results are not the same
+        // physical quantity — the guest's is dominated by virtualization
+        // overhead the simulator has no concept of. See Metric::OffCpuTime for
+        // the decomposition. The values are still carried so the gap stays
+        // visible; what stops is subtracting them and calling it fidelity.
+        run.record(MetricResult::not_comparable(
             Metric::OffCpuTime,
             Some(name.to_string()),
             sim.off_cpu_fraction(name).map(Quantity::Ratio),
@@ -293,8 +299,14 @@ fn the_findings_as_first_measured() {
     // FINDING 1: the simulator models far too little off-CPU time. It has no
     // IRQs, no timer ticks and no competing guest work, so a task that never
     // sleeps is never off-CPU; the live spinners lose ~0.4% to interference.
-    assert_eq!(verdict(Metric::OffCpuTime, Some("cg_0")), Verdict::Disagree);
-    assert_eq!(verdict(Metric::OffCpuTime, Some("cg_1")), Verdict::Disagree);
+    assert_eq!(
+        verdict(Metric::OffCpuTime, Some("cg_0")),
+        Verdict::Inconclusive
+    );
+    assert_eq!(
+        verdict(Metric::OffCpuTime, Some("cg_1")),
+        Verdict::Inconclusive
+    );
 
     // FINDING 2: zero migrations against the guest's 16. `simple` places each
     // task once and never rebalances. Attributable to the scheduler difference
@@ -479,4 +491,75 @@ fn one_run_cannot_support_a_percentile_verdict_on_the_live_side() {
         "identical numbers from one sample are still not evidence"
     );
     let _ = Ratio(0.0);
+}
+
+/// The evidence for ruling `OffCpuTime` not-comparable, asserted rather than
+/// asserted-in-a-comment.
+///
+/// Reclassifying a `Disagree` is the single most dangerous edit in this crate:
+/// done wrongly it is indistinguishable from making an inconvenient result go
+/// away. So the reason is encoded as a test over the same fixture, and it can
+/// fail. If the guest's off-CPU time ever stops being dominated by
+/// non-scheduling time, the premise of the reclassification is gone and this
+/// goes red, pointing at the classification rather than at the workload.
+///
+/// The claim: the live off-CPU number is mostly NOT runqueue waiting, so it is
+/// not measuring what a scheduler-fidelity comparison needs it to measure.
+#[test]
+fn off_cpu_is_dominated_by_non_scheduling_time() {
+    let vm = VmRun::from_json(VM_SIDECAR).expect("the committed sidecar parses");
+
+    for cg in &vm.stats.cgroups {
+        assert!(
+            cg.run_delay_measured,
+            "{}: schedstat run_delay must be measured for this argument to \
+             hold; without it there is no scheduler-attributable baseline to \
+             compare against",
+            cg.cgroup_name,
+        );
+
+        // Recover the wall the guest actually used, by inverting its own
+        // off_cpu fraction against its own CPU time. Both cgroups must land on
+        // the same wall — they are independently reported workers in one run,
+        // so agreement here is what makes the inversion trustworthy.
+        let cpu = cg.total_cpu_time_ns as f64;
+        let off_frac = cg.off_cpu_fraction().get();
+        let wall = cpu / (1.0 - off_frac);
+        let off_cpu_ns = wall - cpu;
+        let run_delay_ns = cg.mean_run_delay_us * 1_000.0;
+
+        assert!(
+            (wall - 12.0e9) / 12.0e9 > 0.0,
+            "{}: the worker's wall window ({:.4}s) should exceed the 12s \
+             scenario; if it does not, the inversion below is measuring \
+             something else",
+            cg.cgroup_name,
+            wall / 1e9,
+        );
+
+        // The load-bearing assertion. 3x is deliberately far below the measured
+        // 5.9x (cg_1) and 11.7x (cg_0) — the claim is "dominated", not a
+        // particular ratio, and a bound hugging the observed value would be
+        // fitting a number to the outcome.
+        assert!(
+            off_cpu_ns > 3.0 * run_delay_ns,
+            "{}: off_cpu {:.2} ms is not >3x run_delay {:.2} ms. The \
+             not-comparable classification of Metric::OffCpuTime rests on the \
+             live number being mostly non-scheduling time; if that is no longer \
+             true, re-evaluate the classification rather than this bound.",
+            cg.cgroup_name,
+            off_cpu_ns / 1e6,
+            run_delay_ns / 1e6,
+        );
+
+        // And no single long stall, which would be a scheduling event and
+        // would undercut the "virtualization overhead" reading.
+        assert!(
+            cg.max_gap_ms <= 2,
+            "{}: max_gap_ms {} suggests a real stall, not finely distributed \
+             overhead — the reclassification's reasoning would need revisiting",
+            cg.cgroup_name,
+            cg.max_gap_ms,
+        );
+    }
 }
