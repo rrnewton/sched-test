@@ -465,34 +465,34 @@ abstention (below) and should say so in those terms.
 
 **4. The detector must be SOUND.** A known-gap test tells people to act on its
 red, so its red has to mean what it says. Derive the detector from the
-**mechanism**, not from an observable side-effect that can occur for other
-reasons.
+mechanism that actually delivers the property — and make sure it is *the*
+mechanism, not merely *a* mechanism.
 
-This is not hypothetical. `cgroup_cpuset_confinement_is_observable_or_is_not`
-carries two assertions:
+The worked example is `cgroup_cpuset_confinement_is_observable_or_is_not`,
+whose gap-asserting form carried two assertions:
 
 ```rust
-// sound: tests the mechanism
+// premise: cgroup cpusets do not reach tasks
 assert!(scenario.tasks.iter().all(|t| t.allowed_cpus.is_none()), ...);
-// unsound: tests a side-effect that luck can produce
-assert!(!violations.is_empty(), "KNOWN GAP CLOSED? Tasks are now confined ...");
+// detector: tasks are observed running outside their declared set
+assert!(!violations.is_empty(), "KNOWN GAP CLOSED? ...");
 ```
 
-The second one went red on 2026-08-13 while the first still passed — cgroup
-cpusets still do not reach `allowed_cpus`, so nothing was confining anything.
-Two tasks on four CPUs simply landed on 0 and 2, inside their declared sets, by
-placement coincidence. The test's own comment had rejected a weaker check for
-exactly that reason ("land apart by luck often enough that … would pass while
-confinement was entirely absent") and then its main detector fell to it anyway.
+When the gap closed (`Scenario::effective_cpuset`, sim-4qlh5 / PR #79) the
+detector fired correctly and the premise assertion **kept passing** — because
+confinement arrived through `effective_cpuset` rather than by populating each
+task's `allowed_cpus`. The premise was checking a mechanism that was never the
+one in force. A reader trusting it would have concluded the gap was still open
+and dismissed a true red as coincidence.
 
-Following the failure message there would have deleted a real, still-open gap
-and replaced it with a confinement assertion that passes by the same luck —
-certifying a feature that does not exist. **A detector that luck can flip is
-worse than no detector**, because the convention tells people to act on it.
+So a premise assertion is not a free safety net: it is a second detector, and
+it needs the same soundness scrutiny as the first. If it names a specific
+mechanism, it silently assumes no other mechanism can deliver the property.
+Prefer asserting the observable property; if you assert a mechanism, say in the
+doc comment which one and why it is the only one.
 
-Two ways to get soundness: assert on the mechanism (as the first assertion
-does), or make the fixture adversarial enough that coincidence is impossible —
-here, more tasks than the declared cpuset has CPUs.
+PR #107 inverted this test to the confinement assertion it was standing in for,
+which is the convention working as intended.
 
 ### Abstention is a near neighbour, and wants a different instruction
 
