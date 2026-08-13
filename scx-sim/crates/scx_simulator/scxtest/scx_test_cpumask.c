@@ -109,6 +109,37 @@ bool bpf_cpumask_test_cpu(u32 cpu, const struct cpumask *cpumask)
 	RBC_GUARD_RETURN(cpumask_test_cpu(cpu, cpumask));
 }
 
+/*
+ * bpf_cpumask_full - is every CPU set?
+ *
+ * The kernel's cpumask_full() tests bits [0, nr_cpu_ids), NOT the whole
+ * fixed-size bitmap. Our struct cpumask is a fixed 128 unsigned longs
+ * (8192 bits) but only the simulated CPUs are ever populated, so a naive
+ * "all 8192 bits set" test would answer false for every mask and silently
+ * change scheduler behaviour (scx_layered's
+ * maybe_init_task_unprotected_mask() uses it to decide whether a task has
+ * ANY placement restriction).
+ *
+ * `all_cpus` is the simulator's online set, populated by the engine via
+ * scx_test_set_all_cpumask() for exactly the simulated CPUs, so it is the
+ * faithful stand-in for the [0, nr_cpu_ids) bound: a mask is "full" iff it
+ * covers every online CPU.
+ *
+ * Lives here rather than in scx-sim/csrc/sim_bpf_stubs.c (where the other
+ * bpf_cpumask_* kfuncs are) because `all_cpus` is defined in this
+ * translation unit; the scheduler .so resolves it from the main binary at
+ * dlopen time via -rdynamic, like the other kfuncs below.
+ */
+bool bpf_cpumask_full(const struct cpumask *cpumask)
+{
+	RBC_GUARD_START;
+	for (int i = 0; i < NR_CPUS; i++) {
+		if (cpumask_test_cpu(i, &all_cpus) && !cpumask_test_cpu(i, cpumask))
+			RBC_GUARD_RETURN(false);
+	}
+	RBC_GUARD_RETURN(true);
+}
+
 s32 scx_bpf_pick_idle_cpu_node(const struct cpumask *cpus_allowed,
 			       int node __attribute__((unused)),
 			       u64 flags __attribute__((unused)))

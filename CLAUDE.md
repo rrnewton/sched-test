@@ -14,6 +14,43 @@ working in a sub-project, follow its `CLAUDE.md`:
 
 - **scx-sim/**: Scheduler simulator — see `scx-sim/CLAUDE.md`
 
+CI: a `schedule:` on an integration workflow will NEVER run
+----------------------------------------
+
+**GitHub resolves `on: schedule:` from the DEFAULT BRANCH only.** The default
+branch is `main`, and `main` carries exactly one workflow of its own (`ci.yml`).
+Every real workflow — `simulator.yml`, `gh-pages.yml`, `scxsim-examples.yml`,
+`scxsim-quickstart.yml`, `sync-upstream.yml`, `scx-pin-staleness.yml` — lives on
+`integration`.
+
+So **adding `on: schedule:` to a workflow on `integration` silently does
+nothing.** The workflow file looks correct, the cron expression is valid, GitHub
+reports no error, and it never fires. Verified against the API: **zero scheduled
+runs have ever occurred on this repository.** `sync-upstream.yml` carried a
+nightly cron for months and never ran here once — which is the underlying reason
+upstream scx syncs stopped for seven weeks.
+
+**What to do instead:** add your workflow's filename to the matrix in
+`.github/workflows/scheduled-dispatch.yml` **on `main`**. That file is a cron
+carrier: it fires from the default branch and dispatches the real workflows on
+`integration`. Your workflow must also declare `workflow_dispatch:` for the
+dispatch to reach it.
+
+Two things worth knowing about that arrangement:
+
+- The dispatcher is deliberately inert — a list of filenames and a dispatch
+  call, no logic. `main` is not a branch we develop on, so anything clever there
+  would rot unseen.
+- Prefer giving a scheduled workflow a `push:` trigger as well, where that makes
+  sense. `scx-pin-staleness.yml` runs on both, so the cron and the push trigger
+  are independent paths: if the dispatcher breaks, pushes still catch the
+  problem; if pushes stop — which is exactly when drift accumulates unnoticed —
+  the cron still fires.
+
+Push- and pull_request-triggered workflows are **unaffected**: for those GitHub
+uses the workflow file from the pushed ref, so they work correctly on
+`integration`. Only `schedule:` resolves from the default branch.
+
 Shipping: you own your PR until it lands
 ----------------------------------------
 
