@@ -258,3 +258,46 @@ had.
 
 **A negative result is only as strong as the range the experiment could have
 observed — and "range" means every axis, not just the one you last checked.**
+
+---
+
+## Question B: does PR #3618's own fix stop it? Not in this scenario.
+
+**PR #3618 does propose a fix** — 3 commits, 3 files, +332/-71, and its body
+describes exactly the pathology reproduced above: *"that wait is not bounded:
+it can grow until a task trips the 30-second SCX runnable-task-stall watchdog
+and brings the scheduler down."* Two mechanisms are attacked: [2/3]
+`scx_cgroup_bw_pressure()` plus LAVD shortening slices as pressure rises, and
+[3/3] blending wall-clock into BTQ vtime so a task reaches the queue head
+within a few seconds regardless of vtime.
+
+Applied and re-run. **The gradient does not flatten and the watchdog still
+fires:**
+
+| quota /100ms | unpatched | with #3618 |
+|---|---|---|
+| 0.5ms | 10.98s | 10.98s |
+| 1ms | 4.98s | 4.98s |
+| 0.125ms | 40.28s, `ErrorStall` | **40.28s, `ErrorStall`** |
+| 0.062ms | 81.18s, `ErrorStall` | **81.18s, `ErrorStall`** |
+
+Patch liveness was verified rather than assumed: the `.so` mtime postdates the
+patched source, `scx_cgroup_bw_pressure` appears in both patched files, and the
+built binary carries 19 `pressure` strings.
+
+### Two caveats that could each explain the null result
+
+1. **The patch was rebased.** It targets scx merge-base `3aa52aaf` with head
+   `a8f72d09` (2026-04-22); our pin is `59c30bae` (2026-05-13), three weeks
+   later. `git apply -3` merged all three files cleanly, but a clean *textual*
+   merge is not a clean *semantic* one. Testing against the PR's own base would
+   settle it.
+2. **The pressure path may not be active.** [2/3] works by LAVD shortening
+   slices as pressure rises. I confirmed the API is compiled in; I did **not**
+   confirm the slice-shortening actually engages in this scenario. If it needs
+   a config knob we do not set, the run tested [3/3] alone.
+
+**So this is not "the fix does not work".** It is: *as applied to our pin, with
+liveness confirmed only at the API level, the fix does not change this
+scenario's outcome.* Resolving caveat 2 is the obvious next step and is cheap —
+instrument whether slices actually shorten under pressure.
