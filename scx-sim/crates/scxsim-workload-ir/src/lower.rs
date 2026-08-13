@@ -778,7 +778,17 @@ fn plan_work(ctx: &mut Ctx, wt: &SourceWorkType, src: &str, n: u32) -> Result<Pl
                  plain CPU time and contention emerges from CPU count alone"
                     .into(),
             );
-            uniform("mutex", c, vec![Phase::Run(hold.saturating_add(work))])
+            let combined = hold.saturating_add(work);
+            ctx.approx(
+                src,
+                format!("Run({combined})"),
+                Cause::BlockingMechanism,
+                format!(
+                    "hold({hold}) + work({work}) collapsed into one run phase; \
+                     neither the lock nor the split survives"
+                ),
+            );
+            uniform("mutex", c, vec![Phase::Run(combined)])
         }
         W::ThunderingHerd {
             waiters,
@@ -940,14 +950,16 @@ fn plan_work(ctx: &mut Ctx, wt: &SourceWorkType, src: &str, n: u32) -> Result<Pl
                 Cause::BlockingMechanism,
                 format!("epoll readiness becomes Wake; events_per_burst={events_per_burst}"),
             );
+            // EpollStorm says nothing about how long a consumer works per
+            // event, so the quantum is the lowering's. Recording the wake
+            // mechanism above is NOT recording this — that was the
+            // PreemptStorm shape, and the provenance check caught it here.
+            let work = ctx.invented_slice(src, "EpollStorm work per event");
             Plan {
                 name_prefix: "epoll".into(),
                 tasks: p + c,
                 repeat: Repeat::Forever,
-                kind: PlanKind::FanOut {
-                    work: spin,
-                    waiters: c,
-                },
+                kind: PlanKind::FanOut { work, waiters: c },
             }
         }
         W::AsymmetricWaker {
@@ -968,8 +980,8 @@ fn plan_work(ctx: &mut Ctx, wt: &SourceWorkType, src: &str, n: u32) -> Result<Pl
                 repeat: Repeat::Forever,
                 kind: PlanKind::Classed {
                     classes: vec![
-                        (1, sched_class(*waker_class)),
-                        (1, sched_class(*wakee_class)),
+                        (1, sched_class(ctx, src, *waker_class)),
+                        (1, sched_class(ctx, src, *wakee_class)),
                     ],
                     work,
                     sleep: work,
@@ -990,12 +1002,19 @@ fn plan_work(ctx: &mut Ctx, wt: &SourceWorkType, src: &str, n: u32) -> Result<Pl
                 Cause::Microarchitectural,
                 format!("cache_footprint_kib={cache_footprint_kib}"),
             );
+            let combined = work.saturating_add(DurationNs::from_micros(*sleep_usec));
+            ctx.approx(
+                src,
+                format!("Run({combined})"),
+                Cause::BlockingMechanism,
+                format!("operations({work}) + sleep_usec({sleep_usec}us) collapsed into one phase"),
+            );
             Plan {
                 name_prefix: "fanoutcompute".into(),
                 tasks: f + 1,
                 repeat: Repeat::Forever,
                 kind: PlanKind::FanOut {
-                    work: work.saturating_add(DurationNs::from_micros(*sleep_usec)),
+                    work: combined,
                     waiters: f,
                 },
             }
@@ -1140,13 +1159,40 @@ fn plan_work(ctx: &mut Ctx, wt: &SourceWorkType, src: &str, n: u32) -> Result<Pl
     Ok(plan)
 }
 
-fn sched_class(c: SourceSchedClass) -> SchedPolicy {
+/// The RT priority the lowering supplies for a class that names no number.
+///
+/// ktstr's `SourceSchedClass` is a class NAME — `Fifo`, `RoundRobin` — with no
+/// priority attached. A real-time policy needs one, so this is the lowering's.
+/// Every use records it: the mechanical provenance check found this helper
+/// after the hand audit had already been through the same arms, because a
+/// shared helper's fabrication does not look like a fabrication at the call
+/// site.
+const SUPPLIED_RT_PRIORITY: i32 = 50;
+
+fn sched_class(ctx: &mut Ctx, src: &str, c: SourceSchedClass) -> SchedPolicy {
     match c {
         SourceSchedClass::Normal => SchedPolicy::Normal,
         SourceSchedClass::Batch => SchedPolicy::Batch,
         SourceSchedClass::Idle => SchedPolicy::Idle,
-        SourceSchedClass::Fifo => SchedPolicy::Fifo { priority: 50 },
-        SourceSchedClass::RoundRobin => SchedPolicy::RoundRobin { priority: 50 },
+        SourceSchedClass::Fifo | SourceSchedClass::RoundRobin => {
+            ctx.approx(
+                src,
+                format!("priority {SUPPLIED_RT_PRIORITY}"),
+                Cause::UnspecifiedWorkQuantum,
+                format!(
+                    "SchedClass::{c:?} names no RT priority; {SUPPLIED_RT_PRIORITY} \
+                     supplied by the lowering"
+                ),
+            );
+            match c {
+                SourceSchedClass::RoundRobin => SchedPolicy::RoundRobin {
+                    priority: SUPPLIED_RT_PRIORITY,
+                },
+                _ => SchedPolicy::Fifo {
+                    priority: SUPPLIED_RT_PRIORITY,
+                },
+            }
+        }
     }
 }
 
@@ -1806,6 +1852,32 @@ mod tests {
                 .any(|a| a.dropped.contains("RT priority")),
             "the invented priority must be named: {:?}",
             ir.fidelity.approximations(),
+        );
+    }
+    /// THE MECHANICAL AUDIT INSTRUMENT, run over every supported arm.
+    ///
+    /// "Does every value in the output appear in the input?" is the question
+    /// that found five defects in eight exact-claiming arms. This is that
+    /// question as a test, so the next fabrication fails the build instead of
+    /// waiting for someone to think to ask.
+    ///
+    /// A value is allowed to be absent from the input ONLY if the lowering
+    /// recorded that it supplied it. See [`crate::provenance`].
+    #[test]
+    fn every_arm_emits_only_values_that_trace_to_the_source_or_are_disclosed() {
+        let mut offenders = Vec::new();
+        for wt in all_supported_work_types() {
+            let name = wt.variant_name();
+            let src = scenario_with(wt);
+            let ir = lower(&src).unwrap_or_else(|e| panic!("{name}: {e}"));
+            for u in crate::provenance::check(&src, &ir) {
+                offenders.push(format!("{name}: {u}"));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "the lowering emitted values with no provenance:\n  {}",
+            offenders.join("\n  "),
         );
     }
 }
