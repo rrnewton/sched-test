@@ -4396,6 +4396,12 @@ impl<S: Scheduler> Simulator<S> {
                     s.sim.resolve_pending_dispatch(cpu);
 
                     let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
+                    // Same stamp as `stop_and_reenqueue`: a task re-entering the
+                    // queue must be charged the modelled kernel path, not left
+                    // to the bare dispatch overheads. See `start_running`.
+                    if let Some(t) = s.tasks.get_mut(&pid) {
+                        t.enqueued_at_ns = Some(__local_t);
+                    }
                     s.sim.trace.record(
                         __local_t,
                         cpu,
@@ -4483,6 +4489,9 @@ impl<S: Scheduler> Simulator<S> {
                                     let s = &mut *guard;
                                     s.sim.resolve_pending_dispatch(cpu);
                                     let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
+                                    if let Some(t) = s.tasks.get_mut(&pid) {
+                                        t.enqueued_at_ns = Some(__local_t);
+                                    }
                                     s.sim.trace.record(
                                         __local_t,
                                         cpu,

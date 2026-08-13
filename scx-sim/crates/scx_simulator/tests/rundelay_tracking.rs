@@ -425,11 +425,15 @@ fn preemption_redispatch_is_charged_the_modelled_kernel_cost() {
     // — under contention real queueing would mask the defect entirely.
     let mut builder = Scenario::builder().cpus(2);
     for i in 0..2 {
-        builder = builder.add_task(&format!("spin{i}"), 0, forever_run(50_000_000));
+        // ONE phase, longer than the run: see the note above. Anything that
+        // repeats manufactures phase-boundary yields and measures those instead.
+        builder = builder.add_task(&format!("spin{i}"), 0, forever_run(10_000_000_000));
     }
-    // 2s, not less: the default slice is 20ms, so a shorter run yields ~10
-    // dispatches per task and the spread assertion would be reading noise.
-    let scenario = builder.duration_ms(2_000).build();
+    // 4s, not less. The default slice is 20ms, but LAVD preempts far less often
+    // than the others — 38 preemptions where `simple` has 198 on the same
+    // scenario — so the run has to be long enough for LAVD to clear the sample
+    // floor below, not just for `simple` to.
+    let scenario = builder.duration_ms(4_000).build();
 
     for (name, make) in SCHEDS {
         let _lock = common::setup_test();
@@ -459,16 +463,86 @@ fn preemption_redispatch_is_charged_the_modelled_kernel_cost() {
                 lat.len()
             );
 
-            if *name == "simple" {
-                let mean = lat.iter().sum::<u64>() as f64 / lat.len() as f64;
-                assert!(
-                    mean > 1_000.0,
-                    "{name}: pid {pid:?} mean re-dispatch delay {mean:.0} ns is below \
-                     1us. The modelled floor is 3us before its heavy tail; anything \
-                     at the few-hundred-ns scale means only the fixed dispatch \
-                     overheads were charged."
-                );
-            }
+            let mean = lat.iter().sum::<u64>() as f64 / lat.len() as f64;
+            assert!(
+                mean > 1_000.0,
+                "{name}: pid {pid:?} mean re-dispatch delay {mean:.0} ns is below \
+                 1us. The modelled floor is 3us before its heavy tail; anything \
+                 at the few-hundred-ns scale means only the fixed dispatch \
+                 overheads were charged."
+            );
         }
+    }
+}
+
+/// A task re-dispatched after an explicit `sched_yield()` must be charged the
+/// modelled kernel cost too.
+///
+/// # Why this needs its own test
+///
+/// `preemption_redispatch_is_charged_the_modelled_kernel_cost` above uses one
+/// continuous run phase, deliberately, so that it measures the preemption path
+/// and not phase-boundary artifacts. That makes it blind to this path: removing
+/// the stamp from `handle_task_phase_complete` leaves it green. Verified by
+/// doing exactly that.
+///
+/// # Why charging here is modelling the kernel, not papering over a gap
+///
+/// `Phase::Yield` is a real `sched_yield()`. The task stays runnable, the kernel
+/// re-enqueues it, and `sched_info_enqueue` restamps `last_queued` — so the next
+/// dispatch accrues `run_delay` exactly as a preemption's does. A yielding task
+/// getting back onto the CPU for free is the same defect as a preempted one
+/// doing so.
+///
+/// Note the separate question this does NOT address: a `Phase::Run` followed by
+/// another `Phase::Run` also routes through `handle_task_phase_complete` and is
+/// emitted as a yield, for a task that never stopped running. That is a
+/// workload-scripting artifact — the anti-pattern `676b42f` fixed on the
+/// lowering side — and whether the engine should coalesce consecutive run
+/// phases is a modelling decision, not a stamping one.
+#[test]
+fn yield_redispatch_is_charged_the_modelled_kernel_cost() {
+    // A yielder ALONE on its CPU. Not sharing with a hog: a competitor would
+    // make every post-yield wait a full 20ms slice of real queueing, which
+    // swamps the few-microsecond overhead this test is about and passes whether
+    // or not the path is stamped. Verified — that is what the first version of
+    // this test did, and it stayed green with the fix reverted.
+    for (name, make) in SCHEDS {
+        let _lock = common::setup_test();
+        let scenario = Scenario::builder()
+            .cpus(1)
+            .add_task(
+                "yielder",
+                0,
+                TaskBehavior {
+                    phases: vec![Phase::Run(1_000_000), Phase::Yield],
+                    repeat: RepeatMode::Count(40),
+                },
+            )
+            .duration_ms(4_000)
+            .build();
+
+        let trace = Simulator::new(make(1)).run(scenario.clone());
+        let stats = TraceStats::from_trace(&trace);
+        let pid = scenario.tasks[0].pid;
+
+        let lat = match stats.tasks.get(&pid) {
+            Some(t) if t.sched_latencies.len() >= 20 => t.sched_latencies.clone(),
+            other => panic!(
+                "{name}: yielder produced {} run-delay samples; this test needs the \
+                 yield path to actually be exercised to say anything",
+                other.map_or(0, |t| t.sched_latencies.len())
+            ),
+        };
+
+        let mean = lat.iter().sum::<u64>() as f64 / lat.len() as f64;
+        assert!(
+            mean > 1_000.0,
+            "{name}: mean post-yield re-dispatch delay {mean:.0} ns is below 1us \
+             across {} samples. The yield path in `handle_task_phase_complete` is \
+             not stamping `enqueued_at_ns`, so the modelled kernel cost is being \
+             skipped and only the fixed dispatch overheads charged.",
+            lat.len()
+        );
     }
 }

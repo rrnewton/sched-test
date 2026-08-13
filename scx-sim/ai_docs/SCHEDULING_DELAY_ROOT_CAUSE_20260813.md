@@ -136,19 +136,43 @@ cg_0 scheduling_delay  150.5us     2.720ms     3.694ms     24.55x -> 1.36x
 cg_1 scheduling_delay  150.2us     2.523ms     8.683ms     57.79x -> 3.44x
 ```
 
-**It is necessary but not sufficient.** Measured on a 2-spinner scenario, after
-the fix:
+**It is necessary but not sufficient**, and the follow-up found both the
+remaining sites and an error in how this residual was first measured.
 
-| scheduler | mean re-dispatch delay | distinct values | still under 1 us |
+Two sites in `handle_task_phase_complete` also failed to stamp. They are now
+stamped too, and with that every `EnqueueTask` emitter in the engine charges the
+modelled path:
+
+| site | function | stamps |
+|---|---|---|
+| 4019 | `handle_task_wake` | yes, originally |
+| 4112 | `handle_slice_expired` (via `stop_and_reenqueue`) | yes, this change |
+| 4402 | `handle_task_phase_complete` (Run -> Run) | yes, follow-up |
+| 4489 | `handle_task_phase_complete` | yes, follow-up |
+
+**Correction to the first measurement of the residual.** It was originally
+reported as 34-36% of `simple`/`cosmos` dispatches and 80-83% of `lavd`'s still
+under 1 us. That was measured on a workload of repeating 50 ms `Run` phases, and
+a `Run` phase followed by another `Run` phase makes the task dequeue and
+re-enqueue at the boundary — a scripting artifact, the same anti-pattern
+`676b42f` fixed on the lowering side. It manufactured the very dispatches it
+then counted. On a continuous single-phase workload, before any further fix, the
+residual was 4% and 0%:
+
+| scheduler | chunked 50 ms | continuous | continuous, after the follow-up |
 |---|---|---|---|
-| simple | 2.48-3.55 us | 76-80 | 34-36% |
-| cosmos | 2.42-3.48 us | 76-80 | 34-36% |
-| lavd | 0.81-0.84 us | 10 | **80-83%** |
+| simple | 34% | 4% | 2% |
+| cosmos | 34% | 4% | 2% |
+| lavd | **83%** | **0%** | 0% |
 
-Further re-dispatch paths remain uncharged, and the residual is
-scheduler-dependent — worst for `lavd`. Scheduling-delay figures are therefore
-still understated, most of all for LAVD. That is a finding, not a caveat, and it
-is the natural follow-up.
+The `lavd` asymmetry was a property of the DISPATCH MIX, not of a LAVD-specific
+uncharged path: LAVD preempts far less often (38 preemptions against `simple`'s
+198 on the same scenario), so phase-boundary yields dominated its dispatches.
+
+**There are no uncharged paths left.** What remains under 1 us is the modelled
+log-normal's own lower tail: samples of 818-996 ns against a theoretical minimum
+of `3000 * exp(-1.733)` = 530 ns. "Under 1 us" was a poor threshold — it sits
+inside the distribution — which is why the regression tests assert on the mean.
 
 Note also that the tolerance was not touched, and cg_1 still **rejects** after
 the fix (70.9% relative, 6.16 ms against the 4 ms absolute arm). The bound was
