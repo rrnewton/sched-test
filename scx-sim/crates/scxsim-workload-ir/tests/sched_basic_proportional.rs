@@ -199,3 +199,49 @@ fn two_equal_cgroups_receive_comparable_cpu() {
          CPU; got {a} vs {b} (ratio {ratio:.3})"
     );
 }
+
+/// THE REGRESSION GUARD for the 68x slice divergence.
+///
+/// `SpinWait` is a continuous busy loop. If it is ever lowered back to a short
+/// repeating run chunk, the workload — not the scheduler — decides when every
+/// slice ends, and the simulator's dispatch rate stops meaning anything.
+///
+/// Measured before the fix: a 500us chunk produced 48067 slices against the
+/// live guest's 710, a 68x divergence entirely manufactured by the lowering,
+/// while `cpu_time` and `occupancy` both still agreed to 0.23% and so could
+/// not see it. See `ai_docs/SLICE_DIVERGENCE_ROOT_CAUSE_20260812.md`.
+///
+/// The bound below is deliberately loose — it is not a tolerance, it is a
+/// tripwire. Anything shorter than the scheduler's own default slice means the
+/// phase boundary is back in charge.
+#[test]
+fn spinwait_runs_continuously_so_the_scheduler_owns_the_slice() {
+    /// `SCX_SLICE_DFL`, what a scheduler typically requests per dispatch.
+    const SCX_SLICE_DFL_NS: u64 = 20_000_000;
+
+    let ir = lower(&sched_basic_proportional()).expect("lowers");
+    assert!(!ir.tasks.is_empty(), "premise: the scenario has tasks");
+
+    for t in &ir.tasks {
+        let phases = &t.phases;
+        assert_eq!(
+            phases.len(),
+            1,
+            "a continuous spinner has exactly one run phase and no yield point; got {phases:?}"
+        );
+        match &phases[0] {
+            scxsim_workload_ir::Phase::Run(d) => assert!(
+                d.as_nanos() >= SCX_SLICE_DFL_NS,
+                "SpinWait's run phase is {d}, shorter than the scheduler's own                  {}ms slice — the workload would end every slice before the                  scheduler could, which is the 68x defect returning",
+                SCX_SLICE_DFL_NS / 1_000_000,
+            ),
+            other => panic!("SpinWait must lower to a single Run phase, got {other:?}"),
+        }
+    }
+
+    // And it must still claim exact — now truthfully, because nothing is
+    // invented any more. Before the fix this assertion ALSO passed, while the
+    // lowering was fabricating the scheduling quantum; that is why the phase
+    // check above exists rather than relying on the fidelity report alone.
+    assert!(ir.fidelity.is_exact(), "{:?}", ir.fidelity.approximations());
+}

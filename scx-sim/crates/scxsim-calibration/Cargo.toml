@@ -40,6 +40,10 @@ scxsim-workload-ir = { path = "../scxsim-workload-ir", features = ["ingest"] }
 name = "dump_sim_perfetto"
 required-features = ["sim"]
 
+[[example]]
+name = "slice_sweep"
+required-features = ["sim"]
+
 # Loads a real scheduler .so and runs the scenario, so it needs the Trace-side
 # derivation. required-features (rather than a cfg inside the file) means cargo
 # skips the target in a default build instead of compiling it empty.

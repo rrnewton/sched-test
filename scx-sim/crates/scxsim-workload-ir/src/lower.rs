@@ -45,9 +45,12 @@ use crate::units::{CgroupName, DurationNs, Nice, TaskId};
 /// modelling one. Every conversion through it is recorded as an approximation.
 pub const ITER_NS: u64 = 100;
 
-/// Slice used when a work type says "spin" without saying how long. Chosen to be
-/// long enough that the scheduler makes a decision about it and short enough
-/// that a repeat loop stays responsive.
+/// Chunk length used when a work type has a yield point but does not say how
+/// much work sits between yields.
+///
+/// This is an INVENTED number and every use of it records an approximation.
+/// It must never be used for a work type that runs continuously — see
+/// [`CONTINUOUS_RUN`] and the measurement that motivated the split.
 const DEFAULT_SLICE: DurationNs = DurationNs::from_micros(500);
 
 /// A construct the lowering will not invent behaviour for.
@@ -95,6 +98,7 @@ pub fn lower(scenario: &SourceScenario) -> Result<WorkloadIr, LoweringError> {
         report: FidelityReport::new(),
         next_task: 0,
         default_workers: scenario.default_workers_per_cgroup.max(1),
+        scenario_duration: scenario.duration,
     };
 
     let topology = Topology {
@@ -123,6 +127,12 @@ struct Ctx {
     report: FidelityReport,
     next_task: u32,
     default_workers: u32,
+    /// How long the whole scenario runs.
+    ///
+    /// Needed by the CONTINUOUS work types: a task that never yields must be
+    /// given a run phase that outlasts the run, so the only thing that can end
+    /// its slice is the scheduler. See [`CONTINUOUS_RUN`].
+    scenario_duration: DurationNs,
 }
 
 impl Ctx {
@@ -452,13 +462,47 @@ fn uniform(name: &str, tasks: u32, phases: Vec<Phase>) -> Plan {
 }
 
 /// The lowering table: one arm per ktstr work type.
+/// A run phase for work that never voluntarily yields.
+///
+/// # Why this is not `DEFAULT_SLICE`, and why it mattered by 68x
+///
+/// ktstr's `SpinWait` is a busy loop with no yield point. Lowering it to a
+/// short repeating `Run` chunk inserts voluntary yields the real workload does
+/// not have, and the simulator — correctly — ends the slice at each one.
+///
+/// Measured on `sched_basic_proportional` (2 spinners, 2 cpus, 12 s, `simple`,
+/// which requests `SCX_SLICE_DFL` = 20 ms):
+///
+/// ```text
+///   phase len     slices   mean slice      the phase, or the scheduler?
+///     0.100ms      19904      0.100ms      phase  (predicted 20000)
+///     0.500ms       4013      0.498ms      phase  (predicted 4000)
+///     5.000ms        405      4.916ms      phase  (predicted 400)
+///    20.000ms        149     13.341ms      scheduler starts to bind
+///  1000.000ms        102     19.322ms      scheduler — mean pins to SCX_SLICE_DFL
+/// ```
+///
+/// The engine implements `min(phase, scheduler_slice)`, which is right. At the
+/// old 500 us default the phase always won, so the scheduler's slice never
+/// bound and the trace showed 48067 slices against the live guest's 710 — a
+/// 68x divergence that was entirely self-inflicted by this constant.
+///
+/// Making the phase outlast the run hands the decision back to the scheduler,
+/// which is the whole point of simulating a scheduler.
+fn continuous_run(ctx: &Ctx) -> Phase {
+    Phase::Run(ctx.scenario_duration)
+}
+
 fn plan_work(ctx: &mut Ctx, wt: &SourceWorkType, src: &str, n: u32) -> Result<Plan, LoweringError> {
     use SourceWorkType as W;
     let spin = DEFAULT_SLICE;
+    let forever = continuous_run(ctx);
 
     let plan = match wt {
         // ---- exact: pure time, nothing dropped -------------------------------
-        W::SpinWait => uniform("spin", n, vec![Phase::Run(spin)]),
+        // Continuous: no yield point, so the scheduler's slice is the only
+        // thing that may end it. Genuinely exact — nothing is invented.
+        W::SpinWait => uniform("spin", n, vec![forever]),
         W::YieldHeavy => uniform("yield", n, vec![Phase::Run(spin), Phase::Yield]),
         W::Mixed => uniform(
             "mixed",
