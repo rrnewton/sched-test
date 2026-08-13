@@ -381,6 +381,14 @@ mod tests {
             SimPhase::Run(d) => ("run", *d),
             SimPhase::Sleep(d) => ("sleep", *d),
             SimPhase::Wake(pid) => ("wake", pid.0 as u64),
+            // Unit variant, so there is no payload to project; 0 is the only
+            // honest second element. Named "yield" to match `pretty.rs`, which
+            // already renders the IR's own yield phase under that name.
+            //
+            // Deliberately NOT a `_ =>` arm: this match failing to compile is
+            // what surfaced `Phase::Yield` being added upstream, and a
+            // catch-all would spend that signal for good.
+            SimPhase::Yield => ("yield", 0),
         }
     }
 
