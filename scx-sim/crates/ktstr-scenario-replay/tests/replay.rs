@@ -339,3 +339,64 @@ fn cgroup_cpusets_are_enforced() {
          actually ran on must not overlap; got cg_0={cg0:?} cg_1={cg1:?}",
     );
 }
+
+/// The simulator must run the span the scenario DECLARES, exactly.
+///
+/// # Why exactly, with no tolerance
+///
+/// Duration is part of the spec: it comes from the `#[ktstr_scenario]`
+/// attribute and travels through the exported record into `Scenario::duration_ns`.
+/// The simulator advances a virtual clock it controls completely — there is no
+/// jitter source, no boot cost and no sampling window between the declared span
+/// and the elapsed one. An exact match is not an aspiration but the only correct
+/// outcome, so any tolerance here would be tolerance for a bug.
+///
+/// # Why this is not covered by the cross-backend share check
+///
+/// `cross_backend` compares each cgroup's SHARE of total CPU, and share is
+/// invariant under uniform scaling: if every cgroup's CPU is scaled by the same
+/// factor the shares are identical and the comparison sees nothing. A run that
+/// came in short across the board would produce a perfect share match. The only
+/// existing guard is `GROSS_TOTAL_RATIO`, which is 2.0 and deliberately loose.
+///
+/// More precisely, the gap this closes is that `cross_backend` compares the two
+/// backends **to each other** and anchors neither to the spec. This anchors the
+/// simulator. The VM side remains unanchored, and cannot be anchored from what
+/// is committed: the baselines carry per-cgroup CPU time and provenance but no
+/// observed wall duration, and the sidecars that would have it survive for only
+/// one of the five scenarios.
+///
+/// # Why it can fail
+///
+/// Early termination — a non-`Normal` `ExitKind`, a watchdog trip, or a lowering
+/// that truncates the span. `sched_dynamic_add`'s multi-step handling is exactly
+/// the shape that could shorten a run, and `sim-dk2st` shows step semantics
+/// already diverge between the backends.
+#[test]
+fn the_simulator_runs_the_declared_duration_exactly() {
+    for case in CASES {
+        let compiled = compile(&record(case.name))
+            .unwrap_or_else(|e| panic!("{}: compile the exported record: {e}", case.name));
+        let declared = compiled.scenario.duration_ns;
+        assert!(
+            declared > 0,
+            "{}: record declares no duration; the anchor below would be vacuous",
+            case.name
+        );
+
+        let trace = run(&compiled);
+        let elapsed = trace.events().iter().map(|e| e.time_ns).max().unwrap_or(0);
+
+        assert_eq!(
+            elapsed,
+            declared,
+            "{}: simulator ran {elapsed} ns against a declared {declared} ns \
+             ({:+.4}%). The virtual clock has no reason to miss a declared span, \
+             so this is early termination or a truncating lowering — not drift. \
+             Check the exit kind and the step handling before touching this \
+             assertion.",
+            case.name,
+            (elapsed as f64 - declared as f64) / declared as f64 * 100.0
+        );
+    }
+}
