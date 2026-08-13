@@ -389,6 +389,48 @@ Documentation and Analysis
 
 When creating analysis documents, specifications, or other AI-generated documentation, place them in the `ai_docs/` directory. This keeps the top-level clean and makes it clear which documents are AI-generated analysis (and may become outdated) versus core project documentation.
 
+Walkthroughs and demos need an adversarial reviewer
+-----------------------------------------------------
+
+Owner policy, standing (2026-08-12). Any walkthrough, demo, tutorial or
+reproducer document must be checked by an adversarial reviewer who is **not
+the author**, and who does **both** of these:
+
+1. **Reads the code** and compares the document against what is actually on
+   disk and actually running — every attribute, flag, path, command, SHA and
+   claimed relationship, checked against the tree at the pinned commit.
+2. **Runs every command the document gives**, at that commit, and confirms the
+   output matches what is shown. *Reviewing by reading is not reviewing.*
+
+### Honest-about-caveats and technically-correct are DIFFERENT properties
+
+`ai_docs/BOTH_BACKENDS_DEMO_20260812.md` was reviewed and passed. What the
+review actually checked was whether the document was **honest about its
+limitations** — it disclosed the recorded-VM caveat, the missing IR dump, the
+failing calibration metric. All true, all properly flagged. Nobody asked
+whether the content was **correct**, and it showed `#[ktstr_test]` where its
+central claim required `#[ktstr_scenario]`.
+
+A document can be scrupulously honest about what it does not show while being
+wrong about what it does show. Confirming the caveats are complete is not the
+start of this review, let alone the end of it.
+
+The author of that document flagged its own limitations unprompted and still
+got the central attribute wrong. Author diligence does not substitute for an
+adversarial second pass.
+
+### Traps
+
+- **Ignore-aware greps lie about absence.** ripgrep, ugrep and `git grep` skip
+  untracked, ignored and other-worktree paths. Confirm any "this symbol does
+  not exist" claim with
+  `find . -name '*.rs' -print0 | xargs -0 grep -l <symbol>` first.
+- **Name the commit you checked against**, or "not in the tree" means nothing.
+- **A command you did not run is not verified** — say which and why.
+
+This complements, and does not replace, the honesty requirements elsewhere in
+this file (No-Stub, No Silent Failures, the tiered-reporting discipline).
+
 Cache Reproducer Methodology
 ----------------------------------------
 See `CACHE_REPRODUCER.md` (in this directory) for the authoritative methodology document covering:

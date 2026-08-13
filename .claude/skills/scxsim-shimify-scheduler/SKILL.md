@@ -631,6 +631,20 @@ and a bead per documented divergence.
 overclaiming *by their author*. That disclosure is what makes the rest of the
 report trustworthy.
 
+**But honesty is not correctness, and this section can lull you.** Everything
+above is about disclosing what you did *not* establish. None of it checks
+whether what you *did* write down is true. `BOTH_BACKENDS_DEMO_20260812.md`
+disclosed its recorded-VM caveat, its missing IR dump and its failing
+calibration metric — scrupulously — and still showed `#[ktstr_test]` where its
+central claim required `#[ktstr_scenario]`. The review that passed it checked
+the disclosures and stopped.
+
+So any walkthrough, demo or reproducer doc you write needs an **adversarial
+reviewer who is not you**, doing both halves: reading the code and checking
+every attribute, flag, path and SHA against the tree at the pinned commit, and
+**running every command the doc gives**. Reviewing by reading is not
+reviewing. See the harness `CLAUDE.md` for the full rule.
+
 ---
 
 ## 9. Trap catalogue
