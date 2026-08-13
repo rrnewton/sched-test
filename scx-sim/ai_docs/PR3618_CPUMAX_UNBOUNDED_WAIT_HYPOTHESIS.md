@@ -1,0 +1,178 @@
+# PR #3618: `cpu.max` Unbounded-Wait Reproduction Hypothesis
+
+**Status:** hypothesis recorded before the first simulation run
+
+**Simulator baseline:** `sched-test` `origin/integration` at `1fec4b4`, with
+`scx` at `59c30ba`
+
+**Upstream target:** [sched-ext/scx PR #3618](https://github.com/sched-ext/scx/pull/3618),
+open as of 2026-08-12
+
+## Claim under test
+
+With a quota that is tight relative to runnable demand, LAVD's real
+`cgroup_bw.bpf.c` library repeatedly parks tasks in its backup task queue
+(BTQ). The unpatched BTQ is ordered only by scheduler vtime. A compute-heavy
+task can therefore accumulate a large vtime and remain behind an ongoing
+population of short, low-vtime tasks across replenishment periods. That wait
+has no wall-clock bound and can eventually reach the kernel's 30-second
+runnable-task-stall watchdog.
+
+This is distinct from an earlier `period_budget` poisoning failure. PR #3618
+addresses two mechanisms: pressure-scaled slices and a wall-clock component in
+the BTQ key. This experiment primarily targets the latter ordering mechanism.
+
+## Capability check
+
+The baseline can express the causal scenario:
+
+- LAVD links and executes the real `scx/lib/cgroup_bw.bpf.c` library.
+- A scenario can assign a finite `cpu.max` directly to the cgroup containing
+  the tasks and set LAVD's `enable_cpu_bw` global.
+- Task behaviors can mix long CPU-bound phases with short run/sleep cycles and
+  delayed starts.
+- `LavdBailOnCgroupThrottle` identifies a successful per-PID park by the real
+  library; `CbwPutAside`, `CbwDrainBtqBatch`, throttle transitions, and
+  replenishment events expose aggregate cgroup/BTQ state; `TaskScheduled`
+  identifies subsequent per-PID service.
+
+Two limitations materially shape detection:
+
+1. BTQ drain tracing is aggregate rather than per-PID. Per-task service must
+   therefore be reconstructed from a task's successful bail and its next
+   `TaskScheduled` event, joined to the aggregate BTQ events.
+2. The throttle-aware simulator watchdog deliberately suppresses
+   `ErrorStall` while the authoritative library snapshot reports
+   `cgx->is_throttled`. That change is correct: legitimate quota throttling is
+   not itself scheduler starvation. It also removes the most obvious signal
+   for this bug, because the victim is parked precisely while the cgroup is
+   throttled.
+
+Detection is consequently **differential by necessity, not preference**. The
+primary metric is maximum successful-bail-to-next-schedule latency, joined to
+competitor progress, repeated replenishment, and BTQ activity. The absence of
+`ErrorStall` is expected and **does not kill the hypothesis**.
+
+## Confirmation criteria
+
+A causal reproduction requires all of the following on the unpatched source:
+
+1. A directly bandwidth-limited cgroup reaches the real library's throttle
+   path and has nonzero BTQ activity.
+2. A named victim has a successful `LavdBailOnCgroupThrottle` event.
+3. Across repeated replenishment/drain opportunities, competing tasks continue
+   to receive CPU time while the victim receives no `TaskScheduled` event.
+4. The victim's bail-to-next-schedule latency grows to a watchdog-scale value,
+   or grows monotonically with workload duration without a finite bound in the
+   tested range.
+5. A no-`cpu.max` control does not exhibit the wait.
+6. With PR #3618's wall-clock BTQ-key patch applied, the same scenario bounds
+   ordering delay to approximately one `2^32`-nanosecond epoch (about 4.29 s),
+   subject to additional legitimate quota delay. This patch differential is
+   the strongest evidence that the wait came from BTQ ordering rather than
+   ordinary low priority.
+
+## Falsification criteria
+
+The hypothesis is killed for current scx-sim if any of these holds after a
+documented sweep over task mix, quota, concurrency, seed, and duration:
+
+- the simulator cannot naturally enter or observe the real LAVD BTQ path;
+- every successfully parked task is serviced promptly across the sweep;
+- a long wait appears without the throttle, replenish, and BTQ causal
+  fingerprint;
+- the same wait appears in the no-`cpu.max` control; or
+- the PR #3618 wall-clock-key patch does not reduce the specific differential.
+
+Artificially inserting a task into the parked state would reproduce only the
+consequence. It is not evidence that `cpu.max` accounting and normal LAVD
+callbacks naturally reach the upstream failure.
+
+## Production corroboration boundary
+
+The pinned 2026-08-05 through 2026-08-12 production query found 34,734 LAVD
+`runnable task stall` exits (5.39% of LAVD BpfExit stops). That independently
+corroborates urgency, not subtype: the bucket does not prove that every event,
+or any particular event, was caused by tight `cpu.max`. A simulator result must
+stand on the causal criteria above rather than borrowing causation from that
+count.
+
+---
+
+## Result, 2026-08-12: NOT REPRODUCED. The wait is bounded at ~1.98s.
+
+**Verdict against the criteria above: the confirmation criteria are NOT met.**
+scx-sim produces a large, causally-attributed, bandwidth-induced wait — but a
+**bounded** one, and #3618 is specifically about an *unbounded* wait.
+
+Test: `crates/scx_simulator/tests/pr3618_cpumax_unbounded_wait.rs`.
+
+### What the scenario does produce
+
+Tight `cpu.max` on a directly-limited cgroup, LAVD `enable_cpu_bw=true`, a
+compute hog plus repeatedly-waking short victims inside the cgroup, and an
+unlimited competitor outside it. Worst bail-to-next-schedule, 600ms window:
+
+| quota | victims | bails | throttled | worst wait | victims never rescheduled |
+|---|---|---|---|---|---|
+| 10ms/100ms | 1 | 8 | 4 | 190.4ms | 0 |
+| 10ms/100ms | 4 | 15 | 3 | 280.2ms | 2 |
+| 2ms/100ms | 4 | 5 | 1 | 480.0ms | 5 |
+| 1ms/100ms | 8 | 9 | 1 | 480.0ms | 9 |
+| 0.5ms/100ms | 8 | 9 | 1 | 480.0ms | 9 |
+
+The **control with no `cpu.max`** shows 0 bails, 0 throttles, 0 wait, and
+victims scheduled ~500 times each versus ~100 in the throttled runs. So the
+wait is bandwidth-specific, not ordinary contention — that part of the
+hypothesis holds, and the causal fingerprint (successful
+`LavdBailOnCgroupThrottle`, throttle transitions, replenish records,
+competitor still running) is present.
+
+### The measurement artefact that nearly became a false positive
+
+Three different quotas all reported **exactly 480.000ms**. A round number
+identical across configurations differing tenfold in quota is not a measured
+wait — it is `end_of_run - bail_time` for a victim still parked when the run
+ended. The 600ms window minus a bail at 120ms is 480ms.
+
+That is either the bug or an illusion, and the two are distinguishable: an
+unbounded wait tracks the observation window, a bounded one converges. Result:
+
+| window | worst wait | % of window |
+|---|---|---|
+| 2400ms | 1780.2ms | 74.2% |
+| 4800ms | 1980.2ms | 41.3% |
+| 9600ms | 1980.2ms | 20.6% |
+| 19200ms | 1980.2ms | 10.3% |
+
+**It converges, to 1980.2ms exactly, and stops.** Tripling the window past that
+point adds nothing. The wait is bounded at ~1.98s.
+
+### What this means
+
+- **Not a #3618 reproduction.** A ~2s bounded worst case is a real and probably
+  unacceptable latency, but it is categorically not "waits unboundedly until
+  the 30-second runnable-stall watchdog fires".
+- **Cause vs consequence:** the wait we DO produce is causal, not injected —
+  the real `cgroup_bw.bpf.c` parked the victims and the accounting reached that
+  state on its own. Nothing was forced.
+- **The likely reading** is that the mechanism in #3618 spans the `ext.c`
+  boundary and is therefore outside what scx-sim models. That would route this
+  to hermit rather than to more simulator grinding, and it is consistent with
+  scx-sim bounding the wait at ~2s while production reports waits reaching the
+  30s watchdog.
+- **A bound to watch.** `the_cpumax_wait_is_bounded_not_unbounded` asserts the
+  plateau, so if scx-sim ever starts scaling this wait with the observation
+  window, that test fails and #3618 should be reopened here.
+
+### What was NOT established
+
+The origin of the ~1.98s bound. It is stable to the tenth of a millisecond
+across three window sizes, which suggests a specific mechanism rather than a
+statistical ceiling, but this run did not identify it. Worth knowing before
+anyone cites 1.98s as a property of LAVD rather than of this scenario.
+
+**Production corroboration boundary, restated because it constrains the above:**
+the 34,734 runnable-task-stall exits corroborate URGENCY, NOT SUBTYPE. They do
+not establish that any particular event was caused by tight `cpu.max`, and this
+negative result borrows no causation from them either.

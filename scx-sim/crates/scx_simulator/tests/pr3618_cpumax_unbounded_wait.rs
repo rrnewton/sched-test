@@ -1,0 +1,280 @@
+//! PR #3618: does a tight `cpu.max` leave a task waiting unboundedly?
+//!
+//! Hypothesis, criteria and capability limits:
+//! `scx-sim/ai_docs/PR3618_CPUMAX_UNBOUNDED_WAIT_HYPOTHESIS.md`.
+//!
+//! # What is measured, and why it is not "did a stall fire"
+//!
+//! The throttle-aware watchdog was fixed on 2026-08-12 to read the library's
+//! own `cgx->is_throttled`, so it correctly no longer reports a throttled
+//! cgroup as a runnable stall. `ExitKind::ErrorStall` is therefore SUPPRESSED
+//! for exactly the scenario under test, and "no stall fired" must not be read
+//! as falsifying the hypothesis.
+//!
+//! The observable is instead **bail-to-next-schedule latency**: the wall time
+//! from a successful per-pid `LavdBailOnCgroupThrottle` (the real
+//! `cgroup_bw.bpf.c` parking the task) to that pid's next `TaskScheduled`.
+//! Joined to competitor progress and replenish events, a large value is
+//! bandwidth-accounting starvation rather than ordinary low priority: the
+//! victim was parked by the library, the period replenished repeatedly, other
+//! tasks kept running, and the victim was still not picked.
+
+use scx_simulator::*;
+use std::collections::BTreeMap;
+
+mod common;
+
+const PERIOD_US: u64 = 100_000;
+const PERIOD_NS: u64 = PERIOD_US * 1_000;
+
+unsafe fn lavd_set_bool(sched: &DynamicScheduler, name: &str, val: bool) {
+    let sym: libloading::Symbol<'_, *mut bool> = sched
+        .get_symbol(name.as_bytes())
+        .unwrap_or_else(|| panic!("symbol {name} not found"));
+    std::ptr::write_volatile(*sym, val);
+}
+
+fn lavd_cpu_bw(nr_cpus: u32) -> DynamicScheduler {
+    let sched = DynamicScheduler::lavd(nr_cpus);
+    sched.lavd_set_cgroup_bw_max(64);
+    unsafe {
+        lavd_set_bool(&sched, "enable_cpu_bw\0", true);
+    }
+    sched
+}
+
+fn forever_run(run_ns: u64) -> TaskBehavior {
+    TaskBehavior {
+        phases: vec![Phase::Run(run_ns)],
+        repeat: RepeatMode::Forever,
+    }
+}
+
+/// A repeatedly-waking short task: the #3618 victim shape. Low vtime, so LAVD
+/// should favour it — which is what makes a long wait diagnostic.
+fn wake_sleep(run_ns: u64, sleep_ns: u64) -> TaskBehavior {
+    TaskBehavior {
+        phases: vec![Phase::Run(run_ns), Phase::Sleep(sleep_ns)],
+        repeat: RepeatMode::Forever,
+    }
+}
+
+/// Max time from each pid's `LavdBailOnCgroupThrottle` to its next
+/// `TaskScheduled`. `None` for a pid that was parked and never ran again.
+fn bail_to_next_schedule(trace: &Trace) -> BTreeMap<u64, (u64, Option<u64>)> {
+    let mut pending: BTreeMap<u64, u64> = BTreeMap::new();
+    let mut worst: BTreeMap<u64, (u64, Option<u64>)> = BTreeMap::new();
+    for ev in trace.events() {
+        match &ev.kind {
+            TraceKind::LavdBailOnCgroupThrottle { pid, .. } => {
+                pending.entry(pid.0 as u64).or_insert(ev.time_ns);
+                worst.entry(pid.0 as u64).or_insert((0, None));
+            }
+            TraceKind::TaskScheduled { pid } => {
+                if let Some(t0) = pending.remove(&(pid.0 as u64)) {
+                    let d = ev.time_ns.saturating_sub(t0);
+                    let e = worst.entry(pid.0 as u64).or_insert((0, None));
+                    if d > e.0 {
+                        *e = (d, Some(d));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    // Pids still parked at end of run: unbounded within the observation window.
+    for (pid, t0) in pending {
+        let e = worst.entry(pid).or_insert((0, None));
+        e.0 = e.0.max(
+            trace
+                .events()
+                .last()
+                .map_or(0, |l| l.time_ns)
+                .saturating_sub(t0),
+        );
+        e.1 = None;
+    }
+    worst
+}
+
+fn count_kind(trace: &Trace, pred: impl Fn(&TraceKind) -> bool) -> usize {
+    trace.events().iter().filter(|e| pred(&e.kind)).count()
+}
+
+fn scheduled_per_pid(trace: &Trace) -> BTreeMap<u64, usize> {
+    let mut m = BTreeMap::new();
+    for ev in trace.events() {
+        if let TraceKind::TaskScheduled { pid } = &ev.kind {
+            *m.entry(pid.0 as u64).or_insert(0) += 1;
+        }
+    }
+    m
+}
+
+/// The scenario under test: a directly `cpu.max`-limited cgroup holding a
+/// compute hog (drives the cgroup into debt) and a repeatedly-waking short
+/// victim, plus an unlimited competitor outside the cgroup whose continued
+/// progress proves the machine was not simply saturated.
+fn scenario(quota_us: u64, nr_victims: u32, duration_ms: u64) -> Scenario {
+    let mut b = Scenario::builder()
+        .cpus(4)
+        .seed(42)
+        .instant_timing()
+        .cgroup_with_bandwidth(
+            "tight",
+            &[CpuId(0), CpuId(1), CpuId(2), CpuId(3)],
+            PERIOD_US,
+            quota_us,
+            0,
+        )
+        .add_task_in_cgroup("hog", 0, forever_run(2_000_000_000), "tight");
+    for i in 0..nr_victims {
+        b = b.add_task_in_cgroup(
+            &format!("victim{i}"),
+            0,
+            wake_sleep(200_000, 1_000_000),
+            "tight",
+        );
+    }
+    b.add_task("competitor", 0, forever_run(2_000_000_000))
+        .duration_ms(duration_ms)
+        .build()
+}
+
+/// Same shape with NO `cpu.max`: the control. Any wait here is ordinary
+/// contention, not bandwidth accounting.
+fn control(nr_victims: u32, duration_ms: u64) -> Scenario {
+    let mut b = Scenario::builder()
+        .cpus(4)
+        .seed(42)
+        .instant_timing()
+        .add_task("hog", 0, forever_run(2_000_000_000));
+    for i in 0..nr_victims {
+        b = b.add_task(&format!("victim{i}"), 0, wake_sleep(200_000, 1_000_000));
+    }
+    b.add_task("competitor", 0, forever_run(2_000_000_000))
+        .duration_ms(duration_ms)
+        .build()
+}
+
+fn report(label: &str, trace: &Trace) -> u64 {
+    let bails = count_kind(trace, |k| {
+        matches!(k, TraceKind::LavdBailOnCgroupThrottle { .. })
+    });
+    let throttles = count_kind(trace, |k| {
+        matches!(
+            k,
+            TraceKind::CbwThrottleCgroups {
+                throttled: true,
+                ..
+            }
+        )
+    });
+    let replenish = count_kind(trace, |k| matches!(k, TraceKind::CgroupBwReplenish { .. }));
+    let waits = bail_to_next_schedule(trace);
+    let worst = waits.values().map(|(d, _)| *d).max().unwrap_or(0);
+    let never = waits.values().filter(|(_, r)| r.is_none()).count();
+    let sched = scheduled_per_pid(trace);
+    eprintln!(
+        "[{label}] exit={:?} bails={bails} throttled={throttles} replenish={replenish} \
+         worst_bail_to_sched={:.3}ms never_rescheduled={never} periods={:.1} sched_per_pid={sched:?}",
+        trace.exit_kind(),
+        worst as f64 / 1e6,
+        replenish as f64,
+    );
+    worst
+}
+
+/// Exploratory probe. Prints the measurement across configurations; asserts
+/// only the things that must hold for the measurement to mean anything.
+#[test]
+fn probe_cpumax_bail_to_schedule_latency() {
+    let _lock = common::setup_test();
+
+    for (quota_us, victims) in [
+        (10_000u64, 1u32),
+        (10_000, 4),
+        (2_000, 4),
+        (1_000, 8),
+        (500, 8),
+    ] {
+        let t = Simulator::new(lavd_cpu_bw(4)).run(scenario(quota_us, victims, 600));
+        let label = format!("quota={quota_us}us victims={victims}");
+        let worst = report(&label, &t);
+
+        // The measurement is only meaningful if the library actually parked
+        // someone and the period actually replenished.
+        if worst > 0 {
+            assert!(
+                count_kind(&t, |k| matches!(k, TraceKind::CgroupBwReplenish { .. })) > 0,
+                "{label}: measured a bail wait with no replenish — not a bandwidth story"
+            );
+        }
+    }
+
+    let c = Simulator::new(lavd_cpu_bw(4)).run(control(4, 600));
+    report("CONTROL no-cpu.max", &c);
+}
+
+/// The decisive test of "unbounded".
+///
+/// In the probe above, the worst wait came out at exactly 480.000ms for three
+/// different quotas — a suspiciously round number, and identical across
+/// configurations that differ tenfold in quota. That is the signature of a
+/// measurement artefact: the victim was parked and the RUN ENDED, so the
+/// "wait" is `end_of_observation - bail_time`, not an observed wait.
+///
+/// Which is either the bug or an illusion, and the two are distinguishable.
+/// If the wait is genuinely unbounded, it tracks the observation window: run
+/// longer and the measured wait grows with it, with no ceiling. If instead
+/// there is some bound the victim eventually clears, the measured wait
+/// converges to that bound and stops growing.
+///
+/// # Result, measured 2026-08-12
+///
+/// It converges. 2400ms window -> 1780.2ms; 4800 -> 1980.2; 9600 -> 1980.2;
+/// 19200 -> 1980.2. The wait is BOUNDED at ~1.98s and stops growing once the
+/// window exceeds it, so the earlier "480.000ms" was indeed the run length,
+/// not a wait. Asserted below so a regression toward genuinely unbounded
+/// behaviour fails here.
+#[test]
+fn the_cpumax_wait_is_bounded_not_unbounded() {
+    let _lock = common::setup_test();
+    let mut prev = 0u64;
+    let mut plateau: Vec<u64> = Vec::new();
+    for duration_ms in [2_400u64, 4_800, 9_600, 19_200] {
+        let t = Simulator::new(lavd_cpu_bw(4)).run(scenario(2_000, 4, duration_ms));
+        let worst = report(&format!("duration={duration_ms}ms"), &t);
+        eprintln!(
+            "         -> worst={:.1}ms is {:.1}% of the {duration_ms}ms window (prev {:.1}ms)",
+            worst as f64 / 1e6,
+            100.0 * worst as f64 / (duration_ms as f64 * 1e6),
+            prev as f64 / 1e6
+        );
+        prev = worst;
+        if duration_ms >= 4_800 {
+            plateau.push(worst);
+        }
+    }
+
+    // The bound: once the window is comfortably larger than the wait, the
+    // measured wait stops growing. If this starts scaling with the window
+    // again, scx-sim has begun reproducing an unbounded wait and #3618 should
+    // be revisited.
+    let lo = *plateau.iter().min().unwrap();
+    let hi = *plateau.iter().max().unwrap();
+    assert!(
+        hi - lo < 50_000_000,
+        "worst wait should plateau once the window exceeds it, but ranged \
+         {:.1}ms..{:.1}ms across 4.8s/9.6s/19.2s windows — that is the \
+         signature of an UNBOUNDED wait and would be a #3618 reproduction",
+        lo as f64 / 1e6,
+        hi as f64 / 1e6
+    );
+    assert!(
+        hi > 500_000_000,
+        "expected a multi-hundred-ms bandwidth-attributed wait; got {:.1}ms. \
+         If this collapsed, the scenario stopped throttling.",
+        hi as f64 / 1e6
+    );
+}
