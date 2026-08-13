@@ -1,4 +1,4 @@
-crate,coverage_pct
-scx_simulator,73.5
-scxsim-build,51.9
-scx_perf,78.4
+crate,coverage_pct,coverage_pct_nopmu
+scx_simulator,73.5,
+scxsim-build,51.9,
+scx_perf,78.4,32.5

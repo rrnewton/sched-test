@@ -64,14 +64,62 @@ def line_pct(count: int, covered: int) -> float:
     return (covered * 100.0 / count) if count > 0 else 0.0
 
 
-def read_baseline(path: Path) -> dict[str, float]:
-    """crate -> committed baseline percentage."""
+def pmu_available() -> bool:
+    """True when this machine can actually open a hardware PMU counter.
+
+    Some crates (notably scx_perf) are hardware abstraction layers whose tests
+    self-skip when perf_event_open fails -- printing "likely VM/container" and
+    returning, while still reporting PASSED. On such a machine large parts of
+    the crate are UNREACHABLE, so holding it to a PMU-hardware baseline is not
+    a coverage standard, it is a hardware requirement in disguise.
+
+    Probed by attempting the syscall rather than reading perf_event_paranoid,
+    because paranoid is necessary but not sufficient (containers, missing vPMU).
+    Any failure answers False, which is the conservative direction: it selects
+    the lower floor only when the counter genuinely cannot be opened.
+    """
+    try:
+        import ctypes, os, struct
+
+        # perf_event_attr: type=PERF_TYPE_HARDWARE(0), config=CPU_CYCLES(0).
+        attr = bytearray(128)
+        struct.pack_into("=IIQ", attr, 0, 0, 128, 0)
+        libc = ctypes.CDLL(None, use_errno=True)
+        # __NR_perf_event_open on x86_64 = 298; pid=0 (self), cpu=-1, group=-1.
+        fd = libc.syscall(298, ctypes.c_char_p(bytes(attr)), 0, -1, -1, 0)
+        if fd < 0:
+            return False
+        os.close(fd)
+        return True
+    except Exception:
+        return False
+
+
+def read_baseline(path: Path, *, has_pmu: bool | None = None) -> dict[str, float]:
+    """crate -> committed baseline percentage for THIS environment.
+
+    The CSV carries two floors per crate: `coverage_pct` (the number achievable
+    where a PMU exists) and the optional `coverage_pct_nopmu` (what the same
+    tests can reach without one). A blank/absent nopmu cell means the crate is
+    hardware-independent and both environments are held to the same number.
+
+    Both figures stay committed on purpose. Replacing the PMU number with the
+    lower one would stop the PMU-only paths being measured ANYWHERE, which
+    would fix a gate that cannot run by creating a gate that never runs.
+    """
+    if has_pmu is None:
+        has_pmu = pmu_available()
     out: dict[str, float] = {}
     with path.open(newline="") as handle:
         # start=2: DictReader consumes line 1 as the header.
         for lineno, row in enumerate(csv.DictReader(handle), start=2):
             try:
-                out[row["crate"]] = float(row["coverage_pct"])
+                pct = float(row["coverage_pct"])
+                if not has_pmu:
+                    nopmu = (row.get("coverage_pct_nopmu") or "").strip()
+                    if nopmu:
+                        pct = float(nopmu)
+                out[row["crate"]] = pct
             except (KeyError, ValueError) as exc:
                 raise BaselineError(
                     f"malformed baseline {path} (line {lineno}): {exc}; regenerate "
