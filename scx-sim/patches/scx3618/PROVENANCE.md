@@ -48,8 +48,16 @@ Earlier rounds of this investigation applied the patch into the submodule
 working tree and never committed it. The consequence was not a tidiness problem:
 **results were published without recording which side of the before/after was
 patched**, and at least one "unpatched" measurement was in fact patched. The
-conclusion drawn from it — that the fix does not bound the wait — was wrong and
-has been withdrawn. See PR sched-test#104.
+conclusion drawn from it — *"the fix engages but does not help"* — was wrong:
+the fix helps by ~17x. See PR sched-test#104.
+
+Worth stating precisely, because it is the sort of thing that gets remembered
+sloppily: that conclusion was **wrong about the thing it measured and
+accidentally right about a thing it did not**. The fix does help, so "does not
+help" was false. But it also does not *bound* the wait, which the later
+gradient established on evidence the original comparison never had. Being
+coincidentally near a true statement is not the same as having supported it,
+and the original claim gets no credit for it.
 
 So the rule this directory enforces is: *no before/after claim without a build
 state that a reader can reconstruct.*
@@ -147,7 +155,13 @@ artifact immediately before each run:
 | build | command exit | result |
 |---|---|---|
 | unpatched (pin) | 42 | `ExitKind::ErrorStall pid=4 runnable_for_ns=39879690773` — 39.88s |
-| patched (this patch applied) | 0 | ran to completion, no stall |
+| patched (this patch applied) | 0 | no stall at the default 30s watchdog |
+
+That patched row means "under 30 seconds", not "bounded". Probed with a 1s
+watchdog the same configuration waits **2.30s**, and the full quota gradient
+shows the patched wait still scaling as 1/quota — a ~17x constant-factor
+improvement, not a bound. See
+`experiments/scx3618_fix_efficacy_20260813/` in the harness repo.
 
 An incremental `cargo build --release` does pick the change up; no `clean` is
 needed. That was checked rather than assumed — the release `.so` flipped from
