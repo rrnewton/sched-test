@@ -1519,8 +1519,17 @@ impl<S: Scheduler> Simulator<S> {
             // cause bpf_task_from_pid() to return NULL during init_task,
             // triggering the correct initialization path in scheduler code
             // (e.g., LAVD's avg_runtime_wall = sys_stat.slice_wall).
-            // Set up cpus_ptr — restricted to allowed_cpus if specified
-            ffi::task_setup_cpumask(task.raw(), def.allowed_cpus.as_deref());
+            // Set up cpus_ptr — restricted to the task's EFFECTIVE cpuset:
+            // its own allowed_cpus narrowed by its cgroup's cpuset. Passing
+            // def.allowed_cpus directly (as this did until sim-4qlh5) drops
+            // cgroup-level confinement on the floor: a cgroup declared on CPUs
+            // {2,3} would happily run on CPU 0, because a cgroup cpuset only
+            // ever reached the registry, where it is advertised to the BPF
+            // scheduler and never enforced. In the kernel a cpuset narrows the
+            // task's cpumask, so the scheduler cannot place it outside — see
+            // Scenario::effective_cpuset.
+            let effective_cpus = scenario.effective_cpuset(def);
+            ffi::task_setup_cpumask(task.raw(), effective_cpus.as_deref());
             // Set mm pointer for address-space grouping (wake-affine scheduling)
             if let Some(mm_id) = def.mm_id {
                 // Synthetic non-NULL pointer: never dereferenced, only compared.

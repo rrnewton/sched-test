@@ -833,7 +833,114 @@ pub struct ScenarioBuilder {
     warmup_ns: TimeNs,
 }
 
+/// Depth bound for the cgroup parent walk in [`Scenario::effective_cpuset`].
+///
+/// A `parent_name` cycle is a malformed scenario, not a runtime condition, so
+/// the walk is bounded and reports rather than looping forever. The bound is
+/// far above any plausible real hierarchy.
+const MAX_CGROUP_DEPTH: usize = 64;
+
+/// The CPUs a task in `cgroup_name` may run on, from the cgroup hierarchy
+/// alone.
+///
+/// `CgroupDef::cpuset == None` means INHERIT THE PARENT, not "unrestricted",
+/// so this walks `parent_name` to the root and takes the first cpuset it
+/// finds. `None` comes back only when no ancestor declares one.
+///
+/// Resolved from the `CgroupDef`s rather than from the live cgroup registry
+/// because tasks are constructed before the registry is populated. Reordering
+/// engine setup to fix that would be a large change for no benefit — the
+/// definitions carry everything this needs.
+fn cgroup_cpuset(cgroups: &[CgroupDef], cgroup_name: &str) -> Option<Vec<CpuId>> {
+    let mut name = cgroup_name;
+    for _ in 0..MAX_CGROUP_DEPTH {
+        let def = cgroups.iter().find(|c| c.name == name)?;
+        if let Some(cpuset) = &def.cpuset {
+            return Some(cpuset.clone());
+        }
+        // No parent means the walk reached the root without finding a
+        // cpuset, i.e. unconfined — `?` returns None for exactly that case.
+        name = def.parent_name.as_deref()?;
+    }
+    panic!(
+        "cgroup parent chain from {cgroup_name:?} exceeded {MAX_CGROUP_DEPTH} \
+         levels — `parent_name` almost certainly contains a cycle"
+    );
+}
+
 impl Scenario {
+    /// The CPUs `task` may actually run on: its own affinity narrowed by its
+    /// cgroup's cpuset.
+    ///
+    /// This mirrors the kernel, where a task's affinity is always further
+    /// restricted by its cpuset — `sched_setaffinity`'s requested mask is
+    /// intersected with `cpuset_cpus_allowed`, not obeyed in place of it. A
+    /// cgroup cpuset is therefore a hard constraint on placement, not advice
+    /// the scheduler may decline.
+    ///
+    /// `None` means unrestricted: neither the task nor any ancestor cgroup
+    /// narrowed anything.
+    ///
+    /// # Panics
+    ///
+    /// If the intersection is empty. That is a task which could never be
+    /// scheduled anywhere, and the kernel does not permit it either —
+    /// `sched_setaffinity` fails with `EINVAL` rather than producing an
+    /// unrunnable task. Returning an empty mask here would produce a task that
+    /// silently never runs, which is far harder to diagnose than a scenario
+    /// that refuses to start.
+    #[must_use]
+    pub fn effective_cpuset(&self, task: &TaskDef) -> Option<Vec<CpuId>> {
+        // A cpuset listing every online CPU constrains nothing, so it is not
+        // applied. This is not a shortcut — it avoids a real behaviour change
+        // that has nothing to do with confinement. The default mask from
+        // `sim_task_setup_cpus_ptr` is memset to 0xFF (every bit in cpus_mask,
+        // well past nr_cpus) and leaves `nr_cpus_allowed` alone; going through
+        // the explicit path instead clears the mask, sets exactly the listed
+        // CPUs, and writes `nr_cpus_allowed`. For a genuinely narrowing cpuset
+        // that difference IS the fix. For an all-CPUs cpuset it would only
+        // perturb the mask's high bits and `nr_cpus_allowed` for every task in
+        // any cpuset-declaring cgroup — which schedulers read (LAVD's
+        // per-CPU-task and affinity logic among them), so it would change
+        // scheduling decisions in scenarios that declare no confinement at all.
+        // Whether that default mask ought to be exactly nr_cpus wide is a real
+        // question, but it is a separate one from cgroup cpuset enforcement.
+        let covers_all_cpus = |cpus: &[CpuId]| (0..self.nr_cpus).all(|c| cpus.contains(&CpuId(c)));
+
+        let from_cgroup = task
+            .cgroup_name
+            .as_deref()
+            .and_then(|cg| cgroup_cpuset(&self.cgroups, cg))
+            .filter(|cpus| !covers_all_cpus(cpus));
+
+        match (task.allowed_cpus.as_deref(), from_cgroup) {
+            (None, None) => None,
+            (Some(affinity), None) => Some(affinity.to_vec()),
+            (None, Some(cpuset)) => Some(cpuset),
+            (Some(affinity), Some(cpuset)) => {
+                let narrowed: Vec<CpuId> = affinity
+                    .iter()
+                    .filter(|c| cpuset.contains(c))
+                    .copied()
+                    .collect();
+                assert!(
+                    !narrowed.is_empty(),
+                    "task {:?} (pid {}) has affinity {:?} but its cgroup {:?} \
+                     is confined to {:?}; the intersection is empty, so the \
+                     task could never be scheduled. The kernel rejects this \
+                     (sched_setaffinity -> EINVAL) rather than creating an \
+                     unrunnable task.",
+                    task.name,
+                    task.pid.0,
+                    affinity,
+                    task.cgroup_name,
+                    cpuset,
+                );
+                Some(narrowed)
+            }
+        }
+    }
+
     pub fn builder() -> ScenarioBuilder {
         ScenarioBuilder {
             nr_cpus: 1,

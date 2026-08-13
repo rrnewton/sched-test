@@ -32,9 +32,23 @@ pub enum Fidelity {
 }
 
 impl fmt::Display for Fidelity {
+    /// Deliberately says what was *carried*, not that the run is faithful.
+    ///
+    /// This used to render as the bare word `exact`, which was true of the
+    /// lowering and read as a verdict on the simulation. The two are different
+    /// claims and they were spelled identically, so a reader could see
+    /// `fidelity: exact` on a scenario whose whole point was cpuset
+    /// confinement, on a run where the simulator ignored the cpuset entirely
+    /// (sim-4qlh5), and reasonably conclude the property had been reproduced.
+    ///
+    /// A self-report whose scope is narrower than its apparent claim is worse
+    /// than a missing one: it is trusted. The wording is now scoped to the only
+    /// thing this type can actually know — the lowering runs before the
+    /// simulator exists, so it cannot verify downstream honouring, and it must
+    /// not sound as though it has.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Fidelity::Exact => f.write_str("exact"),
+            Fidelity::Exact => f.write_str("all declared fields carried"),
             Fidelity::Approximated => f.write_str("approximated"),
         }
     }
@@ -155,8 +169,13 @@ impl FidelityReport {
         &self.approximations
     }
 
-    /// True when every construct lowered exactly. Note this is about the
-    /// lowering, not about whether the simulation is realistic.
+    /// True when every construct lowered exactly — i.e. the IR carried every
+    /// declared field.
+    ///
+    /// This is about the LOWERING and nothing else. A field can be carried
+    /// faithfully and then ignored by the simulator, and this still returns
+    /// true: sim-4qlh5 was exactly that, a cpuset that arrived intact and was
+    /// not enforced at placement. Do not read it as "the run was faithful".
     pub fn is_exact(&self) -> bool {
         self.approximations.is_empty()
     }
