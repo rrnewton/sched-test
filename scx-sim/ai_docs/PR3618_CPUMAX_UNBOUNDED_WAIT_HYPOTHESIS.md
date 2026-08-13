@@ -176,3 +176,85 @@ anyone cites 1.98s as a property of LAVD rather than of this scenario.
 the 34,734 runnable-task-stall exits corroborate URGENCY, NOT SUBTYPE. They do
 not establish that any particular event was caused by tight `cpu.max`, and this
 negative result borrows no causation from them either.
+
+---
+
+## Follow-up: was the 1.98s convergence itself window-limited? (expectation stated before running)
+
+The 480.0ms figure was already identified above as a window ceiling, and the
+window sweep that followed converged at 1980.2ms with the window at 19.2s —
+10.3% of the window, so 1980.2ms is not itself a ceiling of *that* window.
+
+**But that sweep tested only one configuration: quota 2ms/100ms with 4
+victims.** The two MOST SEVERE configurations — 1ms/100ms and 0.5ms/100ms,
+both with 8 victims — were only ever run at 600ms, where all three hit the
+480.0ms ceiling and were therefore indistinguishable. **Nothing establishes
+that the most severe configurations also converge at ~1.98s.** They could
+plausibly scale further: more victims contending for less quota is exactly the
+direction in which a starvation effect would worsen.
+
+Stated before the run:
+
+- **If the most severe configs also converge near ~1.98s** with the window far
+  above it, the ~2s bound is a property of the mechanism rather than of one
+  quota setting, and the NOT-REPRODUCED verdict stands on firmer ground than it
+  did.
+- **If they keep growing with the window** — 6s, 60s — then the earlier
+  convergence was specific to a mild configuration, the bound is not general,
+  and **the negative is wrong**: severe `cpu.max` would be producing exactly
+  the unbounded wait #3618 describes, and this becomes a reproduction.
+- **If they land on a different, larger constant** the bound is real but
+  quota-dependent, which is a third answer and would need its own explanation.
+
+Windows: 6s and 60s, against the 600ms baseline.
+
+### Answer: THE NEGATIVE WAS WRONG. #3618 REPRODUCES.
+
+The second of the three stated outcomes. The ~1.98s bound was specific to a
+mild quota; it is not general, and the wait keeps climbing as `cpu.max`
+tightens until the watchdog fires.
+
+| quota (per 100ms) | converged worst wait | 30s watchdog |
+|---|---|---|
+| 2ms | 1.98s | no |
+| 1ms | 4.98s | no |
+| 0.5ms | 10.98s | no |
+| 0.25ms | 21.18s | no |
+| **0.125ms** | **40.28s** | **`ErrorStall { pid: 3, runnable_for_ns: 40279800000 }`** |
+| **0.062ms** | **81.18s** | **`ErrorStall { pid: 3, runnable_for_ns: 49379200000 }`** |
+
+Each halving of quota roughly doubles the worst wait (~2.1x). The wait
+converges *for a fixed quota* — 0.5ms gives 10.98s at 60s, 120s and 240s
+windows alike — but there is no quota-independent ceiling. Below ~0.25ms the
+wait exceeds 30s and **the runnable-stall watchdog fires**.
+
+That is the #3618 failure mode: tight `cpu.max` leaves a task waiting until the
+30-second runnable-stall watchdog. It reproduces in scx-sim, causally, with no
+injection.
+
+**Note what fires.** The watchdog trips *despite* the throttle-aware exemption
+added on 2026-08-12 that forgives tasks whose cgroup reports `is_throttled`.
+The victim is starved long enough that even a watchdog specifically taught not
+to blame throttling reports a stall. The earlier expectation that `ErrorStall`
+would be suppressed for this scenario holds only while the wait is short.
+
+**The routing conclusion is withdrawn.** "The mechanism spans the `ext.c`
+boundary, route to hermit" was inferred from a bound that does not exist. No
+such inference is available: scx-sim reproduces this on its own.
+
+### Why the first answer was wrong, since the lesson is the point
+
+Both wrong verdicts came from the same defect at different scales. The 480.0ms
+figure was the 600ms window's ceiling. The 1.98s figure was not a ceiling — but
+it was measured on **one mild configuration**, and generalised to a claim about
+the mechanism. The severe configurations were never extended past 600ms, where
+the window ceiling had made all three look identical and therefore
+uninteresting.
+
+So the second error was subtler than the first: the measurement was no longer
+window-limited, it was **configuration-limited**. The sweep that disproved the
+ceiling did not also disprove the generalisation, and I treated it as though it
+had.
+
+**A negative result is only as strong as the range the experiment could have
+observed — and "range" means every axis, not just the one you last checked.**

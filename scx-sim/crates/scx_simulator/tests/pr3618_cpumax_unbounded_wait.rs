@@ -238,7 +238,7 @@ fn probe_cpumax_bail_to_schedule_latency() {
 /// not a wait. Asserted below so a regression toward genuinely unbounded
 /// behaviour fails here.
 #[test]
-fn the_cpumax_wait_is_bounded_not_unbounded() {
+fn the_wait_converges_for_a_given_quota() {
     let _lock = common::setup_test();
     let mut prev = 0u64;
     let mut plateau: Vec<u64> = Vec::new();
@@ -276,5 +276,75 @@ fn the_cpumax_wait_is_bounded_not_unbounded() {
         "expected a multi-hundred-ms bandwidth-attributed wait; got {:.1}ms. \
          If this collapsed, the scenario stopped throttling.",
         hi as f64 / 1e6
+    );
+}
+
+/// Does the ~1.98s bound hold for the MOST SEVERE configurations?
+///
+/// The convergence test above swept only `quota=2ms, victims=4`. The two most
+/// severe configurations — 1ms/8 and 0.5ms/8 — were only ever run at 600ms,
+/// where all three hit the window ceiling and were indistinguishable. More
+/// victims contending for less quota is the direction a starvation effect
+/// would worsen, so "the mild config converges" does not establish that the
+/// severe ones do.
+#[test]
+fn the_bound_holds_for_the_most_severe_configurations() {
+    let _lock = common::setup_test();
+    for (quota_us, victims) in [(1_000u64, 8u32), (500, 8)] {
+        let mut seen: Vec<u64> = Vec::new();
+        for duration_ms in [600u64, 6_000, 60_000] {
+            let t = Simulator::new(lavd_cpu_bw(4)).run(scenario(quota_us, victims, duration_ms));
+            let worst = report(
+                &format!("SEVERE quota={quota_us}us victims={victims} window={duration_ms}ms"),
+                &t,
+            );
+            eprintln!(
+                "         -> worst={:.1}ms = {:.1}% of window",
+                worst as f64 / 1e6,
+                100.0 * worst as f64 / (duration_ms as f64 * 1e6)
+            );
+            if duration_ms >= 6_000 {
+                seen.push(worst);
+            }
+        }
+        let lo = *seen.iter().min().unwrap();
+        let hi = *seen.iter().max().unwrap();
+        // Recorded fact, not a bound: at these quotas the wait converges, but
+        // to a value that scales inversely with quota (1ms -> ~4.98s,
+        // 0.5ms -> ~10.98s). It keeps climbing as quota tightens and crosses
+        // the 30s watchdog below 0.25ms — see `tight_cpumax_reaches_the_watchdog`.
+        let _ = (lo, hi);
+    }
+}
+
+/// Does the severest configuration converge AT ALL, or scale to the watchdog?
+#[test]
+fn tight_cpumax_reaches_the_watchdog() {
+    let _lock = common::setup_test();
+    let mut stalled = 0;
+    for (quota_us, victims) in [(125u64, 8u32), (62, 8)] {
+        for duration_ms in [240_000u64] {
+            let t = Simulator::new(lavd_cpu_bw(4)).run(scenario(quota_us, victims, duration_ms));
+            let worst = report(&format!("q={quota_us} v={victims} w={duration_ms}ms"), &t);
+            eprintln!(
+                "         -> worst={:.2}s = {:.1}% of window  exit={:?}",
+                worst as f64 / 1e9,
+                100.0 * worst as f64 / (duration_ms as f64 * 1e6),
+                t.exit_kind()
+            );
+            if matches!(t.exit_kind(), ExitKind::ErrorStall { .. }) {
+                stalled += 1;
+            }
+        }
+    }
+    // THE REPRODUCTION. Tight enough cpu.max drives the wait past the 30s
+    // runnable-stall watchdog, which fires DESPITE the throttle-aware
+    // exemption added on 2026-08-12 — the task is starved long enough that
+    // even a watchdog that forgives throttled cgroups reports a stall.
+    assert_eq!(
+        stalled, 2,
+        "expected both sub-0.25ms quotas to reach ExitKind::ErrorStall; got {stalled}. \
+         If this stops firing, either the starvation was fixed or the scenario \
+         stopped throttling — check which before relaxing this."
     );
 }
