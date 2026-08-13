@@ -130,8 +130,15 @@ jobs:
         run: |
           DATE=$(date +%Y%m%d)
           WORK_BRANCH="sync-upstream-${DATE}"
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # --global, NOT repo-local. The rebase below runs INSIDE the scx
+          # submodule, which has its own config (.git/modules/scx/config), so a
+          # repo-local identity set here never reaches it and the rebase dies
+          # with `fatal: empty ident name`. Not hypothetical: that is exactly how
+          # this job failed on its first-ever real run (2026-08-13, run
+          # 31654870871). The fail-closed guard below then refused to proceed --
+          # correct behaviour, spurious trigger.
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b $WORK_BRANCH
 
           # Update the submodule to upstream main, REPLAYING any local commits

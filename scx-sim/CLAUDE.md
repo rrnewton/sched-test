@@ -389,6 +389,97 @@ Documentation and Analysis
 
 When creating analysis documents, specifications, or other AI-generated documentation, place them in the `ai_docs/` directory. This keeps the top-level clean and makes it clear which documents are AI-generated analysis (and may become outdated) versus core project documentation.
 
+Walkthroughs and demos need an adversarial reviewer
+-----------------------------------------------------
+
+Owner policy, standing (2026-08-12). Any walkthrough, demo, tutorial or
+reproducer document must be checked by an adversarial reviewer who is **not
+the author**, and who does **both** of these:
+
+1. **Reads the code** and compares the document against what is actually on
+   disk and actually running — every attribute, flag, path, command, SHA and
+   claimed relationship, checked against the tree at the pinned commit.
+2. **Runs every command the document gives**, at that commit, and confirms the
+   output matches what is shown. *Reviewing by reading is not reviewing.*
+
+### Honest-about-caveats and technically-correct are DIFFERENT properties
+
+`ai_docs/BOTH_BACKENDS_DEMO_20260812.md` was reviewed and passed. What the
+review actually checked was whether the document was **honest about its
+limitations** — it disclosed the recorded-VM caveat, the missing IR dump, the
+failing calibration metric. All true, all properly flagged. Nobody asked
+whether the content was **correct**, and it showed `#[ktstr_test]` where its
+central claim required `#[ktstr_scenario]`.
+
+A document can be scrupulously honest about what it does not show while being
+wrong about what it does show. Confirming the caveats are complete is not the
+start of this review, let alone the end of it.
+
+The author of that document flagged its own limitations unprompted and still
+got the central attribute wrong. Author diligence does not substitute for an
+adversarial second pass.
+
+### Traps
+
+- **Ignore-aware greps lie about absence.** ripgrep, ugrep and `git grep` skip
+  untracked, ignored and other-worktree paths. Confirm any "this symbol does
+  not exist" claim with
+  `find . -name '*.rs' -print0 | xargs -0 grep -l <symbol>` first.
+- **Name the commit you checked against**, or "not in the tree" means nothing.
+- **A command you did not run is not verified** — say which and why.
+
+This complements, and does not replace, the honesty requirements elsewhere in
+this file (No-Stub, No Silent Failures, the tiered-reporting discipline).
+
+Run the whole gate, at the feature sets it uses
+-------------------------------------------------
+
+Before landing: run **`bash validate.sh` in full, at the feature sets it
+uses**. Not `cargo nextest`, not "the Rust gates", not the stages you believe
+your change touches.
+
+Two distinct failures, and you need both halves:
+
+1. **The whole script.** A change that looks confined to one area routinely
+   fails a stage elsewhere. `validate.sh` was made provably equivalent to GH CI
+   (PR #69), and *that equivalence is what licenses landing without waiting for
+   CI*. Run a subset and you have voided the guarantee you are relying on — the
+   speed of local validation without the coverage that justified it.
+2. **At the right feature sets.** Running the correct script under default
+   features skips every `required-features` target and returns a confident
+   green over code it never compiled.
+
+### The shape: commands scoped narrower than they read
+
+Name the shape, not the instances — the next one will be a command nobody here
+has met yet.
+
+> **A green is only as wide as the narrowest axis the command selects on.**
+> Build tools select on several independent axes, and a breadth-sounding flag
+> usually widens exactly *one* of them. Every other axis silently stays at its
+> default.
+
+For cargo the axes are **package**, **target**, **feature set**, and
+**profile**. Three instances hit this project in a single night, all the same
+bug wearing different clothes:
+
+| Command | Axis it widens | Axis left at default | What was never checked |
+|---|---|---|---|
+| `cargo clippy --all` | package | **target** | test and bench code was never linted |
+| `cargo nextest --workspace` | package | **features** | 16 `required-features` tests had never compiled anywhere |
+| `bash validate.sh` (default features) | — | **features** | the same feature-gated targets |
+
+The third is how a `Phase::Yield` compile break reached the tip and then stayed
+invisible to two separate checks afterwards: `scxsim-workload-ir` only fails
+under `--features ingest`, so every default-feature check stayed green while
+the crate did not build.
+
+**The check to run on any command before you trust its green:** list the axes
+it selects on, and confirm which one your flag actually widened. If you cannot
+name the axes, you do not yet know what the green covers. `--all` and
+`--workspace` are the two words most likely to be lying to you — both mean
+*packages*, and neither means *targets* or *features*.
+
 Cache Reproducer Methodology
 ----------------------------------------
 See `CACHE_REPRODUCER.md` (in this directory) for the authoritative methodology document covering:
