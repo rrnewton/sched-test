@@ -2,8 +2,32 @@ name: Sync Upstream SCX
 
 on:
   schedule:
-    - cron: '0 4 * * *'  # Nightly at 4 AM UTC
-  workflow_dispatch:      # Manual trigger
+    # NOTE: this cron does NOT fire. GitHub schedules only from the DEFAULT
+    # branch (main), and this file lives on integration. It is kept because it
+    # documents the intended cadence; the cron that actually fires is in
+    # .github/workflows/scheduled-dispatch.yml ON MAIN, which dispatches this
+    # workflow against integration. See CLAUDE.md, "a schedule: on an
+    # integration workflow will NEVER run".
+    - cron: '0 4 * * *'  # Nightly at 4 AM UTC (via the carrier on main)
+  workflow_dispatch:      # Manual trigger, and how the carrier reaches this
+  push:
+    # REGISTRATION ONLY -- deliberately the narrowest possible filter: this file
+    # and nothing else.
+    #
+    # A workflow that has never RUN is not registered with the Actions API, and
+    # an unregistered workflow cannot be dispatched at all: the carrier on main
+    # gets `HTTP 404: workflow sync-upstream.yml not found on the default
+    # branch`. That is why this job was unreachable by ANY trigger -- no cron
+    # (wrong branch), no dispatch (never registered), no push (none existed).
+    #
+    # One push to this file registers it, after which the carrier can reach it
+    # forever. The job below is skipped on push events, because the point is
+    # registration, not execution: firing a real upstream sync on unrelated
+    # pushes would turn a job that never ran into one that runs constantly, and
+    # it would be muted within a week.
+    branches: ['integration']
+    paths:
+      - '.github/workflows/sync-upstream.yml'
     inputs:
       force_sync:
         description: 'Force sync even if no new upstream commits'
@@ -29,6 +53,10 @@ env:
 
 jobs:
   sync-upstream:
+    # Push events exist only to register this workflow with the Actions API so
+    # the carrier on main can dispatch it (see the `push:` comment above). They
+    # must never perform a sync.
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     # Replaces the claude-code-action `timeout_minutes` input, which @v1 rejects.
     timeout-minutes: 60
