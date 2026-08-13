@@ -182,6 +182,130 @@ impl<'a> SimRun<'a> {
             .sum()
     }
 
+    /// Scheduling delay: total time runnable-but-not-running, averaged over the
+    /// cgroup's tasks. `None` when the cgroup has no task in the scenario.
+    ///
+    /// # The live definition this is matching, stated exactly
+    ///
+    /// ktstr's `mean_run_delay_us` is the mean over the cgroup's WORKERS of each
+    /// worker's whole-run delta in `task->sched_info.run_delay`, read from
+    /// `/proc/self/task/<tid>/schedstat` field 2 (`workload/worker/sched.rs`,
+    /// `assert/reductions.rs`). The kernel accumulates that field in
+    /// `sched_info_arrive()` at each dispatch, as `now - last_queued`, where
+    /// `last_queued` is stamped by `sched_info_enqueue()` on every enqueue —
+    /// including the re-enqueue of a preempted task. So: the summed length of
+    /// every on-runqueue-but-not-on-CPU interval, per worker, then averaged
+    /// across workers. It is a TOTAL per worker, not a per-dispatch mean;
+    /// `worst_run_delay_us` is the worker with the largest total, not the worst
+    /// single dispatch. (The kernel also exposes the dispatch count in field 3,
+    /// but ktstr does not publish it per cgroup, so no per-episode figure is
+    /// available on the live side and none is computed here.)
+    ///
+    /// This accumulates `TaskScheduled - EnqueueTask` per episode and sums, per
+    /// task, then averages over tasks — the same shape, deliberately. The rule
+    /// is the one `TraceStats::sched_latencies` uses and
+    /// `tests/rundelay_tracking.rs` validates, including that samples accumulate
+    /// across preempt/re-enqueue cycles, which is what makes it a total rather
+    /// than a first-wakeup latency.
+    ///
+    /// # Where the two still differ
+    ///
+    /// Two known differences, both of which push the simulator DOWN. Neither
+    /// determines the sign of an observed gap, and on the one run measured so
+    /// far the simulator came out ABOVE one cgroup and BELOW the other — so do
+    /// not read "sim is lower" as the expected outcome.
+    ///
+    /// * **Direct dispatch.** When `select_cpu` finds an idle CPU the simulator
+    ///   never emits `EnqueueTask`, so that dispatch contributes no sample —
+    ///   correctly zero, because in the simulator a wakeup costs no time. The
+    ///   kernel enqueues unconditionally and charges the real wakeup-to-switch
+    ///   path, single-digit microseconds, on every one of those. Measure the
+    ///   exposure with [`SimRun::direct_dispatches`] rather than assuming it:
+    ///   on `sched_basic_proportional` it is 1 dispatch in 24029, which rules
+    ///   this out as an explanation for anything on that run.
+    /// * **No interference.** The simulator has no IRQs, no timer ticks, no
+    ///   kernel threads, no host, and only the scenario's own tasks exist. Its
+    ///   scheduling delay is a FLOOR on what a real machine would show, not an
+    ///   estimate of it. Useful for comparing scheduler policy; misleading for
+    ///   anything about jitter or tails.
+    ///
+    /// What CAN dominate the sign is the schedulers being different. A global-
+    /// DSQ policy in the simulator can queue tasks the guest's policy would not,
+    /// which is a policy difference and not infidelity; on a calibration where
+    /// both sides run the same scheduler that term disappears.
+    ///
+    /// The populations DO match, unlike context switches: both sides count the
+    /// workload's workers and nothing else.
+    pub fn run_delay(&self, cgroup: &str) -> Option<DurationNs> {
+        let pids: Vec<Pid> = self.pids_in(cgroup).collect();
+        if pids.is_empty() {
+            return None;
+        }
+        let mut enqueued_at: HashMap<Pid, u64> = HashMap::new();
+        let mut total: HashMap<Pid, u64> = HashMap::new();
+        for e in self.trace.events() {
+            match e.kind {
+                TraceKind::EnqueueTask { pid, .. } if pids.contains(&pid) => {
+                    // Refresh rather than insert: a second enqueue with no
+                    // intervening dispatch restarts the wait, as
+                    // `sched_info_enqueue` restamps `last_queued`.
+                    enqueued_at.insert(pid, e.time_ns);
+                }
+                TraceKind::TaskScheduled { pid } if pids.contains(&pid) => {
+                    if let Some(t0) = enqueued_at.remove(&pid) {
+                        *total.entry(pid).or_default() += e.time_ns.saturating_sub(t0);
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Tasks that never queued contribute a real zero, matching the live
+        // side: ktstr pools one value per worker and a worker that never waited
+        // reads a measured 0.0, not a missing sample.
+        let sum: u64 = pids
+            .iter()
+            .map(|p| total.get(p).copied().unwrap_or(0))
+            .sum();
+        Some(DurationNs(sum / pids.len() as u64))
+    }
+
+    /// Dispatches of a cgroup's tasks that bypassed the enqueue path entirely.
+    ///
+    /// The size of the known downward bias in [`SimRun::run_delay`]: each of
+    /// these contributes zero delay in the simulator and a real wakeup-path cost
+    /// in the guest. Reported rather than corrected — inventing a per-wakeup
+    /// overhead to close the gap would be manufacturing the agreement.
+    /// Dispatches of a cgroup's tasks, the denominator for
+    /// [`SimRun::direct_dispatches`].
+    pub fn dispatches(&self, cgroup: &str) -> u64 {
+        let pids: Vec<Pid> = self.pids_in(cgroup).collect();
+        self.trace
+            .events()
+            .iter()
+            .filter(|e| matches!(e.kind, TraceKind::TaskScheduled { pid } if pids.contains(&pid)))
+            .count() as u64
+    }
+
+    pub fn direct_dispatches(&self, cgroup: &str) -> u64 {
+        let pids: Vec<Pid> = self.pids_in(cgroup).collect();
+        let mut queued: HashMap<Pid, bool> = HashMap::new();
+        let mut count = 0u64;
+        for e in self.trace.events() {
+            match e.kind {
+                TraceKind::EnqueueTask { pid, .. } if pids.contains(&pid) => {
+                    queued.insert(pid, true);
+                }
+                TraceKind::TaskScheduled { pid }
+                    if pids.contains(&pid) && !queued.remove(&pid).unwrap_or(false) =>
+                {
+                    count += 1;
+                }
+                _ => {}
+            }
+        }
+        count
+    }
+
     /// Wake-to-run latencies: each `TaskWoke` to that task's next
     /// `TaskScheduled`.
     ///

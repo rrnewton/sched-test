@@ -1,10 +1,11 @@
 ---
 title: 'calibration: add a scheduling-delay metric, and pre-register its tolerance BEFORE looking at the numbers'
-status: open
+status: closed
 priority: 2
 issue_type: task
 created_at: 2026-08-12T23:57:15.784197719+00:00
-updated_at: 2026-08-12T23:57:15.784197719+00:00
+updated_at: 2026-08-13T00:52:18.323159320+00:00
+closed_at: 2026-08-13T00:52:18.323159210+00:00
 ---
 
 # Description

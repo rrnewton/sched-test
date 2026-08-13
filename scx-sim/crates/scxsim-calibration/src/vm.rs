@@ -70,17 +70,30 @@ pub struct VmCgroup {
     pub avg_off_cpu_pct: f64,
     /// schedstat run_delay: runnable-but-not-running, in microseconds.
     ///
-    /// NOT a comparison quantity — the simulator emits no counterpart today, so
-    /// nothing here evaluates it against anything. It is carried because it is
-    /// the EVIDENCE for [`Metric::OffCpuTime`](crate::report::Metric::OffCpuTime)
-    /// being ruled not-comparable: it isolates the scheduler-attributable share
-    /// of off-CPU time, and on the one run we have that share is 8-17%. Without
-    /// it the classification would be an assertion rather than a measurement.
+    /// Mean over the cgroup's WORKERS of each worker's whole-run delta in
+    /// `task->sched_info.run_delay` — a per-worker TOTAL, not a per-dispatch
+    /// mean. See [`Self::run_delay`] for the full definition and for the
+    /// simulator quantity it is matched against.
+    ///
+    /// It is also the EVIDENCE for
+    /// [`Metric::OffCpuTime`](crate::report::Metric::OffCpuTime) being ruled
+    /// not-comparable: it isolates the scheduler-attributable share of off-CPU
+    /// time, and on the one run we have that share is 8-17%. Without it the
+    /// classification would be an assertion rather than a measurement.
     #[serde(default)]
     pub mean_run_delay_us: f64,
-    /// Whether the guest actually sampled run_delay. Same discipline as
-    /// `wake_measured`: a `0.0` that was never measured must not be usable as
-    /// if it were a reading.
+    /// Whether run_delay is a reading. Read via [`Self::run_delay`].
+    ///
+    /// A WEAKER predicate than `wake_measured`, and the difference matters.
+    /// `wake_measured` is "did any wakeup get sampled". This is
+    /// `!run_delays.is_empty()`, i.e. "did this cgroup have a worker at all"
+    /// (ktstr `assert/reductions.rs`). That is the correct predicate for this
+    /// field and not laxity: `sched_info.run_delay` accumulates whenever
+    /// `CONFIG_SCHED_INFO` is compiled in — forced on in ktstr, and not gated by
+    /// the runtime `kernel.sched_schedstats` key — so there is exactly one value
+    /// per worker on every run, and a worker that never queued reads a genuine
+    /// measured `0.0` rather than a placeholder. A cgroup with no workers is the
+    /// only way to get a sentinel, and that is what this excludes.
     #[serde(default)]
     pub run_delay_measured: bool,
     /// Longest observed gap between the worker's own iterations, in ms.
@@ -118,6 +131,27 @@ impl VmCgroup {
     /// Off-CPU time in ns, derived against a wall duration.
     pub fn off_cpu_time(&self, wall: DurationNs) -> DurationNs {
         DurationNs((wall.as_nanos() as f64 * self.off_cpu_fraction().get()) as u64)
+    }
+
+    /// Scheduling delay: mean over the cgroup's workers of each worker's TOTAL
+    /// runnable-but-not-running time. `None` when the cgroup had no worker.
+    ///
+    /// The kernel's `task->sched_info.run_delay`, read per worker from
+    /// `/proc/self/task/<tid>/schedstat` field 2 and differenced across the run.
+    /// It accumulates in `sched_info_arrive()` at each dispatch as
+    /// `now - last_queued`, with `last_queued` stamped by `sched_info_enqueue()`
+    /// on every enqueue including the re-enqueue of a preempted task — so it is
+    /// the summed length of every interval the worker spent on a runqueue in
+    /// TASK_RUNNING state without the CPU.
+    ///
+    /// Matched against [`SimRun::run_delay`](crate::sim::SimRun::run_delay),
+    /// which sets out the two remaining definitional differences and measures
+    /// the size of the one that can be measured. Note that this side, being a
+    /// real machine, includes waiting caused by everything else on it: kernel
+    /// threads, IRQ work, the test harness. The simulator has none of those.
+    pub fn run_delay(&self) -> Option<DurationNs> {
+        self.run_delay_measured
+            .then_some(DurationNs((self.mean_run_delay_us * 1_000.0) as u64))
     }
 
     /// p99 wake latency, or `None` when the run did not measure it.
@@ -191,6 +225,44 @@ mod tests {
         assert_eq!(run.vcpus, 2);
         assert_eq!(run.stats.cgroups.len(), 2);
         assert_eq!(run.stats.total_workers, 2);
+    }
+
+    /// Run delay reads through, in ns, from a µs field.
+    ///
+    /// A missed factor of 1000 here would put the live side three orders of
+    /// magnitude off and read as a spectacular fidelity gap rather than as the
+    /// unit bug it is — the same trap `off_cpu_fraction` exists to close.
+    #[test]
+    fn run_delay_converts_microseconds_to_nanoseconds() {
+        let run = fixture();
+        let cg = run.cgroup("cg_0").expect("cg_0 is in the fixture");
+        assert!(cg.run_delay_measured, "fixture premise: run delay measured");
+        assert_eq!(cg.mean_run_delay_us, 3694.068);
+        assert_eq!(cg.run_delay(), Some(DurationNs(3_694_068)));
+    }
+
+    /// A cgroup with no worker yields no run-delay reading.
+    ///
+    /// Weaker than the wake-latency guard below, and deliberately so: unlike
+    /// wake latency, `sched_info.run_delay` is populated on every ktstr run, so
+    /// a real measured `0.0` is a legitimate value and must NOT be suppressed.
+    /// The only sentinel is the worker-less cohort, and that is what this pins.
+    /// Constructed rather than taken from the fixture because the fixture has no
+    /// empty cgroup — which is also why this cannot be an assertion about it.
+    #[test]
+    fn run_delay_of_a_workerless_cgroup_is_none_but_a_measured_zero_is_some() {
+        let mut cg = fixture().stats.cgroups.into_iter().next().unwrap();
+
+        cg.run_delay_measured = false;
+        cg.mean_run_delay_us = 0.0;
+        assert_eq!(cg.run_delay(), None, "no worker: not a reading");
+
+        cg.run_delay_measured = true;
+        assert_eq!(
+            cg.run_delay(),
+            Some(DurationNs(0)),
+            "a worker that never queued measured zero, and zero is the answer"
+        );
     }
 
     /// THE guard this module exists for. The fixture has
