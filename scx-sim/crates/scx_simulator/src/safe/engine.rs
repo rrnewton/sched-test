@@ -1368,43 +1368,64 @@ impl Simulator<ffi::DynamicScheduler> {
 /// longer than the timeout. Returns the stall with the lowest PID for
 /// determinism (HashMap iteration order is non-deterministic).
 ///
+/// # Throttled time is not starvation time
+///
+/// A task parked in its cgroup's BTQ by `cpu.max` is withheld by policy, not
+/// starved. Real Linux/SCX DEQUEUES such a task and re-enqueues it on
+/// unthrottle, which RESTARTS the kernel's runnable clock; the simulator
+/// keeps it in `TaskState::Runnable` because `TaskState` has no parked
+/// variant, so `runnable_at_ns` keeps accruing across the whole throttled
+/// period. `last_throttled_at` restores the kernel's semantics: the
+/// starvation clock starts at `max(runnable_at, last observed throttled)`,
+/// so only UNTHROTTLED waiting counts.
+///
+/// This replaces an earlier design that merely SKIPPED tasks whose cgroup was
+/// throttled. Skipping is structurally insufficient — it hides the task only
+/// while the cgroup stays throttled, and the accrued time survives, so the
+/// first instant the cgroup unthrottles the whole throttled period is charged
+/// at once as starvation. Measured on
+/// `examples/scx3618_cpumax_unbounded_wait.json`: 1 tick in 73333 observed
+/// `is_throttled == 0`, and that single tick fired a 40.5s `ErrorStall`.
+///
+/// Genuine starvation in an unthrottled cgroup is unaffected and still fires;
+/// the exclusion is per-task via its own cgroup, never a global mute.
+///
 /// Free function rather than an associated fn: it never used the
 /// `Simulator<S>` type parameter, and lifting it out makes the
 /// throttle-awareness contrast tests below able to call it directly.
 pub(crate) fn check_watchdog(
     tasks: &HashMap<Pid, SimTask>,
     task_to_cgid: &HashMap<Pid, crate::cgroup::CgroupId>,
-    throttled_cgids: &std::collections::HashSet<u64>,
+    last_throttled_at: &HashMap<u64, TimeNs>,
     current_time: TimeNs,
     timeout_ns: TimeNs,
 ) -> Option<ExitKind> {
     let mut worst: Option<(Pid, TimeNs)> = None;
     for task in tasks.values() {
-        // A task in a cgroup the cgroup_bw library currently reports as
-        // throttled is parked in that cgroup's BTQ by policy, not starved.
-        // Real Linux/SCX DEQUEUES such a task; the simulator keeps it in
-        // TaskState::Runnable because TaskState has no parked variant, so
-        // without this check the watchdog charges deliberate cpu.max
-        // throttling as starvation and reports a stall that is not a stall.
-        if task_to_cgid
-            .get(&task.pid)
-            .is_some_and(|cgid| throttled_cgids.contains(&cgid.0))
-        {
+        if !matches!(task.state, TaskState::Runnable) {
             continue;
         }
-        if matches!(task.state, TaskState::Runnable) {
-            if let Some(runnable_at) = task.runnable_at_ns {
-                let runnable_for = current_time.saturating_sub(runnable_at);
-                if runnable_for > timeout_ns {
-                    // Pick the lowest PID for deterministic error reporting.
-                    let dominated = worst.map(|(pid, _)| task.pid < pid).unwrap_or(true);
-                    if dominated {
-                        worst = Some((task.pid, runnable_for));
-                    }
-                }
+        let Some(runnable_at) = task.runnable_at_ns else {
+            continue;
+        };
+        // Do not charge time the task spent withheld by cpu.max as
+        // starvation. The starvation clock starts at whichever is later:
+        // when the task became runnable, or the last instant its cgroup was
+        // observed throttled.
+        let effective_start = task_to_cgid
+            .get(&task.pid)
+            .and_then(|cgid| last_throttled_at.get(&cgid.0).copied())
+            .map_or(runnable_at, |t| runnable_at.max(t));
+        let runnable_for = current_time.saturating_sub(effective_start);
+        if runnable_for > timeout_ns {
+            // Lowest PID wins, for deterministic error reporting
+            // (HashMap iteration order is not stable).
+            if worst.map(|(pid, _)| task.pid < pid).unwrap_or(true) {
+                worst = Some((task.pid, runnable_for));
             }
         }
     }
+
     worst.map(|(pid, runnable_for_ns)| ExitKind::ErrorStall {
         pid,
         runnable_for_ns,
@@ -1780,7 +1801,7 @@ impl<S: Scheduler> Simulator<S> {
             events,
             cgroup_registry,
             task_to_cgid: HashMap::new(),
-            throttled_cgids: std::collections::HashSet::new(),
+            last_throttled_at: HashMap::new(),
         }));
         // Install the Arc in ENGINE_SIM_ARC so enter_sim can propagate it
         // to SIM_ARC for kfuncs and cgroup callbacks.
@@ -2692,10 +2713,65 @@ impl<S: Scheduler> Simulator<S> {
             }
             EventKind::Tick { cpu } => {
                 if let Some(timeout) = watchdog_timeout {
+                    // Refresh, LIVE, the last instant each cgroup carrying a
+                    // runnable task was observed throttled.
+                    //
+                    // Live, and at Tick, is the whole point. This used to be a
+                    // set cached once per replenish period on the fire_timer
+                    // path — i.e. sampled from a POST-replenish snapshot, the
+                    // single moment in each period when the library has just
+                    // cleared `is_throttled`. That read a ~99.9%-duty
+                    // condition as true about 0.25% of the time. Measured on
+                    // `examples/scx3618_cpumax_unbounded_wait.json`: a
+                    // watchpoint over the 40.4s run saw the cached set
+                    // non-empty for exactly ONE interval while the library
+                    // reported `nr_throttled_periods: 405/406`. Read live at
+                    // the same tick, the same condition resolves throttled
+                    // 73332 times out of 73333.
+                    //
+                    // `snapshot_by_raw_cgrp` takes the raw cgrp pointer
+                    // precisely so it can be called while the engine holds the
+                    // SIM_ARC mutex (see its docs in ffi.rs) — which is
+                    // exactly the situation here. A cgroup is treated as NOT
+                    // throttled when the scheduler does not link cgroup_bw,
+                    // when the registry does not know it, or when the library
+                    // declines it (rc != 0): in each case there is no
+                    // throttling to excuse the wait, so the watchdog reports.
+                    let now = s.sim.clock;
+                    let mut throttled_now: Vec<u64> = Vec::new();
+                    {
+                        let mut seen: Vec<u64> = Vec::new();
+                        for task in s.tasks.values() {
+                            if !matches!(task.state, TaskState::Runnable) {
+                                continue;
+                            }
+                            let Some(cgid) = s.task_to_cgid.get(&task.pid).map(|c| c.0) else {
+                                continue;
+                            };
+                            if seen.contains(&cgid) {
+                                continue;
+                            }
+                            seen.push(cgid);
+                            let Some(raw) =
+                                s.cgroup_registry.get_raw(crate::cgroup::CgroupId(cgid))
+                            else {
+                                continue;
+                            };
+                            let mut snap = crate::ffi::CbwCgroupSnapshot::default();
+                            if self.scheduler.snapshot_by_raw_cgrp(cgid, raw, &mut snap) == Some(0)
+                                && snap.is_throttled != 0
+                            {
+                                throttled_now.push(cgid);
+                            }
+                        }
+                    }
+                    for cgid in throttled_now {
+                        s.last_throttled_at.insert(cgid, now);
+                    }
                     if let Some(stall_error) = check_watchdog(
                         &s.tasks,
                         &s.task_to_cgid,
-                        &s.throttled_cgids,
+                        &s.last_throttled_at,
                         s.sim.clock,
                         timeout,
                     ) {
@@ -2864,16 +2940,11 @@ impl<S: Scheduler> Simulator<S> {
                 })
                 .unwrap_or_default();
             let now_ns = s.sim.cpus[cpu.0 as usize].local_clock;
-            // Refresh the watchdog's view of which cgroups are throttled from
-            // the library's own state. This is the authoritative source -- the
-            // same `cgx->is_throttled` the lib acts on -- rather than a value
-            // the simulator models independently. Refreshed every fire_timer,
-            // i.e. once per replenish period.
-            s.throttled_cgids = cbw_after
-                .iter()
-                .filter(|snap| snap.is_throttled != 0)
-                .map(|snap| snap.cgid)
-                .collect();
+            // NOTE: the watchdog's throttle view is deliberately NOT cached
+            // here any more. It used to be, and that was the bug: this point
+            // is phase-locked to replenish, so the snapshot was always taken
+            // just after the library cleared `is_throttled`. `check_watchdog`
+            // now resolves `cgx->is_throttled` live at Tick instead.
             let events = crate::cgroup_bw_replenish::diff_snapshots(&cbw_before, &cbw_after);
             // For each cgroup that just replenished AND is no longer
             // throttled (`keep_throttled == false`), drain any tasks the
@@ -5373,7 +5444,7 @@ mod tests {
     mod watchdog_throttle_awareness {
         use super::*;
         use crate::cgroup::CgroupId;
-        use std::collections::{HashMap, HashSet};
+        use std::collections::HashMap;
 
         /// One task, Runnable and well past the timeout, in cgroup 7.
         fn starving_task_in_cgroup_7() -> (HashMap<Pid, SimTask>, HashMap<Pid, CgroupId>) {
@@ -5403,14 +5474,19 @@ mod tests {
             (tasks, map)
         }
 
+        /// `last_throttled_at` entries as `check_watchdog` consumes them:
+        /// cgid -> the last simulated instant that cgroup was seen throttled.
+        fn throttled_at(entries: &[(u64, TimeNs)]) -> HashMap<u64, TimeNs> {
+            entries.iter().copied().collect()
+        }
+
         #[test]
         fn fires_for_genuine_starvation_when_cgroup_is_not_throttled() {
             let (tasks, task_to_cgid) = starving_task_in_cgroup_7();
-            let none_throttled = HashSet::new();
             let got = check_watchdog(
                 &tasks,
                 &task_to_cgid,
-                &none_throttled,
+                &throttled_at(&[]),
                 200_000_000,
                 100_000_000,
             );
@@ -5425,8 +5501,13 @@ mod tests {
         fn does_not_fire_when_the_cgroup_is_bandwidth_throttled() {
             let (tasks, task_to_cgid) = starving_task_in_cgroup_7();
             // Same task, same elapsed time -- only the library's throttle state differs.
-            let throttled: HashSet<u64> = [7u64].into_iter().collect();
-            let got = check_watchdog(&tasks, &task_to_cgid, &throttled, 200_000_000, 100_000_000);
+            let got = check_watchdog(
+                &tasks,
+                &task_to_cgid,
+                &throttled_at(&[(7, 200_000_000)]),
+                200_000_000,
+                100_000_000,
+            );
             assert!(
                 got.is_none(),
                 "a task parked in its cgroup's BTQ by cpu.max is withheld by policy, \
@@ -5439,17 +5520,67 @@ mod tests {
             // Guards the obvious regression: exempting throttled cgroups must be
             // per-task, not a global mute.
             let (tasks, task_to_cgid) = starving_task_in_cgroup_7();
-            let other_cgroup_throttled: HashSet<u64> = [9u64].into_iter().collect();
             let got = check_watchdog(
                 &tasks,
                 &task_to_cgid,
-                &other_cgroup_throttled,
+                &throttled_at(&[(9, 200_000_000)]),
                 200_000_000,
                 100_000_000,
             );
             assert!(
                 matches!(got, Some(ExitKind::ErrorStall { pid: Pid(2), .. })),
                 "throttling cgroup 9 must not exempt a starving task in cgroup 7; got {got:?}"
+            );
+        }
+
+        #[test]
+        fn throttled_time_is_excluded_from_the_clock_not_merely_suppressed() {
+            // THE REGRESSION FOR THE SECOND BUG. Merely SKIPPING tasks whose
+            // cgroup is throttled right now is structurally insufficient: the
+            // accrued time survives, so the first instant the cgroup
+            // unthrottles the entire throttled period is charged at once.
+            // Measured on scx3618_cpumax_unbounded_wait.json, 1 tick in 73333
+            // observed is_throttled == 0 and that single tick fired a 40.5s
+            // ErrorStall.
+            //
+            // Here the cgroup is NOT throttled at `current_time` -- it was
+            // throttled up to 1ms ago -- and the task has been runnable since 0.
+            // Only that 1ms of unthrottled waiting may be charged.
+            let (tasks, task_to_cgid) = starving_task_in_cgroup_7();
+            let got = check_watchdog(
+                &tasks,
+                &task_to_cgid,
+                &throttled_at(&[(7, 199_000_000)]),
+                200_000_000,
+                100_000_000,
+            );
+            assert!(
+                got.is_none(),
+                "the task waited 200ms but 199ms of it was cpu.max throttling; only \
+                 the 1ms since unthrottle is starvation, which is under the 100ms \
+                 timeout. Charging withheld time as starvation is the false positive \
+                 this exclusion exists to prevent; got {got:?}"
+            );
+        }
+
+        #[test]
+        fn starvation_accrued_after_unthrottle_still_fires() {
+            // The other side of the same coin, and the guard against "fix" by
+            // muting: once the cgroup stops being throttled the clock runs
+            // again, and a task starved past the timeout on unthrottled time
+            // alone must still be reported.
+            let (tasks, task_to_cgid) = starving_task_in_cgroup_7();
+            let got = check_watchdog(
+                &tasks,
+                &task_to_cgid,
+                &throttled_at(&[(7, 50_000_000)]),
+                200_000_000,
+                100_000_000,
+            );
+            assert!(
+                matches!(got, Some(ExitKind::ErrorStall { pid: Pid(2), .. })),
+                "150ms of UNTHROTTLED waiting past a 100ms timeout is real starvation \
+                 and must fire even though the cgroup was throttled earlier; got {got:?}"
             );
         }
     }

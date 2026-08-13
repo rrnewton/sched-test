@@ -535,17 +535,15 @@ pub(crate) struct SimState {
     /// Tasks not present in this map belong to the root cgroup and are
     /// not charged against any tracked bandwidth state.
     pub task_to_cgid: HashMap<Pid, CgroupId>,
-    /// Cgroups the cgroup_bw library currently reports as throttled
-    /// (`cgx->is_throttled != 0`), refreshed from the live library state
-    /// on every `fire_timer` snapshot in `handle_timer_fired`.
+    /// Last simulated instant at which each cgroup was observed throttled by
+    /// the cgroup_bw library, refreshed live on every watchdog Tick.
     ///
-    /// Consumed ONLY by the watchdog. A task whose cgroup is throttled is
-    /// parked in the lib's BTQ by policy; on real Linux/SCX it is dequeued
-    /// rather than left on a runqueue, so charging that time as starvation
-    /// is a model artefact. `TaskState` has no parked variant, so this set
-    /// is how the watchdog distinguishes "withheld by cpu.max" from
-    /// "runnable and never dispatched".
-    pub throttled_cgids: std::collections::HashSet<u64>,
+    /// The watchdog uses it to exclude cpu.max-withheld time from the
+    /// starvation clock: real Linux/SCX dequeues a throttled task and
+    /// re-enqueues it on unthrottle, restarting the runnable clock, but
+    /// `TaskState` has no parked variant so `runnable_at_ns` would otherwise
+    /// accrue across the entire throttled period.
+    pub last_throttled_at: HashMap<u64, TimeNs>,
 }
 
 /// Split-borrowed references to all SimState fields.
@@ -3681,8 +3679,8 @@ mod tests {
             tasks: HashMap::new(),
             events: EventQueue::new(0, false),
             cgroup_registry: CgroupRegistry::new(nr_cpus, 100),
-            throttled_cgids: std::collections::HashSet::new(),
             task_to_cgid: HashMap::new(),
+            last_throttled_at: HashMap::new(),
         }))
     }
 
