@@ -338,3 +338,62 @@ Of the three possible messages, the evidence now supports the third, narrowed:
 - **"[2/3] engages correctly and does not bound the wait in this scenario;
   the watchdog still fires at identical times."** Whether [3/3] would, on its
   own base, is the remaining open question.
+
+---
+
+## Part [3/3] engages too, and the wait is ~9-19x its intended bound
+
+[3/3] blends wall-clock into the BTQ sort key:
+`btq_vtime = (scx_bpf_now() & UPPER_MASK) | (vtime & LOWER_MASK)` with
+`CBW_BTQ_VTIME_MASK_SHIFT = 32`. Its own comment states the design intent:
+*"bounding the maximum BTQ wait to ~4 seconds"* — one 2^32 ns epoch, which is
+exactly what this investigation's original hypothesis predicted it would cap.
+
+**The runs that produced 40.28s and 81.18s had [3/3] applied.** The diff fetched
+from `pull/3618.diff` is the whole PR, all three commits, so every result
+reported here for "with the fix" already included the blend. Engagement
+evidence: the blend appears 5 times in the patched source, and the scenario
+reaches the BTQ — `nr_pending` is 9 and 8 at the two severe quotas, so there
+are real tasks queued in the BTQ for the blend to reorder.
+
+So both parts are active and the measured wait is **~9x and ~19x** the ~4s
+bound [3/3] is designed to enforce.
+
+**This is a significant finding about the whole PR, and it needs saying
+plainly: with both mechanisms verified active, the proposed fix does not
+address the failure mode in this repro.** That is a claim about this scenario
+in this simulator, not a claim that the PR is wrong in general — see Limits.
+
+## Watchdog threshold: which was used, and does it matter
+
+**The #104 runs used 30s** — `DEFAULT_WATCHDOG_TIMEOUT_NS = 30_000_000_000`
+(`safe/scenario.rs:666`), applied by the builder at `:851`; the test never
+overrode it. So the inference from the gradient was right.
+
+Whether a 4s watchdog would do — tested, not argued:
+
+| watchdog | quota | worst wait | exit |
+|---|---|---|---|
+| 30s | 1ms | 4.98s | Normal |
+| 30s | 0.5ms | 10.98s | Normal |
+| 30s | 0.125ms | 40.28s | `ErrorStall` |
+| 4s | 1ms | 4.98s | `ErrorStall` @4.98s |
+| 4s | 0.5ms | **9.98s** | `ErrorStall` @9.98s |
+| 4s | 0.125ms | **40.28s** | `ErrorStall` @40.28s |
+
+**The gradient survives.** I expected truncation — abort at 4s, measurement
+censored, gradient flattened — and that did not happen. The watchdog reports
+`runnable_for_ns` at the stall's full length, and the wait is one continuous
+stall rather than an accumulation, so the measured value is intact at abort.
+
+Two qualifications. The 0.5ms case moved 10.98s -> 9.98s, about 9%, so values
+are not perfectly threshold-independent. And the cost saving is smaller than it
+looks: at 0.125ms the run still proceeds to a 40.28s stall before aborting, so
+only the mild configurations finish early.
+
+**Conclusion: report wait times, which are near-threshold-independent, not
+"the watchdog fired", which is a parameter.** 4s is fine for sweeping and
+cheaper on the mild end. 30s is retained in the committed tests for fidelity to
+scx#3618's own claim, which is specifically about *the 30-second SCX
+runnable-task-stall watchdog*; a reader checking our result against the PR's
+wording should not have to reconcile a different threshold.

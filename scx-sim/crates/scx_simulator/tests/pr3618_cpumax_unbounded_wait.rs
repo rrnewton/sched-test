@@ -348,3 +348,53 @@ fn tight_cpumax_reaches_the_watchdog() {
          stopped throttling — check which before relaxing this."
     );
 }
+
+/// Would a 4s watchdog let us sweep cheaper without weakening the finding?
+///
+/// The proposal: the gradient is the evidence, the watchdog trip is just where
+/// the kernel gives up, so lower the threshold and sweep further for less
+/// simulated time. Tested rather than argued.
+#[test]
+fn does_a_lower_watchdog_preserve_the_gradient() {
+    let _lock = common::setup_test();
+    for wd_s in [30u64, 4] {
+        for quota_us in [1_000u64, 500, 125] {
+            let mut b = Scenario::builder()
+                .cpus(4)
+                .seed(42)
+                .instant_timing()
+                .cgroup_with_bandwidth(
+                    "tight",
+                    &[CpuId(0), CpuId(1), CpuId(2), CpuId(3)],
+                    PERIOD_US,
+                    quota_us,
+                    0,
+                )
+                .add_task_in_cgroup("hog", 0, forever_run(2_000_000_000), "tight");
+            for i in 0..8 {
+                b = b.add_task_in_cgroup(
+                    &format!("victim{i}"),
+                    0,
+                    wake_sleep(200_000, 1_000_000),
+                    "tight",
+                );
+            }
+            let sc = b
+                .add_task("competitor", 0, forever_run(2_000_000_000))
+                .watchdog_timeout_ns(Some(wd_s * 1_000_000_000))
+                .duration_ms(240_000)
+                .build();
+            let t = Simulator::new(lavd_cpu_bw(4)).run(sc);
+            let worst = bail_to_next_schedule(&t)
+                .values()
+                .map(|(d, _)| *d)
+                .max()
+                .unwrap_or(0);
+            eprintln!(
+                "  watchdog={wd_s}s quota={quota_us}us -> worst_wait={:.2}s exit={:?}",
+                worst as f64 / 1e9,
+                t.exit_kind()
+            );
+        }
+    }
+}
