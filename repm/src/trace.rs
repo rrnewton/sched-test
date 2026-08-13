@@ -134,13 +134,9 @@ impl ThreadRole {
 /// A single row from an rt-app per-thread log file.
 #[derive(Debug, Clone)]
 struct RtAppLogRow {
-    #[allow(dead_code)]
-    idx: u32,
     run_us: u64,
     period_us: u64,
     start_ns: u64,
-    end_ns: u64,
-    slack_us: i64,
     wu_lat_us: u64,
     cpu: u32,
 }
@@ -218,7 +214,7 @@ pub fn parse_rtapp_log_dir(dir: &Path) -> Result<Vec<ThreadProfile>> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.extension().map_or(false, |e| e == "log") {
+        if path.extension().is_some_and(|e| e == "log") {
             match parse_rtapp_log(&path) {
                 Ok((_events, profile)) => profiles.push(profile),
                 Err(e) => {
@@ -248,13 +244,16 @@ fn parse_rtapp_log_line(line: &str) -> Option<RtAppLogRow> {
         return None;
     }
 
+    // Only the columns that are actually consumed are parsed. idx, end and
+    // slack were parsed into fields nobody read -- and each used `?`, so a
+    // malformed value in an UNUSED column discarded the whole row and quietly
+    // shortened the profile. The `fields.len() < 12` check above still
+    // validates the column count. (No evidence this ever fired; it was a live
+    // path regardless.)
     Some(RtAppLogRow {
-        idx: fields[0].parse().ok()?,
         run_us: fields[2].parse().ok()?,
         period_us: fields[3].parse().ok()?,
         start_ns: fields[4].parse().ok()?,
-        end_ns: fields[5].parse().ok()?,
-        slack_us: fields[7].parse().ok()?,
         wu_lat_us: fields[10].parse().ok()?,
         cpu: fields[11].parse().ok()?,
     })
@@ -583,7 +582,7 @@ pub fn parse_perfetto_json(path: &Path) -> Result<Vec<SchedulingEvent>> {
 // Utility
 // ---------------------------------------------------------------------------
 
-fn compute_percentiles(values: &mut Vec<f64>) -> LatencyPercentiles {
+fn compute_percentiles(values: &mut [f64]) -> LatencyPercentiles {
     if values.is_empty() {
         return LatencyPercentiles::default();
     }
@@ -846,23 +845,38 @@ timestamp,mode,scheduler,condition,thread_type,thread_id,metric_name,percentile,
         assert_eq!(pcts.avg, 0.0);
     }
 
-    /// Integration: parse a real rt-app log, if one is pointed at.
+    /// Integration: parse a real rt-app log.
     ///
     /// Opt in by setting `REPM_REAL_RTAPP_LOG` to an rt-app log from a real
-    /// capture, e.g. `<capture>/logs/<workload>-<task>-0.log`. Skipped when
-    /// unset. This used to hardcode one machine's capture directory, which
-    /// meant the test silently skipped everywhere else.
+    /// capture, e.g. `<capture>/logs/<workload>-<task>-0.log`:
+    ///
+    /// ```text
+    /// REPM_REAL_RTAPP_LOG=<path> cargo test --bins test_parse_real_rtapp_log -- --ignored
+    /// ```
+    ///
+    /// `#[ignore]`d rather than returning early. An early return is reported as
+    /// PASSED, so the suite counted a test that did nothing — which is how this
+    /// one survived years pointed at a directory that had stopped existing.
+    /// Ignored is reported as skipped, which is the honest answer.
+    ///
+    /// The body asserts instead of returning for the same reason: forcing this
+    /// with `--ignored` and no input must FAIL, not pass vacuously. That is the
+    /// trap in the `#[ignore]`d tests over in `scx_simulator` — they are ignored
+    /// AND early-return, so running them with `--run-ignored` reports a pass
+    /// having done nothing.
     #[test]
+    #[ignore = "requires a real rt-app capture; set REPM_REAL_RTAPP_LOG and run with --ignored"]
     fn test_parse_real_rtapp_log() {
-        let Ok(real_log) = std::env::var("REPM_REAL_RTAPP_LOG") else {
-            eprintln!("Skipping real rt-app log test (REPM_REAL_RTAPP_LOG not set)");
-            return;
-        };
+        let real_log = std::env::var("REPM_REAL_RTAPP_LOG").expect(
+            "REPM_REAL_RTAPP_LOG must be set to run this test; it is #[ignore]d so that \
+             forcing it without an input fails here rather than passing vacuously",
+        );
         let real_log = std::path::Path::new(&real_log);
-        if !real_log.exists() {
-            eprintln!("Skipping real rt-app log test (file not found)");
-            return;
-        }
+        assert!(
+            real_log.exists(),
+            "REPM_REAL_RTAPP_LOG points at {} which does not exist",
+            real_log.display()
+        );
 
         let (events, profile) = parse_rtapp_log(real_log).unwrap();
 
@@ -896,21 +910,30 @@ timestamp,mode,scheduler,condition,thread_type,thread_id,metric_name,percentile,
         eprintln!("    cpus: {:?}", profile.cpu_set);
     }
 
-    /// Integration: parse a real metrics CSV, if one is pointed at.
+    /// Integration: parse a real metrics CSV.
     ///
-    /// Opt in by setting `REPM_REAL_METRICS_CSV` to a `metrics.csv` from a
-    /// real capture. Skipped when unset.
+    /// Opt in by setting `REPM_REAL_METRICS_CSV` to a `metrics.csv` from a real
+    /// capture:
+    ///
+    /// ```text
+    /// REPM_REAL_METRICS_CSV=<path> cargo test --bins test_parse_real_metrics_csv -- --ignored
+    /// ```
+    ///
+    /// `#[ignore]`d, and asserting rather than returning early, for the reasons
+    /// spelled out on [`test_parse_real_rtapp_log`] above.
     #[test]
+    #[ignore = "requires a real capture; set REPM_REAL_METRICS_CSV and run with --ignored"]
     fn test_parse_real_metrics_csv() {
-        let Ok(real_csv) = std::env::var("REPM_REAL_METRICS_CSV") else {
-            eprintln!("Skipping real metrics CSV test (REPM_REAL_METRICS_CSV not set)");
-            return;
-        };
+        let real_csv = std::env::var("REPM_REAL_METRICS_CSV").expect(
+            "REPM_REAL_METRICS_CSV must be set to run this test; it is #[ignore]d so that \
+             forcing it without an input fails here rather than passing vacuously",
+        );
         let real_csv = std::path::Path::new(&real_csv);
-        if !real_csv.exists() {
-            eprintln!("Skipping real metrics CSV test (file not found)");
-            return;
-        }
+        assert!(
+            real_csv.exists(),
+            "REPM_REAL_METRICS_CSV points at {} which does not exist",
+            real_csv.display()
+        );
 
         let profiles = parse_metrics_csv(real_csv, Some("cache_worker")).unwrap();
         assert!(!profiles.is_empty(), "Should find cache_worker profiles");
