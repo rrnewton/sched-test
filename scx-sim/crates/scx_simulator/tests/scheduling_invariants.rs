@@ -25,11 +25,12 @@ mod common;
 
 type SchedFactory = fn(u32) -> DynamicScheduler;
 
-fn schedulers() -> [(&'static str, SchedFactory); 3] {
+fn schedulers() -> [(&'static str, SchedFactory); 4] {
     [
         ("simple", |_n| DynamicScheduler::simple()),
         ("lavd", DynamicScheduler::lavd),
         ("cosmos", DynamicScheduler::cosmos),
+        ("layered", DynamicScheduler::layered),
     ]
 }
 

@@ -55,6 +55,22 @@ jobs:
           sudo apt-get install -y clang llvm libelf-dev \
             build-essential xxd markdown zlib1g-dev
 
+      # The coverage gate builds a SECOND full target tree
+      # (target/llvm-cov-target/) with -C instrument-coverage and debuginfo=2,
+      # on top of the existing target/debug/. That does not fit in a stock
+      # runner's free space: the build dies with
+      #   LLVM ERROR: IO failure on output stream: No space left on device
+      # which surfaces as a bogus "ld terminated with signal 7 [Bus error]"
+      # and an invitation to file an LLVM bug. Reclaim the preinstalled
+      # toolchains this job never uses (~25 GB) before building.
+      - name: Free runner disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                      /usr/local/.ghcup /usr/local/share/boost \
+                      /usr/share/swift "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
       - name: Install cargo-nextest
         run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 

@@ -43,6 +43,12 @@ void *sim_task_get_cpus_ptr(struct task_struct *p);
 unsigned int sim_task_get_scx_flags(struct task_struct *p);
 void sim_task_set_scx_flags(struct task_struct *p, unsigned int flags);
 
+/* p->scx.runnable_at, in JIFFIES (not nanoseconds) — matches the kernel,
+ * which stamps it in scx_runnable(). Read by schedulers to measure queueing
+ * delay (e.g. scx_layered antistall). */
+unsigned long long sim_task_get_runnable_at(struct task_struct *p);
+void sim_task_set_runnable_at(struct task_struct *p, unsigned long long jiffies);
+
 /* Root cgroup for simulator cgroup modeling.
  * Returns a pointer to the global root cgroup (struct cgroup *). */
 void *sim_get_root_cgroup(void);
@@ -57,6 +63,10 @@ void sim_cgroup_free(void *cgrp);
 /* Read kn->id (the cgid the kernel ABI exposes) from a cgroup pointer.
  * Returns 0 if the pointer is NULL or has no kernfs_node. */
 unsigned long long sim_cgroup_get_kn_id(void *cgrp);
+/* Set cgrp->kn->name — the cgroup's directory-entry name, which BPF
+ * schedulers walk to reconstruct the cgroup path (scx_layered's
+ * MATCH_CGROUP_* rules). No-op for the root cgroup. */
+void sim_cgroup_set_name(void *cgrp, const char *name);
 void sim_cgroup_set_cpuset(void *cgrp, const unsigned int *cpus, unsigned int nr_cpus);
 void sim_task_set_cgroup(struct task_struct *p, void *cgrp);
 void *sim_task_get_cgroup(struct task_struct *p);

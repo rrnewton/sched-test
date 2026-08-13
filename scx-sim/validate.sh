@@ -39,6 +39,25 @@ echo "=== Running cargo fmt --check ==="
 cargo fmt --all -- --check
 
 echo ""
+echo "=== Checking the scx submodule is unmodified ==="
+# Several crates compile upstream scx sources directly as path dependencies
+# (scx_layered's alloc.rs and layer_core_growth.rs today). That puts those
+# files in rustfmt's and clippy's module graph, so a bare `cargo fmt` rewrites
+# them in place — silently destroying the "compiled byte-identical to the pin"
+# guarantee that is the whole reason we link them instead of vendoring copies.
+# rustfmt's `ignore` option is nightly-only, so guard the invariant itself.
+if ! git -C ../scx diff --quiet HEAD 2>/dev/null; then
+    echo "ERROR: the scx submodule has local modifications:"
+    git -C ../scx status --short
+    echo ""
+    echo "scx is a pinned upstream checkout and must stay byte-identical to"
+    echo "the gitlink. If 'cargo fmt' did this, revert with:"
+    echo "    git -C scx checkout -- ."
+    exit 1
+fi
+echo "  scx submodule clean"
+
+echo ""
 echo "=== Checking safe/ contains no unsafe code ==="
 # Belt-and-suspenders: safe/mod.rs has #![forbid(unsafe_code)] which the
 # compiler enforces, but this grep catches it before compilation even starts.
@@ -118,6 +137,22 @@ command -v cargo-llvm-cov >/dev/null 2>&1 || {
 # rebuild its tree once (different profile fingerprint).
 CARGO_PROFILE_DEV_DEBUG=line-tables-only \
     cargo llvm-cov nextest --workspace --no-fail-fast --no-report
+
+echo ""
+echo "=== Running feature-gated tests (not reachable from --workspace) ==="
+# `cargo nextest --workspace` builds with DEFAULT features, so any target with
+# required-features is silently never built. scxsim-workload-ir's
+# sched_basic_proportional is exactly that: required-features = ["ingest"],
+# which loads a real scheduler .so and RUNS a lowered ktstr scenario. Measured:
+# the package exposes 39 tests by default and 55 with the feature on, so 16
+# tests -- including the only end-to-end ktstr-on-simulator check -- had never
+# executed anywhere.
+#
+# Run as its own invocation rather than adding --all-features to the coverage
+# gate above: that gate feeds the ratchet, and turning on every optional feature
+# workspace-wide would move the coverage numbers it enforces for reasons
+# unrelated to anyone's change.
+cargo nextest run -p scxsim-workload-ir --features ingest --no-fail-fast
 
 echo ""
 echo "=== Running doc-tests ==="

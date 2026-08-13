@@ -1,0 +1,30 @@
+[package]
+name = "scx_layered_growth"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+# The 43 #[test]s inside the included upstream layer_core_growth.rs do NOT run,
+# and structurally cannot here. This crate supplies the module's dependencies
+# by shimming the whole scx_utils namespace (`extern crate self as scx_utils`
+# in lib.rs), so upstream's tests — which want the real scx_utils::testutils,
+# the real CpuPool::new, serde_json, and the full production LayerSpec serde
+# schema — do not compile against it. Enabling this yields ~20 hard errors,
+# not failures.
+#
+# Note the asymmetry with alloc.rs, which scx_simulator links against its real
+# dependencies and whose 80 upstream tests DO run in our suite: that is a
+# materially stronger guarantee than this module has. What backs
+# layer_core_growth.rs instead is differential behaviour testing from
+# scx_simulator's integration tests — `upstream_linear_and_reverse_choose_
+# different_freed_cores` distinguishes two real algorithms on a simulated
+# topology, and a sabotage that collapses per-layer core ordering fails it.
+test = false
+doctest = false
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4.5", features = ["derive"] }
+fastrand = "2"
+serde = { version = "1", features = ["derive"] }
