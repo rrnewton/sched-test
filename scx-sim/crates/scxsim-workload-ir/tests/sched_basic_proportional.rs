@@ -245,3 +245,103 @@ fn spinwait_runs_continuously_so_the_scheduler_owns_the_slice() {
     // check above exists rather than relying on the fidelity report alone.
     assert!(ir.fidelity.is_exact(), "{:?}", ir.fidelity.approximations());
 }
+
+/// SCOPE-NARROWNESS CHECK: does a cgroup cpuset actually confine its tasks?
+///
+/// The second failure shape the exact-arm audit looked for: a value the
+/// lowering carries correctly that something downstream then ignores. Cgroup
+/// cpusets are the candidate — `to_scenario` resolves them onto `CgroupDef`,
+/// but a task's `allowed_cpus` is populated only from its OWN affinity, so
+/// nothing in the ingestion confines a task to its cgroup's CPUs.
+///
+/// This runs two cgroups pinned to disjoint halves of a 4-CPU box and reports
+/// where the tasks actually ran. It asserts only what it can prove; the
+/// interesting output is printed.
+#[test]
+fn cgroup_cpuset_confinement_is_observable_or_is_not() {
+    use scx_simulator::{DynamicScheduler, Simulator, TraceKind};
+    use scxsim_workload_ir::{SourceCpuset, SourceTopology};
+    use std::collections::{HashMap, HashSet};
+
+    let _guard = scx_simulator::SIM_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let src = SourceScenario {
+        duration: DurationNs::from_secs(1),
+        topology: SourceTopology {
+            numa_nodes: 1,
+            llcs: 1,
+            cores: 4,
+            threads: 1,
+        },
+        default_workers_per_cgroup: 1,
+        ..SourceScenario::new("cpuset_split")
+    }
+    .step(SourceStep::new(
+        vec![
+            SourceCgroupDef::named("cg_0")
+                .cpuset(SourceCpuset::Disjoint { index: 0, of: 2 })
+                .work(SourceWorkSpec::new(SourceWorkType::SpinWait)),
+            SourceCgroupDef::named("cg_1")
+                .cpuset(SourceCpuset::Disjoint { index: 1, of: 2 })
+                .work(SourceWorkSpec::new(SourceWorkType::SpinWait)),
+        ],
+        SourceHold::FULL,
+    ));
+
+    let ir = lower(&src).expect("lowers");
+    let scenario = to_scenario(&ir).expect("ingests");
+
+    // What the ingestion produced, before running anything.
+    for t in &scenario.tasks {
+        println!(
+            "task {:?} cgroup {:?} allowed_cpus {:?}",
+            t.pid, t.cgroup_name, t.allowed_cpus
+        );
+    }
+
+    let trace = Simulator::new(DynamicScheduler::simple()).run(scenario.clone());
+    let mut used: HashMap<i32, HashSet<u32>> = HashMap::new();
+    for e in trace.events() {
+        if let TraceKind::TaskScheduled { pid } = e.kind {
+            used.entry(pid.0).or_default().insert(e.cpu.0);
+        }
+    }
+    println!("observed CPUs per task: {used:?}");
+
+    // cg_0 declared CPUs 0-1 and cg_1 declared CPUs 2-3. Check each task
+    // against ITS OWN cgroup's declared set — two tasks on four CPUs land apart
+    // by luck often enough that "are they disjoint from each other" would pass
+    // while confinement was entirely absent.
+    let declared: HashMap<i32, HashSet<u32>> =
+        HashMap::from([(1, HashSet::from([0, 1])), (2, HashSet::from([2, 3]))]);
+    let mut violations = Vec::new();
+    for (pid, cpus) in &used {
+        if let Some(allowed) = declared.get(pid) {
+            let outside: Vec<u32> = cpus.difference(allowed).copied().collect();
+            if !outside.is_empty() {
+                violations.push(format!("pid {pid} allowed {allowed:?} ran on {outside:?}"));
+            }
+        }
+    }
+
+    // THE FINDING, asserted rather than merely printed: the ingestion resolves
+    // the cgroup cpuset onto CgroupDef but never onto the member tasks'
+    // allowed_cpus, and nothing downstream confines them either.
+    assert!(
+        scenario.tasks.iter().all(|t| t.allowed_cpus.is_none()),
+        "premise of this characterization test: cgroup cpusets do not reach \
+         task allowed_cpus today",
+    );
+    assert!(
+        !violations.is_empty(),
+        "KNOWN GAP CLOSED? Tasks are now confined to their cgroup's cpuset. \
+         That is the desired behaviour — delete this characterization test and \
+         replace it with a real confinement assertion.",
+    );
+    println!(
+        "CONFIRMED SCOPE-NARROWNESS GAP: cgroup cpusets do not confine tasks. {}",
+        violations.join("; ")
+    );
+}

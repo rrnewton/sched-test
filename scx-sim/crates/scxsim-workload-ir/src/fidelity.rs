@@ -69,6 +69,27 @@ pub enum Cause {
     /// An iteration count that had to become a duration. Iterations are not a
     /// unit the simulator advances in; see [`crate::lower::ITER_NS`].
     IterationsToTime,
+    /// **The source did not say how much work, and the lowering supplied a
+    /// number.** The output therefore contains a duration that appears nowhere
+    /// in the input.
+    ///
+    /// This exists because a lowering that invents the scheduling quantum and
+    /// reports EXACT is the most dangerous thing this crate can do, and it did
+    /// it: `SpinWait` fabricated a 500us run phase, `ir.fidelity.is_exact()`
+    /// returned true, two tests asserted on that flag and passed, and the
+    /// result was a 68x slice-count divergence against the live kernel. See
+    /// `ai_docs/SLICE_DIVERGENCE_ROOT_CAUSE_20260812.md`.
+    ///
+    /// Any arm that reaches for a default duration must record this, so the
+    /// fabrication is visible in the report rather than inferable only by
+    /// reading the lowering.
+    UnspecifiedWorkQuantum,
+    /// **The source specified a duration the IR cannot carry**, so it was
+    /// dropped. The opposite direction from
+    /// [`Cause::UnspecifiedWorkQuantum`] and deliberately a separate variant:
+    /// "we made a number up" and "we threw a number away" are different
+    /// failures and blurring them is how one hides behind the other.
+    UnrepresentableWorkQuantum,
 }
 
 impl Cause {
@@ -84,6 +105,12 @@ impl Cause {
             Cause::DynamicSchedAttr => "runtime sched-attribute change lowered to an initial attribute",
             Cause::TaskLifecycle => "task create/exit churn folded into a fixed task set",
             Cause::IterationsToTime => "iteration count converted to a duration estimate",
+            Cause::UnspecifiedWorkQuantum => {
+                "the source did not specify this quantity; the lowering supplied a value"
+            }
+            Cause::UnrepresentableWorkQuantum => {
+                "the source specified a duration the IR cannot carry; it was dropped"
+            }
         }
     }
 }
@@ -98,6 +125,8 @@ impl fmt::Display for Cause {
             Cause::DynamicSchedAttr => "dynamic-sched-attr",
             Cause::TaskLifecycle => "task-lifecycle",
             Cause::IterationsToTime => "iterations-to-time",
+            Cause::UnspecifiedWorkQuantum => "unspecified-work-quantum",
+            Cause::UnrepresentableWorkQuantum => "unrepresentable-work-quantum",
         };
         f.write_str(s)
     }
