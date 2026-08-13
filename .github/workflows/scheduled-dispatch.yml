@@ -1,0 +1,58 @@
+# Cron carrier for workflows that live on `integration`.
+#
+# WHY THIS FILE IS ON `main` WHEN NOTHING ELSE DEVELOPS HERE
+# ----------------------------------------------------------
+# GitHub schedules `on: schedule:` ONLY from the repository's DEFAULT BRANCH.
+# The default branch is `main`, and `main` carries exactly one other workflow
+# (ci.yml). Every real workflow — simulator, gh-pages, scxsim-examples,
+# scxsim-quickstart, sync-upstream, scx-pin-staleness — lives on `integration`.
+#
+# Consequence, measured rather than assumed: **no scheduled run has EVER fired
+# on this repository.** `sync-upstream.yml` has carried a nightly cron the whole
+# time and it has never once run here. (It did run 50 times on the
+# rrnewton/sched-test mirror, whose default branch DOES carry it — which is
+# worse than never running, because it produced a nightly red X that looked like
+# coverage while delivering nothing.)
+#
+# So this file exists to give cron a home on the default branch. It dispatches
+# the real workflows on `integration` and does NOTHING ELSE. That is deliberate:
+# `main` is a branch we do not develop on, so anyone editing these workflows will
+# edit them on `integration` and never look here. Any logic placed in this file
+# would rot unseen. Keep it inert — a list of targets and a dispatch call.
+#
+# ADDING A NEW NIGHTLY JOB? Adding `on: schedule:` to a workflow on `integration`
+# WILL SILENTLY NEVER RUN. Add the workflow's filename to the matrix below as
+# well. The workflow must also declare `workflow_dispatch:` for this to reach it.
+#
+# This is one of two independent paths. `scx-pin-staleness.yml` also triggers on
+# every push to `integration`, so if this dispatcher breaks, drift is still
+# caught on any push; and if pushes stop — which is exactly when drift
+# accumulates unnoticed — this cron still fires. Neither failing silences the
+# other.
+name: scheduled dispatch
+
+on:
+  schedule:
+    # 04:10 UTC daily. Single cron on purpose: one carrier, no scheduling logic
+    # on a branch nobody reads.
+    - cron: '10 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  actions: write   # required to dispatch workflows on another ref
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false   # one unreachable target must not silence the others
+      matrix:
+        workflow:
+          - sync-upstream.yml
+          - scx-pin-staleness.yml
+    steps:
+      - name: Dispatch ${{ matrix.workflow }} on integration
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run "${{ matrix.workflow }}" --repo "${{ github.repository }}" --ref integration
