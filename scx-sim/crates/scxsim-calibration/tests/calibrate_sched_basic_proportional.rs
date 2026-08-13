@@ -27,8 +27,9 @@
 //! That is also why the interesting result is not the metrics that agree.
 
 use scxsim_calibration::{
-    report::MetricResult, CalibrationRun, Metric, NegativeControl, Quantity, RunOutcome,
-    SampleCount, SimRun, Verdict, VmRun,
+    report::{mean_slice_result, MetricResult},
+    CalibrationRun, Metric, NegativeControl, Quantity, RunOutcome, SampleCount, SimRun, Verdict,
+    VmRun,
 };
 use scxsim_workload_ir::{
     lower, to_scenario, DurationNs as IrDuration, SourceCgroupDef, SourceHold, SourceScenario,
@@ -103,6 +104,10 @@ fn calibrate() -> CalibrationRun {
         ExitKind::Normal,
         "the simulation must terminate normally"
     );
+    // Named once, and threaded into the mean-slice guard below. The guest's
+    // scheduler comes off its own sidecar (`vm.scheduler`), so neither side is
+    // asserted by this file — they are reported by the runs themselves.
+    const SIM_SCHEDULER: &str = "simple";
     let sim = SimRun::new(&scenario, &trace);
     let wall = sim.elapsed();
 
@@ -137,7 +142,13 @@ fn calibrate() -> CalibrationRun {
             Some(Quantity::Duration(cg.cpu_time())),
             n,
         ));
-        run.record(MetricResult::evaluate(
+        // Off-CPU: RECORDED, NOT EVALUATED. Both sides compute
+        // (wall - cpu)/wall correctly and the two results are not the same
+        // physical quantity — the guest's is dominated by virtualization
+        // overhead the simulator has no concept of. See Metric::OffCpuTime for
+        // the decomposition. The values are still carried so the gap stays
+        // visible; what stops is subtracting them and calling it fidelity.
+        run.record(MetricResult::not_comparable(
             Metric::OffCpuTime,
             Some(name.to_string()),
             sim.off_cpu_fraction(name).map(Quantity::Ratio),
@@ -183,6 +194,23 @@ fn calibrate() -> CalibrationRun {
         sim_wake.count(),
     ));
 
+    // --- Mean slice length. The guard runs BEFORE either measurement is
+    // consulted: the guest runs scx-ktstr and the simulator runs `simple`, so
+    // this must abstain rather than compare two different schedulers' slice
+    // policies and call the difference simulator infidelity.
+    //
+    // The VM side is None because no wprof slice extraction exists in this
+    // crate yet — a second, independent reason to abstain, and one that would
+    // still hold if the schedulers were made to match. Both are reported.
+    let sim_slices = sim.slice_durations();
+    run.record(mean_slice_result(
+        SIM_SCHEDULER,
+        &vm.scheduler,
+        sim.mean_slice(),
+        None,
+        sim_slices.count(),
+    ));
+
     // --- The negative control. A 3x-wrong occupancy must be rejected by the
     // SAME tolerance the real comparison used, or nothing above is citable. ---
     let run = run.with_control(NegativeControl::perturbed(
@@ -202,6 +230,22 @@ fn calibrate() -> CalibrationRun {
         vm.scheduler,
         run.render()
     );
+    // The sample-floor caveat on Metric::MeanSliceLength is only valid while
+    // the slice distribution stays tight; report the dispersion so the floor
+    // can be raised on evidence rather than assumed adequate.
+    match (sim_slices.mean(), sim_slices.coefficient_of_variation()) {
+        (Some(m), Some(cv)) => println!(
+            "sim slice distribution: {} mean={m} CV={cv:.3}{}",
+            sim_slices.count(),
+            if cv > 0.33 {
+                "  <-- CV > 0.33: MinSamples::PERCENTILE is NOT sufficient here; \
+                 raise to TAIL_PERCENTILE"
+            } else {
+                "  (CV <= 0.33, so PERCENTILE is adequate)"
+            }
+        ),
+        _ => println!("sim slice distribution: not computable"),
+    }
     println!(
         "supporting detail not in the table:\n  \
          sim context switches {} (live side has no per-task counterpart)\n  \
@@ -296,8 +340,9 @@ fn the_findings_as_first_measured() {
     for cg in ["cg_0", "cg_1"] {
         assert_eq!(
             verdict(Metric::OffCpuTime, Some(cg)),
-            Verdict::Disagree,
-            "{cg}: off-CPU time now AGREES with the guest. \
+            Verdict::Inconclusive,
+            "{cg}: off-CPU time is no longer Inconclusive. If it became Agree, \
+             the gap closed. If it became Disagree, a real divergence appeared. \
              KNOWN-GAP TEST: this going red means the gap CLOSED. Invert this \
              assertion to assert the property now holds. Do not delete it, and \
              do not loosen the bound."
@@ -470,6 +515,43 @@ fn the_simulated_side_actually_ran() {
     }
 }
 
+/// THE ACCEPTANCE TEST FOR `MeanSliceLength`, and it is the NEGATIVE case.
+///
+/// The guest runs `scx-ktstr`; the simulator runs `simple`. Those are different
+/// schedulers, and different schedulers legitimately choose different slice
+/// lengths — so a mean-slice comparison between them is a category error and
+/// the metric MUST report `NotMeasured` rather than a number.
+///
+/// A number here would be worse than having no metric at all. It would look
+/// like a comparison, it would sit in the calibration output beside real
+/// results, and nothing would tell a reader it compared two unlike things.
+/// That is the same defect as an `is_exact()` returning true while fabricating
+/// a value: a report confidently about the wrong thing.
+///
+/// Written before the wiring and watched to fail, so that it is known to be
+/// capable of failing.
+#[test]
+fn mean_slice_abstains_when_the_two_sides_run_different_schedulers() {
+    let run = calibrate();
+    let r = run
+        .results
+        .iter()
+        .find(|r| r.metric == Metric::MeanSliceLength)
+        .expect("mean slice must APPEAR in the report, even when it abstains");
+
+    assert_eq!(
+        r.verdict,
+        Verdict::NotMeasured,
+        "guest and simulator run different schedulers, so this must abstain \
+         rather than produce a number: {r:?}",
+    );
+    assert!(
+        r.at.as_deref().is_some_and(|a| a.contains("scheduler")),
+        "the abstention must say WHY, so a reader is not left guessing: {:?}",
+        r.at,
+    );
+}
+
 /// Percentile metrics cannot clear their floor from a single run, whatever the
 /// numbers look like. Pinned so that a later change which starts reporting a
 /// percentile as Agree from N=1 fails here.
@@ -495,4 +577,75 @@ fn one_run_cannot_support_a_percentile_verdict_on_the_live_side() {
         "identical numbers from one sample are still not evidence"
     );
     let _ = Ratio(0.0);
+}
+
+/// The evidence for ruling `OffCpuTime` not-comparable, asserted rather than
+/// asserted-in-a-comment.
+///
+/// Reclassifying a `Disagree` is the single most dangerous edit in this crate:
+/// done wrongly it is indistinguishable from making an inconvenient result go
+/// away. So the reason is encoded as a test over the same fixture, and it can
+/// fail. If the guest's off-CPU time ever stops being dominated by
+/// non-scheduling time, the premise of the reclassification is gone and this
+/// goes red, pointing at the classification rather than at the workload.
+///
+/// The claim: the live off-CPU number is mostly NOT runqueue waiting, so it is
+/// not measuring what a scheduler-fidelity comparison needs it to measure.
+#[test]
+fn off_cpu_is_dominated_by_non_scheduling_time() {
+    let vm = VmRun::from_json(VM_SIDECAR).expect("the committed sidecar parses");
+
+    for cg in &vm.stats.cgroups {
+        assert!(
+            cg.run_delay_measured,
+            "{}: schedstat run_delay must be measured for this argument to \
+             hold; without it there is no scheduler-attributable baseline to \
+             compare against",
+            cg.cgroup_name,
+        );
+
+        // Recover the wall the guest actually used, by inverting its own
+        // off_cpu fraction against its own CPU time. Both cgroups must land on
+        // the same wall — they are independently reported workers in one run,
+        // so agreement here is what makes the inversion trustworthy.
+        let cpu = cg.total_cpu_time_ns as f64;
+        let off_frac = cg.off_cpu_fraction().get();
+        let wall = cpu / (1.0 - off_frac);
+        let off_cpu_ns = wall - cpu;
+        let run_delay_ns = cg.mean_run_delay_us * 1_000.0;
+
+        assert!(
+            (wall - 12.0e9) / 12.0e9 > 0.0,
+            "{}: the worker's wall window ({:.4}s) should exceed the 12s \
+             scenario; if it does not, the inversion below is measuring \
+             something else",
+            cg.cgroup_name,
+            wall / 1e9,
+        );
+
+        // The load-bearing assertion. 3x is deliberately far below the measured
+        // 5.9x (cg_1) and 11.7x (cg_0) — the claim is "dominated", not a
+        // particular ratio, and a bound hugging the observed value would be
+        // fitting a number to the outcome.
+        assert!(
+            off_cpu_ns > 3.0 * run_delay_ns,
+            "{}: off_cpu {:.2} ms is not >3x run_delay {:.2} ms. The \
+             not-comparable classification of Metric::OffCpuTime rests on the \
+             live number being mostly non-scheduling time; if that is no longer \
+             true, re-evaluate the classification rather than this bound.",
+            cg.cgroup_name,
+            off_cpu_ns / 1e6,
+            run_delay_ns / 1e6,
+        );
+
+        // And no single long stall, which would be a scheduling event and
+        // would undercut the "virtualization overhead" reading.
+        assert!(
+            cg.max_gap_ms <= 2,
+            "{}: max_gap_ms {} suggests a real stall, not finely distributed \
+             overhead — the reclassification's reasoning would need revisiting",
+            cg.cgroup_name,
+            cg.max_gap_ms,
+        );
+    }
 }

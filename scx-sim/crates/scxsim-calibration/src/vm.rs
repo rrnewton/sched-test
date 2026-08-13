@@ -68,6 +68,28 @@ pub struct VmCgroup {
     /// `off_cpu_ns / wall_time_ns * 100`, averaged over the cgroup's workers.
     /// A PERCENTAGE, not a fraction — `0.358` means 0.358%.
     pub avg_off_cpu_pct: f64,
+    /// schedstat run_delay: runnable-but-not-running, in microseconds.
+    ///
+    /// NOT a comparison quantity — the simulator emits no counterpart today, so
+    /// nothing here evaluates it against anything. It is carried because it is
+    /// the EVIDENCE for [`Metric::OffCpuTime`](crate::report::Metric::OffCpuTime)
+    /// being ruled not-comparable: it isolates the scheduler-attributable share
+    /// of off-CPU time, and on the one run we have that share is 8-17%. Without
+    /// it the classification would be an assertion rather than a measurement.
+    #[serde(default)]
+    pub mean_run_delay_us: f64,
+    /// Whether the guest actually sampled run_delay. Same discipline as
+    /// `wake_measured`: a `0.0` that was never measured must not be usable as
+    /// if it were a reading.
+    #[serde(default)]
+    pub run_delay_measured: bool,
+    /// Longest observed gap between the worker's own iterations, in ms.
+    ///
+    /// Also evidence, not a comparison quantity: it distinguishes "one long
+    /// stall" (a scheduling event) from "finely distributed overhead", and the
+    /// off-CPU classification depends on which of those the missing time is.
+    #[serde(default)]
+    pub max_gap_ms: u64,
     pub total_migrations: u64,
     /// Placeholder unless [`Self::wake_measured`]. Read via
     /// [`Self::wake_latency_p99`], never directly.

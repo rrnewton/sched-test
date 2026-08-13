@@ -16,7 +16,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::units::{Quantity, SampleCount};
+use crate::units::{DurationNs, Quantity, SampleCount};
 use crate::verdict::{compare, MinSamples, Tolerance, Verdict};
 
 /// A quantity compared across the two backends.
@@ -28,7 +28,43 @@ use crate::verdict::{compare, MinSamples, Tolerance, Verdict};
 pub enum Metric {
     /// Per-task CPU time. VM `cpu_time_ns` vs sim `total_runtime(pid)`.
     CpuTime,
-    /// Per-task off-CPU time. VM `off_cpu_ns` vs sim (wall - runtime).
+    /// Per-task off-CPU time, `(wall - cpu) / wall` on both sides.
+    ///
+    /// **NOT COMPARABLE ACROSS BACKENDS AS DEFINED, and recorded via
+    /// [`MetricResult::not_comparable`] rather than evaluated.** Both sides
+    /// compute the same formula correctly; the formula does not mean the same
+    /// thing in the two places.
+    ///
+    /// Measured on `sched_basic_proportional`, the live guest's off-CPU time is
+    /// dominated by something that is not scheduling:
+    ///
+    /// ```text
+    /// cg_0   off_cpu 43.18 ms   run_delay 3.69 ms    91% is not runqueue waiting
+    /// cg_1   off_cpu 52.14 ms   run_delay 8.68 ms    83% is not runqueue waiting
+    /// ```
+    ///
+    /// `run_delay` (schedstat, runnable-but-not-running) is the
+    /// scheduler-attributable part and is 8-17% of the metric. The remainder is
+    /// finely distributed — `max_gap_ms` is 1 and 0, so there was no single
+    /// stall — and the guest separately measured the host stealing from it
+    /// (`host_dilation` 1.00063, "wall / delivered vCPU CPU time"). That is
+    /// virtualization overhead: VM exits, host preemption of the vCPU.
+    ///
+    /// The simulator has no host, no vCPU and no exits, so it has no
+    /// counterpart, and per this project's modelling charter it should not
+    /// acquire one — synthesising steal time to close a verdict would be
+    /// inventing behaviour.
+    ///
+    /// On the quantity both sides DO mean, they are close: sim off-CPU is
+    /// 6.0 ms against the guest's 3.69 / 8.68 ms of run_delay. The simulator
+    /// sits between the two cgroups. It is not 7x low on scheduling delay; it
+    /// was 7x low on a number that is mostly not scheduling delay.
+    ///
+    /// The metric that would capture the intent is scheduling delay itself
+    /// (guest `mean_run_delay_us` against a simulator runnable-but-not-running
+    /// figure). It is deliberately NOT added here: its tolerance would be
+    /// chosen by someone who has already seen both numbers, which is the thing
+    /// pre-registration exists to prevent. Filed instead.
     OffCpuTime,
     /// CPU occupancy, busy/elapsed. Dimensionless, so immune to unit-conversion
     /// error on either side — the strictest bound we can fairly demand.
@@ -272,6 +308,41 @@ impl MetricResult {
         }
     }
 
+    /// A metric BOTH backends produce but whose two numbers are not the same
+    /// physical quantity, recorded as [`Verdict::Inconclusive`] with the reason
+    /// in `at`.
+    ///
+    /// This is a distinct failure from [`Verdict::NotMeasured`], and conflating
+    /// them would lose the distinction that matters. NotMeasured means nobody
+    /// looked. This means both sides looked, both produced a number, and
+    /// comparing them would be comparing two different things and calling the
+    /// difference fidelity — the error the context-switches line already avoids
+    /// by refusing to feed a VM-wide count against a two-task one.
+    ///
+    /// Inconclusive rather than NotMeasured on purpose: it sits ABOVE Agree in
+    /// the severity lattice, so a run carrying one cannot fold to a clean pass.
+    /// A metric we cannot interpret must not read as a metric we verified.
+    ///
+    /// Both sides' values are still recorded. The point is to stop them being
+    /// subtracted, not to hide them.
+    pub fn not_comparable(
+        metric: Metric,
+        at: Option<String>,
+        sim: Option<Quantity>,
+        vm: Option<Quantity>,
+        samples: SampleCount,
+    ) -> Self {
+        MetricResult {
+            metric,
+            at,
+            sim,
+            vm,
+            samples,
+            verdict: Verdict::Inconclusive,
+            tolerance: metric.spec().tolerance,
+        }
+    }
+
     /// Relative discrepancy, for trend tracking. `None` when either side is
     /// missing or the reference is zero.
     pub fn relative_gap(&self) -> Option<f64> {
@@ -281,6 +352,79 @@ impl MetricResult {
         }
         Some((s.value() - v.value()).abs() / v.value().abs())
     }
+}
+
+/// Build the `MeanSliceLength` result, applying the same-scheduler guard.
+///
+/// The guard is the whole point of this function, not an edge case. Mean slice
+/// is a statement about SCHEDULER POLICY, so comparing it across two different
+/// schedulers is a category error: they legitimately choose different slice
+/// lengths, and a red would say "the simulator is wrong" when the honest
+/// reading is "these are two schedulers".
+///
+/// Producing a number there would be worse than having no metric. It would
+/// look like a comparison, sit in the report beside real results, and nothing
+/// would tell a reader it compared unlike things — the same defect as an
+/// `is_exact()` flag that returns true while fabricating a value.
+///
+/// So the guard runs FIRST, before either measurement is consulted, and the
+/// reason for abstaining is recorded in [`MetricResult::at`] rather than left
+/// for the reader to infer from an empty cell.
+pub fn mean_slice_result(
+    sim_scheduler: &str,
+    vm_scheduler: &str,
+    sim: Option<DurationNs>,
+    vm: Option<DurationNs>,
+    samples: SampleCount,
+) -> MetricResult {
+    let metric = Metric::MeanSliceLength;
+    let abstain = |why: String| MetricResult {
+        metric,
+        at: Some(why),
+        sim: sim.map(Quantity::Duration),
+        vm: vm.map(Quantity::Duration),
+        samples,
+        verdict: Verdict::NotMeasured,
+        tolerance: metric.spec().tolerance,
+    };
+
+    if !same_scheduler(sim_scheduler, vm_scheduler) {
+        // Deliberately still carries whatever each side measured, so the
+        // numbers are visible for inspection — but with NotMeasured, so they
+        // cannot be read as a verdict.
+        // Kept short so it does not wreck the report table, but explicit
+        // enough that a reader does not have to go looking for the reason.
+        return abstain(format!("scheduler mismatch {sim_scheduler}/{vm_scheduler}"));
+    }
+    if sim.is_none() || vm.is_none() {
+        return abstain("a side did not report a mean slice".into());
+    }
+    MetricResult::evaluate(
+        metric,
+        None,
+        sim.map(Quantity::Duration),
+        vm.map(Quantity::Duration),
+        samples,
+    )
+}
+
+/// Do the two sides run the same scheduler?
+///
+/// String identity after a narrow normalisation: the guest names its scheduler
+/// as ktstr registers it (`ktstr_sched`) while the simulator names its `.so`
+/// (`ktstr`), so a bare `==` would report a mismatch even once they DO match
+/// and the metric would abstain forever without anyone noticing.
+///
+/// Deliberately narrow — it strips a `scx[-_]` prefix and a `_sched`/`-sched`
+/// suffix and nothing else. A looser rule risks the failure this whole guard
+/// exists to prevent: declaring two different schedulers equivalent.
+fn same_scheduler(a: &str, b: &str) -> bool {
+    fn norm(s: &str) -> String {
+        let s = s.trim().to_ascii_lowercase().replace('-', "_");
+        let s = s.strip_prefix("scx_").unwrap_or(&s).to_string();
+        s.strip_suffix("_sched").unwrap_or(&s).to_string()
+    }
+    !a.trim().is_empty() && !b.trim().is_empty() && norm(a) == norm(b)
 }
 
 /// Whether a run's result may be believed at all.
@@ -873,5 +1017,88 @@ mod tests {
             spec.tolerance.rationale.contains("SAME"),
             "the rationale must keep the same-scheduler scope explicit",
         );
+    }
+    /// The guard, in both directions.
+    ///
+    /// The abstention is the case that matters, but a guard that abstains
+    /// unconditionally is indistinguishable from a broken metric — so the
+    /// positive direction is tested too.
+    #[test]
+    fn mean_slice_abstains_across_schedulers_and_evaluates_within_one() {
+        let sim = Some(DurationNs(20_000_000));
+        let vm = Some(DurationNs(21_000_000)); // 5% apart: inside the 10% bound.
+        let n = SampleCount(200);
+
+        let across = mean_slice_result("simple", "ktstr_sched", sim, vm, n);
+        assert_eq!(across.verdict, Verdict::NotMeasured);
+        assert!(
+            across
+                .at
+                .as_deref()
+                .unwrap_or_default()
+                .contains("scheduler mismatch"),
+            "the abstention must name its reason: {:?}",
+            across.at,
+        );
+        assert!(
+            across.sim.is_some() && across.vm.is_some(),
+            "both measurements stay visible for inspection — they just carry no verdict",
+        );
+
+        let within = mean_slice_result("simple", "simple", sim, vm, n);
+        assert_eq!(
+            within.verdict,
+            Verdict::Agree,
+            "same scheduler, 5% apart, 200 samples — must actually evaluate",
+        );
+    }
+
+    /// Naming differs across the two sides for the SAME scheduler, and a bare
+    /// `==` would abstain forever without anyone noticing.
+    #[test]
+    fn scheduler_identity_tolerates_naming_but_not_difference() {
+        assert!(
+            same_scheduler("ktstr", "ktstr_sched"),
+            "sim .so vs guest name"
+        );
+        assert!(same_scheduler("scx_lavd", "lavd"));
+        assert!(same_scheduler("Simple", "simple"));
+        assert!(!same_scheduler("simple", "lavd"), "different schedulers");
+        assert!(!same_scheduler("simple", "ktstr_sched"), "today's pairing");
+        assert!(!same_scheduler("", "simple"), "unknown is not a match");
+    }
+
+    /// A same-scheduler pairing still abstains when a side has no measurement.
+    /// Absence must not read as agreement.
+    #[test]
+    fn mean_slice_abstains_when_a_side_reported_nothing() {
+        let r = mean_slice_result(
+            "simple",
+            "simple",
+            Some(DurationNs(20_000_000)),
+            None,
+            SampleCount(200),
+        );
+        assert_eq!(r.verdict, Verdict::NotMeasured);
+        assert!(r
+            .at
+            .as_deref()
+            .unwrap_or_default()
+            .contains("did not report"));
+    }
+
+    /// The bound binds once the guard lets a comparison through — 70% apart
+    /// must fail. Guards the case where a future change makes the guard pass
+    /// everything.
+    #[test]
+    fn a_large_same_scheduler_divergence_is_a_disagreement() {
+        let r = mean_slice_result(
+            "simple",
+            "simple",
+            Some(DurationNs(20_000_000)),
+            Some(DurationNs(34_000_000)),
+            SampleCount(200),
+        );
+        assert_eq!(r.verdict, Verdict::Disagree);
     }
 }
