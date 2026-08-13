@@ -846,13 +846,19 @@ timestamp,mode,scheduler,condition,thread_type,thread_id,metric_name,percentile,
         assert_eq!(pcts.avg, 0.0);
     }
 
-    /// Integration: parse a real rt-app log from 0.10_v2 if available.
+    /// Integration: parse a real rt-app log, if one is pointed at.
+    ///
+    /// Opt in by setting `REPM_REAL_RTAPP_LOG` to an rt-app log from a real
+    /// capture, e.g. `<capture>/logs/<workload>-<task>-0.log`. Skipped when
+    /// unset. This used to hardcode one machine's capture directory, which
+    /// meant the test silently skipped everywhere else.
     #[test]
     fn test_parse_real_rtapp_log() {
-        let real_log = std::path::Path::new(
-            "/home/newton/work/multi_sched-test/ucache_reproducer/experiments/0.10_v2/\
-             data/rtapp_pinned/eevdf_level1_nice0_rep1/logs/cache_prodscale-cache_worker_0-0.log",
-        );
+        let Ok(real_log) = std::env::var("REPM_REAL_RTAPP_LOG") else {
+            eprintln!("Skipping real rt-app log test (REPM_REAL_RTAPP_LOG not set)");
+            return;
+        };
+        let real_log = std::path::Path::new(&real_log);
         if !real_log.exists() {
             eprintln!("Skipping real rt-app log test (file not found)");
             return;
@@ -890,13 +896,17 @@ timestamp,mode,scheduler,condition,thread_type,thread_id,metric_name,percentile,
         eprintln!("    cpus: {:?}", profile.cpu_set);
     }
 
-    /// Integration: parse a real metrics CSV from 0.10_v2 if available.
+    /// Integration: parse a real metrics CSV, if one is pointed at.
+    ///
+    /// Opt in by setting `REPM_REAL_METRICS_CSV` to a `metrics.csv` from a
+    /// real capture. Skipped when unset.
     #[test]
     fn test_parse_real_metrics_csv() {
-        let real_csv = std::path::Path::new(
-            "/home/newton/work/multi_sched-test/ucache_reproducer/experiments/0.10_v2/\
-             data/rtapp_pinned/eevdf_level1_nice0_rep1/metrics.csv",
-        );
+        let Ok(real_csv) = std::env::var("REPM_REAL_METRICS_CSV") else {
+            eprintln!("Skipping real metrics CSV test (REPM_REAL_METRICS_CSV not set)");
+            return;
+        };
+        let real_csv = std::path::Path::new(&real_csv);
         if !real_csv.exists() {
             eprintln!("Skipping real metrics CSV test (file not found)");
             return;

@@ -101,6 +101,16 @@ jobs:
         working-directory: scx-sim
         run: make install-e9patch
 
+      # PR #110 made validate.sh hard-fail on missing required dependencies
+      # (venv, mypy, pandas-stubs) but did not add the matching install step
+      # here, so every run since 718e9713 has died before the first check with
+      # "validate.sh cannot run with required dependencies missing". The remedy
+      # ships in that same PR: deps.sh install provisions everything that does
+      # not need root, and prints a command for anything that does.
+      - name: Install scx-sim dependencies
+        working-directory: scx-sim
+        run: make install-deps
+
       - name: Validate scx_simulator
         if: hashFiles('scx-sim/validate.sh') != ''
         working-directory: scx-sim
