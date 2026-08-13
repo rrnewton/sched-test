@@ -275,7 +275,17 @@ fn test_yield_keeps_task_runnable_and_making_progress() {
                 },
             )
             .add_task("hog", 0, workloads::cpu_bound(50_000_000))
-            .duration_ms(200)
+            // Headroom, not a weakened assertion. The yielder needs 10 turns on
+            // a CPU it shares with a hog, so ~10 x one 20ms slice ~= 200ms of
+            // wall — this scenario was sitting exactly on that edge and fitting
+            // the tenth iteration only because re-dispatch was free. Once
+            // re-dispatch is charged the modelled kernel cost (~4.5us, see
+            // `stop_and_reenqueue`) the tenth iteration falls off the end and
+            // the count drops to 9. The assertion below is unchanged at 10;
+            // what changes is that the run is now long enough to actually
+            // contain 10 iterations rather than depending on a zero-cost
+            // dispatch path.
+            .duration_ms(400)
             .build();
         let t = Simulator::new(make(1)).run(scenario);
         assert_eq!(t.exit_kind(), &ExitKind::Normal, "{name}: not normal exit");

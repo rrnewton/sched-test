@@ -5025,6 +5025,19 @@ impl<S: Scheduler> Simulator<S> {
         // Resolve deferred dispatch from enqueue callback
         s.sim.resolve_pending_dispatch(cpu);
 
+        // Stamp the re-enqueue so the wakeup-latency floor in `start_running`
+        // can see it. Without this the floor is applied to WAKEUPS ONLY —
+        // `enqueued_at_ns` was written in exactly one place, `handle_task_wake`
+        // — so every preempted / slice-expired task was re-dispatched charged
+        // only the fixed dispatch overheads (250ns) instead of the modelled
+        // kernel path. The kernel's `sched_info_enqueue` restamps `last_queued`
+        // on every enqueue, including the re-enqueue of a preempted task, which
+        // is why guest `sched_info.run_delay` accrues on these and ours did not.
+        let __enq_t = s.sim.cpus[cpu.0 as usize].local_clock;
+        if let Some(t) = s.tasks.get_mut(&pid) {
+            t.enqueued_at_ns = Some(__enq_t);
+        }
+
         // Caller-specific traces after enqueue
         post_enqueue(&mut s.sim, cpu, pid);
 
