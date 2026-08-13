@@ -36,6 +36,50 @@ fi
 echo "  No merge conflict markers — OK"
 
 echo ""
+echo "=== Checking for host-specific absolute paths ==="
+# Harness rule: nothing committed may carry an absolute path under a user's
+# home directory. Four offenders reached the tree before anything checked for
+# them — one made `scxsim vm-run` fail on every machine but its author's, and
+# two more sat in repm/ keying tests to a capture directory that stopped
+# existing.
+#
+# Tracked files only, via git grep, because the rule is about what is
+# COMMITTED. A filesystem grep would drown in target/, .venv/ and local
+# scratch until somebody turned the check off.
+#
+# Repo-wide rather than scx-sim-only: validate.sh lives here but two of the
+# four offenders were under repm/, so a check scoped to this directory would
+# have caught half of them.
+#
+# This is NARROWER than the rule it enforces. It catches absolute
+# /home/<user>/ and /Users/<user>/ paths, not the rule's tilde-rooted or
+# hardcoded-username clauses; `~/bin/rt-app` in prose is legitimate and
+# flagging it would get the whole check disabled, which is worse than the gap.
+# Placeholder users (/home/user/ and friends) are documentation, not leaks.
+HOSTPATH_ROOT=$(git rev-parse --show-toplevel)
+# EXEMPT: captured output. These are recorded stdout/stderr and lldb
+# transcripts where the path is what the tool actually printed on the day it
+# ran. Rewriting them would make a captured record say something that did not
+# happen — worse than the leak, and they break no clone because no code reads
+# them. Listed by exact path so a new artifact must be exempted deliberately.
+HOST_PATHS=$(git -C "$HOSTPATH_ROOT" grep -nIE '(/home|/Users)/[a-z][a-z0-9_-]*/' -- \
+    ':(exclude)repm/tests/blind_e2e/' \
+    ':(exclude)scx-sim/lldb_debug/*.transcript.txt' \
+    | grep -vE '(/home|/Users)/(user|username|youruser|someuser)/' || true)
+if [ -n "$HOST_PATHS" ]; then
+    echo "ERROR: host-specific absolute paths in tracked files:"
+    echo "$HOST_PATHS" | head -20
+    echo ""
+    echo "  A committed home-directory path breaks every other clone. Resolve"
+    echo "  it at runtime (env var, then PATH, then a clear error), or make the"
+    echo "  reference repo-relative. If it is CAPTURED OUTPUT, add its exact"
+    echo "  path to the exemption list in validate.sh rather than editing the"
+    echo "  record."
+    exit 1
+fi
+echo "  No host-specific absolute paths — OK"
+
+echo ""
 echo "=== Checking Makefile syntax ==="
 # Dry-run the Makefile to catch parse errors (missing separators, conflict
 # markers, etc.). make -n prints commands without running them; a parse error
