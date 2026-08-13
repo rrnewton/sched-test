@@ -579,6 +579,74 @@ adversarial second pass.
 This complements, and does not replace, the honesty requirements elsewhere in
 this file (No-Stub, No Silent Failures, the tiered-reporting discipline).
 
+Verify state before acting
+----------------------------
+
+Two rules. Both cost real time on 2026-08-12, and the counts are the reason
+they are written down rather than left to judgement.
+
+### FILED IS NOT LANDED
+
+**A closed task, an open PR, or an instruction given is not the change being on
+integration. Verify the merge, not the intention.**
+
+Five instances in one night:
+
+- sched-test#79's fix task was **closed while its PR was still open** and the
+  bug was still live on the tip.
+- The cpuset task was nearly closed as a duplicate of work that **had not
+  landed**.
+- `agent/deps` carried a complete `check-deps` implementation that was
+  **never pushed**.
+- An agent was told "sched-test#85 is landing now" when someone had only been
+  **instructed to land it**.
+- The recheck-pin task was unblocked by the sync workflow being **fixed**
+  rather than the pin actually **moving**.
+
+The check is cheap — does the tip contain it?
+
+```bash
+git fetch -q origin integration
+git merge-base --is-ancestor <sha> origin/integration && echo LANDED || echo NOT LANDED
+```
+
+For a bug fix, the stronger check is the one that cannot be faked: **is the bug
+still reproducible on the tip?**
+
+### CHECK FOR PRIOR WORK BEFORE STARTING
+
+**Someone may already have done this, and their version may be better than the
+one you are about to write.**
+
+- `agent/deps` held a `deps.sh` with a `list` subcommand while a separate
+  visible copy lacked it — re-implementing would have shipped the worse
+  version.
+- A July feasibility doc had already surveyed the gdb-MCP-plus-`rr` question
+  that an agent spent a session on.
+- `demo5` in the parent harness already ran SCX schedulers under hermit, while
+  an agent concluded from the vendored tool alone that it could not.
+- Two agents independently fixed the same one-arm compile error.
+
+Three cheap checks, in the order that pays:
+
+```bash
+# 1. unpushed work on local branches — 46 branches held 116 unpushed
+#    commits on 2026-08-12, so this is not a rare case
+for b in $(git for-each-ref --format='%(refname:short)' refs/heads/); do
+  n=$(git rev-list --count "$b" --not --remotes); [ "$n" -gt 0 ] && echo "$b: $n"
+done
+
+# 2. a prior study
+ls scx-sim/ai_docs/ | grep -i <topic>
+
+# 3. whether OUR harness already extends the tool, before concluding
+#    from the dependency's own source
+```
+
+That third one is the subtle one: concluding "the tool cannot do X" from the
+vendored copy is wrong whenever we have wrapped, patched or extended it — which
+here we routinely have.
+
 Run the whole gate, at the feature sets it uses
 -------------------------------------------------
 
