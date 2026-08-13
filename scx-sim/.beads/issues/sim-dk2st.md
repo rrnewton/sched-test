@@ -23,7 +23,26 @@ WHY THIS IS TEARDOWN SEMANTICS AND NOT AN ACCOUNTING WINDOW, which was my first 
 
 WHY NOTHING CAUGHT IT. The replay test asserts that each scenario EXECUTES and that declared cpusets are honoured. Nothing compares per-cgroup CPU time across the two backends, so a 2x disagreement on one cgroup passes both suites. This is the same shape as the cpuset gap (sim-4qlh5): the lowering reports 'all declared fields carried' and is correct about the fields, while a behaviour downstream of the IR diverges.
 
-WHICH SIDE IS RIGHT IS NOT ESTABLISHED. The kernel-side behaviour is whatever ktstr's execute_steps does with a prior step's cgroups, and I did not read that path. Do not assume the VM is the oracle here without checking; it is possible the intended semantics are cumulative and the VM is the one dropping cg_0.
+RESOLVED 2026-08-13: THE VM IS RIGHT AND THE SIMULATOR IS WRONG. ktstr's own
+source settles it. `execute_steps` is documented as "a thin wrapper around
+`execute_scenario_with` with an empty Backdrop -- every Step's effects
+(cgroups, workloads, payloads) TEAR DOWN AT THE STEP BOUNDARY." sched_dynamic_add
+goes through `execute_steps`, so cg_0 is supposed to stop when step 1 begins,
+which is exactly what the VM measured. The simulator keeping it alive for the
+full duration is the defect.
+
+The existence of ktstr's `Backdrop` type is the corroboration: it is the
+explicit opt-in for cross-step persistence, and it would be pointless if steps
+persisted by default. `execute_scenario(ctx, backdrop, steps)` is the form a
+scenario uses when it wants cgroups to outlive their step.
+
+So the fix belongs on the simulator/IR side: the pipeline flattens a multi-step
+scenario into one task set with no step boundaries. Two consequences beyond this
+issue -- any multi-step scenario lowers to something semantically wrong, and
+`Backdrop` has no representation in `ScenarioDef` at all, so a scenario needing
+one cannot even be expressed as a value. Both surfaced while triaging the next
+porting tranche: they block `cover_cgroup_load_oscillation` (four steps) and
+`cover_cgroup_add_midrun` (backdrop plus two steps).
 
 THE FIX IS NOT OBVIOUSLY IN THE ENGINE. It may be in the lowering (whether SourceStep setup is cumulative or replacing), which is the ktstr-owned half. Worth settling before anyone adds a cross-backend CPU-time oracle, because that oracle would go red on this immediately.
 
