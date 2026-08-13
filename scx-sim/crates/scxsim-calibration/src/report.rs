@@ -39,6 +39,18 @@ pub enum Metric {
     ContextSwitches,
     /// Wake-to-run latency. Distributional, not a mean — see [`crate::sample`].
     WakeLatency,
+    /// Mean on-CPU slice length for the workload tasks: total workload on-CPU
+    /// time divided by the number of dispatches of those tasks. VM side from
+    /// wprof per-task slices; sim side from the simulator trace.
+    ///
+    /// SAMPLE-FLOOR CAVEAT: PERCENTILE (100) suffices only if the slice
+    /// distribution has CV <= ~0.33 (SE = CV/sqrt(n) ~= 3.3% of the mean,
+    /// about a third of the tolerance). A bimodal mixture of near-zero early
+    /// exits and full slices can reach CV ~ 1, where n=100 gives SE = 10% —
+    /// the whole tolerance, making a pass meaningless. Record the observed
+    /// sample SD; if CV > 0.33 raise this to TAIL_PERCENTILE. Raising it on
+    /// measured dispersion is evidence; lowering it is not.
+    MeanSliceLength,
 }
 
 impl Metric {
@@ -108,6 +120,46 @@ impl Metric {
                 min_samples: MinSamples::PERCENTILE,
                 distributional: true,
             },
+            // Derived BLIND under tg `blind_tolerance_derivation_what` by an
+            // agent that had not seen the measurement, from decision-relevance
+            // rather than from data, and carried across here VERBATIM. See the
+            // parent CLAUDE.md section "Blind derivation: pre-registered
+            // bounds, and how blinding actually breaks" for the protocol, and
+            // that task's notes for the full derivation and for a
+            // self-reported blinding breach that occurred AFTER the bound was
+            // published (a commit subject leaked the magnitude while the agent
+            // was locating the branch). The ordering is established by the tg
+            // note timestamps; the bound was not changed afterwards and must
+            // not be. If it ever has to move, use `Tolerance::widening()` so
+            // the relaxation is conspicuous — never edit the width in place.
+            Metric::MeanSliceLength => MetricSpec {
+                tolerance: Tolerance::relative_or_absolute(
+                    0.10,
+                    50_000.0,
+                    "slice length drives wake latency, preemption rate, short-window \
+                     fairness and time-to-effect of a placement decision LINEARLY, so \
+                     it must be bounded tighter than the metrics it causes — \
+                     ContextSwitches at 15% and WakeLatency at 20% — or a slice error \
+                     alone consumes their whole budget and those bounds stop testing \
+                     the scheduler. 10% also resolves a 1.25x slice-policy difference, \
+                     the finest we will claim to adjudicate: two policies differing by \
+                     factor R have disjoint bands at relative error f exactly when \
+                     R > (1+f)/(1-f). Deliberately sharper than its own components \
+                     (CpuTime 10% over dispatch count 15% compose adversarially to \
+                     ~25%) because those errors share one fidelity gap and cancel in \
+                     the ratio; what survives is slice policy modelled wrong, which \
+                     nothing else in the registry can see. Absolute arm 50us: below \
+                     ~500us mean slice, 10% is comparable to per-event overheads the \
+                     two sides account for differently (migration penalty 10us, \
+                     cross-LLC 25us). HOLDS ONLY WHEN BOTH SIDES RUN THE SAME \
+                     SCHEDULER — different schedulers legitimately choose different \
+                     slice lengths; that is a policy difference, not simulator \
+                     infidelity. Derived blind under tg blind_tolerance_derivation_what; \
+                     do not retune.",
+                ),
+                min_samples: MinSamples::PERCENTILE,
+                distributional: false,
+            },
         }
     }
 
@@ -119,6 +171,7 @@ impl Metric {
             Metric::Migrations => "migrations",
             Metric::ContextSwitches => "context_switches",
             Metric::WakeLatency => "wake_latency",
+            Metric::MeanSliceLength => "mean_slice_length",
         }
     }
 
@@ -130,6 +183,7 @@ impl Metric {
         Metric::Migrations,
         Metric::ContextSwitches,
         Metric::WakeLatency,
+        Metric::MeanSliceLength,
     ];
 }
 
@@ -659,5 +713,39 @@ mod tests {
                 spec.tolerance.rationale
             );
         }
+    }
+    /// The mean-slice bound is PINNED, because its only property is that it was
+    /// fixed before anyone compared the two sides.
+    ///
+    /// Derived blind under tg `blind_tolerance_derivation_what` by an agent
+    /// that had not seen the measurement. If a future run comes back far
+    /// outside 10% and 10% starts to feel harsh, THAT IS THE BOUND WORKING.
+    /// Changing these numbers in place silently converts a pre-registered
+    /// tolerance into one fitted to the result — use `Tolerance::widening()`
+    /// instead, which records the previous bound and prints it in the report.
+    #[test]
+    fn the_blind_mean_slice_bound_is_exactly_as_derived() {
+        let spec = Metric::MeanSliceLength.spec();
+        assert_eq!(
+            spec.tolerance.kind,
+            crate::verdict::ToleranceKind::RelativeOrAbsolute {
+                frac: 0.10,
+                abs: 50_000.0,
+            },
+            "relative 0.10 with a 50us absolute arm, as derived blind",
+        );
+        assert_eq!(spec.min_samples, MinSamples::PERCENTILE);
+        assert!(!spec.distributional);
+        assert!(
+            spec.tolerance.widened_from.is_none(),
+            "the bound has never been relaxed; if it is, that must be recorded \
+             as a widening rather than edited in place",
+        );
+        // The scope restriction is load-bearing, not commentary: comparing
+        // slice lengths across two different schedulers is a category error.
+        assert!(
+            spec.tolerance.rationale.contains("SAME"),
+            "the rationale must keep the same-scheduler scope explicit",
+        );
     }
 }
