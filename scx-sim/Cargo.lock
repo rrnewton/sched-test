@@ -954,6 +954,8 @@ dependencies = [
 name = "scxsim-calibration"
 version = "0.1.0"
 dependencies = [
+ "scx_simulator",
+ "scxsim-build",
  "scxsim-workload-ir",
  "serde",
  "serde_json",

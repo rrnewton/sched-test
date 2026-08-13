@@ -161,6 +161,34 @@ echo "=== Running doc-tests ==="
 cargo test --workspace --doc
 
 echo ""
+echo "=== Running feature-gated ktstr<->simulator tests ==="
+# `--workspace` above builds every member with DEFAULT features, so a target
+# marked `required-features` is silently skipped rather than run. Two of them
+# are, and both load a real scheduler .so and execute a scenario end to end —
+# exactly the tests that must not rot unnoticed:
+#
+#   scxsim-workload-ir  `ingest`  ktstr ops -> IR -> Scenario, then RUN it
+#   scxsim-calibration  `sim`     that run compared against a live guest run,
+#                                 under the pre-registered rejection rule
+#
+# The calibration one is a ratchet: `the_findings_as_first_measured` pins the
+# current per-metric verdicts, so a change in simulator fidelity fails here
+# instead of quietly moving. That is worthless if nothing runs it.
+#
+# Separate invocations because the features are per-crate and enabling them in
+# the --workspace runs would unify them across members. Not instrumented, so
+# they contribute no coverage and cannot perturb the ratchet below.
+cargo nextest run -p scxsim-workload-ir --features ingest --test sched_basic_proportional
+cargo nextest run -p scxsim-calibration --features sim --test calibrate_sched_basic_proportional
+
+echo ""
+echo "=== Running feature-gated example builds ==="
+# The trace-comparison example is how the simulated half of a wprof comparison
+# is produced. It is behind `sim` for the same reason the test is, so the
+# --workspace build never compiles it and a break would go unnoticed.
+cargo build -p scxsim-calibration --features sim --example dump_sim_perfetto
+
+echo ""
 echo "=== Rust library coverage ratchet (self-test + gate) ==="
 # Verify the ratchet's own logic, then gate. The gate reuses the profile data
 # from the instrumented `cargo llvm-cov nextest` run above and hard-fails if any

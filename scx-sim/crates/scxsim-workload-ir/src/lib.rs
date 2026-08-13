@@ -38,6 +38,7 @@ pub mod ingest;
 pub mod ir;
 pub mod lower;
 pub mod pretty;
+pub mod provenance;
 pub mod source;
 pub mod units;
 

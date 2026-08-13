@@ -7,7 +7,46 @@ description = "Defines what it means for the simulator to agree with a live VM r
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
+# Reading ktstr's stats sidecar is part of the crate's job, not a test concern:
+# the live half of every comparison arrives as one of those files.
+serde_json = "1"
 scxsim-workload-ir = { path = "../scxsim-workload-ir" }
+# Optional: only deriving the compared quantities from a Trace needs the
+# simulator. The DEFINITION of calibrated does not, and a consumer that wants
+# just the metric registry and the verdict rule should not pull in a BPF build.
+scx_simulator = { path = "../scx_simulator", optional = true, default-features = false }
+
+[features]
+default = []
+sim = ["dep:scx_simulator"]
+
+[build-dependencies]
+# Only for EXPORTED_SYMS — the non-transitive link contract the `sim` feature
+# needs re-emitted. See build.rs.
+scxsim-build = { path = "../scxsim-build" }
 
 [dev-dependencies]
-serde_json = "1"
+# Default features ON here (unlike the optional dep above) so the calibration
+# test can use the standalone DynamicScheduler constructors to actually RUN the
+# scenario rather than merely describe it.
+scx_simulator = { path = "../scx_simulator" }
+# The scenario under calibration arrives through the ktstr -> IR -> Scenario
+# bridge, and the last hop is behind `ingest`.
+scxsim-workload-ir = { path = "../scxsim-workload-ir", features = ["ingest"] }
+
+# Writes the simulated half of a trace comparison. Same feature gate and the
+# same reason as the test below.
+[[example]]
+name = "dump_sim_perfetto"
+required-features = ["sim"]
+
+[[example]]
+name = "slice_sweep"
+required-features = ["sim"]
+
+# Loads a real scheduler .so and runs the scenario, so it needs the Trace-side
+# derivation. required-features (rather than a cfg inside the file) means cargo
+# skips the target in a default build instead of compiling it empty.
+[[test]]
+name = "calibrate_sched_basic_proportional"
+required-features = ["sim"]
