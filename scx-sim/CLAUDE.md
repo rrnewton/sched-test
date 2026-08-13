@@ -389,6 +389,154 @@ Documentation and Analysis
 
 When creating analysis documents, specifications, or other AI-generated documentation, place them in the `ai_docs/` directory. This keeps the top-level clean and makes it clear which documents are AI-generated analysis (and may become outdated) versus core project documentation.
 
+Known-gap tests: invert them, do not delete them
+--------------------------------------------------
+
+Some tests deliberately assert that a gap **still exists** — that two numbers
+disagree, that a feature is not yet modelled, that a bound is not yet met.
+They go red **the day the gap closes**, which is the point: an improvement
+should force someone to look, not slip by unremarked.
+
+The hazard is that they look wrong to anyone meeting them cold. A test
+asserting two numbers *disagree* reads like a mistake, and the reflex on a red
+one is to delete it — which silently discards the coverage it was protecting.
+That is precisely the failure it existed to prevent.
+
+### The convention
+
+**1. Name it `known_gap_*`** when the *whole test* is a gap assertion. The name
+is the only thing guaranteed to be in front of the reader — it is in the test
+list, and it is in the failure line. A doc comment is invisible until someone
+opens the file.
+
+```rust
+fn known_gap_scheduling_delay_agrees_only_on_the_absolute_arm() {
+```
+
+It also makes the set enumerable, which is the other half of the payoff:
+
+```bash
+cargo nextest run -E 'test(known_gap_)'    # every known gap, in one list
+```
+
+When instead a *single assertion inside a mixed test* is the gap — as in
+`the_findings_as_first_measured`, which asserts some metrics agree and others
+do not — there is no name to change. Rule 2 carries it alone, so rule 2 is not
+optional.
+
+**2. End every assertion message with the standard sentence**, verbatim, so
+the instruction arrives with the failure and not one file-open later:
+
+```
+KNOWN-GAP TEST: this going red means the gap CLOSED. Invert this assertion to
+assert the property now holds. Do not delete it, and do not loosen the bound.
+```
+
+**3. Doc comment states four things, in this order.** *What* the gap is, *why*
+it is expected, *what to do* when it closes, and *what not to do*:
+
+```rust
+/// KNOWN GAP: <the property that does not hold yet, in one line>.
+///
+/// WHY EXPECTED: <the reason, and the evidence it rests on>.
+///
+/// WHEN THIS GOES RED: the gap has closed. Invert the assertion — assert
+/// <the positive property> — and keep the test.
+///
+/// DO NOT: delete it (silently drops the coverage), or loosen the bound to
+/// make it pass (destroys the property that made it worth having).
+```
+
+And the shape this template exists to prevent: **the finding must be in an
+assertion, not only in the comment.** A test that computes the interesting
+values and then discards them —
+
+```rust
+let lo = *seen.iter().min().unwrap();
+let hi = *seen.iter().max().unwrap();
+// Recorded fact, not a bound: at these quotas the wait converges ...
+let _ = (lo, hi);
+```
+
+— is green forever and protects nothing. Nobody has to delete it for the
+coverage to be absent; it was never there. If the comment states a property,
+assert the property; if it genuinely cannot be asserted yet, that is an
+abstention (below) and should say so in those terms.
+
+**4. The detector must be SOUND.** A known-gap test tells people to act on its
+red, so its red has to mean what it says. Derive the detector from the
+mechanism that actually delivers the property — and make sure it is *the*
+mechanism, not merely *a* mechanism.
+
+The worked example is `cgroup_cpuset_confinement_is_observable_or_is_not`,
+whose gap-asserting form carried two assertions:
+
+```rust
+// premise: cgroup cpusets do not reach tasks
+assert!(scenario.tasks.iter().all(|t| t.allowed_cpus.is_none()), ...);
+// detector: tasks are observed running outside their declared set
+assert!(!violations.is_empty(), "KNOWN GAP CLOSED? ...");
+```
+
+When the gap closed (`Scenario::effective_cpuset`, sim-4qlh5 / PR #79) the
+detector fired correctly and the premise assertion **kept passing** — because
+confinement arrived through `effective_cpuset` rather than by populating each
+task's `allowed_cpus`. The premise was checking a mechanism that was never the
+one in force. A reader trusting it would have concluded the gap was still open
+and dismissed a true red as coincidence.
+
+So a premise assertion is not a free safety net: it is a second detector, and
+it needs the same soundness scrutiny as the first. If it names a specific
+mechanism, it silently assumes no other mechanism can deliver the property.
+Prefer asserting the observable property; if you assert a mechanism, say in the
+doc comment which one and why it is the only one.
+
+PR #107 inverted this test to the confinement assertion it was standing in for,
+which is the convention working as intended.
+
+### Abstention is a near neighbour, and wants a different instruction
+
+The rules above cover **gap assertions**: the comparison is made, and the
+answer is "still disagrees". They do **not** fully cover **abstentions**: the
+comparison is declined outright, as with `Verdict::NotMeasured` in
+`context_switches_are_not_measured_because_the_populations_differ` and
+`wake_latency_is_not_measured_because_the_guest_did_not_measure_it`.
+
+Both say "this is not measuring what you think yet", and both go red when the
+situation improves. Rules 1–4 apply to abstentions unchanged. What differs is
+**what to do about the red**, so say this instead of rule 2's sentence:
+
+```
+KNOWN-ABSTENTION TEST: this going red means the metric became measurable.
+Supply the real bound and assert it. Do not weaken this to assert_ne!, and do
+not restore the abstention to make it pass.
+```
+
+The reason is that "invert" is not enough here. Inverting a gap assertion
+yields a real property (*the two sides now agree within X*). Inverting an
+abstention yields only *"it is measured now"* — which certifies nothing. The
+work the red is asking for is to decide what the comparison should assert now
+that it is possible, which is a bigger job than flipping a comparator, and
+`assert_ne!(NotMeasured)` is the tempting way to skip it.
+
+**Out of scope:** *pinning* tests such as
+`the_blind_mean_slice_bound_is_exactly_as_derived`, which assert a
+pre-registered tolerance has not been edited. They go red when someone changes
+the bound, not when a gap closes, and they already carry their own instruction
+(`Tolerance::widening()`). Different trigger, different remedy; do not rename
+them `known_gap_*`.
+
+### Inverting is the default, not an absolute
+
+Invert unless you can name the test that now covers the property instead. If
+you genuinely believe deletion is right, say so in the PR description and point
+at the replacement coverage. "It has served its purpose" is not a reason on its
+own — the gap closing is exactly when the positive property becomes assertable
+for the first time, and usually nobody else is asserting it.
+
+Loosening the bound is never right. A bound derived before the measurement and
+then widened after seeing the result is no longer evidence of anything.
+
 Walkthroughs and demos need an adversarial reviewer
 -----------------------------------------------------
 
