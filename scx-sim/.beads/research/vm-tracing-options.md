@@ -36,7 +36,7 @@ This document explores options for tracing scheduler behavior during `scxsim --r
    sudo ./wprof -o trace.proto
    ```
 
-4. **scxtop Integration**: scxtop can parse and analyze wprof traces via its MCP interface. See `/home/newton/work/multi_scx/scx1/tools/scxtop/WPROF_COMPATIBILITY_GUIDE.md`.
+4. **scxtop Integration**: scxtop can parse and analyze wprof traces via its MCP interface. See `scx/tools/scxtop/WPROF_COMPATIBILITY_GUIDE.md`.
 
 ### Limitations for VM Use
 
@@ -148,7 +148,7 @@ pub fn run_vm(
 
 ### 3.1 scxtop BPF Tracing
 
-**Location**: `/home/newton/work/multi_scx/scx1/tools/scxtop/src/bpf/main.bpf.c`
+**Location**: `scx/tools/scxtop/src/bpf/main.bpf.c`
 
 scxtop has comprehensive BPF programs that trace:
 - `sched_switch`, `sched_wakeup`, `sched_waking`, `sched_wakeup_new`
@@ -175,8 +175,8 @@ sudo scxtop trace -d 5000 -o trace.proto -s
 ### 3.2 bpftrace Scripts
 
 **Existing scripts**:
-- `/home/newton/work/multi_scx/scx1/rust/scx_simulator/scripts/trace_scx_ops.bt` - Traces sched_class callbacks and kfuncs
-- `/home/newton/work/multi_scx/scx1/scripts/scxtop.bt` - Interactive DSQ and latency monitoring
+- `scx-sim/scripts/trace_scx_ops.bt` - Traces sched_class callbacks and kfuncs
+- `scx/scripts/scxtop.bt` - Interactive DSQ and latency monitoring
 
 **trace_scx_ops.bt captures**:
 - sched_class entry points (select_task_rq, enqueue_task, dequeue_task, balance, etc.)
@@ -221,7 +221,7 @@ perf sched map
 
 ### 3.4 ftrace / trace-cmd
 
-**Location**: `/home/newton/work/multi_scx/scx1/scripts/sched_ftrace.py`
+**Location**: `scx/scripts/sched_ftrace.py`
 
 Simple ftrace-based tracing via `/sys/kernel/tracing/`:
 ```bash
@@ -268,7 +268,7 @@ trace-cmd report
 
 ### 4.1 Simulator's Internal Format
 
-**Location**: `/home/newton/work/multi_scx/scx1/rust/scx_simulator/crates/scx_simulator/src/trace.rs`
+**Location**: `scx-sim/crates/scx_simulator/src/safe/trace.rs`
 
 The simulator records `TraceEvent` with:
 - `time_ns`: TimeNs (simulated nanoseconds)
@@ -302,13 +302,13 @@ For comparing sim vs real:
 
 2. **Format conversion**: Write a parser that converts real trace to simulator's `TraceKind` events
 
-3. **Comparison tool**: Implement `compare.rs` (already exists at `/home/newton/work/multi_scx/scx1/rust/scx_simulator/crates/scx_simulator/tests/compare.rs`) to diff traces
+3. **Comparison tool**: Implement `compare.rs` (already exists at `scx-sim/crates/scx_simulator/tests/compare.rs`) to diff traces
 
 ---
 
 ## 5. Existing scx Tooling
 
-### 5.1 In `/home/newton/work/multi_scx/scx1/scripts/`
+### 5.1 In `scx/scripts/`
 
 | Script | Purpose |
 |--------|---------|
@@ -320,7 +320,7 @@ For comparing sim vs real:
 | `slicesnoop.bt` | Slice allocation tracing |
 | `vtime_dist.bt` | Virtual time distribution |
 
-### 5.2 In `/home/newton/work/multi_scx/scx1/rust/scx_simulator/scripts/`
+### 5.2 In `scx-sim/scripts/`
 
 | Script | Purpose |
 |--------|---------|
@@ -386,7 +386,7 @@ scxtop's MCP interface provides:
 
 - wprof repository: https://github.com/facebookexperimental/wprof
 - systing repository: https://github.com/josefbacik/systing
-- scxtop WPROF_COMPATIBILITY_GUIDE.md: `/home/newton/work/multi_scx/scx1/tools/scxtop/WPROF_COMPATIBILITY_GUIDE.md`
-- scxtop PERFETTO_TRACE_ANALYSIS.md: `/home/newton/work/multi_scx/scx1/tools/scxtop/docs/PERFETTO_TRACE_ANALYSIS.md`
-- Simulator trace format: `/home/newton/work/multi_scx/scx1/rust/scx_simulator/crates/scx_simulator/src/trace.rs`
+- scxtop WPROF_COMPATIBILITY_GUIDE.md: `scx/tools/scxtop/WPROF_COMPATIBILITY_GUIDE.md`
+- scxtop PERFETTO_TRACE_ANALYSIS.md: `scx/tools/scxtop/docs/PERFETTO_TRACE_ANALYSIS.md`
+- Simulator trace format: `scx-sim/crates/scx_simulator/src/safe/trace.rs`
 - virtme-ng documentation: `vng --help`, `man vng`

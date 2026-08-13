@@ -1,16 +1,7 @@
-mod commands;
-pub mod compare;
-mod config;
-pub mod score;
-mod synthesis;
-mod templates;
-mod trace;
-mod workspace;
-
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use commands::{analyze, capture, gen_config, init, magic, run};
+use repm::commands::{analyze, capture, gen_config, init, magic, run};
 
 /// ReproMagic — capture and reproduce scheduling behavior.
 ///
