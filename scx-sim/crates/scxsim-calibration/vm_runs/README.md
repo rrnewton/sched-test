@@ -58,3 +58,45 @@ schedstat deltas. It records `wake_measured: false` and `timer_measured: false`
 in them are placeholders, **not measurements**. `crate::vm` reads those flags
 and yields `None`; anything that reads `p99_wake_latency_us` without checking
 `wake_measured` will silently calibrate against a fabricated zero.
+
+## Retention: copy the sidecar here before the target dir is cleaned
+
+**A VM run's sidecar is not reproducible without another VM run.** It lands in
+`$CARGO_TARGET_DIR/ktstr/<kernel>-<commit>/`, which is build output — a
+`cargo clean`, a target-dir change or a fresh worktree removes it, and nothing
+warns you. Regenerating one costs a full guest boot plus the environment in the
+walkthrough's Prerequisites (a `cargo-ktstr` on `PATH`, a device-matched clone
+directory for `FICLONE`, and `with-proxy` for kernel-version resolution).
+
+So: **after any VM run whose numbers you intend to cite, copy the sidecar into
+this directory in the same commit as whatever cites it.** Not afterwards, not
+"once it looks interesting" — by then the target dir has usually turned over.
+
+This is written as an instruction rather than an argument because the argument
+was already here and did not prevent the loss. Four scenarios were run on a
+live guest on 2026-08-13 — `sched_cpuset_split`, `sched_dynamic_add`,
+`sched_perf_positive`, `sched_verifier_stats_populated`, all at ktstr
+`f5d0fce` — their per-cgroup CPU times were quoted in a report, and **the
+sidecars themselves no longer exist anywhere on disk.** What survives of those
+runs is a set of ~430-byte extracts, and only because a separate piece of work
+happened to extract from them the same day. Those extracts land in
+`crates/ktstr-scenario-replay/baselines/*.vm.json` with the cross-backend
+CPU-time check; if that path is not in your checkout yet, that work has not
+merged.
+
+### The baselines are not a substitute, and the difference is specific
+
+Those extracts carry `per_cgroup_cpu_time_ns` plus provenance. That is the right shape for
+what they do — a cross-backend CPU-time check that stays reviewable in a diff
+and carries no strings from the recording host.
+
+They are not a replacement for the sidecar. Everything else the calibration
+compares is dropped: `mean_run_delay_us`, `avg_off_cpu_pct`, `total_migrations`,
+wake latency and timer latency, and the `*_measured` flags that say whether a
+quantity was captured at all. Concretely, the full 13-metric calibration can be
+extended to a new scenario **only** if that scenario's sidecar is in this
+directory; a baseline extract supports the CPU-time comparison and nothing
+further.
+
+If you are recording a run, keep both: the sidecar here, the extract wherever
+the check wants it.
