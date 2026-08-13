@@ -155,6 +155,23 @@ fn calibrate() -> CalibrationRun {
             Some(Quantity::Ratio(cg.off_cpu_fraction())),
             n,
         ));
+        // Scheduling delay: the quantity off-CPU time was MEANT to test, and
+        // unlike off-CPU time the two sides are the same physical thing — total
+        // runnable-but-not-running per worker, averaged over workers. The two
+        // definitions are set out in `VmCgroup::run_delay` and
+        // `SimRun::run_delay`, which also name the two residual differences
+        // (direct dispatch, absence of interference) and, below, measure the
+        // first one rather than assuming its size.
+        //
+        // The tolerance is `Metric::spec`'s, committed before either side could
+        // compute the quantity. It is applied here as written.
+        run.record(MetricResult::evaluate(
+            Metric::SchedulingDelay,
+            Some(name.to_string()),
+            sim.run_delay(name).map(Quantity::Duration),
+            cg.run_delay().map(Quantity::Duration),
+            n,
+        ));
     }
 
     // --- Migrations. Note the estimator difference documented in
@@ -250,11 +267,24 @@ fn calibrate() -> CalibrationRun {
         "supporting detail not in the table:\n  \
          sim context switches {} (live side has no per-task counterpart)\n  \
          sim wake-latency samples {}\n  \
-         sim migrations {} (kernel-exact) vs guest {} (userspace-sampled)\n",
+         sim migrations {} (kernel-exact) vs guest {} (userspace-sampled)\n  \
+         scheduling delay, direct dispatches charged nothing by the simulator \
+         and a real wakeup path by the guest: cg_0 {} of {} dispatches, \
+         cg_1 {} of {}\n  \
+         live between-worker spread on an IDENTICAL workload: cg_0 {} vs cg_1 \
+         {} — the live side's own variation, {:.2}x, is larger than either \
+         side's gap to the other\n",
         sim.context_switches(),
         sim_wake.count(),
         sim.migrations(),
         vm.stats.total_migrations,
+        sim.direct_dispatches("cg_0"),
+        sim.dispatches("cg_0"),
+        sim.direct_dispatches("cg_1"),
+        sim.dispatches("cg_1"),
+        vm.cgroup("cg_0").and_then(|c| c.run_delay()).unwrap(),
+        vm.cgroup("cg_1").and_then(|c| c.run_delay()).unwrap(),
+        vm.cgroup("cg_1").unwrap().mean_run_delay_us / vm.cgroup("cg_0").unwrap().mean_run_delay_us,
     );
 
     run
@@ -360,6 +390,25 @@ fn the_findings_as_first_measured() {
          KNOWN-GAP TEST: this going red means the gap CLOSED. Invert this \
          assertion to assert the property now holds. Do not delete it, and do \
          not loosen the bound."
+    );
+
+    // FINDING 3: the simulator models 25-58x too little scheduling delay.
+    // 150us simulated against 3.694ms / 8.683ms live. cg_1 fails BOTH arms of
+    // the pre-registered bound — 98.3% against the 20% relative arm, and
+    // 8.533ms against the 4ms absolute arm, which it exceeds by 2.1x. cg_0
+    // survives only because its live value is small enough that the absolute
+    // arm still covers the gap, at 89% of that arm.
+    //
+    // Same missing-interference story as FINDING 1, but on a quantity that IS
+    // comparable across backends, so it cannot be set aside as a definitional
+    // artefact the way off-CPU time was.
+    assert_eq!(
+        verdict(Metric::SchedulingDelay, Some("cg_0")),
+        Verdict::Agree
+    );
+    assert_eq!(
+        verdict(Metric::SchedulingDelay, Some("cg_1")),
+        Verdict::Disagree
     );
 
     // Not comparable, for two different reasons — see the dedicated tests.
@@ -646,6 +695,232 @@ fn off_cpu_is_dominated_by_non_scheduling_time() {
              overhead — the reclassification's reasoning would need revisiting",
             cg.cgroup_name,
             cg.max_gap_ms,
+        );
+    }
+}
+
+/// The pre-registered scheduling-delay bound REJECTS on cg_1, and this pins
+/// exactly which arm each cgroup fails.
+///
+/// This test previously asserted the opposite — that both cgroups agreed, on
+/// the absolute arm alone. That was measured against a lowering defect: ktstr's
+/// `SpinWait` was lowered to repeating 500us chunks, so the phase ended every
+/// slice and the scheduler's 20ms `SCX_SLICE_DFL` never bound. 24029 phase-
+/// bound dispatches per task each contributed a fraction of a microsecond of
+/// queueing, summing to a spurious 6.007ms that happened to land between the
+/// two live values and read as agreement. `676b42f` fixed the lowering;
+/// dispatches fell 39.8x to 603 and the simulated delay fell 39.9x with them —
+/// the same factor, which is the mechanism, not a coincidence.
+///
+/// The bound was NOT touched in response, in either direction. It was derived
+/// from what a policy comparison needs and committed before either side could
+/// compute the quantity; it agreed when the data was wrong and rejects now that
+/// the data is right, which is the whole reason for fixing it in advance.
+#[test]
+fn the_pre_registered_bound_rejects_scheduling_delay_on_cg_1() {
+    let run = calibrate();
+    let result = |cg: &str| {
+        run.results
+            .iter()
+            .find(|r| r.metric == Metric::SchedulingDelay && r.at.as_deref() == Some(cg))
+            .expect("scheduling delay was recorded per cgroup")
+    };
+
+    // Both cgroups fail the RELATIVE arm; that is not what separates them.
+    for cg in ["cg_0", "cg_1"] {
+        let gap = result(cg)
+            .relative_gap()
+            .expect("both sides supplied a value");
+        assert!(
+            gap > 0.20,
+            "{cg}: relative gap {:.1}% is now inside the 20% arm — the simulator \
+             would have become accurate on this quantity, which is a bigger \
+             result than this test is guarding and should be read as one",
+            gap * 100.0
+        );
+    }
+
+    // What separates them is the absolute arm, and only because cg_0's live
+    // value is small enough for a 4ms floor to still cover a 24.55x error.
+    let delta = |cg: &str| {
+        let r = result(cg);
+        (r.sim.unwrap().value() - r.vm.unwrap().value()).abs()
+    };
+    assert!(
+        delta("cg_0") <= 4_000_000.0,
+        "cg_0: absolute gap {:.3}ms now exceeds the 4ms arm too",
+        delta("cg_0") / 1e6
+    );
+    assert!(
+        delta("cg_1") > 4_000_000.0,
+        "cg_1: absolute gap {:.3}ms no longer exceeds the 4ms arm, so the \
+         rejection below is not the one this test describes",
+        delta("cg_1") / 1e6
+    );
+
+    assert_eq!(result("cg_0").verdict, Verdict::Agree);
+    assert_eq!(result("cg_1").verdict, Verdict::Disagree);
+}
+
+/// The fixture CAN discriminate: the sim-vs-live gaps now exceed the live
+/// side's own reproducibility.
+///
+/// cg_0 and cg_1 run the identical workload — one spinner each, two cgroups,
+/// two CPUs — and the guest measured 3.694ms against 8.683ms, a 2.35x
+/// between-worker spread. That spread is the floor on what any verdict here can
+/// mean: a gap smaller than the reference's own variation is not resolvable.
+///
+/// The earlier version of this test asserted the spread EXCEEDED both gaps, and
+/// concluded the fixture had no discriminating power. Against the fixed
+/// lowering the gaps are 24.55x and 57.79x — an order of magnitude clear of the
+/// spread. The rejection above is therefore a statement about the simulator and
+/// not about fixture noise, and that distinction is what this test defends.
+#[test]
+fn the_gaps_now_exceed_the_live_sides_own_spread() {
+    let vm = VmRun::from_json(VM_SIDECAR).expect("the committed sidecar parses");
+    let a = vm.cgroup("cg_0").unwrap().mean_run_delay_us;
+    let b = vm.cgroup("cg_1").unwrap().mean_run_delay_us;
+    let live_spread = b.max(a) / b.min(a);
+
+    let run = calibrate();
+    let sim_gap = |cg: &str| -> f64 {
+        let r = run
+            .results
+            .iter()
+            .find(|r| r.metric == Metric::SchedulingDelay && r.at.as_deref() == Some(cg))
+            .unwrap();
+        let (s, v) = (r.sim.unwrap().value(), r.vm.unwrap().value());
+        s.max(v) / s.min(v)
+    };
+
+    for cg in ["cg_0", "cg_1"] {
+        assert!(
+            sim_gap(cg) > 3.0 * live_spread,
+            "{cg}: sim-vs-live gap {:.2}x is no longer comfortably clear of the \
+             live side's own {live_spread:.2}x spread, so the discrepancy can no \
+             longer be separated from fixture noise at N=1. The 3x margin is a \
+             deliberately loose separation check, not a fidelity bound.",
+            sim_gap(cg)
+        );
+    }
+}
+
+/// Direct dispatch is a real definitional difference and a negligible one here.
+///
+/// A simulator dispatch that skipped the enqueue path contributes zero delay,
+/// where the kernel would still charge its wakeup-to-switch cost. That is the
+/// one place the two definitions genuinely part company, so its size decides
+/// whether it can explain anything. It cannot: 1 dispatch in 603. Even valued
+/// at a generous 10us of wakeup path, that is 10us against a 3.5-8.5ms gap.
+#[test]
+fn direct_dispatch_cannot_explain_the_scheduling_delay_gap() {
+    use scx_simulator::{DynamicScheduler, Simulator};
+
+    fn gap_ns(run: &CalibrationRun, cg: &str) -> f64 {
+        let r = run
+            .results
+            .iter()
+            .find(|r| r.metric == Metric::SchedulingDelay && r.at.as_deref() == Some(cg))
+            .unwrap();
+        (r.sim.unwrap().value() - r.vm.unwrap().value()).abs()
+    }
+    let run = calibrate();
+
+    let scenario = to_scenario(&lower(&scenario_source()).unwrap()).unwrap();
+    let _guard = scx_simulator::SIM_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let trace = Simulator::new(DynamicScheduler::simple()).run(scenario.clone());
+    let sim = SimRun::new(&scenario, &trace);
+    for cg in ["cg_0", "cg_1"] {
+        let (direct, total) = (sim.direct_dispatches(cg), sim.dispatches(cg));
+        // Sample-size sanity, NOT a tolerance. The 68x lowering fix cut
+        // dispatches per task from 24029 to ~603 by letting the scheduler's
+        // 20ms slice bind, so the previous floor of 1000 would now fail on a
+        // correct run. Lowered to 100, which still catches a scenario that
+        // barely dispatched at all. Nothing about the metric's bound moves.
+        assert!(total > 100, "{cg}: only {total} dispatches to reason about");
+        // Bound the effect in TIME, not as a ratio of dispatches. The ratio
+        // was the wrong proxy: the lowering fix cut the denominator 39.8x
+        // without changing the numerator, so a fixed percentage threshold
+        // started failing on a run where the absolute effect had not moved at
+        // all. What the test actually claims is that this difference cannot
+        // account for the observed gap, so measure that directly.
+        //
+        // 10us per wakeup path is deliberately generous — a real
+        // wakeup-to-context-switch is nearer 1-5us — so the bound is
+        // conservative in the direction that would refute the claim.
+        const GENEROUS_WAKEUP_NS: u64 = 10_000;
+        let unmodelled = direct * GENEROUS_WAKEUP_NS;
+        let gap = gap_ns(&run, cg);
+        assert!(
+            (unmodelled as f64) < 0.05 * gap,
+            "{cg}: {direct} skipped enqueue paths at a generous 10us each is \
+             {}us, which is no longer negligible against the {:.0}us \
+             scheduling-delay gap. Direct dispatch may now be part of the \
+             explanation rather than a rounding error.",
+            unmodelled / 1_000,
+            gap / 1e3
+        );
+    }
+}
+
+/// The calibration's scheduling-delay definition is the SAME rule the simulator
+/// already validates elsewhere, not a second one that can drift from it.
+///
+/// `SimRun::run_delay` reimplements the enqueue-to-dispatch accumulation rather
+/// than calling `TraceStats`, to keep this crate's accessors uniform (every one
+/// of them derives from the raw trace) and free of the warmup window
+/// `TraceStats` applies. That is a duplicated definition, and duplicated
+/// definitions drift. This pins them together: any future change to either
+/// rule that does not change both will fail here.
+///
+/// `crates/scx_simulator/tests/rundelay_tracking.rs` is what validates the rule
+/// itself — that it accumulates across preempt/re-enqueue cycles, that it
+/// matches an independent recomputation from raw events, and that it grows with
+/// load. This test inherits all of that by agreeing with it.
+#[test]
+fn the_calibrations_run_delay_is_the_simulators_own_rule() {
+    use scx_simulator::{DynamicScheduler, Simulator, TraceStats};
+
+    let scenario = to_scenario(&lower(&scenario_source()).unwrap()).unwrap();
+    let _guard = scx_simulator::SIM_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let trace = Simulator::new(DynamicScheduler::simple()).run(scenario.clone());
+    assert_eq!(
+        trace.warmup_ns(),
+        0,
+        "a warmup window would legitimately \
+        separate the two figures, and this test could not tell that apart from \
+        a real divergence"
+    );
+
+    let stats = TraceStats::from_trace(&trace);
+    let sim = SimRun::new(&scenario, &trace);
+    for cg in ["cg_0", "cg_1"] {
+        let pids: Vec<_> = sim.pids_in(cg).collect();
+        let via_trace_stats: u64 = pids
+            .iter()
+            .map(|p| {
+                stats
+                    .tasks
+                    .get(p)
+                    .map(|t| t.sched_latencies.iter().sum::<u64>())
+                    .unwrap_or(0)
+            })
+            .sum::<u64>()
+            / pids.len() as u64;
+        assert!(
+            via_trace_stats > 0,
+            "{cg}: no run delay from either rule, so agreement between them \
+             would be vacuous"
+        );
+        assert_eq!(
+            sim.run_delay(cg),
+            Some(DurationNs(via_trace_stats)),
+            "{cg}: the calibration accessor and TraceStats::sched_latencies \
+             disagree, so one of the two rules has changed"
         );
     }
 }

@@ -16,8 +16,8 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::units::{DurationNs, Quantity, SampleCount};
-use crate::verdict::{compare, MinSamples, Tolerance, Verdict};
+use crate::units::{DurationNs, Hz, Quantity, Ratio, SampleCount};
+use crate::verdict::{compare, MinSamples, Tolerance, ToleranceKind, Verdict};
 
 /// A quantity compared across the two backends.
 ///
@@ -60,11 +60,13 @@ pub enum Metric {
     /// sits between the two cgroups. It is not 7x low on scheduling delay; it
     /// was 7x low on a number that is mostly not scheduling delay.
     ///
-    /// The metric that would capture the intent is scheduling delay itself
-    /// (guest `mean_run_delay_us` against a simulator runnable-but-not-running
-    /// figure). It is deliberately NOT added here: its tolerance would be
-    /// chosen by someone who has already seen both numbers, which is the thing
-    /// pre-registration exists to prevent. Filed instead.
+    /// The metric that captures the intent is scheduling delay itself, and it
+    /// now exists: [`Metric::SchedulingDelay`], guest `mean_run_delay_us`
+    /// against a simulator runnable-but-not-running figure. It was added in two
+    /// separate steps on purpose — tolerance first, from the quantity alone and
+    /// before either side could compute it, then the extraction — because a
+    /// bound chosen by someone who has already seen both numbers is the thing
+    /// pre-registration exists to prevent.
     OffCpuTime,
     /// CPU occupancy, busy/elapsed. Dimensionless, so immune to unit-conversion
     /// error on either side — the strictest bound we can fairly demand.
@@ -91,10 +93,40 @@ pub enum Metric {
     /// running. The scheduler-attributable share of the time a task spends off
     /// CPU, once virtualization overhead is excluded.
     ///
-    /// Registered with its tolerance BEFORE either side computes it, which is
-    /// the strongest form of pre-registration available: the bound cannot have
-    /// been fitted to a measurement that does not exist yet. Until extraction
-    /// is wired on both sides this reports `NotMeasured`.
+    /// Registered with its tolerance BEFORE either side could compute it, which
+    /// is the strongest form of pre-registration available: the bound cannot
+    /// have been fitted to a measurement that did not exist yet.
+    ///
+    /// Both sides are now wired —
+    /// [`VmCgroup::run_delay`](crate::vm::VmCgroup::run_delay) from the kernel's
+    /// `sched_info.run_delay`, and
+    /// [`SimRun::run_delay`](crate::sim::SimRun::run_delay) from the trace's
+    /// enqueue-to-dispatch intervals. Each states its definition in full;
+    /// they are the same physical quantity, which is what off-CPU time was not.
+    ///
+    /// **The bound REJECTS on the first run measured, and that is the result.**
+    /// On `sched_basic_proportional` the simulator reports ~150us of runqueue
+    /// wait against the guest's 3.694ms and 8.683ms — 25x and 58x low. cg_1
+    /// fails both arms (98.3% relative; 8.533ms against the 4ms absolute arm,
+    /// exceeding it by 2.1x) and is recorded as `Disagree`. cg_0 survives only
+    /// because its live value is small enough that the 4ms floor still covers a
+    /// 24.55x error, at 89% of that arm.
+    ///
+    /// The direction is the one the simulator's own construction predicts: no
+    /// IRQs, no timer ticks, no kernel threads, no host, and only the
+    /// scenario's tasks exist, so its scheduling delay is a FLOOR rather than
+    /// an estimate. This is the same missing-interference story as
+    /// [`Metric::OffCpuTime`] — but on a quantity that IS comparable across
+    /// backends, so it cannot be set aside as a definitional artefact.
+    ///
+    /// An earlier measurement of this metric agreed on both cgroups. It was
+    /// taken against a lowering defect that inserted voluntary yields into a
+    /// busy loop, producing 24029 phase-bound dispatches per task whose
+    /// fractional queueing summed to a spurious 6.007ms. Fixing the lowering
+    /// (`676b42f`) cut dispatches 39.8x and the simulated delay 39.9x with
+    /// them. The bound was not moved in either direction: it agreed when the
+    /// data was wrong and rejects now that it is right, which is the entire
+    /// reason for fixing it before the data existed.
     SchedulingDelay,
 }
 
@@ -340,6 +372,32 @@ impl MetricResult {
             samples,
             verdict: Verdict::Inconclusive,
             tolerance: metric.spec().tolerance,
+        }
+    }
+
+    /// The tolerance in force, with any absolute arm expressed in the metric's
+    /// own units.
+    ///
+    /// [`ToleranceKind`]'s own `Display` cannot do this: it holds a bare `f64`
+    /// and has no unit context, so a 4 ms duration bound renders as `4000000`
+    /// on a line whose values read `6.007ms`. Those two strings side by side
+    /// invite the conclusion that the bound is six orders of magnitude wider
+    /// than it is. Counts and ratios were unaffected, which is why this only
+    /// surfaced when the first duration metric acquired an absolute arm.
+    pub fn tolerance_display(&self) -> String {
+        let in_units = |v: f64| match self.sim.or(self.vm) {
+            Some(Quantity::Duration(_)) => Quantity::Duration(DurationNs(v as u64)).to_string(),
+            Some(Quantity::Ratio(_)) => Quantity::Ratio(Ratio(v)).to_string(),
+            Some(Quantity::Rate(_)) => Quantity::Rate(Hz(v)).to_string(),
+            // Counts, and the no-value-on-either-side case, print bare.
+            _ => format!("{v}"),
+        };
+        match self.tolerance.kind {
+            ToleranceKind::Relative { frac } => format!("+/-{:.1}%", frac * 100.0),
+            ToleranceKind::Absolute { abs } => format!("+/-{}", in_units(abs)),
+            ToleranceKind::RelativeOrAbsolute { frac, abs } => {
+                format!("+/-{:.1}% or +/-{}", frac * 100.0, in_units(abs))
+            }
         }
     }
 
@@ -618,7 +676,7 @@ impl CalibrationRun {
                 r.vm.map(|q| q.to_string()).unwrap_or_else(|| "-".into()),
                 gap,
                 r.samples.to_string(),
-                r.tolerance.kind.to_string(),
+                r.tolerance_display(),
                 r.verdict
             );
             if let Some(prev) = &r.tolerance.widened_from {
@@ -919,6 +977,35 @@ mod tests {
     }
 
     /// A widened bound must be visible in the rendered report.
+    /// An absolute tolerance is rendered in the metric's own units.
+    ///
+    /// The regression this pins: `ToleranceKind`'s `Display` prints a bare f64,
+    /// so the scheduling-delay bound appeared as `+/-4000000` on a line reading
+    /// `sim=6.007ms vm=3.694ms`. Nothing there tells a reader the bound is 4 ms
+    /// and not 4 million of whatever the values are in — and the whole value of
+    /// this report is that someone can read a verdict and check it.
+    #[test]
+    fn an_absolute_tolerance_renders_in_the_metrics_own_units() {
+        let r = MetricResult::evaluate(
+            Metric::SchedulingDelay,
+            Some("cg_0".into()),
+            Some(Quantity::Duration(DurationNs(6_007_000))),
+            Some(Quantity::Duration(DurationNs(3_694_068))),
+            SampleCount(1),
+        );
+        assert_eq!(r.tolerance_display(), "+/-20.0% or +/-4.000ms");
+
+        // Counts keep the bare rendering: there is no unit to apply.
+        let c = MetricResult::evaluate(
+            Metric::Migrations,
+            None,
+            Some(Quantity::Count(0)),
+            Some(Quantity::Count(16)),
+            SampleCount(1),
+        );
+        assert_eq!(c.tolerance_display(), "+/-25.0% or +/-2");
+    }
+
     #[test]
     fn render_flags_a_widened_tolerance() {
         let mut run = run_with_control();
@@ -964,9 +1051,12 @@ mod tests {
         );
     }
 
-    /// Until extraction is wired on both sides the metric must report
-    /// NotMeasured — never a pass. A bound with no measurement behind it
-    /// silently counting as agreement is the failure this crate exists to stop.
+    /// A run in which either side fails to supply the quantity must report
+    /// NotMeasured — never a pass. Extraction is wired on both sides now, so
+    /// this covers the case where a run does not produce it: an empty cgroup on
+    /// the live side, or a scenario with no task in it on the simulated side.
+    /// A bound with no measurement behind it silently counting as agreement is
+    /// the failure this crate exists to stop.
     #[test]
     fn scheduling_delay_is_not_measured_until_both_sides_supply_it() {
         let r = MetricResult::evaluate(Metric::SchedulingDelay, None, None, None, SampleCount(0));
