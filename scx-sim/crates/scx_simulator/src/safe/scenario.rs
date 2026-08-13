@@ -49,6 +49,23 @@ pub struct CgroupMigrateEvent {
     pub at_ns: TimeNs,
 }
 
+/// Task rename event: a task changes its `comm` at runtime.
+///
+/// Models `prctl(PR_SET_NAME)` / `pthread_setname_np()`. The engine updates
+/// `p->comm` and fires the kernel's `task_rename` BTF tracepoint, which
+/// schedulers use to re-evaluate any comm-based classification (scx_layered
+/// re-runs layer matching, and parses the new name for an embedded SCXCMD).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskRenameEvent {
+    /// PID of the task being renamed.
+    pub pid: Pid,
+    /// The new `comm`. Truncated to 15 chars + NUL by the C side, as the
+    /// kernel does.
+    pub new_comm: String,
+    /// Simulation time at which the rename occurs.
+    pub at_ns: TimeNs,
+}
+
 /// Cgroup creation event: create a new cgroup at runtime.
 ///
 /// Simulates a cgroup being created (e.g., via mkdir in cgroup filesystem).
@@ -692,6 +709,8 @@ pub struct Scenario {
     pub cpu_preempt_events: Vec<CpuPreemptEvent>,
     /// Cgroup migration events (task moves between cgroups at runtime).
     pub cgroup_migrate_events: Vec<CgroupMigrateEvent>,
+    /// Task rename events (`prctl(PR_SET_NAME)`).
+    pub task_rename_events: Vec<TaskRenameEvent>,
     /// Cgroup creation events (new cgroups created at runtime).
     pub cgroup_create_events: Vec<CgroupCreateEvent>,
     /// Cgroup destruction events (cgroups destroyed at runtime).
@@ -792,6 +811,7 @@ pub struct ScenarioBuilder {
     hotplug_events: Vec<HotplugEvent>,
     cpu_preempt_events: Vec<CpuPreemptEvent>,
     cgroup_migrate_events: Vec<CgroupMigrateEvent>,
+    task_rename_events: Vec<TaskRenameEvent>,
     cgroup_create_events: Vec<CgroupCreateEvent>,
     cgroup_destroy_events: Vec<CgroupDestroyEvent>,
     cgroup_cpuset_change_events: Vec<CgroupCpusetChangeEvent>,
@@ -833,6 +853,7 @@ impl Scenario {
             hotplug_events: Vec::new(),
             cpu_preempt_events: Vec::new(),
             cgroup_migrate_events: Vec::new(),
+            task_rename_events: Vec::new(),
             cgroup_create_events: Vec::new(),
             cgroup_destroy_events: Vec::new(),
             cgroup_cpuset_change_events: Vec::new(),
@@ -1227,6 +1248,21 @@ impl ScenarioBuilder {
         self
     }
 
+    /// Schedule a task rename at a specific simulation time.
+    ///
+    /// At `at_ns`, the engine writes `new_comm` into the task's `p->comm`
+    /// and fires the kernel's `task_rename` BTF tracepoint. Schedulers that
+    /// classify tasks by name re-evaluate at that point — scx_layered re-runs
+    /// layer matching, so a rename can move a task between layers.
+    pub fn task_rename(mut self, pid: Pid, new_comm: &str, at_ns: TimeNs) -> Self {
+        self.task_rename_events.push(TaskRenameEvent {
+            pid,
+            new_comm: new_comm.to_string(),
+            at_ns,
+        });
+        self
+    }
+
     /// Schedule a cgroup to be created at a specific simulation time.
     ///
     /// At `at_ns`, the engine creates the cgroup in the registry and calls
@@ -1488,6 +1524,7 @@ impl ScenarioBuilder {
             hotplug_events: self.hotplug_events,
             cpu_preempt_events: self.cpu_preempt_events,
             cgroup_migrate_events: self.cgroup_migrate_events,
+            task_rename_events: self.task_rename_events,
             cgroup_create_events: self.cgroup_create_events,
             cgroup_destroy_events: self.cgroup_destroy_events,
             cgroup_cpuset_change_events: self.cgroup_cpuset_change_events,

@@ -83,6 +83,15 @@ pub enum Phase {
     Sleep(TimeNs),
     /// Wake another task by PID (instantaneous).
     Wake(Pid),
+    /// Call `sched_yield()` (instantaneous). The task stays runnable and
+    /// continues with the next phase, but the kernel first runs
+    /// `yield_task_scx()` → `ops.yield`, giving the scheduler a chance to
+    /// deprioritise it. When the scheduler has no `ops.yield` — or it returns
+    /// `false` — the kernel zeroes `p->scx.slice`, which the engine mirrors.
+    ///
+    /// Only the plain one-argument `sched_yield()` form is modelled;
+    /// `sched_yield_to()` (the `to` argument of `ops.yield`) is not.
+    Yield,
 }
 
 /// How a task's phase sequence repeats.

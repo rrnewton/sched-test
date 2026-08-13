@@ -167,6 +167,22 @@ pub const SCHEDULERS: &[SchedulerManifest] = &[
         },
     },
     SchedulerManifest {
+        name: "layered",
+        strip_const: true,
+        scx_bpf_dir: true,
+        // No generated or patched source: layered's BPF compiles unmodified,
+        // and its wrapper #includes straight out of the scx tree.
+        extra_local_include: false,
+        source_patches: &[],
+        // Deliberately empty. layered's config is not a handful of rodata
+        // scalars — it is a topology, a layer table with match rules, and a CPU
+        // allocation, all published by layered_setup()/layered_set_topology()
+        // /layered_add_layer() the way scx_layered's Rust userspace publishes
+        // them. Listing a few scalars here would split that across two
+        // mechanisms.
+        runtime: SchedulerRuntime::EMPTY,
+    },
+    SchedulerManifest {
         name: "simple",
         strip_const: false,
         scx_bpf_dir: false,
