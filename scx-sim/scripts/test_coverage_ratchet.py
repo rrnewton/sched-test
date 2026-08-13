@@ -92,28 +92,28 @@ class EnvironmentAwareBaseline(unittest.TestCase):
         "scx_perf,78.4,32.5\n"
     )
 
-    def test_pmu_host_gets_the_hardware_floor(self):
+    def test_pmu_host_gets_the_hardware_floor(self) -> None:
         got = cr.read_baseline(self._csv(self.BOTH), has_pmu=True)
         self.assertEqual(got["scx_perf"], 78.4)
 
-    def test_nopmu_host_gets_the_reachable_floor(self):
+    def test_nopmu_host_gets_the_reachable_floor(self) -> None:
         got = cr.read_baseline(self._csv(self.BOTH), has_pmu=False)
         self.assertEqual(got["scx_perf"], 32.5)
 
-    def test_blank_nopmu_cell_means_hardware_independent(self):
+    def test_blank_nopmu_cell_means_hardware_independent(self) -> None:
         """A crate with no nopmu entry is held to the SAME floor everywhere."""
         with_pmu = cr.read_baseline(self._csv(self.BOTH), has_pmu=True)
         without = cr.read_baseline(self._csv(self.BOTH), has_pmu=False)
         self.assertEqual(with_pmu["scx_simulator"], 73.5)
         self.assertEqual(without["scx_simulator"], 73.5)
 
-    def test_legacy_single_column_csv_still_reads(self):
+    def test_legacy_single_column_csv_still_reads(self) -> None:
         """A CSV predating the nopmu column must not break either environment."""
         legacy = self._csv("crate,coverage_pct\nscx_perf,78.4\n")
         self.assertEqual(cr.read_baseline(legacy, has_pmu=True)["scx_perf"], 78.4)
         self.assertEqual(cr.read_baseline(legacy, has_pmu=False)["scx_perf"], 78.4)
 
-    def test_probe_returns_a_bool_and_does_not_raise(self):
+    def test_probe_returns_a_bool_and_does_not_raise(self) -> None:
         self.assertIsInstance(cr.pmu_available(), bool)
 
 
