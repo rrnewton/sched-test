@@ -3,11 +3,44 @@
 `scx3618-vs-pin-59c30bae.patch` is the [scx#3618](https://github.com/sched-ext/scx/pull/3618)
 change, expressed against **our scx pin `59c30bae`** so it applies strictly.
 
-It is carried as a patch file rather than as a submodule pin bump because the
-PR head is **not a descendant of anything we may pin**: our rule is that the scx
-gitlink must always name an ancestor of upstream `main`, and an unmerged PR head
-is not one. Carrying the patch keeps the before/after reproducible without
-violating that.
+It is carried as a patch file rather than as a submodule pin bump because
+**`a8f72d09` is not in upstream `main`'s history at all** — scx#3618 is an
+unmerged pull request. Pinning it would put the submodule on a ref that upstream
+may rebase or abandon, and that no one else can resolve from `sched-ext/scx`.
+Carrying the patch keeps the before/after reproducible without doing that.
+
+### The pin invariant, stated correctly
+
+Getting this wrong has already cost us, so it is spelled out rather than
+paraphrased.
+
+- **Wrong:** *"the gitlink must name an ancestor of upstream `main`."*
+- **Right:** *"the pin's **base** must be an ancestor of upstream `main`"* — i.e.
+  the pin must share history with upstream, while being free to carry local
+  commits on top of it.
+
+The naive form is **false every day**, because our pin legitimately carries
+local patches. As of 2026-08-13 the pin `59c30bae` carries exactly one:
+
+```
+96e4f928  (base — an ancestor of upstream main c630d994)   ✔ invariant satisfied
+└─ 59c30bae  lib/cgroup_bw: add scxsim targeted yield hooks   ← ours, deliberately
+```
+
+So `git merge-base --is-ancestor 59c30bae <upstream main>` answers **no**, and
+that is correct and expected. The check that matters is
+`git merge-base --is-ancestor $(git merge-base 59c30bae <upstream main>) <upstream main>`,
+which answers **yes**.
+
+Why the distinction is not pedantry: a check encoding the naive form fires
+constantly, gets ignored as noise, and is eventually "fixed" by deleting the
+local patches so it passes. That is exactly what a bare `git checkout
+origin/main` in a sync workflow does — silently — and it is why that workflow
+needed repairing. **If you are writing a pin check, check the base.**
+
+None of this is why scx#3618 is carried out-of-pin. Its reason is stronger and
+unrelated: the PR head is not in upstream history at all, so there is no base to
+be an ancestor of anything.
 
 ## Why this file exists
 
