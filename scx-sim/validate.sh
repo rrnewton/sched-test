@@ -39,6 +39,25 @@ echo "=== Running cargo fmt --check ==="
 cargo fmt --all -- --check
 
 echo ""
+echo "=== Checking the scx submodule is unmodified ==="
+# Several crates compile upstream scx sources directly as path dependencies
+# (scx_layered's alloc.rs and layer_core_growth.rs today). That puts those
+# files in rustfmt's and clippy's module graph, so a bare `cargo fmt` rewrites
+# them in place — silently destroying the "compiled byte-identical to the pin"
+# guarantee that is the whole reason we link them instead of vendoring copies.
+# rustfmt's `ignore` option is nightly-only, so guard the invariant itself.
+if ! git -C ../scx diff --quiet HEAD 2>/dev/null; then
+    echo "ERROR: the scx submodule has local modifications:"
+    git -C ../scx status --short
+    echo ""
+    echo "scx is a pinned upstream checkout and must stay byte-identical to"
+    echo "the gitlink. If 'cargo fmt' did this, revert with:"
+    echo "    git -C scx checkout -- ."
+    exit 1
+fi
+echo "  scx submodule clean"
+
+echo ""
 echo "=== Checking safe/ contains no unsafe code ==="
 # Belt-and-suspenders: safe/mod.rs has #![forbid(unsafe_code)] which the
 # compiler enforces, but this grep catches it before compilation even starts.
@@ -91,7 +110,49 @@ command -v cargo-llvm-cov >/dev/null 2>&1 || {
     echo "       Install: cargo install cargo-llvm-cov && rustup component add llvm-tools-preview" >&2
     exit 1
 }
-cargo llvm-cov nextest --workspace --no-fail-fast --no-report
+# CARGO_PROFILE_DEV_DEBUG=line-tables-only: the instrumented tree is what
+# exhausts the GitHub runner's disk. Measured on this exact sequence with a
+# fresh target dir:
+#
+#   after clippy --all-targets ......   667 MB
+#   after build --no-default-features   2.1 GB
+#   after llvm-cov nextest ..........  30 GB   (debug/ 2.1 GB + llvm-cov-target/ 28 GB)
+#
+# against 32 GB free on the runner after its cleanup step -- so the job died
+# with SIGBUS in ld, which is what a linker mmap'ing its output onto a full
+# filesystem gets, rather than a clean ENOSPC. The cost is one tree, not two:
+# clippy --all-targets never links the 85 test executables, so target/debug
+# contributes only ~2 GB here.
+#
+# Dropping full DWARF for this build alone takes llvm-cov-target/ from 28 GB to
+# 16 GB, i.e. peak ~18 GB, and costs the gate NOTHING: LLVM source-based
+# coverage carries its line information in __llvm_covmap, not in DWARF. Verified
+# by comparing `cargo llvm-cov report --summary-only` between the two profiles --
+# byte-identical (36006 regions / 76.44%, 2414 functions / 73.78%, 24182 lines /
+# 74.91%).
+#
+# Scoped to this invocation on purpose rather than set in Cargo.toml: a plain
+# `cargo test` / lldb session keeps full debuginfo, so local debuggability is
+# unaffected. Running `cargo llvm-cov` by hand without this variable will
+# rebuild its tree once (different profile fingerprint).
+CARGO_PROFILE_DEV_DEBUG=line-tables-only \
+    cargo llvm-cov nextest --workspace --no-fail-fast --no-report
+
+echo ""
+echo "=== Running feature-gated tests (not reachable from --workspace) ==="
+# `cargo nextest --workspace` builds with DEFAULT features, so any target with
+# required-features is silently never built. scxsim-workload-ir's
+# sched_basic_proportional is exactly that: required-features = ["ingest"],
+# which loads a real scheduler .so and RUNS a lowered ktstr scenario. Measured:
+# the package exposes 39 tests by default and 55 with the feature on, so 16
+# tests -- including the only end-to-end ktstr-on-simulator check -- had never
+# executed anywhere.
+#
+# Run as its own invocation rather than adding --all-features to the coverage
+# gate above: that gate feeds the ratchet, and turning on every optional feature
+# workspace-wide would move the coverage numbers it enforces for reasons
+# unrelated to anyone's change.
+cargo nextest run -p scxsim-workload-ir --features ingest --no-fail-fast
 
 echo ""
 echo "=== Running doc-tests ==="
@@ -171,12 +232,15 @@ echo ""
 echo "=== Running ASLR stability test ==="
 # The ASLR test needs a release binary (it tests the re-exec path).
 RELEASE_BIN="target/release/scxsim"
-if [ -x "$RELEASE_BIN" ]; then
-    ./scripts/test_aslr.sh "$RELEASE_BIN"
-else
-    echo "  (skipped: $RELEASE_BIN not found; run: cargo build --release)"
-    record_skip "ASLR stability test (release binary not found)"
+# Build it rather than skipping. Whether this binary happens to be lying around
+# is a property of the developer's last command, not of the tree, so skipping on
+# its absence made the ASLR gate run on some machines and not others -- and CI,
+# which never builds release, would silently never run it at all.
+if [ ! -x "$RELEASE_BIN" ]; then
+    echo "  ($RELEASE_BIN not found — building it; the gate runs either way)"
+    cargo build --release -p scx_simulator --bin scxsim
 fi
+./scripts/test_aslr.sh "$RELEASE_BIN"
 
 echo ""
 echo "=== Running BPF/C UB fidelity checks ==="
@@ -188,15 +252,34 @@ echo "=== Running BPF/C UB fidelity checks ==="
 echo ""
 ./scripts/typecheck.sh
 
-echo ""
-echo "=== All checks passed ==="
-
+# A skipped check is a FAILURE, not a footnote.
+#
+# CI runs this exact script (.github/workflows/simulator.yml runs `bash
+# validate.sh`), so the commands are identical by construction and the only way
+# local and CI can disagree is if one of them quietly ran less than the other.
+# This block used to print "All checks passed", warn about the skips, and exit
+# 0 -- so a run that never executed the ASLR gate was indistinguishable from a
+# run that passed it. "validate.sh is green" has to mean "CI will be green",
+# and it cannot mean that while green is reachable without running everything.
+#
+# There is deliberately NO opt-out. An env var that turns a skip back into a
+# zero exit would mean "validate.sh is green" depends on whether someone set
+# it -- which is the same silent-divergence this whole change exists to remove,
+# reintroduced as a flag. If something is missing, install it; every skip
+# message above names the command that fixes it.
 if [ ${#SKIPPED[@]} -gt 0 ]; then
     echo ""
     echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-    echo "!!! WARNING: The following checks were SKIPPED:"
+    echo "!!! The following checks were SKIPPED:"
     for skip in "${SKIPPED[@]}"; do
         echo "!!!   - $skip"
     done
     echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    echo ""
+    echo "ERROR: validate.sh is incomplete — ${#SKIPPED[@]} check(s) did not run,"
+    echo "       so this result says nothing about whether CI will pass."
+    exit 1
 fi
+
+echo ""
+echo "=== All checks passed ==="

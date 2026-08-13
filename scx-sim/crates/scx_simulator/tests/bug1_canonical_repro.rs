@@ -279,9 +279,32 @@ fn parse_token_after(line: &str, key: &str) -> Option<String> {
 // Whether is_throttled==1 is genuinely-correct new behavior (update assertion)
 // or a scxsim accounting gap vs the new period_budget semantics (fix engine) is
 // tracked in minibeads sim-560f79.
+// Ignored pending mb sim-560f79 / mb sim-1ei8j. This is a DOCUMENTED OPEN
+// QUESTION, not a silent skip: end-of-run is_throttled is 0 on a dev box and
+// 1 on CI for the same commit, fixture and flags.
+//
+// History, because it has moved twice: sim-560f79 recorded it as
+// deterministically 1 after the June cgroup_bw rewrite. It was un-ignored on
+// 2026-08-12 once integration 37f7f8a fixed check_watchdog reporting
+// deliberate bandwidth throttling as starvation, after which it passed 20/20
+// locally -- and CI could not contradict that, because the coverage gate was
+// dying in ld before any test ran. Fixing that (PR #81) let CI run it, and it
+// failed there.
+//
+// Ruled out by experiment: host CPU count (316/4/2 via taskset), ASLR (on and
+// off), and repetition (20 runs) -- 0 every time locally. Remaining hypothesis
+// is toolchain codegen (CI: rustc 1.97.1 + Ubuntu clang; dev: 1.96.0 + clang
+// 18.1.8), which would make it kin to the upstream match_substr uninitialised
+// read (mb sim-hyr11). Not confirmed.
+//
+// The stack-address garbage in the CI dump's period/burst is a RED HERRING: an
+// upstream printf arity bug in one line of cbw_dump_cgroup_tree (mb sim-uv2ir),
+// diagnostic-only. The is_throttled value itself is printed by a separately
+// well-formed call and is trustworthy.
 #[test]
-#[ignore = "scx upstream cgroup_bw rewrite changed end-of-run throttle state; \
-            re-validate cpu-bw-stall-bug hypothesis — see mb sim-560f79"]
+#[ignore = "mb sim-560f79 / mb sim-1ei8j: end-of-run is_throttled is 0 on a \
+            dev box and 1 on CI for the same commit; open question, not a \
+            silent skip. Un-ignore when that is resolved."]
 fn test_bug1_canonical_subprocess_reproduces_throttle() {
     let _lock = common::setup_test();
 
@@ -387,7 +410,16 @@ fn test_bug1_canonical_subprocess_deterministic_10_reps() {
 // full per-SHA fingerprint matrix and methodology.)
 // ---------------------------------------------------------------------------
 
+// SKIP DISPOSITION: needs a per-SHA binary cache that neither CI nor a fresh
+// clone has. Until 2026-08-12 this was a plain #[test]: with
+// SCXSIM_BIN_CACHE_DIR unset it printed a "skipping" line, returned, and was
+// counted as PASSED — a test asserting nothing, indistinguishable from a real
+// pass in the suite total. #[ignore] makes that honest. Build the cache with
+// experiments/bug1_scx_version_matrix_20260512/build_per_hash.sh, point
+// SCXSIM_BIN_CACHE_DIR at it, and run with --run-ignored all.
 #[test]
+#[ignore = "requires a per-SHA libscx_lavd.so cache via SCXSIM_BIN_CACHE_DIR \
+            (build_per_hash.sh); absent in CI and in a fresh clone"]
 fn test_bug1_canonical_per_sha_discrimination() {
     let _lock = common::setup_test();
 

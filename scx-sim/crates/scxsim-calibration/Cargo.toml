@@ -1,0 +1,13 @@
+[package]
+name = "scxsim-calibration"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Defines what it means for the simulator to agree with a live VM run, and measures it: metrics, pre-registered tolerances, verdicts, and gap tracking over time"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+scxsim-workload-ir = { path = "../scxsim-workload-ir" }
+
+[dev-dependencies]
+serde_json = "1"

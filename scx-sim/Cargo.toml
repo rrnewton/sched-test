@@ -5,7 +5,10 @@ members = [
     "crates/scx_cgroup_tree",
     "crates/scxsim-build",
     "crates/embed_harness",
+    "crates/scxsim-workload-ir",
+    "crates/scxsim-calibration",
 ]
+exclude = ["crates/scx_layered_growth"]
 resolver = "2"
 
 [profile.release]

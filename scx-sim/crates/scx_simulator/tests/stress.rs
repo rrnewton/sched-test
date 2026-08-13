@@ -330,7 +330,10 @@ fn contention_scenario(rng: &mut Rng, nr_cpus: u32) -> Scenario {
 /// This test is ignored by default - run with `cargo test -- --ignored` or
 /// via `./bug_finding/stress.sh`.
 #[test]
-#[ignore]
+#[ignore = "long-running randomised fuzzer, not a deterministic regression \
+            test; driven by ./bug_finding/stress.sh with an explicit seed \
+            sweep. Run: cargo nextest run --run-ignored all -E \
+            'test(stress_random_lavd)'"]
 fn stress_random_lavd() {
     let _lock = common::setup_test();
     let seed = get_seed();
@@ -381,7 +384,10 @@ fn stress_random_lavd() {
 /// This test is ignored by default - run with `cargo test -- --ignored` or
 /// via `./bug_finding/stress.sh`.
 #[test]
-#[ignore]
+#[ignore = "long-running randomised fuzzer, not a deterministic regression \
+            test; driven by ./bug_finding/stress.sh with an explicit seed \
+            sweep. Run: cargo nextest run --run-ignored all -E \
+            'test(stress_random_mitosis)'"]
 fn stress_random_mitosis() {
     let _lock = common::setup_test();
     let seed = get_seed();
@@ -430,7 +436,10 @@ fn stress_random_mitosis() {
 /// This test is ignored by default - run with `cargo test -- --ignored` or
 /// via `./bug_finding/stress.sh`.
 #[test]
-#[ignore]
+#[ignore = "long-running randomised fuzzer, not a deterministic regression \
+            test; driven by ./bug_finding/stress.sh with an explicit seed \
+            sweep. Run: cargo nextest run --run-ignored all -E \
+            'test(stress_random_simple)'"]
 fn stress_random_simple() {
     let _lock = common::setup_test();
     let seed = get_seed();

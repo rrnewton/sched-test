@@ -428,7 +428,12 @@ const SCX_WAKE_SYNC: u64 = 16;
 const SCX_DEQ_SLEEP: u64 = 1;
 
 /// Tick interval in nanoseconds (4ms, matching HZ=250).
-const TICK_INTERVAL_NS: TimeNs = 4_000_000;
+///
+/// `kfuncs::CONFIG_HZ` and `kfuncs::ns_to_jiffies` derive the simulated
+/// jiffies rate from this, so schedulers that read `p->scx.runnable_at` or
+/// call `bpf_jiffies64()` observe a tick rate consistent with the ticks the
+/// engine actually delivers.
+pub(crate) const TICK_INTERVAL_NS: TimeNs = 4_000_000;
 
 /// Maximum dispatch loop iterations (matches kernel SCX_DSP_MAX_LOOPS).
 /// TODO(sim-b825e): Use this to implement dispatch loop exhaustion detection.
@@ -648,6 +653,12 @@ pub(crate) enum EventKind {
     /// dispatch to the right callback. Single-timer schedulers (mitosis,
     /// cosmos, the legacy LAVD path) all use `slot = 0`.
     TimerFired { cpu: CpuId, slot: u8 },
+    /// One iteration of an enabled scheduler userspace control loop.
+    ///
+    /// This is not a kernel scheduler callback: it models the userspace half
+    /// of hybrid schedulers such as scx_layered, including their BPF_PROG_RUN
+    /// configuration refresh. `cpu` supplies the syscall execution context.
+    UserspaceControl { cpu: CpuId },
     /// Periodic scheduler tick on a CPU.
     Tick { cpu: CpuId },
     /// A CPU goes offline (hotplug remove).
@@ -668,6 +679,16 @@ pub(crate) enum EventKind {
         pid: Pid,
         from_cgroup: String,
         to_cgroup: String,
+        cpu: CpuId,
+    },
+    /// A task renames itself (`prctl(PR_SET_NAME)`).
+    ///
+    /// `cpu` is the CPU where the rename is initiated. In the kernel,
+    /// `__set_task_comm()` runs in process context on the renaming task's
+    /// CPU, and fires the `task_rename` BTF tracepoint.
+    TaskRename {
+        pid: Pid,
+        new_comm: String,
         cpu: CpuId,
     },
     /// A cgroup is created at runtime.
@@ -1443,6 +1464,9 @@ impl<S: Scheduler> Simulator<S> {
         // registered during scheduler setup() which happens before run_internal().
         // Clearing maps here would break map lookups in the scheduler.
         ffi::reset_task_state();
+        // ops.dump output accumulates in a thread-local; start each run empty
+        // so a test reads only its own dump.
+        kfuncs::dump_buffer_reset();
 
         let nr_cpus = scenario.nr_cpus;
         let smt = scenario.smt_threads_per_core;
@@ -1734,6 +1758,16 @@ impl<S: Scheduler> Simulator<S> {
             });
             charge_sched_time(&mut s.sim, CpuId(0), "init");
             assert!(rc == 0, "scheduler init failed with rc={rc}");
+
+            // Userspace-side post-attach step, for schedulers that have one.
+            // scx_tickless arms its periodic timer from a syscall program its
+            // Rust userspace calls right after ops.init; without this the
+            // timer is created and never started (mb sim-rq117). No-op for
+            // schedulers that do not export the hook.
+            sim_callback!(s, s, sim_arc, cpu, {
+                self.scheduler.post_init();
+            });
+            charge_sched_time(&mut s.sim, CpuId(0), "post_init");
         }
 
         // Call cgroup_init for each cgroup (root first, then children in order).
@@ -1981,6 +2015,14 @@ impl<S: Scheduler> Simulator<S> {
             }
         }
 
+        // Seed an optional scheduler userspace loop. Production scx_layered
+        // defaults to 100ms; the scheduler configuration owns the period so
+        // non-hybrid schedulers add no events at all.
+        if let Some(period_ns) = self.scheduler.userspace_control_period_ns() {
+            s.events
+                .push(period_ns, EventKind::UserspaceControl { cpu: CpuId(0) });
+        }
+
         // Schedule initial TaskWake events for all tasks
         for def in &scenario.tasks {
             // Initial wakes have no waker; use the task's initial prev_cpu
@@ -2029,6 +2071,18 @@ impl<S: Scheduler> Simulator<S> {
                     pid: me.pid,
                     from_cgroup: me.from_cgroup.clone(),
                     to_cgroup: me.to_cgroup.clone(),
+                    cpu: CpuId(0),
+                },
+            );
+        }
+
+        // Seed task rename events
+        for re in &scenario.task_rename_events {
+            s.events.push(
+                re.at_ns,
+                EventKind::TaskRename {
+                    pid: re.pid,
+                    new_comm: re.new_comm.clone(),
                     cpu: CpuId(0),
                 },
             );
@@ -2225,11 +2279,40 @@ impl<S: Scheduler> Simulator<S> {
         // Call exit_task for each task (mirrors kernel scheduler unload)
         {
             let cpu = s.sim.current_cpu;
-            let task_raws: Vec<(Pid, *mut c_void)> = shutdown_pids
+            let task_raws: Vec<(Pid, *mut c_void, bool)> = shutdown_pids
                 .iter()
-                .map(|&pid| (pid, s.tasks[&pid].raw()))
+                .map(|&pid| {
+                    let t = &s.tasks[&pid];
+                    (pid, t.raw(), t.enabled)
+                })
                 .collect();
-            for &(pid, raw) in &task_raws {
+            for &(pid, raw, enabled) in &task_raws {
+                // The kernel tears a task down as scx_disable_task() (which
+                // invokes ops.disable) followed by ops.exit_task. Keep that
+                // order: scx_layered's layered_disable() drops the task's
+                // layer membership that layered_exit_task() then frees.
+                //
+                // scx_disable_task() fires ops.disable only for a task in
+                // SCX_TASK_ENABLED — the state ops.enable moved it into.
+                // `enabled` is that bit here (set at the same point we call
+                // ops.enable). A task that never ran must NOT get a disable
+                // it was never enabled for: schedulers are entitled to
+                // assume the callbacks pair, and layered_disable() would be
+                // dropping layer membership that layered_enable() never
+                // established.
+                if enabled {
+                    debug!(pid = pid.0, "enter:structop disable");
+                    start_rbc(&mut s.sim);
+                    let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
+                    sim_callback!(s, s, sim_arc, cpu, {
+                        self.scheduler.disable(TaskPtr::new(raw));
+                    });
+                    s.sim
+                        .trace
+                        .record(__local_t, cpu, TraceKind::Disable { pid });
+                    charge_sched_time(&mut s.sim, CpuId(0), "disable");
+                }
+
                 debug!(pid = pid.0, "enter:structop exit_task");
                 start_rbc(&mut s.sim);
                 let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
@@ -2514,7 +2597,9 @@ impl<S: Scheduler> Simulator<S> {
             | EventKind::StartRunning { cpu, .. }
             | EventKind::KickDelivered { cpu, .. }
             | EventKind::TimerFired { cpu, .. }
+            | EventKind::UserspaceControl { cpu }
             | EventKind::CgroupMigrate { cpu, .. }
+            | EventKind::TaskRename { cpu, .. }
             | EventKind::CgroupCreate { cpu, .. }
             | EventKind::CgroupDestroy { cpu, .. } => {
                 s.sim.advance_cpu_clock(*cpu);
@@ -2549,6 +2634,11 @@ impl<S: Scheduler> Simulator<S> {
             EventKind::TimerFired { cpu, slot } => {
                 drop(guard);
                 self.handle_timer_fired(cpu, slot, sim_arc, monitor);
+                guard = sim_arc.lock().unwrap();
+            }
+            EventKind::UserspaceControl { cpu } => {
+                drop(guard);
+                self.handle_userspace_control(cpu, sim_arc);
                 guard = sim_arc.lock().unwrap();
             }
             EventKind::Tick { cpu } => {
@@ -2595,6 +2685,11 @@ impl<S: Scheduler> Simulator<S> {
             } => {
                 drop(guard);
                 self.handle_cgroup_migrate(pid, &from_cgroup, &to_cgroup, sim_arc, monitor);
+                guard = sim_arc.lock().unwrap();
+            }
+            EventKind::TaskRename { pid, new_comm, cpu } => {
+                drop(guard);
+                self.handle_task_rename(pid, &new_comm, cpu, sim_arc);
                 guard = sim_arc.lock().unwrap();
             }
             EventKind::CgroupCreate { event, .. } => {
@@ -2832,6 +2927,26 @@ impl<S: Scheduler> Simulator<S> {
             let s = &mut *guard;
             flush_staged_events(&mut s.sim, &mut s.events);
         }
+    }
+
+    /// Run one userspace control iteration and maintain its periodic chain.
+    fn handle_userspace_control(&self, cpu: CpuId, sim_arc: &SimArc) {
+        let mut guard = sim_arc.lock().unwrap();
+        let s = &mut *guard;
+        let period_ns = self
+            .scheduler
+            .userspace_control_period_ns()
+            .expect("userspace control event without an enabled loop");
+        s.events.push(
+            s.sim.clock.saturating_add(period_ns),
+            EventKind::UserspaceControl { cpu },
+        );
+
+        let rc;
+        sim_callback!(s, guard, sim_arc, cpu, {
+            rc = self.scheduler.userspace_control();
+        });
+        assert_eq!(rc, 0, "scheduler userspace control iteration failed: {rc}");
     }
 
     /// Handle a periodic scheduler tick on a CPU.
@@ -3113,6 +3228,34 @@ impl<S: Scheduler> Simulator<S> {
         self.try_dispatch_and_run(cpu, sim_arc, monitor);
     }
 
+    /// Handle a task rename (`prctl(PR_SET_NAME)`).
+    ///
+    /// The kernel's `__set_task_comm()` writes the new name into `p->comm`
+    /// and then fires the `task_rename` BTF tracepoint. Both halves matter:
+    /// a scheduler that classifies by name needs the new `comm` visible
+    /// *before* it is told to re-classify (scx_layered's `tp_task_rename`
+    /// sets `refresh_layer`, and the re-match reads `p->comm`).
+    fn handle_task_rename(&self, pid: Pid, new_comm: &str, cpu: CpuId, sim_arc: &SimArc) {
+        let mut guard = sim_arc.lock().unwrap();
+        let s = &mut *guard;
+        let raw = match s.tasks.get(&pid) {
+            Some(t) => t.raw(),
+            None => return,
+        };
+        info!(pid = pid.0, comm = new_comm, "TASK RENAME");
+
+        let comm = std::ffi::CString::new(new_comm).unwrap_or_default();
+        ffi::task_set_comm(raw, &comm);
+
+        start_rbc(&mut s.sim);
+        sim_callback!(s, guard, sim_arc, cpu, {
+            self.scheduler.tp_task_rename(TaskPtr::new(raw), &comm);
+        });
+        let s = &mut *guard;
+        charge_sched_time(&mut s.sim, cpu, "tp_task_rename");
+        flush_staged_events(&mut s.sim, &mut s.events);
+    }
+
     /// Handle a cgroup migration: move a task between cgroups.
     ///
     /// In the kernel, this is triggered by writing a PID to cgroup.procs.
@@ -3198,6 +3341,19 @@ impl<S: Scheduler> Simulator<S> {
             },
         );
         charge_sched_time(&mut s.sim, cpu, "cgroup_move");
+
+        // The kernel also fires the `cgroup_attach_task` BTF tracepoint here.
+        // Schedulers whose grouping follows the DEFAULT cgroup hierarchy
+        // rather than the CPU controller hook that instead of ops.cgroup_move
+        // (scx_layered does), so a scheduler that only sees cgroup_move would
+        // never re-evaluate membership on a migration.
+        let to_path = std::ffi::CString::new(to_name).unwrap_or_default();
+        sim_callback!(s, guard, sim_arc, cpu, {
+            self.scheduler
+                .tp_cgroup_attach_task(TaskPtr::new(to_raw), &to_path, TaskPtr::new(raw));
+        });
+        let s = &mut *guard;
+        charge_sched_time(&mut s.sim, cpu, "tp_cgroup_attach_task");
 
         // --- sched_change_end: re-enqueue if was queued ---
         if was_queued {
@@ -3631,6 +3787,10 @@ impl<S: Scheduler> Simulator<S> {
             // Only set if not already set (kernel semantics: only reset when task runs).
             if task.runnable_at_ns.is_none() {
                 task.runnable_at_ns = Some(s.sim.clock);
+                // Mirror it into `p->scx.runnable_at` the way the kernel's
+                // scx_runnable() does, in JIFFIES. Schedulers read the field
+                // directly to measure queueing delay (scx_layered antistall).
+                ffi::task_set_runnable_at(task.raw(), ffi::ns_to_jiffies(s.sim.clock));
             }
         }
 
@@ -3953,8 +4113,20 @@ impl<S: Scheduler> Simulator<S> {
         let original_slice = task.get_slice();
 
         // Advance to the next phase
-        let has_next = task.advance_phase();
-        let next_phase = task.current_phase().cloned();
+        let mut has_next = task.advance_phase();
+        let mut next_phase = task.current_phase().cloned();
+
+        // A `Phase::Yield` is instantaneous: the task calls sched_yield() and
+        // stays runnable. Consume every consecutive Yield here and remember
+        // that we owe the scheduler an ops.yield call, which the kernel makes
+        // from yield_task_scx() BEFORE the task is put back (i.e. before
+        // ops.stopping).
+        let mut nr_yields = 0u32;
+        while has_next && matches!(next_phase, Some(Phase::Yield)) {
+            nr_yields += 1;
+            has_next = task.advance_phase();
+            next_phase = task.current_phase().cloned();
+        }
 
         // Stop the running task
         let still_runnable = has_next && matches!(next_phase, Some(Phase::Run(_)));
@@ -3975,6 +4147,44 @@ impl<S: Scheduler> Simulator<S> {
         // Set slice to reflect consumed time (used by stopping() for vtime)
         let remaining_slice = original_slice.saturating_sub(time_consumed);
         crate::ffi::task_set_slice(raw, remaining_slice);
+
+        // sched_yield(): the kernel runs yield_task_scx() -> ops.yield on the
+        // *current* task, after its runtime has been accounted and before it
+        // is put back (ops.stopping). Delivered here so the callback sees the
+        // real remaining slice and its own write to `p->scx.slice` (scx_layered
+        // deducts `yield_step_ns`) survives into ops.stopping.
+        for _ in 0..nr_yields {
+            // Re-borrow per iteration: `sim_callback!` drops and re-acquires
+            // `guard`, so a borrow taken outside the loop cannot span it.
+            let s = &mut *guard;
+            set_ops_context(&mut s.sim, OpsContext::None);
+            debug!(pid = pid.0, "enter:structop yield");
+            start_rbc(&mut s.sim);
+            let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
+            #[allow(unused_assignments)]
+            let mut ret = None;
+            sim_callback!(s, guard, sim_arc, cpu, {
+                ret = self
+                    .scheduler
+                    .task_yield(TaskPtr::new(raw), OptionalPtr::null());
+            });
+            let s = &mut *guard;
+            let handled = ret.is_some();
+            if !handled {
+                // Kernel fallback: yield_task_scx() zeroes the slice ONLY
+                // when the scheduler has no ops.yield. When it does, the
+                // callback's return value is discarded for a plain
+                // sched_yield() — so a scheduler that returns false (as
+                // scx_layered always does) must not have its slice zeroed
+                // behind its back.
+                crate::ffi::task_set_slice(raw, 0);
+            }
+            s.sim
+                .trace
+                .record(__local_t, cpu, TraceKind::TaskYield { pid, handled });
+            charge_sched_time(&mut s.sim, cpu, "yield");
+        }
+        let s = &mut *guard;
 
         // Update sum_exec_runtime: task consumed time_consumed ns on-CPU
         {
@@ -4090,6 +4300,12 @@ impl<S: Scheduler> Simulator<S> {
             info!(task = task_name.as_str(), pid = pid.0, "COMPLETED");
         } else {
             match next_phase {
+                // Consumed by the `nr_yields` loop above, which only exits
+                // with a non-Yield phase or with `has_next == false` (handled
+                // by the `if` branch). Assert rather than silently ignore.
+                Some(Phase::Yield) => unreachable!(
+                    "Phase::Yield should have been consumed before dispatching next_phase"
+                ),
                 Some(Phase::Sleep(sleep_ns)) => {
                     let task = s.tasks.get_mut(&pid).unwrap();
                     task.state = TaskState::Sleeping;
@@ -4169,6 +4385,22 @@ impl<S: Scheduler> Simulator<S> {
                         // Process chained Wake phases (e.g. wake A, wake B, run)
                         loop {
                             match task.current_phase() {
+                                // A Yield reached from the wake chain has no
+                                // running slice to forfeit — the task is
+                                // already off-CPU here. ops.yield is only
+                                // delivered for a Yield that directly follows
+                                // a Run (see the `nr_yields` loop above).
+                                Some(Phase::Yield) => {
+                                    if !task.advance_phase() {
+                                        task.state = TaskState::Exited;
+                                        s.sim.trace.record(
+                                            local_t,
+                                            cpu,
+                                            TraceKind::TaskCompleted { pid },
+                                        );
+                                        break;
+                                    }
+                                }
                                 Some(Phase::Wake(next_target)) => {
                                     let next_target = *next_target;
                                     s.events.push(
@@ -4775,7 +5007,25 @@ impl<S: Scheduler> Simulator<S> {
         let cross_llc = migrated
             && s.sim.cpus[task.prev_cpu.0 as usize].llc_id != s.sim.cpus[cpu.0 as usize].llc_id;
         task.prev_cpu = cpu;
-        // Clear runnable_at_ns: task is now running (watchdog reset).
+        // Task is now running. `runnable_at_ns == None` is this engine's
+        // SCX_TASK_RESET_RUNNABLE_AT: the next transition to runnable stamps
+        // a fresh time rather than keeping the old one.
+        //
+        // `p->scx.runnable_at` is deliberately NOT written here. The kernel
+        // does not clear it either — `set_next_task_scx()` calls
+        // `clr_task_runnable(p, true)`, which only sets
+        // SCX_TASK_RESET_RUNNABLE_AT and leaves the field holding the past
+        // jiffies at which this run episode became runnable
+        // (kernel/sched/ext: clr_task_runnable / set_task_runnable). What
+        // stops the timeout watchdog seeing a running task as stalled is the
+        // `list_del_init()` off rq->scx.runnable_list, not a sentinel value.
+        //
+        // The value matters: scx_layered's `get_delay_sec()` computes
+        // `(jiffies_now - runnable_at) / CONFIG_HZ` whenever
+        // `time_before(runnable_at, jiffies_now)`. Writing 0 here made every
+        // running task report a delay of the entire uptime; writing
+        // (u64)-1 would make it report none. Leaving the real past stamp is
+        // what yields the true wakeup-to-run latency the kernel exposes.
         task.runnable_at_ns = None;
         s.sim.cpus[cpu.0 as usize].current_task = Some(pid);
         s.sim.cpus[cpu.0 as usize].prev_task = None;
@@ -4831,6 +5081,25 @@ impl<S: Scheduler> Simulator<S> {
                 .trace
                 .record(__local_t, cpu, TraceKind::Enable { pid });
             charge_sched_time(&mut s.sim, cpu, "enable");
+
+            // The kernel's scx_enable_task() publishes the task's weight to
+            // the scheduler immediately after ops.enable. Schedulers that
+            // implement ops.set_weight (scx_layered) never see the weight
+            // otherwise, because the simulator has no nice(2) primitive to
+            // drive reweight_task_scx().
+            let weight = ffi::task_get_scx_weight(raw);
+            set_ops_context(&mut s.sim, OpsContext::Enable);
+            debug!(pid = pid.0, weight, "enter:structop set_weight");
+            start_rbc(&mut s.sim);
+            let __local_t = s.sim.cpus[cpu.0 as usize].local_clock;
+            sim_callback!(s, guard, sim_arc, cpu, {
+                self.scheduler.set_weight(TaskPtr::new(raw), weight);
+            });
+            let s = &mut *guard;
+            s.sim
+                .trace
+                .record(__local_t, cpu, TraceKind::SetWeight { pid, weight });
+            charge_sched_time(&mut s.sim, cpu, "set_weight");
         }
 
         // Call running
@@ -5010,7 +5279,14 @@ impl<S: Scheduler> Simulator<S> {
                         return;
                     }
                 }
-                Some(Phase::Sleep(_)) => {
+                // Sleep is already satisfied by the time we get here (this
+                // runs on the wake path). Yield is instantaneous and only has
+                // an effect while the task is on-CPU — a Yield reached from
+                // here (e.g. first phase, or straight after a Sleep) has no
+                // running slice to forfeit, so it is simply skipped. Yields
+                // that follow a Run are delivered to ops.yield in
+                // `handle_task_phase_complete`.
+                Some(Phase::Sleep(_)) | Some(Phase::Yield) => {
                     if !task.advance_phase() {
                         task.state = TaskState::Exited;
                         sim.trace.record(

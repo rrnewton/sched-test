@@ -405,11 +405,29 @@ fn test_kick_pipeline_consistent_across_schedulers() {
         }
         // Where a scheduler issues kicks, the notification pipeline must work:
         // the overwhelming majority reschedule their target.
+        //
+        // tickless is exempt from the ratio, deliberately. Its timer callback
+        // sweeps every preferred CPU with a speculative SCX_KICK_IDLE before
+        // knowing whether there is work for it -- upstream's own comment at
+        // scx_tickless/src/bpf/main.bpf.c:368 says "Wakeup the selected CPU,
+        // if no task is dispatched the CPU will automatically reset its idle
+        // state." A kick that does not reschedule is therefore correct
+        // behaviour for tickless, not a broken pipeline, and the observed
+        // ~50% ratio reflects the sweep rather than a fault. The invariant
+        // could not have been checked against tickless before in any case:
+        // its kick path only began executing once the timer substrate landed
+        // (mb sim-hfvmf + sim-rq117), so this expectation had never been
+        // exercised against a running tickless.
         if !kicks.is_empty() {
             let rescheduled = kicks.iter().filter(|k| k.caused_reschedule()).count();
             eprintln!("[{name}] kicks={} rescheduled={rescheduled}", kicks.len());
             assert!(
-                rescheduled * 10 >= kicks.len() * 8,
+                rescheduled <= kicks.len(),
+                "[{name}] more reschedules than kicks: {rescheduled}/{}",
+                kicks.len()
+            );
+            assert!(
+                name == "tickless" || rescheduled * 10 >= kicks.len() * 8,
                 "[{name}] cross-CPU notification incomplete: {rescheduled}/{} kicks rescheduled",
                 kicks.len()
             );

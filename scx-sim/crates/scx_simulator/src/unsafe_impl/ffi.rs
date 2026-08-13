@@ -11,6 +11,10 @@
 
 use std::ffi::c_void;
 use std::path::Path;
+use std::sync::Mutex;
+
+use crate::layered::LayerSpec;
+use crate::layered_control::{LayeredControl, LayeredControlSnapshot};
 
 // ---------------------------------------------------------------------------
 // task_struct accessors (implemented in csrc/sim_task.c)
@@ -49,6 +53,10 @@ extern "C" {
     pub fn sim_task_get_cpus_ptr(p: *mut c_void) -> *const c_void;
     pub fn sim_task_get_scx_flags(p: *mut c_void) -> u32;
     pub fn sim_task_set_scx_flags(p: *mut c_void, flags: u32);
+
+    // p->scx.runnable_at, in JIFFIES (kernel scx_runnable/scx_running semantics)
+    pub fn sim_task_get_runnable_at(p: *mut c_void) -> u64;
+    pub fn sim_task_set_runnable_at(p: *mut c_void, jiffies: u64);
 
     // Execution time accounting (se.sum_exec_runtime)
     pub fn sim_task_get_sum_exec_runtime(p: *mut c_void) -> u64;
@@ -93,6 +101,7 @@ extern "C" {
     pub fn sim_cgroup_alloc(cgid: u64, level: u32, parent: *mut c_void) -> *mut c_void;
     pub fn sim_cgroup_free(cgrp: *mut c_void);
     pub fn sim_cgroup_get_kn_id(cgrp: *mut c_void) -> u64;
+    pub fn sim_cgroup_set_name(cgrp: *mut c_void, name: *const i8);
     pub fn sim_cgroup_set_cpuset(cgrp: *mut c_void, cpus: *const u32, nr_cpus: u32);
     pub fn sim_task_set_cgroup(p: *mut c_void, cgrp: *mut c_void);
     pub fn sim_task_get_cgroup(p: *mut c_void) -> *mut c_void;
@@ -128,6 +137,9 @@ extern "C" {
     // persist in the main binary across simulation runs.
     pub fn sim_task_reset();
     pub fn sim_sdt_reset();
+    /// Freeze everything allocated so far as scheduler-lifetime state, so
+    /// the per-run arena reset does not reclaim it. See csrc/sim_arena.h.
+    pub fn sim_arena_mark_persistent();
 
     // BPF map registry reset (implemented in scx_test_map.c).
     // Clears the thread-local map registration arrays to prevent
@@ -242,6 +254,34 @@ pub fn task_get_sum_exec_runtime(raw: *mut c_void) -> u64 {
     unsafe { sim_task_get_sum_exec_runtime(raw) }
 }
 
+/// Convert a simulated nanosecond timestamp to jiffies.
+///
+/// Re-exported here so `safe/` callers (which cannot `use` the
+/// `unsafe_impl::kfuncs` module directly in an `unsafe` context) get the same
+/// conversion the C side sees via `bpf_jiffies64()`.
+pub fn ns_to_jiffies(ns: crate::types::TimeNs) -> u64 {
+    crate::kfuncs::ns_to_jiffies(ns)
+}
+
+/// Set `p->scx.runnable_at` (in JIFFIES) on a raw task_struct.
+///
+/// Mirrors the kernel: `scx_runnable()` stamps the current jiffies,
+/// `scx_running()` clears it. Schedulers read the field to measure how long a
+/// task has been queued.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn task_set_runnable_at(raw: *mut c_void, jiffies: u64) {
+    // SAFETY: The caller guarantees `raw` is a valid task_struct pointer.
+    unsafe { sim_task_set_runnable_at(raw, jiffies) }
+}
+
+/// Get `p->scx.weight` from a raw task_struct — the weight the kernel hands
+/// to `ops.set_weight`.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn task_get_scx_weight(raw: *mut c_void) -> u32 {
+    // SAFETY: The caller guarantees `raw` is a valid task_struct pointer.
+    unsafe { sim_task_get_scx_weight(raw) }
+}
+
 /// Set the `mm` pointer on a raw task_struct.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn task_set_mm(raw: *mut c_void, mm: *mut c_void) {
@@ -255,6 +295,15 @@ pub fn task_set_mm(raw: *mut c_void, mm: *mut c_void) {
 pub fn task_set_real_parent(child: *mut c_void, parent: *mut c_void) {
     // SAFETY: Both pointers must be valid task_struct pointers.
     unsafe { sim_task_set_real_parent(child, parent) }
+}
+
+/// Set `p->comm` on a raw task_struct (truncated to 15 chars + NUL, as the
+/// kernel's `__set_task_comm()` does).
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn task_set_comm(raw: *mut c_void, comm: &std::ffi::CStr) {
+    // SAFETY: The caller guarantees `raw` is a valid task_struct pointer;
+    // `comm` is NUL-terminated and borrowed for the duration of the call.
+    unsafe { sim_task_set_comm(raw, comm.as_ptr()) }
 }
 
 /// Set the cgroup pointer on a raw task_struct.
@@ -442,6 +491,35 @@ pub trait Scheduler {
     /// Calls into C code.
     unsafe fn fire_timer(&self, _slot: u32) {}
 
+    /// Run the scheduler's userspace-side post-attach setup, if it has any.
+    /// Optional.
+    ///
+    /// Some schedulers split attach across ops.init and a userspace step that
+    /// runs immediately after: scx_tickless arms its periodic BPF timer from
+    /// the `start_timer` SEC("syscall") program, which its Rust userspace
+    /// calls once ops.init has created the timers. Without an equivalent step
+    /// here the timer is initialised and never armed, so `sched_timerfn` never
+    /// fires and the scheduler's central mechanism does not run (mb
+    /// sim-rq117). A wrapper opts in by exporting `<prefix>_post_init`.
+    ///
+    /// # Safety
+    /// Calls into C code.
+    unsafe fn post_init(&self) {}
+
+    /// Period of a scheduler's userspace control loop, if enabled.
+    fn userspace_control_period_ns(&self) -> Option<u64> {
+        None
+    }
+
+    /// Run one userspace control-loop iteration. Optional.
+    ///
+    /// # Safety
+    /// Implementations may call scheduler BPF_PROG_RUN entry points in the
+    /// dynamically loaded scheduler library.
+    unsafe fn userspace_control(&self) -> i32 {
+        0
+    }
+
     /// Deliver a simulated futex transition to the scheduler's real futex
     /// hooks (`op` = FUTEX_* command, `ret` = observed syscall return).
     /// Returns the running task's scheduler flags for observation, or `-1`
@@ -463,6 +541,75 @@ pub trait Scheduler {
     /// # Safety
     /// Calls into C code. `p` must be a valid task_struct pointer.
     unsafe fn set_cpumask(&self, _p: *mut c_void, _cpumask: *const c_void) {}
+
+    /// A task called `sched_yield()` (ops.yield). Optional.
+    ///
+    /// Mirrors the kernel's `yield_task_scx()`: `to` is NULL for a plain
+    /// `sched_yield()` (the only form the simulator delivers today;
+    /// `yield_to()` is not modelled).
+    ///
+    /// Returns `None` when the scheduler has no `ops.yield`, in which case
+    /// the kernel zeroes `p->scx.slice` itself and the engine must do the
+    /// same. `Some(ret)` is the callback's return value; note that
+    /// `yield_task_scx()` DISCARDS it for a plain `sched_yield()` — it only
+    /// matters for `yield_to()`, which the simulator does not deliver. So a
+    /// scheduler returning `false` (scx_layered always does) must NOT have
+    /// its slice zeroed behind its back.
+    ///
+    /// # Safety
+    /// Calls into C code. `from` must be a valid task_struct pointer.
+    unsafe fn task_yield(&self, _from: *mut c_void, _to: *mut c_void) -> Option<bool> {
+        None
+    }
+
+    /// A task's weight changed (ops.set_weight). Optional.
+    ///
+    /// The kernel calls this from `scx_enable_task()` (once, with the task's
+    /// initial weight) and from `reweight_task_scx()` when nice changes.
+    ///
+    /// # Safety
+    /// Calls into C code. `p` must be a valid task_struct pointer.
+    unsafe fn set_weight(&self, _p: *mut c_void, _weight: u32) {}
+
+    /// Deliver the `tp_btf/cgroup_attach_task` BTF tracepoint. Optional.
+    ///
+    /// Not a `struct_ops` callback — schedulers whose grouping follows the
+    /// DEFAULT cgroup hierarchy rather than the CPU controller attach here
+    /// instead of using `ops.cgroup_move` (scx_layered does exactly this).
+    /// Resolved by the `<prefix>_tp_cgroup_attach_task` symbol, like
+    /// `futex_hook`; schedulers without it get the no-op default.
+    ///
+    /// # Safety
+    /// Calls into C code. `cgrp` and `leader` must be valid pointers and
+    /// `cgrp_path` a valid NUL-terminated string.
+    unsafe fn tp_cgroup_attach_task(
+        &self,
+        _cgrp: *mut c_void,
+        _cgrp_path: *const i8,
+        _leader: *mut c_void,
+    ) {
+    }
+
+    /// Deliver the `tp_btf/task_rename` BTF tracepoint. Optional.
+    ///
+    /// A rename can change which comm-based rule a task matches, so
+    /// scx_layered re-evaluates layer membership here.
+    ///
+    /// # Safety
+    /// Calls into C code. `p` must be a valid task_struct pointer and
+    /// `new_comm` a valid NUL-terminated string.
+    unsafe fn tp_task_rename(&self, _p: *mut c_void, _new_comm: *const i8) {}
+
+    /// A task is leaving SCX control (ops.disable). Optional.
+    ///
+    /// The kernel calls `scx_disable_task()` — and hence `ops.disable` —
+    /// immediately before `ops.exit_task` on the teardown path. Distinct from
+    /// `exit_task`: `disable` can also fire when a live task switches away
+    /// from the SCX class, which the simulator does not model.
+    ///
+    /// # Safety
+    /// Calls into C code. `p` must be a valid task_struct pointer.
+    unsafe fn disable(&self, _p: *mut c_void) {}
 
     /// Dump scheduler state for debugging (ops.dump). Optional.
     /// # Safety
@@ -688,6 +835,7 @@ type CpuReleaseFn = unsafe extern "C" fn(i32, *mut c_void);
 type ExitFn = unsafe extern "C" fn(*mut c_void);
 type SetupFn = unsafe extern "C" fn(u32);
 type FireTimerFn = unsafe extern "C" fn(u32);
+type PostInitFn = unsafe extern "C" fn();
 /// `<prefix>_futex_hook(op, ret) -> flags`: deliver a simulated futex
 /// transition to the scheduler's real futex hooks and return the running
 /// task's flags for observation. Only LAVD provides this.
@@ -696,6 +844,16 @@ type QuiescentFn = unsafe extern "C" fn(*mut c_void, u64);
 type DequeueFn = unsafe extern "C" fn(*mut c_void, u64);
 type TickFn = unsafe extern "C" fn(*mut c_void);
 type SetCpumaskFn = unsafe extern "C" fn(*mut c_void, *const c_void);
+/// `<prefix>_yield(from, to) -> bool` (ops.yield).
+type YieldFn = unsafe extern "C" fn(*mut c_void, *mut c_void) -> bool;
+/// `<prefix>_set_weight(p, weight)` (ops.set_weight).
+type SetWeightFn = unsafe extern "C" fn(*mut c_void, u32);
+/// `<prefix>_disable(p)` (ops.disable).
+type DisableFn = unsafe extern "C" fn(*mut c_void);
+/// `<prefix>_tp_cgroup_attach_task(cgrp, cgrp_path, leader)` — BTF tracepoint.
+type TpCgroupAttachTaskFn = unsafe extern "C" fn(*mut c_void, *const i8, *mut c_void);
+/// `<prefix>_tp_task_rename(p, new_comm)` — BTF tracepoint.
+type TpTaskRenameFn = unsafe extern "C" fn(*mut c_void, *const i8);
 type DumpFn = unsafe extern "C" fn(*mut c_void);
 type DumpTaskFn = unsafe extern "C" fn(*mut c_void, *mut c_void);
 type UpdateIdleFn = unsafe extern "C" fn(i32, bool);
@@ -828,11 +986,17 @@ struct SchedOps {
     cpu_release: Option<CpuReleaseFn>,
     exit: Option<ExitFn>,
     fire_timer: Option<FireTimerFn>,
+    post_init: Option<PostInitFn>,
     futex_op: Option<FutexHookFn>,
     quiescent: Option<QuiescentFn>,
     dequeue: Option<DequeueFn>,
     tick: Option<TickFn>,
     set_cpumask: Option<SetCpumaskFn>,
+    task_yield: Option<YieldFn>,
+    set_weight: Option<SetWeightFn>,
+    disable: Option<DisableFn>,
+    tp_cgroup_attach_task: Option<TpCgroupAttachTaskFn>,
+    tp_task_rename: Option<TpTaskRenameFn>,
     dump: Option<DumpFn>,
     dump_task: Option<DumpTaskFn>,
     update_idle: Option<UpdateIdleFn>,
@@ -994,6 +1158,18 @@ pub struct DynamicScheduler {
     prefix: String,
     /// Absolute path to the loaded `.so` file.
     so_path: String,
+    /// scx_layered's userspace-only state. `None` for every other scheduler.
+    layered_userspace: Mutex<Option<LayeredUserspaceState>>,
+}
+
+struct LayeredUserspaceState {
+    nr_cpus: u32,
+    cpus_per_llc: u32,
+    nr_llcs: u32,
+    nr_numa_nodes: u32,
+    threads_per_core: u32,
+    specs: Vec<LayerSpec>,
+    control: Option<LayeredControl>,
 }
 
 impl DynamicScheduler {
@@ -1160,6 +1336,17 @@ impl DynamicScheduler {
                 let setup_fn: SetupFn = *sym;
                 setup_fn(nr_cpus);
             }
+
+            // `<prefix>_setup()` runs once, here, and may allocate objects the
+            // scheduler holds for its whole lifetime -- tickless and cosmos
+            // both create their primary-CPU bpf_cpumask in it. Those come out
+            // of the deterministic bump arena, which is reset before every
+            // run. Marking the current watermark as persistent stops that
+            // reset from zeroing them and from handing the same bytes to the
+            // next run's allocations. Without it is_primary_cpu() was false
+            // for the entire run, so tickless never reached init_timer() and
+            // its whole timer path went unexecuted (mb sim-hfvmf).
+            sim_arena_mark_persistent();
         }
 
         // SAFETY: The library contains the expected ops symbols with
@@ -1170,6 +1357,15 @@ impl DynamicScheduler {
             ops,
             prefix: prefix.to_owned(),
             so_path: path.to_owned(),
+            layered_userspace: Mutex::new((prefix == "layered").then(|| LayeredUserspaceState {
+                nr_cpus,
+                cpus_per_llc: nr_cpus,
+                nr_llcs: 1,
+                nr_numa_nodes: 1,
+                threads_per_core: 1,
+                specs: vec![LayerSpec::catch_all("default")],
+                control: None,
+            })),
         };
         // Apply the definition's rodata (config globals) before run -- the
         // kernel-faithful analog of patching .rodata before BPF_PROG_LOAD, and
@@ -1238,6 +1434,273 @@ impl DynamicScheduler {
     pub fn mitosis(nr_cpus: u32) -> Self {
         let dir = env!("SCHEDULER_SO_DIR");
         Self::load(&format!("{dir}/libscx_mitosis.so"), "mitosis", nr_cpus)
+    }
+
+    /// Load the scx_layered scheduler, configured for `nr_cpus` CPUs.
+    ///
+    /// scx_layered partitions tasks into *layers* matched by comm / cgroup /
+    /// nice / pid rules, each with its own CPU set, slice, preemption policy
+    /// and per-(layer, LLC) DSQs.
+    ///
+    /// `layered_setup()` (called during load) establishes a flat topology —
+    /// one LLC, one NUMA node, no SMT — and a single catch-all OPEN layer, so
+    /// this constructor alone gives a runnable scheduler. That configuration
+    /// exercises very little of layered's actual policy; use
+    /// [`DynamicScheduler::layered_with_topology`] and
+    /// [`DynamicScheduler::layered_layers`] to build a multi-layer scheduler
+    /// on real topology.
+    ///
+    /// # Optional userspace control loop
+    /// CPU allocation remains static — a weight-proportional slice computed
+    /// once before `ops.init` — unless
+    /// [`DynamicScheduler::layered_enable_control_loop`] is called. The loop
+    /// reallocates live from measured usage on multi-LLC, multi-node and SMT
+    /// topologies, running upstream's own `alloc.rs` and
+    /// `layer_core_growth.rs`. Configurations it cannot honestly serve
+    /// (`CpuSetSpread*`, multi-LLC `StickyDynamic`, an explicitly pinned
+    /// layer) fail when enabling the loop rather than being approximated.
+    pub fn layered(nr_cpus: u32) -> Self {
+        let dir = env!("SCHEDULER_SO_DIR");
+        Self::load(&format!("{dir}/libscx_layered.so"), "layered", nr_cpus)
+    }
+
+    /// Load scx_layered on a topology matching the `Scenario`'s.
+    ///
+    /// The arguments must agree with the `Scenario` the simulator will run:
+    /// `cpus_per_llc` with [`ScenarioBuilder::cpus_per_llc`] and
+    /// `threads_per_core` with [`ScenarioBuilder::smt`]. The scheduler must
+    /// observe the same machine the engine simulates.
+    ///
+    /// `nr_numa_nodes` has no engine counterpart — scxsim models LLCs and SMT
+    /// siblings but has no NUMA concept and no inter-node distance cost — so
+    /// it is a harness-supplied grouping over LLCs that exists to exercise
+    /// layered's cross-node code paths. This mirrors the existing
+    /// [`DynamicScheduler::cosmos_with_numa`] precedent.
+    ///
+    /// [`ScenarioBuilder::cpus_per_llc`]: crate::scenario::ScenarioBuilder::cpus_per_llc
+    /// [`ScenarioBuilder::smt`]: crate::scenario::ScenarioBuilder::smt
+    pub fn layered_with_topology(
+        nr_cpus: u32,
+        cpus_per_llc: u32,
+        nr_numa_nodes: u32,
+        threads_per_core: u32,
+    ) -> Self {
+        assert!(nr_cpus > 0, "nr_cpus must be positive");
+        assert!(
+            cpus_per_llc == 0 || nr_cpus.is_multiple_of(cpus_per_llc),
+            "nr_cpus ({nr_cpus}) must be divisible by cpus_per_llc ({cpus_per_llc})"
+        );
+        assert!(
+            threads_per_core > 0 && nr_cpus.is_multiple_of(threads_per_core),
+            "nr_cpus ({nr_cpus}) must be divisible by threads_per_core ({threads_per_core})"
+        );
+        let cpus_per_llc = if cpus_per_llc == 0 {
+            nr_cpus
+        } else {
+            cpus_per_llc
+        };
+        assert!(
+            cpus_per_llc.is_multiple_of(threads_per_core),
+            "an SMT core may not cross an LLC boundary"
+        );
+        let sched = Self::layered(nr_cpus);
+        type SetTopologyFn = unsafe extern "C" fn(u32, u32, u32, u32) -> u32;
+        // SAFETY: Symbol resolved from a `.so` built by our build system.
+        let effective_nodes = unsafe {
+            let sym: libloading::Symbol<SetTopologyFn> = sched
+                ._lib
+                .get(b"layered_set_topology")
+                .expect("layered_set_topology not found");
+            (sym)(nr_cpus, cpus_per_llc, nr_numa_nodes, threads_per_core)
+        };
+        // The wrapper clamps the requested node count against MAX_NUMA_NODES
+        // and the LLC count, and returns what it actually published. Adopt
+        // that rather than re-deriving it here: the control loop indexes
+        // per-node usage arrays laid out by the wrapper, so two independent
+        // clamps would let us read a node partition the scheduler does not
+        // share — silently, and only on topologies large enough to trip the
+        // difference.
+        assert!(
+            effective_nodes > 0,
+            "layered_set_topology rejected nr_cpus={nr_cpus} (exceeds the \
+             wrapper's LAYERED_MAX_SIM_CPUS); no topology was published"
+        );
+        {
+            let mut userspace = sched.layered_userspace.lock().unwrap();
+            let state = userspace.as_mut().expect("layered userspace state missing");
+            state.cpus_per_llc = cpus_per_llc;
+            state.nr_llcs = nr_cpus.div_ceil(cpus_per_llc);
+            state.nr_numa_nodes = effective_nodes;
+            state.threads_per_core = threads_per_core;
+        }
+        sched
+    }
+
+    /// Replace scx_layered's default single catch-all layer with `specs`.
+    ///
+    /// Plays the role of scx_layered's userspace layer-config parsing: each
+    /// [`LayerSpec`] is published into the BPF `layers[]` array exactly as
+    /// `main.rs::init_layers()` does. Must be called after construction and
+    /// before `Simulator::run()`, because `ops.init` finalises the layer table.
+    ///
+    /// # Panics
+    /// Panics if `specs` is empty, exceeds `MAX_LAYERS` (16), or contains a
+    /// match kind the simulator cannot honestly configure (see
+    /// [`LayerMatch`]).
+    pub fn layered_layers(&self, specs: &[LayerSpec]) {
+        assert!(!specs.is_empty(), "need at least one layer");
+        type ResetFn = unsafe extern "C" fn();
+        type AddLayerFn = unsafe extern "C" fn(
+            *const i8,
+            i32,
+            i32,
+            i32,
+            i32,
+            u32,
+            u64,
+            u64,
+            u64,
+            i32,
+            i32,
+        ) -> i32;
+        type AddMatchFn = unsafe extern "C" fn(u32, u32, i32, *const i8, i64, i32) -> i32;
+        type SetNrOrsFn = unsafe extern "C" fn(u32, u32) -> i32;
+        type SetCpusFn = unsafe extern "C" fn(u32, *const u64, u32) -> i32;
+
+        // SAFETY: Symbols resolved from a `.so` built by our build system.
+        // Every string is kept alive across its call via the owned CString.
+        unsafe {
+            let reset: libloading::Symbol<ResetFn> = self
+                ._lib
+                .get(b"layered_reset_layers")
+                .expect("layered_reset_layers not found");
+            let add_layer: libloading::Symbol<AddLayerFn> = self
+                ._lib
+                .get(b"layered_add_layer")
+                .expect("layered_add_layer not found");
+            let add_match: libloading::Symbol<AddMatchFn> = self
+                ._lib
+                .get(b"layered_add_layer_match")
+                .expect("layered_add_layer_match not found");
+            let set_nr_ors: libloading::Symbol<SetNrOrsFn> = self
+                ._lib
+                .get(b"layered_set_layer_nr_match_ors")
+                .expect("layered_set_layer_nr_match_ors not found");
+            let set_cpus: libloading::Symbol<SetCpusFn> = self
+                ._lib
+                .get(b"layered_set_layer_cpus")
+                .expect("layered_set_layer_cpus not found");
+
+            (reset)();
+            for spec in specs {
+                let name = std::ffi::CString::new(spec.name.as_str())
+                    .expect("layer name must not contain NUL");
+                let id = (add_layer)(
+                    name.as_ptr(),
+                    spec.kind as i32,
+                    spec.preempt as i32,
+                    spec.preempt_first as i32,
+                    spec.exclusive as i32,
+                    spec.weight,
+                    spec.slice_ns,
+                    spec.min_exec_ns,
+                    spec.max_exec_ns,
+                    spec.growth_algo as i32,
+                    spec.protected as i32,
+                );
+                assert!(id >= 0, "layered_add_layer failed for {:?}", spec.name);
+                let id = id as u32;
+
+                for (or_id, ands) in spec.matches.iter().enumerate() {
+                    for m in ands {
+                        let (kind, s, i) = m.to_ffi();
+                        let cstr = s.map(|s| {
+                            std::ffi::CString::new(s).expect("match string must not contain NUL")
+                        });
+                        let ptr = cstr.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
+                        let rc = (add_match)(id, or_id as u32, kind, ptr, i, m.exclude() as i32);
+                        assert_eq!(rc, 0, "layered_add_layer_match({m:?}) failed with rc={rc}");
+                    }
+                }
+                // An OR group with zero AND rules is the catch-all; it has no
+                // match call to grow `nr_match_ors`, so publish the count
+                // explicitly or the layer would match nothing at all.
+                let rc = (set_nr_ors)(id, spec.matches.len() as u32);
+                assert_eq!(rc, 0, "layered_set_layer_nr_match_ors failed with rc={rc}");
+
+                if let Some(cpus) = &spec.cpus {
+                    let mut words = [0u64; 8];
+                    for c in cpus {
+                        words[(c.0 / 64) as usize] |= 1u64 << (c.0 % 64);
+                    }
+                    let rc = (set_cpus)(id, words.as_ptr(), words.len() as u32);
+                    assert_eq!(rc, 0, "layered_set_layer_cpus failed with rc={rc}");
+                }
+            }
+        }
+        let mut userspace = self.layered_userspace.lock().unwrap();
+        let state = userspace.as_mut().expect("layered userspace state missing");
+        state.specs = specs.to_vec();
+        state.control = None;
+    }
+
+    /// The node count the userspace control loop indexes its per-node usage
+    /// arrays by.
+    ///
+    /// Must equal `LayeredProbes::nr_nodes()`, the count the scheduler itself
+    /// sees. They are the same number by construction — this returns what
+    /// [`Self::layered_with_topology`] adopted from the wrapper — and
+    /// `control_loop_and_scheduler_agree_on_the_node_partition` holds it
+    /// there.
+    ///
+    /// # Panics
+    /// Panics if this is not an scx_layered scheduler.
+    pub fn layered_nr_numa_nodes(&self) -> u32 {
+        let userspace = self.layered_userspace.lock().unwrap();
+        userspace
+            .as_ref()
+            .expect("not an scx_layered scheduler")
+            .nr_numa_nodes
+    }
+
+    /// Enable scx_layered's periodic userspace CPU-reallocation loop.
+    ///
+    /// Core and node ordering execute upstream `layer_core_growth.rs`.
+    /// Algorithms needing unavailable substrate fail here rather than
+    /// silently running a different policy.
+    pub fn layered_enable_control_loop(&self, period_ns: u64) {
+        let mut userspace = self.layered_userspace.lock().unwrap();
+        let state = userspace.as_mut().expect("not an scx_layered scheduler");
+        state.control = Some(LayeredControl::new(
+            period_ns,
+            state.nr_cpus as usize,
+            state.cpus_per_llc as usize,
+            state.nr_numa_nodes as usize,
+            state.threads_per_core as usize,
+            state.specs.clone(),
+        ));
+    }
+
+    /// Configure scx_layered's antistall watchdog.
+    ///
+    /// `enable` and `sec` mirror the production `--disable-antistall` and
+    /// `--antistall-sec` options. `timer_interval_ns` overrides the antistall
+    /// scan period, which production hardcodes at 15s — shortening it is a
+    /// **simulation accelerator**, letting a test reach the scan without
+    /// simulating 15 seconds; pass `None` to keep the production interval.
+    ///
+    /// Must be called after construction and before `Simulator::run()`,
+    /// because `start_layered_timers()` reads the interval during `ops.init`.
+    pub fn layered_set_antistall(&self, enable: bool, sec: u64, timer_interval_ns: Option<u64>) {
+        type SetAntistallFn = unsafe extern "C" fn(i32, u64, u64);
+        // SAFETY: Symbol resolved from a `.so` built by our build system.
+        unsafe {
+            let sym: libloading::Symbol<SetAntistallFn> = self
+                ._lib
+                .get(b"layered_set_antistall")
+                .expect("layered_set_antistall not found");
+            (sym)(enable as i32, sec, timer_interval_ns.unwrap_or(0));
+        }
     }
 
     /// Load the scx_lavd scheduler, configured for `nr_cpus` CPUs.
@@ -1613,6 +2076,8 @@ impl DynamicScheduler {
             exit: try_get!("exit").map(|p| std::mem::transmute::<*const (), ExitFn>(p)),
             fire_timer: try_get!("fire_timer")
                 .map(|p| std::mem::transmute::<*const (), FireTimerFn>(p)),
+            post_init: try_get!("post_init")
+                .map(|p| std::mem::transmute::<*const (), PostInitFn>(p)),
             futex_op: try_get!("futex_hook")
                 .map(|p| std::mem::transmute::<*const (), FutexHookFn>(p)),
             quiescent: try_get!("quiescent")
@@ -1621,6 +2086,16 @@ impl DynamicScheduler {
             tick: try_get!("tick").map(|p| std::mem::transmute::<*const (), TickFn>(p)),
             set_cpumask: try_get!("set_cpumask")
                 .map(|p| std::mem::transmute::<*const (), SetCpumaskFn>(p)),
+            // `yield` is a Rust keyword, so the trait method is
+            // `task_yield`, but the C symbol keeps the upstream ops name.
+            task_yield: try_get!("yield").map(|p| std::mem::transmute::<*const (), YieldFn>(p)),
+            set_weight: try_get!("set_weight")
+                .map(|p| std::mem::transmute::<*const (), SetWeightFn>(p)),
+            disable: try_get!("disable").map(|p| std::mem::transmute::<*const (), DisableFn>(p)),
+            tp_cgroup_attach_task: try_get!("tp_cgroup_attach_task")
+                .map(|p| std::mem::transmute::<*const (), TpCgroupAttachTaskFn>(p)),
+            tp_task_rename: try_get!("tp_task_rename")
+                .map(|p| std::mem::transmute::<*const (), TpTaskRenameFn>(p)),
             dump: try_get!("dump").map(|p| std::mem::transmute::<*const (), DumpFn>(p)),
             dump_task: try_get!("dump_task")
                 .map(|p| std::mem::transmute::<*const (), DumpTaskFn>(p)),
@@ -1695,13 +2170,22 @@ impl DynamicScheduler {
             "stopping",
         ];
         // Optional ops — include only when present in the loaded .so
-        let optional: [(&str, bool); 21] = [
+        let optional: [(&str, bool); 27] = [
+            (
+                "tp_cgroup_attach_task",
+                self.ops.tp_cgroup_attach_task.is_some(),
+            ),
+            ("tp_task_rename", self.ops.tp_task_rename.is_some()),
+            ("yield", self.ops.task_yield.is_some()),
+            ("set_weight", self.ops.set_weight.is_some()),
+            ("disable", self.ops.disable.is_some()),
             ("enable", self.ops.enable.is_some()),
             ("runnable", self.ops.runnable.is_some()),
             ("init_task", self.ops.init_task.is_some()),
             ("cpu_release", self.ops.cpu_release.is_some()),
             ("exit", self.ops.exit.is_some()),
             ("fire_timer", self.ops.fire_timer.is_some()),
+            ("post_init", self.ops.post_init.is_some()),
             ("quiescent", self.ops.quiescent.is_some()),
             ("dequeue", self.ops.dequeue.is_some()),
             ("tick", self.ops.tick.is_some()),
@@ -1733,6 +2217,12 @@ impl DynamicScheduler {
 impl Scheduler for DynamicScheduler {
     unsafe fn init(&self) -> i32 {
         (self.ops.init)()
+    }
+
+    unsafe fn post_init(&self) {
+        if let Some(f) = self.ops.post_init {
+            f();
+        }
     }
 
     unsafe fn select_cpu(&self, p: *mut c_void, prev_cpu: i32, wake_flags: u64) -> i32 {
@@ -1812,6 +2302,110 @@ impl Scheduler for DynamicScheduler {
         }
     }
 
+    fn userspace_control_period_ns(&self) -> Option<u64> {
+        self.layered_userspace
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|state| state.control.as_ref().map(LayeredControl::period_ns))
+    }
+
+    unsafe fn userspace_control(&self) -> i32 {
+        type UsageFn = unsafe extern "C" fn(u32, u32) -> u64;
+        type NodeUsageFn = unsafe extern "C" fn(u32, u32) -> u64;
+        type HasCpuFn = unsafe extern "C" fn(u32, u32) -> i32;
+        type ApplyFn = unsafe extern "C" fn(*const u64, u32, u32) -> i32;
+        type SetGrowthDeniedFn = unsafe extern "C" fn(u32, u32, i32, u64);
+
+        let usage: libloading::Symbol<UsageFn> = self
+            ._lib
+            .get(b"layered_probe_layer_usage")
+            .expect("layered_probe_layer_usage not found");
+        let node_usage: libloading::Symbol<NodeUsageFn> = self
+            ._lib
+            .get(b"layered_probe_layer_node_usage")
+            .expect("layered_probe_layer_node_usage not found");
+        let node_pinned_usage: libloading::Symbol<NodeUsageFn> = self
+            ._lib
+            .get(b"layered_probe_layer_node_pinned_usage")
+            .expect("layered_probe_layer_node_pinned_usage not found");
+        let has_cpu: libloading::Symbol<HasCpuFn> = self
+            ._lib
+            .get(b"layered_probe_layer_has_cpu")
+            .expect("layered_probe_layer_has_cpu not found");
+        let apply: libloading::Symbol<ApplyFn> = self
+            ._lib
+            .get(b"layered_apply_layer_cpumasks")
+            .expect("layered_apply_layer_cpumasks not found");
+        let set_growth_denied: libloading::Symbol<SetGrowthDeniedFn> = self
+            ._lib
+            .get(b"layered_set_growth_denied")
+            .expect("layered_set_growth_denied not found");
+
+        let mut userspace = self.layered_userspace.lock().unwrap();
+        let state = userspace.as_mut().expect("not an scx_layered scheduler");
+        let nr_layers = state.specs.len();
+        let nr_cpus = state.nr_cpus as usize;
+        let nr_nodes = state.nr_numa_nodes as usize;
+        let control = state.control.as_mut().expect("layered control not enabled");
+        let snapshot = LayeredControlSnapshot {
+            usages: (0..nr_layers)
+                .map(|layer| [usage(layer as u32, 0), usage(layer as u32, 1)])
+                .collect(),
+            node_usages: (0..nr_layers)
+                .map(|layer| {
+                    (0..nr_nodes)
+                        .map(|node| node_usage(layer as u32, node as u32))
+                        .collect()
+                })
+                .collect(),
+            node_pinned_usages: (0..nr_layers)
+                .map(|layer| {
+                    (0..nr_nodes)
+                        .map(|node| node_pinned_usage(layer as u32, node as u32))
+                        .collect()
+                })
+                .collect(),
+            cpu_masks: (0..nr_layers)
+                .map(|layer| {
+                    (0..nr_cpus)
+                        .map(|cpu| has_cpu(layer as u32, cpu as u32) != 0)
+                        .collect()
+                })
+                .collect(),
+        };
+        let previous_masks = snapshot.cpu_masks.clone();
+        let update = control.step(snapshot);
+        let rc = if update.cpu_masks == previous_masks {
+            0
+        } else {
+            let nr_words = nr_cpus.div_ceil(64);
+            let mut words = vec![0u64; nr_layers * nr_words];
+            for (layer, mask) in update.cpu_masks.iter().enumerate() {
+                for (cpu, &set) in mask.iter().enumerate() {
+                    if set {
+                        words[layer * nr_words + cpu / 64] |= 1u64 << (cpu % 64);
+                    }
+                }
+            }
+            apply(words.as_ptr(), nr_layers as u32, nr_words as u32)
+        };
+        if rc != 0 {
+            return rc;
+        }
+        for layer in 0..nr_layers {
+            for node in 0..nr_nodes {
+                set_growth_denied(
+                    layer as u32,
+                    node as u32,
+                    update.growth_denied[layer][node] as i32,
+                    control.growth_denied_count(layer, node),
+                );
+            }
+        }
+        0
+    }
+
     unsafe fn futex_op(&self, op: i32, ret: i64) -> i64 {
         if let Some(f) = self.ops.futex_op {
             f(op, ret)
@@ -1841,6 +2435,39 @@ impl Scheduler for DynamicScheduler {
     unsafe fn set_cpumask(&self, p: *mut c_void, cpumask: *const c_void) {
         if let Some(f) = self.ops.set_cpumask {
             f(p, cpumask);
+        }
+    }
+
+    unsafe fn task_yield(&self, from: *mut c_void, to: *mut c_void) -> Option<bool> {
+        self.ops.task_yield.map(|f| f(from, to))
+    }
+
+    unsafe fn set_weight(&self, p: *mut c_void, weight: u32) {
+        if let Some(f) = self.ops.set_weight {
+            f(p, weight);
+        }
+    }
+
+    unsafe fn disable(&self, p: *mut c_void) {
+        if let Some(f) = self.ops.disable {
+            f(p);
+        }
+    }
+
+    unsafe fn tp_cgroup_attach_task(
+        &self,
+        cgrp: *mut c_void,
+        cgrp_path: *const i8,
+        leader: *mut c_void,
+    ) {
+        if let Some(f) = self.ops.tp_cgroup_attach_task {
+            f(cgrp, cgrp_path, leader);
+        }
+    }
+
+    unsafe fn tp_task_rename(&self, p: *mut c_void, new_comm: *const i8) {
+        if let Some(f) = self.ops.tp_task_rename {
+            f(p, new_comm);
         }
     }
 

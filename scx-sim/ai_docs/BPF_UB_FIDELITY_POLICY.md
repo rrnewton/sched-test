@@ -110,8 +110,8 @@ given. The objection is not "zeroing is more permissive than a rejecting
 verifier" — for the stack class the verifier does not reject. The objection is
 that zero substitutes **one plausible-looking value** for the kernel's
 unconstrained garbage, so a divergence looks like a correct answer. Zero
-**hides** this bug class. `-ftrivial-auto-var-init=pattern` is available in UB
-probe mode (below) precisely because it does the opposite: it makes a surviving
+**hides** this bug class. `-ftrivial-auto-var-init=pattern` is available under
+`SCX_SIM_UBSAN=1` (below) precisely because it does the opposite: it makes a surviving
 uninitialised read produce an obviously-bogus `0xAA..` value.
 
 ### 2. Division and modulo by zero
@@ -208,7 +208,7 @@ coverage flags, meaning the build configs disagreed about which UB was visible.
 |---|---|
 | *(default)* | `-Wconditional-uninitialized` on. SIGFPE handler active. Production-fidelity. |
 | `SCX_SIM_COVERAGE=1` | Adds `-fprofile-instr-generate -fcoverage-mapping`. Changes stack layout, so it changes *which* garbage an uninitialised read sees — this is why UB bugs are coverage-config-sensitive. |
-| `SCX_SIM_UB_PROBE=1` | Adds `-ftrivial-auto-var-init=pattern` and trapping UBSan for `integer-divide-by-zero`, `shift-exponent`, `signed-integer-overflow`. |
+| `SCX_SIM_UBSAN=1` | Adds `-fsanitize=undefined -fno-sanitize-recover=all` plus `-ftrivial-auto-var-init=pattern`. Originally drafted here as a separate `SCX_SIM_UB_PROBE=1` knob; it landed concurrently with `SCX_SIM_UBSAN=1` (two agents built a UB mode independently) and the two were folded into one. `SCX_SIM_UBSAN`'s sanitizer selection and linking work won; `=pattern` came from this side. |
 
 UB probe mode is **opt-in and never the default**, per Twin Design Principle 2:
 the default must match production, and the production kernel does not abort on
@@ -226,7 +226,7 @@ exclusion predates the policy; it is correct and is retained.
 Running probe mode:
 
 ```bash
-make -C schedulers SCX_SIM_UB_PROBE=1 BUILD_DIR=<dir> BPF_INCLUDE=<dir>
+make -C schedulers SCX_SIM_UBSAN=1 BUILD_DIR=<dir> BPF_INCLUDE=<dir>
 ```
 
 ---
@@ -273,7 +273,7 @@ Two further residual gaps are recorded rather than fixed:
 - **`sim-kykh4`** — the compiler-optimises-around-division problem, which no
   handler can fix, together with the `cosmos/config.mk` `sed` patch that guards
   one division site at source. Nobody has yet measured how many division sites
-  actually reach a zero divisor; running the suite under `SCX_SIM_UB_PROBE=1`
+  actually reach a zero divisor; running the suite under `SCX_SIM_UBSAN=1`
   is the first step.
 - **`sim-7rl9v`** — the upstream `match_substr` bug itself. Whether upstream
   layered's cgroup substring matching actually misbehaves in production is not
