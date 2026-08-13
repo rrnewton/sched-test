@@ -775,9 +775,14 @@ fn run(args: &RunArgs) -> Result<(), RunError> {
     }
     if let Some(rbc_ns) = args.rbc_ns {
         scenario.sched_overhead_rbc_ns = Some(rbc_ns);
+        // Asked for by name: a silent downgrade to another clock is an error,
+        // not a warning. See Scenario::rbc_explicitly_requested.
+        scenario.rbc_explicitly_requested = true;
     }
     if args.no_rbc {
         scenario.sched_overhead_rbc_ns = Some(0);
+        // --no-rbc asks for NO PMU, so it can never be downgraded; leave the
+        // explicit flag clear so it cannot trip the hard error.
     }
     if let Some(ref timeout) = args.watchdog_timeout {
         let normalized = timeout.trim().to_lowercase();
@@ -1187,12 +1192,19 @@ fn replay_simulation(args: &ReplayArgs) -> Result<(), String> {
     }
 
     // Print simulation summary.
+    //
+    // The clock line is unconditional: a result is not interpretable without
+    // knowing which of the three models advanced its time, and two results are
+    // only comparable when they match.
+    let mode = sim_trace.clock_mode();
     if args.verbose_summary {
         let stats = TraceStats::from_trace(&sim_trace);
         println!();
+        println!("clock: {} ({})", mode, mode.describe());
         stats.print_summary();
     } else {
         println!();
+        println!("clock: {} ({})", mode, mode.describe());
         println!("{}", sim_trace.summary());
     }
 
@@ -1411,12 +1423,19 @@ fn run_simulation(args: &RunArgs, scenario: Scenario) -> Result<(), RunError> {
     }
 
     // Print simulation summary.
+    //
+    // The clock line is unconditional: a result is not interpretable without
+    // knowing which of the three models advanced its time, and two results are
+    // only comparable when they match.
+    let mode = trace.clock_mode();
     if args.verbose_summary {
         let stats = TraceStats::from_trace(&trace);
         println!();
+        println!("clock: {} ({})", mode, mode.describe());
         stats.print_summary();
     } else {
         println!();
+        println!("clock: {} ({})", mode, mode.describe());
         println!("{}", trace.summary());
     }
 

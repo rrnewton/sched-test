@@ -312,6 +312,22 @@ pub struct CalibrationRun {
     pub ktstr_commit: String,
     pub results: Vec<MetricResult>,
     pub negative_control: Option<NegativeControl>,
+    /// Which model advanced simulated time on the scxsim side
+    /// (`scx_simulator::ClockMode::as_str`: "pmu", "e9patch", "fallback",
+    /// "off").
+    ///
+    /// Provenance, exactly like the two commit fields above. The simulated
+    /// clock is chosen at runtime from what the host provides, and the PMU
+    /// model makes simulated time a function of THIS machine's hardware — so a
+    /// calibration verdict recorded under one clock cannot be compared against
+    /// one recorded under another. A run that does not record it is not
+    /// comparable to anything, which is why this is serialised as `null`
+    /// rather than defaulted to a plausible-looking value.
+    ///
+    /// Held as a String rather than the enum so this crate stays free of a
+    /// dependency on the simulator; `ClockMode::as_str()` is pinned by test.
+    #[serde(default)]
+    pub clock_mode: Option<String>,
 }
 
 impl CalibrationRun {
@@ -326,7 +342,16 @@ impl CalibrationRun {
             ktstr_commit: ktstr_commit.into(),
             results: Vec::new(),
             negative_control: None,
+            clock_mode: None,
         }
+    }
+
+    /// Record which clock advanced simulated time for this run.
+    ///
+    /// Pass `scx_simulator::Trace::clock_mode().as_str()`.
+    pub fn with_clock_mode(mut self, mode: impl Into<String>) -> Self {
+        self.clock_mode = Some(mode.into());
+        self
     }
 
     pub fn record(&mut self, r: MetricResult) {
@@ -478,6 +503,36 @@ mod tests {
 
     /// The control must actually reject. If a 3x error passes the CpuTime
     /// tolerance, the tolerance is wrong.
+    /// A calibration verdict is only comparable against another recorded
+    /// under the same clock, so the field must survive a JSON round trip and
+    /// must be ABSENT rather than invented when nobody recorded it.
+    #[test]
+    fn clock_mode_is_recorded_in_the_serialised_artifact() {
+        let run = CalibrationRun::new("demo", "abc", "def").with_clock_mode("pmu");
+        let json = serde_json::to_string(&run).unwrap();
+        assert!(
+            json.contains("\"clock_mode\":\"pmu\""),
+            "clock mode must reach the artifact, not just the console: {json}"
+        );
+        let back: CalibrationRun = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.clock_mode.as_deref(), Some("pmu"));
+    }
+
+    #[test]
+    fn an_unlabelled_run_records_no_clock_rather_than_guessing_one() {
+        let run = CalibrationRun::new("demo", "abc", "def");
+        assert_eq!(
+            run.clock_mode, None,
+            "defaulting to a plausible clock would make an uncomparable result \
+             look comparable"
+        );
+        // And it must still deserialise from an artifact written before this
+        // field existed, rather than failing to load.
+        let old = r#"{"scenario":"s","sched_test_commit":"c","ktstr_commit":"k","results":[],"negative_control":null}"#;
+        let parsed: CalibrationRun = serde_json::from_str(old).unwrap();
+        assert_eq!(parsed.clock_mode, None);
+    }
+
     #[test]
     fn negative_control_rejects_a_threefold_error() {
         let c = NegativeControl::perturbed(Metric::CpuTime, q_dur(1_000_000), 3.0, SampleCount(10));

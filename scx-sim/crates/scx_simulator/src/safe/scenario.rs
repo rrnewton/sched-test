@@ -689,6 +689,14 @@ pub struct Scenario {
     /// Nanoseconds per retired conditional branch in scheduler C code.
     /// `None` = disabled (no PMU counter). `Some(10)` = 10ns per RBC.
     pub sched_overhead_rbc_ns: Option<u64>,
+    /// Whether the PMU path was asked for EXPLICITLY, rather than arriving via
+    /// the `Some(10)` default.
+    ///
+    /// Only the explicit case is a hard error when no PMU counter can be
+    /// created: the default means every run on a PMU-less host would otherwise
+    /// fail, which would change behaviour rather than merely surface it. Set by
+    /// `--rbc-ns` / `--no-rbc` and by an explicit `SCX_SIM_RBC_NS`.
+    pub rbc_explicitly_requested: bool,
     /// Watchdog timeout for detecting stalled runnable tasks.
     ///
     /// - `Some(ns)` — watchdog fires after `ns` simulated nanoseconds of stall.
@@ -806,6 +814,7 @@ pub struct ScenarioBuilder {
     seed: u32,
     fixed_priority: bool,
     sched_overhead_rbc_ns: Option<u64>,
+    rbc_explicitly_requested: bool,
     watchdog_timeout_ns: Option<TimeNs>,
     ignore_bpf_errors: bool,
     hotplug_events: Vec<HotplugEvent>,
@@ -955,6 +964,7 @@ impl Scenario {
             seed: seed_from_env(),
             fixed_priority: false,
             sched_overhead_rbc_ns: None,
+            rbc_explicitly_requested: false,
             watchdog_timeout_ns: Some(DEFAULT_WATCHDOG_TIMEOUT_NS),
             ignore_bpf_errors: true, // Default true for compatibility
             hotplug_events: Vec::new(),
@@ -1626,6 +1636,7 @@ impl ScenarioBuilder {
             seed: self.seed,
             fixed_priority: self.fixed_priority,
             sched_overhead_rbc_ns: self.sched_overhead_rbc_ns,
+            rbc_explicitly_requested: self.rbc_explicitly_requested,
             watchdog_timeout_ns: self.watchdog_timeout_ns,
             ignore_bpf_errors: self.ignore_bpf_errors,
             hotplug_events: self.hotplug_events,
