@@ -890,6 +890,16 @@ name = "scx_cgroup_tree"
 version = "0.1.0"
 
 [[package]]
+name = "scx_layered_growth"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "fastrand",
+ "serde",
+]
+
+[[package]]
 name = "scx_perf"
 version = "0.1.0"
 dependencies = [
@@ -912,6 +922,7 @@ dependencies = [
  "perfetto_protos",
  "protobuf",
  "rand",
+ "scx_layered_growth",
  "scx_perf",
  "scxsim-build",
  "serde",

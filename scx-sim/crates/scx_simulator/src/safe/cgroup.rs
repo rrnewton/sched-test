@@ -214,6 +214,9 @@ impl CgroupRegistry {
 
         // Allocate the C struct cgroup via the RAII handle.
         let handle = SimCgroupHandle::new(cgid.0, level, parent_ptr);
+        // Publish the directory-entry name so schedulers that reconstruct the
+        // cgroup path (scx_layered's MATCH_CGROUP_* rules) can see it.
+        handle.set_name(name);
 
         // Set cpuset if specified.
         if let Some(ref cpus) = cpuset {

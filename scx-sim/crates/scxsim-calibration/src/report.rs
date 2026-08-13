@@ -39,6 +39,15 @@ pub enum Metric {
     ContextSwitches,
     /// Wake-to-run latency. Distributional, not a mean — see [`crate::sample`].
     WakeLatency,
+    /// Scheduling delay: runqueue wait, the time a task is runnable but not
+    /// running. The scheduler-attributable share of the time a task spends off
+    /// CPU, once virtualization overhead is excluded.
+    ///
+    /// Registered with its tolerance BEFORE either side computes it, which is
+    /// the strongest form of pre-registration available: the bound cannot have
+    /// been fitted to a measurement that does not exist yet. Until extraction
+    /// is wired on both sides this reports `NotMeasured`.
+    SchedulingDelay,
 }
 
 impl Metric {
@@ -97,6 +106,29 @@ impl Metric {
                 min_samples: MinSamples::AGGREGATE,
                 distributional: false,
             },
+            Metric::SchedulingDelay => MetricSpec {
+                tolerance: Tolerance::relative_or_absolute(
+                    0.20,
+                    4_000_000.0,
+                    "derived from what a policy comparison needs, not from what the \
+                     simulator achieves. Two policies whose true delays differ by a \
+                     factor R have disjoint error bands at relative error f exactly \
+                     when R > (1+f)/(1-f); f=0.20 resolves 1.5x, which is the smallest \
+                     difference worth ranking — a third off runqueue wait is a clear \
+                     win, below that is workload noise. Equal to WakeLatency because \
+                     it shares that metric's weakness (near-constant simulated timings \
+                     against a live distribution) and adds runqueue ordering on top, so \
+                     it cannot honestly be tighter; looser than Occupancy's 5% and \
+                     CpuTime's 10% because it is a difference of two live timestamps \
+                     and is exposed to virtualization jitter they are not. The absolute \
+                     arm is one scheduler tick (TICK_INTERVAL_NS, CONFIG_HZ 250): below \
+                     one tick the scheduler had no opportunity to decide differently, \
+                     so no policy conclusion can rest on it. The arms cross at 20ms, \
+                     exactly the default slice_ns — not chosen, it falls out.",
+                ),
+                min_samples: MinSamples::AGGREGATE,
+                distributional: false,
+            },
             Metric::WakeLatency => MetricSpec {
                 tolerance: Tolerance::relative(
                     0.20,
@@ -119,6 +151,7 @@ impl Metric {
             Metric::Migrations => "migrations",
             Metric::ContextSwitches => "context_switches",
             Metric::WakeLatency => "wake_latency",
+            Metric::SchedulingDelay => "scheduling_delay",
         }
     }
 
@@ -130,6 +163,7 @@ impl Metric {
         Metric::Migrations,
         Metric::ContextSwitches,
         Metric::WakeLatency,
+        Metric::SchedulingDelay,
     ];
 }
 
@@ -702,6 +736,43 @@ mod tests {
         run.record(r);
         let out = run.render();
         assert!(out.contains("WIDENED from"), "{out}");
+    }
+
+    /// The scheduling-delay bound was derived from what a policy comparison
+    /// needs, before either side could measure it. Pin the exact values so a
+    /// later edit has to be deliberate and visible in a diff, rather than a
+    /// quiet retune once a real measurement lands and disagrees.
+    #[test]
+    fn scheduling_delay_tolerance_is_the_pre_registered_one() {
+        let spec = Metric::SchedulingDelay.spec();
+        assert_eq!(
+            spec.tolerance.kind,
+            crate::verdict::ToleranceKind::RelativeOrAbsolute {
+                frac: 0.20,
+                abs: 4_000_000.0,
+            },
+            "scheduling-delay tolerance changed. 0.20 resolves a 1.5x policy \
+             difference ((1+f)/(1-f)); 4ms is one scheduler tick, below which no \
+             policy conclusion can rest. If this must change, use \
+             Tolerance::widened_from so the report shows it."
+        );
+        assert!(
+            !spec.distributional,
+            "registered as an aggregate, not a distribution"
+        );
+        assert!(
+            spec.tolerance.widened_from.is_none(),
+            "the pre-registered bound has been widened; that must be argued, not assumed"
+        );
+    }
+
+    /// Until extraction is wired on both sides the metric must report
+    /// NotMeasured — never a pass. A bound with no measurement behind it
+    /// silently counting as agreement is the failure this crate exists to stop.
+    #[test]
+    fn scheduling_delay_is_not_measured_until_both_sides_supply_it() {
+        let r = MetricResult::evaluate(Metric::SchedulingDelay, None, None, None, SampleCount(0));
+        assert_eq!(r.verdict, Verdict::NotMeasured);
     }
 
     #[test]

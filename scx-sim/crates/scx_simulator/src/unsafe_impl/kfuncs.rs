@@ -2693,6 +2693,30 @@ pub extern "C" fn sim_bpf_ktime_get_ns() -> u64 {
     bpf_ktime_get_ns()
 }
 
+/// Simulated `CONFIG_HZ`. Must agree with `engine::TICK_INTERVAL_NS`
+/// (4ms → 250Hz) — the scheduler sees one tick per jiffy, as in the kernel.
+pub const CONFIG_HZ: u64 = 1_000_000_000 / crate::engine::TICK_INTERVAL_NS;
+
+/// Convert a simulated nanosecond timestamp to jiffies.
+///
+/// Single source of truth for the ns↔jiffies relationship, shared by the
+/// engine (which stamps `p->scx.runnable_at` in jiffies, like the kernel's
+/// `scx_runnable()`) and by scheduler wrappers overriding `bpf_jiffies64()`.
+pub const fn ns_to_jiffies(ns: u64) -> u64 {
+    ns / (1_000_000_000 / CONFIG_HZ)
+}
+
+/// `bpf_jiffies64()` — the kernel helper returning the current jiffies count.
+///
+/// `bpf_helper_defs.h` declares this as a static function pointer initialised
+/// to the raw helper number, so calling it unoverridden jumps to a bogus
+/// address. Wrappers redirect it here. Derived from the same per-CPU local
+/// clock as `bpf_ktime_get_ns()` so the two never disagree.
+#[no_mangle]
+pub extern "C" fn sim_bpf_jiffies64() -> u64 {
+    ns_to_jiffies(bpf_ktime_get_ns())
+}
+
 // RCU stubs -- no-op in simulator
 #[no_mangle]
 pub extern "C" fn bpf_rcu_read_lock() {}
@@ -2703,6 +2727,23 @@ pub extern "C" fn bpf_rcu_read_unlock() {}
 // Task reference stubs
 #[no_mangle]
 pub extern "C" fn bpf_task_release(_p: *mut c_void) {}
+
+/// `bpf_task_acquire(p)` — take a reference on a task and return it.
+///
+/// The kernel bumps `p->rcu_users` and returns NULL if the task is already
+/// dying. The simulator owns every `task_struct` for the whole run (they are
+/// allocated by `sim_task_alloc` at fixture load and freed at teardown), so
+/// there is no refcount to bump and no window in which a live task pointer
+/// can become invalid mid-callback. Returning `p` unchanged is therefore the
+/// faithful answer, not a stub: the paired `bpf_task_release` is likewise a
+/// no-op, so acquire/release stay balanced.
+///
+/// Used by scx_layered's `tp_cgroup_attach_task` hook to pin the thread-group
+/// leader while it walks the group.
+#[no_mangle]
+pub extern "C" fn bpf_task_acquire(p: *mut c_void) -> *mut c_void {
+    p
+}
 
 /// Get the current task's task_struct pointer (for the CPU we're running on).
 ///
@@ -2991,12 +3032,165 @@ pub extern "C" fn scx_bpf_kick_cpu(cpu: i32, flags: u64) {
 }
 
 // ---------------------------------------------------------------------------
-// Dump kfuncs — no-op stubs for scheduler debug output
+// Dump kfuncs — scheduler debug output capture
 // ---------------------------------------------------------------------------
 
-/// Dump debug text. No-op in the simulator (debug output is not modeled).
+/// Format scheduler debug text into the simulator's per-run dump buffer.
 #[no_mangle]
-pub extern "C" fn scx_bpf_dump_bstr(_fmt: *const i8, _data: *const u64, _data_sz: u32) {}
+pub extern "C" fn scx_bpf_dump_bstr(fmt: *const i8, data: *const u64, data_sz: u32) {
+    if fmt.is_null() {
+        return;
+    }
+    // SAFETY: `fmt` is a NUL-terminated literal emitted by the scx_bpf_dump()
+    // macro, and `data`/`data_sz` describe the matching u64 argument array.
+    let text = unsafe { format_bstr(fmt, data, data_sz) };
+    DUMP_BUF.with(|b| b.borrow_mut().push_str(&text));
+}
+
+thread_local! {
+    /// Text captured from `scx_bpf_dump_bstr`.
+    ///
+    /// The kernel routes `ops.dump` output into the exit dump buffer that
+    /// userspace prints on scheduler unload. Discarding it here would make
+    /// `ops.dump` untestable for every scheduler — a dump that faults and a
+    /// dump that is a no-op would look identical.
+    static DUMP_BUF: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// Clear the captured `ops.dump` text. Called by the engine at run start.
+pub fn dump_buffer_reset() {
+    DUMP_BUF.with(|b| b.borrow_mut().clear());
+}
+
+/// Read back everything `ops.dump` emitted during the run.
+pub fn dump_buffer_take() -> String {
+    DUMP_BUF.with(|b| std::mem::take(&mut *b.borrow_mut()))
+}
+
+/// Format a BPF `bstr`-style call: a printf format string plus an array of
+/// u64 arguments (the kernel's `bpf_bprintf` ABI).
+///
+/// Supports the `%[-+ #0][width][l|ll]{d,i,u,x,s,c,%}` subset the scx
+/// schedulers use. An unsupported conversion is copied through literally
+/// rather than silently misformatted — `tests/layered.rs` asserts no such
+/// leftover reaches the dump, which is how the missing `+` flag was caught.
+///
+/// # Safety
+/// `fmt` must be NUL-terminated; `data` must point to at least
+/// `data_sz / 8` u64 values, and any `%s` argument must be a valid
+/// NUL-terminated string pointer.
+unsafe fn format_bstr(fmt: *const i8, data: *const u64, data_sz: u32) -> String {
+    let fmt_s = std::ffi::CStr::from_ptr(fmt).to_string_lossy().into_owned();
+    let nr_args = if data.is_null() {
+        0
+    } else {
+        (data_sz as usize) / std::mem::size_of::<u64>()
+    };
+    let arg = |i: usize| -> Option<u64> {
+        if i < nr_args {
+            Some(*data.add(i))
+        } else {
+            None
+        }
+    };
+
+    let mut out = String::with_capacity(fmt_s.len() + 32);
+    let bytes: Vec<char> = fmt_s.chars().collect();
+    let mut i = 0usize;
+    let mut argi = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != '%' {
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        let spec_start = i;
+        i += 1;
+        if i < bytes.len() && bytes[i] == '%' {
+            out.push('%');
+            i += 1;
+            continue;
+        }
+        // Flags: '-' (left-justify), '+' (always sign), ' ', '#', '0'.
+        let mut zero_pad = false;
+        let mut left_justify = false;
+        let mut plus_sign = false;
+        loop {
+            match bytes.get(i) {
+                Some('0') => zero_pad = true,
+                Some('-') => left_justify = true,
+                Some('+') => plus_sign = true,
+                Some(' ') | Some('#') => {}
+                _ => break,
+            }
+            i += 1;
+        }
+        let mut width = 0usize;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            width = width * 10 + bytes[i].to_digit(10).unwrap() as usize;
+            i += 1;
+        }
+        while i < bytes.len() && bytes[i] == 'l' {
+            i += 1;
+        }
+        let conv = if i < bytes.len() { bytes[i] } else { '\0' };
+        let v = match arg(argi) {
+            Some(v) => v,
+            None => {
+                // Not enough arguments — emit the spec literally.
+                out.extend(&bytes[spec_start..bytes.len().min(i + 1)]);
+                i += 1;
+                continue;
+            }
+        };
+        let rendered = match conv {
+            'd' | 'i' => {
+                let sv = v as i64;
+                if plus_sign && sv >= 0 {
+                    format!("+{sv}")
+                } else {
+                    format!("{sv}")
+                }
+            }
+            'u' => format!("{v}"),
+            'x' => format!("{v:x}"),
+            'c' => char::from_u32(v as u32).map_or_else(String::new, |c| c.to_string()),
+            's' => {
+                if v == 0 {
+                    "(null)".to_string()
+                } else {
+                    // SAFETY: the scheduler passed a NUL-terminated string
+                    // pointer for a %s conversion, per the bstr ABI.
+                    std::ffi::CStr::from_ptr(v as *const i8)
+                        .to_string_lossy()
+                        .into_owned()
+                }
+            }
+            _ => {
+                // Unsupported conversion — copy it through, consume nothing.
+                out.extend(&bytes[spec_start..bytes.len().min(i + 1)]);
+                i += 1;
+                continue;
+            }
+        };
+        argi += 1;
+        let pad_n = width.saturating_sub(rendered.len());
+        if left_justify {
+            out.push_str(&rendered);
+            for _ in 0..pad_n {
+                out.push(' ');
+            }
+        } else {
+            let pad = if zero_pad { '0' } else { ' ' };
+            for _ in 0..pad_n {
+                out.push(pad);
+            }
+            out.push_str(&rendered);
+        }
+        i += 1;
+    }
+    out
+}
 
 // ---------------------------------------------------------------------------
 // Cgroup kfuncs

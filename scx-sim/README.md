@@ -158,7 +158,7 @@ scxsim simulate [OPTIONS] [WORKLOAD]
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `-s, --scheduler` | `simple` | Scheduler to load (`simple`, `lavd`, `mitosis`, `cosmos`, `tickless`) |
+| `-s, --scheduler` | `simple` | Scheduler to load (`simple`, `lavd`, `mitosis`, `cosmos`, `tickless`, `layered`) |
 | `-c, --cpus` | `4` | Number of simulated CPUs |
 | `--smt` | `1` | SMT threads per core |
 | `--seed` | `42` | PRNG seed (integer or `"entropy"`) |
@@ -244,6 +244,27 @@ Replays a previously recorded preemption trace for deterministic reproduction.
 | `mitosis` | Cgroup-aware scheduler with task migration |
 | `cosmos` | Multi-domain scheduler |
 | `tickless` | Tickless/event-driven scheduler |
+| `layered` | Layer-partitioned scheduler (comm/cgroup/nice matching, per-(layer, LLC) DSQs) |
+
+### `layered` — userspace CPU allocation
+
+`scx_layered` is userspace-driven: in production a control loop continuously
+re-allocates CPUs between layers from live utilisation. scxsim plays that
+userspace role in two modes.
+
+By default the allocation is computed once before `ops.init` and held fixed,
+which is enough for everything that does not depend on re-allocation: layer
+matching, per-(layer, LLC) DSQs, hi/lo fallback, preemption, antistall and
+`ops.dump` all run the real BPF.
+
+`layered_enable_control_loop()` turns on the periodic loop. It reads the real
+BPF usage counters, runs upstream's own `alloc.rs` and `layer_core_growth.rs`
+(compiled verbatim from the scx submodule, not reimplemented), and drives the
+real BPF refresh programs — so growth and shrink genuinely execute. It
+approximates production in one respect, `calc_raw_demands`, and refuses
+loudly rather than approximating for `CpuSetSpread*` and multi-LLC
+`StickyDynamic`. See `ai_docs/LAYERED_SUPPORT.md` and
+`ai_docs/LAYERED_TIER3_HANDOFF.md` §9 for the full capability statement.
 
 ## Project structure
 

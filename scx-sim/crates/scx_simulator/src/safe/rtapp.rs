@@ -9,6 +9,7 @@
 //! - `sleep` — fixed-duration sleep (mapped to [`Phase::Sleep`])
 //! - `suspend` — self-suspend until resumed (mapped to `Phase::Sleep(u64::MAX)`)
 //! - `resume` — wake another task (mapped to [`Phase::Wake`])
+//! - `yield` — call `sched_yield()` (mapped to [`Phase::Yield`])
 //! - `timer` — periodic timer (approximated as `Phase::Sleep(period)`)
 //! - `priority` — nice value
 //! - `loop` — repetition control
@@ -26,7 +27,7 @@
 //! - JSON files with duplicate keys (common in rt-app) must be preprocessed
 //!   with rt-app's `workgen` script or use suffixed keys (`"run0"`, `"run1"`).
 //! - Unsupported events (`lock`, `unlock`, `wait`, `signal`, `broad`, `sync`,
-//!   `mem`, `iorun`, `yield`, `barrier`, `fork`) are skipped with a warning.
+//!   `mem`, `iorun`, `barrier`, `fork`) are skipped with a warning.
 //! - Phase-level `taskgroup` migration is not modeled.
 
 use std::collections::{BTreeSet, HashMap};
@@ -194,6 +195,12 @@ fn parse_events(
                     .get(target_name)
                     .ok_or_else(|| RtAppError::UnresolvedResume(target_name.to_string()))?;
                 phases.push(Phase::Wake(*target_pid));
+            }
+            "yield" => {
+                // rt-app calls sched_yield() once per loop iteration for a
+                // `yield` event; the JSON value is parsed but ignored (verified
+                // by strace: `"yield": 1` and `"yield": 7` both yield once).
+                phases.push(Phase::Yield);
             }
             unsupported => {
                 warn!(
@@ -849,6 +856,7 @@ pub fn load_rtapp(json_str: &str, nr_cpus: u32) -> Result<Scenario, RtAppError> 
         hotplug_events: Vec::new(),
         cpu_preempt_events: Vec::new(),
         cgroup_migrate_events: Vec::new(),
+        task_rename_events: Vec::new(),
         cgroup_create_events: Vec::new(),
         cgroup_destroy_events: Vec::new(),
         cgroup_cpuset_change_events: Vec::new(),

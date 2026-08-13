@@ -66,6 +66,12 @@ pub(crate) use safe::cpu;
 pub(crate) use safe::dsq;
 pub(crate) use safe::engine;
 pub(crate) use safe::fmt;
+pub(crate) use safe::layered;
+pub(crate) use safe::layered_alloc_upstream;
+pub(crate) use safe::layered_control;
+// scx_layered's alloc.rs does `use crate::largest_remainder;`. Re-exporting it
+// at the crate root is what lets the upstream source compile here unmodified.
+pub(crate) use safe::layered_alloc::largest_remainder;
 pub(crate) use safe::monitor;
 pub(crate) use safe::perf;
 pub(crate) use safe::perfetto;
@@ -108,7 +114,7 @@ pub use ffi::{
     discover_schedulers, DebuggerInfo, DynamicScheduler, LavdPowerMode, LoadError, Scheduler,
     SchedulerInfo,
 };
-pub use kfuncs::sim_clock;
+pub use kfuncs::{dump_buffer_reset, dump_buffer_take, sim_clock};
 pub use preempt::trace::PreemptionTrace;
 pub use preempt::trace::TraceMetadata;
 pub use preempt::{
@@ -120,11 +126,18 @@ pub use preempt::{
     StructopInfo, INSN_BYTES_LEN,
 };
 #[cfg(feature = "standalone")]
-pub use probes::{LavdMonitor, LavdProbes, LavdSnapshot};
+pub use probes::{
+    GlobalStat, LavdMonitor, LavdProbes, LavdSnapshot, LayerStat, LayeredEnumProbe, LayeredProbes,
+    LAYERED_NO_LAYER,
+};
 pub use safe::bpf_trace::{
     BpfEventKind, BpfTrace, BpfTraceEvent, TraceComparisonResult, TraceDifferences,
 };
 pub use safe::fmt::{FmtN, FmtTs, SimFormat};
+pub use safe::layered::{LayerGrowthAlgo, LayerKind, LayerMatch, LayerSpec, DEFAULT_LAYER_WEIGHT};
+// scx_layered's own allocator, compiled verbatim from the scx submodule.
+// tests/layered_alloc.rs drives it directly to prove it is the real thing.
+pub use safe::layered_alloc_upstream::{unified_alloc, LayerDemand};
 pub use safe::monitor::{Monitor, ProbeContext, ProbePoint};
 pub use safe::perf::PmuEvent;
 pub use safe::perf::RbcCounter;

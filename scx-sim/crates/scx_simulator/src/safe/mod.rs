@@ -23,6 +23,15 @@ pub mod det_hashmap;
 pub mod dsq;
 pub mod engine;
 pub mod fmt;
+pub mod layered;
+pub mod layered_alloc;
+pub mod layered_control;
+
+/// scx_layered's real CPU allocator, compiled from the upstream source.
+/// See `layered_alloc` for why this is included verbatim rather than
+/// re-implemented, and for the one vendored helper it needs.
+#[path = "../../../../../scx/scheds/rust/scx_layered/src/alloc.rs"]
+pub mod layered_alloc_upstream;
 pub mod monitor;
 pub mod perf;
 pub(crate) mod perfetto;

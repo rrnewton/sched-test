@@ -1,5 +1,5 @@
 //! Comprehensive regression matrix: every `scx-sim/examples/*.json` workload
-//! run through every scheduler (simple, lavd, cosmos), asserting no parse
+//! run through every scheduler (simple, lavd, cosmos, layered), asserting no parse
 //! failure, no panic/crash, no hang, and a valid (non-empty, cleanly
 //! terminated) trace.
 //!
@@ -26,9 +26,9 @@ use scx_simulator::*;
 
 mod common;
 
-/// The three schedulers under test. `simple` takes no CPU count; `lavd`/`cosmos`
-/// are constructed with the scenario's CPU count.
-const SCHEDULERS: [&str; 3] = ["simple", "lavd", "cosmos"];
+/// The schedulers under test. `simple` takes no CPU count; the others are
+/// constructed with the scenario's CPU count.
+const SCHEDULERS: [&str; 4] = ["simple", "lavd", "cosmos", "layered"];
 
 /// CPUs to run every example with (examples are authored for `--cpus 4`).
 const NR_CPUS: u32 = 4;
@@ -76,6 +76,7 @@ fn make_scheduler(name: &str, nr_cpus: u32) -> DynamicScheduler {
         "simple" => DynamicScheduler::simple(),
         "lavd" => DynamicScheduler::lavd(nr_cpus),
         "cosmos" => DynamicScheduler::cosmos(nr_cpus),
+        "layered" => DynamicScheduler::layered(nr_cpus),
         other => panic!("unknown scheduler {other}"),
     }
 }

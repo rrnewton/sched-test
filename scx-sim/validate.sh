@@ -39,6 +39,25 @@ echo "=== Running cargo fmt --check ==="
 cargo fmt --all -- --check
 
 echo ""
+echo "=== Checking the scx submodule is unmodified ==="
+# Several crates compile upstream scx sources directly as path dependencies
+# (scx_layered's alloc.rs and layer_core_growth.rs today). That puts those
+# files in rustfmt's and clippy's module graph, so a bare `cargo fmt` rewrites
+# them in place — silently destroying the "compiled byte-identical to the pin"
+# guarantee that is the whole reason we link them instead of vendoring copies.
+# rustfmt's `ignore` option is nightly-only, so guard the invariant itself.
+if ! git -C ../scx diff --quiet HEAD 2>/dev/null; then
+    echo "ERROR: the scx submodule has local modifications:"
+    git -C ../scx status --short
+    echo ""
+    echo "scx is a pinned upstream checkout and must stay byte-identical to"
+    echo "the gitlink. If 'cargo fmt' did this, revert with:"
+    echo "    git -C scx checkout -- ."
+    exit 1
+fi
+echo "  scx submodule clean"
+
+echo ""
 echo "=== Checking safe/ contains no unsafe code ==="
 # Belt-and-suspenders: safe/mod.rs has #![forbid(unsafe_code)] which the
 # compiler enforces, but this grep catches it before compilation even starts.
