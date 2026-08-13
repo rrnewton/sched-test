@@ -775,8 +775,14 @@ eight-branch pile, and it is discontinued.
 - [ ] Tests use `.detect_bpf_errors()`; each behavioural claim has a negative
       control or sabotage proof.
 - [ ] Test-name list diffed against `HEAD` after bulk edits.
-- [ ] `cargo nextest run --workspace` green; `cargo fmt --check` and
-      `cargo clippy --all-targets --workspace -- -D warnings` clean.
+- [ ] **`bash validate.sh` run IN FULL, at the feature sets it uses** — not
+      `cargo nextest`, not "the Rust gates", not the stages you think your
+      change touches. A green is only as wide as the narrowest axis the command
+      selects on: `--all` and `--workspace` widen *packages*, not *targets* and
+      not *features*. `cargo clippy --all` left test code unlinted;
+      `nextest --workspace` never compiled 16 `required-features` tests;
+      default-feature runs hid a compile break in a feature-gated crate. Name
+      the axes before you trust the green.
 - [ ] Tier table written, per criterion, distinguishing *exercised* from
       *published only* from *inherently unobservable*.
 - [ ] Beads filed for every divergence and substrate gap.

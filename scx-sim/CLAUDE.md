@@ -431,6 +431,55 @@ adversarial second pass.
 This complements, and does not replace, the honesty requirements elsewhere in
 this file (No-Stub, No Silent Failures, the tiered-reporting discipline).
 
+Run the whole gate, at the feature sets it uses
+-------------------------------------------------
+
+Before landing: run **`bash validate.sh` in full, at the feature sets it
+uses**. Not `cargo nextest`, not "the Rust gates", not the stages you believe
+your change touches.
+
+Two distinct failures, and you need both halves:
+
+1. **The whole script.** A change that looks confined to one area routinely
+   fails a stage elsewhere. `validate.sh` was made provably equivalent to GH CI
+   (PR #69), and *that equivalence is what licenses landing without waiting for
+   CI*. Run a subset and you have voided the guarantee you are relying on — the
+   speed of local validation without the coverage that justified it.
+2. **At the right feature sets.** Running the correct script under default
+   features skips every `required-features` target and returns a confident
+   green over code it never compiled.
+
+### The shape: commands scoped narrower than they read
+
+Name the shape, not the instances — the next one will be a command nobody here
+has met yet.
+
+> **A green is only as wide as the narrowest axis the command selects on.**
+> Build tools select on several independent axes, and a breadth-sounding flag
+> usually widens exactly *one* of them. Every other axis silently stays at its
+> default.
+
+For cargo the axes are **package**, **target**, **feature set**, and
+**profile**. Three instances hit this project in a single night, all the same
+bug wearing different clothes:
+
+| Command | Axis it widens | Axis left at default | What was never checked |
+|---|---|---|---|
+| `cargo clippy --all` | package | **target** | test and bench code was never linted |
+| `cargo nextest --workspace` | package | **features** | 16 `required-features` tests had never compiled anywhere |
+| `bash validate.sh` (default features) | — | **features** | the same feature-gated targets |
+
+The third is how a `Phase::Yield` compile break reached the tip and then stayed
+invisible to two separate checks afterwards: `scxsim-workload-ir` only fails
+under `--features ingest`, so every default-feature check stayed green while
+the crate did not build.
+
+**The check to run on any command before you trust its green:** list the axes
+it selects on, and confirm which one your flag actually widened. If you cannot
+name the axes, you do not yet know what the green covers. `--all` and
+`--workspace` are the two words most likely to be lying to you — both mean
+*packages*, and neither means *targets* or *features*.
+
 Cache Reproducer Methodology
 ----------------------------------------
 See `CACHE_REPRODUCER.md` (in this directory) for the authoritative methodology document covering:
