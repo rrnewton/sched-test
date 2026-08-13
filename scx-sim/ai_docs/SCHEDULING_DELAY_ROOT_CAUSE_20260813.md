@@ -147,8 +147,21 @@ modelled path:
 |---|---|---|
 | 4019 | `handle_task_wake` | yes, originally |
 | 4112 | `handle_slice_expired` (via `stop_and_reenqueue`) | yes, this change |
-| 4402 | `handle_task_phase_complete` (Run -> Run) | yes, follow-up |
-| 4489 | `handle_task_phase_complete` | yes, follow-up |
+| 4402 | `handle_task_phase_complete`, explicit `Phase::Yield` | yes, follow-up |
+| 4402 | `handle_task_phase_complete`, plain Run -> Run | **no, by decision** |
+| 4489 | `handle_task_phase_complete`, wake chain | only on an explicit yield |
+
+**The Run -> Run boundary is deliberately NOT charged** (owner ruling,
+2026-08-13). `wakeup_latency_floor_ns` models the cost of getting a task ONTO a
+cpu; a task crossing a phase boundary never left one, so the boundary is a
+scripting artifact rather than a kernel event. Charging it was tried and the
+measurement was silent — the calibration fixture crosses it 9 times in ~1200
+dispatches, and cg_0 moved 2.720ms -> 2.591ms against a live 3.694ms, slightly
+further away and well inside noise. With no empirical signal the principled
+model decides, because it generalises to phase structures nobody has tested.
+`nr_yields` is the discriminator: an explicit `Phase::Yield` is a real
+`sched_yield()` and is charged. `run_to_run_phase_boundary_is_deliberately_not_charged`
+guards the non-charge so it cannot be "fixed" into an oversight.
 
 **Correction to the first measurement of the residual.** It was originally
 reported as 34-36% of `simple`/`cosmos` dispatches and 80-83% of `lavd`'s still

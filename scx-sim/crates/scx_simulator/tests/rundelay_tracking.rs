@@ -546,3 +546,70 @@ fn yield_redispatch_is_charged_the_modelled_kernel_cost() {
         );
     }
 }
+
+/// A `Run` -> `Run` phase boundary must NOT be charged the wakeup-latency floor.
+///
+/// # This guards a decision, not a bug
+///
+/// The other two tests in this group assert that re-dispatch IS charged. This
+/// one asserts the single case where it deliberately is not, and it exists
+/// because a decision nobody can see is indistinguishable from an oversight —
+/// four genuinely-uncharged paths were found and fixed, and without this test
+/// the natural next move is to "fix" this one too and turn every test green
+/// while making the simulator wrong.
+///
+/// The reasoning, in short (the long form is at the stamp site in
+/// `handle_task_phase_complete`): `wakeup_latency_floor_ns` models the cost of
+/// getting a task ONTO a cpu, and a task crossing a Run -> Run boundary never
+/// left one. The boundary is an artifact of how the workload was scripted, not
+/// a kernel event. Charging it was measured and made no difference to the
+/// live-guest match, so the principled model decides.
+///
+/// An explicit `Phase::Yield` IS charged — see
+/// `yield_redispatch_is_charged_the_modelled_kernel_cost`. The pair of tests is
+/// what makes the distinction visible.
+#[test]
+fn run_to_run_phase_boundary_is_deliberately_not_charged() {
+    // One task alone on one cpu, in chunks. Alone, so nothing can preempt it and
+    // every sample is a phase boundary; chunked, so there are boundaries at all.
+    for (name, make) in SCHEDS {
+        let _lock = common::setup_test();
+        let scenario = Scenario::builder()
+            .cpus(1)
+            .add_task(
+                "chunked",
+                0,
+                TaskBehavior {
+                    phases: vec![Phase::Run(1_000_000)],
+                    repeat: RepeatMode::Count(60),
+                },
+            )
+            .duration_ms(4_000)
+            .build();
+
+        let trace = Simulator::new(make(1)).run(scenario.clone());
+        let stats = TraceStats::from_trace(&trace);
+        let pid = scenario.tasks[0].pid;
+
+        let lat = match stats.tasks.get(&pid) {
+            Some(t) if t.sched_latencies.len() >= 20 => t.sched_latencies.clone(),
+            other => panic!(
+                "{name}: produced {} run-delay samples; this test needs the Run -> Run \
+                 boundary to actually be exercised to say anything",
+                other.map_or(0, |t| t.sched_latencies.len())
+            ),
+        };
+
+        let mean = lat.iter().sum::<u64>() as f64 / lat.len() as f64;
+        assert!(
+            mean < 1_000.0,
+            "{name}: mean Run -> Run re-dispatch delay is {mean:.0} ns across {} \
+             samples, i.e. the wakeup-latency floor is now being applied here. \
+             That is a DELIBERATE non-charge, not a missed path — a task crossing \
+             a phase boundary never left the cpu, so it must not pay the cost of \
+             getting onto one. Read the comment at the stamp site in \
+             `handle_task_phase_complete` before changing this.",
+            lat.len()
+        );
+    }
+}
