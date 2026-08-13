@@ -1,0 +1,36 @@
+[package]
+name = "scxsim-workload-ir"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Restricted workload IR shared between ktstr and scx-sim, plus the lowering from ktstr's declarative op vocabulary onto it"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+# Optional: only the IR -> Scenario ingestion needs the simulator itself. Kept
+# behind a feature so a consumer that only wants the IR + lowering (ktstr's
+# DSL PR, which must stay scx-sim-free) does not pull in the BPF build.
+scx_simulator = { path = "../scx_simulator", optional = true, default-features = false }
+
+[features]
+default = []
+ingest = ["dep:scx_simulator"]
+
+[build-dependencies]
+# Only for EXPORTED_SYMS — the non-transitive link contract the `ingest` feature
+# needs re-emitted. See build.rs.
+scxsim-build = { path = "../scxsim-build" }
+
+[dev-dependencies]
+serde_json = "1"
+# Default features ON here (unlike the optional dep above) so integration
+# tests can use the standalone DynamicScheduler constructors to actually RUN a
+# lowered scenario, not merely build one.
+scx_simulator = { path = "../scx_simulator" }
+
+# Loads a real scheduler .so and RUNS a lowered scenario, so it needs the
+# ingestion half. required-features (rather than a cfg in the file) means cargo
+# skips the target entirely in a default build instead of compiling it empty.
+[[test]]
+name = "sched_basic_proportional"
+required-features = ["ingest"]

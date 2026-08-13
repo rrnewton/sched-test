@@ -182,6 +182,59 @@ impl<S: Scheduler> SchedulerWrapper<S> {
         unsafe { self.inner.exit_task(p.as_raw()) }
     }
 
+    /// A task is leaving scheduler control (`ops.disable`).
+    ///
+    /// The kernel calls this immediately before `ops.exit_task`.
+    pub fn disable(&self, p: TaskPtr) {
+        // SAFETY: `p` is guaranteed non-null by `TaskPtr::new`.
+        unsafe { self.inner.disable(p.as_raw()) }
+    }
+
+    /// Deliver the `tp_btf/cgroup_attach_task` BTF tracepoint.
+    ///
+    /// `cgrp_path` must be a valid NUL-terminated C string that outlives the
+    /// call; callers pass a borrowed `CString`.
+    pub fn tp_cgroup_attach_task(
+        &self,
+        cgrp: TaskPtr,
+        cgrp_path: &std::ffi::CStr,
+        leader: TaskPtr,
+    ) {
+        // SAFETY: both pointers are non-null by `TaskPtr::new`, and `cgrp_path`
+        // is NUL-terminated and borrowed for the duration of the call.
+        unsafe {
+            self.inner
+                .tp_cgroup_attach_task(cgrp.as_raw(), cgrp_path.as_ptr(), leader.as_raw())
+        }
+    }
+
+    /// Deliver the `tp_btf/task_rename` BTF tracepoint.
+    pub fn tp_task_rename(&self, p: TaskPtr, new_comm: &std::ffi::CStr) {
+        // SAFETY: `p` is non-null by `TaskPtr::new`, and `new_comm` is
+        // NUL-terminated and borrowed for the duration of the call.
+        unsafe { self.inner.tp_task_rename(p.as_raw(), new_comm.as_ptr()) }
+    }
+
+    /// A task's weight was published to the scheduler (`ops.set_weight`).
+    pub fn set_weight(&self, p: TaskPtr, weight: u32) {
+        // SAFETY: `p` is guaranteed non-null by `TaskPtr::new`.
+        unsafe { self.inner.set_weight(p.as_raw(), weight) }
+    }
+
+    /// A task called `sched_yield()` (`ops.yield`).
+    ///
+    /// `to` is null for a plain `sched_yield()`. `None` means the scheduler
+    /// has no `ops.yield`, so the caller must apply the kernel's fallback of
+    /// zeroing `p->scx.slice`; `Some` is the callback's return value, which
+    /// `yield_task_scx()` discards for a plain yield.
+    ///
+    /// Named `task_yield` because `yield` is a reserved Rust keyword.
+    pub fn task_yield(&self, from: TaskPtr, to: OptionalPtr) -> Option<bool> {
+        // SAFETY: `from` is guaranteed non-null by `TaskPtr::new`; `to` is
+        // allowed to be null per the trait contract.
+        unsafe { self.inner.task_yield(from.as_raw(), to.as_raw()) }
+    }
+
     // ------------------------------------------------------------------
     // Optional callbacks — CPU lifecycle
     // ------------------------------------------------------------------
@@ -291,6 +344,29 @@ impl<S: Scheduler> SchedulerWrapper<S> {
         // SAFETY: `slot` is a small integer; the scheduler's wrapper.c
         // dispatches based on it.
         unsafe { self.inner.fire_timer(slot as u32) }
+    }
+
+    /// Run the scheduler's userspace-side post-attach setup, if it exports
+    /// one (`<prefix>_post_init`). Called once, immediately after ops.init.
+    ///
+    /// scx_tickless arms its periodic BPF timer from a syscall program its
+    /// Rust userspace invokes after ops.init has created the timers; this is
+    /// where scxsim plays that role. No-op for schedulers without the hook.
+    pub fn post_init(&self) {
+        // SAFETY: No arguments; the wrapper's hook takes and returns nothing.
+        unsafe { self.inner.post_init() }
+    }
+
+    /// Period of the scheduler's userspace control loop, when enabled.
+    pub fn userspace_control_period_ns(&self) -> Option<u64> {
+        self.inner.userspace_control_period_ns()
+    }
+
+    /// Run one userspace control iteration, including any BPF_PROG_RUN tail.
+    pub fn userspace_control(&self) -> i32 {
+        // SAFETY: The dynamic scheduler owns all control-loop state and the
+        // engine installs the same callback context used for scheduler code.
+        unsafe { self.inner.userspace_control() }
     }
 
     /// Deliver a simulated futex transition (`op` = FUTEX_* command, `ret` =

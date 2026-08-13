@@ -243,6 +243,19 @@ pub enum TraceKind {
     /// `ops.enable` — task is being enabled (made schedulable). One-shot
     /// per task on first run, required for full handshake parity.
     Enable { pid: Pid },
+    /// `ops.set_weight` — task weight was (re)published to the scheduler.
+    /// Fired once right after `ops.enable`, as the kernel's
+    /// `scx_enable_task()` does.
+    SetWeight { pid: Pid, weight: u32 },
+    /// `ops.disable` — task is leaving scheduler control. Fired immediately
+    /// before `ops.exit_task`, as the kernel's teardown path does.
+    Disable { pid: Pid },
+    /// `ops.yield` — task called `sched_yield()`. `handled` records whether
+    /// the loaded scheduler implements `ops.yield`; when it does not, the
+    /// engine applied the kernel's fallback of zeroing `p->scx.slice`.
+    /// (`yield_task_scx()` discards the callback's own return value for a
+    /// plain yield, so it is deliberately not what is recorded here.)
+    TaskYield { pid: Pid, handled: bool },
 
     // ----- Task affinity structop (TOP-7: affinity parity) -----
     //
@@ -1191,6 +1204,15 @@ impl Trace {
                 }
                 TraceKind::Enable { pid } => {
                     format!("ENABLE   pid={}", pid.0)
+                }
+                TraceKind::SetWeight { pid, weight } => {
+                    format!("SET_WGT  pid={} weight={}", pid.0, weight)
+                }
+                TraceKind::Disable { pid } => {
+                    format!("DISABLE  pid={}", pid.0)
+                }
+                TraceKind::TaskYield { pid, handled } => {
+                    format!("YIELD    pid={} handled={}", pid.0, handled)
                 }
                 TraceKind::SetCpumask { pid, cpumask_hex } => {
                     format!("SET_MASK pid={} cpus={}", pid.0, cpumask_hex)

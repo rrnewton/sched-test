@@ -81,10 +81,20 @@ pub const SCHEDULERS: &[SchedulerManifest] = &[
         // Migrated from cosmos_setup's config-global writes.
         // smt_enabled=true (SMT avoidance is unconditional upstream; the avoid_smt
         // toggle was deprecated, so there is no avoid_smt global to set).
-        // perf_config / slice_ns / slice_lag / busy_threshold are u64; nr_node_ids
-        // is u32. Five globals' setup value differs from the BPF rodata default, so
-        // those writes are load-bearing: nr_node_ids, mm_affinity, perf_config,
-        // slice_ns, busy_threshold. numa_enabled and nr_node_ids are re-overwritten
+        // slice_ns / slice_lag / busy_threshold are u64; nr_node_ids is u32. Four
+        // globals' setup value differs from the BPF rodata default, so those
+        // writes are load-bearing: nr_node_ids, mm_affinity, slice_ns,
+        // busy_threshold.
+        //
+        // perf_config is deliberately NOT set. Upstream defaults it to 0x0 ("no
+        // event", scx_cosmos/src/main.rs), and forcing it to 1 here switched on
+        // cosmos's PMU path while the wrapper fed it fabricated counter values —
+        // a No-Stub Rule violation that also meant cosmos's real no-PMU path
+        // never ran. Nothing sets perf_threshold either, so is_event_heavy()
+        // degenerated to "perf_events > 0" and cosmos treated essentially every
+        // task as event-heavy, changing its migration decisions. Leaving it at
+        // the rodata default keeps the simulator on the path production takes
+        // without -e/--perf-config. numa_enabled and nr_node_ids are re-overwritten
         // by cosmos_configure_numa, which runs after apply_rodata (ffi.rs), so these
         // manifest values are the correct pre-NUMA defaults.
         runtime: SchedulerRuntime {
@@ -97,7 +107,6 @@ pub const SCHEDULERS: &[SchedulerManifest] = &[
                 ("numa_enabled", ConfigValue::Bool(false)),
                 ("nr_node_ids", ConfigValue::U32(1)),
                 ("mm_affinity", ConfigValue::Bool(true)),
-                ("perf_config", ConfigValue::U64(1)),
                 ("slice_ns", ConfigValue::U64(20_000_000)),
                 ("slice_lag", ConfigValue::U64(20_000_000)),
                 ("busy_threshold", ConfigValue::U64(1)),
@@ -156,6 +165,22 @@ pub const SCHEDULERS: &[SchedulerManifest] = &[
                 ("reject_multicpu_pinning", ConfigValue::Bool(false)),
             ],
         },
+    },
+    SchedulerManifest {
+        name: "layered",
+        strip_const: true,
+        scx_bpf_dir: true,
+        // No generated or patched source: layered's BPF compiles unmodified,
+        // and its wrapper #includes straight out of the scx tree.
+        extra_local_include: false,
+        source_patches: &[],
+        // Deliberately empty. layered's config is not a handful of rodata
+        // scalars — it is a topology, a layer table with match rules, and a CPU
+        // allocation, all published by layered_setup()/layered_set_topology()
+        // /layered_add_layer() the way scx_layered's Rust userspace publishes
+        // them. Listing a few scalars here would split that across two
+        // mechanisms.
+        runtime: SchedulerRuntime::EMPTY,
     },
     SchedulerManifest {
         name: "simple",

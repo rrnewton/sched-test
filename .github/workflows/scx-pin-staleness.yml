@@ -1,0 +1,52 @@
+# Independent alarm for scx submodule pin staleness.
+#
+# DELIBERATELY STANDALONE. This workflow shares nothing with
+# `.github/workflows/sync-upstream.yml` — no job, no branch, no secret, no
+# trigger. That separation is the entire point:
+#
+#     A MONITOR MUST NOT DEPEND ON THE THING IT MONITORS.
+#
+# The sync job ran nightly for seven weeks (2026-06-26..2026-08-12), failed 48
+# times, succeeded zero, and nobody noticed — because the only signal that
+# syncing had stopped was that job's own red X, on a mirror repository nobody
+# watches. This workflow fires whether the sync job runs, fails, is disabled, is
+# deleted, or is quietly delivering to a dead branch.
+#
+# It reports where people already look: a red check on `integration` in this
+# repository, plus annotations and a run summary. Not a mirror, not a dashboard
+# with one reader.
+name: scx pin staleness
+
+on:
+  schedule:
+    # 07:00 UTC daily. Independent of the sync job's 04:00 cron on purpose: if
+    # they shared a schedule, one runner-wide outage would silence both.
+    - cron: '0 7 * * *'
+  workflow_dispatch:
+  push:
+    branches: ['integration']
+    # Also on any change to the alarm itself or to the pin, so a pin bump is
+    # checked at the moment it lands rather than up to a day later.
+    paths:
+      - '.gitmodules'
+      - 'scx'
+      - 'scripts/check_scx_pin_staleness.py'
+      - '.github/workflows/scx-pin-staleness.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  pin-staleness:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+          # Full history: the check needs merge-base against upstream, which a
+          # shallow clone cannot compute.
+          fetch-depth: 0
+
+      - name: Check scx pin against upstream
+        run: python3 scripts/check_scx_pin_staleness.py --fetch

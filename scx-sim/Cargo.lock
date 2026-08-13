@@ -890,6 +890,16 @@ name = "scx_cgroup_tree"
 version = "0.1.0"
 
 [[package]]
+name = "scx_layered_growth"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "fastrand",
+ "serde",
+]
+
+[[package]]
 name = "scx_perf"
 version = "0.1.0"
 dependencies = [
@@ -912,6 +922,7 @@ dependencies = [
  "perfetto_protos",
  "protobuf",
  "rand",
+ "scx_layered_growth",
  "scx_perf",
  "scxsim-build",
  "serde",
@@ -926,6 +937,25 @@ name = "scxsim-build"
 version = "0.1.0"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "scxsim-calibration"
+version = "0.1.0"
+dependencies = [
+ "scxsim-workload-ir",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "scxsim-workload-ir"
+version = "0.1.0"
+dependencies = [
+ "scx_simulator",
+ "scxsim-build",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

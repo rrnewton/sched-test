@@ -533,6 +533,16 @@ fn csv_experiment_run() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
     let warmup_ns: u64 = warmup_ms * 1_000_000;
+    // Same trap as the scxsim CLI (rc-issue-scxsim-stats-zero): every metric
+    // below is gated on `event.time_ns >= warmup_ns`, so a warmup covering the
+    // whole run emits a full CSV of zeros that reads as real measurement data.
+    // Fail loudly instead — a silently all-zero CSV is worse than no CSV.
+    assert!(
+        warmup_ms < duration_ms,
+        "SCX_SIM_WARMUP_MS ({warmup_ms}ms) must be less than SCX_SIM_DURATION_MS \
+         ({duration_ms}ms): metrics only count post-warmup events, so this would \
+         emit an all-zero CSV rather than a measurement."
+    );
 
     let with_nice_hints = condition.contains("nice_hints") || condition.contains("level2");
     let timestamp = std::env::var("SCX_SIM_TIMESTAMP").unwrap_or_else(|_| {
@@ -577,6 +587,8 @@ fn csv_experiment_run() {
 
     // Create scheduler and optionally attach LAVD monitor
     let use_lavd = scheduler == "lavd";
+    // cpus_per_llc == 0 means "one flat domain"; checked_div gives exactly
+    // that fallback and keeps clippy::manual_checked_ops quiet.
     let nr_domains = nr_cpus.checked_div(cpus_per_llc).unwrap_or(1);
 
     if print_header {

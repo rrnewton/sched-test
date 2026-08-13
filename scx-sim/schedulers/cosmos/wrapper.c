@@ -16,114 +16,53 @@
 #define MAX_SIM_CPUS 128
 
 /*
- * Simulated PMU kfunc stubs.
+ * bpf_perf_event_read_value() — the one genuinely-hardware primitive that
+ * scx/lib/pmu.bpf.c needs (the real library is compiled in below the
+ * scheduler source; see that include for why).
  *
- * The new COSMOS API uses scx_pmu_read() kfunc instead of the old
- * start_readings map + bpf_perf_event_read_value() approach.
+ * The simulated machine exposes no performance counters: scxsim models CPU
+ * time, not microarchitecture, so there is no per-task event count to report.
+ * -ENOENT is exactly what the kernel returns for a perf event array slot with
+ * nothing installed, so the library takes its real "counter unavailable" path
+ * instead of being handed invented numbers.
  *
- * We simulate PMU counters using scx_bpf_now() as a monotonic counter.
- * The delta between event_start and event_stop represents task runtime
- * in nanoseconds, which serves as a simulated "event count".
+ * This replaced seven hand-written scx_pmu_* bodies that returned
+ * scx_bpf_now() deltas as if they were event counts. That was a No-Stub Rule
+ * violation twice over: the counts were fabricated, and the build manifest
+ * also forced perf_config=1 (upstream default is 0x0, "no event"), so cosmos's
+ * real no-PMU path never executed. Both are fixed; perf_config now stays at
+ * its upstream default in crates/scxsim-build/src/lib.rs.
+ */
+static int cosmos_perf_event_read_value(void *map, unsigned long long flags,
+					void *buf, unsigned int buf_size);
+#undef bpf_perf_event_read_value
+#define bpf_perf_event_read_value(map, flags, buf, buf_size) \
+	cosmos_perf_event_read_value((void *)(map), (flags), (buf), (buf_size))
+
+/*
+ * bpf_task_storage_delete() — scx/lib/pmu.bpf.c drops its per-task counters
+ * with this in scx_pmu_task_fini(). scx_test_map.h supplies a
+ * bpf_task_storage_get() macro but no matching delete, and libbpf's
+ * bpf_helper_defs.h declares the helper as a function pointer holding the raw
+ * helper id (157), so an un-overridden call jumps to address 0x9d and
+ * segfaults rather than failing to link.
  *
- * Tasks with runtime > perf_threshold are classified as "event heavy"
- * and routed to the least-busy-event CPU.
+ * scx_test_map_delete_elem() keys off the same bytes
+ * scx_test_task_storage_get() keys off, so get and delete stay symmetric.
  */
-extern u64 scx_bpf_now(void);
+#undef bpf_task_storage_delete
+#define bpf_task_storage_delete(map, task) \
+	scx_test_map_delete_elem((void *)(map), (task))
 
-/* Per-task PMU baseline storage (indexed by task pointer hash) */
-#define PMU_TASK_HASH_SIZE 1024
-static u64 pmu_task_baseline[PMU_TASK_HASH_SIZE];
-
-static inline unsigned int pmu_task_hash(struct task_struct *p)
+static int cosmos_perf_event_read_value(void *map, unsigned long long flags,
+					void *buf, unsigned int buf_size)
 {
-	return ((unsigned long)p >> 4) % PMU_TASK_HASH_SIZE;
-}
-
-/*
- * scx_pmu_install - Install a PMU event for tracking.
- * In simulation, this is a no-op since we use scx_bpf_now() as counter.
- */
-int scx_pmu_install(u64 event)
-{
-	(void)event;
-	return 0;
-}
-
-/*
- * scx_pmu_uninstall - Uninstall a PMU event.
- * No-op in simulation.
- */
-int scx_pmu_uninstall(u64 event)
-{
-	(void)event;
-	return 0;
-}
-
-/*
- * scx_pmu_task_init - Initialize per-task PMU tracking.
- * No-op in simulation.
- */
-int scx_pmu_task_init(struct task_struct *p)
-{
-	(void)p;
-	return 0;
-}
-
-/*
- * scx_pmu_task_fini - Finalize per-task PMU tracking.
- * No-op in simulation.
- */
-int scx_pmu_task_fini(struct task_struct *p)
-{
-	(void)p;
-	return 0;
-}
-
-/*
- * scx_pmu_event_start - Record baseline counter when task starts running.
- * Stores current scx_bpf_now() value as baseline.
- */
-int scx_pmu_event_start(struct task_struct *p, bool update)
-{
-	(void)update;
-	pmu_task_baseline[pmu_task_hash(p)] = scx_bpf_now();
-	return 0;
-}
-
-/*
- * scx_pmu_event_stop - Mark end of PMU event tracking for task.
- * The actual reading happens in scx_pmu_read().
- */
-int scx_pmu_event_stop(struct task_struct *p)
-{
-	(void)p;
-	return 0;
-}
-
-/*
- * scx_pmu_read - Read PMU counter delta for a task.
- *
- * Returns the difference between current time and baseline (task runtime).
- * If clear=true, resets the baseline for the next measurement.
- */
-int scx_pmu_read(struct task_struct *p, u64 event, u64 *value, bool clear)
-{
-	unsigned int hash = pmu_task_hash(p);
-	u64 now = scx_bpf_now();
-	u64 baseline = pmu_task_baseline[hash];
-
-	(void)event;
-
-	/* Return delta since event_start */
-	if (now >= baseline)
-		*value = now - baseline;
-	else
-		*value = 0;
-
-	if (clear)
-		pmu_task_baseline[hash] = now;
-
-	return 0;
+	(void)map;
+	(void)flags;
+	(void)buf;
+	(void)buf_size;
+	/* No perf event is installed on the simulated machine. */
+	return -ENOENT;
 }
 
 /*
@@ -153,6 +92,24 @@ static void *cosmos_map_lookup(void *map, const void *key)
  */
 #include "intf.h"
 #include <cosmos_main_patched.c>
+
+/*
+ * scx/lib/pmu.bpf.c — the REAL PMU library, compiled in.
+ *
+ * scx_cosmos calls scx_pmu_install / _uninstall / _task_init / _task_fini /
+ * _event_start / _event_stop / _read. Hand-writing those bodies here would be
+ * the "elided library" antipattern scx-sim/CLAUDE.md's No-Stub Rule forbids,
+ * so the library's own logic is linked in and only the hardware primitive
+ * underneath it (bpf_perf_event_read_value, above) is simulator-supplied.
+ * Same arrangement as the layered wrapper.
+ *
+ * `_license` has to be renamed because SEC() is a no-op here, so pmu.bpf.c's
+ * and main.bpf.c's license arrays would otherwise collide in one translation
+ * unit.
+ */
+#define _license _scx_pmu_license
+#include "lib/pmu.bpf.c"
+#undef _license
 
 
 /*
@@ -214,6 +171,14 @@ void cosmos_register_maps(void)
 	gpu_pid_map_registered = false;
 
 	SCX_REGISTER_STORAGE(task_ctx_stor);
+
+	/*
+	 * scx_pmu_tasks belongs to the compiled-in scx/lib/pmu.bpf.c. cosmos calls
+	 * scx_pmu_task_init()/_task_fini() unconditionally (not gated on
+	 * perf_config), so the library needs its task storage backed even when no
+	 * perf event is configured.
+	 */
+	SCX_REGISTER_STORAGE(scx_pmu_tasks);
 
 	/*
 	 * cpu_util_map (BPF_MAP_TYPE_ARRAY): per-CPU user utilization in
