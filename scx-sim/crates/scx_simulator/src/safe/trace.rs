@@ -3,6 +3,7 @@
 //! Every scheduling action (task scheduled, preempted, slept, woke, CPU idle)
 //! is recorded as a `TraceEvent` with a simulated timestamp and CPU ID.
 
+use crate::clock_mode::ClockMode;
 use crate::dsq::DsqManager;
 use crate::engine::ExitKind;
 use crate::fmt::FmtTs;
@@ -561,9 +562,24 @@ pub struct Trace {
     dsq_samples: Vec<DsqLengthSample>,
     /// Warmup period: stats exclude events before this simulated time.
     warmup_ns: TimeNs,
+    /// Which model advanced simulated time for this run.
+    ///
+    /// Recorded on the trace so a result carries its own clock rather than
+    /// requiring the reader to know what hardware it ran on. Two traces are
+    /// only comparable when this matches. See [`ClockMode`].
+    clock_mode: ClockMode,
 }
 
 impl Trace {
+    /// Which model advanced simulated time for this run.
+    pub fn clock_mode(&self) -> ClockMode {
+        self.clock_mode
+    }
+
+    pub(crate) fn set_clock_mode(&mut self, mode: ClockMode) {
+        self.clock_mode = mode;
+    }
+
     #[allow(dead_code)]
     pub(crate) fn new(nr_cpus: u32, tasks: &[TaskDef]) -> Self {
         Self::with_warmup(nr_cpus, tasks, 0)
@@ -578,6 +594,9 @@ impl Trace {
             exit_kind: ExitKind::Normal,
             dsq_samples: Vec::new(),
             warmup_ns,
+            // Overwritten by the engine once the clock is chosen; Fallback is
+            // the conservative default for traces built outside a run.
+            clock_mode: ClockMode::Fallback,
         }
     }
 

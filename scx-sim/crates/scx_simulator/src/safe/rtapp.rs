@@ -840,6 +840,10 @@ pub fn load_rtapp(json_str: &str, nr_cpus: u32) -> Result<Scenario, RtAppError> 
         seed: seed_from_env(),
         fixed_priority: false,
         sched_overhead_rbc_ns: sched_overhead_rbc_ns_from_env(),
+        // Explicit iff the operator actually set SCX_SIM_RBC_NS; the
+        // unset case yields the Some(10) default, which must not hard-fail
+        // on a PMU-less host.
+        rbc_explicitly_requested: std::env::var_os("SCX_SIM_RBC_NS").is_some(),
         watchdog_timeout_ns: Some(DEFAULT_WATCHDOG_TIMEOUT_NS),
         ignore_bpf_errors: true,
         hotplug_events: Vec::new(),

@@ -14,6 +14,7 @@
 pub mod atomic_types;
 pub mod bpf_trace;
 pub mod cgroup;
+pub mod clock_mode;
 pub mod cpu;
 // Deterministic-iteration map utility, currently exercised only by its own unit
 // tests; retained as a determinism primitive (the crate's reason for being).
