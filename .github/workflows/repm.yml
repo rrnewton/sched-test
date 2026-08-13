@@ -1,0 +1,104 @@
+name: repm
+
+# repm is its own cargo workspace and, until this workflow existed, it was run
+# by NOTHING: none of the seven workflows on `integration` touched it, and
+# scx-sim/validate.sh does not either. 135 tests executed only when a human
+# remembered to run them locally. That is how two of its tests spent years
+# pointed at a capture directory on one developer's machine, silently returning
+# early and reporting PASSED — found by the 2026-08-12 skipped-test sweep
+# (ai_docs/SKIPPED_TEST_SWEEP_20260812.md in the dev harness).
+#
+# `on: push` / `on: pull_request` and NOT `on: schedule` — a `schedule:` here
+# would never fire, because GitHub resolves schedules from the default branch
+# and this workflow lives on `integration`. See sched-test CLAUDE.md.
+
+on:
+  push:
+    branches:
+      - '**'
+  pull_request:
+    branches:
+      - '**'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            repm/target/
+          key: ${{ runner.os }}-repm-${{ hashFiles('repm/Cargo.lock') }}
+
+      # ┌───────────────────────────────────────────────────────────────────┐
+      # │ TESTS FIRST. DO NOT REORDER THIS JOB INTO THE CONVENTIONAL SHAPE. │
+      # └───────────────────────────────────────────────────────────────────┘
+      #
+      # If you are here to tidy this into the usual lint -> build -> test order
+      # that ci.yml uses: that ordering, applied here, silently defeats the
+      # entire purpose of this file. Read this before changing it.
+      #
+      # repm's clippy is RED — 24 pre-existing findings, tracked separately.
+      # `cargo clippy -- -D warnings` exits 101. So in the conventional order
+      # the job dies at step one and the tests NEVER EXECUTE.
+      #
+      # The result would have been perfect: a crate that had never run in CI
+      # gets added to CI, and carries on never running — while the workflow
+      # file looks correct, the checks list shows repm present, and the job
+      # reports a real failure with a real reason. Nothing would look wrong.
+      # It would just quietly still be true that no repm test had ever run.
+      #
+      # That is the failure class this whole workflow exists to end, and
+      # putting the lint first would have recreated it inside the fix. The
+      # ordering is load-bearing, not stylistic.
+      #
+      # When the 24 findings are cleared, this job may be reordered freely —
+      # the constraint is "tests must not sit behind a step that is red", not
+      # "tests must be first" forever.
+      #
+      # --all-targets to widen the target axis; `cargo test` alone would leave
+      # some targets uncompiled and still report success.
+      - name: Test
+        working-directory: repm
+        run: cargo test --all-targets
+
+      # No doc-test step. Doc-tests ARE a separate axis that --all-targets does
+      # not cover, so one belongs here in principle — but repm is binary-only
+      # and `cargo test --doc` errors with "no library targets found in package
+      # `repm`". A step that always fails for a reason unrelated to the code
+      # teaches people to ignore this workflow. Add it if repm ever grows a lib
+      # target.
+
+      - name: Build (release)
+        if: always()
+        working-directory: repm
+        run: cargo build --release
+
+      - name: Format
+        if: always()
+        working-directory: repm
+        run: cargo fmt --check
+
+      # EXPECTED RED, and left red on purpose. 24 pre-existing findings under
+      # --all-targets (18 without it) — unused imports and a lot of dead code in
+      # synthesis.rs and trace.rs that is reachable only from tests. None of it
+      # was introduced here; it accumulated precisely because nothing ever
+      # linted this crate. Fixing it is its own task; excluding it to manufacture
+      # a green is how a crate ends up outside CI in the first place.
+      - name: Clippy
+        if: always()
+        working-directory: repm
+        run: cargo clippy --all-targets -- -D warnings
+
+      # `if: always()` on every step after the first so that ONE run reports
+      # every problem, rather than stopping at the first red and hiding the rest
+      # behind it. For an inventory pass that is the difference between "clippy
+      # is red" and "clippy is red, fmt is clean, and all 133 tests pass".

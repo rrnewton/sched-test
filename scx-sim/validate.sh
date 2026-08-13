@@ -243,7 +243,15 @@ echo "=== Running feature-gated example builds ==="
 # The trace-comparison example is how the simulated half of a wprof comparison
 # is produced. It is behind `sim` for the same reason the test is, so the
 # --workspace build never compiles it and a break would go unnoticed.
-cargo build -p scxsim-calibration --features sim --example dump_sim_perfetto
+#
+# `--examples`, not `--example dump_sim_perfetto`. This named one target and so
+# covered one; `slice_sweep` sits behind the same feature and was compiled by
+# nothing at all — not here, not in any workflow, not by the Makefile. A guard
+# whose coverage is a hand-maintained list drifts the moment a target is added,
+# which is exactly what happened. `--examples` builds every example in the
+# package whose required-features are satisfied, so the next one is covered on
+# the day it is written.
+cargo build -p scxsim-calibration --features sim --examples
 
 echo ""
 echo "=== Rust library coverage ratchet (self-test + gate) ==="

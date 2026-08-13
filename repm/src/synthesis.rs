@@ -670,10 +670,16 @@ Duration: 9000.000ms
             env!("CARGO_MANIFEST_DIR"),
             "/tests/blind_simple/scxsim_output.txt"
         ));
-        if !output_path.exists() {
-            eprintln!("Skipping real scxsim output test (run scxsim first)");
-            return;
-        }
+        // Asserted, not skipped. The fixture is TRACKED, so there is no
+        // legitimate case where it is absent — an early return here could only
+        // ever hide someone deleting it, while reporting PASSED. (The old
+        // message said "run scxsim first", which has not been true since the
+        // output was committed.)
+        assert!(
+            output_path.exists(),
+            "tracked fixture {} is missing",
+            output_path.display()
+        );
 
         let text = std::fs::read_to_string(output_path).unwrap();
         let result = synthesize_from_summary(&text, 4, 10).unwrap();
