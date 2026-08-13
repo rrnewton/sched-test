@@ -376,3 +376,99 @@ fn test_run_delay_scales_with_load() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// The kernel-overhead path: re-dispatch must be charged, not free
+// ---------------------------------------------------------------------------
+
+/// A preempted task's re-dispatch must be charged the modelled kernel cost,
+/// not treated as free.
+///
+/// # The defect this pins
+///
+/// `enqueued_at_ns` gates the wakeup-latency floor in `start_running` (a 3us
+/// log-normal with a 3.5% Pareto tail, modelling IPI, context switch and cache
+/// warming). It used to be written in exactly ONE place — `handle_task_wake` —
+/// so the floor applied to WAKEUPS ONLY. Every preempted or slice-expired task
+/// went back through `stop_and_reenqueue`, whose trace callbacks receive
+/// `SimulatorState` but not the task table, so the stamp could not be made
+/// there. Those tasks were re-dispatched charged only the fixed dispatch
+/// overheads: a flat 250ns with ZERO variance.
+///
+/// On CPU-bound spinners that never sleep that is 99.8% of dispatches, and it
+/// made the simulator's scheduling delay 25-58x below a live guest's
+/// `sched_info.run_delay` on the same scenario. The kernel charges this path:
+/// `sched_info_enqueue` restamps `last_queued` on every enqueue, including the
+/// re-enqueue of a preempted task.
+///
+/// # What is asserted, and what is deliberately NOT
+///
+/// The fix stamps the shared `stop_and_reenqueue` spine, which is necessary but
+/// NOT sufficient: measured on this scenario, 34-36% of `simple` and `cosmos`
+/// re-dispatches and ~80% of `lavd`'s still come in under 1us, so further
+/// re-dispatch paths remain uncharged and are scheduler-dependent. This test
+/// therefore pins the mechanism, not a calibrated magnitude:
+///
+///   * SPREAD, for every scheduler — the old behaviour produced ONE distinct
+///     value, and a constant cannot have a spread. This fails on a regression
+///     to any fixed cost, whatever its size.
+///   * MAGNITUDE, only for `simple` — the scheduler the calibration fixture
+///     uses, and the one whose gap to the live guest was measured. Asserting a
+///     magnitude for `lavd` today would be asserting the residual defect.
+///
+/// The residual is a follow-up, and it is a finding rather than a caveat: it
+/// means scheduling-delay figures remain understated, most for `lavd`.
+#[test]
+fn preemption_redispatch_is_charged_the_modelled_kernel_cost() {
+    // Two spinners on two CPUs: no contention, so every sample is pure
+    // per-dispatch cost with no queueing mixed in. That isolation is the point
+    // — under contention real queueing would mask the defect entirely.
+    let mut builder = Scenario::builder().cpus(2);
+    for i in 0..2 {
+        builder = builder.add_task(&format!("spin{i}"), 0, forever_run(50_000_000));
+    }
+    // 2s, not less: the default slice is 20ms, so a shorter run yields ~10
+    // dispatches per task and the spread assertion would be reading noise.
+    let scenario = builder.duration_ms(2_000).build();
+
+    for (name, make) in SCHEDS {
+        let _lock = common::setup_test();
+        let trace = Simulator::new(make(2)).run(scenario.clone());
+        let stats = TraceStats::from_trace(&trace);
+
+        for pid in scenario.tasks.iter().map(|t| t.pid) {
+            let lat = match stats.tasks.get(&pid) {
+                Some(t) if t.sched_latencies.len() >= 20 => t.sched_latencies.clone(),
+                other => panic!(
+                    "{name}: pid {pid:?} produced {} run-delay samples; this test needs \
+                     a preemption-driven workload to say anything",
+                    other.map_or(0, |t| t.sched_latencies.len())
+                ),
+            };
+
+            let mut distinct = lat.clone();
+            distinct.sort_unstable();
+            distinct.dedup();
+            assert!(
+                distinct.len() > 1,
+                "{name}: pid {pid:?} re-dispatch delay took ONE distinct value \
+                 ({} ns) across {} episodes. That is the signature of a fixed \
+                 dispatch overhead being charged instead of the modelled kernel \
+                 path — the wakeup-latency floor is not reaching re-enqueue.",
+                distinct[0],
+                lat.len()
+            );
+
+            if *name == "simple" {
+                let mean = lat.iter().sum::<u64>() as f64 / lat.len() as f64;
+                assert!(
+                    mean > 1_000.0,
+                    "{name}: pid {pid:?} mean re-dispatch delay {mean:.0} ns is below \
+                     1us. The modelled floor is 3us before its heavy tail; anything \
+                     at the few-hundred-ns scale means only the fixed dispatch \
+                     overheads were charged."
+                );
+            }
+        }
+    }
+}
