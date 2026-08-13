@@ -138,6 +138,12 @@ pub enum Verdict {
     /// Measured, but the estimate is too weak to support a conclusion (too few
     /// samples for the percentile being claimed). NOT agreement.
     Inconclusive,
+    /// The metric could not have disagreed on this scenario: its achievable
+    /// range is a small fraction of its tolerance. NOT agreement — a pass here
+    /// says the quantity is pinned, not that the model is right. See
+    /// [`crate::power`]. The remedy is a scenario that exercises the metric,
+    /// never a wider tolerance.
+    Powerless,
     /// Outside tolerance. The simulator and the live run disagree.
     Disagree,
 }
@@ -162,6 +168,7 @@ impl fmt::Display for Verdict {
             Verdict::NotMeasured => "not-measured",
             Verdict::Agree => "agree",
             Verdict::Inconclusive => "inconclusive",
+            Verdict::Powerless => "POWERLESS",
             Verdict::Disagree => "DISAGREE",
         };
         f.write_str(s)
