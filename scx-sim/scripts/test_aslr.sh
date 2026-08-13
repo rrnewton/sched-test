@@ -44,9 +44,21 @@ collect_addresses() {
     local flags="$1"
     local results=()
     for _ in $(seq "$RUNS"); do
+        # Do NOT discard stderr here. This runs under `set -e` inside a
+        # command substitution, so a failing scxsim used to kill the whole
+        # script with zero output — the exact silent-failure mode this repo
+        # forbids. Capture stderr and report it before bailing out.
         # shellcheck disable=SC2086
-        local out
-        out=$("$SCXSIM" print-addresses -s simple $flags 2>/dev/null)
+        local out err rc=0
+        err=$(mktemp)
+        out=$("$SCXSIM" print-addresses -s simple $flags 2>"$err") || rc=$?
+        if [ "$rc" -ne 0 ]; then
+            echo "ERROR: '$SCXSIM print-addresses -s simple $flags' exited $rc" >&2
+            sed 's/^/    /' "$err" >&2
+            rm -f "$err"
+            exit 1
+        fi
+        rm -f "$err"
         results+=("$out")
     done
     printf '%s\n' "${results[@]}"

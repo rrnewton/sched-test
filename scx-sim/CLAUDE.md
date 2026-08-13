@@ -727,14 +727,54 @@ CPU model name in the CSV directory structure).
 
 Set up the Python venv (one-time, requires network):
 
+    make install-deps
+
+which creates `.venv` and installs mypy, pandas-stubs, plotly, and pandas
+into it. The manual equivalent:
+
     python3 -m venv .venv && .venv/bin/pip install plotly pandas
 
-(On Meta corporate machines behind a proxy, prefix pip with `with-proxy`.)
+(On Meta corporate machines behind a proxy, prefix pip with `with-proxy`.
+`deps.sh` retries through `with-proxy` automatically when a direct fetch
+fails.)
 
 The benchmark scripts auto-detect `.venv/bin/python3` if available.
 
 Dependencies and Missing Software
 ========================================
+
+### Start here: `make check-deps` / `make install-deps`
+
+    make check-deps     # report every dependency, where it was found, and
+                        # a copy-pasteable install command for each missing one
+    make install-deps   # install everything installable without root
+
+`scripts/deps.sh` is the single source of truth for what scx-sim needs. Both
+Make targets are thin wrappers over it; `validate.sh` runs `check-deps` first
+and refuses to start when a REQUIRED dependency is missing, so you get one
+explicit message instead of a confusing failure several checks later. Missing
+OPTIONAL dependencies are reported and then re-listed as SKIPPED at the end of
+`validate.sh` — never silently passed over.
+
+Rules that section obeys, and that new code must too:
+
+- **No machine-specific paths.** Nothing may assume a particular user, home
+  directory layout, or distro package set. Do not hard-code an absolute path
+  to a tool; resolve it from an env var, then `$PATH`, then a `$HOME`-relative
+  fallback. (`SCXSIM_RTAPP_BIN` → `$PATH` → `~/bin/rt-app` is the pattern.)
+- **One environment per toolchain.** All Python tooling resolves from
+  `.venv` and only `.venv`. Probing `.venv/bin/pip` while running a `$PATH`
+  `mypy` is the exact bug this section exists to prevent.
+- **$HOME installs are versioned and activatable.** Anything installed into
+  `$HOME` goes to `$HOME/opt/<tool>-<version>` with an `env.sh` that sets
+  `PATH`/`LD_LIBRARY_PATH`. Nothing system-wide, no chef-owned path touched,
+  so it survives a chef run — unlike `dnf install`.
+- **Prefer OSS tooling over the fb clang.** Coverage needs
+  `libclang_rt.profile.a`, which neither the CentOS clang nor the fb clang
+  ships. `make install-deps` installs OSS LLVM to `$HOME/opt/llvm-<ver>`;
+  activate it with `source ~/opt/llvm-<ver>/env.sh`.
+
+The lists below are the manual equivalents, for reference.
 
 ### Required system packages (Ubuntu/Debian)
 
@@ -777,7 +817,9 @@ user for help. The `~/bin/` directory is on `$PATH` for locally-built tools.
 and run the check. If installation fails, escalate to the human — do NOT
 silently skip the check and report success. A skipped check is a lie. Examples:
 
-- mypy not found → `pip install mypy` (or `.venv/bin/pip install mypy`), then run it
+- mypy not found → `make install-deps` (creates `.venv` and installs mypy +
+  pandas-stubs into it), then run it. Do NOT reach for the system `pip`: on
+  Meta dev boxes it refuses every install.
 - clippy not available → install it, don't skip lint
 - a test runner is missing → install it, don't skip tests
 
@@ -785,11 +827,16 @@ The same principle applies to test failures: if a test fails, fix it or
 escalate. Never comment out, skip, or ignore a failing test to make the suite
 "pass."
 
-Common tools already available:
+Common tools already available (run `make check-deps` to see which of these
+this machine actually has, and where):
 
-- **rt-app**: `~/bin/rt-app` (built from `~/playground/rt-app`)
+- **rt-app**: resolved as `$SCXSIM_RTAPP_BIN` → `$PATH` → `~/bin/rt-app`
 - **bpftrace**: system-installed
 - **mb** (minibeads): local issue tracker
+- **gh**: GitHub CLI. Also backs git's `github.com` credential helper
+  (`credential.https://github.com.helper = !gh auth git-credential`), so a
+  broken or dangling `gh` silently breaks git auth against github.com.
+  `make check-deps` reports the dangling-symlink case explicitly.
 - **e9patch**: `make install-e9patch` (requires network). After install: `make -C schedulers e9` to build instrumented scheduler libraries. (On Meta corporate machines behind a proxy, prefix with `with-proxy`.)
 
 Every TODO in source code MUST reference an issue: `TODO(sim-XXXXX)`. Do not
