@@ -9,6 +9,19 @@ cd "$(dirname "$0")"
 SKIPPED=()
 record_skip() { SKIPPED+=("$1"); }
 
+echo "=== Checking dependencies ==="
+# A missing dependency must produce an explicit, actionable message here —
+# never a silent skip, and never a confusing failure five checks later.
+# deps.sh exits non-zero only when a REQUIRED dependency is missing; missing
+# OPTIONAL ones are printed and then show up again as SKIPPED at the end.
+if ! ./scripts/deps.sh check; then
+    echo ""
+    echo "ERROR: validate.sh cannot run with required dependencies missing."
+    echo "       Fix with: make install-deps    (then re-run ./validate.sh)"
+    exit 1
+fi
+
+echo ""
 echo "=== Checking for merge conflict markers ==="
 CONFLICT_FILES=$(grep -rl --include='*.rs' --include='*.py' --include='*.sh' \
     --include='*.c' --include='*.h' --include='*.toml' --include='Makefile' \
