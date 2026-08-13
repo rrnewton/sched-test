@@ -1,7 +1,13 @@
 # Design: porting hermit's happens-before to scx-sim
 
-**Status: DESIGN ONLY — nothing implemented. Brought back for approval before
-any engine code is written, per the task brief.**
+**Status: HELD — NOT APPROVED, DO NOT IMPLEMENT FROM THIS.**
+
+Written before the owner narrowed the ask to "just study how we did it in
+hermit". The account that supersedes it as the current deliverable is
+`HERMIT_HAPPENS_BEFORE_STUDY.md`; read that first. This file is retained only
+because its §2 refutation and §3 what-scx-sim-already-has survey are still
+accurate and were separately verified. Its §4 design and §7 recommendation are
+premature and have not been reviewed.
 **Task:** tg `port-hermit-happens-before-to-scxsim`
 **Date:** 2026-08-13
 **Baseline:** scx-sim at `origin/integration@706ea87`; hermit at the dev-hermit
