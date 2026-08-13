@@ -301,3 +301,40 @@ built binary carries 19 `pressure` strings.
 liveness confirmed only at the API level, the fix does not change this
 scenario's outcome.* Resolving caveat 2 is the obvious next step and is cheap —
 instrument whether slices actually shorten under pressure.
+
+---
+
+## Caveat 2 resolved: the mechanism ENGAGES. It just does not help here.
+
+The patch adds a `pressure:` field to the cgroup dump, which the existing
+LAVD-PRINTK output already surfaces — so no new instrumentation was needed.
+Measured, patch applied, at the two watchdog-tripping quotas:
+
+| quota | `cgx->pressure` | expected slice scaling | outcome |
+|---|---|---|---|
+| 0.125ms | **2176** | `1024/2176` = 47% of base | 40.28s, `ErrorStall` |
+| 0.062ms | **3323** | `1024/3323` = 31% of base | 81.18s, `ErrorStall` |
+
+`CBW_PRESSURE_NORMAL` is 1024, so pressure is 2.1x and 3.2x normal. It is being
+computed, it is nonzero, and LAVD is consuming it — `main.bpf.c:397` really does
+`slice_wall = max((slice_wall * LAVD_SCALE) / pressure, 1)`, so slices genuinely
+shorten to roughly a third under the severest quota.
+
+**So the earlier "may not be engaging" caveat is wrong, and the answer is the
+more interesting one:** part [2/3] works exactly as designed — pressure is
+detected, propagated and applied — and the watchdog still fires at bit-identical
+times. Shortening slices does not bound this wait.
+
+That is consistent with the PR's own framing, which treats slice length and
+queue ordering as *two separate* causes of unbounded wait. It suggests the
+binding constraint here is [3/3] — the BTQ vtime ordering — not [2/3].
+
+### What this changes about the message
+
+Of the three possible messages, the evidence now supports the third, narrowed:
+
+- ~~"your fix does not work"~~ — unsupported; [2/3] demonstrably does what it says.
+- ~~"we could not make your fix engage"~~ — disproved; pressure 2176/3323.
+- **"[2/3] engages correctly and does not bound the wait in this scenario;
+  the watchdog still fires at identical times."** Whether [3/3] would, on its
+  own base, is the remaining open question.
