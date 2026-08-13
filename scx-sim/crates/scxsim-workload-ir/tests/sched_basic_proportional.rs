@@ -246,17 +246,26 @@ fn spinwait_runs_continuously_so_the_scheduler_owns_the_slice() {
     assert!(ir.fidelity.is_exact(), "{:?}", ir.fidelity.approximations());
 }
 
-/// SCOPE-NARROWNESS CHECK: does a cgroup cpuset actually confine its tasks?
+/// A cgroup cpuset must actually confine its member tasks.
 ///
-/// The second failure shape the exact-arm audit looked for: a value the
-/// lowering carries correctly that something downstream then ignores. Cgroup
-/// cpusets are the candidate — `to_scenario` resolves them onto `CgroupDef`,
-/// but a task's `allowed_cpus` is populated only from its OWN affinity, so
-/// nothing in the ingestion confines a task to its cgroup's CPUs.
+/// INVERTED FROM A CHARACTERIZATION TEST, deliberately not deleted. The
+/// exact-arm audit wrote this to assert the OPPOSITE — that cgroup cpusets
+/// reached `CgroupDef` and then confined nothing, because a task's
+/// `allowed_cpus` was populated only from its own affinity. That gap was
+/// sim-4qlh5; it is fixed (`Scenario::effective_cpuset`, PR #79), so the
+/// original assertion fired its own "KNOWN GAP CLOSED?" message.
 ///
-/// This runs two cgroups pinned to disjoint halves of a 4-CPU box and reports
-/// where the tasks actually ran. It asserts only what it can prove; the
-/// interesting output is printed.
+/// The gap-asserting form was replaced with the confinement assertion it was
+/// standing in for, rather than removed. Deleting it would have discarded
+/// exactly the coverage it existed to protect: this is the only test in the
+/// crate that checks a declared cpuset against where tasks were OBSERVED to
+/// run, and nothing else would notice the gap reopening.
+///
+/// THE TRAP THE ORIGINAL AUTHOR LEFT, preserved because it is the whole reason
+/// this test is written the way it is: two tasks on four CPUs land apart by
+/// luck often enough that "are the two tasks disjoint from each other" passes
+/// while confinement is entirely absent. Each task is therefore checked
+/// against ITS OWN cgroup's declared set, never against the other task.
 #[test]
 fn cgroup_cpuset_confinement_is_observable_or_is_not() {
     use scx_simulator::{DynamicScheduler, Simulator, TraceKind};
@@ -326,22 +335,42 @@ fn cgroup_cpuset_confinement_is_observable_or_is_not() {
         }
     }
 
-    // THE FINDING, asserted rather than merely printed: the ingestion resolves
-    // the cgroup cpuset onto CgroupDef but never onto the member tasks'
-    // allowed_cpus, and nothing downstream confines them either.
+    // The cpuset must reach the task's EFFECTIVE cpumask. Note it does NOT
+    // reach `TaskDef::allowed_cpus`, and asserting that it does would be
+    // wrong: `allowed_cpus` stays the task's OWN declared affinity (None
+    // here), and the fix intersects it with the cgroup's cpuset at task
+    // construction via `Scenario::effective_cpuset`. Checking `allowed_cpus`
+    // would test an implementation that does not exist.
+    for task in &scenario.tasks {
+        let effective = scenario.effective_cpuset(task).unwrap_or_else(|| {
+            panic!(
+                "task {:?} is in a cpuset-confined cgroup, so its effective \
+                 cpuset must be Some; got None. If this fires, the cgroup \
+                 cpuset has stopped reaching task placement (sim-4qlh5 \
+                 reopened).",
+                task.pid,
+            )
+        });
+        let expected = declared
+            .get(&task.pid.0)
+            .expect("both pids are in the declared map");
+        let got: HashSet<u32> = effective.iter().map(|c| c.0).collect();
+        assert_eq!(
+            &got, expected,
+            "task {:?} effective cpuset must be exactly its cgroup's declared \
+             set",
+            task.pid,
+        );
+    }
+
+    // And it must hold in the RUN, not just in the scenario: a populated
+    // allowed_cpus that the engine ignored would satisfy the check above.
     assert!(
-        scenario.tasks.iter().all(|t| t.allowed_cpus.is_none()),
-        "premise of this characterization test: cgroup cpusets do not reach \
-         task allowed_cpus today",
-    );
-    assert!(
-        !violations.is_empty(),
-        "KNOWN GAP CLOSED? Tasks are now confined to their cgroup's cpuset. \
-         That is the desired behaviour — delete this characterization test and \
-         replace it with a real confinement assertion.",
-    );
-    println!(
-        "CONFIRMED SCOPE-NARROWNESS GAP: cgroup cpusets do not confine tasks. {}",
+        violations.is_empty(),
+        "a cgroup confined by cpuset.cpus must not run outside it — in the \
+         kernel this is impossible, since cpuset.cpus narrows every member \
+         task's effective cpumask. Violations: {}",
         violations.join("; ")
     );
+    println!("confinement holds: every task ran only within its cgroup's declared cpuset");
 }

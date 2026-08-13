@@ -27,8 +27,9 @@
 //! That is also why the interesting result is not the metrics that agree.
 
 use scxsim_calibration::{
-    report::MetricResult, CalibrationRun, Metric, NegativeControl, Quantity, RunOutcome,
-    SampleCount, SimRun, Verdict, VmRun,
+    report::{mean_slice_result, MetricResult},
+    CalibrationRun, Metric, NegativeControl, Quantity, RunOutcome, SampleCount, SimRun, Verdict,
+    VmRun,
 };
 use scxsim_workload_ir::{
     lower, to_scenario, DurationNs as IrDuration, SourceCgroupDef, SourceHold, SourceScenario,
@@ -103,6 +104,10 @@ fn calibrate() -> CalibrationRun {
         ExitKind::Normal,
         "the simulation must terminate normally"
     );
+    // Named once, and threaded into the mean-slice guard below. The guest's
+    // scheduler comes off its own sidecar (`vm.scheduler`), so neither side is
+    // asserted by this file — they are reported by the runs themselves.
+    const SIM_SCHEDULER: &str = "simple";
     let sim = SimRun::new(&scenario, &trace);
     let wall = sim.elapsed();
 
@@ -206,6 +211,23 @@ fn calibrate() -> CalibrationRun {
         sim_wake.count(),
     ));
 
+    // --- Mean slice length. The guard runs BEFORE either measurement is
+    // consulted: the guest runs scx-ktstr and the simulator runs `simple`, so
+    // this must abstain rather than compare two different schedulers' slice
+    // policies and call the difference simulator infidelity.
+    //
+    // The VM side is None because no wprof slice extraction exists in this
+    // crate yet — a second, independent reason to abstain, and one that would
+    // still hold if the schedulers were made to match. Both are reported.
+    let sim_slices = sim.slice_durations();
+    run.record(mean_slice_result(
+        SIM_SCHEDULER,
+        &vm.scheduler,
+        sim.mean_slice(),
+        None,
+        sim_slices.count(),
+    ));
+
     // --- The negative control. A 3x-wrong occupancy must be rejected by the
     // SAME tolerance the real comparison used, or nothing above is citable. ---
     let run = run.with_control(NegativeControl::perturbed(
@@ -225,6 +247,22 @@ fn calibrate() -> CalibrationRun {
         vm.scheduler,
         run.render()
     );
+    // The sample-floor caveat on Metric::MeanSliceLength is only valid while
+    // the slice distribution stays tight; report the dispersion so the floor
+    // can be raised on evidence rather than assumed adequate.
+    match (sim_slices.mean(), sim_slices.coefficient_of_variation()) {
+        (Some(m), Some(cv)) => println!(
+            "sim slice distribution: {} mean={m} CV={cv:.3}{}",
+            sim_slices.count(),
+            if cv > 0.33 {
+                "  <-- CV > 0.33: MinSamples::PERCENTILE is NOT sufficient here; \
+                 raise to TAIL_PERCENTILE"
+            } else {
+                "  (CV <= 0.33, so PERCENTILE is adequate)"
+            }
+        ),
+        _ => println!("sim slice distribution: not computable"),
+    }
     println!(
         "supporting detail not in the table:\n  \
          sim context switches {} (live side has no per-task counterpart)\n  \
@@ -513,6 +551,43 @@ fn the_simulated_side_actually_ran() {
             other => panic!("expected a duration, got {other:?}"),
         }
     }
+}
+
+/// THE ACCEPTANCE TEST FOR `MeanSliceLength`, and it is the NEGATIVE case.
+///
+/// The guest runs `scx-ktstr`; the simulator runs `simple`. Those are different
+/// schedulers, and different schedulers legitimately choose different slice
+/// lengths — so a mean-slice comparison between them is a category error and
+/// the metric MUST report `NotMeasured` rather than a number.
+///
+/// A number here would be worse than having no metric at all. It would look
+/// like a comparison, it would sit in the calibration output beside real
+/// results, and nothing would tell a reader it compared two unlike things.
+/// That is the same defect as an `is_exact()` returning true while fabricating
+/// a value: a report confidently about the wrong thing.
+///
+/// Written before the wiring and watched to fail, so that it is known to be
+/// capable of failing.
+#[test]
+fn mean_slice_abstains_when_the_two_sides_run_different_schedulers() {
+    let run = calibrate();
+    let r = run
+        .results
+        .iter()
+        .find(|r| r.metric == Metric::MeanSliceLength)
+        .expect("mean slice must APPEAR in the report, even when it abstains");
+
+    assert_eq!(
+        r.verdict,
+        Verdict::NotMeasured,
+        "guest and simulator run different schedulers, so this must abstain \
+         rather than produce a number: {r:?}",
+    );
+    assert!(
+        r.at.as_deref().is_some_and(|a| a.contains("scheduler")),
+        "the abstention must say WHY, so a reader is not left guessing: {:?}",
+        r.at,
+    );
 }
 
 /// Percentile metrics cannot clear their floor from a single run, whatever the
