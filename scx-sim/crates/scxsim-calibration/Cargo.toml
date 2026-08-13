@@ -34,6 +34,12 @@ scx_simulator = { path = "../scx_simulator" }
 # bridge, and the last hop is behind `ingest`.
 scxsim-workload-ir = { path = "../scxsim-workload-ir", features = ["ingest"] }
 
+# Writes the simulated half of a trace comparison. Same feature gate and the
+# same reason as the test below.
+[[example]]
+name = "dump_sim_perfetto"
+required-features = ["sim"]
+
 # Loads a real scheduler .so and runs the scenario, so it needs the Trace-side
 # derivation. required-features (rather than a cfg inside the file) means cargo
 # skips the target in a default build instead of compiling it empty.
