@@ -32,9 +32,23 @@ pub enum Fidelity {
 }
 
 impl fmt::Display for Fidelity {
+    /// Deliberately says what was *carried*, not that the run is faithful.
+    ///
+    /// This used to render as the bare word `exact`, which was true of the
+    /// lowering and read as a verdict on the simulation. The two are different
+    /// claims and they were spelled identically, so a reader could see
+    /// `fidelity: exact` on a scenario whose whole point was cpuset
+    /// confinement, on a run where the simulator ignored the cpuset entirely
+    /// (sim-4qlh5), and reasonably conclude the property had been reproduced.
+    ///
+    /// A self-report whose scope is narrower than its apparent claim is worse
+    /// than a missing one: it is trusted. The wording is now scoped to the only
+    /// thing this type can actually know — the lowering runs before the
+    /// simulator exists, so it cannot verify downstream honouring, and it must
+    /// not sound as though it has.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Fidelity::Exact => f.write_str("exact"),
+            Fidelity::Exact => f.write_str("all declared fields carried"),
             Fidelity::Approximated => f.write_str("approximated"),
         }
     }
@@ -69,6 +83,27 @@ pub enum Cause {
     /// An iteration count that had to become a duration. Iterations are not a
     /// unit the simulator advances in; see [`crate::lower::ITER_NS`].
     IterationsToTime,
+    /// **The source did not say how much work, and the lowering supplied a
+    /// number.** The output therefore contains a duration that appears nowhere
+    /// in the input.
+    ///
+    /// This exists because a lowering that invents the scheduling quantum and
+    /// reports EXACT is the most dangerous thing this crate can do, and it did
+    /// it: `SpinWait` fabricated a 500us run phase, `ir.fidelity.is_exact()`
+    /// returned true, two tests asserted on that flag and passed, and the
+    /// result was a 68x slice-count divergence against the live kernel. See
+    /// `ai_docs/SLICE_DIVERGENCE_ROOT_CAUSE_20260812.md`.
+    ///
+    /// Any arm that reaches for a default duration must record this, so the
+    /// fabrication is visible in the report rather than inferable only by
+    /// reading the lowering.
+    UnspecifiedWorkQuantum,
+    /// **The source specified a duration the IR cannot carry**, so it was
+    /// dropped. The opposite direction from
+    /// [`Cause::UnspecifiedWorkQuantum`] and deliberately a separate variant:
+    /// "we made a number up" and "we threw a number away" are different
+    /// failures and blurring them is how one hides behind the other.
+    UnrepresentableWorkQuantum,
 }
 
 impl Cause {
@@ -84,6 +119,12 @@ impl Cause {
             Cause::DynamicSchedAttr => "runtime sched-attribute change lowered to an initial attribute",
             Cause::TaskLifecycle => "task create/exit churn folded into a fixed task set",
             Cause::IterationsToTime => "iteration count converted to a duration estimate",
+            Cause::UnspecifiedWorkQuantum => {
+                "the source did not specify this quantity; the lowering supplied a value"
+            }
+            Cause::UnrepresentableWorkQuantum => {
+                "the source specified a duration the IR cannot carry; it was dropped"
+            }
         }
     }
 }
@@ -98,6 +139,8 @@ impl fmt::Display for Cause {
             Cause::DynamicSchedAttr => "dynamic-sched-attr",
             Cause::TaskLifecycle => "task-lifecycle",
             Cause::IterationsToTime => "iterations-to-time",
+            Cause::UnspecifiedWorkQuantum => "unspecified-work-quantum",
+            Cause::UnrepresentableWorkQuantum => "unrepresentable-work-quantum",
         };
         f.write_str(s)
     }
@@ -155,8 +198,13 @@ impl FidelityReport {
         &self.approximations
     }
 
-    /// True when every construct lowered exactly. Note this is about the
-    /// lowering, not about whether the simulation is realistic.
+    /// True when every construct lowered exactly — i.e. the IR carried every
+    /// declared field.
+    ///
+    /// This is about the LOWERING and nothing else. A field can be carried
+    /// faithfully and then ignored by the simulator, and this still returns
+    /// true: sim-4qlh5 was exactly that, a cpuset that arrived intact and was
+    /// not enforced at placement. Do not read it as "the run was faithful".
     pub fn is_exact(&self) -> bool {
         self.approximations.is_empty()
     }

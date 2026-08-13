@@ -1519,8 +1519,17 @@ impl<S: Scheduler> Simulator<S> {
             // cause bpf_task_from_pid() to return NULL during init_task,
             // triggering the correct initialization path in scheduler code
             // (e.g., LAVD's avg_runtime_wall = sys_stat.slice_wall).
-            // Set up cpus_ptr — restricted to allowed_cpus if specified
-            ffi::task_setup_cpumask(task.raw(), def.allowed_cpus.as_deref());
+            // Set up cpus_ptr — restricted to the task's EFFECTIVE cpuset:
+            // its own allowed_cpus narrowed by its cgroup's cpuset. Passing
+            // def.allowed_cpus directly (as this did until sim-4qlh5) drops
+            // cgroup-level confinement on the floor: a cgroup declared on CPUs
+            // {2,3} would happily run on CPU 0, because a cgroup cpuset only
+            // ever reached the registry, where it is advertised to the BPF
+            // scheduler and never enforced. In the kernel a cpuset narrows the
+            // task's cpumask, so the scheduler cannot place it outside — see
+            // Scenario::effective_cpuset.
+            let effective_cpus = scenario.effective_cpuset(def);
+            ffi::task_setup_cpumask(task.raw(), effective_cpus.as_deref());
             // Set mm pointer for address-space grouping (wake-affine scheduling)
             if let Some(mm_id) = def.mm_id {
                 // Synthetic non-NULL pointer: never dereferenced, only compared.
@@ -1578,6 +1587,41 @@ impl<S: Scheduler> Simulator<S> {
             None
         };
 
+        // Which clock actually advanced simulated time, decided here and
+        // recorded so it travels with the result. The decision lives in
+        // `clock_mode::decide` so every combination is unit-testable without
+        // needing a machine that lacks a PMU; keep its arms in step with
+        // `charge_sched_time`'s three modes.
+        let decision = crate::clock_mode::decide(
+            is_e9,
+            rbc_ns,
+            rbc_counter.is_some(),
+            scenario.overhead.enabled,
+            scenario.rbc_explicitly_requested,
+        );
+        let clock_mode = decision.mode;
+
+        // A run that ASKED for the PMU and did not get one has been silently
+        // downgraded to a different clock. That is the shape of defect this
+        // change exists to surface, so say so.
+        //
+        // Loud, but fatal only when asked for EXPLICITLY:
+        // `sched_overhead_rbc_ns` defaults to Some(10), so every run on a
+        // PMU-less machine -- including all of CI -- implicitly "asks".
+        // Hard-failing that would change behaviour rather than surface it.
+        if let Some(downgrade) = decision.downgrade {
+            if downgrade.explicit {
+                panic!(
+                    "{}\nFailing because the PMU path was requested EXPLICITLY \
+                     (--rbc-ns / SCX_SIM_RBC_NS). Drop the flag to accept the '{}' \
+                     clock, or run where perf_event_open succeeds.",
+                    downgrade.message(),
+                    downgrade.actual,
+                );
+            }
+            eprintln!("WARNING: {}", downgrade.message());
+        }
+
         let mut state = SimulatorState {
             cpus,
             dsqs: DsqManager::new(),
@@ -1629,6 +1673,11 @@ impl<S: Scheduler> Simulator<S> {
             native_concurrent: scenario.native_concurrent,
             bw_blocked: std::collections::BTreeMap::new(),
         };
+
+        // Stamp the chosen clock onto the trace so every downstream consumer
+        // -- summary, JSON export, calibration fixture -- carries it without
+        // having to ask the machine what hardware it had.
+        state.trace.set_clock_mode(clock_mode);
 
         // Build the persistent replay backend once if we have a replay trace.
         // This must happen after state construction because the backend holds

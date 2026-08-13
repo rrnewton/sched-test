@@ -63,6 +63,15 @@ jobs:
     permissions:
       contents: write
       pull-requests: write   # the success path raises a PR against integration
+      # claude-code-action@v1 mints an OIDC token REGARDLESS of whether an
+      # anthropic_api_key is supplied, so it needs this even though the key is
+      # present. Without it the action fails with
+      #   Unable to get ACTIONS_ID_TOKEN_REQUEST_URL env variable
+      #   Could not fetch an OIDC token. Did you remember to add id-token: write?
+      # which reads as a missing-secret problem and is not one. The key-presence
+      # guard in the first step covers the genuinely-missing-key case (the mirror
+      # holds zero secrets); this covers the token the action wants on top of it.
+      id-token: write
 
     steps:
       - name: Require the Anthropic API key
@@ -130,8 +139,15 @@ jobs:
         run: |
           DATE=$(date +%Y%m%d)
           WORK_BRANCH="sync-upstream-${DATE}"
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # --global, NOT repo-local. The rebase below runs INSIDE the scx
+          # submodule, which has its own config (.git/modules/scx/config), so a
+          # repo-local identity set here never reaches it and the rebase dies
+          # with `fatal: empty ident name`. Not hypothetical: that is exactly how
+          # this job failed on its first-ever real run (2026-08-13, run
+          # 31654870871). The fail-closed guard below then refused to proceed --
+          # correct behaviour, spurious trigger.
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b $WORK_BRANCH
 
           # Update the submodule to upstream main, REPLAYING any local commits

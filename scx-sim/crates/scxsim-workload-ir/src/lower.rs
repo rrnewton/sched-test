@@ -45,9 +45,12 @@ use crate::units::{CgroupName, DurationNs, Nice, TaskId};
 /// modelling one. Every conversion through it is recorded as an approximation.
 pub const ITER_NS: u64 = 100;
 
-/// Slice used when a work type says "spin" without saying how long. Chosen to be
-/// long enough that the scheduler makes a decision about it and short enough
-/// that a repeat loop stays responsive.
+/// Chunk length used when a work type has a yield point but does not say how
+/// much work sits between yields.
+///
+/// This is an INVENTED number and every use of it records an approximation.
+/// It must never be used for a work type that runs continuously — see
+/// [`CONTINUOUS_RUN`] and the measurement that motivated the split.
 const DEFAULT_SLICE: DurationNs = DurationNs::from_micros(500);
 
 /// A construct the lowering will not invent behaviour for.
@@ -95,6 +98,7 @@ pub fn lower(scenario: &SourceScenario) -> Result<WorkloadIr, LoweringError> {
         report: FidelityReport::new(),
         next_task: 0,
         default_workers: scenario.default_workers_per_cgroup.max(1),
+        scenario_duration: scenario.duration,
     };
 
     let topology = Topology {
@@ -123,6 +127,12 @@ struct Ctx {
     report: FidelityReport,
     next_task: u32,
     default_workers: u32,
+    /// How long the whole scenario runs.
+    ///
+    /// Needed by the CONTINUOUS work types: a task that never yields must be
+    /// given a run phase that outlasts the run, so the only thing that can end
+    /// its slice is the scheduler. See [`CONTINUOUS_RUN`].
+    scenario_duration: DurationNs,
 }
 
 impl Ctx {
@@ -139,6 +149,24 @@ impl Ctx {
             cause,
             dropped,
         });
+    }
+
+    /// Supply a work quantum the source did not specify — and say so.
+    ///
+    /// Every use of [`DEFAULT_SLICE`] must go through here. Returning the
+    /// constant directly is what let `SpinWait` fabricate the scheduling
+    /// quantum while reporting EXACT; routing it through a method that records
+    /// makes the honest path the only path.
+    fn invented_slice(&mut self, source: &str, what: &str) -> DurationNs {
+        self.approx(
+            source,
+            format!("Run({DEFAULT_SLICE})"),
+            Cause::UnspecifiedWorkQuantum,
+            format!(
+                "{what}: the source declares the behaviour but not how much work                  per phase; {DEFAULT_SLICE} supplied by the lowering"
+            ),
+        );
+        DEFAULT_SLICE
     }
 
     /// Convert an iteration count to a duration, recording the conversion.
@@ -452,19 +480,63 @@ fn uniform(name: &str, tasks: u32, phases: Vec<Phase>) -> Plan {
 }
 
 /// The lowering table: one arm per ktstr work type.
+/// A run phase for work that never voluntarily yields.
+///
+/// # Why this is not `DEFAULT_SLICE`, and why it mattered by 68x
+///
+/// ktstr's `SpinWait` is a busy loop with no yield point. Lowering it to a
+/// short repeating `Run` chunk inserts voluntary yields the real workload does
+/// not have, and the simulator — correctly — ends the slice at each one.
+///
+/// Measured on `sched_basic_proportional` (2 spinners, 2 cpus, 12 s, `simple`,
+/// which requests `SCX_SLICE_DFL` = 20 ms):
+///
+/// ```text
+///   phase len     slices   mean slice      the phase, or the scheduler?
+///     0.100ms      19904      0.100ms      phase  (predicted 20000)
+///     0.500ms       4013      0.498ms      phase  (predicted 4000)
+///     5.000ms        405      4.916ms      phase  (predicted 400)
+///    20.000ms        149     13.341ms      scheduler starts to bind
+///  1000.000ms        102     19.322ms      scheduler — mean pins to SCX_SLICE_DFL
+/// ```
+///
+/// The engine implements `min(phase, scheduler_slice)`, which is right. At the
+/// old 500 us default the phase always won, so the scheduler's slice never
+/// bound and the trace showed 48067 slices against the live guest's 710 — a
+/// 68x divergence that was entirely self-inflicted by this constant.
+///
+/// Making the phase outlast the run hands the decision back to the scheduler,
+/// which is the whole point of simulating a scheduler.
+fn continuous_run(ctx: &Ctx) -> Phase {
+    Phase::Run(ctx.scenario_duration)
+}
+
 fn plan_work(ctx: &mut Ctx, wt: &SourceWorkType, src: &str, n: u32) -> Result<Plan, LoweringError> {
     use SourceWorkType as W;
+    let forever = continuous_run(ctx);
+    // Bare DEFAULT_SLICE. Every arm reaching for it MUST also disclose that it
+    // was invented — the arms below that already call `ctx.approx` are
+    // non-exact for other reasons, and the ones that were not are fixed to go
+    // through `ctx.invented_slice`. See the audit note on `DEFAULT_SLICE`.
     let spin = DEFAULT_SLICE;
 
     let plan = match wt {
         // ---- exact: pure time, nothing dropped -------------------------------
-        W::SpinWait => uniform("spin", n, vec![Phase::Run(spin)]),
-        W::YieldHeavy => uniform("yield", n, vec![Phase::Run(spin), Phase::Yield]),
-        W::Mixed => uniform(
-            "mixed",
-            n,
-            vec![Phase::Run(spin), Phase::Yield, Phase::Run(spin)],
-        ),
+        // Continuous: no yield point, so the scheduler's slice is the only
+        // thing that may end it. Genuinely exact — nothing is invented.
+        W::SpinWait => uniform("spin", n, vec![forever]),
+        // Was EXACT while inventing the work between yields. ktstr says the
+        // workload yields often; it does not say how much work sits between
+        // yields, so this quantum is the lowering's and must be disclosed.
+        W::YieldHeavy => {
+            let q = ctx.invented_slice(src, "YieldHeavy work between yields");
+            uniform("yield", n, vec![Phase::Run(q), Phase::Yield])
+        }
+        // Same defect as YieldHeavy, twice over.
+        W::Mixed => {
+            let q = ctx.invented_slice(src, "Mixed work between yields");
+            uniform("mixed", n, vec![Phase::Run(q), Phase::Yield, Phase::Run(q)])
+        }
         W::Bursty {
             burst_duration,
             sleep_duration,
@@ -706,7 +778,17 @@ fn plan_work(ctx: &mut Ctx, wt: &SourceWorkType, src: &str, n: u32) -> Result<Pl
                  plain CPU time and contention emerges from CPU count alone"
                     .into(),
             );
-            uniform("mutex", c, vec![Phase::Run(hold.saturating_add(work))])
+            let combined = hold.saturating_add(work);
+            ctx.approx(
+                src,
+                format!("Run({combined})"),
+                Cause::BlockingMechanism,
+                format!(
+                    "hold({hold}) + work({work}) collapsed into one run phase; \
+                     neither the lock nor the split survives"
+                ),
+            );
+            uniform("mutex", c, vec![Phase::Run(combined)])
         }
         W::ThunderingHerd {
             waiters,
@@ -831,6 +913,16 @@ fn plan_work(ctx: &mut Ctx, wt: &SourceWorkType, src: &str, n: u32) -> Result<Pl
         } => {
             let burst = ctx.iters(src, "rt_burst_iters", *rt_burst_iters);
             let c = (*cfs_workers).max(1) as u32;
+            // PreemptStorm has NO priority field; 50 is the lowering's. The
+            // arm was already non-exact via the iters conversion, which is
+            // exactly why this went unnoticed — a non-green report is not the
+            // same as a disclosed one.
+            ctx.approx(
+                src,
+                "Fifo { priority: 50 }".into(),
+                Cause::UnspecifiedWorkQuantum,
+                "PreemptStorm does not specify an RT priority; 50 supplied by the lowering".into(),
+            );
             Plan {
                 name_prefix: "preemptstorm".into(),
                 tasks: c + 1,
@@ -858,14 +950,16 @@ fn plan_work(ctx: &mut Ctx, wt: &SourceWorkType, src: &str, n: u32) -> Result<Pl
                 Cause::BlockingMechanism,
                 format!("epoll readiness becomes Wake; events_per_burst={events_per_burst}"),
             );
+            // EpollStorm says nothing about how long a consumer works per
+            // event, so the quantum is the lowering's. Recording the wake
+            // mechanism above is NOT recording this — that was the
+            // PreemptStorm shape, and the provenance check caught it here.
+            let work = ctx.invented_slice(src, "EpollStorm work per event");
             Plan {
                 name_prefix: "epoll".into(),
                 tasks: p + c,
                 repeat: Repeat::Forever,
-                kind: PlanKind::FanOut {
-                    work: spin,
-                    waiters: c,
-                },
+                kind: PlanKind::FanOut { work, waiters: c },
             }
         }
         W::AsymmetricWaker {
@@ -886,8 +980,8 @@ fn plan_work(ctx: &mut Ctx, wt: &SourceWorkType, src: &str, n: u32) -> Result<Pl
                 repeat: Repeat::Forever,
                 kind: PlanKind::Classed {
                     classes: vec![
-                        (1, sched_class(*waker_class)),
-                        (1, sched_class(*wakee_class)),
+                        (1, sched_class(ctx, src, *waker_class)),
+                        (1, sched_class(ctx, src, *wakee_class)),
                     ],
                     work,
                     sleep: work,
@@ -908,12 +1002,19 @@ fn plan_work(ctx: &mut Ctx, wt: &SourceWorkType, src: &str, n: u32) -> Result<Pl
                 Cause::Microarchitectural,
                 format!("cache_footprint_kib={cache_footprint_kib}"),
             );
+            let combined = work.saturating_add(DurationNs::from_micros(*sleep_usec));
+            ctx.approx(
+                src,
+                format!("Run({combined})"),
+                Cause::BlockingMechanism,
+                format!("operations({work}) + sleep_usec({sleep_usec}us) collapsed into one phase"),
+            );
             Plan {
                 name_prefix: "fanoutcompute".into(),
                 tasks: f + 1,
                 repeat: Repeat::Forever,
                 kind: PlanKind::FanOut {
-                    work: work.saturating_add(DurationNs::from_micros(*sleep_usec)),
+                    work: combined,
                     waiters: f,
                 },
             }
@@ -1058,13 +1159,40 @@ fn plan_work(ctx: &mut Ctx, wt: &SourceWorkType, src: &str, n: u32) -> Result<Pl
     Ok(plan)
 }
 
-fn sched_class(c: SourceSchedClass) -> SchedPolicy {
+/// The RT priority the lowering supplies for a class that names no number.
+///
+/// ktstr's `SourceSchedClass` is a class NAME — `Fifo`, `RoundRobin` — with no
+/// priority attached. A real-time policy needs one, so this is the lowering's.
+/// Every use records it: the mechanical provenance check found this helper
+/// after the hand audit had already been through the same arms, because a
+/// shared helper's fabrication does not look like a fabrication at the call
+/// site.
+const SUPPLIED_RT_PRIORITY: i32 = 50;
+
+fn sched_class(ctx: &mut Ctx, src: &str, c: SourceSchedClass) -> SchedPolicy {
     match c {
         SourceSchedClass::Normal => SchedPolicy::Normal,
         SourceSchedClass::Batch => SchedPolicy::Batch,
         SourceSchedClass::Idle => SchedPolicy::Idle,
-        SourceSchedClass::Fifo => SchedPolicy::Fifo { priority: 50 },
-        SourceSchedClass::RoundRobin => SchedPolicy::RoundRobin { priority: 50 },
+        SourceSchedClass::Fifo | SourceSchedClass::RoundRobin => {
+            ctx.approx(
+                src,
+                format!("priority {SUPPLIED_RT_PRIORITY}"),
+                Cause::UnspecifiedWorkQuantum,
+                format!(
+                    "SchedClass::{c:?} names no RT priority; {SUPPLIED_RT_PRIORITY} \
+                     supplied by the lowering"
+                ),
+            );
+            match c {
+                SourceSchedClass::RoundRobin => SchedPolicy::RoundRobin {
+                    priority: SUPPLIED_RT_PRIORITY,
+                },
+                _ => SchedPolicy::Fifo {
+                    priority: SUPPLIED_RT_PRIORITY,
+                },
+            }
+        }
     }
 }
 
@@ -1072,7 +1200,18 @@ fn lower_phase(ctx: &mut Ctx, src: &str, p: &SourceWorkPhase) -> Phase {
     match p {
         SourceWorkPhase::Spin(d) => Phase::Run(*d),
         SourceWorkPhase::Sleep(d) => Phase::Sleep(*d),
-        SourceWorkPhase::Yield(_) => Phase::Yield,
+        // `Phase::Yield` carries no duration, so the declared one is DROPPED.
+        // It was dropped silently until the exact-arm audit: a Sequence
+        // containing Yield(9ms) reported EXACT with the 9ms gone.
+        SourceWorkPhase::Yield(d) => {
+            ctx.approx(
+                src,
+                "Yield".into(),
+                Cause::UnrepresentableWorkQuantum,
+                format!("WorkPhase::Yield({d}) — Phase::Yield carries no duration"),
+            );
+            Phase::Yield
+        }
         SourceWorkPhase::Io(d) => {
             ctx.approx(
                 src,
@@ -1205,14 +1344,26 @@ mod tests {
         assert_eq!(a.source, "WorkType::CachePressure");
     }
 
-    /// The pure-timing work types must lower with NO approximation at all —
-    /// otherwise the report is noise and callers will stop reading it.
+    /// The work types whose behaviour is FULLY DETERMINED BY THE SOURCE must
+    /// lower with no approximation — otherwise the report is noise and callers
+    /// stop reading it.
+    ///
+    /// `YieldHeavy` and `Mixed` were in this list and should never have been.
+    /// They declare a yielding pattern but NOT how much work sits between
+    /// yields, so the lowering supplies that quantum — and this test asserted
+    /// the result was exact, which is how the fabrication survived review. It
+    /// was the third test to assert on the false exactness, alongside the
+    /// calibration test and the trace comparison. Removing them from here is
+    /// the fix, not a relaxation: see
+    /// `ai_docs/EXACT_ARM_AUDIT_20260812.md`.
+    ///
+    /// What remains are the two arms that genuinely carry only declared values:
+    /// `SpinWait` (a continuous spin, no quantum to invent) and `Bursty` (both
+    /// durations declared).
     #[test]
     fn pure_timing_work_types_lower_exactly() {
         for wt in [
             SourceWorkType::SpinWait,
-            SourceWorkType::YieldHeavy,
-            SourceWorkType::Mixed,
             SourceWorkType::Bursty {
                 burst_duration: DurationNs::from_millis(1),
                 sleep_duration: DurationNs::from_millis(2),
@@ -1412,11 +1563,8 @@ mod tests {
         assert_eq!(ir.tasks.len(), 3);
     }
 
-    /// Whatever else changes, every lowered IR must satisfy its own invariants —
-    /// this is the guard against the lowering shipping a broken workload.
-    #[test]
-    fn every_supported_work_type_lowers_to_valid_ir() {
-        let all = [
+    fn all_supported_work_types() -> Vec<SourceWorkType> {
+        vec![
             SourceWorkType::SpinWait,
             SourceWorkType::YieldHeavy,
             SourceWorkType::Mixed,
@@ -1560,7 +1708,15 @@ mod tests {
                 interval_us: 100,
                 frame_bytes: 60,
             },
-        ];
+        ]
+    }
+
+    /// Whatever else changes, every lowered IR must satisfy its own invariants —
+    /// this is the guard against the lowering shipping a broken workload.
+    #[test]
+
+    fn every_supported_work_type_lowers_to_valid_ir() {
+        let all = all_supported_work_types();
         // 42 supported + 3 refused = ktstr's 45.
         assert_eq!(
             all.len(),
@@ -1574,5 +1730,154 @@ mod tests {
             assert_eq!(ir.validate(), Ok(()), "{name} produced invalid IR");
             assert!(!ir.tasks.is_empty(), "{name} produced no tasks");
         }
+    }
+    /// THE SYSTEMIC TRIPWIRE for the whole fabricated-value class.
+    ///
+    /// An arm may report `Fidelity::Exact` only if every duration in its output
+    /// came from the input. `DEFAULT_SLICE` is by definition not in the input —
+    /// it is the lowering's own number — so its appearance in an arm that
+    /// claims exact is proof of fabrication.
+    ///
+    /// This single assertion would have caught all three known instances:
+    /// `SpinWait` (which cost a 68x slice-count divergence and was invisible
+    /// because two tests asserted on `is_exact()` and passed), `YieldHeavy`,
+    /// and `Mixed`. Written as a loop over every supported work type so a NEW
+    /// arm cannot reintroduce it either.
+    #[test]
+    fn no_arm_reports_exact_while_using_the_invented_default_slice() {
+        for wt in all_supported_work_types() {
+            let name = wt.variant_name();
+            let ir = lower(&scenario_with(wt)).unwrap_or_else(|e| panic!("{name}: {e}"));
+            if !ir.fidelity.is_exact() {
+                continue;
+            }
+            for t in &ir.tasks {
+                for p in &t.phases {
+                    if let Phase::Run(d) = p {
+                        assert_ne!(
+                            *d, DEFAULT_SLICE,
+                            "{name} reports EXACT but its run phase is exactly \
+                             DEFAULT_SLICE ({DEFAULT_SLICE}) — a value the source \
+                             never specified. Either carry a declared duration or \
+                             record it via Ctx::invented_slice.",
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// `Bursty` is the control: it MUST stay exact, and its phases must be the
+    /// declared values. Without this, the tripwire above could be satisfied by
+    /// an arm that stopped reporting exact for the wrong reason.
+    #[test]
+    fn bursty_is_exact_and_carries_both_declared_durations() {
+        let burst = DurationNs::from_millis(3);
+        let sleep = DurationNs::from_millis(7);
+        let ir = lower(&scenario_with(SourceWorkType::Bursty {
+            burst_duration: burst,
+            sleep_duration: sleep,
+        }))
+        .expect("lowers");
+        assert!(ir.fidelity.is_exact(), "{:?}", ir.fidelity.approximations());
+        assert_eq!(
+            ir.tasks[0].phases,
+            vec![Phase::Run(burst), Phase::Sleep(sleep)],
+            "the declared durations must survive verbatim",
+        );
+    }
+
+    /// The two arms that fabricated the work quantum while claiming exact.
+    #[test]
+    fn yieldheavy_and_mixed_disclose_the_invented_quantum() {
+        for wt in [SourceWorkType::YieldHeavy, SourceWorkType::Mixed] {
+            let name = wt.variant_name();
+            let ir = lower(&scenario_with(wt)).expect("lowers");
+            assert!(!ir.fidelity.is_exact(), "{name} must not claim exact");
+            assert!(
+                ir.fidelity
+                    .approximations()
+                    .iter()
+                    .any(|a| a.cause == Cause::UnspecifiedWorkQuantum),
+                "{name} must record WHAT it invented, not merely be non-exact: {:?}",
+                ir.fidelity.approximations(),
+            );
+        }
+    }
+
+    /// A declared `Yield` duration cannot be carried by `Phase::Yield`, so it is
+    /// dropped — which must be recorded. It was silent until the exact-arm
+    /// audit, and `Sequence` reported EXACT with the duration gone.
+    #[test]
+    fn a_dropped_yield_duration_is_recorded_not_silent() {
+        let ir = lower(&scenario_with(SourceWorkType::Sequence {
+            first: SourceWorkPhase::Spin(DurationNs::from_millis(4)),
+            rest: vec![SourceWorkPhase::Yield(DurationNs::from_millis(9))],
+        }))
+        .expect("lowers");
+        assert!(!ir.fidelity.is_exact(), "a dropped duration is not exact");
+        let a = ir
+            .fidelity
+            .approximations()
+            .iter()
+            .find(|a| a.cause == Cause::UnrepresentableWorkQuantum)
+            .expect("the drop must be recorded");
+        assert!(
+            a.dropped.contains("9.000ms"),
+            "the record must name the value that was lost, got {:?}",
+            a.dropped,
+        );
+        // And the surviving phases must still be the declared ones.
+        assert_eq!(
+            ir.tasks[0].phases,
+            vec![Phase::Run(DurationNs::from_millis(4)), Phase::Yield],
+        );
+    }
+
+    /// `PreemptStorm` has no priority field; 50 is the lowering's. It was
+    /// already non-exact via the iterations conversion, which is exactly why
+    /// this went unnoticed — a non-green report is not a disclosed one.
+    #[test]
+    fn preemptstorm_discloses_its_fabricated_rt_priority() {
+        let ir = lower(&scenario_with(SourceWorkType::PreemptStorm {
+            cfs_workers: 2,
+            rt_burst_iters: 100,
+            rt_sleep_us: 5,
+        }))
+        .expect("lowers");
+        assert!(
+            ir.fidelity
+                .approximations()
+                .iter()
+                .any(|a| a.dropped.contains("RT priority")),
+            "the invented priority must be named: {:?}",
+            ir.fidelity.approximations(),
+        );
+    }
+    /// THE MECHANICAL AUDIT INSTRUMENT, run over every supported arm.
+    ///
+    /// "Does every value in the output appear in the input?" is the question
+    /// that found five defects in eight exact-claiming arms. This is that
+    /// question as a test, so the next fabrication fails the build instead of
+    /// waiting for someone to think to ask.
+    ///
+    /// A value is allowed to be absent from the input ONLY if the lowering
+    /// recorded that it supplied it. See [`crate::provenance`].
+    #[test]
+    fn every_arm_emits_only_values_that_trace_to_the_source_or_are_disclosed() {
+        let mut offenders = Vec::new();
+        for wt in all_supported_work_types() {
+            let name = wt.variant_name();
+            let src = scenario_with(wt);
+            let ir = lower(&src).unwrap_or_else(|e| panic!("{name}: {e}"));
+            for u in crate::provenance::check(&src, &ir) {
+                offenders.push(format!("{name}: {u}"));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "the lowering emitted values with no provenance:\n  {}",
+            offenders.join("\n  "),
+        );
     }
 }

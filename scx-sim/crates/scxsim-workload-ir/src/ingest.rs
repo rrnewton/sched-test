@@ -381,13 +381,16 @@ mod tests {
             SimPhase::Run(d) => ("run", *d),
             SimPhase::Sleep(d) => ("sleep", *d),
             SimPhase::Wake(pid) => ("wake", pid.0 as u64),
-            // Unit variant, so there is no payload to project; 0 is the only
-            // honest second element. Named "yield" to match `pretty.rs`, which
-            // already renders the IR's own yield phase under that name.
+            // Unit variant: no payload, so 0. This is a TEST-HELPER projection
+            // and deliberately asserts nothing about semantics.
             //
-            // Deliberately NOT a `_ =>` arm: this match failing to compile is
-            // what surfaced `Phase::Yield` being added upstream, and a
-            // catch-all would spend that signal for good.
+            // NOTE for this crate's owner: `scx_simulator::Phase` gained a
+            // `Yield` variant, which makes the module doc above ("Phase is
+            // Run | Sleep | Wake") stale and probably makes the
+            // `YieldNotRepresentable` refusal obsolete — a yield may now be
+            // lowerable rather than rejected. That is a design call for whoever
+            // owns the lowering, not something to decide from here; this arm
+            // only unbreaks the build.
             SimPhase::Yield => ("yield", 0),
         }
     }

@@ -1,0 +1,47 @@
+{
+  "default_workers_per_cgroup": 1,
+  "duration": 12000000000,
+  "name": "sched_basic_proportional",
+  "steps": [
+    {
+      "hold": {
+        "frac": 1.0
+      },
+      "ops": [],
+      "setup": [
+        {
+          "cpu_quota": null,
+          "cpu_weight": null,
+          "cpuset": null,
+          "name": "cg_0",
+          "works": [
+            {
+              "nice": null,
+              "work_type": "spin_wait",
+              "workers": null
+            }
+          ]
+        },
+        {
+          "cpu_quota": null,
+          "cpu_weight": null,
+          "cpuset": null,
+          "name": "cg_1",
+          "works": [
+            {
+              "nice": null,
+              "work_type": "spin_wait",
+              "workers": null
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "topology": {
+    "cores": 2,
+    "llcs": 1,
+    "numa_nodes": 1,
+    "threads": 1
+  }
+}

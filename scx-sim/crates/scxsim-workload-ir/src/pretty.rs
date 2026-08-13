@@ -96,8 +96,25 @@ pub fn pretty(ir: &WorkloadIr) -> String {
         }
     }
 
-    // Fidelity last, and always present — "exact" is information too.
-    let _ = writeln!(s, "  fidelity: {}", ir.fidelity.overall());
+    // Fidelity last, and always present — "nothing was approximated" is
+    // information too.
+    //
+    // Labelled `lowering fidelity` rather than `fidelity`, and rendered as
+    // "all declared fields carried" rather than "exact", because this line
+    // describes only what survived ktstr -> IR. Whether the SIMULATOR then
+    // honours a carried field is downstream of everything the IR can see: a
+    // cpuset can arrive intact and still be ignored at placement time
+    // (sim-4qlh5). The unqualified word "exact" invited exactly that
+    // misreading, so the caveat is printed here where the number is read
+    // rather than left in a doc comment nobody opens.
+    let _ = writeln!(s, "  lowering fidelity: {}", ir.fidelity.overall());
+    if ir.fidelity.is_exact() {
+        let _ = writeln!(
+            s,
+            "    (describes ktstr -> IR only; says nothing about whether the \
+             simulator honours them)"
+        );
+    }
     for a in ir.fidelity.approximations() {
         let _ = writeln!(s, "    - {a}");
     }
@@ -209,7 +226,14 @@ mod tests {
         ));
         let ir = lower(&s).expect("lowers");
         let out = pretty(&ir);
-        assert!(out.contains("fidelity: exact"), "{out}");
+        assert!(
+            out.contains("lowering fidelity: all declared fields carried"),
+            "{out}"
+        );
+        assert!(
+            out.contains("says nothing about whether the simulator honours them"),
+            "the scope caveat must be printed where the verdict is read: {out}",
+        );
     }
 
     #[test]

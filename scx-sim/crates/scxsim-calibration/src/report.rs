@@ -77,6 +77,18 @@ pub enum Metric {
     ContextSwitches,
     /// Wake-to-run latency. Distributional, not a mean — see [`crate::sample`].
     WakeLatency,
+    /// Mean on-CPU slice length for the workload tasks: total workload on-CPU
+    /// time divided by the number of dispatches of those tasks. VM side from
+    /// wprof per-task slices; sim side from the simulator trace.
+    ///
+    /// SAMPLE-FLOOR CAVEAT: PERCENTILE (100) suffices only if the slice
+    /// distribution has CV <= ~0.33 (SE = CV/sqrt(n) ~= 3.3% of the mean,
+    /// about a third of the tolerance). A bimodal mixture of near-zero early
+    /// exits and full slices can reach CV ~ 1, where n=100 gives SE = 10% —
+    /// the whole tolerance, making a pass meaningless. Record the observed
+    /// sample SD; if CV > 0.33 raise this to TAIL_PERCENTILE. Raising it on
+    /// measured dispersion is evidence; lowering it is not.
+    MeanSliceLength,
     /// Scheduling delay: runqueue wait, the time a task is runnable but not
     /// running. The scheduler-attributable share of the time a task spends off
     /// CPU, once virtualization overhead is excluded.
@@ -192,6 +204,46 @@ impl Metric {
                 min_samples: MinSamples::PERCENTILE,
                 distributional: true,
             },
+            // Derived BLIND under tg `blind_tolerance_derivation_what` by an
+            // agent that had not seen the measurement, from decision-relevance
+            // rather than from data, and carried across here VERBATIM. See the
+            // parent CLAUDE.md section "Blind derivation: pre-registered
+            // bounds, and how blinding actually breaks" for the protocol, and
+            // that task's notes for the full derivation and for a
+            // self-reported blinding breach that occurred AFTER the bound was
+            // published (a commit subject leaked the magnitude while the agent
+            // was locating the branch). The ordering is established by the tg
+            // note timestamps; the bound was not changed afterwards and must
+            // not be. If it ever has to move, use `Tolerance::widening()` so
+            // the relaxation is conspicuous — never edit the width in place.
+            Metric::MeanSliceLength => MetricSpec {
+                tolerance: Tolerance::relative_or_absolute(
+                    0.10,
+                    50_000.0,
+                    "slice length drives wake latency, preemption rate, short-window \
+                     fairness and time-to-effect of a placement decision LINEARLY, so \
+                     it must be bounded tighter than the metrics it causes — \
+                     ContextSwitches at 15% and WakeLatency at 20% — or a slice error \
+                     alone consumes their whole budget and those bounds stop testing \
+                     the scheduler. 10% also resolves a 1.25x slice-policy difference, \
+                     the finest we will claim to adjudicate: two policies differing by \
+                     factor R have disjoint bands at relative error f exactly when \
+                     R > (1+f)/(1-f). Deliberately sharper than its own components \
+                     (CpuTime 10% over dispatch count 15% compose adversarially to \
+                     ~25%) because those errors share one fidelity gap and cancel in \
+                     the ratio; what survives is slice policy modelled wrong, which \
+                     nothing else in the registry can see. Absolute arm 50us: below \
+                     ~500us mean slice, 10% is comparable to per-event overheads the \
+                     two sides account for differently (migration penalty 10us, \
+                     cross-LLC 25us). HOLDS ONLY WHEN BOTH SIDES RUN THE SAME \
+                     SCHEDULER — different schedulers legitimately choose different \
+                     slice lengths; that is a policy difference, not simulator \
+                     infidelity. Derived blind under tg blind_tolerance_derivation_what; \
+                     do not retune.",
+                ),
+                min_samples: MinSamples::PERCENTILE,
+                distributional: false,
+            },
         }
     }
 
@@ -203,6 +255,7 @@ impl Metric {
             Metric::Migrations => "migrations",
             Metric::ContextSwitches => "context_switches",
             Metric::WakeLatency => "wake_latency",
+            Metric::MeanSliceLength => "mean_slice_length",
             Metric::SchedulingDelay => "scheduling_delay",
         }
     }
@@ -215,6 +268,7 @@ impl Metric {
         Metric::Migrations,
         Metric::ContextSwitches,
         Metric::WakeLatency,
+        Metric::MeanSliceLength,
         Metric::SchedulingDelay,
     ];
 }
@@ -425,6 +479,22 @@ pub struct CalibrationRun {
     pub ktstr_commit: String,
     pub results: Vec<MetricResult>,
     pub negative_control: Option<NegativeControl>,
+    /// Which model advanced simulated time on the scxsim side
+    /// (`scx_simulator::ClockMode::as_str`: "pmu", "e9patch", "fallback",
+    /// "off").
+    ///
+    /// Provenance, exactly like the two commit fields above. The simulated
+    /// clock is chosen at runtime from what the host provides, and the PMU
+    /// model makes simulated time a function of THIS machine's hardware — so a
+    /// calibration verdict recorded under one clock cannot be compared against
+    /// one recorded under another. A run that does not record it is not
+    /// comparable to anything, which is why this is serialised as `null`
+    /// rather than defaulted to a plausible-looking value.
+    ///
+    /// Held as a String rather than the enum so this crate stays free of a
+    /// dependency on the simulator; `ClockMode::as_str()` is pinned by test.
+    #[serde(default)]
+    pub clock_mode: Option<String>,
 }
 
 impl CalibrationRun {
@@ -439,7 +509,16 @@ impl CalibrationRun {
             ktstr_commit: ktstr_commit.into(),
             results: Vec::new(),
             negative_control: None,
+            clock_mode: None,
         }
+    }
+
+    /// Record which clock advanced simulated time for this run.
+    ///
+    /// Pass `scx_simulator::Trace::clock_mode().as_str()`.
+    pub fn with_clock_mode(mut self, mode: impl Into<String>) -> Self {
+        self.clock_mode = Some(mode.into());
+        self
     }
 
     pub fn record(&mut self, r: MetricResult) {
@@ -591,6 +670,36 @@ mod tests {
 
     /// The control must actually reject. If a 3x error passes the CpuTime
     /// tolerance, the tolerance is wrong.
+    /// A calibration verdict is only comparable against another recorded
+    /// under the same clock, so the field must survive a JSON round trip and
+    /// must be ABSENT rather than invented when nobody recorded it.
+    #[test]
+    fn clock_mode_is_recorded_in_the_serialised_artifact() {
+        let run = CalibrationRun::new("demo", "abc", "def").with_clock_mode("pmu");
+        let json = serde_json::to_string(&run).unwrap();
+        assert!(
+            json.contains("\"clock_mode\":\"pmu\""),
+            "clock mode must reach the artifact, not just the console: {json}"
+        );
+        let back: CalibrationRun = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.clock_mode.as_deref(), Some("pmu"));
+    }
+
+    #[test]
+    fn an_unlabelled_run_records_no_clock_rather_than_guessing_one() {
+        let run = CalibrationRun::new("demo", "abc", "def");
+        assert_eq!(
+            run.clock_mode, None,
+            "defaulting to a plausible clock would make an uncomparable result \
+             look comparable"
+        );
+        // And it must still deserialise from an artifact written before this
+        // field existed, rather than failing to load.
+        let old = r#"{"scenario":"s","sched_test_commit":"c","ktstr_commit":"k","results":[],"negative_control":null}"#;
+        let parsed: CalibrationRun = serde_json::from_str(old).unwrap();
+        assert_eq!(parsed.clock_mode, None);
+    }
+
     #[test]
     fn negative_control_rejects_a_threefold_error() {
         let c = NegativeControl::perturbed(Metric::CpuTime, q_dur(1_000_000), 3.0, SampleCount(10));
@@ -875,5 +984,39 @@ mod tests {
                 spec.tolerance.rationale
             );
         }
+    }
+    /// The mean-slice bound is PINNED, because its only property is that it was
+    /// fixed before anyone compared the two sides.
+    ///
+    /// Derived blind under tg `blind_tolerance_derivation_what` by an agent
+    /// that had not seen the measurement. If a future run comes back far
+    /// outside 10% and 10% starts to feel harsh, THAT IS THE BOUND WORKING.
+    /// Changing these numbers in place silently converts a pre-registered
+    /// tolerance into one fitted to the result — use `Tolerance::widening()`
+    /// instead, which records the previous bound and prints it in the report.
+    #[test]
+    fn the_blind_mean_slice_bound_is_exactly_as_derived() {
+        let spec = Metric::MeanSliceLength.spec();
+        assert_eq!(
+            spec.tolerance.kind,
+            crate::verdict::ToleranceKind::RelativeOrAbsolute {
+                frac: 0.10,
+                abs: 50_000.0,
+            },
+            "relative 0.10 with a 50us absolute arm, as derived blind",
+        );
+        assert_eq!(spec.min_samples, MinSamples::PERCENTILE);
+        assert!(!spec.distributional);
+        assert!(
+            spec.tolerance.widened_from.is_none(),
+            "the bound has never been relaxed; if it is, that must be recorded \
+             as a widening rather than edited in place",
+        );
+        // The scope restriction is load-bearing, not commentary: comparing
+        // slice lengths across two different schedulers is a category error.
+        assert!(
+            spec.tolerance.rationale.contains("SAME"),
+            "the rationale must keep the same-scheduler scope explicit",
+        );
     }
 }

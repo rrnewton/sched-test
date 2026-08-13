@@ -428,6 +428,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ktstr-scenario-replay"
+version = "0.1.0"
+dependencies = [
+ "libbpf-sys",
+ "scx_simulator",
+ "scxsim-build",
+ "scxsim-workload-ir",
+ "serde_json",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

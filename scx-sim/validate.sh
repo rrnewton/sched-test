@@ -182,6 +182,13 @@ cargo nextest run -p scxsim-workload-ir --features ingest --test sched_basic_pro
 cargo nextest run -p scxsim-calibration --features sim --test calibrate_sched_basic_proportional
 
 echo ""
+echo "=== Running feature-gated example builds ==="
+# The trace-comparison example is how the simulated half of a wprof comparison
+# is produced. It is behind `sim` for the same reason the test is, so the
+# --workspace build never compiles it and a break would go unnoticed.
+cargo build -p scxsim-calibration --features sim --example dump_sim_perfetto
+
+echo ""
 echo "=== Rust library coverage ratchet (self-test + gate) ==="
 # Verify the ratchet's own logic, then gate. The gate reuses the profile data
 # from the instrumented `cargo llvm-cov nextest` run above and hard-fails if any

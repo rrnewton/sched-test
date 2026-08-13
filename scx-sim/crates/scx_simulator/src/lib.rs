@@ -61,6 +61,7 @@ pub(crate) mod unsafe_impl;
 // (`scx_simulator::workloads::cpu_bound`, ...), not internal plumbing.
 pub(crate) use safe::atomic_types;
 pub(crate) use safe::cgroup;
+pub(crate) use safe::clock_mode;
 pub(crate) use safe::cpu;
 pub(crate) use safe::dsq;
 pub(crate) use safe::engine;
@@ -107,6 +108,7 @@ pub(crate) use unsafe_impl::task_wrapper;
 // mmap_rip_shared through it).
 pub use backend::e9patch;
 pub use cgroup::{CgroupId, CgroupInfo, CgroupRegistry, DEFAULT_MAX_CGROUPS};
+pub use clock_mode::ClockMode;
 pub use engine::{ExitKind, SimulationResult, Simulator};
 pub use ffi::{
     discover_schedulers, DebuggerInfo, DynamicScheduler, LavdPowerMode, LoadError, Scheduler,
