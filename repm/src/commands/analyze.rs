@@ -300,13 +300,16 @@ fn load_csv_with_provenance(csv_path: &Path, base_dir: &Path, thread_type: &str)
                 "p99" => rd.sched_p99.push(val, &rel_path, line_num),
                 _ => {}
             },
-            "irq_avoidance" | "irq_exposure" => {
+            // Guard rather than a nested `if`: a failed guard falls through to
+            // the `_ => {}` arm below, which is exactly what the empty `if`
+            // did. irq_avoidance is only counted when the note says the value
+            // is runtime/time-weighted; irq_exposure always is.
+            "irq_avoidance" | "irq_exposure"
                 if notes.contains("runtime_weighted")
                     || notes.contains("time-weighted")
-                    || metric == "irq_exposure"
-                {
-                    rd.irq_exposure.push(val, &rel_path, line_num);
-                }
+                    || metric == "irq_exposure" =>
+            {
+                rd.irq_exposure.push(val, &rel_path, line_num);
             }
             _ => {}
         }

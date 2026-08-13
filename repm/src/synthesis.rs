@@ -9,9 +9,8 @@
 //! reconstruct a workload config that produces similar scheduling behavior.
 
 use std::collections::BTreeMap;
-use std::path::Path;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 
 // ---------------------------------------------------------------------------
 // Inferred task profile (extracted from trace data)

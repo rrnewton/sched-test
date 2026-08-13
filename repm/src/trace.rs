@@ -134,13 +134,9 @@ impl ThreadRole {
 /// A single row from an rt-app per-thread log file.
 #[derive(Debug, Clone)]
 struct RtAppLogRow {
-    #[allow(dead_code)]
-    idx: u32,
     run_us: u64,
     period_us: u64,
     start_ns: u64,
-    end_ns: u64,
-    slack_us: i64,
     wu_lat_us: u64,
     cpu: u32,
 }
@@ -218,7 +214,7 @@ pub fn parse_rtapp_log_dir(dir: &Path) -> Result<Vec<ThreadProfile>> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if path.extension().map_or(false, |e| e == "log") {
+        if path.extension().is_some_and(|e| e == "log") {
             match parse_rtapp_log(&path) {
                 Ok((_events, profile)) => profiles.push(profile),
                 Err(e) => {
@@ -248,13 +244,16 @@ fn parse_rtapp_log_line(line: &str) -> Option<RtAppLogRow> {
         return None;
     }
 
+    // Only the columns that are actually consumed are parsed. idx, end and
+    // slack were parsed into fields nobody read -- and each used `?`, so a
+    // malformed value in an UNUSED column discarded the whole row and quietly
+    // shortened the profile. The `fields.len() < 12` check above still
+    // validates the column count. (No evidence this ever fired; it was a live
+    // path regardless.)
     Some(RtAppLogRow {
-        idx: fields[0].parse().ok()?,
         run_us: fields[2].parse().ok()?,
         period_us: fields[3].parse().ok()?,
         start_ns: fields[4].parse().ok()?,
-        end_ns: fields[5].parse().ok()?,
-        slack_us: fields[7].parse().ok()?,
         wu_lat_us: fields[10].parse().ok()?,
         cpu: fields[11].parse().ok()?,
     })
@@ -583,7 +582,7 @@ pub fn parse_perfetto_json(path: &Path) -> Result<Vec<SchedulingEvent>> {
 // Utility
 // ---------------------------------------------------------------------------
 
-fn compute_percentiles(values: &mut Vec<f64>) -> LatencyPercentiles {
+fn compute_percentiles(values: &mut [f64]) -> LatencyPercentiles {
     if values.is_empty() {
         return LatencyPercentiles::default();
     }

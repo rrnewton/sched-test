@@ -60,9 +60,11 @@ jobs:
       # putting the lint first would have recreated it inside the fix. The
       # ordering is load-bearing, not stylistic.
       #
-      # When the 24 findings are cleared, this job may be reordered freely —
-      # the constraint is "tests must not sit behind a step that is red", not
-      # "tests must be first" forever.
+      # The 24 findings have since been cleared, so the ordering constraint is
+      # now dormant rather than active: the job may be reordered freely while
+      # clippy is green. Keep it in mind if a step ever goes red again — the
+      # rule is "tests must not sit behind a red step", not "tests must be
+      # first" forever.
       #
       # --all-targets to widen the target axis; `cargo test` alone would leave
       # some targets uncompiled and still report success.
@@ -70,12 +72,16 @@ jobs:
         working-directory: repm
         run: cargo test --all-targets
 
-      # No doc-test step. Doc-tests ARE a separate axis that --all-targets does
-      # not cover, so one belongs here in principle — but repm is binary-only
-      # and `cargo test --doc` errors with "no library targets found in package
-      # `repm`". A step that always fails for a reason unrelated to the code
-      # teaches people to ignore this workflow. Add it if repm ever grows a lib
-      # target.
+      # Doc-tests are a separate axis that --all-targets does not cover. This
+      # step was absent on the first pass because repm was binary-only and
+      # `cargo test --doc` errored with "no library targets found in package
+      # `repm`". The crate now has a lib target, so the axis is reachable and
+      # the step is here. It currently runs 0 doc-tests; that is a real 0, not
+      # an error being swallowed.
+      - name: Doc tests
+        if: always()
+        working-directory: repm
+        run: cargo test --doc
 
       - name: Build (release)
         if: always()
