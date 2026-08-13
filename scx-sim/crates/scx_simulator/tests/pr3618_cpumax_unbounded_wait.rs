@@ -5,11 +5,20 @@
 //!
 //! # What is measured, and why it is not "did a stall fire"
 //!
-//! The throttle-aware watchdog was fixed on 2026-08-12 to read the library's
-//! own `cgx->is_throttled`, so it correctly no longer reports a throttled
-//! cgroup as a runnable stall. `ExitKind::ErrorStall` is therefore SUPPRESSED
-//! for exactly the scenario under test, and "no stall fired" must not be read
-//! as falsifying the hypothesis.
+//! The throttle-aware watchdog reads the library's own `cgx->is_throttled`
+//! live, and excludes cpu.max-throttled time from the starvation clock, so it
+//! correctly does not report a throttled cgroup as a runnable stall.
+//! `ExitKind::ErrorStall` is therefore SUPPRESSED for exactly the scenario
+//! under test, and "no stall fired" must not be read as falsifying the
+//! hypothesis.
+//!
+//! That was first claimed on 2026-08-12 and was NOT true as written: the
+//! throttle state was sampled once per replenish period, from a
+//! post-replenish snapshot, so it read a ~99.9%-duty condition as throttled
+//! about 0.25% of the time and the suppression almost never fired. Worse, the
+//! accrued throttled time survived the suppression, so the first unthrottled
+//! tick charged the whole period at once. Both are fixed; see
+//! `check_watchdog` and its `last_throttled_at` argument.
 //!
 //! The observable is instead **bail-to-next-schedule latency**: the wall time
 //! from a successful per-pid `LavdBailOnCgroupThrottle` (the real
@@ -341,36 +350,96 @@ fn the_bound_holds_for_the_most_severe_configurations() {
     }
 }
 
-/// Does the severest configuration converge AT ALL, or scale to the watchdog?
+/// Does the severest configuration converge AT ALL, or scale past the watchdog
+/// threshold?
+///
+/// # This test used to assert `ExitKind::ErrorStall` and no longer does
+///
+/// It previously required both sub-0.25ms quotas to reach `ErrorStall`, with
+/// the note "if this stops firing, either the starvation was fixed or the
+/// scenario stopped throttling — check which before relaxing this."
+///
+/// It is now neither of those. It is a third thing the note did not anticipate:
+/// **those stalls were simulator artefacts.** scx-sim's watchdog was charging
+/// cpu.max-throttled time as starvation, because a throttled task stays
+/// `TaskState::Runnable` here while real Linux/SCX DEQUEUES it — so
+/// `p->scx.runnable_at` stops accruing on the kernel and the kernel's own
+/// runnable-stall watchdog would never have fired for these runs. scx-sim now
+/// excludes throttled time from the starvation clock, which is a
+/// match-production fix (scx-sim/CLAUDE.md Principle 1), not a weakening.
+///
+/// **Nothing about the measured wait changed.** q=62us still yields
+/// worst=81.18s, exactly as before. Only the classification changed, from
+/// `ErrorStall` to `Normal`. The wait — measured from
+/// `LavdBailOnCgroupThrottle` -> `TaskScheduled`, which never consulted the
+/// watchdog — remains the evidence for #3618, and it is a stronger assertion
+/// than the exit kind ever was: the exit kind saturates at "a stall happened",
+/// while the wait keeps reporting how bad it got.
+///
+/// DO NOT re-add an `ErrorStall` assertion here. A scx-sim stall in this
+/// scenario would mean the throttled-time exclusion regressed, not that the
+/// pathology worsened.
 #[test]
-fn tight_cpumax_reaches_the_watchdog() {
+fn tight_cpumax_drives_a_multi_second_wait_without_a_watchdog_stall() {
     let _lock = common::setup_test();
-    let mut stalled = 0;
+    let mut worsts: Vec<(u64, u64)> = Vec::new();
     for (quota_us, victims) in [(125u64, 8u32), (62, 8)] {
-        {
-            let duration_ms = 240_000u64;
-            let t = Simulator::new(lavd_cpu_bw(4)).run(scenario(quota_us, victims, duration_ms));
-            let worst = report(&format!("q={quota_us} v={victims} w={duration_ms}ms"), &t);
-            eprintln!(
-                "         -> worst={:.2}s = {:.1}% of window  exit={:?}",
-                worst as f64 / 1e9,
-                100.0 * worst as f64 / (duration_ms as f64 * 1e6),
-                t.exit_kind()
-            );
-            if matches!(t.exit_kind(), ExitKind::ErrorStall { .. }) {
-                stalled += 1;
-            }
-        }
+        let duration_ms = 240_000u64;
+        let t = Simulator::new(lavd_cpu_bw(4)).run(scenario(quota_us, victims, duration_ms));
+        let worst = report(&format!("q={quota_us} v={victims} w={duration_ms}ms"), &t);
+        eprintln!(
+            "         -> worst={:.2}s = {:.1}% of window  exit={:?}",
+            worst as f64 / 1e9,
+            100.0 * worst as f64 / (duration_ms as f64 * 1e6),
+            t.exit_kind()
+        );
+
+        // The pathology itself, and the part that carries the finding.
+        assert!(
+            worst > 30_000_000_000,
+            "quota={quota_us}us victims={victims}: worst bail-to-schedule wait was \
+             {:.2}s, expected > 30s. THIS is the #3618 reproduction; if it stops \
+             holding, the starvation really did change — investigate before \
+             touching this bound.",
+            worst as f64 / 1e9
+        );
+
+        // Non-vacuity: "no stall" must mean "correctly not reported", never
+        // "the scenario stopped throttling".
+        let bails = count_kind(&t, |k| {
+            matches!(k, TraceKind::LavdBailOnCgroupThrottle { .. })
+        });
+        assert!(
+            bails > 0,
+            "quota={quota_us}us victims={victims}: zero LavdBailOnCgroupThrottle \
+             events — the scenario stopped throttling, so the wait above is not \
+             measuring cpu.max starvation at all."
+        );
+
+        // The corrected classification.
+        assert!(
+            !matches!(t.exit_kind(), ExitKind::ErrorStall { .. }),
+            "quota={quota_us}us victims={victims}: got {:?}. A task withheld by \
+             cpu.max is parked by policy, and the kernel dequeues it rather than \
+             leaving it runnable, so no runnable-stall watchdog should fire. An \
+             ErrorStall here means scx-sim is charging throttled time as \
+             starvation again — see check_watchdog's last_throttled_at.",
+            t.exit_kind()
+        );
+
+        worsts.push((quota_us, worst));
     }
-    // THE REPRODUCTION. Tight enough cpu.max drives the wait past the 30s
-    // runnable-stall watchdog, which fires DESPITE the throttle-aware
-    // exemption added on 2026-08-12 — the task is starved long enough that
-    // even a watchdog that forgives throttled cgroups reports a stall.
-    assert_eq!(
-        stalled, 2,
-        "expected both sub-0.25ms quotas to reach ExitKind::ErrorStall; got {stalled}. \
-         If this stops firing, either the starvation was fixed or the scenario \
-         stopped throttling — check which before relaxing this."
+
+    // The gradient across the two severest quotas, which the exit kind could
+    // never express: halving the quota must make the wait substantially worse.
+    let (_, w125) = worsts[0];
+    let (_, w62) = worsts[1];
+    assert!(
+        w62 > w125,
+        "halving quota 125us -> 62us must worsen the worst wait, but it went \
+         {:.2}s -> {:.2}s",
+        w125 as f64 / 1e9,
+        w62 as f64 / 1e9
     );
 }
 
