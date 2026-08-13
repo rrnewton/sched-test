@@ -1,0 +1,97 @@
+{
+  "_comment": "scx#3618 repro: a directly cpu.max-limited cgroup (125us quota per 100ms period = 0.125% of one CPU) holding one compute hog and eight repeatedly-waking short victims, plus an unlimited competitor in the root cgroup whose continued progress shows the machine is not merely saturated. Run with -s lavd and --sched-config enabling enable_cpu_bw. Demonstrates the unbounded bandwidth wait of https://github.com/sched-ext/scx/pull/3618.",
+  "_run_units": "rt-app run/sleep are microseconds; cpu.max is '<quota_us> <period_us>'. NOTE: 'duration' is parsed with as_i64 \u2014 a FLOAT here is silently ignored and replaced by the 10s default.",
+  "global": {
+    "duration": 240
+  },
+  "tasks": {
+    "hog": {
+      "priority": 0,
+      "loop": -1,
+      "run": 2000000,
+      "sleep": 0,
+      "taskgroup": {
+        "path": "/tight",
+        "cpu.max": "125 100000"
+      }
+    },
+    "victim_0": {
+      "priority": 0,
+      "loop": -1,
+      "run": 200,
+      "sleep": 1000,
+      "taskgroup": {
+        "path": "/tight"
+      }
+    },
+    "victim_1": {
+      "priority": 0,
+      "loop": -1,
+      "run": 200,
+      "sleep": 1000,
+      "taskgroup": {
+        "path": "/tight"
+      }
+    },
+    "victim_2": {
+      "priority": 0,
+      "loop": -1,
+      "run": 200,
+      "sleep": 1000,
+      "taskgroup": {
+        "path": "/tight"
+      }
+    },
+    "victim_3": {
+      "priority": 0,
+      "loop": -1,
+      "run": 200,
+      "sleep": 1000,
+      "taskgroup": {
+        "path": "/tight"
+      }
+    },
+    "victim_4": {
+      "priority": 0,
+      "loop": -1,
+      "run": 200,
+      "sleep": 1000,
+      "taskgroup": {
+        "path": "/tight"
+      }
+    },
+    "victim_5": {
+      "priority": 0,
+      "loop": -1,
+      "run": 200,
+      "sleep": 1000,
+      "taskgroup": {
+        "path": "/tight"
+      }
+    },
+    "victim_6": {
+      "priority": 0,
+      "loop": -1,
+      "run": 200,
+      "sleep": 1000,
+      "taskgroup": {
+        "path": "/tight"
+      }
+    },
+    "victim_7": {
+      "priority": 0,
+      "loop": -1,
+      "run": 200,
+      "sleep": 1000,
+      "taskgroup": {
+        "path": "/tight"
+      }
+    },
+    "competitor": {
+      "priority": 0,
+      "loop": -1,
+      "run": 2000000,
+      "sleep": 0
+    }
+  }
+}
