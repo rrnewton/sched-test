@@ -23,17 +23,17 @@ the same work type, so a scenario count reads as far more maturity than exists.
 The 45 work types are clustered into ten buckets by WHAT THEY STRESS (see
 `BUCKETS`), and the per-bucket table is the headline: it makes the shape of the
 evidence sayable in one sentence -- pure-CPU work has an agreeing comparison,
-blocking IO has three work types that are all the same fabricated duty cycle,
-and six buckets have nothing at all.
+blocking IO's three ordinary ktstr types are now explicitly refused without a
+calibrated model input, and six buckets have nothing at all.
 
 A FOURTH CATEGORY, WORSE THAN THE THIRD, AND NOT DETECTABLE BY COUNTING RUNS.
 A work type can be mapped, accepted, run to completion and satisfy its oracle
 while the engine models something that is not the workload. Nothing refuses it
 and nothing goes red: `compile_source` carries `ir.fidelity` and no caller
 in-tree gates on it. `FIDELITY` records what has been AUDITED -- currently 11
-work types, because only the exporter-mapped ones reach the lowering at all --
-and 8 of those 11 are in this state. Every number this script prints is
-therefore an UPPER BOUND on trustworthy coverage, including the agreeing one.
+ordinary ktstr replay types emitted by the exporter -- and 5 of those 11 are in
+this state. Every number this script prints is therefore an UPPER BOUND on
+trustworthy coverage, including the agreeing one.
 
 THE THIRD CATEGORY IS THE POINT. A scenario can run on both backends and still
 be uncheckable, and in a two-number summary that state is invisible -- it reads
@@ -90,10 +90,10 @@ NOT_CHECKABLE: tuple[NotCheckable, ...] = (
         issue="sim-1zqbl",
         work_types=("io_sync_write", "spin_wait"),
         cgroups=2,
-        why="the io/compute split is a fabricated constant. IoSyncWrite lowers to "
-            "a 50% duty cycle; the VM measures the worker off-CPU 21.4%. A share "
-            "bound here is red for a workload-modelling reason and would be "
-            "misread as a scheduler divergence.",
+        why="this committed capture used the now-removed fabricated IoSyncWrite "
+            "50% duty-cycle fallback; current ordinary replay refuses the "
+            "fieldless source. Its historical share result is not an evaluation "
+            "of the separate, explicitly calibrated IoModelV1 input.",
         measured="VM cg_0 19.72% vs SIM 1.52% (12.96x), reproduced at 19.48%",
     ),
     NotCheckable(
@@ -238,6 +238,11 @@ BUCKETS: tuple[Bucket, ...] = (
     ),
 )
 
+# SourceWorkType also carries typed inputs that are deliberately not ktstr
+# WorkType variants. Keep them explicit and outside ktstr coverage denominators;
+# source.rs documents why each one exists.
+SIMULATOR_ONLY_VARIANTS: frozenset[str] = frozenset({"IoModelV1"})
+
 
 def snake(camel: str) -> str:
     """`IoSyncWrite` -> `io_sync_write`, matching serde's rename_all."""
@@ -253,16 +258,18 @@ def snake(camel: str) -> str:
 # goes red. `compile_source` carries `ir.fidelity` and NO caller in-tree gates
 # on it, so the disclosure exists and changes nothing.
 #
-# IoSyncWrite is the proof case: fully disclosed, and still 19.72% in the VM
-# against 1.52% in the simulator.
+# The storage types are the proof that this audit must stay live: their old
+# fabricated fallback produced 19.72% in the VM against 1.52% in the simulator;
+# ordinary replay now refuses all three rather than reporting a false result.
 #
 # Entries are keyed by work type and derived by reading `plan_work` in
 # `scxsim-workload-ir/src/lower.rs` against the ktstr doc comments. Symbols, not
 # line numbers -- line numbers rot across every rebase.
 #
 # NOT AN EXHAUSTIVE LIST OF DEFECTS. It records what has been AUDITED. A work
-# type absent from here is unexamined, not clean -- and only the 11 the exporter
-# maps have been audited at all, because the other 34 never reach the lowering.
+# ordinary ktstr type absent from here is unexamined, not clean. The 11 types
+# emitted by the exporter have been audited; the other 34 never arrive through
+# ordinary replay. Simulator-only typed inputs are accounted for separately.
 # ---------------------------------------------------------------------------
 # Each entry is (VERDICT, one-line, detail). The one-line is what the summary
 # prints, so it is written once here rather than sliced out of the prose -- a
@@ -283,19 +290,17 @@ FIDELITY: dict[str, tuple[str, str, str]] = {
         "REFUSED", "same stale YieldNotRepresentable path",
         "Refused at ingest via the same arm as YieldHeavy."),
     "IoSyncWrite": (
-        "NOT MODELLED", "one invented constant used twice as a 50% duty cycle",
-        "Run(spin)/Sleep(spin) from ONE invented_slice call bound once and used "
-        "TWICE, at DEFAULT_SLICE 500us. Measured: VM 19.72% vs SIM 1.52%."),
+        "REFUSED", "fieldless source cannot select a calibrated volume profile",
+        "LoweringError::UnmodelledIoSource. The fabricated Run/Sleep fallback "
+        "was removed; an explicit typed IoModelV1 source and profile are required."),
     "IoRandRead": (
-        "NOT MODELLED", "byte-identical to IoSyncWrite; differs only in prose",
-        "Same shared match arm, same task-name prefix 'io'. The only "
-        "per-variant difference in the whole lowering is a string in the "
-        "fidelity text."),
+        "REFUSED", "no calibrated random-read model is accepted",
+        "LoweringError::UnmodelledIoSource. The v1 profile is specific to "
+        "synchronous sequential writes and cannot be relabelled as a read model."),
     "IoConvoy": (
-        "NOT MODELLED", "byte-identical to the other two: 3 names, 1 behaviour",
-        "Same shared arm again. O_SYNC buffered writes and O_DIRECT reads reach "
-        "the device differently in reality, so their off-CPU fractions differ "
-        "by construction; the lowering cannot tell them apart."),
+        "REFUSED", "no calibrated multi-worker convoy model is accepted",
+        "LoweringError::UnmodelledIoSource. The one-worker v1 profile cannot "
+        "represent device contention and is rejected rather than reused."),
     "ForkExit": (
         "NOT MODELLED", "tasks EXIT after 500us, leaving the cgroup empty",
         "Repeat::Once means a 12s scenario gets ~1ms of CPU and then an empty "
@@ -332,13 +337,12 @@ FIDELITY: dict[str, tuple[str, str, str]] = {
 # because they never become a Phase::Yield, so the ingest gate never sees them.
 
 
-def source_work_type_names() -> list[str]:
-    """The work types ktstr can express, as the IR enumerates them.
+def source_work_type_variants() -> list[str]:
+    """Every SourceWorkType variant, including simulator-only typed inputs.
 
-    Returns NAMES rather than a count so the bucket table can be checked against
-    them. A count alone cannot catch the failure that matters -- one variant
-    renamed and another added keeps the count at 45 while the buckets silently
-    stop partitioning the enum.
+    Returns names rather than a count so the ktstr buckets plus the explicit
+    simulator-only set can be checked against the enum. A count alone cannot
+    catch one variant being renamed while another is added.
     """
     s = SOURCE_RS.read_text()
     i = s.index("pub enum SourceWorkType")
@@ -494,16 +498,19 @@ def main() -> int:
     validated = sorted({wt for n in agree for wt in records[n].work_types})
     reached = sorted({wt for f in records.values() for wt in f.work_types}
                      | {wt for e in NOT_CHECKABLE for wt in e.work_types})
-    names = source_work_type_names()
+    source_variants = set(source_work_type_variants())
+    ktstr_names = source_variants - SIMULATOR_ONLY_VARIANTS
     mapped = exporter_mapped(pathlib.Path(a.ktstr)) if a.ktstr else None
 
     print()
     print("WORK TYPES  (the better predictor: a future test is likelier to use")
     print("             one we have never validated than another spin_wait)")
-    print(f"  ktstr can express ............... {len(names)}")
+    print(f"  ktstr can express ............... {len(ktstr_names)}")
+    print(f"  simulator-only model inputs ..... {len(SIMULATOR_ONLY_VARIANTS)}   "
+          f"{sorted(SIMULATOR_ONLY_VARIANTS)} (excluded from ktstr coverage)")
     if mapped is not None:
         print(f"  the EXPORTER maps ............... {len(mapped)}   <- THE CEILING. "
-              f"the other {len(names) - len(mapped)} cannot reach the simulator at all,")
+              f"the other {len(ktstr_names) - len(mapped)} cannot reach the simulator at all,")
         print( "                                       no matter how many tests are written")
     print(f"  reached either backend .......... {len(reached)}   {reached}")
     print(f"  in an AGREEING comparison ....... {len(validated)}   {validated}")
@@ -514,7 +521,7 @@ def main() -> int:
     # per bucket, the shape of what is and is not established is visible at a
     # glance.
     print()
-    print("BY BUCKET  (n = work types in the bucket; the columns narrow left to")
+    print("BY BUCKET  (n = ktstr work types in the bucket; columns narrow left to")
     print("            right, and every one of them is an UPPER bound)")
     print()
     print(f"  {'bucket':<42} {'n':>2} {'map':>4} {'run':>4} {'agr':>4}  {'audited fidelity':<24}")
@@ -551,20 +558,20 @@ def main() -> int:
     print("  in-tree gates on it, so disclosure changes nothing.")
     print()
     print(f"  audited ......................... {len(audited_all)} "
-          f"(only the exporter-mapped ones reach the lowering at all)")
+          f"(ordinary ktstr replay types emitted by the exporter)")
     print(f"  NOT FAITHFULLY MODELLED ......... {len(broken_all)}")
     for k in broken_all:
         print(f"      {k:<20} {FIDELITY[k][1]}")
     print()
-    print(f"  The remaining {len(names) - len(audited_all)} work types are UNEXAMINED, not clean:")
-    print("  they never reach the lowering, so nobody has looked.")
+    print(f"  The remaining {len(ktstr_names) - len(audited_all)} ktstr work types "
+          "are UNEXAMINED, not clean:")
+    print("  the exporter does not emit them, so ordinary replay has not audited them.")
 
     problems = []
-    # THE ANTI-STALENESS GATE. The buckets must partition SourceWorkType
-    # exactly. Without this the table decays the way ktstr_gate_chain.py's
-    # hardcoded exporter set did: correct when written, silently wrong later,
-    # and still printing confident numbers. A variant added to ktstr and not
-    # bucketed would otherwise just shrink the denominator with no signal.
+    # THE ANTI-STALENESS GATE. The ktstr buckets and simulator-only set must be
+    # an exact, disjoint partition of SourceWorkType. Without this the table
+    # decays the way ktstr_gate_chain.py's hardcoded exporter set did: correct
+    # when written, silently wrong later, and still printing confident numbers.
     bucketed: dict[str, str] = {}
     for b in BUCKETS:
         for m in b.members:
@@ -572,23 +579,27 @@ def main() -> int:
                 problems.append(
                     f"work type in two buckets: {m} ({bucketed[m]} and {b.key})")
             bucketed[m] = b.key
-    known = set(names)
-    for m in sorted(set(bucketed) - known):
+    bucketed_names = set(bucketed)
+    for m in sorted(bucketed_names - source_variants):
         problems.append(f"bucketed work type no longer in SourceWorkType: {m}")
-    for m in sorted(known - set(bucketed)):
+    for m in sorted(SIMULATOR_ONLY_VARIANTS - source_variants):
+        problems.append(f"simulator-only variant no longer in SourceWorkType: {m}")
+    for m in sorted(bucketed_names & SIMULATOR_ONLY_VARIANTS):
+        problems.append(f"source variant classified as both ktstr and simulator-only: {m}")
+    for m in sorted(source_variants - bucketed_names - SIMULATOR_ONLY_VARIANTS):
         problems.append(
-            f"NEW work type not in any bucket: {m} -- add it to BUCKETS "
-            f"(and decide what it stresses) rather than letting the "
-            f"denominator drift")
+            f"NEW SourceWorkType variant is unclassified: {m} -- add ordinary "
+            "ktstr types to BUCKETS or typed model inputs to "
+            "SIMULATOR_ONLY_VARIANTS")
     for b in BUCKETS:
         if b.rep not in b.members:
             problems.append(
                 f"bucket {b.key}: representative {b.rep} is not a member")
-    for m in sorted(set(FIDELITY) - known):
-        problems.append(f"FIDELITY names a work type not in SourceWorkType: {m}")
+    for m in sorted(set(FIDELITY) - ktstr_names):
+        problems.append(f"FIDELITY names a non-ktstr SourceWorkType: {m}")
     if mapped is not None:
-        for m in sorted(mapped - known):
-            problems.append(f"exporter maps a work type the IR does not mirror: {m}")
+        for m in sorted(mapped - ktstr_names):
+            problems.append(f"exporter maps a non-ktstr or unknown work type: {m}")
         # The audit covers exactly the mapped set; anything else is unexamined.
         for m in sorted(mapped - set(FIDELITY)):
             problems.append(
