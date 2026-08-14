@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Two numbers that keep getting conflated: how many scenarios RUN on both
-backends, and how many AGREE.
+"""Two numbers that keep getting conflated: how many scenarios have a capture
+from both backends, and how many AGREE.
 
 They are not the same and the gap between them is the interesting part. Nothing
 computed either, so reports drifted into quoting one as the other -- this
@@ -18,13 +18,14 @@ lives only on `feat/ktstr-scenario-dsl-v2` (ktstr PR #47, public fork
 https://github.com/rrnewton/ktstr); against `main` there is no exporter and the
 ceiling is undefined rather than zero.
 
-REPORTED BY BUCKET, NOT ONLY BY COUNT. Five of the seven scenarios that run are
-the same work type, so a scenario count reads as far more maturity than exists.
+REPORTED BY BUCKET, NOT ONLY BY COUNT. Five of the seven scenarios with
+two-backend captures use the same work type, so a scenario count reads as far
+more maturity than exists.
 The 45 work types are clustered into ten buckets by WHAT THEY STRESS (see
 `BUCKETS`), and the per-bucket table is the headline: it makes the shape of the
 evidence sayable in one sentence -- pure-CPU work has an agreeing comparison,
-blocking IO's three ordinary ktstr types are now explicitly refused without a
-calibrated model input, and six buckets have nothing at all.
+blocking IO's three ordinary ktstr types are explicitly refused while calibrated
+modelling uses a separate simulator-only input, and six buckets have nothing.
 
 A FOURTH CATEGORY, WORSE THAN THE THIRD, AND NOT DETECTABLE BY COUNTING RUNS.
 A work type can be mapped, accepted, run to completion and satisfy its oracle
@@ -35,10 +36,10 @@ ordinary ktstr replay types emitted by the exporter -- and 5 of those 11 are in
 this state. Every number this script prints is therefore an UPPER BOUND on
 trustworthy coverage, including the agreeing one.
 
-THE THIRD CATEGORY IS THE POINT. A scenario can run on both backends and still
-be uncheckable, and in a two-number summary that state is invisible -- it reads
-as neither agreement nor failure. Both of the conversions done on 2026-08-13
-landed there, for two unrelated reasons, so it is not a corner case.
+THE THIRD CATEGORY IS THE POINT. A scenario can have a capture from both
+backends and still be uncheckable, and in a two-number summary that state is
+invisible -- it reads as neither agreement nor failure. Both conversions done
+on 2026-08-13 landed there, for unrelated reasons, so it is not a corner case.
 
 WHY WORK TYPES AND NOT JUST COUNTS. The scenarios are a proxy. The question
 behind them is whether the simulator and a VM will agree on a ktstr test
@@ -119,8 +120,9 @@ NOT_CHECKABLE: tuple[NotCheckable, ...] = (
 #
 # This is the one hardcoded table in this file, because the clustering is a
 # judgement and cannot be derived. `--check` guarantees it stays in sync: the
-# buckets must partition `SourceWorkType` EXACTLY, so a new variant nobody
-# bucketed fails CI instead of quietly vanishing from the denominator.
+# buckets plus `SIMULATOR_ONLY_VARIANTS` must partition `SourceWorkType`
+# exactly, so a new variant nobody classified fails CI instead of quietly
+# vanishing from the denominator.
 #
 # THE AXIS IS WHAT THE SCHEDULER SEES, which is not always what the variant is
 # named after. Two that catch people, both worth knowing before trusting a
@@ -266,8 +268,8 @@ def snake(camel: str) -> str:
 # `scxsim-workload-ir/src/lower.rs` against the ktstr doc comments. Symbols, not
 # line numbers -- line numbers rot across every rebase.
 #
-# NOT AN EXHAUSTIVE LIST OF DEFECTS. It records what has been AUDITED. A work
-# ordinary ktstr type absent from here is unexamined, not clean. The 11 types
+# NOT AN EXHAUSTIVE LIST OF DEFECTS. It records what has been AUDITED. An
+# ordinary ktstr work type absent from here is unexamined, not clean. The 11 types
 # emitted by the exporter have been audited; the other 34 never arrive through
 # ordinary replay. Simulator-only typed inputs are accounted for separately.
 # ---------------------------------------------------------------------------
@@ -477,13 +479,13 @@ def main() -> int:
     discriminating = [n for n in agree if len(records[n].cgroups) >= 2]
     gross_only = [n for n in agree if len(records[n].cgroups) < 2]
 
-    runs = len(committed) + len(NOT_CHECKABLE)
+    captures = len(committed) + len(NOT_CHECKABLE)
     print("SCENARIOS")
-    print(f"  run on both backends ............ {runs}")
+    print(f"  captured on both backends ....... {captures}")
     print(f"    with a committed comparison ... {len(committed)}")
     print(f"    measured, not comparable ...... {len(NOT_CHECKABLE)}")
     print()
-    print(f"  AGREE ........................... {len(agree)} / {runs}")
+    print(f"  AGREE ........................... {len(agree)} / {captures}")
     print(f"    share-discriminating .......... {len(discriminating)}   "
           f"(>=2 cgroups, so the share bound can fire)")
     print(f"    gross-total only .............. {len(gross_only)}   "
@@ -491,13 +493,15 @@ def main() -> int:
     print(f"  KNOWN DIVERGENCE ................ {len(diverge)}")
     for n in diverge:
         print(f"      {n}")
-    print(f"  RUN BUT NOT CHECKABLE ........... {len(NOT_CHECKABLE)}")
+    print(f"  CAPTURED BUT NOT CHECKABLE ...... {len(NOT_CHECKABLE)}")
     for e in NOT_CHECKABLE:
         print(f"      {e.name}  ({e.issue})")
 
     validated = sorted({wt for n in agree for wt in records[n].work_types})
-    reached = sorted({wt for f in records.values() for wt in f.work_types}
-                     | {wt for e in NOT_CHECKABLE for wt in e.work_types})
+    captured_work_types = sorted(
+        {wt for f in records.values() for wt in f.work_types}
+        | {wt for e in NOT_CHECKABLE for wt in e.work_types}
+    )
     source_variants = set(source_work_type_variants())
     ktstr_names = source_variants - SIMULATOR_ONLY_VARIANTS
     mapped = exporter_mapped(pathlib.Path(a.ktstr)) if a.ktstr else None
@@ -512,11 +516,12 @@ def main() -> int:
         print(f"  the EXPORTER maps ............... {len(mapped)}   <- THE CEILING. "
               f"the other {len(ktstr_names) - len(mapped)} cannot reach the simulator at all,")
         print( "                                       no matter how many tests are written")
-    print(f"  reached either backend .......... {len(reached)}   {reached}")
+    print(f"  in two-backend captures ......... {len(captured_work_types)}   "
+          f"{captured_work_types}")
     print(f"  in an AGREEING comparison ....... {len(validated)}   {validated}")
 
     # ---- by bucket -------------------------------------------------------
-    # The headline. Five of the seven scenarios that run are the same work
+    # The headline. Five of the seven captured scenarios use the same work
     # type, so a per-scenario count reads as far more maturity than exists;
     # per bucket, the shape of what is and is not established is visible at a
     # glance.
@@ -524,13 +529,13 @@ def main() -> int:
     print("BY BUCKET  (n = ktstr work types in the bucket; columns narrow left to")
     print("            right, and every one of them is an UPPER bound)")
     print()
-    print(f"  {'bucket':<42} {'n':>2} {'map':>4} {'run':>4} {'agr':>4}  {'audited fidelity':<24}")
+    print(f"  {'bucket':<42} {'n':>2} {'map':>4} {'cap':>4} {'agr':>4}  {'audited fidelity':<24}")
     print(f"  {'-'*42} {'--':>2} {'----':>4} {'----':>4} {'----':>4}  {'-'*24:<24}")
     for b in BUCKETS:
         mem = b.members
         sn = {snake(m) for m in mem}
         n_map = len([m for m in mem if m in mapped]) if mapped is not None else None
-        n_run = len(sn & set(reached))
+        n_captured = len(sn & set(captured_work_types))
         n_agr = len(sn & set(validated))
         audited = [m for m in mem if m in FIDELITY]
         faithful = [m for m in audited if FIDELITY[m][0] == "FAITHFUL"]
@@ -541,9 +546,11 @@ def main() -> int:
         else:
             fid = "none audited"
         mapcol = "  -" if n_map is None else f"{n_map:>4}"
-        print(f"  {b.title:<42} {len(mem):>2} {mapcol} {n_run:>4} {n_agr:>4}  {fid:<24}")
+        print(f"  {b.title:<42} {len(mem):>2} {mapcol} {n_captured:>4} "
+              f"{n_agr:>4}  {fid:<24}")
     print()
-    print("  map = exporter emits it (blank without --ktstr)   run = reached a backend")
+    print("  map = exporter emits it (blank without --ktstr)   "
+          "cap = appears in captured two-backend evidence")
     print("  agr = appeared in an agreeing comparison")
     print("  WRONG = mapped, accepted, ran green, and does not model the workload")
 
