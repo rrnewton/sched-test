@@ -701,18 +701,58 @@ fn plan_work(ctx: &mut Ctx, wt: &SourceWorkType, src: &str, n: u32) -> Result<Pl
         }
 
         // ---- I/O: off-CPU time kept, device dropped -------------------------
+        //
+        // HOW WRONG THE INVENTED DUTY CYCLE CAN BE, measured 2026-08-13 by
+        // replicating ktstr's IoSyncWrite inner loop exactly (16 x 4 KiB pwrite
+        // per iteration, O_SYNC) -- experiments/io_worktype_offcpu_20260813/ in
+        // the dev harness:
+        //
+        //     tmpfs     O_SYNC    4 KiB     0.0% off-CPU   (no device: a no-op)
+        //     disk      O_SYNC    4 KiB    29.8%
+        //     disk      O_SYNC   64 KiB    42.8%
+        //     disk      buffered           0.0%
+        //
+        // 0% to 43%, with iteration counts spanning 400x. THE OFF-CPU FRACTION
+        // IS A PROPERTY OF THE STORAGE BACKEND, NOT OF THE WORKLOAD, and ktstr
+        // chooses that backend at runtime (/dev/vda when present, else a
+        // tempfile) -- so two runs of the SAME scenario can sit at different
+        // points on that range. `Run(spin) Sleep(spin)` emits 50%, which is
+        // DEFAULT_SLICE used twice rather than a claim about I/O.
+        //
+        // NO TUNED CONSTANT IS INTRODUCED HERE, DELIBERATELY. Fitting one to
+        // the 21.4% observed on one host with one filesystem would look like a
+        // fix and would be a number chosen to make a comparison agree. Since
+        // the fraction is not a workload property, no constant is correct --
+        // including a better-measured one. The end state is a DECLARED quantum
+        // rather than an invented one; sim-1zqbl carries that.
         W::IoSyncWrite | W::IoRandRead | W::IoConvoy => {
+            // These three are NOT one mechanism, though this arm has always
+            // treated them as one. IoSyncWrite opens O_SYNC and writes through
+            // the page cache; IoRandRead and IoConvoy open O_DIRECT and always
+            // reach the device. Their real off-CPU fractions differ for that
+            // reason, so the shared arm is itself an approximation and is now
+            // named per variant rather than silently collapsed.
+            let mechanism = match wt {
+                W::IoSyncWrite => "O_SYNC buffered writes",
+                W::IoRandRead => "O_DIRECT random reads",
+                _ => "O_DIRECT convoy reads",
+            };
             let spin = ctx.invented_slice(src, "I/O compute and off-CPU wait durations");
             ctx.approx(
                 src,
-                format!("Run({spin}) Sleep({spin})"),
+                format!("Run({spin}) Sleep({spin}) = 50% off-CPU"),
                 Cause::IoMechanism,
-                "block device, queue depth and byte counts are not modelled. The \
-                 off-CPU wait is represented as a Sleep phase, but its DURATION is \
-                 the lowering's invention, not the device's — see the \
-                 UnspecifiedWorkQuantum record for the same source. Do not read \
-                 this as a preserved wait time."
-                    .into(),
+                format!(
+                    "{mechanism}: block device, queue depth and byte counts are not \
+                     modelled. The off-CPU wait is represented as a Sleep phase, but \
+                     its DURATION is the lowering's invention, not the device's — see \
+                     the UnspecifiedWorkQuantum record for the same source. Do not \
+                     read this as a preserved wait time. MEASURED reality for this \
+                     loop spans 0%-43% off-CPU depending on the storage backend \
+                     (tmpfs 0%, disk 4 KiB 30%, disk 64 KiB 43%), so the 50% emitted \
+                     here is wrong for every backend but at most one, and a \
+                     cross-backend share comparison must not be gated on it."
+                ),
             );
             uniform("io", n, vec![Phase::Run(spin), Phase::Sleep(spin)])
         }
