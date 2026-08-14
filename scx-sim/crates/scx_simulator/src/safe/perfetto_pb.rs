@@ -146,6 +146,9 @@ mod cat {
     /// follow-up to closed `align-ipi-send-category-naming`).
     pub const SOFTIRQ: &str = "SOFTIRQ";
     pub const IDLE: &str = "IDLE";
+    /// Scxsim-only task lifecycle markers that are instants rather than
+    /// ONCPU slice boundaries.
+    pub const SCXSIM_TASK: &str = "SCXSIM_TASK";
     /// All scxsim-only ops/kfunc-level events (PutPrevTask,
     /// SelectTaskRq, EnqueueTask, Balance, PickTask, SetNextTask,
     /// DsqMoveToLocal, DispatchRejected).
@@ -292,6 +295,18 @@ fn emit_event(trace: &Trace, ev: &crate::trace::TraceEvent, proto: &mut TracePro
         }
         TraceKind::TaskSlept { pid } => {
             push_oncpu_end(proto, ts, cpu, *pid, "slept");
+        }
+        TraceKind::TaskParked { pid } => {
+            let mut anns = vec![ann_uint("cpu", u64::from(cpu.0))];
+            push_task_anns(&mut anns, *pid, trace.task_name(*pid));
+            push_instant(
+                proto,
+                ts,
+                task_track_uuid(*pid),
+                cat::SCXSIM_TASK,
+                "task_parked",
+                anns,
+            );
         }
         TraceKind::TaskCompleted { pid } => {
             push_oncpu_end(proto, ts, cpu, *pid, "completed");
@@ -1252,6 +1267,7 @@ fn event_pid(kind: &TraceKind) -> Option<Pid> {
         | TraceKind::TaskPreempted { pid }
         | TraceKind::TaskYielded { pid }
         | TraceKind::TaskSlept { pid }
+        | TraceKind::TaskParked { pid }
         | TraceKind::TaskWoke { pid }
         | TraceKind::TaskCompleted { pid }
         | TraceKind::SimulationEnd { pid }

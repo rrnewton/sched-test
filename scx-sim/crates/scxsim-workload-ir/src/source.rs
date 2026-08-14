@@ -55,12 +55,95 @@ pub enum SourceSchedClass {
     RoundRobin,
 }
 
-/// ktstr's `WorkType`, as data.
+/// Operation represented by the first-generation fixed-volume I/O model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IoModelOperation {
+    SequentialWrite,
+}
+
+/// Storage backing represented by the first-generation fixed-volume I/O model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IoModelBacking {
+    FreshRawUnthrottledBlockDevice,
+}
+
+/// Write-open mode represented by the first-generation fixed-volume I/O model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IoModelOpenMode {
+    OSync,
+}
+
+/// Flush pattern represented by the first-generation fixed-volume I/O model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IoModelFlush {
+    FdatasyncPerCycle,
+}
+
+/// Scheduler under which the first-generation profile was measured.
 ///
-/// All 45 variants are represented. Where ktstr's variant carries tuning knobs
-/// the simulator has no model for (cache footprints, strides, byte counts), the
-/// field is kept rather than dropped at this layer — the lowering needs it to
-/// say *what* it discarded.
+/// This requirement survives in the typed spec and applied-profile metadata.
+/// Ingestion binds it to the resulting `Scenario`, and the simulator rejects a
+/// different scheduler identity before executing any scheduler callback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IoCalibrationScheduler {
+    ScxKtstr,
+}
+
+impl IoCalibrationScheduler {
+    /// Canonical `DynamicScheduler` prefix required by the simulator.
+    pub const fn simulator_identity(self) -> &'static str {
+        match self {
+            Self::ScxKtstr => "ktstr",
+        }
+    }
+}
+
+/// Typed declaration of one abstract, fixed-volume I/O workload.
+///
+/// The workload/device-regime dimensions that lowering can mechanically check
+/// are data, not prose. A resolved profile must carry an exactly equal value
+/// before it can unlock this source construct. Host, kernel and concrete device
+/// identity are not inferred from this declaration: they remain external
+/// calibration conditions, bound to the resolved profile by its exact frozen
+/// ID and manifest digest and copied into IR provenance. Lowering pins the full
+/// 1-node/1-LLC/4-core/no-SMT topology and all numeric bounds; ingestion binds
+/// scheduler identity for a fail-closed runtime check. Ordinary ktstr
+/// `IoSyncWrite` records carry neither and therefore cannot consume the profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IoModelSpec {
+    pub operation: IoModelOperation,
+    pub backing: IoModelBacking,
+    /// Capacity of the fresh raw backing used by the calibration.
+    pub backing_capacity_bytes: u64,
+    pub open_mode: IoModelOpenMode,
+    pub write_size_bytes: u32,
+    pub writes_per_cycle: u32,
+    pub flush: IoModelFlush,
+    pub queue_depth: u32,
+    pub calibration_scheduler: IoCalibrationScheduler,
+    pub declared_bytes_per_worker: u64,
+}
+
+impl IoModelSpec {
+    /// Bytes completed per model cycle, or `None` if the declaration overflows.
+    pub fn cycle_bytes(&self) -> Option<u64> {
+        u64::from(self.write_size_bytes).checked_mul(u64::from(self.writes_per_cycle))
+    }
+}
+
+/// ktstr's `WorkType`, as data, plus one explicitly simulator-only model input.
+///
+/// All 45 ktstr variants are represented. Where a ktstr variant carries tuning
+/// knobs the simulator has no model for (cache footprints, strides, byte
+/// counts), the field is kept rather than dropped at this layer — the lowering
+/// needs it to say *what* it discarded. [`SourceWorkType::IoModelV1`] is not a
+/// 46th ktstr work type and is never accepted as an ordinary replay record; it
+/// is the typed abstract workload paired with separately measured VM data.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceWorkType {
@@ -95,6 +178,11 @@ pub enum SourceWorkType {
     IoSyncWrite,
     IoRandRead,
     IoConvoy,
+    /// Simulator-only abstract fixed-volume model input. This is deliberately
+    /// distinct from ktstr's fieldless, unbounded storage work types.
+    IoModelV1 {
+        spec: IoModelSpec,
+    },
     PipeIo {
         burst_iters: u64,
     },
@@ -260,6 +348,7 @@ impl SourceWorkType {
             IoSyncWrite => "IoSyncWrite",
             IoRandRead => "IoRandRead",
             IoConvoy => "IoConvoy",
+            IoModelV1 { .. } => "IoModelV1",
             PipeIo { .. } => "PipeIo",
             CachePressure { .. } => "CachePressure",
             CacheYield { .. } => "CacheYield",

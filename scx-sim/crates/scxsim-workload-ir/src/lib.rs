@@ -46,13 +46,18 @@ pub use fidelity::{Approximation, Cause, Fidelity, FidelityReport};
 #[cfg(feature = "ingest")]
 pub use ingest::{to_scenario, IngestError};
 pub use ir::{
-    Bandwidth, Cgroup, CpuSet, CpuSetDisplay, Mutation, Phase, Probe, Repeat, SchedPolicy, Task,
-    TimedMutation, Topology, ValidationError, WorkloadIr,
+    AppliedIoProfile, Bandwidth, Cgroup, CpuSet, CpuSetDisplay, Mutation, Phase, Probe, Repeat,
+    SchedPolicy, Task, TimedMutation, Topology, ValidationError, WorkloadIr,
 };
-pub use lower::{lower, LoweringError};
+pub use lower::{
+    lower, lower_with_options, LoweringError, LoweringOptions, ResolvedIoProfile,
+    IO_MODEL_V1_BACKING_CAPACITY_BYTES, IO_MODEL_V1_GUEST_CPUS, IO_MODEL_V1_MANIFEST_SHA256,
+    IO_MODEL_V1_MAX_BYTES, IO_MODEL_V1_MIN_BYTES, IO_MODEL_V1_PROFILE_ID, IO_MODEL_V1_TOPOLOGY,
+};
 pub use pretty::pretty;
 pub use source::{
-    SourceCgroupDef, SourceCpuset, SourceHold, SourceOp, SourceScenario, SourceStep,
+    IoCalibrationScheduler, IoModelBacking, IoModelFlush, IoModelOpenMode, IoModelOperation,
+    IoModelSpec, SourceCgroupDef, SourceCpuset, SourceHold, SourceOp, SourceScenario, SourceStep,
     SourceTopology, SourceWorkPhase, SourceWorkSpec, SourceWorkType,
 };
 pub use units::{CgroupName, CpuIndex, DurationNs, Nice, TaskId};

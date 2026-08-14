@@ -30,8 +30,8 @@
 
 use crate::fidelity::{Approximation, Cause, FidelityReport};
 use crate::ir::{
-    Bandwidth, Cgroup, CpuSet, Mutation, Phase, Repeat, SchedPolicy, Task, TimedMutation, Topology,
-    WorkloadIr,
+    AppliedIoProfile, Bandwidth, Cgroup, CpuSet, Mutation, Phase, Repeat, SchedPolicy, Task,
+    TimedMutation, Topology, WorkloadIr,
 };
 use crate::source::*;
 use crate::units::{CgroupName, DurationNs, Nice, TaskId};
@@ -45,6 +45,21 @@ use crate::units::{CgroupName, DurationNs, Nice, TaskId};
 /// modelling one. Every conversion through it is recorded as an approximation.
 pub const ITER_NS: u64 = 100;
 
+/// Frozen first-generation fixed-volume I/O model identity and applicability.
+pub const IO_MODEL_V1_PROFILE_ID: &str = "io-sync-write-raw-vda-v1";
+pub const IO_MODEL_V1_MANIFEST_SHA256: &str =
+    "4707d3374cc5fb6d7f63980729df2688eb53ce397d92c0b04672fff52d776c68";
+pub const IO_MODEL_V1_BACKING_CAPACITY_BYTES: u64 = 256 * 1024 * 1024;
+pub const IO_MODEL_V1_MIN_BYTES: u64 = 2 * 1024 * 1024;
+pub const IO_MODEL_V1_MAX_BYTES: u64 = 64 * 1024 * 1024;
+pub const IO_MODEL_V1_GUEST_CPUS: u32 = 4;
+pub const IO_MODEL_V1_TOPOLOGY: SourceTopology = SourceTopology {
+    numa_nodes: 1,
+    llcs: 1,
+    cores: 4,
+    threads: 1,
+};
+
 /// Chunk length used when a work type has a yield point but does not say how
 /// much work sits between yields.
 ///
@@ -52,6 +67,103 @@ pub const ITER_NS: u64 = 100;
 /// It must never be used for a work type that runs continuously — see
 /// [`CONTINUOUS_RUN`] and the measurement that motivated the split.
 const DEFAULT_SLICE: DurationNs = DurationNs::from_micros(500);
+
+/// Explicit, already-resolved timing for one fixed-volume I/O work spec.
+///
+/// [`ResolvedIoProfile::frozen_v1`] applies the manifest-backed rational
+/// coefficients embedded below and returns the two distinct estimands. The
+/// profile remains an explicit opt-in token: lowering refuses both an absent
+/// token and any manually constructed token that differs from the frozen
+/// identity, domain or formula.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedIoProfile {
+    /// Stable calibration/model identifier carried into the fidelity record.
+    pub profile_id: String,
+    /// SHA-256 of the frozen calibration manifest which records external
+    /// applicability conditions (including host, guest kernel and device).
+    pub calibration_manifest_sha256: String,
+    /// Fully typed regime and fixed work volume this profile resolves. It must
+    /// equal the source declaration field-for-field.
+    pub spec: IoModelSpec,
+    /// Worker count under which this profile was resolved.
+    pub workers: u32,
+    /// Guest CPU count under which this profile was resolved.
+    pub guest_cpus: u32,
+    /// Task-context system execution for each worker.
+    pub system_cpu_per_worker: DurationNs,
+    /// Measured non-running estimate for each worker. It may retain host-stolen
+    /// time; lowering explicitly chooses to model the estimate as unrunnable
+    /// scheduler state and does not relabel it as I/O wait.
+    pub nonrunning_per_worker: DurationNs,
+}
+
+impl ResolvedIoProfile {
+    /// Resolve the one frozen v1 model. Returns `None` outside its declared
+    /// byte/device/operation domain; lowering independently rechecks every
+    /// condition so constructing the public struct manually cannot bypass it.
+    #[must_use]
+    pub fn frozen_v1(spec: IoModelSpec) -> Option<Self> {
+        let (system_cpu_per_worker, nonrunning_per_worker) = frozen_v1_totals(&spec)?;
+        Some(Self {
+            profile_id: IO_MODEL_V1_PROFILE_ID.into(),
+            calibration_manifest_sha256: IO_MODEL_V1_MANIFEST_SHA256.into(),
+            spec,
+            workers: 1,
+            guest_cpus: IO_MODEL_V1_GUEST_CPUS,
+            system_cpu_per_worker,
+            nonrunning_per_worker,
+        })
+    }
+}
+
+fn frozen_v1_totals(spec: &IoModelSpec) -> Option<(DurationNs, DurationNs)> {
+    if spec.operation != IoModelOperation::SequentialWrite
+        || spec.backing != IoModelBacking::FreshRawUnthrottledBlockDevice
+        || spec.backing_capacity_bytes != IO_MODEL_V1_BACKING_CAPACITY_BYTES
+        || spec.open_mode != IoModelOpenMode::OSync
+        || spec.write_size_bytes != 4096
+        || spec.writes_per_cycle != 16
+        || spec.flush != IoModelFlush::FdatasyncPerCycle
+        || spec.queue_depth != 1
+        || spec.calibration_scheduler != IoCalibrationScheduler::ScxKtstr
+        || !(IO_MODEL_V1_MIN_BYTES..=IO_MODEL_V1_MAX_BYTES)
+            .contains(&spec.declared_bytes_per_worker)
+    {
+        return None;
+    }
+    let cycle_bytes = spec.cycle_bytes()?;
+    if cycle_bytes != 65_536 || !spec.declared_bytes_per_worker.is_multiple_of(cycle_bytes) {
+        return None;
+    }
+    let cycles = u128::from(spec.declared_bytes_per_worker / cycle_bytes);
+    let round_half_up = |numerator: u128, denominator: u128| -> Option<u64> {
+        u64::try_from(numerator.checked_add(denominator / 2)? / denominator).ok()
+    };
+    let system = round_half_up(17_222_875u128.checked_mul(cycles)?, 32)?;
+    let nonrunning_numerator = 87_669_391u128
+        .checked_mul(16)?
+        .checked_add(143_388_103u128.checked_mul(cycles)?)?;
+    let nonrunning = round_half_up(nonrunning_numerator, 128)?;
+    Some((
+        DurationNs::from_nanos(system),
+        DurationNs::from_nanos(nonrunning),
+    ))
+}
+
+/// Explicit model profiles supplied to the lowering. The frozen constructor,
+/// not caller-chosen numbers, resolves v1 totals.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LoweringOptions {
+    pub io_profiles: Vec<ResolvedIoProfile>,
+}
+
+impl LoweringOptions {
+    #[must_use]
+    pub fn with_io_profile(mut self, profile: ResolvedIoProfile) -> Self {
+        self.io_profiles.push(profile);
+        self
+    }
+}
 
 /// A construct the lowering will not invent behaviour for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +173,15 @@ pub enum LoweringError {
     /// Structurally impossible input (e.g. a step referencing a cgroup that was
     /// never declared).
     Malformed(String),
+    /// A storage workload has no explicit measured/modelled timing.  The old
+    /// 500us/500us fallback was a fabricated 50% duty cycle and is forbidden.
+    MissingIoProfile { construct: String },
+    /// A fieldless ktstr storage record does not declare a fixed volume or the
+    /// regime needed to select a calibrated profile.
+    UnmodelledIoSource { construct: String },
+    /// A supplied profile cannot truthfully describe the scenario that tried
+    /// to consume it.
+    InvalidIoProfile { profile_id: String, why: String },
     /// The IR the lowering produced does not satisfy its own invariants. A bug
     /// in the lowering, surfaced rather than shipped.
     ProducedInvalidIr(crate::ir::ValidationError),
@@ -76,6 +197,20 @@ impl std::fmt::Display for LoweringError {
                  from a real one in the results."
             ),
             LoweringError::Malformed(m) => write!(f, "malformed source scenario: {m}"),
+            LoweringError::MissingIoProfile { construct } => write!(
+                f,
+                "cannot lower typed {construct}: no exactly matching resolved I/O profile was \
+                 supplied. Refusing rather than inventing system or non-running time"
+            ),
+            LoweringError::UnmodelledIoSource { construct } => write!(
+                f,
+                "cannot lower {construct}: the ktstr record declares neither fixed volume nor \
+                 storage regime. It cannot consume an out-of-band profile; use the separately \
+                 versioned IoModelV1 abstract source. Refusing the old fabricated fallback"
+            ),
+            LoweringError::InvalidIoProfile { profile_id, why } => {
+                write!(f, "invalid resolved I/O profile `{profile_id}`: {why}")
+            }
             LoweringError::ProducedInvalidIr(e) => {
                 write!(
                     f,
@@ -94,11 +229,31 @@ impl std::error::Error for LoweringError {}
 /// validated before it is handed back, so a caller never receives a structurally
 /// broken workload.
 pub fn lower(scenario: &SourceScenario) -> Result<WorkloadIr, LoweringError> {
+    lower_with_options(scenario, &LoweringOptions::default())
+}
+
+/// Lower with an explicit frozen profile for constructs whose resolved timing
+/// is not present in the source vocabulary.
+pub fn lower_with_options(
+    scenario: &SourceScenario,
+    options: &LoweringOptions,
+) -> Result<WorkloadIr, LoweringError> {
+    let total_cpus = scenario
+        .topology
+        .llcs
+        .saturating_mul(scenario.topology.cores)
+        .saturating_mul(scenario.topology.threads);
     let mut ctx = Ctx {
         report: FidelityReport::new(),
         next_task: 0,
-        default_workers: scenario.default_workers_per_cgroup.max(1),
+        default_workers: scenario.default_workers_per_cgroup,
         scenario_duration: scenario.duration,
+        source_topology: scenario.topology,
+        total_cpus,
+        options,
+        used_io_profiles: std::collections::BTreeSet::new(),
+        io_model_v1_consumed: false,
+        applied_io_profiles: Vec::new(),
     };
 
     let topology = Topology {
@@ -118,12 +273,24 @@ pub fn lower(scenario: &SourceScenario) -> Result<WorkloadIr, LoweringError> {
     }
 
     ir.timeline.sort_by_key(|t| t.at);
+    if let Some((index, profile)) = options
+        .io_profiles
+        .iter()
+        .enumerate()
+        .find(|(index, _)| !ctx.used_io_profiles.contains(index))
+    {
+        return Err(LoweringError::InvalidIoProfile {
+            profile_id: profile.profile_id.clone(),
+            why: format!("profile entry {index} matched no typed IoModelV1 source spec"),
+        });
+    }
     ir.fidelity = ctx.report;
+    ir.applied_io_profiles = ctx.applied_io_profiles;
     ir.validate().map_err(LoweringError::ProducedInvalidIr)?;
     Ok(ir)
 }
 
-struct Ctx {
+struct Ctx<'a> {
     report: FidelityReport,
     next_task: u32,
     default_workers: u32,
@@ -133,9 +300,18 @@ struct Ctx {
     /// given a run phase that outlasts the run, so the only thing that can end
     /// its slice is the scheduler. See [`CONTINUOUS_RUN`].
     scenario_duration: DurationNs,
+    source_topology: SourceTopology,
+    total_cpus: u32,
+    options: &'a LoweringOptions,
+    used_io_profiles: std::collections::BTreeSet<usize>,
+    /// V1 was calibrated with exactly one device worker.  Until a
+    /// scenario-level concurrency model exists, consuming a second declaration
+    /// (even sequentially or with the same profile) is outside that regime.
+    io_model_v1_consumed: bool,
+    applied_io_profiles: Vec<AppliedIoProfile>,
 }
 
-impl Ctx {
+impl Ctx<'_> {
     fn task_id(&mut self) -> TaskId {
         let id = TaskId(self.next_task);
         self.next_task += 1;
@@ -180,6 +356,162 @@ impl Ctx {
             format!("{label}={iters} at the stipulated {ITER_NS}ns/iter"),
         );
         d
+    }
+
+    fn io_profile(
+        &mut self,
+        spec: &IoModelSpec,
+        source: &str,
+        workers: u32,
+    ) -> Result<ResolvedIoProfile, LoweringError> {
+        if self.io_model_v1_consumed {
+            return Err(LoweringError::InvalidIoProfile {
+                profile_id: "io-model-v1-one-worker-regime".into(),
+                why: "IoModelV1 is calibrated for exactly one scenario-wide device worker; a second declaration would introduce unmodelled device concurrency"
+                    .into(),
+            });
+        }
+        if workers != 1 {
+            return Err(LoweringError::InvalidIoProfile {
+                profile_id: "io-model-v1-one-worker-regime".into(),
+                why: format!(
+                    "IoModelV1 is calibrated for exactly one device worker, but the source requests {workers}"
+                ),
+            });
+        }
+        if self.source_topology != IO_MODEL_V1_TOPOLOGY {
+            return Err(LoweringError::InvalidIoProfile {
+                profile_id: IO_MODEL_V1_PROFILE_ID.into(),
+                why: format!(
+                    "IoModelV1 is calibrated for topology {:?}, but the source topology is {:?}",
+                    IO_MODEL_V1_TOPOLOGY, self.source_topology
+                ),
+            });
+        }
+        if frozen_v1_totals(spec).is_none() {
+            return Err(LoweringError::InvalidIoProfile {
+                profile_id: IO_MODEL_V1_PROFILE_ID.into(),
+                why: format!(
+                    "source IoModelV1 spec is outside the frozen {}..={} byte/device/operation domain",
+                    IO_MODEL_V1_MIN_BYTES, IO_MODEL_V1_MAX_BYTES
+                ),
+            });
+        }
+        let spec_matches: Vec<(usize, &ResolvedIoProfile)> = self
+            .options
+            .io_profiles
+            .iter()
+            .enumerate()
+            .filter(|(_, profile)| &profile.spec == spec)
+            .collect();
+        if spec_matches.is_empty() {
+            return Err(LoweringError::MissingIoProfile {
+                construct: source.to_string(),
+            });
+        }
+        let matches: Vec<(usize, &ResolvedIoProfile)> = spec_matches
+            .iter()
+            .copied()
+            .filter(|(_, profile)| {
+                profile.workers == workers && profile.guest_cpus == self.total_cpus
+            })
+            .collect();
+        let (index, profile) = match matches.as_slice() {
+            [] => {
+                let profile = spec_matches[0].1;
+                return Err(LoweringError::InvalidIoProfile {
+                    profile_id: profile.profile_id.clone(),
+                    why: format!(
+                        "typed spec matches, but profile covers {} worker(s)/{} guest CPU(s) and source requires {workers}/{}",
+                        profile.workers, profile.guest_cpus, self.total_cpus
+                    ),
+                });
+            }
+            [one] => *one,
+            _ => {
+                return Err(LoweringError::InvalidIoProfile {
+                    profile_id: "ambiguous-fixed-volume-spec".into(),
+                    why: format!(
+                    "{} profiles match the same typed IoModelV1 spec; selection would be ambiguous",
+                    matches.len()
+                ),
+                })
+            }
+        };
+        let profile = profile.clone();
+        let expected_totals = match frozen_v1_totals(&profile.spec) {
+            Some(totals) => totals,
+            None => {
+                return Err(LoweringError::InvalidIoProfile {
+                    profile_id: profile.profile_id,
+                    why: "typed spec is outside the frozen v1 domain".into(),
+                });
+            }
+        };
+        let invalid = if profile.profile_id != IO_MODEL_V1_PROFILE_ID {
+            Some(format!(
+                "profile_id must be the frozen v1 identity `{IO_MODEL_V1_PROFILE_ID}`"
+            ))
+        } else if profile.calibration_manifest_sha256 != IO_MODEL_V1_MANIFEST_SHA256 {
+            Some(format!(
+                "calibration manifest must be frozen v1 SHA-256 {IO_MODEL_V1_MANIFEST_SHA256}"
+            ))
+        } else if profile.spec.declared_bytes_per_worker == 0 {
+            Some("spec.declared_bytes_per_worker is zero".to_string())
+        } else if profile.spec.backing_capacity_bytes == 0 {
+            Some("spec.backing_capacity_bytes is zero".to_string())
+        } else if profile.spec.write_size_bytes == 0 {
+            Some("spec.write_size_bytes is zero".to_string())
+        } else if profile.spec.writes_per_cycle == 0 {
+            Some("spec.writes_per_cycle is zero".to_string())
+        } else if profile.spec.queue_depth == 0 {
+            Some("spec.queue_depth is zero".to_string())
+        } else if !matches!(
+            profile.spec.cycle_bytes(),
+            Some(cycle)
+                if cycle > 0 && profile.spec.declared_bytes_per_worker.is_multiple_of(cycle)
+        ) {
+            Some("declared bytes are not an integer number of nonzero model cycles".to_string())
+        } else if profile.workers == 0 {
+            Some("profile worker count is zero".to_string())
+        } else if profile.workers != workers {
+            Some(format!(
+                "profile covers {} worker(s), source emits {workers}",
+                profile.workers
+            ))
+        } else if profile.guest_cpus != self.total_cpus {
+            Some(format!(
+                "profile covers {} guest CPU(s), source topology has {}",
+                profile.guest_cpus, self.total_cpus
+            ))
+        } else if (profile.system_cpu_per_worker, profile.nonrunning_per_worker) != expected_totals
+        {
+            let (system, nonrunning) = expected_totals;
+            Some(format!(
+                "resolved totals do not equal the frozen formula: expected SystemCpu({system}) and NonRunning({nonrunning})"
+            ))
+        } else {
+            None
+        };
+        if let Some(why) = invalid {
+            return Err(LoweringError::InvalidIoProfile {
+                profile_id: profile.profile_id,
+                why,
+            });
+        }
+        self.io_model_v1_consumed = true;
+        if self.used_io_profiles.insert(index) {
+            self.applied_io_profiles.push(AppliedIoProfile {
+                profile_id: profile.profile_id.clone(),
+                calibration_manifest_sha256: profile.calibration_manifest_sha256.clone(),
+                spec: profile.spec.clone(),
+                workers: profile.workers,
+                guest_cpus: profile.guest_cpus,
+                system_cpu_per_worker: profile.system_cpu_per_worker,
+                nonrunning_per_worker: profile.nonrunning_per_worker,
+            });
+        }
+        Ok(profile)
     }
 }
 
@@ -274,7 +606,15 @@ fn lower_cgroup_def(
     };
 
     for work in &works {
-        let n = work.workers.unwrap_or(ctx.default_workers).max(1);
+        let declared_workers = work.workers.unwrap_or(ctx.default_workers);
+        if matches!(&work.work_type, SourceWorkType::IoModelV1 { .. }) && declared_workers == 0 {
+            return Err(LoweringError::InvalidIoProfile {
+                profile_id: IO_MODEL_V1_PROFILE_ID.into(),
+                why: "IoModelV1 declares zero workers; the frozen one-worker regime must be explicit rather than normalized"
+                    .into(),
+            });
+        }
+        let n = declared_workers.max(1);
         lower_work(ir, ctx, work, n, Some(&def.name), at)?;
     }
     Ok(())
@@ -347,7 +687,7 @@ fn lower_work(
         _ => {}
     }
 
-    let plan = plan_work(ctx, wt, &src, n)?;
+    let plan = plan_work(ctx, wt, &src, n, start)?;
     let base = ctx.next_task;
 
     for i in 0..plan.tasks {
@@ -512,7 +852,13 @@ fn continuous_run(ctx: &Ctx) -> Phase {
     Phase::Run(ctx.scenario_duration)
 }
 
-fn plan_work(ctx: &mut Ctx, wt: &SourceWorkType, src: &str, n: u32) -> Result<Plan, LoweringError> {
+fn plan_work(
+    ctx: &mut Ctx,
+    wt: &SourceWorkType,
+    src: &str,
+    n: u32,
+    start: DurationNs,
+) -> Result<Plan, LoweringError> {
     use SourceWorkType as W;
     let forever = continuous_run(ctx);
     // THERE IS DELIBERATELY NO BARE `spin = DEFAULT_SLICE` BINDING HERE.
@@ -525,10 +871,12 @@ fn plan_work(ctx: &mut Ctx, wt: &SourceWorkType, src: &str, n: u32) -> Result<Pl
     // The old tripwire could not see them because it only examined arms
     // reporting `Exact`, and these do not.
     //
-    // A convention that must be remembered at twelve call sites is not a
-    // convention. Every arm now calls `ctx.invented_slice`, which returns the
-    // value AND records it, so the two cannot come apart. Do not reintroduce a
-    // shared binding; take the slice from `invented_slice` at the point of use.
+    // A convention that must be remembered at call sites is not a convention.
+    // Every arm that still needs the synthetic default calls
+    // `ctx.invented_slice`, which returns the value AND records it, so the two
+    // cannot come apart. Do not reintroduce a shared binding; take the slice
+    // from `invented_slice` at the point of use. Storage workloads are stricter:
+    // they require a resolved profile and never pass through this helper.
     // `an_invented_quantum_is_recorded_as_one_even_when_something_else_is_too`
     // enforces this.
 
@@ -700,61 +1048,79 @@ fn plan_work(ctx: &mut Ctx, wt: &SourceWorkType, src: &str, n: u32) -> Result<Pl
             uniform("numamig", n, vec![Phase::Run(period)])
         }
 
-        // ---- I/O: off-CPU time kept, device dropped -------------------------
+        // ---- I/O: calibrated task state kept, device dropped ----------------
         //
-        // HOW WRONG THE INVENTED DUTY CYCLE CAN BE, measured 2026-08-13 by
-        // replicating ktstr's IoSyncWrite inner loop exactly (16 x 4 KiB pwrite
-        // per iteration, O_SYNC) -- experiments/io_worktype_offcpu_20260813/ in
-        // the dev harness:
+        // Storage timing is not a property of the enum variant. It depends on
+        // the operation, device, queueing, fixed work volume, worker count and
+        // guest topology. The ordinary ktstr source vocabulary carries none of
+        // those values, so those three fieldless variants always fail here.
         //
-        //     tmpfs     O_SYNC    4 KiB     0.0% off-CPU   (no device: a no-op)
-        //     disk      O_SYNC    4 KiB    29.8%
-        //     disk      O_SYNC   64 KiB    42.8%
-        //     disk      buffered           0.0%
-        //
-        // 0% to 43%, with iteration counts spanning 400x. THE OFF-CPU FRACTION
-        // IS A PROPERTY OF THE STORAGE BACKEND, NOT OF THE WORKLOAD, and ktstr
-        // chooses that backend at runtime (/dev/vda when present, else a
-        // tempfile) -- so two runs of the SAME scenario can sit at different
-        // points on that range. `Run(spin) Sleep(spin)` emits 50%, which is
-        // DEFAULT_SLICE used twice rather than a claim about I/O.
-        //
-        // NO TUNED CONSTANT IS INTRODUCED HERE, DELIBERATELY. Fitting one to
-        // the 21.4% observed on one host with one filesystem would look like a
-        // fix and would be a number chosen to make a comparison agree. Since
-        // the fraction is not a workload property, no constant is correct --
-        // including a better-measured one. The end state is a DECLARED quantum
-        // rather than an invented one; sim-1zqbl carries that.
+        // The separate IoModelV1 source carries a typed fixed-volume regime.
+        // The caller resolves that declaration outside the simulator; every
+        // typed field must match. We preserve its two estimands as distinct IR
+        // phases, run the aggregate once, and then park like the measured VM
+        // worker. Repeating it would multiply both declared work and any affine
+        // intercept. Missing, ambiguous, mismatched and unused profiles fail.
         W::IoSyncWrite | W::IoRandRead | W::IoConvoy => {
-            // These three are NOT one mechanism, though this arm has always
-            // treated them as one. IoSyncWrite opens O_SYNC and writes through
-            // the page cache; IoRandRead and IoConvoy open O_DIRECT and always
-            // reach the device. Their real off-CPU fractions differ for that
-            // reason, so the shared arm is itself an approximation and is now
-            // named per variant rather than silently collapsed.
-            let mechanism = match wt {
-                W::IoSyncWrite => "O_SYNC buffered writes",
-                W::IoRandRead => "O_DIRECT random reads",
-                _ => "O_DIRECT convoy reads",
-            };
-            let spin = ctx.invented_slice(src, "I/O compute and off-CPU wait durations");
+            return Err(LoweringError::UnmodelledIoSource {
+                construct: src.to_string(),
+            });
+        }
+        W::IoModelV1 { spec } => {
+            let profile = ctx.io_profile(spec, src, n)?;
+            let completes_at = start
+                .as_nanos()
+                .checked_add(profile.system_cpu_per_worker.as_nanos())
+                .and_then(|at| at.checked_add(profile.nonrunning_per_worker.as_nanos()))
+                .ok_or_else(|| LoweringError::InvalidIoProfile {
+                    profile_id: profile.profile_id.clone(),
+                    why: "task start plus resolved phases overflows simulated nanoseconds".into(),
+                })?;
+            if completes_at > ctx.scenario_duration.as_nanos() {
+                return Err(LoweringError::InvalidIoProfile {
+                    profile_id: profile.profile_id.clone(),
+                    why: format!(
+                        "fixed volume would finish at {}ns, after scenario end {}ns; refusing partial execution",
+                        completes_at,
+                        ctx.scenario_duration.as_nanos()
+                    ),
+                });
+            }
+            let cycle_bytes = spec
+                .cycle_bytes()
+                .expect("validated profile has non-overflowing cycle size");
+            let cycles = spec.declared_bytes_per_worker / cycle_bytes;
             ctx.approx(
                 src,
-                format!("Run({spin}) Sleep({spin}) = 50% off-CPU"),
+                format!(
+                    "SystemCpu({}) NonRunning({}) Park once [profile_id={}, bytes/worker={}]",
+                    profile.system_cpu_per_worker,
+                    profile.nonrunning_per_worker,
+                    profile.profile_id,
+                    profile.spec.declared_bytes_per_worker,
+                ),
                 Cause::IoMechanism,
                 format!(
-                    "{mechanism}: block device, queue depth and byte counts are not \
-                     modelled. The off-CPU wait is represented as a Sleep phase, but \
-                     its DURATION is the lowering's invention, not the device's — see \
-                     the UnspecifiedWorkQuantum record for the same source. Do not \
-                     read this as a preserved wait time. MEASURED reality for this \
-                     loop spans 0%-43% off-CPU depending on the storage backend \
-                     (tmpfs 0%, disk 4 KiB 30%, disk 64 KiB 43%), so the 50% emitted \
-                     here is wrong for every backend but at most one, and a \
-                     cross-backend share comparison must not be gated on it."
+                    "typed fixed-volume spec={spec:?}; {cycles} run/block cycles are collapsed \
+                     into one aggregate system-CPU phase followed by one aggregate non-running \
+                     phase, so cycle ordering and latency distribution are not preserved. The \
+                     non-running measurement may retain host-stolen time and is modelled as \
+                     unrunnable rather than proven to be device wait. Device and queue mechanics \
+                     are not simulated. The IR records the scx-ktstr calibration requirement; \
+                     ingestion binds it to the Scenario and Simulator<S> rejects any other \
+                     scheduler identity before execution"
                 ),
             );
-            uniform("io", n, vec![Phase::Run(spin), Phase::Sleep(spin)])
+            Plan {
+                name_prefix: "io".into(),
+                tasks: n,
+                repeat: Repeat::Once,
+                kind: PlanKind::Uniform(vec![
+                    Phase::SystemCpu(profile.system_cpu_per_worker),
+                    Phase::NonRunning(profile.nonrunning_per_worker),
+                    Phase::Park,
+                ]),
+            }
         }
         W::PipeIo { burst_iters } => {
             let burst = ctx.iters(src, "burst_iters", *burst_iters);
@@ -1361,10 +1727,378 @@ mod tests {
     use super::*;
 
     fn scenario_with(wt: SourceWorkType) -> SourceScenario {
-        SourceScenario::new("t").step(SourceStep::new(
+        let is_io_model = matches!(wt, SourceWorkType::IoModelV1 { .. });
+        let mut scenario = SourceScenario::new("t").step(SourceStep::new(
             vec![SourceCgroupDef::named("cg_0").work(SourceWorkSpec::new(wt).workers(1))],
             SourceHold::Frac(1.0),
+        ));
+        if is_io_model {
+            scenario.topology.cores = IO_MODEL_V1_GUEST_CPUS;
+        }
+        scenario
+    }
+
+    fn io_spec(declared_bytes_per_worker: u64) -> IoModelSpec {
+        IoModelSpec {
+            operation: IoModelOperation::SequentialWrite,
+            backing: IoModelBacking::FreshRawUnthrottledBlockDevice,
+            backing_capacity_bytes: 256 * 1024 * 1024,
+            open_mode: IoModelOpenMode::OSync,
+            write_size_bytes: 4096,
+            writes_per_cycle: 16,
+            flush: IoModelFlush::FdatasyncPerCycle,
+            queue_depth: 1,
+            calibration_scheduler: IoCalibrationScheduler::ScxKtstr,
+            declared_bytes_per_worker,
+        }
+    }
+
+    fn model_work(spec: IoModelSpec) -> SourceWorkType {
+        SourceWorkType::IoModelV1 { spec }
+    }
+
+    fn io_profile(spec: IoModelSpec) -> ResolvedIoProfile {
+        ResolvedIoProfile::frozen_v1(spec).expect("test spec is inside frozen v1")
+    }
+
+    fn options_for(wt: &SourceWorkType) -> LoweringOptions {
+        match wt {
+            SourceWorkType::IoModelV1 { spec } => {
+                LoweringOptions::default().with_io_profile(io_profile(spec.clone()))
+            }
+            _ => LoweringOptions::default(),
+        }
+    }
+
+    #[test]
+    fn storage_work_types_refuse_the_old_fabricated_fallback() {
+        for wt in [
+            SourceWorkType::IoSyncWrite,
+            SourceWorkType::IoRandRead,
+            SourceWorkType::IoConvoy,
+        ] {
+            let name = wt.variant_name();
+            let profile = io_profile(io_spec(2 * 1024 * 1024));
+            let options = LoweringOptions::default().with_io_profile(profile);
+            let err = lower_with_options(&scenario_with(wt), &options)
+                .expect_err("fieldless source must never consume an out-of-band profile");
+            assert!(
+                matches!(err, LoweringError::UnmodelledIoSource { .. }),
+                "{name}: {err:?}"
+            );
+            let message = err.to_string();
+            assert!(message.contains(name), "{message}");
+            assert!(message.contains("Refusing"), "{message}");
+        }
+    }
+
+    #[test]
+    fn resolved_storage_profile_is_once_only_and_keeps_both_estimands() {
+        let spec = io_spec(2 * 1024 * 1024);
+        let source = scenario_with(model_work(spec.clone()));
+        let missing = lower(&source).expect_err("typed source still requires a profile");
+        assert!(matches!(missing, LoweringError::MissingIoProfile { .. }));
+
+        let profile = io_profile(spec);
+        let options = LoweringOptions::default().with_io_profile(profile.clone());
+        let ir = lower_with_options(&source, &options).expect("profile matches source");
+
+        assert_eq!(ir.tasks.len(), 1);
+        assert_eq!(ir.tasks[0].repeat, Repeat::Once);
+        assert_eq!(
+            ir.tasks[0].phases,
+            vec![
+                Phase::SystemCpu(profile.system_cpu_per_worker),
+                Phase::NonRunning(profile.nonrunning_per_worker),
+                Phase::Park,
+            ]
+        );
+        assert_eq!(ir.applied_io_profiles.len(), 1);
+        assert_eq!(ir.applied_io_profiles[0].profile_id, profile.profile_id);
+        assert_eq!(ir.applied_io_profiles[0].spec, profile.spec);
+        assert!(ir.fidelity.by_cause(Cause::IoMechanism).next().is_some());
+        assert!(
+            ir.fidelity
+                .by_cause(Cause::UnspecifiedWorkQuantum)
+                .next()
+                .is_none(),
+            "manifest-backed resolved durations must not use the old invented default"
+        );
+        let record = ir
+            .fidelity
+            .by_cause(Cause::IoMechanism)
+            .next()
+            .expect("I/O mechanism limitation is explicit");
+        assert!(record.lowered_to.contains(&profile.profile_id));
+        assert!(record
+            .lowered_to
+            .contains(&profile.spec.declared_bytes_per_worker.to_string()));
+        assert!(record.dropped.contains("collapsed"));
+        assert!(record.dropped.contains("host-stolen"));
+        assert!(
+            crate::provenance::check(&source, &ir).is_empty(),
+            "both supplied durations must be disclosed"
+        );
+    }
+
+    #[test]
+    fn resolved_storage_profiles_are_exactly_matched_and_consumed() {
+        let spec = io_spec(2 * 1024 * 1024);
+        let source = scenario_with(model_work(spec.clone()));
+
+        let wrong_spec =
+            LoweringOptions::default().with_io_profile(io_profile(io_spec(4 * 1024 * 1024)));
+        assert!(matches!(
+            lower_with_options(&source, &wrong_spec).expect_err("wrong typed spec"),
+            LoweringError::MissingIoProfile { .. }
+        ));
+
+        let duplicate = LoweringOptions::default()
+            .with_io_profile(io_profile(spec.clone()))
+            .with_io_profile(io_profile(spec.clone()));
+        assert!(matches!(
+            lower_with_options(&source, &duplicate).expect_err("ambiguous profile"),
+            LoweringError::InvalidIoProfile { .. }
+        ));
+
+        let non_io = scenario_with(SourceWorkType::SpinWait);
+        let unused = LoweringOptions::default().with_io_profile(io_profile(spec));
+        let err = lower_with_options(&non_io, &unused).expect_err("unused profile");
+        assert!(matches!(err, LoweringError::InvalidIoProfile { .. }));
+        assert!(err.to_string().contains("matched no"));
+    }
+
+    #[test]
+    fn resolved_storage_profile_must_match_workers_topology_and_positive_totals() {
+        let spec = io_spec(2 * 1024 * 1024);
+        let source = scenario_with(model_work(spec.clone()));
+        for (label, mutate) in [
+            (
+                "profile ID",
+                (|p: &mut ResolvedIoProfile| p.profile_id = "other".into())
+                    as fn(&mut ResolvedIoProfile),
+            ),
+            ("manifest", |p: &mut ResolvedIoProfile| {
+                p.calibration_manifest_sha256 = "0".repeat(64)
+            }),
+            (
+                "workers",
+                (|p: &mut ResolvedIoProfile| p.workers = 2) as fn(&mut ResolvedIoProfile),
+            ),
+            ("guest CPUs", |p: &mut ResolvedIoProfile| p.guest_cpus = 2),
+            ("system CPU", |p: &mut ResolvedIoProfile| {
+                p.system_cpu_per_worker = DurationNs::ZERO
+            }),
+            ("non-running", |p: &mut ResolvedIoProfile| {
+                p.nonrunning_per_worker = DurationNs::ZERO
+            }),
+        ] {
+            let mut profile = io_profile(spec.clone());
+            mutate(&mut profile);
+            let options = LoweringOptions::default().with_io_profile(profile);
+            let err = lower_with_options(&source, &options).expect_err(label);
+            assert!(
+                matches!(err, LoweringError::InvalidIoProfile { .. }),
+                "{label}: {err:?}"
+            );
+        }
+
+        for (label, mutate) in [
+            (
+                "bytes",
+                (|spec: &mut IoModelSpec| spec.declared_bytes_per_worker = 0)
+                    as fn(&mut IoModelSpec),
+            ),
+            ("backing capacity", |spec: &mut IoModelSpec| {
+                spec.backing_capacity_bytes /= 2
+            }),
+            ("write size", |spec: &mut IoModelSpec| {
+                spec.write_size_bytes = 0
+            }),
+            ("writes per cycle", |spec: &mut IoModelSpec| {
+                spec.writes_per_cycle = 0
+            }),
+            ("queue depth", |spec: &mut IoModelSpec| spec.queue_depth = 0),
+            ("partial cycle", |spec: &mut IoModelSpec| {
+                spec.declared_bytes_per_worker += 1
+            }),
+        ] {
+            let mut invalid_spec = spec.clone();
+            mutate(&mut invalid_spec);
+            let source = scenario_with(model_work(invalid_spec.clone()));
+            let mut profile = io_profile(spec.clone());
+            profile.spec = invalid_spec;
+            let options = LoweringOptions::default().with_io_profile(profile);
+            assert!(matches!(
+                lower_with_options(&source, &options).expect_err(label),
+                LoweringError::InvalidIoProfile { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn frozen_v1_constructor_pins_formula_and_byte_domain() {
+        let minimum = io_profile(io_spec(IO_MODEL_V1_MIN_BYTES));
+        assert_eq!(
+            minimum.system_cpu_per_worker,
+            DurationNs::from_nanos(17_222_875)
+        );
+        assert_eq!(
+            minimum.nonrunning_per_worker,
+            DurationNs::from_nanos(46_805_700)
+        );
+        assert_eq!(minimum.profile_id, IO_MODEL_V1_PROFILE_ID);
+        assert_eq!(
+            minimum.calibration_manifest_sha256,
+            IO_MODEL_V1_MANIFEST_SHA256
+        );
+
+        let maximum = io_profile(io_spec(IO_MODEL_V1_MAX_BYTES));
+        assert_eq!(
+            maximum.system_cpu_per_worker,
+            DurationNs::from_nanos(551_132_000)
+        );
+        assert_eq!(
+            maximum.nonrunning_per_worker,
+            DurationNs::from_nanos(1_158_063_498)
+        );
+
+        assert!(ResolvedIoProfile::frozen_v1(io_spec(IO_MODEL_V1_MIN_BYTES - 65_536)).is_none());
+        assert!(ResolvedIoProfile::frozen_v1(io_spec(IO_MODEL_V1_MAX_BYTES + 65_536)).is_none());
+
+        let invalid_source = io_spec(IO_MODEL_V1_MIN_BYTES - 65_536);
+        let err = lower_with_options(
+            &scenario_with(model_work(invalid_source)),
+            &LoweringOptions::default(),
+        )
+        .expect_err("an unsupported source must fail before profile lookup");
+        assert!(matches!(err, LoweringError::InvalidIoProfile { .. }));
+        assert!(err.to_string().contains("outside the frozen"));
+    }
+
+    #[test]
+    fn fixed_volume_profile_must_finish_before_the_scenario_ends() {
+        let spec = io_spec(2 * 1024 * 1024);
+        let profile = io_profile(spec.clone());
+        let options = LoweringOptions::default().with_io_profile(profile.clone());
+        let short = SourceScenario {
+            duration: DurationNs::from_millis(60),
+            ..scenario_with(model_work(spec.clone()))
+        };
+        let err = lower_with_options(&short, &options).expect_err("63ms does not fit in 60ms");
+        assert!(err.to_string().contains("partial execution"));
+
+        let late = SourceScenario {
+            duration: DurationNs::from_millis(100),
+            topology: SourceTopology {
+                cores: IO_MODEL_V1_GUEST_CPUS,
+                ..SourceTopology::default()
+            },
+            ..SourceScenario::new("late")
+        }
+        .step(SourceStep::new(
+            vec![SourceCgroupDef::named("initial")],
+            SourceHold::Frac(0.5),
         ))
+        .step(SourceStep::new(
+            vec![
+                SourceCgroupDef::named("io").work(SourceWorkSpec::new(model_work(spec)).workers(1))
+            ],
+            SourceHold::Frac(0.5),
+        ));
+        let err = lower_with_options(&late, &options).expect_err("late start truncates profile");
+        assert!(err.to_string().contains("partial execution"));
+    }
+
+    #[test]
+    fn a_profile_cannot_cover_multiple_typed_specs_in_the_one_worker_regime() {
+        let spec = io_spec(2 * 1024 * 1024);
+        let source = SourceScenario {
+            topology: SourceTopology {
+                cores: IO_MODEL_V1_GUEST_CPUS,
+                ..SourceTopology::default()
+            },
+            ..SourceScenario::new("two")
+        }
+        .step(SourceStep::new(
+            vec![
+                SourceCgroupDef::named("a")
+                    .work(SourceWorkSpec::new(model_work(spec.clone())).workers(1)),
+                SourceCgroupDef::named("b")
+                    .work(SourceWorkSpec::new(model_work(spec.clone())).workers(1)),
+            ],
+            SourceHold::FULL,
+        ));
+        let options = LoweringOptions::default().with_io_profile(io_profile(spec));
+        let err = lower_with_options(&source, &options)
+            .expect_err("a second device worker is outside the v1 calibration regime");
+        assert!(err
+            .to_string()
+            .contains("exactly one scenario-wide device worker"));
+    }
+
+    #[test]
+    fn one_declaration_cannot_request_multiple_device_workers() {
+        let spec = io_spec(2 * 1024 * 1024);
+        let source = SourceScenario {
+            topology: SourceTopology {
+                cores: IO_MODEL_V1_GUEST_CPUS,
+                ..SourceTopology::default()
+            },
+            ..SourceScenario::new("two-workers")
+        }
+        .step(SourceStep::new(
+            vec![SourceCgroupDef::named("io")
+                .work(SourceWorkSpec::new(model_work(spec.clone())).workers(2))],
+            SourceHold::FULL,
+        ));
+        let mut profile = io_profile(spec);
+        profile.workers = 2;
+        let err = lower_with_options(
+            &source,
+            &LoweringOptions::default().with_io_profile(profile),
+        )
+        .expect_err("one declaration with two workers is still outside v1");
+        assert!(err.to_string().contains("exactly one device worker"));
+    }
+
+    #[test]
+    fn io_model_rejects_zero_workers_and_same_product_wrong_topology() {
+        let spec = io_spec(IO_MODEL_V1_MIN_BYTES);
+        for use_default in [false, true] {
+            let work = if use_default {
+                SourceWorkSpec::new(model_work(spec.clone()))
+            } else {
+                SourceWorkSpec::new(model_work(spec.clone())).workers(0)
+            };
+            let mut source = SourceScenario {
+                topology: IO_MODEL_V1_TOPOLOGY,
+                ..SourceScenario::new("zero-workers")
+            }
+            .step(SourceStep::new(
+                vec![SourceCgroupDef::named("io").work(work)],
+                SourceHold::FULL,
+            ));
+            if use_default {
+                source.default_workers_per_cgroup = 0;
+            }
+            let err = lower_with_options(
+                &source,
+                &LoweringOptions::default().with_io_profile(io_profile(spec.clone())),
+            )
+            .expect_err("zero must not normalize to one");
+            assert!(err.to_string().contains("zero workers"));
+        }
+
+        let mut wrong_topology = scenario_with(model_work(spec.clone()));
+        wrong_topology.topology.cores = 2;
+        wrong_topology.topology.threads = 2;
+        let err = lower_with_options(
+            &wrong_topology,
+            &LoweringOptions::default().with_io_profile(io_profile(spec)),
+        )
+        .expect_err("same CPU product with SMT is outside the frozen topology");
+        assert!(err.to_string().contains("source topology"));
     }
 
     /// The three refusals are the No-Stub line. Each must fail loudly, and the
@@ -1663,9 +2397,7 @@ mod tests {
                 cold_iters: 10,
                 period_iters: 20,
             },
-            SourceWorkType::IoSyncWrite,
-            SourceWorkType::IoRandRead,
-            SourceWorkType::IoConvoy,
+            model_work(io_spec(2 * 1024 * 1024)),
             SourceWorkType::PipeIo { burst_iters: 64 },
             SourceWorkType::CachePressure {
                 size_kib: 256,
@@ -1785,16 +2517,20 @@ mod tests {
 
     fn every_supported_work_type_lowers_to_valid_ir() {
         let all = all_supported_work_types();
-        // 42 supported + 3 refused = ktstr's 45.
+        // 39 lowerable ktstr variants + one simulator-only model input. The
+        // three fieldless storage variants and three benchmark/custom variants
+        // are deliberately refused.
         assert_eq!(
             all.len(),
-            42,
-            "supported arm count drifted from ktstr's 45-3"
+            40,
+            "lowerable arm count drifted from ktstr's 45-6 plus IoModelV1"
         );
 
         for wt in all {
             let name = wt.variant_name();
-            let ir = lower(&scenario_with(wt)).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let options = options_for(&wt);
+            let ir = lower_with_options(&scenario_with(wt), &options)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
             assert_eq!(ir.validate(), Ok(()), "{name} produced invalid IR");
             assert!(!ir.tasks.is_empty(), "{name} produced no tasks");
         }
@@ -1815,7 +2551,9 @@ mod tests {
     fn no_arm_reports_exact_while_using_the_invented_default_slice() {
         for wt in all_supported_work_types() {
             let name = wt.variant_name();
-            let ir = lower(&scenario_with(wt)).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let options = options_for(&wt);
+            let ir = lower_with_options(&scenario_with(wt), &options)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
             if !ir.fidelity.is_exact() {
                 continue;
             }
@@ -1840,12 +2578,10 @@ mod tests {
     ///
     /// The tripwire above is scoped to arms that report `Exact`, which leaves a
     /// hole: an arm that records SOME approximation escapes it entirely and can
-    /// then use `DEFAULT_SLICE` freely. `IoSyncWrite` is the worked example —
-    /// it records `IoMechanism` ("block device, queue depth and byte counts are
-    /// not modelled; the off-CPU wait is preserved as Sleep") and then lowers
-    /// to `Run(500us) Sleep(500us)`, both invented. A reader of that report is
-    /// told the device was dropped and told the off-CPU wait was PRESERVED,
-    /// which is the opposite of true: the wait is `DEFAULT_SLICE`.
+    /// then use `DEFAULT_SLICE` freely. Storage I/O used to demonstrate that
+    /// defect with an invented `Run(500us) Sleep(500us)` pair. It now requires
+    /// an explicit resolved profile; this systemic guard remains for every arm
+    /// that still uses the synthetic default.
     ///
     /// This matters beyond tidiness because `UnspecifiedWorkQuantum` is the
     /// documented port gate — a scenario whose lowering records it against the
@@ -1857,7 +2593,9 @@ mod tests {
         let mut offenders: Vec<(&str, Vec<Cause>)> = Vec::new();
         for wt in all_supported_work_types() {
             let name = wt.variant_name();
-            let ir = lower(&scenario_with(wt)).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let options = options_for(&wt);
+            let ir = lower_with_options(&scenario_with(wt), &options)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
             let fabricated = ir
                 .tasks
                 .iter()
@@ -1988,8 +2726,9 @@ mod tests {
         let mut offenders = Vec::new();
         for wt in all_supported_work_types() {
             let name = wt.variant_name();
+            let options = options_for(&wt);
             let src = scenario_with(wt);
-            let ir = lower(&src).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let ir = lower_with_options(&src, &options).unwrap_or_else(|e| panic!("{name}: {e}"));
             for u in crate::provenance::check(&src, &ir) {
                 offenders.push(format!("{name}: {u}"));
             }

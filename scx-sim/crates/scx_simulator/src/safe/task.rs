@@ -79,8 +79,18 @@ pub enum TaskState {
 pub enum Phase {
     /// Run (consume CPU) for the given number of nanoseconds.
     Run(TimeNs),
+    /// Calibrated task-context system CPU for the given number of nanoseconds.
+    ///
+    /// This takes the ordinary scheduled-task path, but unlike [`Phase::Run`]
+    /// its already-resolved duration is not perturbed by generic compute
+    /// jitter.  Doing so would silently replace a calibrated estimand with a
+    /// simulator noise sample.
+    SystemCpu(TimeNs),
     /// Sleep (block) for the given number of nanoseconds.
     Sleep(TimeNs),
+    /// Remain alive but sleeping until global scenario teardown. Unlike a very
+    /// long timed sleep, this has no wake event and cannot complete the task.
+    Park,
     /// Wake another task by PID (instantaneous).
     Wake(Pid),
     /// Call `sched_yield()` (instantaneous). The task stays runnable and

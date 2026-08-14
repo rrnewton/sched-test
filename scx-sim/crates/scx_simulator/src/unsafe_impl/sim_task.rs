@@ -28,7 +28,7 @@ pub struct SimTask {
     /// sequence wraps back to the beginning.
     pub repeat_iteration: u32,
     /// Remaining nanoseconds in the current Run phase (only meaningful
-    /// when the current phase is `Phase::Run`).
+    /// when the current phase is `Phase::Run` or `Phase::SystemCpu`).
     pub run_remaining_ns: TimeNs,
     /// Current task state.
     pub state: TaskState,
@@ -94,9 +94,9 @@ impl SimTask {
             }
         }
 
-        // Initialize run_remaining from the first phase if it's a Run
+        // Initialize run_remaining from the first CPU-consuming phase.
         let run_remaining_ns = match def.behavior.phases.first() {
-            Some(Phase::Run(ns)) => *ns,
+            Some(Phase::Run(ns) | Phase::SystemCpu(ns)) => *ns,
             _ => 0,
         };
 
@@ -150,9 +150,9 @@ impl SimTask {
                 }
             }
         }
-        // Reset run_remaining for the new phase
+        // Reset run_remaining for the new CPU-consuming phase.
         match self.current_phase() {
-            Some(Phase::Run(ns)) => self.run_remaining_ns = *ns,
+            Some(Phase::Run(ns) | Phase::SystemCpu(ns)) => self.run_remaining_ns = *ns,
             _ => self.run_remaining_ns = 0,
         }
         true

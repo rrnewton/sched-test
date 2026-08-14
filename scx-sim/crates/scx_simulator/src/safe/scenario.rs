@@ -669,6 +669,12 @@ pub const DEFAULT_WATCHDOG_TIMEOUT_NS: TimeNs = 30_000_000_000;
 #[derive(Debug, Clone)]
 pub struct Scenario {
     pub nr_cpus: u32,
+    /// Scheduler identity required by a calibrated workload profile.
+    ///
+    /// Private so a compiled scenario cannot accidentally discard its
+    /// applicability contract before execution. Generic scenarios leave this
+    /// unset.
+    pub(crate) required_scheduler_identity: Option<String>,
     /// SMT threads per physical core (1 = no SMT, 2 = hyperthreading).
     /// CPUs are grouped sequentially: with 4 CPUs and smt=2, CPUs 0,1
     /// share core 0 and CPUs 2,3 share core 1.
@@ -801,6 +807,7 @@ pub struct Scenario {
 /// Builder for constructing scenarios.
 pub struct ScenarioBuilder {
     nr_cpus: u32,
+    required_scheduler_identity: Option<String>,
     smt_threads_per_core: u32,
     /// CPUs per LLC domain. 0 = all CPUs in one domain (default).
     /// E.g., cpus_per_llc=12 with nr_cpus=48 creates 4 LLC domains.
@@ -878,6 +885,11 @@ fn cgroup_cpuset(cgroups: &[CgroupDef], cgroup_name: &str) -> Option<Vec<CpuId>>
 }
 
 impl Scenario {
+    /// Scheduler identity this scenario requires, if any.
+    pub fn required_scheduler_identity(&self) -> Option<&str> {
+        self.required_scheduler_identity.as_deref()
+    }
+
     /// The CPUs `task` may actually run on: its own affinity narrowed by its
     /// cgroup's cpuset.
     ///
@@ -953,6 +965,7 @@ impl Scenario {
     pub fn builder() -> ScenarioBuilder {
         ScenarioBuilder {
             nr_cpus: 1,
+            required_scheduler_identity: None,
             smt_threads_per_core: 1,
             cpus_per_llc: 0,
             tasks: Vec::new(),
@@ -995,6 +1008,20 @@ impl Scenario {
 }
 
 impl ScenarioBuilder {
+    /// Require a named scheduler implementation for this scenario.
+    ///
+    /// [`Simulator`](crate::Simulator) rejects a mismatch before invoking any
+    /// scheduler callback or allocating simulation tasks.
+    pub fn require_scheduler_identity(mut self, identity: impl Into<String>) -> Self {
+        let identity = identity.into();
+        assert!(
+            !identity.is_empty(),
+            "required scheduler identity cannot be empty"
+        );
+        self.required_scheduler_identity = Some(identity);
+        self
+    }
+
     /// Set the number of simulated CPUs.
     pub fn cpus(mut self, n: u32) -> Self {
         self.nr_cpus = n;
@@ -1626,6 +1653,7 @@ impl ScenarioBuilder {
         }
         Scenario {
             nr_cpus: self.nr_cpus,
+            required_scheduler_identity: self.required_scheduler_identity,
             smt_threads_per_core: self.smt_threads_per_core,
             cpus_per_llc: self.cpus_per_llc,
             tasks: self.tasks,

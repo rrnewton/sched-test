@@ -330,12 +330,22 @@ fn emitted_values(ir: &WorkloadIr) -> Vec<(String, u64, Kind)> {
                     d.as_nanos(),
                     Kind::Loose,
                 )),
+                Phase::SystemCpu(d) => out.push((
+                    format!("task[{i}].phases[{j}] SystemCpu"),
+                    d.as_nanos(),
+                    Kind::Loose,
+                )),
                 Phase::Sleep(d) => out.push((
                     format!("task[{i}].phases[{j}] Sleep"),
                     d.as_nanos(),
                     Kind::Loose,
                 )),
-                Phase::Yield | Phase::Wake(_) => {}
+                Phase::NonRunning(d) => out.push((
+                    format!("task[{i}].phases[{j}] NonRunning"),
+                    d.as_nanos(),
+                    Kind::Loose,
+                )),
+                Phase::Park | Phase::Yield | Phase::Wake(_) => {}
             }
         }
     }

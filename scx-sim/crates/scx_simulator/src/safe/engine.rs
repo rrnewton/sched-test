@@ -403,6 +403,12 @@ pub enum ExitKind {
         active_count: u32,
         max_cgroups: u32,
     },
+    /// A task declared terminal [`Phase::Park`] but the simulation ended before
+    /// it reached that fixed-volume completion marker.
+    ErrorTerminalParkNotReached { pid: Pid },
+    /// A calibrated scenario was run with a scheduler outside its declared
+    /// applicability domain.
+    ErrorSchedulerIdentityMismatch { required: String, actual: String },
 }
 
 impl ExitKind {
@@ -1477,6 +1483,22 @@ impl<S: Scheduler> Simulator<S> {
 
     /// Internal simulation loop shared by `run()` and `run_monitored()`.
     fn run_internal(&self, scenario: Scenario, monitor: &mut dyn Monitor) -> SimulationResult {
+        if let Some(required) = scenario.required_scheduler_identity() {
+            let actual = self.scheduler.identity();
+            if required != actual {
+                let mut trace =
+                    Trace::with_warmup(scenario.nr_cpus, &scenario.tasks, scenario.warmup_ns);
+                trace.set_exit_kind(ExitKind::ErrorSchedulerIdentityMismatch {
+                    required: required.to_owned(),
+                    actual: actual.to_owned(),
+                });
+                return SimulationResult {
+                    trace,
+                    tasks: HashMap::new(),
+                };
+            }
+        }
+
         // Reset global C state that persists between simulation runs.
         // These static variables are compiled into the main binary (not the
         // scheduler .so), so they survive across runs and cause non-determinism.
@@ -2315,6 +2337,33 @@ impl<S: Scheduler> Simulator<S> {
             }
         }
 
+        // A terminal Park is a completion contract, not merely a long sleep.
+        // The static start+phase-duration check performed by workload lowering
+        // is necessary but not sufficient: scheduler contention or cgroup
+        // throttling can delay the CPU phase until the following wake no longer
+        // fits. Never report such a truncated fixed-volume run as Normal.
+        if matches!(exit_kind, ExitKind::Normal) {
+            let reached: std::collections::BTreeSet<Pid> = s
+                .sim
+                .trace
+                .events()
+                .iter()
+                .filter_map(|event| match event.kind {
+                    TraceKind::TaskParked { pid } => Some(pid),
+                    _ => None,
+                })
+                .collect();
+            if let Some(task) = scenario.tasks.iter().find(|task| {
+                task.behavior
+                    .phases
+                    .iter()
+                    .any(|phase| matches!(phase, Phase::Park))
+                    && !reached.contains(&task.pid)
+            }) {
+                exit_kind = ExitKind::ErrorTerminalParkNotReached { pid: task.pid };
+            }
+        }
+
         // Call scheduler dump before exit (mirrors kernel dump on scheduler unload)
         // IMPORTANT: Sort PIDs for deterministic order. HashMap iteration
         // is non-deterministic, and scheduler callbacks (dump_task, exit_task)
@@ -2686,9 +2735,9 @@ impl<S: Scheduler> Simulator<S> {
         }
 
         match event.kind {
-            EventKind::TaskWake { pid, waker, .. } => {
+            EventKind::TaskWake { pid, waker, cpu } => {
                 drop(guard);
-                self.handle_task_wake(pid, waker, sim_arc, monitor);
+                self.handle_task_wake(pid, waker, cpu, sim_arc, monitor);
                 guard = sim_arc.lock().unwrap();
             }
             EventKind::SliceExpired { cpu } => {
@@ -3789,7 +3838,7 @@ impl<S: Scheduler> Simulator<S> {
         // interrupt context still active.
         for &pid in wake_pids {
             drop(guard);
-            self.handle_task_wake(pid, None, sim_arc, monitor);
+            self.handle_task_wake(pid, None, cpu, sim_arc, monitor);
             guard = sim_arc.lock().unwrap();
         }
         let s = &mut *guard;
@@ -3882,6 +3931,7 @@ impl<S: Scheduler> Simulator<S> {
         &self,
         pid: Pid,
         waker: Option<WakerInfo>,
+        event_cpu: CpuId,
         sim_arc: &SimArc,
         monitor: &mut dyn Monitor,
     ) {
@@ -3919,7 +3969,7 @@ impl<S: Scheduler> Simulator<S> {
         {
             let s = &mut *guard;
             let task = s.tasks.get_mut(&pid).unwrap();
-            self.advance_to_run_phase(task, &mut s.sim, &mut s.events);
+            self.advance_to_run_phase(task, event_cpu, &mut s.sim, &mut s.events);
         }
 
         let s = &mut *guard;
@@ -3938,6 +3988,14 @@ impl<S: Scheduler> Simulator<S> {
             return;
         }
         if task.state == TaskState::Sleeping {
+            // A completed timed sleep may transition directly into Park. The
+            // wake event is then only the boundary between two non-runnable
+            // states, not a runnable episode for watchdog accounting.
+            let task = s.tasks.get_mut(&pid).unwrap();
+            task.runnable_at_ns = None;
+            // Keep the raw task_struct mirror consistent too. No runnable,
+            // select_cpu or enqueue callback was delivered for this boundary.
+            ffi::task_set_runnable_at(task.raw(), 0);
             return;
         }
 
@@ -4249,7 +4307,8 @@ impl<S: Scheduler> Simulator<S> {
         }
 
         // Stop the running task
-        let still_runnable = has_next && matches!(next_phase, Some(Phase::Run(_)));
+        let still_runnable =
+            has_next && matches!(next_phase, Some(Phase::Run(_)) | Some(Phase::SystemCpu(_)));
 
         // Determine stop reason: Run→Run is a voluntary yield, Sleep/Wake/Complete are voluntary
         let stop_reason = LastStopReason::Voluntary;
@@ -4426,6 +4485,22 @@ impl<S: Scheduler> Simulator<S> {
                 Some(Phase::Yield) => unreachable!(
                     "Phase::Yield should have been consumed before dispatching next_phase"
                 ),
+                Some(Phase::Park) => {
+                    let task = s.tasks.get_mut(&pid).unwrap();
+                    task.state = TaskState::Sleeping;
+                    let local_t = s.sim.cpus[cpu.0 as usize].local_clock;
+                    // Close the ONCPU slice, then emit a distinct terminal
+                    // marker. A Park reached from a timed Sleep emits only the
+                    // marker in `advance_to_run_phase` because its slice was
+                    // already closed when that Sleep began.
+                    s.sim
+                        .trace
+                        .record(local_t, cpu, TraceKind::TaskSlept { pid });
+                    s.sim
+                        .trace
+                        .record(local_t, cpu, TraceKind::TaskParked { pid });
+                    info!(task = task_name.as_str(), pid = pid.0, "PARKED");
+                }
                 Some(Phase::Sleep(sleep_ns)) => {
                     let task = s.tasks.get_mut(&pid).unwrap();
                     task.state = TaskState::Sleeping;
@@ -4448,7 +4523,7 @@ impl<S: Scheduler> Simulator<S> {
                         );
                     }
                 }
-                Some(Phase::Run(_)) => {
+                Some(Phase::Run(_)) | Some(Phase::SystemCpu(_)) => {
                     // Task goes directly to the next Run phase (still runnable)
                     let task = s.tasks.get_mut(&pid).unwrap();
                     task.state = TaskState::Runnable;
@@ -4583,7 +4658,7 @@ impl<S: Scheduler> Simulator<S> {
                                         break;
                                     }
                                 }
-                                Some(Phase::Run(_)) => {
+                                Some(Phase::Run(_)) | Some(Phase::SystemCpu(_)) => {
                                     // Still runnable — re-enqueue (same as yield)
                                     task.state = TaskState::Runnable;
                                     let raw = task.raw();
@@ -4621,6 +4696,21 @@ impl<S: Scheduler> Simulator<S> {
                                         task = task_name.as_str(),
                                         pid = pid.0,
                                         "YIELDED (after wake)"
+                                    );
+                                    break;
+                                }
+                                Some(Phase::Park) => {
+                                    task.state = TaskState::Sleeping;
+                                    s.sim
+                                        .trace
+                                        .record(local_t, cpu, TraceKind::TaskSlept { pid });
+                                    s.sim
+                                        .trace
+                                        .record(local_t, cpu, TraceKind::TaskParked { pid });
+                                    info!(
+                                        task = task_name.as_str(),
+                                        pid = pid.0,
+                                        "PARKED (after wake)"
                                     );
                                     break;
                                 }
@@ -5367,7 +5457,8 @@ impl<S: Scheduler> Simulator<S> {
         // branch mispredictions, TLB misses, and memory bandwidth contention.
         {
             let task = s.tasks.get_mut(&pid).unwrap();
-            if task.run_remaining_ns > 0
+            if matches!(task.current_phase(), Some(Phase::Run(_)))
+                && task.run_remaining_ns > 0
                 && s.sim.noise.enabled
                 && s.sim.noise.run_jitter
                 && s.sim.noise.run_jitter_cv_ppm > 0
@@ -5422,26 +5513,34 @@ impl<S: Scheduler> Simulator<S> {
         }
     }
 
-    /// Advance a task past completed Sleep/Wake phases to the next Run phase.
+    /// Advance a task past completed Sleep/Wake phases to the next
+    /// CPU-consuming phase.
     ///
     /// Called when a wake event fires. The current phase (Sleep) is considered
     /// complete (the wake timer fired), so we advance past it. We also skip
     /// any Wake phases (triggering wakes for other tasks) until we reach a
-    /// Run phase that the task can execute.
+    /// phase that the task can execute.
     fn advance_to_run_phase(
         &self,
         task: &mut SimTask,
+        event_cpu: CpuId,
         sim: &mut SimulatorState,
         events: &mut EventQueue,
     ) {
         let pid = task.pid;
         loop {
             match task.current_phase() {
-                Some(Phase::Run(ns)) => {
+                Some(Phase::Run(ns) | Phase::SystemCpu(ns)) => {
                     if task.run_remaining_ns == 0 {
                         task.run_remaining_ns = *ns;
                     }
                     break;
+                }
+                Some(Phase::Park) => {
+                    task.state = TaskState::Sleeping;
+                    sim.trace
+                        .record(sim.clock, event_cpu, TraceKind::TaskParked { pid });
+                    return;
                 }
                 Some(Phase::Wake(target_pid)) => {
                     let target = *target_pid;

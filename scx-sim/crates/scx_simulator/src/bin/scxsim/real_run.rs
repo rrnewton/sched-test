@@ -618,6 +618,12 @@ pub fn scenario_to_rtapp_json(scenario: &scx_simulator::Scenario) -> Result<Stri
                     task_obj.insert(key, json!(usec));
                     run_idx += 1;
                 }
+                Phase::SystemCpu(_) => {
+                    return Err(format!(
+                        "task {:?} contains calibrated SystemCpu, which rt-app can only replay as user CPU; refusing to relabel the estimand",
+                        task.name
+                    ));
+                }
                 Phase::Sleep(ns) => {
                     if *ns == u64::MAX {
                         // Suspend: self-suspend until woken
@@ -632,6 +638,9 @@ pub fn scenario_to_rtapp_json(scenario: &scx_simulator::Scenario) -> Result<Stri
                         task_obj.insert(key, json!(usec));
                         sleep_idx += 1;
                     }
+                }
+                Phase::Park => {
+                    task_obj.insert("suspend".into(), json!(task.name.clone()));
                 }
                 Phase::Wake(target_pid) => {
                     // Find the target task name
@@ -696,6 +705,24 @@ mod tests {
         assert!(json.contains("\"run\""));
         assert!(json.contains("\"sleep\""));
         assert!(json.contains("\"loop\": -1"));
+    }
+
+    #[test]
+    fn rtapp_refuses_to_relabel_calibrated_system_cpu_as_user_run() {
+        let scenario = Scenario::builder()
+            .add_task(
+                "modelled-io",
+                0,
+                TaskBehavior {
+                    phases: vec![Phase::SystemCpu(1_000_000), Phase::Park],
+                    repeat: RepeatMode::Once,
+                },
+            )
+            .duration_ms(10)
+            .build();
+        let err = scenario_to_rtapp_json(&scenario).expect_err("estimand must not be relabelled");
+        assert!(err.contains("calibrated SystemCpu"));
+        assert!(err.contains("refusing"));
     }
 
     #[test]

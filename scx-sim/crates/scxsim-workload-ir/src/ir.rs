@@ -17,6 +17,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::fidelity::FidelityReport;
+use crate::source::IoModelSpec;
 use crate::units::{CgroupName, CpuIndex, DurationNs, Nice, TaskId};
 
 /// CPU topology the workload runs on.
@@ -167,9 +168,27 @@ pub enum SchedPolicy {
 pub enum Phase {
     /// Occupy a CPU for this long.
     Run(DurationNs),
+    /// Occupy a CPU in task context for time attributed to system execution.
+    ///
+    /// This is scheduler-visible runtime, not IRQ or scheduler overhead.  The
+    /// simulator ingests it as an ordinary run phase so the real BPF scheduler
+    /// still decides when and where the task runs; the distinct IR tag keeps a
+    /// calibrated system-CPU quantity from being relabelled as user compute.
+    SystemCpu(DurationNs),
     /// Be off-CPU, unrunnable, for this long. Covers sleeping and blocking
     /// alike — the distinction is a mechanism the simulator does not model.
     Sleep(DurationNs),
+    /// Be off-CPU and unrunnable for a calibrated non-running interval.
+    ///
+    /// Kept distinct from [`Phase::Sleep`] because the estimate may retain
+    /// host-stolen time and is not proof of a particular sleep syscall or of
+    /// device wait. Ingestion deliberately models the estimate as unrunnable.
+    NonRunning(DurationNs),
+    /// Remain alive but unrunnable until scenario teardown.
+    ///
+    /// This models a fixed-volume ktstr worker's terminal iteration gate. It is
+    /// not task exit and has no timer wake.
+    Park,
     /// `sched_yield`: stay runnable, give up the CPU now.
     Yield,
     /// Make another task runnable.
@@ -273,6 +292,18 @@ pub struct TimedMutation {
     pub mutation: Mutation,
 }
 
+/// Structured provenance for a resolved I/O profile applied by lowering.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppliedIoProfile {
+    pub profile_id: String,
+    pub calibration_manifest_sha256: String,
+    pub spec: IoModelSpec,
+    pub workers: u32,
+    pub guest_cpus: u32,
+    pub system_cpu_per_worker: DurationNs,
+    pub nonrunning_per_worker: DurationNs,
+}
+
 /// A complete lowered workload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkloadIr {
@@ -289,6 +320,10 @@ pub struct WorkloadIr {
     /// What this lowering cost in fidelity. Never empty silently — see
     /// [`crate::fidelity`].
     pub fidelity: FidelityReport,
+    /// Machine-readable profile provenance. Empty for workloads that do not
+    /// use the explicitly modelled fixed-volume I/O construct.
+    #[serde(default)]
+    pub applied_io_profiles: Vec<AppliedIoProfile>,
 }
 
 impl WorkloadIr {
@@ -302,6 +337,7 @@ impl WorkloadIr {
             duration,
             seed: 42,
             fidelity: FidelityReport::new(),
+            applied_io_profiles: Vec::new(),
         }
     }
 
@@ -349,6 +385,12 @@ impl WorkloadIr {
                 return Err(ValidationError::DuplicateTask(task.id));
             }
         }
+        let parked_tasks: std::collections::BTreeSet<TaskId> = self
+            .tasks
+            .iter()
+            .filter(|task| task.phases.iter().any(|phase| matches!(phase, Phase::Park)))
+            .map(|task| task.id)
+            .collect();
         for task in &self.tasks {
             if let Some(cg) = &task.cgroup {
                 if !seen_cg.contains(cg) {
@@ -358,11 +400,35 @@ impl WorkloadIr {
                     });
                 }
             }
-            // A Wake naming a task that does not exist would silently never fire.
+            if let Some(park_index) = task
+                .phases
+                .iter()
+                .position(|phase| matches!(phase, Phase::Park))
+            {
+                if park_index + 1 != task.phases.len() {
+                    return Err(ValidationError::NonTerminalPark {
+                        task: task.name.clone(),
+                    });
+                }
+                if task.repeat != Repeat::Once {
+                    return Err(ValidationError::RepeatingPark {
+                        task: task.name.clone(),
+                    });
+                }
+            }
+            // A Wake naming a task that does not exist would silently never
+            // fire. A Wake targeting terminal Park would diverge between the
+            // simulator (which re-parks it) and rt-app (which resumes it).
             for ph in &task.phases {
                 if let Phase::Wake(target) = ph {
                     if !seen_task.contains(target) {
                         return Err(ValidationError::UnknownTask {
+                            referenced_by: task.name.clone(),
+                            id: *target,
+                        });
+                    }
+                    if parked_tasks.contains(target) {
+                        return Err(ValidationError::WakeOfParkedTask {
                             referenced_by: task.name.clone(),
                             id: *target,
                         });
@@ -404,6 +470,16 @@ pub enum ValidationError {
         referenced_by: String,
         id: TaskId,
     },
+    NonTerminalPark {
+        task: String,
+    },
+    RepeatingPark {
+        task: String,
+    },
+    WakeOfParkedTask {
+        referenced_by: String,
+        id: TaskId,
+    },
     MutationAfterEnd {
         at: DurationNs,
         duration: DurationNs,
@@ -431,6 +507,16 @@ impl std::fmt::Display for ValidationError {
             ValidationError::UnknownTask { referenced_by, id } => {
                 write!(f, "`{referenced_by}` wakes undeclared task {id}")
             }
+            ValidationError::NonTerminalPark { task } => {
+                write!(f, "task `{task}` has a phase after terminal Park")
+            }
+            ValidationError::RepeatingPark { task } => {
+                write!(f, "task `{task}` contains terminal Park but does not use Repeat::Once")
+            }
+            ValidationError::WakeOfParkedTask { referenced_by, id } => write!(
+                f,
+                "`{referenced_by}` wakes terminally parked task {id}"
+            ),
             ValidationError::MutationAfterEnd { at, duration } => write!(
                 f,
                 "timeline mutation at {at} is past the workload duration {duration}"
@@ -518,6 +604,36 @@ mod tests {
     }
 
     #[test]
+    fn park_is_terminal_nonrepeating_and_not_wakeable() {
+        let mut w = ir();
+        let mut parked = Task::new(TaskId(0), "parked");
+        parked.repeat = Repeat::Once;
+        parked.phases = vec![Phase::Park, Phase::Yield];
+        w.tasks.push(parked.clone());
+        assert!(matches!(
+            w.validate(),
+            Err(ValidationError::NonTerminalPark { .. })
+        ));
+
+        parked.phases = vec![Phase::Park];
+        parked.repeat = Repeat::Forever;
+        w.tasks = vec![parked.clone()];
+        assert!(matches!(
+            w.validate(),
+            Err(ValidationError::RepeatingPark { .. })
+        ));
+
+        parked.repeat = Repeat::Once;
+        let mut waker = Task::new(TaskId(1), "waker");
+        waker.phases = vec![Phase::Wake(TaskId(0))];
+        w.tasks = vec![parked, waker];
+        assert!(matches!(
+            w.validate(),
+            Err(ValidationError::WakeOfParkedTask { .. })
+        ));
+    }
+
+    #[test]
     fn task_in_undeclared_cgroup_is_rejected() {
         let mut w = ir();
         let mut t = Task::new(TaskId(0), "worker");
@@ -594,9 +710,13 @@ mod tests {
         t.cgroup = Some(CgroupName::new("cg_0"));
         t.phases = vec![
             Phase::Run(DurationNs::from_millis(1)),
+            Phase::SystemCpu(DurationNs::from_micros(750)),
             Phase::Sleep(DurationNs::from_micros(500)),
+            Phase::NonRunning(DurationNs::from_micros(250)),
             Phase::Yield,
+            Phase::Park,
         ];
+        t.repeat = Repeat::Once;
         w.tasks.push(t);
         w.timeline.push(TimedMutation {
             at: DurationNs::from_millis(10),

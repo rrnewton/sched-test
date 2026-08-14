@@ -106,6 +106,9 @@ pub enum TraceKind {
     TaskYielded { pid: Pid },
     /// A task voluntarily slept on this CPU.
     TaskSlept { pid: Pid },
+    /// A task reached a terminal park and will remain non-runnable until
+    /// global scenario teardown.
+    TaskParked { pid: Pid },
     /// A task woke up.
     TaskWoke { pid: Pid },
     /// A task completed all its phases.
@@ -1057,6 +1060,7 @@ impl Trace {
                 TraceKind::TaskPreempted { pid } => format!("PREEMPT  pid={}", pid.0),
                 TraceKind::TaskYielded { pid } => format!("YIELD    pid={}", pid.0),
                 TraceKind::TaskSlept { pid } => format!("SLEEP    pid={}", pid.0),
+                TraceKind::TaskParked { pid } => format!("PARK     pid={}", pid.0),
                 TraceKind::TaskWoke { pid } => format!("WAKE     pid={}", pid.0),
                 TraceKind::TaskCompleted { pid } => format!("COMPLETE pid={}", pid.0),
                 TraceKind::CpuIdle => "IDLE".to_string(),
