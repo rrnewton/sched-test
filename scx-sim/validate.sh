@@ -338,6 +338,15 @@ fi
 echo ""
 ./scripts/typecheck.sh
 
+# Cheap (no build, no VM, pure file reads) and it catches the thing that
+# actually rots: a record, baseline or CASES entry added without the other two,
+# or a scenario promoted out of the not-checkable list with the entry left
+# behind. Prints the scoreboard either way so a reviewer sees the two numbers
+# move in the diff rather than having to ask.
+echo ""
+echo "=== Cross-backend scoreboard (runs vs agrees) ==="
+python3 ./scripts/backend_scoreboard.py --check
+
 # A skipped check is a FAILURE, not a footnote.
 #
 # CI runs this exact script (.github/workflows/simulator.yml runs `bash
