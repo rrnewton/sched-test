@@ -37,12 +37,16 @@ use scx_simulator::{
     TaskDef,
 };
 
-use crate::ir::{CpuSet, Mutation, Phase, Repeat, SchedPolicy, Task, Topology, WorkloadIr};
+use crate::ir::{
+    CpuSet, Mutation, Phase, Repeat, SchedPolicy, Task, Topology, ValidationError, WorkloadIr,
+};
 use crate::units::TaskId;
 
 /// A construct the simulator's `Scenario` cannot represent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IngestError {
+    /// The public ingestion boundary received structurally malformed IR.
+    InvalidIr(ValidationError),
     /// `Scenario`'s phase vocabulary has no yield.
     YieldNotRepresentable { task: String },
     /// `TaskDef` carries no scheduling policy.
@@ -63,6 +67,7 @@ pub enum IngestError {
 impl std::fmt::Display for IngestError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            IngestError::InvalidIr(error) => write!(f, "invalid workload IR: {error}"),
             IngestError::YieldNotRepresentable { task } => write!(
                 f,
                 "task `{task}` yields, but scx_simulator::Phase is Run|Sleep|Wake with no \
@@ -198,7 +203,16 @@ fn phases_of(task: &Task, known: &[TaskId]) -> Result<Vec<SimPhase>, IngestError
         .iter()
         .map(|p| match p {
             Phase::Run(d) => Ok(SimPhase::Run(d.as_nanos())),
+            // System CPU is task-context execution charged to this task.  It
+            // traverses the ordinary scheduler path, but retains its tag so
+            // generic compute jitter cannot perturb a calibrated duration.
+            Phase::SystemCpu(d) => Ok(SimPhase::SystemCpu(d.as_nanos())),
             Phase::Sleep(d) => Ok(SimPhase::Sleep(d.as_nanos())),
+            // This is known only to be unrunnable time; mapping it to Sleep
+            // preserves that scheduler state without claiming a syscall or
+            // block-device mechanism.
+            Phase::NonRunning(d) => Ok(SimPhase::Sleep(d.as_nanos())),
+            Phase::Park => Ok(SimPhase::Park),
             Phase::Wake(t) => {
                 if known.contains(t) {
                     Ok(SimPhase::Wake(pid_of(*t)))
@@ -233,6 +247,7 @@ fn policy_name(p: SchedPolicy) -> &'static str {
 /// question. Folding it away at ingestion would hide it at exactly the moment it
 /// becomes actionable.
 pub fn to_scenario(ir: &WorkloadIr) -> Result<Scenario, IngestError> {
+    ir.validate().map_err(IngestError::InvalidIr)?;
     if ir.tasks.is_empty() {
         return Err(IngestError::NoTasks {
             workload: ir.name.clone(),
@@ -245,6 +260,9 @@ pub fn to_scenario(ir: &WorkloadIr) -> Result<Scenario, IngestError> {
         .cpus_per_llc(topo.cpus_per_llc())
         .duration_ns(ir.duration.as_nanos())
         .seed(ir.seed as u32);
+    if let Some(profile) = ir.applied_io_profiles.first() {
+        b = b.require_scheduler_identity(profile.spec.calibration_scheduler.simulator_identity());
+    }
 
     for cg in &ir.cgroups {
         let cpus = match &cg.cpuset {
@@ -379,7 +397,9 @@ mod tests {
     fn phase_shape(p: &SimPhase) -> (&'static str, u64) {
         match p {
             SimPhase::Run(d) => ("run", *d),
+            SimPhase::SystemCpu(d) => ("system-cpu", *d),
             SimPhase::Sleep(d) => ("sleep", *d),
+            SimPhase::Park => ("park", 0),
             SimPhase::Wake(pid) => ("wake", pid.0 as u64),
             // Unit variant: no payload, so 0. This is a TEST-HELPER projection
             // and deliberately asserts nothing about semantics.
@@ -403,6 +423,21 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn calibrated_io_phases_keep_scheduler_state_at_ingestion() {
+        let mut task = Task::new(TaskId(0), "io");
+        task.phases = vec![
+            Phase::SystemCpu(DurationNs::from_millis(3)),
+            Phase::NonRunning(DurationNs::from_millis(7)),
+            Phase::Park,
+        ];
+        let phases = phases_of(&task, &[TaskId(0)]).expect("ingest phases");
+        assert_eq!(
+            phases.iter().map(phase_shape).collect::<Vec<_>>(),
+            vec![("system-cpu", 3_000_000), ("sleep", 7_000_000), ("park", 0)]
+        );
     }
 
     fn simple_source(wt: SourceWorkType) -> SourceScenario {
@@ -582,6 +617,25 @@ mod tests {
         let err = to_scenario(&ir).expect_err("must refuse");
         assert!(matches!(err, IngestError::NoTasks { .. }));
         assert!(err.to_string().contains("mistaken for a clean result"));
+    }
+
+    /// `to_scenario()` is a public boundary used by deserialized and hand-built
+    /// IR as well as by `lower()`. It must enforce the structural invariants
+    /// itself instead of assuming every caller already validated them.
+    #[test]
+    fn public_ingress_rejects_invalid_ir_before_translation() {
+        let mut ir = WorkloadIr::new("invalid", Topology::default(), DurationNs::from_secs(1));
+        let mut task = Task::new(TaskId(0), "worker");
+        task.repeat = Repeat::Once;
+        task.phases = vec![Phase::Park, Phase::Yield];
+        ir.tasks.push(task);
+
+        assert!(matches!(
+            to_scenario(&ir),
+            Err(IngestError::InvalidIr(
+                ValidationError::NonTerminalPark { .. }
+            ))
+        ));
     }
 
     /// nice must survive; it is the only priority signal the simulator has, so

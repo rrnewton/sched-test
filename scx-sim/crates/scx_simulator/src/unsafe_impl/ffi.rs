@@ -404,6 +404,14 @@ pub fn task_setup_cpumask(raw: *mut c_void, allowed_cpus: Option<&[crate::types:
 /// Each method corresponds to one of the sched_ext_ops callbacks.
 /// Default implementations are no-ops for optional callbacks.
 pub trait Scheduler {
+    /// Stable scheduler identity used to enforce scenario applicability.
+    ///
+    /// Custom/test schedulers default to `unknown`, which deliberately cannot
+    /// satisfy a scenario that requires a named production scheduler.
+    fn identity(&self) -> &str {
+        "unknown"
+    }
+
     /// Initialize the scheduler (ops.init). Called once before simulation.
     /// # Safety
     /// Calls into C code.
@@ -2215,6 +2223,10 @@ impl DynamicScheduler {
 }
 
 impl Scheduler for DynamicScheduler {
+    fn identity(&self) -> &str {
+        &self.prefix
+    }
+
     unsafe fn init(&self) -> i32 {
         (self.ops.init)()
     }

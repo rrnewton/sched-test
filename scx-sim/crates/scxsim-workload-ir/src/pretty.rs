@@ -96,6 +96,23 @@ pub fn pretty(ir: &WorkloadIr) -> String {
         }
     }
 
+    if !ir.applied_io_profiles.is_empty() {
+        let _ = writeln!(s, "  applied I/O profiles:");
+        for profile in &ir.applied_io_profiles {
+            let _ = writeln!(
+                s,
+                "    {}  manifest-sha256={}  workers={} guest-cpus={}  system-cpu={} non-running={}",
+                profile.profile_id,
+                profile.calibration_manifest_sha256,
+                profile.workers,
+                profile.guest_cpus,
+                profile.system_cpu_per_worker,
+                profile.nonrunning_per_worker,
+            );
+            let _ = writeln!(s, "      spec: {:?}", profile.spec);
+        }
+    }
+
     // Fidelity last, and always present — "nothing was approximated" is
     // information too.
     //
@@ -129,7 +146,10 @@ fn phases_str(phases: &[Phase]) -> String {
         .iter()
         .map(|p| match p {
             Phase::Run(d) => format!("run {d}"),
+            Phase::SystemCpu(d) => format!("system-cpu {d}"),
             Phase::Sleep(d) => format!("sleep {d}"),
+            Phase::NonRunning(d) => format!("non-running {d}"),
+            Phase::Park => "park".to_string(),
             Phase::Yield => "yield".to_string(),
             Phase::Wake(t) => format!("wake {t}"),
         })
@@ -185,7 +205,7 @@ fn probe_str(p: &Probe) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lower::lower;
+    use crate::lower::{lower, lower_with_options, LoweringOptions, ResolvedIoProfile};
     use crate::source::*;
     use crate::units::DurationNs;
 
@@ -257,5 +277,47 @@ mod tests {
         assert!(out.contains("wake t"), "{out}");
         assert!(out.contains("timeline:"), "{out}");
         assert!(out.contains("create cgroup b"), "{out}");
+    }
+
+    #[test]
+    fn pretty_renders_manifest_bound_io_provenance() {
+        let spec = IoModelSpec {
+            operation: IoModelOperation::SequentialWrite,
+            backing: IoModelBacking::FreshRawUnthrottledBlockDevice,
+            backing_capacity_bytes: 256 * 1024 * 1024,
+            open_mode: IoModelOpenMode::OSync,
+            write_size_bytes: 4096,
+            writes_per_cycle: 16,
+            flush: IoModelFlush::FdatasyncPerCycle,
+            queue_depth: 1,
+            calibration_scheduler: IoCalibrationScheduler::ScxKtstr,
+            declared_bytes_per_worker: 2 * 1024 * 1024,
+        };
+        let source = SourceScenario {
+            topology: SourceTopology {
+                numa_nodes: 1,
+                llcs: 1,
+                cores: 4,
+                threads: 1,
+            },
+            ..SourceScenario::new("io")
+        }
+        .step(SourceStep::new(
+            vec![SourceCgroupDef::named("io").work(
+                SourceWorkSpec::new(SourceWorkType::IoModelV1 { spec: spec.clone() }).workers(1),
+            )],
+            SourceHold::FULL,
+        ));
+        let profile = ResolvedIoProfile::frozen_v1(spec).expect("in-domain spec");
+        let ir = lower_with_options(
+            &source,
+            &LoweringOptions::default().with_io_profile(profile.clone()),
+        )
+        .expect("model lowers");
+        let out = pretty(&ir);
+        assert!(out.contains(&profile.profile_id), "{out}");
+        assert!(out.contains(&profile.calibration_manifest_sha256), "{out}");
+        assert!(out.contains("workers=1 guest-cpus=4"), "{out}");
+        assert!(out.contains("declared_bytes_per_worker: 2097152"), "{out}");
     }
 }

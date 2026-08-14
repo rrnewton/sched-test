@@ -837,6 +837,7 @@ pub fn load_rtapp(json_str: &str, nr_cpus: u32) -> Result<Scenario, RtAppError> 
 
     Ok(Scenario {
         nr_cpus,
+        required_scheduler_identity: None,
         smt_threads_per_core: 1,
         cpus_per_llc: 0,
         tasks: all_tasks,

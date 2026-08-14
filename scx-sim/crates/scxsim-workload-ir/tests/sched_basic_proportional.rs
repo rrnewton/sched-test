@@ -45,7 +45,9 @@
 //! simulator infidelity.
 
 use scxsim_workload_ir::{
-    lower, to_scenario, DurationNs, SourceCgroupDef, SourceHold, SourceScenario, SourceStep,
+    lower, lower_with_options, to_scenario, DurationNs, IoCalibrationScheduler, IoModelBacking,
+    IoModelFlush, IoModelOpenMode, IoModelOperation, IoModelSpec, LoweringOptions, Phase, Repeat,
+    ResolvedIoProfile, SourceCgroupDef, SourceHold, SourceScenario, SourceStep, SourceTopology,
     SourceWorkSpec, SourceWorkType,
 };
 
@@ -170,6 +172,187 @@ fn executes_on_the_simulator_and_produces_comparable_output() {
         pids.len(),
         total_runtime,
         occupancy
+    );
+}
+
+/// A resolved storage profile is calibrated under scx-ktstr and must not run
+/// under another scheduler. scx-sim has no scx-ktstr implementation today, so
+/// the production path must fail closed rather than normalize a `simple` run as
+/// in-domain evidence. A separate unbound Scenario below checks only the generic
+/// SystemCpu/Sleep/Park plumbing.
+#[test]
+fn resolved_storage_profile_requires_the_calibration_scheduler() {
+    use scx_simulator::{
+        DynamicScheduler, ExitKind, Phase as SimPhase, Pid, RepeatMode, Scenario, Simulator,
+        TaskBehavior, TaskDef, TraceKind,
+    };
+
+    let _guard = scx_simulator::SIM_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let source = SourceScenario {
+        duration: DurationNs::from_millis(100),
+        topology: SourceTopology {
+            numa_nodes: 1,
+            llcs: 1,
+            cores: 4,
+            threads: 1,
+        },
+        ..SourceScenario::new("resolved_io_sync_write")
+    }
+    .step(SourceStep::new(
+        vec![SourceCgroupDef::named("io").work(
+            SourceWorkSpec::new(SourceWorkType::IoModelV1 {
+                spec: IoModelSpec {
+                    operation: IoModelOperation::SequentialWrite,
+                    backing: IoModelBacking::FreshRawUnthrottledBlockDevice,
+                    backing_capacity_bytes: 256 * 1024 * 1024,
+                    open_mode: IoModelOpenMode::OSync,
+                    write_size_bytes: 4096,
+                    writes_per_cycle: 16,
+                    flush: IoModelFlush::FdatasyncPerCycle,
+                    queue_depth: 1,
+                    calibration_scheduler: IoCalibrationScheduler::ScxKtstr,
+                    declared_bytes_per_worker: 2 * 1024 * 1024,
+                },
+            })
+            .workers(1),
+        )],
+        SourceHold::FULL,
+    ));
+    let spec = match &source.steps[0].setup[0].works[0].work_type {
+        SourceWorkType::IoModelV1 { spec } => spec.clone(),
+        other => panic!("expected typed I/O model source, got {other:?}"),
+    };
+    let profile = ResolvedIoProfile::frozen_v1(spec).expect("spec is inside frozen v1");
+    let options = LoweringOptions::default().with_io_profile(profile.clone());
+    let ir = lower_with_options(&source, &options).expect("resolved profile lowers");
+    assert_eq!(ir.tasks[0].repeat, Repeat::Once);
+    assert_eq!(
+        ir.tasks[0].phases,
+        vec![
+            Phase::SystemCpu(profile.system_cpu_per_worker),
+            Phase::NonRunning(profile.nonrunning_per_worker),
+            Phase::Park,
+        ]
+    );
+
+    let scenario = to_scenario(&ir).expect("resolved profile ingests");
+    assert_eq!(scenario.required_scheduler_identity(), Some("ktstr"));
+    match scenario.tasks[0].behavior.phases.as_slice() {
+        [SimPhase::SystemCpu(system), SimPhase::Sleep(nonrunning), SimPhase::Park] => {
+            assert_eq!(*system, profile.system_cpu_per_worker.as_nanos());
+            assert_eq!(*nonrunning, profile.nonrunning_per_worker.as_nanos());
+        }
+        phases => panic!("unexpected model phases: {phases:?}"),
+    }
+    let rejected = Simulator::new(DynamicScheduler::simple()).run(scenario);
+    assert_eq!(
+        rejected.exit_kind(),
+        &ExitKind::ErrorSchedulerIdentityMismatch {
+            required: "ktstr".into(),
+            actual: "simple".into(),
+        }
+    );
+    assert!(
+        rejected.events().is_empty(),
+        "a scheduler mismatch must reject before simulation execution"
+    );
+
+    // Generic phase-semantics plumbing, deliberately not an IoModelV1
+    // Scenario and therefore not evidence about the calibrated profile.
+    let mut scenario = Scenario::builder()
+        .cpus(4)
+        .duration_ns(100_000_000)
+        .task(TaskDef {
+            name: "generic_phase_plumbing".into(),
+            pid: Pid(1),
+            nice: 0,
+            behavior: TaskBehavior {
+                phases: vec![
+                    SimPhase::SystemCpu(profile.system_cpu_per_worker.as_nanos()),
+                    SimPhase::Sleep(profile.nonrunning_per_worker.as_nanos()),
+                    SimPhase::Park,
+                ],
+                repeat: RepeatMode::Once,
+            },
+            start_time_ns: 0,
+            mm_id: None,
+            allowed_cpus: None,
+            parent_pid: None,
+            cgroup_name: None,
+            task_flags: 0,
+            migration_disabled: 0,
+        })
+        .build();
+    // Isolate the tagged phase invariant from optional simulator timing
+    // extras. The default-noise path is separately covered by ingestion: a
+    // SystemCpu tag cannot enter the generic Phase::Run jitter branch.
+    scenario.noise.enabled = false;
+    scenario.overhead.enabled = false;
+    scenario.sched_overhead_rbc_ns = None;
+    let trace = Simulator::new(DynamicScheduler::simple()).run(scenario);
+    assert_eq!(trace.exit_kind(), &ExitKind::Normal);
+    assert_eq!(
+        trace.total_runtime(Pid(1)),
+        profile.system_cpu_per_worker.as_nanos(),
+        "SystemCpu must be scheduled exactly, without generic compute jitter"
+    );
+    assert!(
+        trace
+            .events()
+            .iter()
+            .any(|event| matches!(event.kind, TraceKind::TaskSlept { pid } if pid == Pid(1))),
+        "NonRunning must make the task unrunnable"
+    );
+    assert!(
+        trace
+            .events()
+            .iter()
+            .any(|event| matches!(event.kind, TraceKind::TaskParked { pid } if pid == Pid(1))),
+        "the trace must prove that the fixed volume reached its terminal park"
+    );
+    assert!(
+        trace
+            .events()
+            .iter()
+            .all(|event| !matches!(event.kind, TraceKind::TaskCompleted { pid } if pid == Pid(1))),
+        "the measured VM worker parks after its fixed volume; it must not become Exited"
+    );
+
+    let mut truncated = Scenario::builder()
+        .cpus(4)
+        .duration_ns(1_000_000)
+        .task(TaskDef {
+            name: "generic_truncated_phase_plumbing".into(),
+            pid: Pid(1),
+            nice: 0,
+            behavior: TaskBehavior {
+                phases: vec![
+                    SimPhase::SystemCpu(profile.system_cpu_per_worker.as_nanos()),
+                    SimPhase::Sleep(profile.nonrunning_per_worker.as_nanos()),
+                    SimPhase::Park,
+                ],
+                repeat: RepeatMode::Once,
+            },
+            start_time_ns: 0,
+            mm_id: None,
+            allowed_cpus: None,
+            parent_pid: None,
+            cgroup_name: None,
+            task_flags: 0,
+            migration_disabled: 0,
+        })
+        .build();
+    truncated.noise.enabled = false;
+    truncated.overhead.enabled = false;
+    truncated.sched_overhead_rbc_ns = None;
+    let truncated_trace = Simulator::new(DynamicScheduler::simple()).run(truncated);
+    assert_eq!(
+        truncated_trace.exit_kind(),
+        &ExitKind::ErrorTerminalParkNotReached { pid: Pid(1) },
+        "a run that never reaches the fixed-volume Park must not report Normal"
     );
 }
 

@@ -666,6 +666,7 @@ fn emit_event(event: &TraceEvent, writer: &mut impl Write) -> io::Result<()> {
         | TraceKind::TaskPreempted { .. }
         | TraceKind::TaskYielded { .. }
         | TraceKind::TaskSlept { .. }
+        | TraceKind::TaskParked { .. }
         | TraceKind::TaskWoke { .. }
         | TraceKind::TaskCompleted { .. }
         | TraceKind::CpuIdle

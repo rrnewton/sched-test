@@ -49,7 +49,9 @@ use std::path::Path;
 
 use scx_simulator::prelude::*;
 use scx_simulator::TraceKind;
-use scxsim_workload_ir::{lower, to_scenario, SourceScenario, WorkloadIr};
+use scxsim_workload_ir::{
+    lower, lower_with_options, to_scenario, LoweringOptions, SourceScenario, WorkloadIr,
+};
 
 /// Everything that went wrong, named at the stage it went wrong.
 #[derive(Debug)]
@@ -103,6 +105,34 @@ pub fn compile(path: &Path) -> Result<Compiled, ReplayError> {
 /// Compile an already-deserialised record.
 pub fn compile_source(source: &SourceScenario) -> Result<Compiled, ReplayError> {
     let ir = lower(source).map_err(|e| ReplayError::Lower(format!("{e:?}")))?;
+    let scenario = to_scenario(&ir).map_err(|e| ReplayError::Ingest(format!("{e:?}")))?;
+    Ok(Compiled { scenario, ir })
+}
+
+/// Read and compile an explicitly abstract IoModelV1 record.
+///
+/// This is deliberately not named replay: an IoModelV1 source is a separate,
+/// typed simulator model paired with VM measurements, not the fieldless ktstr
+/// record the VM backend executed.
+pub fn compile_model(path: &Path, options: &LoweringOptions) -> Result<Compiled, ReplayError> {
+    let bytes = std::fs::read(path).map_err(ReplayError::Read)?;
+    let source: SourceScenario = serde_json::from_slice(&bytes).map_err(ReplayError::Schema)?;
+    compile_model_source(&source, options)
+}
+
+/// Compile an already-deserialised, explicitly abstract IoModelV1 source.
+pub fn compile_model_source(
+    source: &SourceScenario,
+    options: &LoweringOptions,
+) -> Result<Compiled, ReplayError> {
+    let ir =
+        lower_with_options(source, options).map_err(|e| ReplayError::Lower(format!("{e:?}")))?;
+    if ir.applied_io_profiles.len() != 1 {
+        return Err(ReplayError::Lower(format!(
+            "compile_model_source requires exactly one applied IoModelV1 profile, got {}",
+            ir.applied_io_profiles.len()
+        )));
+    }
     let scenario = to_scenario(&ir).map_err(|e| ReplayError::Ingest(format!("{e:?}")))?;
     Ok(Compiled { scenario, ir })
 }
@@ -221,4 +251,81 @@ pub fn cpuset_violations(scenario: &Scenario, trace: &Trace) -> Vec<CpusetViolat
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use scxsim_workload_ir::{
+        IoCalibrationScheduler, IoModelBacking, IoModelFlush, IoModelOpenMode, IoModelOperation,
+        IoModelSpec, Phase, Repeat, ResolvedIoProfile, SourceCgroupDef, SourceHold, SourceStep,
+        SourceWorkSpec, SourceWorkType,
+    };
+
+    #[test]
+    fn ordinary_replay_is_refused_and_typed_model_forwards_its_profile() {
+        let ordinary = SourceScenario::new("ordinary-io").step(SourceStep::new(
+            vec![SourceCgroupDef::named("io")
+                .work(SourceWorkSpec::new(SourceWorkType::IoSyncWrite).workers(1))],
+            SourceHold::FULL,
+        ));
+        assert!(matches!(
+            compile_source(&ordinary),
+            Err(ReplayError::Lower(message)) if message.contains("UnmodelledIoSource")
+        ));
+        let cpu_only = SourceScenario::new("not-a-model").step(SourceStep::new(
+            vec![SourceCgroupDef::named("cpu")
+                .work(SourceWorkSpec::new(SourceWorkType::SpinWait).workers(1))],
+            SourceHold::FULL,
+        ));
+        assert!(matches!(
+            compile_model_source(&cpu_only, &LoweringOptions::default()),
+            Err(ReplayError::Lower(message)) if message.contains("exactly one applied IoModelV1")
+        ));
+
+        let spec = IoModelSpec {
+            operation: IoModelOperation::SequentialWrite,
+            backing: IoModelBacking::FreshRawUnthrottledBlockDevice,
+            backing_capacity_bytes: 256 * 1024 * 1024,
+            open_mode: IoModelOpenMode::OSync,
+            write_size_bytes: 4096,
+            writes_per_cycle: 16,
+            flush: IoModelFlush::FdatasyncPerCycle,
+            queue_depth: 1,
+            calibration_scheduler: IoCalibrationScheduler::ScxKtstr,
+            declared_bytes_per_worker: 2 * 1024 * 1024,
+        };
+        let source = SourceScenario {
+            topology: scxsim_workload_ir::SourceTopology {
+                numa_nodes: 1,
+                llcs: 1,
+                cores: 4,
+                threads: 1,
+            },
+            ..SourceScenario::new("modelled-io")
+        }
+        .step(SourceStep::new(
+            vec![SourceCgroupDef::named("io").work(
+                SourceWorkSpec::new(SourceWorkType::IoModelV1 { spec: spec.clone() }).workers(1),
+            )],
+            SourceHold::FULL,
+        ));
+        assert!(matches!(
+            compile_source(&source),
+            Err(ReplayError::Lower(message)) if message.contains("MissingIoProfile")
+        ));
+
+        let profile = ResolvedIoProfile::frozen_v1(spec).expect("spec is inside frozen v1");
+        let options = LoweringOptions::default().with_io_profile(profile.clone());
+        let compiled = compile_model_source(&source, &options).expect("profile is forwarded");
+        assert_eq!(compiled.ir.tasks[0].repeat, Repeat::Once);
+        assert_eq!(
+            compiled.ir.tasks[0].phases,
+            vec![
+                Phase::SystemCpu(profile.system_cpu_per_worker),
+                Phase::NonRunning(profile.nonrunning_per_worker),
+                Phase::Park,
+            ]
+        );
+    }
 }

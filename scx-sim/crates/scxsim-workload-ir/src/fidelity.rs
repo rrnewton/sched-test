@@ -68,8 +68,10 @@ pub enum Cause {
     /// Page placement, working-set sweeps, fault churn. The simulator models
     /// NUMA topology but not page residency.
     MemoryPlacement,
-    /// Real I/O. Off-CPU *time* is preserved (it is scheduler state); the
-    /// device, queue, and byte counts are not.
+    /// Real I/O. An exactly matched typed profile can preserve resolved
+    /// task-context system time and model a measured non-running estimate as
+    /// scheduler state; the device and queue mechanism are not simulated.
+    /// Ordinary fieldless storage records are always refused.
     IoMechanism,
     /// The specific mechanism a task blocks or is woken by (futex vs pipe vs
     /// epoll vs signal). The wake edge is preserved; which syscall produced it
@@ -114,7 +116,9 @@ impl Cause {
                 "microarchitectural effect; the simulator models elapsed time and scheduler state only"
             }
             Cause::MemoryPlacement => "page placement; the simulator models NUMA topology but not residency",
-            Cause::IoMechanism => "I/O mechanism; off-CPU time is preserved, the device is not modelled",
+            Cause::IoMechanism => {
+                "I/O mechanism; an exact typed profile supplies task time and a non-running estimate, the device is not modelled"
+            }
             Cause::BlockingMechanism => "block/wake mechanism; the wake edge is preserved, the syscall is not",
             Cause::DynamicSchedAttr => "runtime sched-attribute change lowered to an initial attribute",
             Cause::TaskLifecycle => "task create/exit churn folded into a fixed task set",

@@ -102,6 +102,19 @@ pub(crate) fn write_json(trace: &Trace, writer: &mut impl Write) -> std::io::Res
                 })
             }
 
+            TraceKind::TaskParked { pid } => {
+                json!({
+                    "ph": "i",
+                    "pid": cpu,
+                    "tid": 0,
+                    "ts": ts,
+                    "cat": "sched",
+                    "name": "parked",
+                    "s": "t",
+                    "args": { "reason": "parked", "pid": pid.0 }
+                })
+            }
+
             TraceKind::TaskCompleted { pid } => {
                 json!({
                     "ph": "E",

@@ -88,6 +88,11 @@ impl<S: Scheduler> SchedulerWrapper<S> {
         &self.inner
     }
 
+    /// Stable identity of the scheduler implementation behind this wrapper.
+    pub fn identity(&self) -> &str {
+        self.inner.identity()
+    }
+
     // ------------------------------------------------------------------
     // Mandatory callbacks
     // ------------------------------------------------------------------

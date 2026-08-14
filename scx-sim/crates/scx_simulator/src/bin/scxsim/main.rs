@@ -603,6 +603,8 @@ fn main() {
     //  * 43 — ExitKind::ErrorBpf (scheduler called scx_bpf_error())
     //  * 44 — ExitKind::ErrorDispatchLoopExhausted
     //  * 45 — ExitKind::ErrorCgroupExhausted
+    //  * 46 — ExitKind::ErrorTerminalParkNotReached
+    //  * 47 — ExitKind::ErrorSchedulerIdentityMismatch
     //
     // For each non-Normal ExitKind we additionally print a stable
     // single-line stderr marker `scxsim: ExitKind::<Variant> ...` so
@@ -621,7 +623,7 @@ fn main() {
 }
 
 /// Top-level run errors. Either a generic CLI/IO failure (exit 1) or a
-/// structured `ExitKind` from the simulator (mapped to 42-45 by exit code).
+/// structured `ExitKind` from the simulator (mapped to 42-47 by exit code).
 enum RunError {
     Generic(String),
     Sim(ExitKind),
@@ -647,6 +649,8 @@ fn exit_code_for(kind: &ExitKind) -> i32 {
         ExitKind::ErrorBpf(_) => 43,
         ExitKind::ErrorDispatchLoopExhausted { .. } => 44,
         ExitKind::ErrorCgroupExhausted { .. } => 45,
+        ExitKind::ErrorTerminalParkNotReached { .. } => 46,
+        ExitKind::ErrorSchedulerIdentityMismatch { .. } => 47,
     }
 }
 
@@ -677,6 +681,18 @@ fn print_exit_marker(kind: &ExitKind) {
             eprintln!(
                 "scxsim: ExitKind::ErrorCgroupExhausted cgroup_name={cgroup_name:?} \
                  active_count={active_count} max_cgroups={max_cgroups}"
+            );
+        }
+        ExitKind::ErrorTerminalParkNotReached { pid } => {
+            eprintln!(
+                "scxsim: ExitKind::ErrorTerminalParkNotReached pid={}",
+                pid.0
+            );
+        }
+        ExitKind::ErrorSchedulerIdentityMismatch { required, actual } => {
+            eprintln!(
+                "scxsim: ExitKind::ErrorSchedulerIdentityMismatch required={required:?} \
+                 actual={actual:?}"
             );
         }
     }
@@ -1441,7 +1457,7 @@ fn run_simulation(args: &RunArgs, scenario: Scenario) -> Result<(), RunError> {
 
     if trace.has_error() {
         // Surface the typed ExitKind so the top-level main() can map it to
-        // the stable per-variant exit code (42-45). The Debug-format string
+        // the stable per-variant exit code (42-47). The Debug-format string
         // path was the previous behavior; it always became `exit 1` plus a
         // wall-of-text "error: simulation error: …". The new path emits a
         // single stable stderr marker and the per-variant exit code.
