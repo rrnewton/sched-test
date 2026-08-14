@@ -163,7 +163,8 @@ impl Ctx {
             format!("Run({DEFAULT_SLICE})"),
             Cause::UnspecifiedWorkQuantum,
             format!(
-                "{what}: the source declares the behaviour but not how much work                  per phase; {DEFAULT_SLICE} supplied by the lowering"
+                "{what}: the source declares the behaviour but not how much work per \
+                 phase; {DEFAULT_SLICE} supplied by the lowering"
             ),
         );
         DEFAULT_SLICE
@@ -514,11 +515,22 @@ fn continuous_run(ctx: &Ctx) -> Phase {
 fn plan_work(ctx: &mut Ctx, wt: &SourceWorkType, src: &str, n: u32) -> Result<Plan, LoweringError> {
     use SourceWorkType as W;
     let forever = continuous_run(ctx);
-    // Bare DEFAULT_SLICE. Every arm reaching for it MUST also disclose that it
-    // was invented — the arms below that already call `ctx.approx` are
-    // non-exact for other reasons, and the ones that were not are fixed to go
-    // through `ctx.invented_slice`. See the audit note on `DEFAULT_SLICE`.
-    let spin = DEFAULT_SLICE;
+    // THERE IS DELIBERATELY NO BARE `spin = DEFAULT_SLICE` BINDING HERE.
+    //
+    // There used to be, guarded by a comment asking every arm that reached for
+    // it to disclose the invention. Twelve arms did not: they recorded some
+    // OTHER cause (IoMechanism, Microarchitectural, TaskLifecycle, ...) and
+    // then used the bare value, so the fabricated quantum was never recorded as
+    // `UnspecifiedWorkQuantum` — which is the cause the port gate filters on.
+    // The old tripwire could not see them because it only examined arms
+    // reporting `Exact`, and these do not.
+    //
+    // A convention that must be remembered at twelve call sites is not a
+    // convention. Every arm now calls `ctx.invented_slice`, which returns the
+    // value AND records it, so the two cannot come apart. Do not reintroduce a
+    // shared binding; take the slice from `invented_slice` at the point of use.
+    // `an_invented_quantum_is_recorded_as_one_even_when_something_else_is_too`
+    // enforces this.
 
     let plan = match wt {
         // ---- exact: pure time, nothing dropped -------------------------------
@@ -576,6 +588,7 @@ fn plan_work(ctx: &mut Ctx, wt: &SourceWorkType, src: &str, n: u32) -> Result<Pl
             )
         }
         W::AluHot { width } => {
+            let spin = ctx.invented_slice(src, "AluHot spin duration");
             ctx.approx(
                 src,
                 format!("Run({spin})"),
@@ -585,6 +598,7 @@ fn plan_work(ctx: &mut Ctx, wt: &SourceWorkType, src: &str, n: u32) -> Result<Pl
             uniform("aluhot", n, vec![Phase::Run(spin)])
         }
         W::SmtSiblingSpin => {
+            let spin = ctx.invented_slice(src, "SmtSiblingSpin spin duration");
             ctx.approx(
                 src,
                 format!("Run({spin})"),
@@ -614,6 +628,7 @@ fn plan_work(ctx: &mut Ctx, wt: &SourceWorkType, src: &str, n: u32) -> Result<Pl
             uniform("ipcvar", n, vec![Phase::Run(hot), Phase::Run(cold)])
         }
         W::CachePressure { size_kib, stride } => {
+            let spin = ctx.invented_slice(src, "CachePressure sweep duration");
             ctx.approx(
                 src,
                 format!("Run({spin})"),
@@ -623,6 +638,7 @@ fn plan_work(ctx: &mut Ctx, wt: &SourceWorkType, src: &str, n: u32) -> Result<Pl
             uniform("cachepress", n, vec![Phase::Run(spin)])
         }
         W::CacheYield { size_kib, stride } => {
+            let spin = ctx.invented_slice(src, "CacheYield work between yields");
             ctx.approx(
                 src,
                 format!("Run({spin}) Yield"),
@@ -636,6 +652,7 @@ fn plan_work(ctx: &mut Ctx, wt: &SourceWorkType, src: &str, n: u32) -> Result<Pl
             burst_iters,
         } => {
             let burst = ctx.iters(src, "burst_iters", *burst_iters);
+            let spin = ctx.invented_slice(src, "CachePipe blocked duration");
             ctx.approx(
                 src,
                 format!("Run({burst}) Sleep({spin})"),
@@ -685,18 +702,23 @@ fn plan_work(ctx: &mut Ctx, wt: &SourceWorkType, src: &str, n: u32) -> Result<Pl
 
         // ---- I/O: off-CPU time kept, device dropped -------------------------
         W::IoSyncWrite | W::IoRandRead | W::IoConvoy => {
+            let spin = ctx.invented_slice(src, "I/O compute and off-CPU wait durations");
             ctx.approx(
                 src,
                 format!("Run({spin}) Sleep({spin})"),
                 Cause::IoMechanism,
-                "block device, queue depth and byte counts are not modelled; the \
-                 off-CPU wait is preserved as Sleep"
+                "block device, queue depth and byte counts are not modelled. The \
+                 off-CPU wait is represented as a Sleep phase, but its DURATION is \
+                 the lowering's invention, not the device's — see the \
+                 UnspecifiedWorkQuantum record for the same source. Do not read \
+                 this as a preserved wait time."
                     .into(),
             );
             uniform("io", n, vec![Phase::Run(spin), Phase::Sleep(spin)])
         }
         W::PipeIo { burst_iters } => {
             let burst = ctx.iters(src, "burst_iters", *burst_iters);
+            let spin = ctx.invented_slice(src, "PipeIo blocked duration");
             ctx.approx(
                 src,
                 format!("Run({burst}) Sleep({spin})"),
@@ -825,7 +847,10 @@ fn plan_work(ctx: &mut Ctx, wt: &SourceWorkType, src: &str, n: u32) -> Result<Pl
             let period = if *produce_rate_hz > 0 {
                 DurationNs::from_nanos(1_000_000_000 / produce_rate_hz)
             } else {
-                DEFAULT_SLICE
+                // produce_rate_hz = 0 declares no rate at all, so the period
+                // below is entirely the lowering's. Disclosed as such; the
+                // nonzero branch is a real conversion and is not.
+                ctx.invented_slice(src, "ProducerConsumer period (produce_rate_hz = 0)")
             };
             ctx.approx(
                 src,
@@ -1022,6 +1047,7 @@ fn plan_work(ctx: &mut Ctx, wt: &SourceWorkType, src: &str, n: u32) -> Result<Pl
 
         // ---- lifecycle / sched-attribute churn ------------------------------
         W::ForkExit => {
+            let spin = ctx.invented_slice(src, "ForkExit per-task run duration");
             ctx.approx(
                 src,
                 format!("Run({spin}) once, {n} task(s)"),
@@ -1038,6 +1064,7 @@ fn plan_work(ctx: &mut Ctx, wt: &SourceWorkType, src: &str, n: u32) -> Result<Pl
             }
         }
         W::NiceSweep => {
+            let spin = ctx.invented_slice(src, "NiceSweep per-task run duration");
             ctx.approx(
                 src,
                 format!("Run({spin}) at a fixed nice"),
@@ -1102,6 +1129,7 @@ fn plan_work(ctx: &mut Ctx, wt: &SourceWorkType, src: &str, n: u32) -> Result<Pl
             )
         }
         W::CgroupAttachStorm { dest, reap } => {
+            let spin = ctx.invented_slice(src, "CgroupAttachStorm per-task run duration");
             ctx.approx(
                 src,
                 format!("Run({spin})"),
@@ -1765,6 +1793,58 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Fabricating a quantum must be disclosed AS a fabrication, whatever else
+    /// the arm discloses.
+    ///
+    /// The tripwire above is scoped to arms that report `Exact`, which leaves a
+    /// hole: an arm that records SOME approximation escapes it entirely and can
+    /// then use `DEFAULT_SLICE` freely. `IoSyncWrite` is the worked example —
+    /// it records `IoMechanism` ("block device, queue depth and byte counts are
+    /// not modelled; the off-CPU wait is preserved as Sleep") and then lowers
+    /// to `Run(500us) Sleep(500us)`, both invented. A reader of that report is
+    /// told the device was dropped and told the off-CPU wait was PRESERVED,
+    /// which is the opposite of true: the wait is `DEFAULT_SLICE`.
+    ///
+    /// This matters beyond tidiness because `UnspecifiedWorkQuantum` is the
+    /// documented port gate — a scenario whose lowering records it against the
+    /// construct its assertion depends on is meant to be treated as not-ported,
+    /// however green it comes out. An arm that fabricates a quantum while
+    /// recording only `IoMechanism` walks straight through that gate.
+    #[test]
+    fn an_invented_quantum_is_recorded_as_one_even_when_something_else_is_too() {
+        let mut offenders: Vec<(&str, Vec<Cause>)> = Vec::new();
+        for wt in all_supported_work_types() {
+            let name = wt.variant_name();
+            let ir = lower(&scenario_with(wt)).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let fabricated = ir
+                .tasks
+                .iter()
+                .flat_map(|t| &t.phases)
+                .any(|p| matches!(p, Phase::Run(d) | Phase::Sleep(d) if *d == DEFAULT_SLICE));
+            if !fabricated {
+                continue;
+            }
+            let disclosed = ir
+                .fidelity
+                .by_cause(Cause::UnspecifiedWorkQuantum)
+                .next()
+                .is_some();
+            if !disclosed {
+                offenders.push((name, ir.fidelity.causes()));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these arms lower to a DEFAULT_SLICE ({DEFAULT_SLICE}) phase the source \
+             never specified, without recording Cause::UnspecifiedWorkQuantum. \
+             They disclose only: {offenders:#?}\n\n\
+             Route the duration through `Ctx::invented_slice` (which records the \
+             right cause) IN ADDITION to whatever else the arm records. Recording \
+             a different cause is not a substitute: UnspecifiedWorkQuantum is what \
+             the port gate filters on.",
+        );
     }
 
     /// `Bursty` is the control: it MUST stay exact, and its phases must be the
