@@ -38,7 +38,8 @@ out, and where the boundaries live.
 | **Hardware interrupts** | Only the scheduling tick and the cgroup-accounting timer are simulated as interrupt-like events. |
 | **CPU frequency / voltage** | No DVFS modeling. Tasks compute at a fixed virtual rate. |
 | **CFS / fair-class scheduler** | scxsim simulates *sched_ext*, not the rest of Linux's scheduler classes. |
-| **Real syscalls** | rt-app's `lock`/`unlock`/`signal`/`mem`/`iorun` and similar actions are accepted by the parser but skipped with a one-line warning. |
+| **Real syscalls** | rt-app's `lock`/`unlock`/`signal`/`mem` and similar actions are accepted by the parser but skipped with a one-line warning. `iorun` is the exception: it resolves through a calibrated profile (below) or is refused. |
+| **Storage devices** | No block layer, queue or device model. rt-app's `iorun` is supported only through the frozen `rtapp-iorun-devnull-v1` profile — buffered `write(2)` to `/dev/null`, where cost is the *syscall count* `ceil(bytes / mem_buffer_size)` and nothing blocks. Outside that regime the parser **errors** rather than guessing. |
 | **Kernel preemption inside scheduler code** | Mid-callback preemption is opt-in via `--preemptive` (uses PMU or e9patch); the default is run-to-yield. |
 
 ## Where the boundary actually lives

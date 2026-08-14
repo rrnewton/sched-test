@@ -68,11 +68,46 @@ rt-app workloads captured from a kernel) but have no effect in
 scxsim, because the underlying subsystem is not modeled. A warning is
 emitted on parse:
 
-`lock`, `unlock`, `wait`, `signal`, `broad`, `sync`, `mem`, `iorun`,
-`yield`, `barrier`, `fork`.
+`lock`, `unlock`, `wait`, `signal`, `broad`, `sync`, `mem`,
+`barrier`, `fork`.
+
+`yield` and `iorun` are **not** in that list, though earlier revisions
+of this page said they were. `yield` maps to `Phase::Yield`, and
+`iorun` is described below.
 
 See [Concepts → What scxsim Simulates](./what-scxsim-simulates.md)
 for what is and isn't modeled and why.
+
+### `iorun` — supported through one calibrated profile, or refused
+
+`"iorun": <bytes>` is declared in bytes, exactly as I/O model v1's
+input is. Its physics are the opposite: rt-app's `ioload()` is a
+*buffered, unsynced* `write(2)` loop whose `io_device` defaults to
+`/dev/null`, so it never blocks. Cost is driven by the **number of
+`write` calls**, `ceil(bytes / global.mem_buffer_size)` — not by the
+byte count, because `/dev/null` consumes a write without copying it.
+
+Two consequences that surprise people:
+
+- **`global.mem_buffer_size` is required, not decorative.** The same
+  `"iorun"` value with a different buffer costs proportionally
+  differently. Holding declared bytes fixed and sweeping the buffer
+  moved measured cost 215×.
+- **rt-app's own default buffer is 4 MiB**, so a default-configured
+  `"iorun": 8388608` is *two* syscalls costing about a microsecond —
+  not "8 MiB of I/O".
+
+An `iorun` outside the calibrated regime is a **parse error**, not a
+skipped event. Refused cases: any `io_device` other than `/dev/null`;
+declared bytes above 2,147,483,647 (rt-app's own 32-bit `int`
+saturates there and would silently shrink the workload);
+`mem_buffer_size` outside 4 KiB–1 MiB; a resolved call count outside
+512–65,536. A dropped event fails visibly; a wrongly-modelled one does
+not.
+
+Evidence, including the blind held-out evaluation:
+`experiments/io_model_rtapp_iorun_20260814/` in the development
+harness.
 
 ## Cgroup hierarchy
 

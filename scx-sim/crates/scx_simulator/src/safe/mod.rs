@@ -37,6 +37,7 @@ pub mod perf;
 pub(crate) mod perfetto;
 pub(crate) mod perfetto_pb;
 pub mod rtapp;
+pub mod rtapp_iorun;
 pub mod scenario;
 pub mod starvation;
 pub mod stats;

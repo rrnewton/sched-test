@@ -10,6 +10,11 @@
 //! - `suspend` — self-suspend until resumed (mapped to `Phase::Sleep(u64::MAX)`)
 //! - `resume` — wake another task (mapped to [`Phase::Wake`])
 //! - `yield` — call `sched_yield()` (mapped to [`Phase::Yield`])
+//! - `iorun` — buffered `write(2)` volume, resolved through the frozen
+//!   `rtapp-iorun-devnull-v1` profile to one [`Phase::SystemCpu`] interval.
+//!   See [`crate::safe::rtapp_iorun`]; the profile **refuses** any declaration
+//!   outside the regime it was calibrated on rather than reusing the
+//!   coefficient.
 //! - `timer` — periodic timer (approximated as `Phase::Sleep(period)`)
 //! - `priority` — nice value
 //! - `loop` — repetition control
@@ -27,7 +32,10 @@
 //! - JSON files with duplicate keys (common in rt-app) must be preprocessed
 //!   with rt-app's `workgen` script or use suffixed keys (`"run0"`, `"run1"`).
 //! - Unsupported events (`lock`, `unlock`, `wait`, `signal`, `broad`, `sync`,
-//!   `mem`, `iorun`, `barrier`, `fork`) are skipped with a warning.
+//!   `mem`, `barrier`, `fork`) are skipped with a warning.
+//! - `iorun` is **not** skipped, and an out-of-domain `iorun` is an error
+//!   rather than a warning. A dropped event fails visibly; a wrongly-modelled
+//!   one does not, so the profile refuses instead of guessing.
 //! - Phase-level `taskgroup` migration is not modeled.
 
 use std::collections::{BTreeSet, HashMap};
@@ -35,6 +43,7 @@ use std::collections::{BTreeSet, HashMap};
 use serde_json::{Map, Value};
 use tracing::{info, warn};
 
+use crate::safe::rtapp_iorun::{self, IoRunGlobals, IoRunRefusal};
 use crate::scenario::{
     sched_overhead_rbc_ns_from_env, seed_from_env, CgroupBandwidth, CgroupDef, IrqEvent, IrqType,
     NoiseConfig, OverheadConfig, Scenario, DEFAULT_WATCHDOG_TIMEOUT_NS,
@@ -53,6 +62,13 @@ pub enum RtAppError {
     InvalidValue(String),
     /// Unresolved task reference in `resume`.
     UnresolvedResume(String),
+    /// An `iorun` declaration the frozen profile is not calibrated for.
+    ///
+    /// This is deliberately an error rather than a skipped event: silently
+    /// dropping declared I/O work produces a scenario that is quietly missing
+    /// it, and silently modelling it with the wrong coefficients produces a
+    /// confident number about a different workload.
+    UnmodelledIoRun(IoRunRefusal),
 }
 
 impl std::fmt::Display for RtAppError {
@@ -61,6 +77,9 @@ impl std::fmt::Display for RtAppError {
             RtAppError::Json(e) => write!(f, "JSON parse error: {e}"),
             RtAppError::MissingField(field) => write!(f, "missing required field: {field}"),
             RtAppError::InvalidValue(msg) => write!(f, "invalid value: {msg}"),
+            RtAppError::UnmodelledIoRun(why) => {
+                write!(f, "cannot model rt-app `iorun`: {why}")
+            }
             RtAppError::UnresolvedResume(name) => {
                 write!(f, "unresolved resume target: {name:?}")
             }
@@ -140,6 +159,7 @@ const TASK_PHASE_KEYS: &[&str] = &[
 fn parse_events(
     obj: &Map<String, Value>,
     name_to_pid: &HashMap<String, Pid>,
+    io_globals: &IoRunGlobals,
 ) -> Result<Vec<Phase>, RtAppError> {
     let mut phases = Vec::new();
 
@@ -201,6 +221,31 @@ fn parse_events(
                 // `yield` event; the JSON value is parsed but ignored (verified
                 // by strace: `"yield": 1` and `"yield": 7` both yield once).
                 phases.push(Phase::Yield);
+            }
+            "iorun" => {
+                // Declared in bytes, exactly as I/O model v1's input is — and
+                // with opposite physics. Cost tracks the number of `write(2)`
+                // calls, `ceil(bytes / mem_buffer_size)`, not the byte count:
+                // `/dev/null` consumes the iterator without copying, so a call
+                // costs the same whatever its size. `mem_buffer_size` is
+                // therefore load-bearing, and the profile refuses a regime it
+                // was not calibrated on instead of reusing the coefficient.
+                let declared = value
+                    .as_u64()
+                    .or_else(|| value.as_i64().map(|v| v as u64))
+                    .ok_or_else(|| RtAppError::InvalidValue(format!("{key}: expected integer")))?;
+                let resolved = rtapp_iorun::resolve(declared, io_globals)
+                    .map_err(RtAppError::UnmodelledIoRun)?;
+                info!(
+                    profile_id = resolved.profile_id,
+                    calibration_manifest_sha256 = resolved.calibration_manifest_sha256,
+                    declared_bytes = resolved.declared_bytes,
+                    mem_buffer_size = resolved.mem_buffer_size,
+                    write_calls = resolved.write_calls,
+                    system_cpu_ns = resolved.system_cpu_ns,
+                    "resolved rt-app iorun through the frozen calibrated profile"
+                );
+                phases.push(Phase::SystemCpu(resolved.system_cpu_ns));
             }
             unsupported => {
                 warn!(
@@ -483,6 +528,7 @@ fn parse_task(
     pid_start: &mut i32,
     name_to_pid: &HashMap<String, Pid>,
     cgroup_bandwidth: &mut HashMap<String, CgroupBandwidth>,
+    io_globals: &IoRunGlobals,
 ) -> Result<Vec<TaskDef>, RtAppError> {
     let instance_count = obj.get("instance").and_then(|v| v.as_u64()).unwrap_or(1) as u32;
 
@@ -522,7 +568,7 @@ fn parse_task(
 
             let phase_loop = phase_obj.get("loop").and_then(|v| v.as_i64()).unwrap_or(1);
 
-            let events = parse_events(phase_obj, name_to_pid)?;
+            let events = parse_events(phase_obj, name_to_pid, io_globals)?;
 
             if phase_loop <= 0 || phase_loop == 1 {
                 all.extend(events);
@@ -535,7 +581,7 @@ fn parse_task(
         all
     } else {
         // Single-phase task: events are directly in the task object
-        parse_events(obj, name_to_pid)?
+        parse_events(obj, name_to_pid, io_globals)?
     };
 
     if all_phases.is_empty() {
@@ -687,6 +733,27 @@ pub fn load_rtapp(json_str: &str, nr_cpus: u32) -> Result<Scenario, RtAppError> 
         10_000_000_000
     };
 
+    // The two globals the `iorun` profile requires. Both fall back to
+    // rt-app's own defaults (`parse_global`), because that is what rt-app
+    // itself would use — and `mem_buffer_size`'s default of 4 MiB is large
+    // enough that a plausible-looking `iorun` becomes a handful of syscalls,
+    // which is precisely why the profile refuses rather than guesses.
+    let io_globals = root_obj
+        .get("global")
+        .and_then(|g| g.as_object())
+        .map(|g| IoRunGlobals {
+            io_device: g
+                .get("io_device")
+                .and_then(|v| v.as_str())
+                .unwrap_or(rtapp_iorun::RTAPP_IORUN_DEFAULT_DEVICE)
+                .to_string(),
+            mem_buffer_size: g
+                .get("mem_buffer_size")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(rtapp_iorun::RTAPP_IORUN_DEFAULT_MEM_BUFFER_SIZE),
+        })
+        .unwrap_or_default();
+
     let tasks_obj = root_obj
         .get("tasks")
         .and_then(|v| v.as_object())
@@ -805,6 +872,7 @@ pub fn load_rtapp(json_str: &str, nr_cpus: u32) -> Result<Scenario, RtAppError> 
             &mut pid_counter,
             &name_to_pid,
             &mut cgroup_bandwidth,
+            &io_globals,
         )?;
         all_tasks.extend(defs);
     }
@@ -1061,6 +1129,105 @@ mod tests {
         assert!(matches!(task.behavior.phases[0], Phase::Run(2_000_000)));
         // timer period 16667 usec = 16667000 ns
         assert!(matches!(task.behavior.phases[1], Phase::Sleep(16_667_000)));
+    }
+
+    // ---- iorun: the second calibrated I/O profile ------------------------
+    //
+    // Evidence: experiments/io_model_rtapp_iorun_20260814/. The profile scored
+    // 70/70 blind at ARE <= 20%; v1's coefficients applied to the same bytes
+    // scored 0/70.
+
+    fn iorun_json(declared: u64, mem_buffer_size: u64, io_device: &str) -> String {
+        serde_json::json!({
+            "tasks": { "io0": { "instance": 1, "loop": 1, "iorun": declared } },
+            "global": {
+                "duration": 1,
+                "io_device": io_device,
+                "mem_buffer_size": mem_buffer_size
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn iorun_lowers_to_one_system_cpu_phase_and_nothing_else() {
+        let s = load_rtapp(&iorun_json(33_554_432, 16_384, "/dev/null"), 4).unwrap();
+        assert_eq!(s.tasks.len(), 1);
+        // 2048 write() calls at the frozen 218625/2048 ns each, and exactly
+        // one phase: no NonRunning, no Park, no alternation structure.
+        assert_eq!(s.tasks[0].behavior.phases.len(), 1);
+        assert!(matches!(
+            s.tasks[0].behavior.phases[0],
+            Phase::SystemCpu(218_625)
+        ));
+    }
+
+    /// The claim the whole profile exists for. Same declared bytes, different
+    /// `mem_buffer_size`, eight times the cost. A byte-count model is flat here.
+    #[test]
+    fn iorun_cost_tracks_calls_not_declared_bytes() {
+        let bytes = 1_073_741_824;
+        let coarse = load_rtapp(&iorun_json(bytes, 262_144, "/dev/null"), 4).unwrap();
+        let fine = load_rtapp(&iorun_json(bytes, 32_768, "/dev/null"), 4).unwrap();
+        let ns = |s: &Scenario| match s.tasks[0].behavior.phases[0] {
+            Phase::SystemCpu(ns) => ns,
+            ref other => panic!("expected SystemCpu, got {other:?}"),
+        };
+        assert_eq!(ns(&coarse), 437_250);
+        assert_eq!(ns(&fine), 3_498_000);
+        assert_eq!(ns(&fine), ns(&coarse) * 8);
+    }
+
+    /// `iorun` used to be dropped with a warning. A dropped event fails
+    /// visibly; a wrongly-modelled one does not. Out of domain is now an error.
+    #[test]
+    fn out_of_domain_iorun_is_an_error_not_a_silent_drop() {
+        // A real device reintroduces blocking the profile never measured.
+        let err = load_rtapp(&iorun_json(33_554_432, 16_384, "/dev/vda"), 4).unwrap_err();
+        assert!(matches!(err, RtAppError::UnmodelledIoRun(_)), "{err}");
+        assert!(err.to_string().contains("/dev/vda"), "{err}");
+
+        // Above rt-app's own 32-bit saturation point.
+        let err = load_rtapp(&iorun_json(4_294_967_296, 65_536, "/dev/null"), 4).unwrap_err();
+        assert!(matches!(err, RtAppError::UnmodelledIoRun(_)), "{err}");
+
+        // Too few calls to have been calibrated.
+        let err = load_rtapp(&iorun_json(4_194_304, 1_048_576, "/dev/null"), 4).unwrap_err();
+        assert!(matches!(err, RtAppError::UnmodelledIoRun(_)), "{err}");
+    }
+
+    /// rt-app defaults `io_device` to `/dev/null` and `mem_buffer_size` to
+    /// 4 MiB, so a config that omits both must be resolved against *those*
+    /// values rather than against anything convenient.
+    #[test]
+    fn omitted_globals_fall_back_to_rtapp_defaults() {
+        let json = serde_json::json!({
+            "tasks": { "io0": { "instance": 1, "loop": 1, "iorun": 33_554_432u64 } },
+            "global": { "duration": 1 }
+        })
+        .to_string();
+        // 33554432 / 4 MiB = 8 calls, far below the calibrated floor: refused.
+        let err = load_rtapp(&json, 4).unwrap_err();
+        assert!(matches!(err, RtAppError::UnmodelledIoRun(_)), "{err}");
+        assert!(err.to_string().contains("mem_buffer_size"), "{err}");
+    }
+
+    /// `iorun` composes with the events that were already supported, in order.
+    #[test]
+    fn iorun_composes_with_other_events_in_declaration_order() {
+        let json = serde_json::json!({
+            "tasks": { "io0": { "instance": 1, "loop": 1,
+                "run": 500, "iorun": 33_554_432u64, "sleep": 250 } },
+            "global": { "duration": 1, "io_device": "/dev/null",
+                        "mem_buffer_size": 16_384 }
+        })
+        .to_string();
+        let s = load_rtapp(&json, 4).unwrap();
+        let phases = &s.tasks[0].behavior.phases;
+        assert_eq!(phases.len(), 3);
+        assert!(matches!(phases[0], Phase::Run(500_000)));
+        assert!(matches!(phases[1], Phase::SystemCpu(218_625)));
+        assert!(matches!(phases[2], Phase::Sleep(250_000)));
     }
 
     #[test]
