@@ -308,15 +308,18 @@ static struct cell_cpumask_wrapper cell_cpumasks_arr[MAX_CELLS];
 /* cells: ARRAY, MAX_CELLS entries */
 static struct cell cells_arr[MAX_CELLS];
 
-/* debug_events: ARRAY, DEBUG_EVENTS_BUF_SIZE entries */
-static struct debug_event debug_events_arr[DEBUG_EVENTS_BUF_SIZE];
-
 /*
  * NOTE: upstream commits 0f579b78 ("delete legacy BPF cell allocator") and
  * b62f1bae ("make userspace the only cell-control path") removed the
  * `update_timer` ARRAY map and the `cgrp_init_percpu_cpumask` PERCPU_ARRAY
  * map (plus struct update_timer / cpumask_entry / MAX_CPUMASK_ENTRIES).
  * Their static mirrors and map-lookup routing were removed here to match.
+ *
+ * Likewise upstream df131b98 ("scx_mitosis: Remove debug events") deleted the
+ * `debug_events` ARRAY map along with struct debug_event,
+ * DEBUG_EVENTS_BUF_SIZE, and the `debug_events_enabled` global. Its static
+ * mirror, map-lookup routing, and setup-time initialization were removed here
+ * to match.
  */
 
 /* task_ctxs: TASK_STORAGE, indexed by PID */
@@ -357,11 +360,6 @@ static void *mitosis_map_lookup_elem(void *map, const void *key)
 		if (idx >= MAX_CELLS)
 			return NULL;
 		return &cells_arr[idx];
-	}
-	if (map == &debug_events) {
-		if (idx >= DEBUG_EVENTS_BUF_SIZE)
-			return NULL;
-		return &debug_events_arr[idx];
 	}
 	/* Unknown map -- should not happen */
 	return NULL;
@@ -482,7 +480,6 @@ void mitosis_setup(unsigned int num_cpus)
 	memset(percpu_ctx, 0, sizeof(percpu_ctx));
 	memset(cell_cpumasks_arr, 0, sizeof(cell_cpumasks_arr));
 	memset(cells_arr, 0, sizeof(cells_arr));
-	memset(debug_events_arr, 0, sizeof(debug_events_arr));
 	memset(task_ctx_arr, 0, sizeof(task_ctx_arr));
 	memset(task_ctx_in_use, 0, sizeof(task_ctx_in_use));
 	memset(cgrp_storage_entries, 0, sizeof(cgrp_storage_entries));
@@ -497,7 +494,6 @@ void mitosis_setup(unsigned int num_cpus)
 	smt_enabled = false;
 	slice_ns = 20000000;   /* 20ms */
 	root_cgid = 1;
-	debug_events_enabled = false;
 	exiting_task_workaround_enabled = false;
 	cpu_controller_disabled = true;
 	reject_multicpu_pinning = false;

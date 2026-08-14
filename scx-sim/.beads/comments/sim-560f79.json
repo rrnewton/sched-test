@@ -1,0 +1,10 @@
+[
+  {
+    "id": "sim-560f79-cd1d4488e45",
+    "issue_id": "sim-560f79",
+    "author": "devbig030",
+    "body": "Re-scope evidence from `investigate-14-skipped-tests` (2026-08-12), running the ignored test on bare metal:\n\n    cargo nextest run -p scx_simulator --test bug1_canonical_repro --run-ignored all\n\ntest_bug1_canonical_subprocess_reproduces_throttle FAILS, but NOT in the benign way its #[ignore] reason describes. The reason says the upstream cgroup_bw rewrite merely 'changed end-of-run throttle state', implying the fix is to update an assertion. Actual observed failure:\n\n    expected EXIT_OK (0); got 42\n    scxsim: ExitKind::ErrorStall pid=2 runnable_for_ns=200025481\n    is_throttled: 1, nr_throttled_periods: 4/5 (3/3), nr_throttled_tasks: 4\n    period_budget: -3940337, burst_remaining: 0\n    runtime_total_sloppy: 0, runtime_total_last: 0\n\nTwo things that are bigger than 'stale assertion':\n1. Exit 42 = ExitKind::ErrorStall — the simulator STALLS. That is the bug-1 symptom class itself, not an assertion mismatch.\n2. runtime_total_sloppy: 0 — the exact Phase-2 symptom documented in bug1_canonical_repro.rs's own header comment as root-caused (clang-18 struct padding in cgroup_llc_id / memcmp over key_size=16) and FIXED via the lavd_register_cbw_maps key_size 16->12 override. Seeing 0 again suggests either that override is not applying on the rewritten upstream path, or a different path now reaches the same dead end.\n\nSibling tests still pass (test_bug1_canonical_subprocess_deterministic_10_reps, test_bug1_canonical_undersub_subprocess_reproduces_throttle), so this is deterministic, not flake.\n\nRecommend raising priority and re-scoping this bead from 'update the assertion' to 'a stall + the old runtime_total_sloppy=0 symptom are live behind an #[ignore]'. Left ignored (not enabled) because it is a genuine red, not a trivially-enableable test.",
+    "created_at": "2026-08-12T14:13:38.661693761Z",
+    "updated_at": "2026-08-12T14:13:38.661693761Z"
+  }
+]

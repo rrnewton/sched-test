@@ -1299,6 +1299,7 @@ fn test_timer_reconfiguration_path() {
 /// records cgroup init/exit and task init events to the debug buffer.
 /// These are called during init and init_task.
 #[test]
+#[ignore = "mb sim-kg4vk: upstream df131b98 (\"scx_mitosis: Remove debug events\") deleted the debug_events map, struct debug_event, DEBUG_EVENTS_BUF_SIZE, and the debug_events_enabled global; this test's subject no longer exists. Unlike sim-c923d6 there is nothing to re-enable — most likely this test should be deleted."]
 fn test_debug_events_enabled() {
     let _lock = common::setup_test();
     let sched = DynamicScheduler::mitosis(2);
@@ -2228,9 +2229,10 @@ fn test_dump_cpumask_many_cpus() {
     let _lock = common::setup_test();
     let nr_cpus = 33;
     let sched = DynamicScheduler::mitosis(nr_cpus);
-    unsafe {
-        set_mitosis_bool(&sched, b"debug_events_enabled\0", true);
-    }
+    // NOTE: this test used to also set debug_events_enabled=true, but that was
+    // incidental setup, not the subject. Upstream df131b98 deleted the
+    // debug-events feature (mb sim-kg4vk); dump_cpumask is untouched, so the
+    // test keeps its coverage with the stale line dropped.
 
     let mut builder = Scenario::builder().cpus(nr_cpus);
     for i in 1..=4 {
@@ -2265,6 +2267,7 @@ fn test_dump_cpumask_many_cpus() {
 /// fires for each task, populating the debug_events buffer.
 /// The dump function then iterates through all recorded events.
 #[test]
+#[ignore = "mb sim-kg4vk: upstream df131b98 (\"scx_mitosis: Remove debug events\") deleted the debug_events map, struct debug_event, DEBUG_EVENTS_BUF_SIZE, and the debug_events_enabled global; this test's subject no longer exists. Unlike sim-c923d6 there is nothing to re-enable — most likely this test should be deleted."]
 fn test_many_debug_events() {
     let _lock = common::setup_test();
     let nr_cpus = 8;
