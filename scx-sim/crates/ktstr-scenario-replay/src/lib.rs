@@ -319,13 +319,30 @@ mod tests {
         let options = LoweringOptions::default().with_io_profile(profile.clone());
         let compiled = compile_model_source(&source, &options).expect("profile is forwarded");
         assert_eq!(compiled.ir.tasks[0].repeat, Repeat::Once);
-        assert_eq!(
-            compiled.ir.tasks[0].phases,
-            vec![
-                Phase::SystemCpu(profile.system_cpu_per_worker),
-                Phase::NonRunning(profile.nonrunning_per_worker),
-                Phase::Park,
-            ]
-        );
+        // v2 forwards the profile as the block/wake alternation rather than one
+        // aggregate pair, so what must be asserted is that BOTH estimands
+        // survive the forwarding intact -- as sums -- and that the terminal
+        // Park is still there. Asserting the sums is stronger than the old
+        // literal-vector equality: it would catch a forwarding path that
+        // rescaled or dropped either estimand.
+        let phases = &compiled.ir.tasks[0].phases;
+        assert_eq!(phases.last(), Some(&Phase::Park));
+        let system: u64 = phases
+            .iter()
+            .filter_map(|p| match p {
+                Phase::SystemCpu(d) => Some(d.as_nanos()),
+                _ => None,
+            })
+            .sum();
+        let nonrunning: u64 = phases
+            .iter()
+            .filter_map(|p| match p {
+                Phase::NonRunning(d) => Some(d.as_nanos()),
+                _ => None,
+            })
+            .sum();
+        assert_eq!(system, profile.system_cpu_per_worker.as_nanos());
+        assert_eq!(nonrunning, profile.nonrunning_per_worker.as_nanos());
+        assert!(phases.len() > 3, "the alternation must not be collapsed");
     }
 }

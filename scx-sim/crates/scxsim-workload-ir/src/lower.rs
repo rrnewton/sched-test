@@ -1237,6 +1237,25 @@ fn plan_work(
                         .into(),
                 })?;
             let alternations = slices.len();
+            // EVERY emitted value must be nameable, not just summarised. The
+            // apportionment draws each slice from a 33-point table, so despite
+            // emitting thousands of phases it produces only a few dozen
+            // distinct durations (each table entry, plus at most one extra
+            // nanosecond where the largest-remainder pass lands). Listing them
+            // is what gives each emitted phase a provenance chain a reader can
+            // follow back to this record; `provenance::check` enforces that and
+            // is the reason this is a list rather than a description.
+            let distinct = |mut values: Vec<u64>| -> String {
+                values.sort_unstable();
+                values.dedup();
+                values
+                    .iter()
+                    .map(u64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            let system_values = distinct(slices.iter().map(|(s, _)| s.as_nanos()).collect());
+            let nonrunning_values = distinct(slices.iter().map(|(_, n)| n.as_nanos()).collect());
             ctx.approx(
                 src,
                 format!(
@@ -1261,8 +1280,14 @@ fn plan_work(
                      than proven to be device wait. Device and queue mechanics are not simulated. \
                      The IR records the scx-ktstr calibration requirement; ingestion binds it to \
                      the Scenario and Simulator<S> rejects any other scheduler identity before \
-                     execution",
+                     execution. Every emitted duration is listed here so none of them is a value \
+                     that appears from nowhere: distinct SystemCpu nanoseconds are [{}] and \
+                     distinct NonRunning nanoseconds are [{}], each repeated across the {} \
+                     alternations by the apportionment above",
                     alternations_per_cycle(spec).unwrap_or_default(),
+                    system_values,
+                    nonrunning_values,
+                    alternations,
                 ),
             );
             let mut phases = Vec::with_capacity(alternations * 2 + 1);
@@ -1950,7 +1975,8 @@ mod tests {
 
     #[test]
     fn resolved_storage_profile_is_once_only_and_keeps_both_estimands() {
-        let spec = io_spec(2 * 1024 * 1024);
+        let spec_bytes = 2 * 1024 * 1024u64;
+        let spec = io_spec(spec_bytes);
         let source = scenario_with(model_work(spec.clone()));
         let missing = lower(&source).expect_err("typed source still requires a profile");
         assert!(matches!(missing, LoweringError::MissingIoProfile { .. }));
@@ -1961,14 +1987,34 @@ mod tests {
 
         assert_eq!(ir.tasks.len(), 1);
         assert_eq!(ir.tasks[0].repeat, Repeat::Once);
-        assert_eq!(
-            ir.tasks[0].phases,
-            vec![
-                Phase::SystemCpu(profile.system_cpu_per_worker),
-                Phase::NonRunning(profile.nonrunning_per_worker),
-                Phase::Park,
-            ]
-        );
+        // v2 emits the alternation structure where v1 emitted one aggregate
+        // pair. "Keeps both estimands" is therefore asserted on the SUMS, which
+        // is a strictly stronger claim than v1's two-value equality was: it
+        // pins the totals AND the structure AND the terminal Park, and it is
+        // the property that makes v2's dimension-(1) prediction identical to
+        // v1's rather than merely close to it.
+        let cycles = spec_bytes / 65_536;
+        let expected_alternations = usize::try_from(33 * cycles).expect("fits");
+        assert_eq!(ir.tasks[0].phases.len(), expected_alternations * 2 + 1);
+        assert_eq!(ir.tasks[0].phases.last(), Some(&Phase::Park));
+        let system: u64 = ir.tasks[0]
+            .phases
+            .iter()
+            .filter_map(|p| match p {
+                Phase::SystemCpu(d) => Some(d.as_nanos()),
+                _ => None,
+            })
+            .sum();
+        let nonrunning: u64 = ir.tasks[0]
+            .phases
+            .iter()
+            .filter_map(|p| match p {
+                Phase::NonRunning(d) => Some(d.as_nanos()),
+                _ => None,
+            })
+            .sum();
+        assert_eq!(system, profile.system_cpu_per_worker.as_nanos());
+        assert_eq!(nonrunning, profile.nonrunning_per_worker.as_nanos());
         assert_eq!(ir.applied_io_profiles.len(), 1);
         assert_eq!(ir.applied_io_profiles[0].profile_id, profile.profile_id);
         assert_eq!(ir.applied_io_profiles[0].spec, profile.spec);
@@ -1989,7 +2035,20 @@ mod tests {
         assert!(record
             .lowered_to
             .contains(&profile.spec.declared_bytes_per_worker.to_string()));
-        assert!(record.dropped.contains("collapsed"));
+        // v1 disclosed a COLLAPSE; v2 must not, because it no longer collapses.
+        // What it must disclose instead is the limitation it really has: the
+        // slice ORDER within a cycle is not modelled.
+        assert!(
+            !record.dropped.contains("collapsed"),
+            "v2 emits the alternation, so a collapse disclosure would be false"
+        );
+        assert!(
+            record
+                .dropped
+                .contains("ORDER WITHIN A CYCLE IS NOT MODELLED"),
+            "the real remaining limitation must be named: {:?}",
+            record.dropped
+        );
         assert!(record.dropped.contains("host-stolen"));
         assert!(
             crate::provenance::check(&source, &ir).is_empty(),

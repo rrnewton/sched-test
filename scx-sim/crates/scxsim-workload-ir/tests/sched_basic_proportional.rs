@@ -229,24 +229,56 @@ fn resolved_storage_profile_requires_the_calibration_scheduler() {
     let options = LoweringOptions::default().with_io_profile(profile.clone());
     let ir = lower_with_options(&source, &options).expect("resolved profile lowers");
     assert_eq!(ir.tasks[0].repeat, Repeat::Once);
-    assert_eq!(
-        ir.tasks[0].phases,
-        vec![
-            Phase::SystemCpu(profile.system_cpu_per_worker),
-            Phase::NonRunning(profile.nonrunning_per_worker),
-            Phase::Park,
-        ]
-    );
+    // v2 emits the alternation; both estimands must survive as SUMS, and the
+    // terminal Park must still be the last phase.
+    assert_eq!(ir.tasks[0].phases.last(), Some(&Phase::Park));
+    let ir_system: u64 = ir.tasks[0]
+        .phases
+        .iter()
+        .filter_map(|p| match p {
+            Phase::SystemCpu(d) => Some(d.as_nanos()),
+            _ => None,
+        })
+        .sum();
+    let ir_nonrunning: u64 = ir.tasks[0]
+        .phases
+        .iter()
+        .filter_map(|p| match p {
+            Phase::NonRunning(d) => Some(d.as_nanos()),
+            _ => None,
+        })
+        .sum();
+    assert_eq!(ir_system, profile.system_cpu_per_worker.as_nanos());
+    assert_eq!(ir_nonrunning, profile.nonrunning_per_worker.as_nanos());
 
     let scenario = to_scenario(&ir).expect("resolved profile ingests");
     assert_eq!(scenario.required_scheduler_identity(), Some("ktstr"));
-    match scenario.tasks[0].behavior.phases.as_slice() {
-        [SimPhase::SystemCpu(system), SimPhase::Sleep(nonrunning), SimPhase::Park] => {
-            assert_eq!(*system, profile.system_cpu_per_worker.as_nanos());
-            assert_eq!(*nonrunning, profile.nonrunning_per_worker.as_nanos());
-        }
-        phases => panic!("unexpected model phases: {phases:?}"),
-    }
+    // The same two sums must survive INGESTION into the simulator scenario, not
+    // just the lowering. This is the check that would catch the ingest path
+    // rescaling, reordering or dropping part of the alternation, and it is why
+    // it is asserted separately from the IR-level one above.
+    let sim = scenario.tasks[0].behavior.phases.as_slice();
+    assert!(
+        matches!(sim.last(), Some(SimPhase::Park)),
+        "terminal Park must survive ingestion: {sim:?}"
+    );
+    let sim_system: u64 = sim
+        .iter()
+        .filter_map(|p| match p {
+            SimPhase::SystemCpu(ns) => Some(*ns),
+            _ => None,
+        })
+        .sum();
+    let sim_sleep: u64 = sim
+        .iter()
+        .filter_map(|p| match p {
+            SimPhase::Sleep(ns) => Some(*ns),
+            _ => None,
+        })
+        .sum();
+    assert_eq!(sim_system, profile.system_cpu_per_worker.as_nanos());
+    assert_eq!(sim_sleep, profile.nonrunning_per_worker.as_nanos());
+    assert!(sim.len() > 3, "the alternation must not be collapsed");
     let rejected = Simulator::new(DynamicScheduler::simple()).run(scenario);
     assert_eq!(
         rejected.exit_kind(),
