@@ -68,6 +68,23 @@ static u64 sdt_data_size;
 static int sdt_initialized;
 
 /*
+ * Test-only fault injection for scx_task_alloc().
+ *
+ * When nonzero, scx_task_alloc() returns NULL for the task whose PID
+ * matches `sim_sdt_fail_pid`, reproducing the real arena / SDT-table
+ * allocation failure behind scx GitHub #3564 (scx_lavd
+ * `lavd_init_task` -> `scx_task_alloc()` returns NULL ->
+ * `scx_bpf_error("task_ctx_stor first lookup failed")` + return
+ * -ENOMEM). Default 0 = never fail (production behavior, byte-identical).
+ *
+ * The check lives AFTER sim_rbc_pause() (see scx_task_alloc below), so it
+ * adds ZERO retired-branch-conditional counts to scheduler RBC
+ * accounting and is therefore determinism-neutral when disabled. Exposed
+ * (non-static) so the Rust test harness can arm/disarm it via FFI.
+ */
+int sim_sdt_fail_pid;
+
+/*
  * Hash a task's PID for deterministic hash table placement.
  *
  * We hash by PID rather than pointer address because pointer addresses
@@ -133,6 +150,17 @@ void *scx_task_alloc(struct task_struct *p)
 	void *data;
 
 	sim_rbc_pause();
+
+	/*
+	 * Test-only fault injection (scx GitHub #3564 reproducer). Placed
+	 * inside the sim_rbc_pause()/resume() window so it is RBC-neutral
+	 * and does not perturb determinism when disabled (sim_sdt_fail_pid
+	 * == 0). See sim_sdt_fail_pid declaration above.
+	 */
+	if (sim_sdt_fail_pid && p && sim_task_get_pid(p) == sim_sdt_fail_pid) {
+		sim_rbc_resume();
+		return (void *)0;
+	}
 
 	if (!sdt_initialized || !p) {
 		sim_rbc_resume();

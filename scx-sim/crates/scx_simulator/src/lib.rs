@@ -111,8 +111,8 @@ pub use cgroup::{CgroupId, CgroupInfo, CgroupRegistry, DEFAULT_MAX_CGROUPS};
 pub use clock_mode::ClockMode;
 pub use engine::{ExitKind, SimulationResult, Simulator};
 pub use ffi::{
-    discover_schedulers, DebuggerInfo, DynamicScheduler, LavdPowerMode, LoadError, Scheduler,
-    SchedulerInfo,
+    discover_schedulers, set_task_alloc_fail_pid, DebuggerInfo, DynamicScheduler, LavdPowerMode,
+    LoadError, Scheduler, SchedulerInfo,
 };
 pub use kfuncs::{dump_buffer_reset, dump_buffer_take, sim_clock};
 pub use preempt::trace::PreemptionTrace;

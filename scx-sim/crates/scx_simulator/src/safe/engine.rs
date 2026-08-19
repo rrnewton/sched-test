@@ -2026,7 +2026,45 @@ impl<S: Scheduler> Simulator<S> {
                     .trace
                     .record(__local_t, cpu, TraceKind::InitTask { pid: task_pid, rc });
                 charge_sched_time(&mut s.sim, CpuId(0), "init_task");
-                assert!(rc == 0, "init_task failed for pid={} rc={rc}", task_pid.0);
+                if rc != 0 {
+                    // A scheduler that fails `ops.init_task` (e.g. returns
+                    // -ENOMEM after `scx_bpf_error()`) is a REPRODUCIBLE
+                    // scheduler crash, not a harness invariant violation.
+                    // Surface it as `ExitKind::ErrorBpf` instead of
+                    // panicking so production init-path crashes can be
+                    // reproduced as first-class exit kinds.
+                    //
+                    // Canonical target: scx GitHub #3564 — lavd
+                    // `lavd_init_task` -> `scx_task_alloc()` failure ->
+                    // `scx_bpf_error("task_ctx_stor first lookup failed")`
+                    // + return -ENOMEM. Reproduced in
+                    // `tests/lavd_init_task_alloc_fail_repro.rs` via the
+                    // `sim_sdt_fail_pid` fault knob.
+                    let exit_kind = check_bpf_error(&mut s.sim, false).unwrap_or_else(|| {
+                        ExitKind::ErrorBpf(format!(
+                            "init_task failed for pid={} rc={rc}",
+                            task_pid.0
+                        ))
+                    });
+                    s.sim.trace.set_exit_kind(exit_kind);
+                    print_simulation_summary(&s.sim.trace, &s.tasks, s.sim.clock);
+                    kfuncs::clear_engine_sim_arc();
+                    drop(idle_task_handle);
+                    drop(s);
+                    let sim_state = match Arc::try_unwrap(sim_arc) {
+                        Ok(mutex) => match mutex.into_inner() {
+                            Ok(state) => state,
+                            Err(poison) => poison.into_inner(),
+                        },
+                        Err(_) => panic!(
+                            "Arc<Mutex<SimState>> still has multiple owners at end of simulation"
+                        ),
+                    };
+                    return SimulationResult {
+                        trace: sim_state.sim.trace,
+                        tasks: sim_state.tasks,
+                    };
+                }
 
                 // Register task in task_pid_to_raw AFTER init_task completes.
                 s.sim.task_pid_to_raw.insert(task_pid, task_raw as usize);
