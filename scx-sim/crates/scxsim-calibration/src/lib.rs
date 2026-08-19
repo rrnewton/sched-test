@@ -49,6 +49,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod power;
 pub mod report;
 pub mod sample;
 /// Deriving the compared quantities from a simulator `Trace`.
