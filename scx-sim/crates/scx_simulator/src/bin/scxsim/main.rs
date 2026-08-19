@@ -343,6 +343,18 @@ struct RunArgs {
     #[arg(long, alias = "watchdog", value_name = "DURATION")]
     watchdog_timeout: Option<String>,
 
+    /// Report per-task scheduling gaps derived from TRACE EVENTS ONLY.
+    ///
+    /// Threshold-free, and that is the entire point. The watchdog reports
+    /// whichever gap first exceeds its timeout and then aborts the run, so the
+    /// number it yields is a property of the timeout as much as of the
+    /// workload — measured on scx#3618, one quota reported 2.80s at a 1s
+    /// timeout, 4.30s at 4s, and no stall at all at 10s, for the same
+    /// scenario. This walks `TaskScheduled` and reports the whole distribution,
+    /// so the same run yields the same numbers at any timeout, or none.
+    #[arg(long, default_value_t = false)]
+    report_gaps: bool,
+
     /// Path to a TOML scheduler-config file.
     ///
     /// The config file declares per-symbol BPF-global values to write through
@@ -1393,10 +1405,25 @@ fn run_simulation(args: &RunArgs, scenario: Scenario) -> Result<(), RunError> {
         so_path: so_abs_path,
     };
 
+    // Snapshot pid -> name before `run` consumes the scenario; the trace
+    // carries pids only and a bare pid is not a readable report.
+    let task_names: std::collections::BTreeMap<u64, String> = scenario
+        .tasks
+        .iter()
+        .map(|t| (t.pid.0 as u64, t.name.clone()))
+        .collect();
+
     let trace = Simulator::new(sched).run(scenario);
 
     if args.dump_trace {
         trace.dump();
+    }
+
+    // Emit BEFORE any error return below: the runs this exists to measure end
+    // in a watchdog trip (exit 42), and a report that only prints on success
+    // would be absent from every interesting run.
+    if args.report_gaps {
+        report_scheduling_gaps(&trace, &task_names);
     }
 
     if let Some(path) = &args.perfetto {
@@ -1574,6 +1601,108 @@ fn init_tracing() {
         .with_writer(std::io::stderr)
         .event_format(SimFormat)
         .try_init();
+}
+
+/// Per-task scheduling-gap distribution, derived from `TaskScheduled` events
+/// alone.
+///
+/// # Why this exists rather than reading the watchdog's number
+///
+/// The watchdog is a THRESHOLD-TRIGGERED instrument: it fires on whichever gap
+/// first exceeds its timeout and then aborts the run, so what it reports is a
+/// property of the timeout as much as of the workload. On scx#3618 at
+/// 125us/100ms that produced 2.80s at a 1s timeout, 4.30s at 4s, and NO STALL
+/// at 10s, 20s and 30s — three different answers and one absence, for a run
+/// that is byte-for-byte deterministic. It cannot distinguish "one 40s
+/// starvation" from "several gaps, none over 10s", and those are different
+/// pathologies.
+///
+/// This walks the trace instead. It touches no watchdog state, applies no
+/// threshold, and reports the whole distribution, so the same run yields the
+/// same numbers whatever the timeout is set to — the property the original
+/// gradient had and the watchdog-derived numbers lost.
+///
+/// # The trailing gap is included, and must be
+///
+/// A task parked at the end of the run and never scheduled again has its
+/// longest gap running to the end of the trace. Counting only gaps that close
+/// would silently drop the worst starvation in exactly the runs where
+/// starvation is total.
+fn report_scheduling_gaps(
+    trace: &scx_simulator::Trace,
+    names: &std::collections::BTreeMap<u64, String>,
+) {
+    use scx_simulator::TraceKind;
+    use std::collections::BTreeMap;
+
+    // COLLECT THEN SORT, per pid. Trace events are stamped with the PER-CPU
+    // local clock, so the event vector is not globally monotonic in time: a
+    // task that migrates can produce a later entry with an earlier timestamp.
+    // Differencing in vector order underflows on exactly those pairs, and
+    // `u64::MAX` nanoseconds renders as a plausible-looking 18446744073s rather
+    // than as an obvious error. Sorting per pid first is what makes the
+    // difference meaningful at all.
+    let mut sched_at: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+    for ev in trace.events() {
+        if let TraceKind::TaskScheduled { pid } = &ev.kind {
+            sched_at.entry(pid.0 as u64).or_default().push(ev.time_ns);
+        }
+    }
+    let end_ns = sched_at
+        .values()
+        .flatten()
+        .copied()
+        .max()
+        .max(trace.events().iter().map(|e| e.time_ns).max())
+        .unwrap_or(0);
+
+    let mut gaps: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+    for (p, ts) in &mut sched_at {
+        ts.sort_unstable();
+        let g = gaps.entry(*p).or_default();
+        for w in ts.windows(2) {
+            g.push(w[1] - w[0]);
+        }
+        // Trailing gap: last dispatch to end of run. A task parked at the end
+        // and never scheduled again has its longest gap here, so dropping it
+        // would lose the worst starvation in exactly the runs where starvation
+        // is total.
+        if let Some(last) = ts.last() {
+            g.push(end_ns.saturating_sub(*last));
+        }
+    }
+
+    let pct = |v: &[u64], q: f64| -> u64 {
+        if v.is_empty() {
+            return 0;
+        }
+        // Nearest-rank, matching crate::sample's convention.
+        let i = (((v.len() as f64) * q / 100.0).ceil() as usize).clamp(1, v.len()) - 1;
+        v[i]
+    };
+
+    println!();
+    println!("scheduling gaps (trace-derived, threshold-free); end_of_trace_ns={end_ns}");
+    println!("GAPCSV,task,pid,n_gaps,max_ns,p99_ns,p50_ns,total_scheduled");
+    for (p, g) in &gaps {
+        let mut v = g.clone();
+        v.sort_unstable();
+        let name = names.get(p).cloned().unwrap_or_else(|| format!("pid{p}"));
+        println!(
+            "GAPCSV,{},{},{},{},{},{},{}",
+            name,
+            p,
+            v.len(),
+            v.last().copied().unwrap_or(0),
+            pct(&v, 99.0),
+            pct(&v, 50.0),
+            sched_at.get(p).map_or(0, |t| t.len())
+        );
+    }
+    // The single number the gradient is about: the worst gap suffered by any
+    // task in the run.
+    let worst = gaps.values().flatten().copied().max().unwrap_or(0);
+    println!("GAPMAX,{worst}");
 }
 
 #[cfg(test)]
