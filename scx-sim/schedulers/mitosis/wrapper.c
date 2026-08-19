@@ -154,7 +154,6 @@ static void mitosis_register_maps(void)
 	scx_test_map_clear_all();
 
 	/* ARRAY maps: register + pre-seed [0..max_entries) with zeroed values. */
-	SCX_REGISTER_ARRAY(debug_events, true);
 	SCX_REGISTER_ARRAY(cells, true);
 	SCX_REGISTER_ARRAY(cell_cpumasks, true);
 
@@ -168,6 +167,14 @@ static void mitosis_register_maps(void)
 	 * PERCPU_ARRAY map (plus struct update_timer / cpumask_entry /
 	 * MAX_CPUMASK_ENTRIES). Their registrations were dropped here to match
 	 * the scx pin; registering them would not compile.
+	 *
+	 * Likewise upstream df131b98 ("scx_mitosis: Remove debug events")
+	 * removed the `debug_events` ARRAY map, the `debug_events_enabled`
+	 * rodata global and `struct debug_event` (intf.h -27, mitosis.bpf.c
+	 * -125). Its registration was dropped here for the same reason. The
+	 * matching `debug_events_enabled` rodata entry was removed from the
+	 * manifest in crates/scxsim-build/src/lib.rs, and the tests that drove
+	 * that global lost their subject — see tests/mitosis.rs.
 	 */
 
 	/* TASK_STORAGE / CGRP_STORAGE: register; create-on-demand, identity-keyed. */
