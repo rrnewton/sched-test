@@ -336,6 +336,13 @@ fi
 ./scripts/test_aslr.sh "$RELEASE_BIN"
 
 echo ""
+echo "=== Running BPF/C UB fidelity checks ==="
+# scxsim compiles BPF source as userspace C; this gate asserts the places
+# where the two languages disagree about undefined behaviour still behave the
+# way the kernel verifier defines. See ai_docs/BPF_UB_FIDELITY_POLICY.md.
+./scripts/check_ub_fidelity.sh
+
+echo ""
 ./scripts/typecheck.sh
 
 # Cheap (no build, no VM, pure file reads) and it catches the thing that
