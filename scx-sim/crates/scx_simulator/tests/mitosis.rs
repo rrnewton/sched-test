@@ -1295,16 +1295,23 @@ fn test_timer_reconfiguration_path() {
     assert!(trace.total_runtime(Pid(1)) > 0);
 }
 
-/// Exercise the debug_events_enabled path. When enabled, the scheduler
-/// records cgroup init/exit and task init events to the debug buffer.
-/// These are called during init and init_task.
+/// DELETED SUBJECT: this was `test_debug_events_enabled`, which drove mitosis's
+/// debug-event recording path (cgroup init/exit and task init events written to
+/// the debug buffer). Upstream df131b98 ("scx_mitosis: Remove debug events")
+/// deleted the buffer, the `debug_events_enabled` global and `struct
+/// debug_event`, so that path is gone from the scheduler and cannot be tested.
+///
+/// What remains after removing the flag write is plain two-task scheduling:
+/// run two tasks, assert both accrue runtime. That is weaker than the original
+/// and overlaps `test_single_task_completes` and `test_weighted_scheduling`,
+/// but it is still a valid assertion and costs nothing to keep, so it is
+/// renamed to what it now actually checks rather than deleted. The rename is
+/// the point: leaving it called `test_debug_events_enabled` would claim
+/// coverage of a scheduler path that no longer exists.
 #[test]
-fn test_debug_events_enabled() {
+fn test_two_tasks_both_accrue_runtime() {
     let _lock = common::setup_test();
     let sched = DynamicScheduler::mitosis(2);
-    unsafe {
-        set_mitosis_bool(&sched, b"debug_events_enabled\0", true);
-    }
 
     let scenario = Scenario::builder()
         .cpus(2)
@@ -1357,7 +1364,6 @@ fn test_debug_events_with_timer_reconfig() {
     let _lock = common::setup_test();
     let sched = DynamicScheduler::mitosis(2);
     unsafe {
-        set_mitosis_bool(&sched, b"debug_events_enabled\0", true);
         set_mitosis_u32(&sched, b"configuration_seq\0", 1);
     }
 
@@ -1452,7 +1458,6 @@ fn test_overloaded_all_features() {
     let sched = DynamicScheduler::mitosis(2);
     unsafe {
         set_mitosis_bool(&sched, b"smt_enabled\0", true);
-        set_mitosis_bool(&sched, b"debug_events_enabled\0", true);
         set_mitosis_u32(&sched, b"configuration_seq\0", 1);
     }
 
@@ -2022,7 +2027,6 @@ fn test_all_features_cpu_controller_enabled() {
     unsafe {
         set_mitosis_bool(&sched, b"cpu_controller_disabled\0", false);
         set_mitosis_bool(&sched, b"smt_enabled\0", true);
-        set_mitosis_bool(&sched, b"debug_events_enabled\0", true);
         set_mitosis_u32(&sched, b"configuration_seq\0", 1);
     }
 
@@ -2228,9 +2232,6 @@ fn test_dump_cpumask_many_cpus() {
     let _lock = common::setup_test();
     let nr_cpus = 33;
     let sched = DynamicScheduler::mitosis(nr_cpus);
-    unsafe {
-        set_mitosis_bool(&sched, b"debug_events_enabled\0", true);
-    }
 
     let mut builder = Scenario::builder().cpus(nr_cpus);
     for i in 1..=4 {
@@ -2260,19 +2261,21 @@ fn test_dump_cpumask_many_cpus() {
     }
 }
 
-/// Exercise many debug events to cover more dump iteration paths.
-/// With debug_events_enabled=true and many tasks, `record_init_task`
-/// fires for each task, populating the debug_events buffer.
-/// The dump function then iterates through all recorded events.
+/// Many-task scale check: 32 tasks over 8 CPUs, asserting at least half get
+/// runtime, and `trace.dump()` iterates the resulting state without panicking.
+///
+/// This test was `test_many_debug_events` and drove mitosis's debug-event
+/// buffer via `debug_events_enabled`. Upstream df131b98 ("scx_mitosis: Remove
+/// debug events") deleted that buffer, the global and `struct debug_event`
+/// outright, so the original subject no longer exists to test. The flag write
+/// is gone; the many-task scale assertion it also carried is real coverage and
+/// is kept, which is why this is renamed rather than deleted.
 #[test]
-fn test_many_debug_events() {
+fn test_many_tasks_scale_and_dump() {
     let _lock = common::setup_test();
     let nr_cpus = 8;
     let nr_tasks: i32 = 32;
     let sched = DynamicScheduler::mitosis(nr_cpus);
-    unsafe {
-        set_mitosis_bool(&sched, b"debug_events_enabled\0", true);
-    }
 
     let mut builder = Scenario::builder().cpus(nr_cpus);
     for i in 1..=nr_tasks {
@@ -2317,7 +2320,6 @@ fn test_large_cpu_count_all_features() {
     unsafe {
         set_mitosis_bool(&sched, b"cpu_controller_disabled\0", false);
         set_mitosis_bool(&sched, b"smt_enabled\0", true);
-        set_mitosis_bool(&sched, b"debug_events_enabled\0", true);
         set_mitosis_u32(&sched, b"configuration_seq\0", 1);
     }
 

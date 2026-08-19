@@ -159,7 +159,6 @@ pub const SCHEDULERS: &[SchedulerManifest] = &[
                 ("smt_enabled", ConfigValue::Bool(false)),
                 ("slice_ns", ConfigValue::U64(20_000_000)),
                 ("root_cgid", ConfigValue::U64(1)),
-                ("debug_events_enabled", ConfigValue::Bool(false)),
                 ("exiting_task_workaround_enabled", ConfigValue::Bool(false)),
                 ("cpu_controller_disabled", ConfigValue::Bool(true)),
                 ("reject_multicpu_pinning", ConfigValue::Bool(false)),
