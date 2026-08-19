@@ -2155,6 +2155,36 @@ u64 lavd_probe_task_slice_wall(struct task_struct *p)
 }
 
 /*
+ * Greedy-penalty probes. These expose the read-only inputs and output of
+ * calc_greedy_penalty() (lat_cri.bpf.c) so tests can observe LAVD's real
+ * greedy detection / penalty behavior without re-implementing any of it:
+ *
+ *   lag = sys_stat.avg_svc_time_iwgt - taskc->svc_time_iwgt
+ *   lag < 0  (over-served) -> LAVD_FLAG_IS_GREEDY set, penalty in (100%,200%]
+ *   lag >= 0 (under-served) -> flag reset, penalty == 100%
+ */
+
+/* Probe for task's svc_time_iwgt (priority-weighted invariant service time). */
+u64 lavd_probe_svc_time_iwgt(struct task_struct *p)
+{
+	struct task_ctx *taskc = lavd_probe_task_ctx(p);
+	return taskc ? taskc->svc_time_iwgt : 0;
+}
+
+/* Probe for the LAVD_FLAG_IS_GREEDY task flag (1 = flagged greedy). */
+u8 lavd_probe_is_greedy(struct task_struct *p)
+{
+	struct task_ctx *taskc = lavd_probe_task_ctx(p);
+	return (taskc && test_task_flag(taskc, LAVD_FLAG_IS_GREEDY)) ? 1 : 0;
+}
+
+/* Probe for sys_stat.avg_svc_time_iwgt (system-wide fairness baseline). */
+u64 lavd_probe_sys_avg_svc_time_iwgt(void)
+{
+	return sys_stat.avg_svc_time_iwgt;
+}
+
+/*
  * Direct setter for sys_stat.nr_active.
  * Used by tests to force the dispatch compaction path
  * (use_full_cpus() returns false when nr_active < nr_cpus_onln).

@@ -21,6 +21,7 @@ use crate::types::{CpuId, Pid, TimeNs};
 // C function pointer types for LAVD probe functions.
 type TaskProbeU16 = unsafe extern "C" fn(*mut c_void) -> u16;
 type TaskProbeU64 = unsafe extern "C" fn(*mut c_void) -> u64;
+type TaskProbeU8 = unsafe extern "C" fn(*mut c_void) -> u8;
 type SysProbeU32 = unsafe extern "C" fn() -> u32;
 type SysProbeU64 = unsafe extern "C" fn() -> u64;
 
@@ -47,6 +48,10 @@ pub struct LavdProbes {
     sys_nr_queued_task_fn: SysProbeU32,
     can_boost_slice_fn: SysProbeU8,
     task_slice_wall_fn: TaskProbeU64,
+    // Greedy-penalty probes
+    svc_time_iwgt_fn: TaskProbeU64,
+    is_greedy_fn: TaskProbeU8,
+    sys_avg_svc_time_iwgt_fn: SysProbeU64,
 }
 
 impl LavdProbes {
@@ -87,6 +92,13 @@ impl LavdProbes {
                 sys_nr_queued_task_fn: resolve!(b"lavd_probe_sys_nr_queued_task", SysProbeU32),
                 can_boost_slice_fn: resolve!(b"lavd_probe_can_boost_slice", SysProbeU8),
                 task_slice_wall_fn: resolve!(b"lavd_probe_task_slice_wall", TaskProbeU64),
+                // Greedy-penalty probes
+                svc_time_iwgt_fn: resolve!(b"lavd_probe_svc_time_iwgt", TaskProbeU64),
+                is_greedy_fn: resolve!(b"lavd_probe_is_greedy", TaskProbeU8),
+                sys_avg_svc_time_iwgt_fn: resolve!(
+                    b"lavd_probe_sys_avg_svc_time_iwgt",
+                    SysProbeU64
+                ),
             }
         }
     }
@@ -189,6 +201,31 @@ impl LavdProbes {
     pub unsafe fn task_slice_wall(&self, task_raw: *mut c_void) -> u64 {
         (self.task_slice_wall_fn)(task_raw)
     }
+
+    // -- Greedy-penalty probes --
+
+    /// Read `task_ctx.svc_time_iwgt` (priority-weighted invariant service
+    /// time — the per-task input to LAVD's greedy detection).
+    /// # Safety
+    /// `task_raw` must be a valid `task_struct` pointer.
+    pub unsafe fn svc_time_iwgt(&self, task_raw: *mut c_void) -> u64 {
+        (self.svc_time_iwgt_fn)(task_raw)
+    }
+
+    /// Read the `LAVD_FLAG_IS_GREEDY` task flag (set by
+    /// `calc_greedy_penalty` when the task is over-served: `lag < 0`).
+    /// # Safety
+    /// `task_raw` must be a valid `task_struct` pointer.
+    pub unsafe fn is_greedy(&self, task_raw: *mut c_void) -> bool {
+        (self.is_greedy_fn)(task_raw) != 0
+    }
+
+    /// Read `sys_stat.avg_svc_time_iwgt` (system fairness baseline against
+    /// which each task's `svc_time_iwgt` is compared for greediness).
+    pub fn sys_avg_svc_time_iwgt(&self) -> u64 {
+        // SAFETY: Valid function pointer; no pointer arguments.
+        unsafe { (self.sys_avg_svc_time_iwgt_fn)() }
+    }
 }
 
 /// A snapshot of LAVD state at a single probe point.
@@ -210,6 +247,10 @@ pub struct LavdSnapshot {
     pub sys_nr_queued_task: u32,
     pub can_boost_slice: bool,
     pub task_slice_wall: u64,
+    // Greedy-penalty fields
+    pub svc_time_iwgt: u64,
+    pub is_greedy: bool,
+    pub sys_avg_svc_time_iwgt: u64,
 }
 
 /// Accumulates per-task LAVD probe snapshots at each scheduling event.
@@ -265,6 +306,10 @@ impl Monitor for LavdMonitor {
                 sys_nr_queued_task: self.probes.sys_nr_queued_task(),
                 can_boost_slice: self.probes.can_boost_slice(),
                 task_slice_wall: self.probes.task_slice_wall(ctx.task_raw),
+                // Greedy-penalty fields
+                svc_time_iwgt: self.probes.svc_time_iwgt(ctx.task_raw),
+                is_greedy: self.probes.is_greedy(ctx.task_raw),
+                sys_avg_svc_time_iwgt: self.probes.sys_avg_svc_time_iwgt(),
             });
         }
     }
