@@ -14,6 +14,59 @@ working in a sub-project, follow its `CLAUDE.md`:
 
 - **scx-sim/**: Scheduler simulator — see `scx-sim/CLAUDE.md`
 
+Check your toolchain before you trust a local validate
+----------------------------------------
+
+**One command, from anywhere in the repo:**
+
+    rustup show active-toolchain
+
+It must say `1.97.1 ... (overridden by .../rust-toolchain.toml)`. If it says
+`stable (default)` or names any other version, **your local validate is not CI's
+validate** and a green result means nothing. The usual cause is a branch that
+predates the pin (`53f2e1f`, landed 2026-08-12 in #77) and therefore has no
+`rust-toolchain.toml`: rustup then silently falls back to your machine default.
+Rebase onto `integration` and re-check.
+
+### Why this rule exists
+
+For roughly three weeks — **2026-07-23 to 2026-08-12** — "I validated locally"
+and "CI passes" silently meant different things. CI's clippy was already
+**1.97.0** on 2026-07-23 (run `29969561399` cites `rust-clippy/rust-1.97.0`),
+while no toolchain was pinned, so each agent validated against whatever their
+box happened to have — 1.96 on at least one. Lints CI had been rejecting for
+weeks were invisible locally.
+
+That is not a lint problem, it is a **licence problem**. The standing clearance
+to land without waiting for GH CI is conditional on validating locally at the
+current tip, and that condition assumes local and CI are the same gate. For that
+window they were not.
+
+**The divergence is closed** for any checkout containing the pin: local and CI
+both resolve `1.97.1`, verified on both sides. It is **not** closed for a branch
+that predates it — those still fall back to the machine default, so the first
+thing to do on a stale branch is rebase, not diagnose.
+
+### What it looks like when you hit it
+
+`validate.sh` exits **101 on clippy, before a single test runs**. It reads like a
+test failure and is not one. Recognise it by the stage rather than the exit
+code: the last thing printed is `=== Running cargo clippy ===`.
+
+Do **not** read this as "the toolchain moved and broke my branch". CI would have
+rejected the same code at any point since 2026-07-23. The pin did not create the
+failure; it made it visible before you push, which is the improvement.
+
+### Did anything land broken during the window?
+
+Cheap to check and worth knowing: **no surviving violations.** 37 merges and 117
+commits landed in that window, and `cargo clippy --all-targets --workspace -D
+warnings` on the current tip under 1.97.1 is **clean, exit 0**. So nothing landed
+that both violated 1.97 and is still violating it. Whether an individual merge
+was momentarily red and fixed later is not answerable without re-running clippy
+at each of the 37 merge points, and the tip being clean makes that mostly
+academic.
+
 CI: a `schedule:` on an integration workflow will NEVER run
 ----------------------------------------
 
