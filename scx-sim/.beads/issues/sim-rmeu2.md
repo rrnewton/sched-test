@@ -34,3 +34,23 @@ A mitosis **cell** is not a cgroup cpuset. It is a cpumask the scheduler assigns
 ## What is actually needed
 
 Decide how a mitosis cell should be expressed in a scenario. If cells are scheduler-assigned cpumasks, these scenarios should NOT use cgroup cpusets to denote them — they should give the tasks an unconfined cgroup and let mitosis assign cells, which is also the only way the borrowing behaviour can be exercised at all. That is a mitosis-owner call, not a cpuset-enforcement one.
+
+## Two more tests, same class, arriving with PR #60 (2026-08-19)
+
+`tests/mitosis_cell_migration.rs` was written 2026-07-22, before cpuset
+enforcement landed, and merged onto integration during the PR-queue drain. Two
+of its four tests are the same modelling error and are `#[ignore]`d with the
+same reasoning rather than having their bounds lowered:
+
+- `test_multi_cell_topology_all_tasks_run` — two 4-CPU cells as cgroup cpusets,
+  asserts the workload spreads over both. Measured after enforcement: 2 CPUs.
+- `test_uncontended_cross_cell_migration_forward_progress` — additionally
+  depends on a runtime `cgroup_migrate` re-narrowing the cpumask, which is
+  sim-r7eou and still open. Measured: migrant ran 196447325ns of a ~400ms sim.
+
+Bisected to 9501a60 (PR #79) and confirmed by running all four green at PR #60's
+own tip 870eb46. The other two tests in that file pass and are not affected.
+
+Whatever decision this issue reaches about how a mitosis cell should be
+expressed applies to these two as well — there are now five tests waiting on it,
+not three.
