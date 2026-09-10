@@ -48,6 +48,8 @@ pub mod preempt;
 // embed consumer); the embed inspection path is the generic accessor surface,
 // not these lavd-specific probes.
 #[cfg(feature = "standalone")]
+pub mod layered_probes;
+#[cfg(feature = "standalone")]
 pub mod probes;
 pub mod scheduler_wrapper;
 pub mod sim_task;

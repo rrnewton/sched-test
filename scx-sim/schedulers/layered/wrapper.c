@@ -58,6 +58,10 @@ extern void sim_rbc_resume(void);
  * bpf_ktime_get_ns() and the same HZ as the engine's tick interval. */
 extern unsigned long long sim_bpf_jiffies64(void);
 
+/* Light, panic-free "which CPU is this callback on" accessor. See
+ * layered_percpu_scratch() for why the heavy one is not used there. */
+extern unsigned int sim_current_cpu_or_none(void);
+
 /* BPF timer arming (slot-based; layered has a single timer, slot 0). */
 extern void sim_timer_start_slot(unsigned int slot, unsigned long long nsecs);
 
@@ -508,8 +512,29 @@ static long layered_bpf_snprintf(char *str, unsigned int str_sz, const char *fmt
  * Map routing implementations
  * ---------------------------------------------------------------------------*/
 
+/*
+ * A plain (non-explicit-CPU) lookup asks for "the current CPU's slot", which
+ * is `SCX_CPU_CURRENT` in the generic map layer's vocabulary.
+ */
+#define LAYERED_CPU_CURRENT (-1)
+
 static void *layered_percpu_scratch(void *base, unsigned long stride, int cpu)
 {
+	/*
+	 * Resolve the current CPU HERE rather than at the call site, so that
+	 * NORMAL / ARRAY map lookups — the large majority — never touch the
+	 * accessor at all. This mirrors `scx_test_map_lookup()`, which
+	 * resolves only inside its PERCPU branch and for the same reason.
+	 *
+	 * `sim_current_cpu_or_none()` is the light, panic-free accessor: it
+	 * reads the per-callback identity context with no SIM_ARC lock and no
+	 * RBC accounting, where `bpf_get_smp_processor_id()` takes the lock,
+	 * perturbs the branch count, and panics outright when called with no
+	 * simulator context installed. That last property is what previously
+	 * made the read-only match probes unable to reach `format_cgrp_path()`.
+	 */
+	if (cpu == LAYERED_CPU_CURRENT)
+		cpu = (int)sim_current_cpu_or_none();
 	if (cpu < 0 || cpu >= LAYERED_MAX_SIM_CPUS)
 		return NULL;
 	return (char *)base + (unsigned long)cpu * stride;
@@ -562,8 +587,7 @@ static void *layered_map_lookup_common(void *map, const void *key, int cpu)
 
 static void *layered_map_lookup_elem(void *map, const void *key)
 {
-	return layered_map_lookup_common(map, key,
-					 (int)sim_bpf_get_smp_processor_id());
+	return layered_map_lookup_common(map, key, LAYERED_CPU_CURRENT);
 }
 
 static void *layered_map_lookup_percpu_elem(void *map, const void *key, int cpu)
@@ -930,6 +954,356 @@ int layered_probe_sibling_cpu(unsigned int cpu)
 	if (cpu >= MAX_CPUS)
 		return -1;
 	return __sibling_cpu[cpu];
+}
+
+/* ---------------------------------------------------------------------------
+ * Per-task state probes (pid-keyed)
+ *
+ * These read `task_ctx` fields straight out of the storage slot the scheduler
+ * itself writes, so they answer "what did scx_layered decide/record for this
+ * task", never "what should it have decided". Safe after the run: the slot is
+ * wrapper-owned static memory, not the engine's `task_struct`.
+ * ---------------------------------------------------------------------------*/
+
+/* Common guard: return the live task_ctx slot for `pid`, or NULL. */
+static struct task_ctx *layered_probe_taskc(int pid)
+{
+	if (pid < 0 || pid >= LAYERED_MAX_SIM_TASKS)
+		return NULL;
+	if (!layered_task_ctx_in_use[pid])
+		return NULL;
+	return &layered_task_ctxs[pid];
+}
+
+/*
+ * `taskc->refresh_layer` — set when something invalidated the task's layer
+ * (rename, cgroup move, membership expiry) and cleared by maybe_refresh_layer()
+ * once it has re-run the match. Answers "is a re-match still pending?".
+ * Returns -1 when there is no task_ctx.
+ */
+int layered_probe_task_refresh_layer(int pid)
+{
+	struct task_ctx *taskc = layered_probe_taskc(pid);
+
+	if (!taskc)
+		return -1;
+	return !!taskc->refresh_layer;
+}
+
+/*
+ * `taskc->recheck_layer_membership` — MEMBER_NOEXPIRE / MEMBER_EXPIRED /
+ * MEMBER_CANTMATCH, or an absolute ns deadline when the layer sets
+ * member_expire_ms. Answers "why is this task still in that layer?".
+ * Returns MEMBER_INVALID when there is no task_ctx.
+ */
+unsigned long long layered_probe_task_recheck_membership(int pid)
+{
+	struct task_ctx *taskc = layered_probe_taskc(pid);
+
+	if (!taskc)
+		return MEMBER_INVALID;
+	return taskc->recheck_layer_membership;
+}
+
+/*
+ * `taskc->layer_refresh_seq` — the value of layer_refresh_seq_avgruntime as of
+ * the task's last match. Lags the global seq exactly when a refresh is due.
+ */
+unsigned long long layered_probe_task_layer_refresh_seq(int pid)
+{
+	struct task_ctx *taskc = layered_probe_taskc(pid);
+
+	if (!taskc)
+		return 0;
+	return taskc->layer_refresh_seq;
+}
+
+/* The global counter `layer_refresh_seq_avgruntime` the above is compared to. */
+unsigned long long layered_probe_layer_refresh_seq(void)
+{
+	return layer_refresh_seq_avgruntime;
+}
+
+/* `taskc->llc_id` — the LLC scx_layered last placed this task in. */
+unsigned int layered_probe_task_llc(int pid)
+{
+	struct task_ctx *taskc = layered_probe_taskc(pid);
+
+	if (!taskc)
+		return (unsigned int)-1;
+	return taskc->llc_id;
+}
+
+/*
+ * `taskc->pinned_node` — the single NUMA node the task's affinity confines it
+ * to, or MAX_NUMA_NODES when it is not node-pinned. Drives the per-node pinned
+ * demand the userspace allocator sizes layers from.
+ */
+unsigned int layered_probe_task_pinned_node(int pid)
+{
+	struct task_ctx *taskc = layered_probe_taskc(pid);
+
+	if (!taskc)
+		return (unsigned int)-1;
+	return taskc->pinned_node;
+}
+
+/* `taskc->all_cpus_allowed` — false means the task carries a real affinity
+ * restriction, which changes which placement paths are even reachable. */
+int layered_probe_task_all_cpus_allowed(int pid)
+{
+	struct task_ctx *taskc = layered_probe_taskc(pid);
+
+	if (!taskc)
+		return -1;
+	return !!taskc->all_cpus_allowed;
+}
+
+/* `taskc->runtime_avg` — the input MATCH_AVG_RUNTIME compares against. */
+unsigned long long layered_probe_task_runtime_avg(int pid)
+{
+	struct task_ctx *taskc = layered_probe_taskc(pid);
+
+	if (!taskc)
+		return 0;
+	return taskc->runtime_avg;
+}
+
+/* ---------------------------------------------------------------------------
+ * Match-evaluation probes — "WHY is this task in that layer?"
+ *
+ * `layered_probe_task_layer()` reports the OUTCOME of layer assignment. These
+ * report the FACTORS behind it, which is the whole point: the LAVD probe
+ * surface earns its keep by exposing wait_freq / avg_runtime / svc_time_iwgt
+ * alongside lat_cri, so a reviewer can prove a specific decision wrong rather
+ * than merely observe that it differs from expectation.
+ *
+ * The verdicts below come from the scheduler's own `match_one()`. Nothing here
+ * re-implements matching; the only logic that is ours is the walk order, and
+ * that mirrors `match_layer()` term for term (including its
+ * `== !match->exclude` test and its stop-at-first-failure).
+ * `layered_probe_match_term()` is exported separately so a caller can redo the
+ * walk itself and check.
+ * ---------------------------------------------------------------------------*/
+
+/* Verdict encoding shared by the match probes. */
+enum layered_match_verdict {
+	LAYERED_MATCH_NO_TASK_CTX	= -4,
+	LAYERED_MATCH_UNPROBEABLE	= -3,
+	LAYERED_MATCH_NO_CGRP_PATH	= -2,
+	LAYERED_MATCH_OOB		= -1,
+	LAYERED_MATCH_FALSE		= 0,
+	LAYERED_MATCH_TRUE		= 1,
+};
+
+/* `layer->nr_match_ors` — how many alternative rule groups the layer has. */
+unsigned int layered_probe_match_nr_ors(unsigned int layer_id)
+{
+	if (layer_id >= nr_layers)
+		return 0;
+	return layers[layer_id].nr_match_ors;
+}
+
+/* `ands->nr_match_ands` — how many terms must all hold in one OR group. */
+unsigned int layered_probe_match_nr_ands(unsigned int layer_id, unsigned int or_id)
+{
+	if (layer_id >= nr_layers || or_id >= MAX_LAYER_MATCH_ORS)
+		return 0;
+	if (or_id >= layers[layer_id].nr_match_ors)
+		return 0;
+	return layers[layer_id].matches[or_id].nr_match_ands;
+}
+
+/* Resolve one configured term, or NULL when the indices are out of range. */
+static struct layer_match *layered_probe_match_at(unsigned int layer_id,
+						  unsigned int or_id,
+						  unsigned int and_id)
+{
+	struct layer_match_ands *ands;
+
+	if (layer_id >= nr_layers || or_id >= MAX_LAYER_MATCH_ORS)
+		return NULL;
+	if (or_id >= layers[layer_id].nr_match_ors)
+		return NULL;
+	ands = &layers[layer_id].matches[or_id];
+	if (and_id >= NR_LAYER_MATCH_KINDS || and_id >= (unsigned int)ands->nr_match_ands)
+		return NULL;
+	return &ands->matches[and_id];
+}
+
+/* `match->kind` — which `enum layer_match_kind` this term tests. -1 if OOB. */
+int layered_probe_match_kind(unsigned int layer_id, unsigned int or_id,
+			     unsigned int and_id)
+{
+	struct layer_match *m = layered_probe_match_at(layer_id, or_id, and_id);
+
+	if (!m)
+		return -1;
+	return m->kind;
+}
+
+/* `match->exclude` — whether the term is negated. -1 if OOB. */
+int layered_probe_match_exclude(unsigned int layer_id, unsigned int or_id,
+				unsigned int and_id)
+{
+	struct layer_match *m = layered_probe_match_at(layer_id, or_id, and_id);
+
+	if (!m)
+		return -1;
+	return !!m->exclude;
+}
+
+/* Copy `src` into `buf` NUL-terminated; return the copied length. */
+static int layered_probe_copy_str(const char *src, char *buf, unsigned int buf_sz)
+{
+	unsigned int i;
+
+	if (!buf || buf_sz == 0)
+		return -1;
+	for (i = 0; i + 1 < buf_sz && src[i]; i++)
+		buf[i] = src[i];
+	buf[i] = '\0';
+	return (int)i;
+}
+
+/*
+ * The configured string a string-kind term compares against ("the needle").
+ * Returns the length copied, or -1 when the indices are out of range and -2
+ * when the term's kind carries no string. Pairs with
+ * `layered_probe_task_cgrp_path()` / `layered_probe_task_comm()` so a caller
+ * can see BOTH sides of the comparison the scheduler made.
+ */
+int layered_probe_match_needle(unsigned int layer_id, unsigned int or_id,
+			       unsigned int and_id, char *buf, unsigned int buf_sz)
+{
+	struct layer_match *m = layered_probe_match_at(layer_id, or_id, and_id);
+
+	if (!m)
+		return -1;
+	switch (m->kind) {
+	case MATCH_CGROUP_PREFIX:	return layered_probe_copy_str(m->cgroup_prefix, buf, buf_sz);
+	case MATCH_CGROUP_SUFFIX:	return layered_probe_copy_str(m->cgroup_suffix, buf, buf_sz);
+	case MATCH_CGROUP_CONTAINS:	return layered_probe_copy_str(m->cgroup_substr, buf, buf_sz);
+	case MATCH_COMM_PREFIX:		return layered_probe_copy_str(m->comm_prefix, buf, buf_sz);
+	case MATCH_PCOMM_PREFIX:	return layered_probe_copy_str(m->pcomm_prefix, buf, buf_sz);
+	case MATCH_SCXCMD_JOIN:		return layered_probe_copy_str(m->comm_prefix, buf, buf_sz);
+	default:
+		if (buf && buf_sz)
+			buf[0] = '\0';
+		return -2;
+	}
+}
+
+/*
+ * True for the two match kinds that MUTATE scheduler state when evaluated:
+ * MATCH_USED_GPU_TID / MATCH_USED_GPU_PID set
+ * `taskc->recheck_layer_membership = MEMBER_EXPIRED` on a stale timestamp and
+ * call `scx_bpf_error()` when GPU support is off. A read-only probe must not
+ * call them, so it reports LAYERED_MATCH_UNPROBEABLE instead.
+ *
+ * That is UNCOVERED, not stubbed: nothing fake is substituted, and the caller
+ * is told exactly which term could not be observed.
+ */
+static bool layered_match_kind_mutates(int kind)
+{
+	return kind == MATCH_USED_GPU_TID || kind == MATCH_USED_GPU_PID;
+}
+
+/*
+ * `p->comm` as the scheduler sees it — the left-hand side of every
+ * MATCH_COMM_PREFIX comparison. Answers "did the workload actually get the
+ * thread name we think it did?", which is the first thing to rule out when a
+ * name-based rule does not fire.
+ */
+int layered_probe_task_comm(void *task, char *buf, unsigned int buf_sz)
+{
+	struct task_struct *p = (struct task_struct *)task;
+
+	if (!p)
+		return -1;
+	return layered_probe_copy_str(p->comm, buf, buf_sz);
+}
+
+/*
+ * The cgroup path as produced by the scheduler's OWN `format_cgrp_path()` —
+ * the left-hand side of every cgroup match. Not the harness's idea of the
+ * path: the string layered actually compares against.
+ *
+ * Note this refills the scheduler's `cgrp_path_bufs` scratch buffer, which
+ * `maybe_refresh_layer()` re-fills before every use, so it carries no state
+ * across calls. Probe points are between callbacks, never mid-decision.
+ */
+int layered_probe_task_cgrp_path(void *task, char *buf, unsigned int buf_sz)
+{
+	struct task_struct *p = (struct task_struct *)task;
+	const char *path;
+
+	if (!p)
+		return -1;
+	path = format_cgrp_path(p->cgroups->dfl_cgrp);
+	if (!path)
+		return -2;
+	return layered_probe_copy_str(path, buf, buf_sz);
+}
+
+/*
+ * The raw verdict of ONE term, from the scheduler's own `match_one()`, BEFORE
+ * `match->exclude` is applied — so a caller sees the predicate and the
+ * negation separately. See `enum layered_match_verdict` for the negatives.
+ *
+ * Time-varying kinds (MATCH_AVG_RUNTIME, MATCH_SYSTEM_CPU_UTIL_BELOW,
+ * MATCH_DSQ_INSERT_BELOW) are evaluated AS OF this call, not as of the
+ * decision that placed the task in its current layer.
+ */
+int layered_probe_match_term(void *task, unsigned int layer_id,
+			     unsigned int or_id, unsigned int and_id)
+{
+	struct task_struct *p = (struct task_struct *)task;
+	struct layer_match *m = layered_probe_match_at(layer_id, or_id, and_id);
+	struct task_ctx *taskc;
+	const char *cgrp_path;
+
+	if (!p || !m)
+		return LAYERED_MATCH_OOB;
+	if (layered_match_kind_mutates(m->kind))
+		return LAYERED_MATCH_UNPROBEABLE;
+	if (!(taskc = layered_probe_taskc(p->pid)))
+		return LAYERED_MATCH_NO_TASK_CTX;
+	if (!(cgrp_path = format_cgrp_path(p->cgroups->dfl_cgrp)))
+		return LAYERED_MATCH_NO_CGRP_PATH;
+
+	return match_one(&layers[layer_id], m, taskc, p, cgrp_path) ?
+		LAYERED_MATCH_TRUE : LAYERED_MATCH_FALSE;
+}
+
+/*
+ * Walk one OR group the way `match_layer()` does and report WHERE it stopped:
+ *
+ *   >= 0  index of the first AND term that does not hold
+ *   -1    every term holds, i.e. this OR group matches the task
+ *   other a negative `layered_match_verdict` propagated from the term
+ *
+ * This is the probe the whole group exists for. `sim-hyr11` was diagnosed from
+ * an outcome assertion ("landed in layer 2, expected layer 1") and needed a
+ * 20-run coverage/non-coverage bisection; this reports
+ * "or 0 / and 0, MATCH_CGROUP_CONTAINS, does not hold" directly.
+ */
+int layered_probe_match_first_failure(void *task, unsigned int layer_id,
+				      unsigned int or_id)
+{
+	unsigned int and_id, nr_ands = layered_probe_match_nr_ands(layer_id, or_id);
+
+	for (and_id = 0; and_id < nr_ands; and_id++) {
+		int raw = layered_probe_match_term(task, layer_id, or_id, and_id);
+		int excl = layered_probe_match_exclude(layer_id, or_id, and_id);
+
+		if (raw < 0)
+			return raw;
+		/* match_layer()'s test, verbatim: `match_one(..) == !exclude`. */
+		if (raw != !excl)
+			return (int)and_id;
+	}
+	return -1;
 }
 
 /* ---------------------------------------------------------------------------

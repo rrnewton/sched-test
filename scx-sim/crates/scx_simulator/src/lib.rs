@@ -95,6 +95,8 @@ pub(crate) use unsafe_impl::engine_ring;
 pub(crate) use unsafe_impl::ffi;
 pub(crate) use unsafe_impl::interleave;
 pub(crate) use unsafe_impl::kfuncs;
+#[cfg(feature = "standalone")]
+pub(crate) use unsafe_impl::layered_probes;
 pub(crate) use unsafe_impl::preempt;
 #[cfg(feature = "standalone")]
 pub(crate) use unsafe_impl::probes;
@@ -115,6 +117,12 @@ pub use ffi::{
     LoadError, Scheduler, SchedulerInfo,
 };
 pub use kfuncs::{dump_buffer_reset, dump_buffer_take, sim_clock};
+#[cfg(feature = "standalone")]
+pub use layered_probes::{
+    GlobalStat, LayerMatchTrace, LayerStat, LayerUsage, LayeredEnumProbe, LayeredMatchKind,
+    LayeredMonitor, LayeredProbes, LayeredSnapshot, MatchTrace, MatchVerdict, MemberState,
+    OrGroupVerdict, LAYERED_NO_LAYER,
+};
 pub use preempt::trace::PreemptionTrace;
 pub use preempt::trace::TraceMetadata;
 pub use preempt::{
@@ -126,10 +134,7 @@ pub use preempt::{
     StructopInfo, INSN_BYTES_LEN,
 };
 #[cfg(feature = "standalone")]
-pub use probes::{
-    GlobalStat, LavdMonitor, LavdProbes, LavdSnapshot, LayerStat, LayeredEnumProbe, LayeredProbes,
-    LAYERED_NO_LAYER,
-};
+pub use probes::{LavdMonitor, LavdProbes, LavdSnapshot};
 pub use safe::bpf_trace::{
     BpfEventKind, BpfTrace, BpfTraceEvent, TraceComparisonResult, TraceDifferences,
 };
