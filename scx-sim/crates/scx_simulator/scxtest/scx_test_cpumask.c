@@ -7,10 +7,17 @@
 #define BITS_PER_LONG (sizeof(unsigned long) * 8)
 #endif
 
-#ifndef NR_CPUS
-#define NR_CPUS 128
-#endif
+/* NR_CPUS comes from kern_types.h — one definition for all three cpumask
+ * translation units. See the comment there before changing it. */
 
+/*
+ * Deliberately NOT `NR_CPUS / BITS_PER_LONG`: vmlinux.h — which every
+ * scheduler is compiled against — declares `struct cpumask { unsigned long
+ * bits[128]; }` (CONFIG_NR_CPUS=8192). Matching that literal keeps the
+ * engine's view of a cpumask at least as large as the scheduler's. Only the
+ * first NR_CPUS bits are ever populated; `bpf_cpumask_full()` below relies on
+ * exactly that.
+ */
 struct cpumask {
 	unsigned long bits[128];
 };

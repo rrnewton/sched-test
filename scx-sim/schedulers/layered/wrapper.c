@@ -310,8 +310,16 @@ void bpf_iter_scx_dsq_destroy(struct bpf_iter_scx_dsq *it)
  * Static map storage (defined after the source, where the value types exist)
  * ---------------------------------------------------------------------------*/
 
-/* Must be >= the engine's maximum CPU count (lib/scxtest NR_CPUS). */
-#define LAYERED_MAX_SIM_CPUS 128
+/*
+ * Must be >= the engine's maximum CPU count (scxtest NR_CPUS, also 512), and
+ * must not exceed scx_layered's own MAX_CPUS (intf.h, 1 << 9 = 512) — the
+ * scheduler indexes `u16 cpus[MAX_CPUS]` proximity maps by simulator CPU id.
+ * `layered_set_topology()` refuses anything above this rather than truncating.
+ *
+ * 512 is what makes 384-CPU machines simulable; see
+ * `tests/layered_large_topology.rs` and upstream scx PR 3718.
+ */
+#define LAYERED_MAX_SIM_CPUS 512
 /* PID-indexed task storage. Matches the mitosis wrapper's bound. */
 #define LAYERED_MAX_SIM_TASKS 4096
 

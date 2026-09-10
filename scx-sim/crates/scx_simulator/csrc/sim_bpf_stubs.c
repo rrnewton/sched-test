@@ -27,9 +27,8 @@
 #define BITS_PER_LONG (sizeof(unsigned long) * 8)
 #endif
 
-#ifndef NR_CPUS
-#define NR_CPUS 128
-#endif
+/* NR_CPUS comes from kern_types.h — one definition for all three cpumask
+ * translation units. See the comment there before changing it. */
 
 struct cpumask {
 	unsigned long bits[128];

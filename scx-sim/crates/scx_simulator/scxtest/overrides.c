@@ -19,17 +19,23 @@ extern void *memset(void *s, int c, unsigned long n);
 #define BITS_PER_LONG (sizeof(unsigned long) * 8)
 #endif
 
-#ifndef NR_CPUS
-#define NR_CPUS 128
-#endif
+/* NR_CPUS comes from kern_types.h — one definition for all three cpumask
+ * translation units. See the comment there before changing it. */
 
 /*
  * Local struct definitions matching vmlinux.h layout.
  * overrides.c is compiled separately from vmlinux.h, so we define
  * these locally (same pattern as scx_test_cpumask.c).
  */
+/*
+ * `bits[128]`, not `bits[NR_CPUS / BITS_PER_LONG]`, so this matches vmlinux.h
+ * and the other two cpumask TUs exactly. These definitions are shared across
+ * the dlopen boundary and `bpf_cpumask_copy()` below sizes a memcpy from
+ * `sizeof(struct cpumask)`, so a TU that disagreed about the size would
+ * short-copy a mask rather than fail to compile.
+ */
 struct cpumask {
-	unsigned long bits[NR_CPUS / BITS_PER_LONG];
+	unsigned long bits[128];
 };
 
 struct bpf_cpumask {
