@@ -77,6 +77,27 @@ struct task_struct *sim_task_alloc(void)
 		sim_init_root_cgroup();
 		p->cgroups = &sim_root_css_set;
 		p->real_parent = p; /* self-referencing; simulates init as parent */
+		/*
+		 * Every simulated task is a single-threaded process, so it is
+		 * its own thread-group leader — that is what the kernel puts
+		 * here for such a task. (`p->tgid` should track `p->pid` for
+		 * the same reason and does not yet; see the DANGER TODO in
+		 * sim_task_set_pid below for why that half is held back.)
+		 *
+		 * A NULL group_leader is not a state any kernel task can be
+		 * in, and it is not merely inert: scx_layered's
+		 * MATCH_PCOMM_PREFIX does
+		 *   __builtin_memcpy(pcomm, p->group_leader->comm, MAX_COMM)
+		 * (main.bpf.c), so leaving it NULL turned an exposed match kind
+		 * into a segfault.
+		 *
+		 * NOTE the fidelity limit this leaves: with one task per thread
+		 * group, MATCH_PCOMM_PREFIX degenerates to MATCH_COMM_PREFIX.
+		 * Production configs use pcomm precisely to catch worker
+		 * threads by their PROCESS name, which needs real thread groups
+		 * (sim-ttaa0).
+		 */
+		p->group_leader = p;
 	}
 	return p;
 }
@@ -95,6 +116,25 @@ unsigned long sim_task_struct_size(void)
 void sim_task_set_pid(struct task_struct *p, int pid)
 {
 	p->pid = pid;
+	/*
+	 * DANGER TODO(sim-6mheb): p->tgid is left at 0, which is wrong. One
+	 * task per thread group (see sim_task_alloc) means tgid should track
+	 * pid. Because it does not:
+	 *
+	 *   - scx_layered's MATCH_IS_GROUP_LEADER, `(p->tgid == p->pid) ==
+	 *     want`, answers "not a leader" for every task, silently;
+	 *   - MATCH_TGID_EQUALS only ever compares against 0;
+	 *   - layered's is_scheduler_task(), `(u32)p->tgid ==
+	 *     layered_root_tgid` with layered_root_tgid also 0, is TRUE for
+	 *     every task, so all of them take its userspace-daemon fast path
+	 *     rather than the ordinary layer-DSQ path.
+	 *
+	 * The one-line fix is held back rather than landed red: it unmasks
+	 * sim-zwypg, where a task left alone on a layer DSQ while every CPU
+	 * is idle is never dispatched, which takes
+	 * tests/layered.rs::default_config_loads_and_runs from 3/3 to 2/3.
+	 * Fix sim-zwypg first, then set tgid here.
+	 */
 }
 
 int sim_task_get_pid(struct task_struct *p)

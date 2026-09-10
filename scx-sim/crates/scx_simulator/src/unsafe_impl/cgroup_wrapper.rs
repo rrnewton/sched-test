@@ -124,8 +124,19 @@ impl SimCgroupHandle {
     /// (scx_layered's `format_cgrp_path()` → `MATCH_CGROUP_*` rules), so a
     /// cgroup created without a name is invisible to path matching.
     /// Interior NULs truncate the name, as they would a C string.
+    ///
+    /// A `kernfs_node`'s name is a single **directory entry**, never a path:
+    /// the kernel cannot put `/` in one, and a path reader such as
+    /// `format_cgrp_path()` supplies the separators itself as it walks
+    /// `cgrp->ancestors[]`. So only the last component of `name` is
+    /// published. Callers that identify a cgroup by its full path — the
+    /// rt-app bridge names cgroups `/prod/frontend` because a bare `frontend`
+    /// would not be unique across the tree — would otherwise have their
+    /// parent's path re-embedded in the child's entry, and `/prod/frontend`
+    /// would render as `/prod//prod/frontend/`.
     pub fn set_name(&self, name: &str) {
-        let cstr = std::ffi::CString::new(name).unwrap_or_default();
+        let dir_entry = name.rsplit('/').next().unwrap_or(name);
+        let cstr = std::ffi::CString::new(dir_entry).unwrap_or_default();
         // SAFETY: `self.raw` came from `sim_cgroup_alloc`, whose kernfs_node
         // carries co-allocated name storage. The C side copies out of `cstr`
         // before returning, so it need not outlive the call.
