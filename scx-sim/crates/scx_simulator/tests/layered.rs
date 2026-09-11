@@ -220,7 +220,7 @@ fn layer_enum_abi_matches_bpf() {
     );
 
     // Every LayerMatch variant's lowered kind must equal the BPF enum value.
-    let cases: [(LayerMatch, LayeredEnumProbe); 16] = [
+    let cases: [(LayerMatch, LayeredEnumProbe); 17] = [
         (
             LayerMatch::CgroupPrefix("x".into()),
             LayeredEnumProbe::MatchCgroupPrefix,
@@ -264,6 +264,10 @@ fn layer_enum_abi_matches_bpf() {
             LayeredEnumProbe::MatchCgroupContains,
         ),
         (LayerMatch::NumaNode(0), LayeredEnumProbe::MatchNumaNode),
+        (
+            LayerMatch::AvgRuntime(0, 1),
+            LayeredEnumProbe::MatchAvgRuntime,
+        ),
     ];
     for (m, probe) in cases {
         assert_eq!(

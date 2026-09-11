@@ -25,6 +25,7 @@ pub mod engine;
 pub mod fmt;
 pub mod layered;
 pub mod layered_alloc;
+pub mod layered_config;
 pub mod layered_control;
 /// scx_layered's cross-NUMA migration gate, vendored token-identical from
 /// upstream `main.rs` with a drift guard in `tests/layered_xnuma.rs`.

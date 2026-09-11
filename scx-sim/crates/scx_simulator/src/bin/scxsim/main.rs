@@ -11,6 +11,16 @@ use scx_simulator::{
     Phase, PmuEvent, PreemptMode, PreemptionTrace, PreemptiveConfig, RepeatMode, Scenario,
     SimFormat, Simulator, TaskBehavior, TraceMetadata, TraceStats, SIM_LOCK,
 };
+// The layered match probes live behind `standalone` (see `unsafe_impl/mod.rs`:
+// an embed build has no consumer for them), and `--layer-config` reads the
+// scheduler's capacities through them rather than copying constants. So the
+// whole layer-config surface is gated to match, and the flags below say so
+// when they are used in a build that does not have it.
+#[cfg(feature = "standalone")]
+use scx_simulator::{
+    load_layer_config, Disposition, LayerConfigOptions, LayeredEnumProbe, LayeredMonitor,
+    LayeredProbes, LoadedLayerConfig, OrGroupVerdict, Pid, Unsupported, LAYERED_NO_LAYER,
+};
 use scx_simulator::{parse_duration_ns, parse_seed};
 
 mod real_run;
@@ -365,6 +375,44 @@ struct RunArgs {
     /// minimal example (`enable_cpu_bw = true`).
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
+
+    /// Path to an scx_layered JSON layer config, in scx_layered's own format.
+    ///
+    /// This is the file production passes to scx_layered as a positional
+    /// argument, `scx_layered f:<path>` (there is no `--spec` flag): an
+    /// array of layers, each with `matches` and a `kind`. Without it,
+    /// `-s layered` runs the wrapper's single catch-all OPEN layer, which
+    /// evaluates no match rule against anything.
+    ///
+    /// Fields and match kinds scxsim cannot honour are refused BY NAME rather
+    /// than ignored — a run with fields quietly dropped looks like the
+    /// production configuration and is not one. Waive individual fields with
+    /// `--layer-config-drop`; match kinds are never waivable.
+    ///
+    /// Only `--scheduler layered` accepts this.
+    #[arg(long, value_name = "PATH")]
+    layer_config: Option<PathBuf>,
+
+    /// Load the layer config even though these fields cannot be applied.
+    ///
+    /// Comma-separated upstream field names, e.g. `perf,membw_gb`. Every
+    /// dropped field is echoed on stderr before the run, because a result
+    /// produced with fields dropped is not a result for the configuration as
+    /// written. An invalid `--layer-config` on its own lists what is waivable.
+    #[arg(long, value_name = "FIELD,...", value_delimiter = ',')]
+    layer_config_drop: Vec<String>,
+
+    /// Report which layer each task landed in and WHICH RULE put it there.
+    ///
+    /// A layered run that exits 0 is not evidence that any match rule fired:
+    /// with the default single catch-all layer, none is ever evaluated
+    /// against any string. This prints the scheduler's own verdict per OR
+    /// group, read back with the layered match probes, alongside the `comm`
+    /// and cgroup path it compared against.
+    ///
+    /// Needs `--layer-config`, since without one there is only the catch-all.
+    #[arg(long, default_value_t = false)]
+    layer_report: bool,
 
     /// Enable concurrent callback interleaving at kfunc yield points.
     ///
@@ -1260,7 +1308,7 @@ fn run_determinism_check(args: &RunArgs, scenario: Scenario) -> Result<(), RunEr
         use_e9,
         args.scheduler_file.as_deref(),
     )?;
-    apply_config_if_present(args, &sched1)?;
+    let _ = apply_configs(args, &sched1)?;
     let trace1 = Simulator::new(sched1).run(scenario.clone());
     let checkpoints1 = drain_determinism_checkpoints();
 
@@ -1276,7 +1324,7 @@ fn run_determinism_check(args: &RunArgs, scenario: Scenario) -> Result<(), RunEr
         use_e9,
         args.scheduler_file.as_deref(),
     )?;
-    apply_config_if_present(args, &sched2)?;
+    let _ = apply_configs(args, &sched2)?;
     let trace2 = Simulator::new(sched2).run(scenario);
     let checkpoints2 = drain_determinism_checkpoints();
 
@@ -1373,7 +1421,10 @@ fn run_simulation(args: &RunArgs, scenario: Scenario) -> Result<(), RunError> {
         use_e9,
         args.scheduler_file.as_deref(),
     )?;
-    apply_config_if_present(args, &sched)?;
+    // Read only by the layer report, which is standalone-only; without that
+    // feature `LoadedLayers` is uninhabited and this is always `None`.
+    #[cfg_attr(not(feature = "standalone"), allow(unused_variables))]
+    let layer_cfg = apply_configs(args, &sched)?;
     let _lock = SIM_LOCK.lock().unwrap();
 
     // Capture .so base address BEFORE the simulation runs. The scheduler
@@ -1413,7 +1464,34 @@ fn run_simulation(args: &RunArgs, scenario: Scenario) -> Result<(), RunError> {
         .map(|t| (t.pid.0 as u64, t.name.clone()))
         .collect();
 
-    let trace = Simulator::new(sched).run(scenario);
+    // A layer report needs the match probes, and they must be resolved while
+    // the `.so` is still ours — `Simulator::new` takes the scheduler.
+    #[cfg(feature = "standalone")]
+    let mut layer_monitor = args
+        .layer_report
+        .then(|| LayeredMonitor::new(LayeredProbes::new(&sched)));
+    // `sim` is bound rather than used as a temporary ON PURPOSE. It owns the
+    // scheduler, so dropping it dlcloses the `.so` — and the probes the report
+    // calls are function pointers INTO that `.so`. As a temporary it would be
+    // dropped at the end of this statement and the report would jump into
+    // unmapped memory, which is how this was first written.
+    let sim = Simulator::new(sched);
+    #[cfg(feature = "standalone")]
+    let trace = match layer_monitor.as_mut() {
+        Some(monitor) => sim.run_monitored(scenario, monitor).trace,
+        None => sim.run(scenario),
+    };
+    #[cfg(not(feature = "standalone"))]
+    let trace = sim.run(scenario);
+
+    // Before any early return: a report that only prints on a clean exit is
+    // absent from exactly the runs where "which layer did this task land in"
+    // is the question being asked.
+    #[cfg(feature = "standalone")]
+    if let (Some(monitor), Some(cfg)) = (layer_monitor.as_ref(), layer_cfg.as_ref()) {
+        print_layer_report(monitor, cfg, &task_names);
+    }
+    drop(sim);
 
     if args.dump_trace {
         trace.dump();
@@ -1519,20 +1597,292 @@ fn print_addresses(args: &PrintAddressesArgs) -> Result<(), String> {
     Ok(())
 }
 
-/// If `--config <PATH>` is set, load it and write each declared global
-/// through to the loaded scheduler `.so`. No-op otherwise.
+/// The allocator-only inputs this config actually uses.
+///
+/// `growth_algo` is deliberately qualified rather than listed flat: it IS
+/// published, and the BPF's own BigLittle / LittleBig idle-CPU selection reads
+/// `layer->growth_algo`. Only its CPU-ALLOCATION role is lost here, and saying
+/// it is dropped outright would be its own inaccuracy.
+#[cfg(feature = "standalone")]
+fn allocator_only_fields(loaded: &LoadedLayerConfig) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    let mut add = |present: bool, name: &'static str| {
+        if present && !out.contains(&name) {
+            out.push(name);
+        }
+    };
+    for spec in &loaded.specs {
+        add(spec.util_range.is_some(), "util_range");
+        add(spec.cpus_range.is_some(), "cpus_range/cpus_range_frac");
+        add(
+            spec.util_includes_open_cputime,
+            "util_includes_open_cputime",
+        );
+        add(!spec.nodes.is_empty(), "nodes");
+        add(!spec.llcs.is_empty(), "llcs");
+        add(
+            spec.xnuma_threshold != scx_simulator::DEFAULT_XNUMA_THRESHOLD
+                || spec.xnuma_threshold_delta != scx_simulator::DEFAULT_XNUMA_THRESHOLD_DELTA,
+            "xnuma_threshold/xnuma_threshold_delta",
+        );
+        add(
+            spec.growth_algo != scx_simulator::LayerGrowthAlgo::Linear,
+            "growth_algo (its allocation role only; the BPF still reads it)",
+        );
+    }
+    out
+}
+
+/// Report which layer each task landed in, and which rule put it there.
+///
+/// The point of the report is the SECOND half. "The run exited 0" says
+/// nothing about whether any match rule was evaluated — with scx_layered's
+/// default single catch-all layer none ever is — so this prints the
+/// scheduler's own per-OR-group verdict, read back through the match probes,
+/// next to the `comm` and cgroup path it compared against.
+#[cfg(feature = "standalone")]
+fn print_layer_report(
+    monitor: &LayeredMonitor,
+    cfg: &LoadedLayerConfig,
+    task_names: &std::collections::BTreeMap<u64, String>,
+) {
+    let probes = monitor.probes();
+    let layer_name = |id: u32| -> &str {
+        cfg.specs
+            .get(id as usize)
+            .map_or("<unconfigured>", |s| s.name.as_str())
+    };
+
+    println!();
+    println!("layer report: which rule put each task in its layer");
+    for (&pid_raw, task_name) in task_names {
+        let pid = Pid(pid_raw as i32);
+        let Some(snapshot) = monitor.final_snapshot(pid) else {
+            println!("  task {task_name:?} (pid {pid_raw}): never scheduled, no layer");
+            continue;
+        };
+        let layer_id = snapshot.layer_id;
+        let trace = monitor.first_match_trace(pid);
+        let comm = trace.and_then(|t| t.comm.clone()).unwrap_or_default();
+        let cgrp = trace.and_then(|t| t.cgrp_path.clone()).unwrap_or_default();
+        println!("  task {task_name:?} (pid {pid_raw}) comm={comm:?} cgroup={cgrp:?}");
+
+        if layer_id == LAYERED_NO_LAYER {
+            println!("    -> NO LAYER (scx_layered treats this as a fatal error)");
+        } else {
+            println!("    -> layer {layer_id} {:?}", layer_name(layer_id));
+        }
+        let Some(trace) = trace else {
+            println!("    (no match trace captured)");
+            continue;
+        };
+
+        // Walk in maybe_refresh_layer()'s own scan order and stop at the
+        // winner: the layers after it were never consulted, so reporting
+        // verdicts for them would suggest a comparison that did not happen.
+        for lt in &trace.layers {
+            for (or_id, verdict) in lt.groups.iter().enumerate() {
+                let terms = describe_or_group(probes, lt.layer_id, or_id as u32);
+                let label = format!(
+                    "layer {} {:?} OR {or_id}",
+                    lt.layer_id,
+                    layer_name(lt.layer_id)
+                );
+                match verdict {
+                    OrGroupVerdict::Matches => println!("       MATCHED  {label}: {terms}"),
+                    OrGroupVerdict::FailedAt(and_id) => println!(
+                        "       rejected {label}: failed at term {and_id} = {}",
+                        probes.describe_term(lt.layer_id, or_id as u32, *and_id)
+                    ),
+                    OrGroupVerdict::Indeterminate(v) => {
+                        println!("       UNPROBED {label}: {v:?} — {terms}")
+                    }
+                }
+            }
+            if lt.layer_id == layer_id {
+                break;
+            }
+        }
+    }
+}
+
+/// Render every AND term of one OR group, or say that it has none.
+#[cfg(feature = "standalone")]
+fn describe_or_group(probes: &LayeredProbes, layer_id: u32, or_id: u32) -> String {
+    let n = probes.match_nr_ands(layer_id, or_id);
+    if n == 0 {
+        return "<catch-all, no terms>".to_string();
+    }
+    (0..n)
+        .map(|and_id| probes.describe_term(layer_id, or_id, and_id))
+        .collect::<Vec<_>>()
+        .join(" AND ")
+}
+
+/// Apply every config file the run was given to the freshly loaded scheduler:
+/// `--config`'s BPF globals, then `--layer-config`'s layer table.
 ///
 /// Called immediately after `load_scheduler` so that BPF-global writes happen
 /// before the scheduler's `ops.init` runs (i.e. before the simulator
 /// constructs `Simulator::new(sched)`, which holds the SIM_LOCK and triggers
 /// `ops.init` on first event).
-fn apply_config_if_present(args: &RunArgs, sched: &DynamicScheduler) -> Result<(), String> {
-    let Some(path) = args.config.as_ref() else {
-        return Ok(());
+/// Stand-in for a build without the `standalone` feature, where the layered
+/// match probes are not compiled. It REFUSES rather than ignoring the flags:
+/// silently running the default catch-all layer for someone who passed a
+/// config is the failure mode this whole module exists to prevent.
+#[cfg(not(feature = "standalone"))]
+fn apply_layer_config_if_present(
+    args: &RunArgs,
+    _sched: &DynamicScheduler,
+) -> Result<Option<std::convert::Infallible>, String> {
+    if args.layer_config.is_some() || args.layer_report || !args.layer_config_drop.is_empty() {
+        return Err(
+            "--layer-config / --layer-report need the `standalone` feature, which \
+             carries the scx_layered match probes this build was compiled without"
+                .into(),
+        );
+    }
+    Ok(None)
+}
+
+#[cfg(feature = "standalone")]
+type LoadedLayers = LoadedLayerConfig;
+/// Uninhabited, so `Option<LoadedLayers>` is statically always `None` and the
+/// report path below is unreachable without a second `cfg`.
+#[cfg(not(feature = "standalone"))]
+type LoadedLayers = std::convert::Infallible;
+
+fn apply_configs(args: &RunArgs, sched: &DynamicScheduler) -> Result<Option<LoadedLayers>, String> {
+    if let Some(path) = args.config.as_ref() {
+        let cfg = sched_config::load_config(path)?;
+        sched_config::apply_to_scheduler(&cfg, sched)?;
+    }
+    apply_layer_config_if_present(args, sched)
+}
+
+/// If `--layer-config <PATH>` is set, load it and replace scx_layered's
+/// default single catch-all layer with the layers it describes.
+///
+/// Must run before `ops.init`, for the same reason the BPF-global writes
+/// must: `ops.init` finalises the layer table, and a layer added afterwards
+/// would never be seen.
+#[cfg(feature = "standalone")]
+fn apply_layer_config_if_present(
+    args: &RunArgs,
+    sched: &DynamicScheduler,
+) -> Result<Option<LoadedLayerConfig>, String> {
+    let Some(path) = args.layer_config.as_ref() else {
+        if !args.layer_config_drop.is_empty() {
+            return Err("--layer-config-drop has nothing to act on without --layer-config".into());
+        }
+        if args.layer_report {
+            return Err(
+                "--layer-report needs --layer-config: without one the scheduler runs a \
+                 single catch-all layer and evaluates no match rule at all"
+                    .into(),
+            );
+        }
+        return Ok(None);
     };
-    let cfg = sched_config::load_config(path)?;
-    sched_config::apply_to_scheduler(&cfg, sched)?;
-    Ok(())
+    if args.determinism_check && args.layer_report {
+        return Err(
+            "--layer-report has no output under --determinism-check: that path runs \
+             two schedulers to compare checkpoints and installs no layered monitor. \
+             Run them separately."
+                .into(),
+        );
+    }
+    if args.scheduler != "layered" {
+        return Err(format!(
+            "--layer-config is an scx_layered configuration, but --scheduler is \
+             {:?}. Pass `-s layered`.",
+            args.scheduler
+        ));
+    }
+
+    // Capacities come from the scheduler that will consume the config, not
+    // from constants copied into Rust: the two can disagree after an scx bump,
+    // and the copy is the one that would be wrong.
+    let probes = LayeredProbes::new(sched);
+    let probed = |which: LayeredEnumProbe, what: &str| -> Result<usize, String> {
+        match probes.enum_value(which) {
+            v if v > 0 => Ok(v as usize),
+            v => Err(format!(
+                "scheduler reported {what}={v}, which cannot be right"
+            )),
+        }
+    };
+    let mut opts = LayerConfigOptions {
+        nr_cpus: args.cpus,
+        max_layers: probed(LayeredEnumProbe::MaxLayers, "MAX_LAYERS")?,
+        max_match_ors: probed(LayeredEnumProbe::MaxLayerMatchOrs, "MAX_LAYER_MATCH_ORS")?,
+        max_match_ands: probed(LayeredEnumProbe::NrLayerMatchKinds, "NR_LAYER_MATCH_KINDS")?,
+        weight_range: (
+            probed(LayeredEnumProbe::MinLayerWeight, "MIN_LAYER_WEIGHT")? as u32,
+            probed(LayeredEnumProbe::MaxLayerWeight, "MAX_LAYER_WEIGHT")? as u32,
+        ),
+        default_weight: probed(LayeredEnumProbe::DefaultLayerWeight, "DEFAULT_LAYER_WEIGHT")?
+            as u32,
+        nr_nodes: probes.nr_nodes().max(1),
+        max_comm: probed(LayeredEnumProbe::MaxComm, "MAX_COMM")?,
+        max_path: probed(LayeredEnumProbe::MaxPath, "MAX_PATH")?,
+        default_slice_ns: probed(LayeredEnumProbe::DefaultSliceNs, "the default slice")? as u64,
+        scx_slice_dfl_ns: probed(LayeredEnumProbe::ScxSliceDfl, "SCX_SLICE_DFL")? as u64,
+        waived: Default::default(),
+    };
+    let waive: Vec<&str> = args.layer_config_drop.iter().map(String::as_str).collect();
+    opts.waive(&waive).map_err(|bad| {
+        // List the whole waivable set on any bad name: the alternative is a
+        // reader who has to go and read the source to find out what is on
+        // offer, and the set is short.
+        let offered: Vec<&str> = Unsupported::ALL
+            .iter()
+            .filter(|u| u.disposition() == Disposition::Refusable)
+            .map(|u| u.json_name())
+            .collect();
+        format!(
+            "--layer-config-drop: {}\nWaivable fields are: {}",
+            bad.join("; "),
+            offered.join(", ")
+        )
+    })?;
+
+    let loaded = load_layer_config(path, &opts).map_err(|e| e.to_string())?;
+
+    // Echo what was not applied BEFORE the run, not after: the reader has to
+    // know the run is not the configuration as written while there is still a
+    // chance to stop it.
+    for caveat in loaded.caveats() {
+        eprintln!("layer config: {caveat}");
+    }
+    eprintln!(
+        "layer config: {} layer(s) from {}",
+        loaded.specs.len(),
+        path.display()
+    );
+    // scx_layered's userspace daemon reallocates CPUs continuously from
+    // measured utilisation; `scxsim run` publishes the static
+    // weight-proportional split the wrapper computes once. Everything that is
+    // only an input to that daemon is therefore inert here. Name the ones THIS
+    // config actually uses rather than lecturing: a config that uses none gets
+    // no line at all.
+    let inert = allocator_only_fields(&loaded);
+    if !inert.is_empty() {
+        eprintln!(
+            "layer config: CPU sets are the static weight-proportional split, not \
+             scx_layered's userspace allocator, so these do not shape them here: {}",
+            inert.join(", ")
+        );
+    }
+    if loaded.specs.iter().any(|s| s.perf > 0) {
+        eprintln!(
+            "layer config: perf is published and the scheduler's scx_bpf_cpuperf_set \
+             call runs, but the engine models no DVFS — the level is recorded and \
+             does not change how fast simulated work completes"
+        );
+    }
+    sched.layered_layers(&loaded.specs);
+    Ok(Some(loaded))
 }
 
 fn load_scheduler(

@@ -1,0 +1,49 @@
+[
+  {
+    "name": "interactive",
+    "comment": "Latency-sensitive front end, selected by cgroup. Preempting, so scx_layered forces both disallow_*_after_us to 'never'.",
+    "matches": [
+      [{ "CgroupPrefix": "interactive/" }]
+    ],
+    "kind": {
+      "Grouped": {
+        "util_range": [0.1, 0.8],
+        "cpus_range_frac": [0.25, 0.75],
+        "preempt": true,
+        "prev_over_idle_core": true,
+        "growth_algo": "Topo"
+      }
+    }
+  },
+  {
+    "name": "bg_worker_0",
+    "comment": "One named worker inside the background cgroup. Two ANDed terms, so a sibling in the same cgroup with a different thread name falls through.",
+    "matches": [
+      [
+        { "CgroupPrefix": "background/" },
+        { "CommPrefix": "background_0" }
+      ]
+    ],
+    "kind": {
+      "Confined": {
+        "util_range": [0.2, 0.9],
+        "cpus_range": [1, 2],
+        "slice_us": 4000,
+        "fifo": true,
+        "skip_remote_node": true
+      }
+    }
+  },
+  {
+    "name": "everything_else",
+    "comment": "scx_layered treats a task that matches no layer as a fatal error, so the last layer must be a catch-all: matches is exactly [[]].",
+    "matches": [
+      []
+    ],
+    "kind": {
+      "Open": {
+        "weight": 50
+      }
+    }
+  }
+]

@@ -704,6 +704,21 @@ static int layered_perf_event_read_value(void *map, unsigned long long flags,
  * silently mis-configuring every layer.
  * ---------------------------------------------------------------------------*/
 
+enum layered_layer_field {
+	LAYER_FIELD_FIFO,
+	LAYER_FIELD_YIELD_STEP_NS,
+	LAYER_FIELD_DISALLOW_OPEN_AFTER_NS,
+	LAYER_FIELD_DISALLOW_PREEMPT_AFTER_NS,
+	LAYER_FIELD_XLLC_MIG_MIN_NS,
+	LAYER_FIELD_SKIP_REMOTE_NODE,
+	LAYER_FIELD_PREV_OVER_IDLE_CORE,
+	LAYER_FIELD_IDLE_CONFINED,
+	LAYER_FIELD_TASK_PLACE,
+	LAYER_FIELD_MEMBER_EXPIRE_MS,
+	LAYER_FIELD_PERF,
+	LAYER_FIELD_NR_INVALID,
+};
+
 /* Selector namespace for layered_probe_enum(). */
 enum layered_enum_probe_id {
 	LAYERED_PROBE_KIND_OPEN,
@@ -732,6 +747,22 @@ enum layered_enum_probe_id {
 	LAYERED_PROBE_GROWTH_ROUND_ROBIN,
 	LAYERED_PROBE_MAX_LAYERS,
 	LAYERED_PROBE_DEFAULT_LAYER_WEIGHT,
+	/*
+	 * Capacity limits a layer config can exceed. Exported so the JSON
+	 * config loader can reject an over-large config by name instead of
+	 * discovering it as an -E2BIG from layered_add_layer_match().
+	 */
+	LAYERED_PROBE_MAX_LAYER_MATCH_ORS,
+	LAYERED_PROBE_NR_LAYER_MATCH_KINDS,
+	LAYERED_PROBE_MAX_PATH,
+	LAYERED_PROBE_MAX_COMM,
+	LAYERED_PROBE_MAX_LAYER_NAME,
+	LAYERED_PROBE_MATCH_AVG_RUNTIME,
+	LAYERED_PROBE_MIN_LAYER_WEIGHT,
+	LAYERED_PROBE_MAX_LAYER_WEIGHT,
+	LAYERED_PROBE_SCX_SLICE_DFL,
+	LAYERED_PROBE_DEFAULT_SLICE_NS,
+	LAYERED_PROBE_LAYER_FIELD_COUNT,
 	LAYERED_PROBE_NR_INVALID,
 };
 
@@ -764,6 +795,24 @@ int layered_probe_enum(int which)
 	case LAYERED_PROBE_GROWTH_ROUND_ROBIN:		return GROWTH_ALGO_ROUND_ROBIN;
 	case LAYERED_PROBE_MAX_LAYERS:			return MAX_LAYERS;
 	case LAYERED_PROBE_DEFAULT_LAYER_WEIGHT:	return DEFAULT_LAYER_WEIGHT;
+	case LAYERED_PROBE_MAX_LAYER_MATCH_ORS:		return MAX_LAYER_MATCH_ORS;
+	case LAYERED_PROBE_NR_LAYER_MATCH_KINDS:	return NR_LAYER_MATCH_KINDS;
+	case LAYERED_PROBE_MAX_PATH:			return MAX_PATH;
+	case LAYERED_PROBE_MAX_COMM:			return MAX_COMM;
+	case LAYERED_PROBE_MAX_LAYER_NAME:		return MAX_LAYER_NAME;
+	case LAYERED_PROBE_MATCH_AVG_RUNTIME:		return MATCH_AVG_RUNTIME;
+	case LAYERED_PROBE_MIN_LAYER_WEIGHT:		return MIN_LAYER_WEIGHT;
+	case LAYERED_PROBE_MAX_LAYER_WEIGHT:		return MAX_LAYER_WEIGHT;
+	/*
+	 * SCX_SLICE_DFL is the kernel's default slice, and it is what
+	 * scx_layered's DFL_DISALLOW_*_AFTER_US are 2x and 4x of -- a FIXED
+	 * pair, not a multiple of any layer's own slice. sim_wrapper.h
+	 * #undefs the weak-variable macro so this resolves to the real enum.
+	 */
+	case LAYERED_PROBE_SCX_SLICE_DFL:		return (int)SCX_SLICE_DFL;
+	/* The `--slice-us` equivalent an unset per-layer slice inherits. */
+	case LAYERED_PROBE_DEFAULT_SLICE_NS:		return (int)slice_ns;
+	case LAYERED_PROBE_LAYER_FIELD_COUNT:		return LAYER_FIELD_NR_INVALID;
 	default:					return -1;
 	}
 }
@@ -1257,6 +1306,44 @@ static int layered_probe_copy_str(const char *src, char *buf, unsigned int buf_s
  * `layered_probe_task_cgrp_path()` / `layered_probe_task_comm()` so a caller
  * can see BOTH sides of the comparison the scheduler made.
  */
+/*
+ * The scalar operand(s) of a match term: `which` 0 is the primary scalar and
+ * 1 the second, used only by MATCH_AVG_RUNTIME's upper bound. Returns 0 for a
+ * term that has none, which the caller distinguishes by kind.
+ *
+ * Without this the report can only name a scalar term's KIND, so NiceAbove(5)
+ * and NiceAbove(19) render identically and AvgRuntime's bounds never appear.
+ */
+long long layered_probe_match_scalar(unsigned int layer_id, unsigned int or_id,
+				     unsigned int and_id, unsigned int which)
+{
+	const struct layer_match *m;
+
+	if (layer_id >= nr_layers || or_id >= MAX_LAYER_MATCH_ORS ||
+	    and_id >= NR_LAYER_MATCH_KINDS)
+		return 0;
+	m = &layers[layer_id].matches[or_id].matches[and_id];
+
+	if (which == 1)
+		return m->kind == MATCH_AVG_RUNTIME ? (long long)m->max_avg_runtime_us : 0;
+
+	switch (m->kind) {
+	case MATCH_NICE_ABOVE:
+	case MATCH_NICE_BELOW:
+	case MATCH_NICE_EQUALS:		return m->nice;
+	case MATCH_USER_ID_EQUALS:	return m->user_id;
+	case MATCH_GROUP_ID_EQUALS:	return m->group_id;
+	case MATCH_PID_EQUALS:		return m->pid;
+	case MATCH_PPID_EQUALS:		return m->ppid;
+	case MATCH_TGID_EQUALS:		return m->tgid;
+	case MATCH_IS_GROUP_LEADER:	return m->is_group_leader;
+	case MATCH_IS_KTHREAD:		return m->is_kthread;
+	case MATCH_NUMA_NODE:		return m->numa_node_id;
+	case MATCH_AVG_RUNTIME:		return (long long)m->min_avg_runtime_us;
+	default:			return 0;
+	}
+}
+
 int layered_probe_match_needle(unsigned int layer_id, unsigned int or_id,
 			       unsigned int and_id, char *buf, unsigned int buf_sz)
 {
@@ -1833,10 +1920,12 @@ int layered_add_layer(const char *name, int kind, int preempt, int preempt_first
  * layer spec has.
  *
  * `str_arg` carries the string for the *_PREFIX / *_SUFFIX / *_CONTAINS kinds,
- * `int_arg` the scalar for the numeric kinds. Returns 0, or a negative errno.
+ * `int_arg` the scalar for the numeric kinds, and `int_arg2` the second scalar
+ * for the one kind that takes a range. Returns 0, or a negative errno.
  */
 int layered_add_layer_match(unsigned int layer_id, unsigned int or_id, int kind,
-			    const char *str_arg, long long int_arg, int exclude)
+			    const char *str_arg, long long int_arg,
+			    long long int_arg2, int exclude)
 {
 	struct layer *layer;
 	struct layer_match_ands *ands;
@@ -1873,9 +1962,16 @@ int layered_add_layer_match(unsigned int layer_id, unsigned int or_id, int kind,
 		dst[i] = '\0';
 		break;
 	}
+	/*
+	 * MATCH_SCXCMD_JOIN is deliberately NOT here. It compares against
+	 * `taskc->join_layer`, which production fills from the scxcmd
+	 * userspace channel; the simulator has no such channel, so the field
+	 * is always empty and the rule could only ever answer "no match".
+	 * Accepting it would be exactly the silent never-matching rule the
+	 * default arm below exists to prevent, so it falls through to -ENOTSUP.
+	 */
 	case MATCH_COMM_PREFIX:
-	case MATCH_PCOMM_PREFIX:
-	case MATCH_SCXCMD_JOIN: {
+	case MATCH_PCOMM_PREFIX: {
 		char *dst = kind == MATCH_PCOMM_PREFIX ? match->pcomm_prefix
 						       : match->comm_prefix;
 
@@ -1915,6 +2011,23 @@ int layered_add_layer_match(unsigned int layer_id, unsigned int or_id, int kind,
 	case MATCH_NUMA_NODE:
 		match->numa_node_id = (u32)int_arg;
 		break;
+	case MATCH_AVG_RUNTIME:
+		/*
+		 * Half-open [min, max). taskc->runtime_avg is maintained by
+		 * layered_stopping() on the BPF side, so unlike the other
+		 * userspace-fed matchers this one needs no daemon.
+		 *
+		 * Both bounds are u64 in upstream's schema. They cross as i64
+		 * and are cast straight back, which round-trips the whole
+		 * range including values above I64_MAX -- u64::MAX is the
+		 * natural spelling of "no upper limit". No ordering check:
+		 * upstream accepts any ordering and the BPF's
+		 * `min <= avg < max` simply never holds for a reversed pair,
+		 * which the loader reports as a note rather than an error.
+		 */
+		match->min_avg_runtime_us = (u64)int_arg;
+		match->max_avg_runtime_us = (u64)int_arg2;
+		break;
 	default:
 		/*
 		 * No silent success: kinds the harness cannot configure
@@ -1947,6 +2060,158 @@ int layered_set_layer_nr_match_ors(unsigned int layer_id, unsigned int nr_ors)
 	if (nr_ors > layers[layer_id].nr_match_ors)
 		layers[layer_id].nr_match_ors = nr_ors;
 	return 0;
+}
+
+/*
+ * Per-layer scalar policy fields, set after layered_add_layer().
+ *
+ * These are `struct layer` members the BPF reads on its ordinary paths, but
+ * which arrive from a layer config rather than being derivable from the
+ * topology. They live behind a selector rather than growing
+ * layered_add_layer()'s argument list, which is already eleven wide.
+ *
+ * Must match Rust `LayerField` in `safe/layered.rs`. Held there by
+ * `tests/layered_config.rs::layer_field_selectors_name_the_same_struct_members`,
+ * which compares each selector's BYTE OFFSET (via
+ * layered_probe_layer_field_offset) against the Rust side's expectation --
+ * a reordering of either enum moves the offsets and fails the test, which
+ * reading a value back through the same selector cannot detect.
+ */
+
+/*
+ * Publish one scalar field into `struct layer`. Returns 0, or a negative
+ * errno. An unknown selector is -ENOTSUP rather than a silent no-op: a field
+ * the harness cannot publish must be visible to the caller, not lost.
+ */
+int layered_set_layer_field(unsigned int layer_id, int which,
+			    unsigned long long value)
+{
+	struct layer *layer;
+
+	if (layer_id >= nr_layers)
+		return -EINVAL;
+	layer = &layers[layer_id];
+
+	switch (which) {
+	case LAYER_FIELD_FIFO:
+		layer->fifo = !!value;
+		break;
+	case LAYER_FIELD_YIELD_STEP_NS:
+		layer->yield_step_ns = value;
+		break;
+	case LAYER_FIELD_DISALLOW_OPEN_AFTER_NS:
+		layer->disallow_open_after_ns = value;
+		break;
+	case LAYER_FIELD_DISALLOW_PREEMPT_AFTER_NS:
+		layer->disallow_preempt_after_ns = value;
+		break;
+	case LAYER_FIELD_XLLC_MIG_MIN_NS:
+		layer->xllc_mig_min_ns = value;
+		break;
+	case LAYER_FIELD_SKIP_REMOTE_NODE:
+		layer->skip_remote_node = !!value;
+		break;
+	case LAYER_FIELD_PREV_OVER_IDLE_CORE:
+		layer->prev_over_idle_core = !!value;
+		break;
+	case LAYER_FIELD_IDLE_CONFINED:
+		layer->idle_confined = !!value;
+		break;
+	case LAYER_FIELD_TASK_PLACE:
+		if (value > PLACEMENT_FLOAT)
+			return -EINVAL;
+		layer->task_place = (enum layer_task_place)value;
+		break;
+	case LAYER_FIELD_MEMBER_EXPIRE_MS:
+		layer->member_expire_ms = value;
+		break;
+	case LAYER_FIELD_PERF:
+		if (value > 0xffffffffULL)
+			return -EINVAL;
+		layer->perf = (u32)value;
+		break;
+	default:
+		return -ENOTSUP;
+	}
+	return 0;
+}
+
+/*
+ * Read one scalar field back out of `struct layer`.
+ *
+ * Publication is not observable from Rust otherwise, so without this a test
+ * could only assert that layered_set_layer_field() returned 0 — which is a
+ * claim about the setter, not about the scheduler's state. Returns the value,
+ * or ~0ULL for a bad layer id or selector.
+ */
+unsigned long long layered_probe_layer_field(unsigned int layer_id, int which)
+{
+	const struct layer *layer;
+
+	if (layer_id >= nr_layers)
+		return ~0ULL;
+	layer = &layers[layer_id];
+
+	switch (which) {
+	case LAYER_FIELD_FIFO:			return layer->fifo;
+	case LAYER_FIELD_YIELD_STEP_NS:		return layer->yield_step_ns;
+	case LAYER_FIELD_DISALLOW_OPEN_AFTER_NS:
+		return layer->disallow_open_after_ns;
+	case LAYER_FIELD_DISALLOW_PREEMPT_AFTER_NS:
+		return layer->disallow_preempt_after_ns;
+	case LAYER_FIELD_XLLC_MIG_MIN_NS:	return layer->xllc_mig_min_ns;
+	case LAYER_FIELD_SKIP_REMOTE_NODE:	return layer->skip_remote_node;
+	case LAYER_FIELD_PREV_OVER_IDLE_CORE:	return layer->prev_over_idle_core;
+	case LAYER_FIELD_IDLE_CONFINED:		return layer->idle_confined;
+	case LAYER_FIELD_TASK_PLACE:		return (unsigned long long)layer->task_place;
+	case LAYER_FIELD_MEMBER_EXPIRE_MS:	return layer->member_expire_ms;
+	case LAYER_FIELD_PERF:			return layer->perf;
+	default:				return ~0ULL;
+	}
+}
+
+/*
+ * The byte offset within `struct layer` that a selector names, and the width
+ * of the member there.
+ *
+ * This exists because reading a field back through the SAME selector the
+ * setter used cannot detect a reordered enum: both sides move together and
+ * the value round-trips into whichever member the enum currently maps the
+ * selector to. Offsets do not move with the enum, so comparing them against
+ * the Rust side's expectation is an asymmetric check that a reorder fails.
+ *
+ * Returns the offset, or ~0ULL for an unknown selector. The width is written
+ * through `width` when non-NULL.
+ */
+unsigned long long layered_probe_layer_field_offset(int which, unsigned int *width)
+{
+#define LAYER_FIELD_AT(member)						\
+	do {								\
+		if (width)						\
+			*width = (unsigned int)sizeof(((struct layer *)0)->member); \
+		return (unsigned long long)__builtin_offsetof(struct layer, member); \
+	} while (0)
+
+	switch (which) {
+	case LAYER_FIELD_FIFO:			LAYER_FIELD_AT(fifo);
+	case LAYER_FIELD_YIELD_STEP_NS:		LAYER_FIELD_AT(yield_step_ns);
+	case LAYER_FIELD_DISALLOW_OPEN_AFTER_NS:
+		LAYER_FIELD_AT(disallow_open_after_ns);
+	case LAYER_FIELD_DISALLOW_PREEMPT_AFTER_NS:
+		LAYER_FIELD_AT(disallow_preempt_after_ns);
+	case LAYER_FIELD_XLLC_MIG_MIN_NS:	LAYER_FIELD_AT(xllc_mig_min_ns);
+	case LAYER_FIELD_SKIP_REMOTE_NODE:	LAYER_FIELD_AT(skip_remote_node);
+	case LAYER_FIELD_PREV_OVER_IDLE_CORE:	LAYER_FIELD_AT(prev_over_idle_core);
+	case LAYER_FIELD_IDLE_CONFINED:		LAYER_FIELD_AT(idle_confined);
+	case LAYER_FIELD_TASK_PLACE:		LAYER_FIELD_AT(task_place);
+	case LAYER_FIELD_MEMBER_EXPIRE_MS:	LAYER_FIELD_AT(member_expire_ms);
+	case LAYER_FIELD_PERF:			LAYER_FIELD_AT(perf);
+	default:
+		if (width)
+			*width = 0;
+		return ~0ULL;
+	}
+#undef LAYER_FIELD_AT
 }
 
 /*

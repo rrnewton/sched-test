@@ -142,8 +142,15 @@ pub use safe::bpf_trace::{
 };
 pub use safe::fmt::{FmtN, FmtTs, SimFormat};
 pub use safe::layered::{
-    LayerGrowthAlgo, LayerKind, LayerMatch, LayerSpec, DEFAULT_LAYER_WEIGHT,
-    DEFAULT_XNUMA_THRESHOLD, DEFAULT_XNUMA_THRESHOLD_DELTA,
+    LayerField, LayerGrowthAlgo, LayerKind, LayerMatch, LayerPlacement, LayerSpec,
+    DEFAULT_LAYER_WEIGHT, DEFAULT_XNUMA_THRESHOLD, DEFAULT_XNUMA_THRESHOLD_DELTA,
+    DISALLOW_AFTER_NEVER,
+};
+// Loading a real scx_layered JSON layer config. Public because the point of
+// it is that a configuration written for the production scheduler runs here.
+pub use safe::layered_config::{
+    load_layer_config, parse_layer_config, Disposition, LayerConfigError, LayerConfigOptions,
+    LoadedLayerConfig, Rejection, Unsupported,
 };
 // scx_layered's own allocator, compiled verbatim from the scx submodule.
 // tests/layered_alloc.rs drives it directly to prove it is the real thing.

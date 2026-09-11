@@ -13,7 +13,7 @@ use std::ffi::c_void;
 use std::path::Path;
 use std::sync::Mutex;
 
-use crate::layered::LayerSpec;
+use crate::layered::{LayerField, LayerSpec};
 use crate::layered_control::{LayeredControl, LayeredControlSnapshot};
 
 // ---------------------------------------------------------------------------
@@ -1725,9 +1725,10 @@ impl DynamicScheduler {
             i32,
             i32,
         ) -> i32;
-        type AddMatchFn = unsafe extern "C" fn(u32, u32, i32, *const i8, i64, i32) -> i32;
+        type AddMatchFn = unsafe extern "C" fn(u32, u32, i32, *const i8, i64, i64, i32) -> i32;
         type SetNrOrsFn = unsafe extern "C" fn(u32, u32) -> i32;
         type SetCpusFn = unsafe extern "C" fn(u32, *const u64, u32) -> i32;
+        type SetFieldFn = unsafe extern "C" fn(u32, i32, u64) -> i32;
 
         // SAFETY: Symbols resolved from a `.so` built by our build system.
         // Every string is kept alive across its call via the owned CString.
@@ -1752,6 +1753,10 @@ impl DynamicScheduler {
                 ._lib
                 .get(b"layered_set_layer_cpus")
                 .expect("layered_set_layer_cpus not found");
+            let set_field: libloading::Symbol<SetFieldFn> = self
+                ._lib
+                .get(b"layered_set_layer_field")
+                .expect("layered_set_layer_field not found");
 
             (reset)();
             for spec in specs {
@@ -1773,14 +1778,36 @@ impl DynamicScheduler {
                 assert!(id >= 0, "layered_add_layer failed for {:?}", spec.name);
                 let id = id as u32;
 
+                // Every scalar policy field is published unconditionally,
+                // including the ones equal to the wrapper's own default. A
+                // "only publish when it differs" optimisation would make the
+                // published state depend on `layered_reset_layers()` having
+                // run first, which is exactly the sort of implicit ordering
+                // that breaks silently.
+                for field in LayerField::ALL {
+                    let rc = (set_field)(id, field as i32, spec.field_value(field));
+                    assert_eq!(
+                        rc, 0,
+                        "layered_set_layer_field({field:?}) failed with rc={rc}"
+                    );
+                }
+
                 for (or_id, ands) in spec.matches.iter().enumerate() {
                     for m in ands {
-                        let (kind, s, i) = m.to_ffi();
-                        let cstr = s.map(|s| {
+                        let ffi = m.to_ffi();
+                        let cstr = ffi.needle.map(|s| {
                             std::ffi::CString::new(s).expect("match string must not contain NUL")
                         });
                         let ptr = cstr.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
-                        let rc = (add_match)(id, or_id as u32, kind, ptr, i, m.exclude() as i32);
+                        let rc = (add_match)(
+                            id,
+                            or_id as u32,
+                            ffi.kind,
+                            ptr,
+                            ffi.int_arg,
+                            ffi.int_arg2,
+                            m.exclude() as i32,
+                        );
                         assert_eq!(rc, 0, "layered_add_layer_match({m:?}) failed with rc={rc}");
                     }
                 }

@@ -47,6 +47,7 @@ use std::ffi::{c_char, c_void, CStr};
 
 use crate::ffi::DynamicScheduler;
 use crate::kfuncs::{self, CallbackContext, OpsContext};
+use crate::layered::LayerField;
 use crate::monitor::{Monitor, ProbeContext, ProbePoint};
 use crate::types::{CpuId, Pid, TimeNs};
 
@@ -108,6 +109,9 @@ type U32ToI32Fn = unsafe extern "C" fn(u32) -> i32;
 type PairToI32Fn = unsafe extern "C" fn(u32, u32) -> i32;
 type PairToU32Fn = unsafe extern "C" fn(u32, u32) -> u32;
 type PairToU64Fn = unsafe extern "C" fn(u32, u32) -> u64;
+type LayerFieldFn = unsafe extern "C" fn(u32, i32) -> u64;
+type LayerFieldOffsetFn = unsafe extern "C" fn(i32, *mut u32) -> u64;
+type MatchScalarFn = unsafe extern "C" fn(u32, u32, u32, u32) -> i64;
 type TripleToI32Fn = unsafe extern "C" fn(u32, u32, u32) -> i32;
 type TripleToU64Fn = unsafe extern "C" fn(u32, u32, u32) -> u64;
 type NeedleFn = unsafe extern "C" fn(u32, u32, u32, *mut c_char, u32) -> i32;
@@ -168,6 +172,9 @@ pub struct LayeredProbes {
     match_first_failure_fn: TaskOrFn,
     task_comm_fn: TaskStrFn,
     task_cgrp_path_fn: TaskStrFn,
+    layer_field_fn: LayerFieldFn,
+    layer_field_offset_fn: LayerFieldOffsetFn,
+    match_scalar_fn: MatchScalarFn,
 }
 
 impl LayeredProbes {
@@ -245,6 +252,12 @@ impl LayeredProbes {
                 match_first_failure_fn: resolve!(b"layered_probe_match_first_failure", TaskOrFn),
                 task_comm_fn: resolve!(b"layered_probe_task_comm", TaskStrFn),
                 task_cgrp_path_fn: resolve!(b"layered_probe_task_cgrp_path", TaskStrFn),
+                layer_field_fn: resolve!(b"layered_probe_layer_field", LayerFieldFn),
+                layer_field_offset_fn: resolve!(
+                    b"layered_probe_layer_field_offset",
+                    LayerFieldOffsetFn
+                ),
+                match_scalar_fn: resolve!(b"layered_probe_match_scalar", MatchScalarFn),
             }
         }
     }
@@ -255,6 +268,36 @@ impl LayeredProbes {
     pub fn enum_value(&self, which: LayeredEnumProbe) -> i32 {
         // SAFETY: pure switch over an integer selector, no pointers.
         unsafe { (self.enum_fn)(which as i32) }
+    }
+
+    /// The byte offset and width of the `struct layer` member a
+    /// [`LayerField`] selector names, or `None` for an unknown selector.
+    ///
+    /// Reading a field back through the same selector the setter used cannot
+    /// detect a reordered enum — both sides move together. Offsets do not,
+    /// which is what makes this an actual ABI check rather than a round trip.
+    pub fn layer_field_offset(&self, field: LayerField) -> Option<(u64, u32)> {
+        let mut width: u32 = 0;
+        // SAFETY: the selector is a plain integer and `width` is a live local
+        // for the duration of the call; the C side writes it unconditionally.
+        let off = unsafe { (self.layer_field_offset_fn)(field as i32, &mut width) };
+        (off != u64::MAX).then_some((off, width))
+    }
+
+    /// Read one scalar policy field back out of `struct layer`.
+    ///
+    /// This is the only way to see that a [`LayerField`] a config asked for
+    /// actually reached the scheduler. Returns `None` for an unconfigured
+    /// layer id (the C side answers `~0` there, which no field's value can
+    /// legitimately be except the `disallow_*` "never" sentinel — so the
+    /// layer id is range-checked here instead of trusting the value).
+    pub fn layer_field(&self, layer_id: u32, field: LayerField) -> Option<u64> {
+        if layer_id >= self.nr_layers() {
+            return None;
+        }
+        // SAFETY: layer id bounds-checked above and again C-side; the
+        // selector is a plain integer and no pointers cross the call.
+        Some(unsafe { (self.layer_field_fn)(layer_id, field as i32) })
     }
 
     /// The layer scx_layered assigned to `pid`, or [`LAYERED_NO_LAYER`].
@@ -653,7 +696,42 @@ impl LayeredProbes {
         };
         match self.match_needle(layer_id, or_id, and_id) {
             Some(needle) => format!("{bang}{kind:?}({needle:?})"),
-            None => format!("{bang}{kind:?}"),
+            // A scalar term rendered bare cannot be told from another term of
+            // the same kind: `NiceAbove(5)` and `NiceAbove(19)` both printed
+            // `NiceAbove`, and AvgRuntime's bounds never appeared at all.
+            None => match self.match_scalars(layer_id, or_id, and_id, kind) {
+                Some(args) => format!("{bang}{kind:?}({args})"),
+                None => format!("{bang}{kind:?}"),
+            },
+        }
+    }
+
+    /// The scalar operand(s) of a non-string term, rendered, or `None` for a
+    /// kind whose operand the probes cannot read.
+    fn match_scalars(
+        &self,
+        layer_id: u32,
+        or_id: u32,
+        and_id: u32,
+        kind: LayeredMatchKind,
+    ) -> Option<String> {
+        use LayeredMatchKind as K;
+        let one = |v: i64| Some(v.to_string());
+        // SAFETY: pure reads of `struct layer_match` through the C probe;
+        // indices are range-checked C-side.
+        let raw = unsafe { (self.match_scalar_fn)(layer_id, or_id, and_id, 0) };
+        let raw2 = unsafe { (self.match_scalar_fn)(layer_id, or_id, and_id, 1) };
+        match kind {
+            K::NiceAbove | K::NiceBelow | K::NiceEquals => one(raw),
+            K::UserIdEquals
+            | K::GroupIdEquals
+            | K::PidEquals
+            | K::PpidEquals
+            | K::TgidEquals
+            | K::NumaNode => one(raw),
+            K::IsGroupLeader | K::IsKthread => Some((raw != 0).to_string()),
+            K::AvgRuntime => Some(format!("{}us..{}us", raw as u64, raw2 as u64)),
+            _ => None,
         }
     }
 }
@@ -845,6 +923,30 @@ pub enum LayeredEnumProbe {
     MaxLayers = 24,
     /// `DEFAULT_LAYER_WEIGHT`
     DefaultLayerWeight = 25,
+    /// `MAX_LAYER_MATCH_ORS`
+    MaxLayerMatchOrs = 26,
+    /// `NR_LAYER_MATCH_KINDS`
+    NrLayerMatchKinds = 27,
+    /// `MAX_PATH`
+    MaxPath = 28,
+    /// `MAX_COMM`
+    MaxComm = 29,
+    /// `MAX_LAYER_NAME`
+    MaxLayerName = 30,
+    /// `MATCH_AVG_RUNTIME`
+    MatchAvgRuntime = 31,
+    /// `MIN_LAYER_WEIGHT`
+    MinLayerWeight = 32,
+    /// `MAX_LAYER_WEIGHT`
+    MaxLayerWeight = 33,
+    /// `SCX_SLICE_DFL` — the kernel default slice scx_layered's
+    /// `DFL_DISALLOW_*_AFTER_US` are fixed multiples of.
+    ScxSliceDfl = 34,
+    /// The `--slice-us` equivalent an unset per-layer slice inherits.
+    DefaultSliceNs = 35,
+    /// `LAYER_FIELD_NR_INVALID` — how many [`LayerField`] selectors the
+    /// scheduler knows about.
+    LayerFieldCount = 36,
 }
 
 /// `enum layer_match_kind` from `intf.h`, in declaration order.

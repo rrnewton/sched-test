@@ -429,3 +429,202 @@ fn test_help_succeeds() {
         sub.stdout
     );
 }
+
+// ===========================================================================
+// --layer-config: loading a real scx_layered JSON config through the CLI.
+//
+// `tests/layered_config.rs` covers the parser and drives the scheduler
+// in-process. What only a subprocess can show is the thing the CLI is for:
+// a config file named on the command line reaching the scheduler, and the
+// report telling you which rule fired. Those are the two tests below that
+// assert on content rather than on an exit code.
+// ===========================================================================
+
+/// The shipped example layer config, and the workload it is written against.
+const LAYER_CONFIG: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../examples/layer_configs/edge_like.json"
+);
+const CGROUP_WORKLOAD: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../examples/cgroup_hierarchy.json"
+);
+
+/// A config file on the command line reaches the scheduler, and the report
+/// names WHICH rule put each task in its layer.
+///
+/// The assertion that carries the weight is the `background_1` line: it is in
+/// `background/` like `background_0`, so the AND group's cgroup term held and
+/// the comm term did not — `failed at term 1`. A run that compared nothing
+/// cannot produce that, and comparing nothing is exactly what
+/// `scxsim run -s layered` did before a config could be loaded at all.
+#[test]
+fn test_layer_config_rules_fire_and_the_report_names_them() {
+    let out = run_cli(&[
+        "run",
+        "-s",
+        "layered",
+        "--cpus",
+        "4",
+        "--duration",
+        "100ms",
+        "--layer-config",
+        LAYER_CONFIG,
+        "--layer-report",
+        CGROUP_WORKLOAD,
+    ]);
+    assert_eq!(out.code, 0, "run failed; stderr:\n{}", out.stderr);
+    assert!(
+        out.stderr.contains("3 layer(s) from"),
+        "the CLI should say what it loaded; stderr:\n{}",
+        out.stderr
+    );
+    for expected in [
+        // the AND group matching on both a cgroup path and a thread name
+        r#"MATCHED  layer 1 "bg_worker_0" OR 0: CgroupPrefix("background/") AND CommPrefix("background_0")"#,
+        // and the sibling that cleared term 0 and failed term 1
+        r#"rejected layer 1 "bg_worker_0" OR 0: failed at term 1 = CommPrefix("background_0")"#,
+        // a cgroup-only rule, on the path the scheduler itself renders
+        r#"MATCHED  layer 0 "interactive" OR 0: CgroupPrefix("interactive/")"#,
+    ] {
+        assert!(
+            out.stdout.contains(expected),
+            "layer report missing {expected:?}; stdout:\n{}",
+            out.stdout
+        );
+    }
+}
+
+/// Every run that loads a config says the CPU sets are the static split, not
+/// the userspace allocator's, so `util_range` in the file cannot be read as
+/// having sized anything.
+#[test]
+fn test_layer_config_run_declares_the_static_allocation() {
+    let out = run_cli(&[
+        "run",
+        "-s",
+        "layered",
+        "--cpus",
+        "4",
+        "--duration",
+        "50ms",
+        "--layer-config",
+        LAYER_CONFIG,
+        CGROUP_WORKLOAD,
+    ]);
+    assert_eq!(out.code, 0, "run failed; stderr:\n{}", out.stderr);
+    assert!(
+        out.stderr.contains("static weight-proportional split"),
+        "stderr:\n{}",
+        out.stderr
+    );
+}
+
+/// A config asking for something scxsim cannot deliver fails by NAME, and the
+/// message says which of them a waiver would cover.
+#[test]
+fn test_layer_config_refuses_by_name() {
+    let dir = std::env::temp_dir().join(format!("scxsim-lcfg-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("gpu.json");
+    std::fs::write(
+        &path,
+        r#"[
+          { "name": "ai", "matches": [[{ "UsedGpuPid": true }]],
+            "kind": { "Grouped": { "util_range": [0.5, 0.9], "membw_gb": 8.0 } } },
+          { "name": "rest", "matches": [[]], "kind": { "Open": {} } }
+        ]"#,
+    )
+    .expect("write config");
+
+    let out = run_cli(&[
+        "run",
+        "-s",
+        "layered",
+        "--cpus",
+        "4",
+        "--duration",
+        "50ms",
+        "--layer-config",
+        path.to_str().unwrap(),
+        CGROUP_WORKLOAD,
+    ]);
+    assert_ne!(out.code, 0, "a refused config must not run");
+    assert!(
+        out.stderr.contains("UsedGpuPid") && out.stderr.contains("membw_gb"),
+        "both must be named; stderr:\n{}",
+        out.stderr
+    );
+    assert!(
+        out.stderr.contains("--layer-config-drop"),
+        "the waivable one should say how; stderr:\n{}",
+        out.stderr
+    );
+
+    // Waiving the field is not enough: the match kind is never waivable.
+    let waived = run_cli(&[
+        "run",
+        "-s",
+        "layered",
+        "--cpus",
+        "4",
+        "--duration",
+        "50ms",
+        "--layer-config",
+        path.to_str().unwrap(),
+        "--layer-config-drop",
+        "membw_gb",
+        CGROUP_WORKLOAD,
+    ]);
+    assert_ne!(waived.code, 0, "the GPU match kind must still refuse");
+    assert!(
+        waived.stderr.contains("UsedGpuPid") && !waived.stderr.contains(": membw_gb —"),
+        "stderr:\n{}",
+        waived.stderr
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `--layer-config` is an scx_layered configuration; pointing it at another
+/// scheduler is a mistake worth naming rather than silently ignoring.
+#[test]
+fn test_layer_config_rejects_a_non_layered_scheduler() {
+    let out = run_cli(&[
+        "run",
+        "-s",
+        "simple",
+        "--duration",
+        "50ms",
+        "--layer-config",
+        LAYER_CONFIG,
+        WORKLOAD,
+    ]);
+    assert_ne!(out.code, 0);
+    assert!(
+        out.stderr.contains("-s layered"),
+        "should say what to do; stderr:\n{}",
+        out.stderr
+    );
+}
+
+/// `--layer-report` without a config would report on the single catch-all
+/// layer, which evaluates no rule at all — an empty answer that reads like a
+/// real one. Refuse instead.
+#[test]
+fn test_layer_report_requires_a_layer_config() {
+    let out = run_cli(&[
+        "run",
+        "-s",
+        "layered",
+        "--duration",
+        "50ms",
+        "--layer-report",
+        WORKLOAD,
+    ]);
+    assert_ne!(out.code, 0);
+    assert!(
+        out.stderr.contains("--layer-report needs --layer-config"),
+        "stderr:\n{}",
+        out.stderr
+    );
+}

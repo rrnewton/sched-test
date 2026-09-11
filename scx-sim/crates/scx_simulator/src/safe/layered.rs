@@ -35,8 +35,13 @@ pub enum LayerKind {
 /// substrate which does not exist (`CpuSetSpread*`, and multi-LLC
 /// `StickyDynamic` trading) are rejected rather than approximated.
 ///
+/// The variant names are also the ones a JSON layer config spells, because
+/// upstream derives `Deserialize` on its own identically-named enum; deriving
+/// it here rather than mirroring the enum in [`crate::layered_config`] keeps
+/// one list instead of two that can drift.
+///
 /// [`DynamicScheduler::layered`]: crate::ffi::DynamicScheduler::layered
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 #[repr(i32)]
 pub enum LayerGrowthAlgo {
     /// Prefer CPUs the layer already had.
@@ -76,14 +81,19 @@ pub enum LayerGrowthAlgo {
 /// One match rule — a variant of scx_layered's `LayerMatch`.
 ///
 /// Only the kinds the simulator can honestly configure are represented. The
-/// omitted ones need substrate scxsim does not model: `NsPidEquals` / `NsEquals`
-/// (no pid-namespace chain on the simulated `task_struct`), `UsedGpuTid` /
-/// `UsedGpuPid` (no GPU), `CgroupRegex` (needs the userspace regex evaluator
-/// that populates `cgroup_match_bitmap`), and the `AvgRuntime` /
-/// `HintEquals` / `SystemCpuUtilBelow` / `DsqInsertBelow` matchers (driven by
-/// userspace-computed EWMAs). Attempting to pass one of those through the FFI
+/// omitted ones need substrate scxsim does not model: `NsPidEquals` /
+/// `NsEquals` (no pid-namespace chain on the simulated `task_struct`),
+/// `UsedGpuTid` / `UsedGpuPid` (no GPU), `CgroupRegex` (needs the userspace
+/// regex evaluator that populates `cgroup_match_bitmap`), `CmdJoin` (needs the
+/// scxcmd channel that fills `taskc->join_layer`), and `HintEquals` /
+/// `SystemCpuUtilBelow` / `DsqInsertBelow`, whose inputs scx_layered's
+/// userspace daemon computes. Attempting to pass one of those through the FFI
 /// is rejected by the C side rather than silently producing a rule that never
 /// matches.
+///
+/// `AvgRuntime` is NOT in that list even though it looks like it belongs:
+/// `task_ctx.runtime_avg` is maintained by the scheduler's own
+/// `layered_stopping()`, so the comparison runs entirely BPF-side.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LayerMatch {
     /// Task's cgroup path starts with this.
@@ -118,8 +128,26 @@ pub enum LayerMatch {
     IsKthread(bool),
     /// Task's affinity is a subset of this NUMA node's CPUs.
     NumaNode(u32),
+    /// Task's decayed average runtime is in `[min_us, max_us)`.
+    ///
+    /// The average is `task_ctx.runtime_avg`, which the scheduler's own
+    /// `layered_stopping` maintains, so this needs no userspace daemon.
+    AvgRuntime(u64, u64),
     /// Inverts the wrapped rule (scx_layered's `exclude` flag).
     Not(Box<LayerMatch>),
+}
+
+/// The C `layered_add_layer_match()` argument set for one rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MatchFfi<'a> {
+    /// `enum layer_match_kind`.
+    pub kind: i32,
+    /// The needle for the string-comparing kinds.
+    pub needle: Option<&'a str>,
+    /// The scalar for the numeric kinds; the low bound for `AvgRuntime`.
+    pub int_arg: i64,
+    /// The second scalar, used only by `AvgRuntime`'s upper bound.
+    pub int_arg2: i64,
 }
 
 impl LayerMatch {
@@ -134,30 +162,49 @@ impl LayerMatch {
     /// value the compiled scheduler reports, catching an upstream reordering
     /// of the enum instead of silently mis-configuring layers.
     pub fn match_kind(&self) -> i32 {
-        self.to_ffi().0
+        self.to_ffi().kind
     }
 
-    /// Lower to the C `layered_add_layer_match()` argument triple:
-    /// `(enum layer_match_kind, string arg, integer arg)`.
-    pub(crate) fn to_ffi(&self) -> (i32, Option<&str>, i64) {
+    /// Lower to the C `layered_add_layer_match()` arguments.
+    pub(crate) fn to_ffi(&self) -> MatchFfi<'_> {
+        let scalar = |kind: i32, v: i64| MatchFfi {
+            kind,
+            needle: None,
+            int_arg: v,
+            int_arg2: 0,
+        };
+        fn string(kind: i32, s: &str) -> MatchFfi<'_> {
+            MatchFfi {
+                kind,
+                needle: Some(s),
+                int_arg: 0,
+                int_arg2: 0,
+            }
+        }
         match self {
             LayerMatch::Not(inner) => inner.to_ffi(),
-            LayerMatch::CgroupPrefix(s) => (MATCH_CGROUP_PREFIX, Some(s), 0),
-            LayerMatch::CgroupSuffix(s) => (MATCH_CGROUP_SUFFIX, Some(s), 0),
-            LayerMatch::CgroupContains(s) => (MATCH_CGROUP_CONTAINS, Some(s), 0),
-            LayerMatch::CommPrefix(s) => (MATCH_COMM_PREFIX, Some(s), 0),
-            LayerMatch::PcommPrefix(s) => (MATCH_PCOMM_PREFIX, Some(s), 0),
-            LayerMatch::NiceAbove(n) => (MATCH_NICE_ABOVE, None, i64::from(*n)),
-            LayerMatch::NiceBelow(n) => (MATCH_NICE_BELOW, None, i64::from(*n)),
-            LayerMatch::NiceEquals(n) => (MATCH_NICE_EQUALS, None, i64::from(*n)),
-            LayerMatch::UserIdEquals(v) => (MATCH_USER_ID_EQUALS, None, i64::from(*v)),
-            LayerMatch::GroupIdEquals(v) => (MATCH_GROUP_ID_EQUALS, None, i64::from(*v)),
-            LayerMatch::PidEquals(v) => (MATCH_PID_EQUALS, None, i64::from(*v)),
-            LayerMatch::PpidEquals(v) => (MATCH_PPID_EQUALS, None, i64::from(*v)),
-            LayerMatch::TgidEquals(v) => (MATCH_TGID_EQUALS, None, i64::from(*v)),
-            LayerMatch::IsGroupLeader(b) => (MATCH_IS_GROUP_LEADER, None, i64::from(*b)),
-            LayerMatch::IsKthread(b) => (MATCH_IS_KTHREAD, None, i64::from(*b)),
-            LayerMatch::NumaNode(v) => (MATCH_NUMA_NODE, None, i64::from(*v)),
+            LayerMatch::CgroupPrefix(s) => string(MATCH_CGROUP_PREFIX, s),
+            LayerMatch::CgroupSuffix(s) => string(MATCH_CGROUP_SUFFIX, s),
+            LayerMatch::CgroupContains(s) => string(MATCH_CGROUP_CONTAINS, s),
+            LayerMatch::CommPrefix(s) => string(MATCH_COMM_PREFIX, s),
+            LayerMatch::PcommPrefix(s) => string(MATCH_PCOMM_PREFIX, s),
+            LayerMatch::NiceAbove(n) => scalar(MATCH_NICE_ABOVE, i64::from(*n)),
+            LayerMatch::NiceBelow(n) => scalar(MATCH_NICE_BELOW, i64::from(*n)),
+            LayerMatch::NiceEquals(n) => scalar(MATCH_NICE_EQUALS, i64::from(*n)),
+            LayerMatch::UserIdEquals(v) => scalar(MATCH_USER_ID_EQUALS, i64::from(*v)),
+            LayerMatch::GroupIdEquals(v) => scalar(MATCH_GROUP_ID_EQUALS, i64::from(*v)),
+            LayerMatch::PidEquals(v) => scalar(MATCH_PID_EQUALS, i64::from(*v)),
+            LayerMatch::PpidEquals(v) => scalar(MATCH_PPID_EQUALS, i64::from(*v)),
+            LayerMatch::TgidEquals(v) => scalar(MATCH_TGID_EQUALS, i64::from(*v)),
+            LayerMatch::IsGroupLeader(b) => scalar(MATCH_IS_GROUP_LEADER, i64::from(*b)),
+            LayerMatch::IsKthread(b) => scalar(MATCH_IS_KTHREAD, i64::from(*b)),
+            LayerMatch::NumaNode(v) => scalar(MATCH_NUMA_NODE, i64::from(*v)),
+            LayerMatch::AvgRuntime(lo, hi) => MatchFfi {
+                kind: MATCH_AVG_RUNTIME,
+                needle: None,
+                int_arg: *lo as i64,
+                int_arg2: *hi as i64,
+            },
         }
     }
 }
@@ -177,9 +224,98 @@ pub(crate) const MATCH_PPID_EQUALS: i32 = 9;
 pub(crate) const MATCH_TGID_EQUALS: i32 = 10;
 pub(crate) const MATCH_IS_GROUP_LEADER: i32 = 14;
 pub(crate) const MATCH_IS_KTHREAD: i32 = 15;
+pub(crate) const MATCH_AVG_RUNTIME: i32 = 18;
 pub(crate) const MATCH_CGROUP_SUFFIX: i32 = 19;
 pub(crate) const MATCH_CGROUP_CONTAINS: i32 = 20;
 pub(crate) const MATCH_NUMA_NODE: i32 = 25;
+
+/// Where a layer's tasks are placed relative to the CPU they last ran on —
+/// `enum layer_task_place`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u64)]
+pub enum LayerPlacement {
+    /// Ordinary placement.
+    #[default]
+    Standard = 0,
+    /// Stick to the previous CPU.
+    Sticky = 1,
+    /// Never prefer the previous CPU.
+    Floating = 2,
+}
+
+/// Selector for [`LayerSpec`]'s scalar policy fields, as published by the
+/// wrapper's `layered_set_layer_field()`.
+///
+/// These are `struct layer` members the BPF reads on its ordinary paths but
+/// which come from a layer config rather than from the topology. They sit
+/// behind a selector because `layered_add_layer()`'s argument list is already
+/// eleven wide.
+///
+/// The discriminants MUST match `enum layered_layer_field` in
+/// `schedulers/layered/wrapper.c`;
+/// `tests/layered_config.rs::layer_field_publication_reaches_struct_layer`
+/// reads each one back out of the scheduler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum LayerField {
+    /// `layer->fifo`
+    Fifo = 0,
+    /// `layer->yield_step_ns`
+    YieldStepNs = 1,
+    /// `layer->disallow_open_after_ns`
+    DisallowOpenAfterNs = 2,
+    /// `layer->disallow_preempt_after_ns`
+    DisallowPreemptAfterNs = 3,
+    /// `layer->xllc_mig_min_ns`
+    XllcMigMinNs = 4,
+    /// `layer->skip_remote_node`
+    SkipRemoteNode = 5,
+    /// `layer->prev_over_idle_core`
+    PrevOverIdleCore = 6,
+    /// `layer->idle_confined`
+    IdleConfined = 7,
+    /// `layer->task_place`
+    TaskPlace = 8,
+    /// `layer->member_expire_ms`
+    MemberExpireMs = 9,
+    /// `layer->perf` — the cpufreq level `scx_bpf_cpuperf_set` is called with.
+    Perf = 10,
+}
+
+impl LayerField {
+    /// Every field, in `enum layered_layer_field` order.
+    pub const ALL: [LayerField; 11] = [
+        LayerField::Fifo,
+        LayerField::YieldStepNs,
+        LayerField::DisallowOpenAfterNs,
+        LayerField::DisallowPreemptAfterNs,
+        LayerField::XllcMigMinNs,
+        LayerField::SkipRemoteNode,
+        LayerField::PrevOverIdleCore,
+        LayerField::IdleConfined,
+        LayerField::TaskPlace,
+        LayerField::MemberExpireMs,
+        LayerField::Perf,
+    ];
+
+    /// The `struct layer` member this selector names, for the offset check in
+    /// `tests/layered_config.rs`.
+    pub fn struct_layer_member(self) -> &'static str {
+        match self {
+            LayerField::Fifo => "fifo",
+            LayerField::YieldStepNs => "yield_step_ns",
+            LayerField::DisallowOpenAfterNs => "disallow_open_after_ns",
+            LayerField::DisallowPreemptAfterNs => "disallow_preempt_after_ns",
+            LayerField::XllcMigMinNs => "xllc_mig_min_ns",
+            LayerField::SkipRemoteNode => "skip_remote_node",
+            LayerField::PrevOverIdleCore => "prev_over_idle_core",
+            LayerField::IdleConfined => "idle_confined",
+            LayerField::TaskPlace => "task_place",
+            LayerField::MemberExpireMs => "member_expire_ms",
+            LayerField::Perf => "perf",
+        }
+    }
+}
 
 /// scx_layered's `DEFAULT_LAYER_WEIGHT`.
 pub const DEFAULT_LAYER_WEIGHT: u32 = 100;
@@ -189,6 +325,11 @@ pub const DEFAULT_XNUMA_THRESHOLD: (f64, f64) = (0.6, 0.7);
 
 /// scx_layered's `default_xnuma_threshold_delta()` (`scx_layered/src/config.rs`).
 pub const DEFAULT_XNUMA_THRESHOLD_DELTA: (f64, f64) = (0.2, 0.3);
+/// scx_layered's "no limit" sentinel for the `disallow_*_after_ns` fields.
+///
+/// `main.rs::init_layers()` passes `u64::MAX` through unscaled, and the BPF
+/// compares an elapsed-time value against it, so the sentinel means "never".
+pub const DISALLOW_AFTER_NEVER: TimeNs = u64::MAX;
 
 /// One layer of an scx_layered configuration.
 ///
@@ -260,6 +401,39 @@ pub struct LayerSpec {
     ///
     /// Upstream `LayerCommon::xnuma_threshold_delta`, default `(0.2, 0.3)`.
     pub xnuma_threshold_delta: (f64, f64),
+    /// Dispatch in FIFO order instead of by vtime.
+    pub fifo: bool,
+    /// How much slice a `sched_yield()` gives up. 0 ignores yields entirely,
+    /// which is scx_layered's default. Derived from the config's
+    /// `yield_ignore` by [`LayerSpec::set_yield_ignore`].
+    pub yield_step_ns: TimeNs,
+    /// A task may not spill onto another layer's open CPUs once that CPU has
+    /// been busy this long. [`DISALLOW_AFTER_NEVER`] disables the cutoff.
+    pub disallow_open_after_ns: TimeNs,
+    /// As `disallow_open_after_ns`, for preemption.
+    pub disallow_preempt_after_ns: TimeNs,
+    /// Minimum queued runtime on the far LLC before a cross-LLC migration is
+    /// worth it.
+    pub xllc_mig_min_ns: TimeNs,
+    /// Do not look for idle CPUs outside the task's own NUMA node.
+    pub skip_remote_node: bool,
+    /// Prefer the previous CPU over a fully idle core.
+    pub prev_over_idle_core: bool,
+    /// Grouped layers only: confine idle search to the layer's own CPUs until
+    /// the layer saturates.
+    pub idle_confined: bool,
+    /// Placement policy relative to the task's previous CPU.
+    pub placement: LayerPlacement,
+    /// cpufreq level requested for a CPU running this layer's tasks; 0 asks
+    /// for nothing. scxsim's `scx_bpf_cpuperf_set` records it on the CPU, so
+    /// the scheduler's own call path runs — but the engine has no DVFS model,
+    /// so the level does not change how fast simulated work completes.
+    pub perf: u32,
+    /// How long a GPU-ownership membership stays valid; 0 means never expire.
+    /// Read only by the `UsedGpu*` match arms, which scxsim has no substrate
+    /// for — published anyway so the value the config asked for is the value
+    /// in `struct layer`.
+    pub member_expire_ms: u64,
 }
 
 impl LayerSpec {
@@ -286,7 +460,60 @@ impl LayerSpec {
             cpus: None,
             xnuma_threshold: DEFAULT_XNUMA_THRESHOLD,
             xnuma_threshold_delta: DEFAULT_XNUMA_THRESHOLD_DELTA,
+            fifo: false,
+            yield_step_ns: 0,
+            // scx_layered leaves both unset unless the config asks; the
+            // wrapper's own default is the same sentinel.
+            disallow_open_after_ns: DISALLOW_AFTER_NEVER,
+            disallow_preempt_after_ns: DISALLOW_AFTER_NEVER,
+            xllc_mig_min_ns: 0,
+            skip_remote_node: false,
+            prev_over_idle_core: false,
+            idle_confined: false,
+            placement: LayerPlacement::Standard,
+            member_expire_ms: 0,
+            perf: 0,
         }
+    }
+
+    /// The value each scalar policy field publishes into `struct layer`.
+    ///
+    /// One place decides how a [`LayerField`] maps onto this spec, so the FFI
+    /// publisher and the read-back test cannot disagree about what a field
+    /// means.
+    pub(crate) fn field_value(&self, field: LayerField) -> u64 {
+        match field {
+            LayerField::Fifo => u64::from(self.fifo),
+            LayerField::YieldStepNs => self.yield_step_ns,
+            LayerField::DisallowOpenAfterNs => self.disallow_open_after_ns,
+            LayerField::DisallowPreemptAfterNs => self.disallow_preempt_after_ns,
+            LayerField::XllcMigMinNs => self.xllc_mig_min_ns,
+            LayerField::SkipRemoteNode => u64::from(self.skip_remote_node),
+            LayerField::PrevOverIdleCore => u64::from(self.prev_over_idle_core),
+            LayerField::IdleConfined => u64::from(self.idle_confined),
+            LayerField::TaskPlace => self.placement as u64,
+            LayerField::MemberExpireMs => self.member_expire_ms,
+            LayerField::Perf => u64::from(self.perf),
+        }
+    }
+
+    /// Set `yield_step_ns` from a layer config's `yield_ignore` fraction,
+    /// using scx_layered's own three-branch derivation
+    /// (`main.rs::init_layers()`): at least 0.999 ignores yields entirely, at
+    /// most 0.001 gives up the whole slice, and anything between gives up that
+    /// fraction of it.
+    ///
+    /// Depends on `slice_ns`, so set the slice first. Upstream has the same
+    /// ordering constraint — it reads `layer.slice_ns` two lines after
+    /// writing it.
+    pub fn set_yield_ignore(&mut self, yield_ignore: f64) {
+        self.yield_step_ns = if yield_ignore > 0.999 {
+            0
+        } else if yield_ignore < 0.001 {
+            self.slice_ns
+        } else {
+            (self.slice_ns as f64 * (1.0 - yield_ignore)) as TimeNs
+        };
     }
 
     /// A catch-all open layer. scx_layered configs conventionally end with
@@ -414,8 +641,8 @@ mod tests {
         let negated = LayerMatch::Not(Box::new(inner.clone()));
         assert!(!inner.exclude());
         assert!(negated.exclude());
-        assert_eq!(inner.to_ffi().0, negated.to_ffi().0);
-        assert_eq!(inner.to_ffi().1, negated.to_ffi().1);
+        assert_eq!(inner.to_ffi().kind, negated.to_ffi().kind);
+        assert_eq!(inner.to_ffi().needle, negated.to_ffi().needle);
     }
 
     #[test]
