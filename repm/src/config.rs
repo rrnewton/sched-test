@@ -361,8 +361,19 @@ pub struct CaptureConfig {
     pub interrupts_interval: u32,
 
     /// Whether to collect LAVD stats (requires scx_lavd running).
+    /// Skipped when `--scheduler-agnostic` is used.
     #[serde(default)]
     pub collect_lavd_stats: bool,
+
+    /// Whether to sample /proc/stat (CPU time counters).
+    /// Automatically enabled by `--scheduler-agnostic`.
+    #[serde(default)]
+    pub collect_proc_stat: bool,
+
+    /// Whether to sample /proc/schedstat (scheduler run queue stats).
+    /// Automatically enabled by `--scheduler-agnostic`.
+    #[serde(default)]
+    pub collect_schedstat: bool,
 
     /// Additional files to SCP back from the remote host after capture.
     /// Paths are relative to `remote_workdir`.
@@ -381,6 +392,8 @@ impl Default for CaptureConfig {
             collect_interrupts: true,
             interrupts_interval: default_interrupts_interval(),
             collect_lavd_stats: false,
+            collect_proc_stat: false,
+            collect_schedstat: false,
             extra_files: Vec::new(),
         }
     }

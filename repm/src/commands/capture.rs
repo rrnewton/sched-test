@@ -23,6 +23,12 @@ use crate::workspace;
 ///
 /// Connects to a target host, runs trace collection commands, and copies
 /// results back to the local workspace under `traces/<timestamp>/`.
+///
+/// Use `--scheduler-agnostic` when capturing from production hosts where the
+/// scheduler is already running and must not be touched (no LAVD internal
+/// monitoring, no signal-based hooks). This mode still captures all
+/// scheduler-neutral data: /proc/interrupts, /proc/stat, /proc/schedstat,
+/// and any user-configured trace commands.
 #[derive(Debug, Args)]
 pub struct CaptureArgs {
     /// Remote host for SSH capture (e.g., root@prod-host).
@@ -53,6 +59,13 @@ pub struct CaptureArgs {
     /// SSH identity file (overrides config).
     #[arg(long, short = 'i')]
     pub identity: Option<String>,
+
+    /// Scheduler-agnostic mode: skip LAVD-internal monitoring (lat_cri,
+    /// wake_freq signals, scx_lavd --monitor). Use this on production hosts
+    /// where the scheduler is already running and must not be disturbed.
+    /// Enables /proc/stat and /proc/schedstat collection automatically.
+    #[arg(long)]
+    pub scheduler_agnostic: bool,
 }
 
 pub fn execute(args: &CaptureArgs) -> Result<()> {
@@ -108,6 +121,9 @@ fn execute_ssh_capture(
     eprintln!("  timeout:    {}s", ssh_timeout);
     if let Some(ref sched) = args.scheduler {
         eprintln!("  scheduler:  {}", sched);
+    }
+    if args.scheduler_agnostic {
+        eprintln!("  mode:       scheduler-agnostic (no LAVD internal monitoring)");
     }
     if args.dry_run {
         eprintln!("  [DRY RUN — no commands will be executed]");
@@ -177,8 +193,8 @@ fn execute_ssh_capture(
         }
     }
 
-    // 4b: LAVD stats (if enabled)
-    if cfg.collect_lavd_stats {
+    // 4b: LAVD stats (if enabled AND not in scheduler-agnostic mode)
+    if cfg.collect_lavd_stats && !args.scheduler_agnostic {
         let lavd_script = format!(
             "if command -v scx_lavd >/dev/null 2>&1; then \
                 timeout {} scx_lavd --monitor 2>/dev/null > {}/lavd_stats.txt || true; \
@@ -193,6 +209,48 @@ fn execute_ssh_capture(
         if !args.dry_run {
             run_command(&lavd_cmd).context("Failed to start LAVD stats collection")?;
             eprintln!("  started LAVD stats collection");
+        }
+    } else if cfg.collect_lavd_stats && args.scheduler_agnostic {
+        eprintln!("  skipping LAVD stats (scheduler-agnostic mode)");
+    }
+
+    // 4b2: /proc/stat sampling (enabled by config or scheduler-agnostic mode)
+    if cfg.collect_proc_stat || args.scheduler_agnostic {
+        let interval = cfg.interrupts_interval;
+        let stat_script = format!(
+            "for i in $(seq 0 {} {}); do \
+                cat /proc/stat > {}/proc_stat_${{i}}.txt; \
+                sleep {}; \
+            done",
+            interval, args.duration, remote_capture_dir, interval,
+        );
+        let stat_cmd = ssh_command(host, &format!("nohup sh -c '{}' &", stat_script), &ssh_opts);
+        show_command("ssh-proc-stat", &stat_cmd);
+        if !args.dry_run {
+            run_command(&stat_cmd).context("Failed to start /proc/stat sampling")?;
+            eprintln!("  started /proc/stat sampling (every {}s)", interval);
+        }
+    }
+
+    // 4b3: /proc/schedstat snapshot (enabled by config or scheduler-agnostic mode)
+    if cfg.collect_schedstat || args.scheduler_agnostic {
+        let interval = cfg.interrupts_interval;
+        let schedstat_script = format!(
+            "for i in $(seq 0 {} {}); do \
+                cat /proc/schedstat > {}/schedstat_${{i}}.txt 2>/dev/null || true; \
+                sleep {}; \
+            done",
+            interval, args.duration, remote_capture_dir, interval,
+        );
+        let schedstat_cmd = ssh_command(
+            host,
+            &format!("nohup sh -c '{}' &", schedstat_script),
+            &ssh_opts,
+        );
+        show_command("ssh-schedstat", &schedstat_cmd);
+        if !args.dry_run {
+            run_command(&schedstat_cmd).context("Failed to start /proc/schedstat sampling")?;
+            eprintln!("  started /proc/schedstat sampling (every {}s)", interval);
         }
     }
 
@@ -229,7 +287,10 @@ fn execute_ssh_capture(
 
     // If we started background processes, wait for the capture duration
     let has_background = cfg.collect_interrupts
-        || cfg.collect_lavd_stats
+        || (cfg.collect_lavd_stats && !args.scheduler_agnostic)
+        || cfg.collect_proc_stat
+        || cfg.collect_schedstat
+        || args.scheduler_agnostic
         || cfg.trace_commands.iter().any(|t| t.background);
 
     if has_background && !args.dry_run {
@@ -331,6 +392,9 @@ fn execute_local_capture(
     if let Some(ref sched) = args.scheduler {
         eprintln!("  scheduler: {}", sched);
     }
+    if args.scheduler_agnostic {
+        eprintln!("  mode:      scheduler-agnostic (no LAVD internal monitoring)");
+    }
     if args.dry_run {
         eprintln!("  [DRY RUN — no commands will be executed]");
     }
@@ -344,7 +408,7 @@ fn execute_local_capture(
     }
 
     // Collect host metadata locally
-    eprintln!("step 1/4: collecting host metadata...");
+    eprintln!("step 1/5: collecting host metadata...");
     let metadata = collect_local_metadata(args);
     if !args.dry_run {
         let meta_path = local_data_dir.join("host_metadata.json");
@@ -356,7 +420,7 @@ fn execute_local_capture(
     eprintln!();
 
     // /proc/interrupts sampling
-    eprintln!("step 2/4: capturing /proc/interrupts...");
+    eprintln!("step 2/5: capturing /proc/interrupts...");
     if cfg.collect_interrupts && !args.dry_run {
         let interval = cfg.interrupts_interval;
         let samples = args.duration / interval;
@@ -381,8 +445,40 @@ fn execute_local_capture(
     }
     eprintln!();
 
+    // /proc/stat + /proc/schedstat sampling (scheduler-agnostic mode or config)
+    eprintln!("step 3/5: capturing /proc/stat + /proc/schedstat...");
+    if (cfg.collect_proc_stat || args.scheduler_agnostic) && !args.dry_run {
+        // /proc/stat — CPU time counters
+        let stat_path = local_data_dir.join("proc_stat_0.txt");
+        match std::fs::read_to_string("/proc/stat") {
+            Ok(content) => {
+                std::fs::write(&stat_path, &content)?;
+                eprintln!("  captured /proc/stat snapshot");
+            }
+            Err(e) => eprintln!("  warning: failed to read /proc/stat: {}", e),
+        }
+    }
+    if (cfg.collect_schedstat || args.scheduler_agnostic) && !args.dry_run {
+        // /proc/schedstat — scheduler statistics
+        let ss_path = local_data_dir.join("schedstat_0.txt");
+        match std::fs::read_to_string("/proc/schedstat") {
+            Ok(content) => {
+                std::fs::write(&ss_path, &content)?;
+                eprintln!("  captured /proc/schedstat snapshot");
+            }
+            Err(e) => eprintln!("  warning: /proc/schedstat not available: {}", e),
+        }
+    }
+    if args.dry_run && (cfg.collect_proc_stat || cfg.collect_schedstat || args.scheduler_agnostic) {
+        eprintln!("  would capture /proc/stat and /proc/schedstat snapshots");
+    }
+    if !cfg.collect_proc_stat && !cfg.collect_schedstat && !args.scheduler_agnostic {
+        eprintln!("  skipped (not enabled)");
+    }
+    eprintln!();
+
     // Run configured trace commands locally
-    eprintln!("step 3/4: running trace commands...");
+    eprintln!("step 4/5: running trace commands...");
     for trace in &cfg.trace_commands {
         let expanded_cmd = trace
             .command
@@ -412,7 +508,7 @@ fn execute_local_capture(
     eprintln!();
 
     // Write provenance
-    eprintln!("step 4/4: writing provenance...");
+    eprintln!("step 5/5: writing provenance...");
     let provenance = build_provenance("localhost", args, &capture_name);
     let provenance_path = local_data_dir.join("provenance.json");
 
@@ -625,6 +721,10 @@ fn build_provenance(
             .as_ref()
             .map_or(Value::Null, |s| Value::String(s.clone())),
     );
+    prov.insert(
+        "scheduler_agnostic".into(),
+        Value::Bool(args.scheduler_agnostic),
+    );
 
     // Capture the repm binary hash for reproducibility
     if let Ok(self_binary) = std::env::current_exe() {
@@ -769,6 +869,7 @@ mod tests {
             version: "test".into(),
             ssh_timeout: None,
             identity: None,
+            scheduler_agnostic: false,
         };
         let meta = collect_local_metadata(&args);
         assert!(meta.contains_key("hostname"));
@@ -788,13 +889,32 @@ mod tests {
             version: "v1".into(),
             ssh_timeout: None,
             identity: None,
+            scheduler_agnostic: false,
         };
         let prov = build_provenance("root@host", &args, "capture_test");
         assert_eq!(prov["host"], serde_json::json!("root@host"));
         assert_eq!(prov["duration"], serde_json::json!(30));
         assert_eq!(prov["version"], serde_json::json!("v1"));
         assert_eq!(prov["scheduler"], serde_json::Value::Null);
+        assert_eq!(prov["scheduler_agnostic"], serde_json::json!(false));
         assert!(prov.contains_key("repm_binary_hash"));
+    }
+
+    #[test]
+    fn test_build_provenance_scheduler_agnostic() {
+        let args = CaptureArgs {
+            ssh: Some("root@prod-host".into()),
+            duration: 60,
+            scheduler: None,
+            dry_run: false,
+            version: "ab_baseline".into(),
+            ssh_timeout: None,
+            identity: None,
+            scheduler_agnostic: true,
+        };
+        let prov = build_provenance("root@prod-host", &args, "capture_agnostic");
+        assert_eq!(prov["scheduler_agnostic"], serde_json::json!(true));
+        assert_eq!(prov["scheduler"], serde_json::Value::Null);
     }
 
     #[test]
@@ -807,9 +927,27 @@ mod tests {
             version: "baseline".into(),
             ssh_timeout: Some(15),
             identity: Some("/root/.ssh/id_ed25519".into()),
+            scheduler_agnostic: false,
         };
         assert!(args.dry_run);
         assert_eq!(args.ssh_timeout, Some(15));
         assert_eq!(args.identity.as_deref(), Some("/root/.ssh/id_ed25519"));
+    }
+
+    #[test]
+    fn test_scheduler_agnostic_flag() {
+        let args = CaptureArgs {
+            ssh: Some("root@prod".into()),
+            duration: 30,
+            scheduler: None,
+            dry_run: false,
+            version: "ab_test".into(),
+            ssh_timeout: None,
+            identity: None,
+            scheduler_agnostic: true,
+        };
+        assert!(args.scheduler_agnostic);
+        // When scheduler_agnostic is true, LAVD stats should be skipped
+        // This is enforced in execute_ssh_capture / execute_local_capture
     }
 }
