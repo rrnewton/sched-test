@@ -85,6 +85,8 @@ extern "C" {
     pub fn scx_test_clear_idle_cpumask(cpu: i32);
     pub fn scx_test_set_idle_smtmask(cpu: i32);
     pub fn scx_test_clear_idle_smtmask(cpu: i32);
+    pub fn scx_test_set_cpu_node(cpu: i32, node: u32);
+    pub fn scx_test_clear_cpu_nodes();
     pub fn scx_bpf_test_and_clear_cpu_idle(cpu: i32) -> bool;
     pub fn bpf_cpumask_test_cpu(cpu: u32, cpumask: *const c_void) -> bool;
 
@@ -205,6 +207,28 @@ pub fn set_task_alloc_fail_pid(pid: i32) {
     // sim_sdt_stubs.c. Writes are serialized by the simulator's global
     // test lock; no pointers involved.
     unsafe { sim_sdt_fail_pid = pid }
+}
+
+/// Publish which NUMA node a CPU is on, for the substrate's node-scoped
+/// kfuncs (`scx_bpf_pick_idle_cpu_node`, `scx_bpf_get_idle_cpumask_node`,
+/// `scx_bpf_get_idle_smtmask_node`, `scx_bpf_pick_any_cpu_node`).
+///
+/// Until this is published those four answer machine-wide, which is what
+/// every scheduler that calls them saw before the engine modelled NUMA at
+/// all. scx_layered does not call them — it uses `nodec->cpumask` — so it was
+/// not the mechanism behind mb sim-dox34, but anything that does call them
+/// got a node-blind answer with no marker.
+pub fn cpumask_set_cpu_node(cpu: i32, node: u32) {
+    // SAFETY: Sets a bit in a global per-node cpumask; both indices are
+    // bounds-checked C-side.
+    unsafe { scx_test_set_cpu_node(cpu, node) }
+}
+
+/// Drop all per-node CPU membership, so a fresh run does not inherit the
+/// previous scenario's machine.
+pub fn cpumask_clear_cpu_nodes() {
+    // SAFETY: Zeroes thread-local cpumask storage.
+    unsafe { scx_test_clear_cpu_nodes() }
 }
 
 /// Mark a CPU present in the all-CPUs cpumask.
@@ -1523,11 +1547,20 @@ impl DynamicScheduler {
     /// `threads_per_core` with [`ScenarioBuilder::smt`]. The scheduler must
     /// observe the same machine the engine simulates.
     ///
-    /// `nr_numa_nodes` has no engine counterpart — scxsim models LLCs and SMT
-    /// siblings but has no NUMA concept and no inter-node distance cost — so
-    /// it is a harness-supplied grouping over LLCs that exists to exercise
-    /// layered's cross-node code paths. This mirrors the existing
-    /// [`DynamicScheduler::cosmos_with_numa`] precedent.
+    /// **Prefer [`Self::layered_for_topology`].** This constructor takes four
+    /// numbers the caller must separately repeat to [`ScenarioBuilder`], and
+    /// nothing checks the two descriptions agree — which is how mb sim-dox34
+    /// happened. It is kept for the uniform case and for the ceiling test.
+    ///
+    /// `nr_numa_nodes` DOES have an engine counterpart now: the engine carries
+    /// a per-CPU node id and charges a cross-node migration penalty. It still
+    /// models no per-node memory and no distance matrix — see
+    /// [`MachineTopology`](crate::topology::MachineTopology).
+    ///
+    /// The scenario must declare the same node partition
+    /// ([`ScenarioBuilder::numa_nodes`]) or the two will disagree.
+    ///
+    /// [`ScenarioBuilder::numa_nodes`]: crate::scenario::ScenarioBuilder::numa_nodes
     ///
     /// [`ScenarioBuilder::cpus_per_llc`]: crate::scenario::ScenarioBuilder::cpus_per_llc
     /// [`ScenarioBuilder::smt`]: crate::scenario::ScenarioBuilder::smt
@@ -1584,6 +1617,83 @@ impl DynamicScheduler {
             state.nr_llcs = nr_cpus.div_ceil(cpus_per_llc);
             state.nr_numa_nodes = effective_nodes;
             state.threads_per_core = threads_per_core;
+        }
+        sched
+    }
+
+    /// Load scx_layered on an explicit [`MachineTopology`] — the same object
+    /// the `Scenario` is built from.
+    ///
+    /// Prefer this over [`Self::layered_with_topology`]. That one takes four
+    /// numbers that the caller must *separately* repeat to
+    /// [`ScenarioBuilder`], and nothing checks the two descriptions agree;
+    /// this one takes the description itself, so the scheduler and the engine
+    /// cannot end up looking at different machines:
+    ///
+    /// ```no_run
+    /// # use scx_simulator::*;
+    /// let topo = MachineTopology::uniform(384, 16, 2, 2);   // 384c dual socket
+    /// let sched = DynamicScheduler::layered_for_topology(&topo);
+    /// let scenario = Scenario::builder()
+    ///     .topology(topo)
+    ///     .duration_ms(50)
+    ///     .add_task("t", 0, TaskBehavior { phases: vec![Phase::Run(1_000_000)],
+    ///                                      repeat: RepeatMode::Forever })
+    ///     .build();
+    /// ```
+    ///
+    /// Asymmetric shapes go through here too — unequal nodes, unequal LLCs,
+    /// SMT on part of the machine. See [`MachineTopology`] for what the
+    /// simulator can and cannot express.
+    ///
+    /// [`ScenarioBuilder`]: crate::scenario::ScenarioBuilder
+    /// [`MachineTopology`]: crate::topology::MachineTopology
+    ///
+    /// # Panics
+    /// Panics if the machine exceeds a wrapper ceiling
+    /// (`LAYERED_MAX_SIM_CPUS`, `MAX_LLCS`, `MAX_NUMA_NODES`). It does NOT
+    /// clamp: a silently reduced node count is the divergence this
+    /// constructor exists to prevent.
+    pub fn layered_for_topology(topology: &crate::topology::MachineTopology) -> Self {
+        let nr_cpus = topology.nr_cpus();
+        let sched = Self::layered(nr_cpus);
+        let cpu_llc: Vec<u32> = topology.cpus().iter().map(|t| t.llc_id).collect();
+        let cpu_node: Vec<u32> = topology.cpus().iter().map(|t| t.node_id).collect();
+        let cpu_core: Vec<u32> = topology.cpus().iter().map(|t| t.core_id).collect();
+        type SetExplicitFn = unsafe extern "C" fn(u32, *const u32, *const u32, *const u32) -> u32;
+        // SAFETY: Symbol resolved from a `.so` built by our build system; the
+        // three arrays are `nr_cpus` long and outlive the call.
+        let published = unsafe {
+            let sym: libloading::Symbol<SetExplicitFn> = sched
+                ._lib
+                .get(b"layered_set_topology_explicit")
+                .expect("layered_set_topology_explicit not found");
+            (sym)(
+                nr_cpus,
+                cpu_llc.as_ptr(),
+                cpu_node.as_ptr(),
+                cpu_core.as_ptr(),
+            )
+        };
+        assert_eq!(
+            published,
+            topology.nr_nodes(),
+            "layered_set_topology_explicit refused a {nr_cpus}-CPU / {}-LLC / {}-node \
+             machine (wrapper ceilings: LAYERED_MAX_SIM_CPUS, MAX_LLCS, MAX_NUMA_NODES)",
+            topology.nr_llcs(),
+            topology.nr_nodes(),
+        );
+        {
+            let mut userspace = sched.layered_userspace.lock().unwrap();
+            let state = userspace.as_mut().expect("layered userspace state missing");
+            // The control loop's core-growth adapter is uniform-only; an
+            // asymmetric machine has no single `cpus_per_llc` to give it.
+            // Record what is true and let `layered_enable_control_loop`
+            // refuse rather than average it away.
+            state.cpus_per_llc = topology.uniform_cpus_per_llc().unwrap_or(0);
+            state.nr_llcs = topology.nr_llcs();
+            state.nr_numa_nodes = topology.nr_nodes();
+            state.threads_per_core = topology.uniform_threads_per_core().unwrap_or(0);
         }
         sched
     }
@@ -1723,6 +1833,19 @@ impl DynamicScheduler {
     pub fn layered_enable_control_loop(&self, period_ns: u64) {
         let mut userspace = self.layered_userspace.lock().unwrap();
         let state = userspace.as_mut().expect("not an scx_layered scheduler");
+        // 0 is the marker `layered_for_topology` leaves when the machine has
+        // no single value for one of these. Upstream's `layer_core_growth.rs`
+        // is driven through `Topology::simulated`, which takes exactly these
+        // two scalars — so an asymmetric machine cannot be served by it, and
+        // averaging one out would be a fake approximation of the allocator.
+        assert!(
+            state.cpus_per_llc > 0 && state.threads_per_core > 0,
+            "the userspace control loop needs a uniform machine: upstream's \
+             layer_core_growth adapter is built from a single cpus_per_llc and a \
+             single threads_per_core. This topology has neither. Run this shape \
+             with the static (Tier-2) allocation instead, or make the LLCs and \
+             cores uniform."
+        );
         state.control = Some(LayeredControl::new(
             period_ns,
             state.nr_cpus as usize,
@@ -2372,6 +2495,8 @@ impl Scheduler for DynamicScheduler {
         type HasCpuFn = unsafe extern "C" fn(u32, u32) -> i32;
         type ApplyFn = unsafe extern "C" fn(*const u64, u32, u32) -> i32;
         type SetGrowthDeniedFn = unsafe extern "C" fn(u32, u32, i32, u64);
+        type SetXnumaFn = unsafe extern "C" fn(u32, u32, u32, u64);
+        type SetXnumaMigSrcFn = unsafe extern "C" fn(u32, u32, i32);
 
         let usage: libloading::Symbol<UsageFn> = self
             ._lib
@@ -2393,10 +2518,22 @@ impl Scheduler for DynamicScheduler {
             ._lib
             .get(b"layered_apply_layer_cpumasks")
             .expect("layered_apply_layer_cpumasks not found");
+        let node_duty_raw: libloading::Symbol<NodeUsageFn> = self
+            ._lib
+            .get(b"layered_probe_layer_node_duty_raw")
+            .expect("layered_probe_layer_node_duty_raw not found");
         let set_growth_denied: libloading::Symbol<SetGrowthDeniedFn> = self
             ._lib
             .get(b"layered_set_growth_denied")
             .expect("layered_set_growth_denied not found");
+        let set_xnuma: libloading::Symbol<SetXnumaFn> = self
+            ._lib
+            .get(b"layered_set_xnuma")
+            .expect("layered_set_xnuma not found");
+        let set_xnuma_mig_src: libloading::Symbol<SetXnumaMigSrcFn> = self
+            ._lib
+            .get(b"layered_set_xnuma_is_mig_src")
+            .expect("layered_set_xnuma_is_mig_src not found");
 
         let mut userspace = self.layered_userspace.lock().unwrap();
         let state = userspace.as_mut().expect("not an scx_layered scheduler");
@@ -2419,6 +2556,13 @@ impl Scheduler for DynamicScheduler {
                 .map(|layer| {
                     (0..nr_nodes)
                         .map(|node| node_pinned_usage(layer as u32, node as u32))
+                        .collect()
+                })
+                .collect(),
+            node_duty_raw: (0..nr_layers)
+                .map(|layer| {
+                    (0..nr_nodes)
+                        .map(|node| node_duty_raw(layer as u32, node as u32))
                         .collect()
                 })
                 .collect(),
@@ -2456,6 +2600,29 @@ impl Scheduler for DynamicScheduler {
                     node as u32,
                     update.growth_denied[layer][node] as i32,
                     control.growth_denied_count(layer, node),
+                );
+            }
+        }
+        // Rates before flags, as `refresh_xnuma()` does, so a gate that
+        // activates this iteration never reads a stale budget.
+        for layer in 0..nr_layers {
+            for src in 0..nr_nodes {
+                for dst in 0..nr_nodes {
+                    set_xnuma(
+                        layer as u32,
+                        src as u32,
+                        dst as u32,
+                        update.xnuma_rates[layer][src][dst],
+                    );
+                }
+            }
+        }
+        for layer in 0..nr_layers {
+            for node in 0..nr_nodes {
+                set_xnuma_mig_src(
+                    layer as u32,
+                    node as u32,
+                    update.xnuma_mig_src[layer][node] as i32,
                 );
             }
         }

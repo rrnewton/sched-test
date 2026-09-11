@@ -37,6 +37,7 @@ fn test_weighted_fairness() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "light".into(),
@@ -56,6 +57,7 @@ fn test_weighted_fairness() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(200)
         .build();

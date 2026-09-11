@@ -73,6 +73,7 @@ fn one_shot_task(pid: i32, name: &str) -> TaskDef {
         thread_group_leader: None,
         uid: Uid(0),
         gid: Gid(0),
+        fork_cpu: None,
     }
 }
 

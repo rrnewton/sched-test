@@ -319,6 +319,7 @@ fn resolved_storage_profile_requires_the_calibration_scheduler() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .build();
     // Isolate the tagged phase invariant from optional simulator timing
@@ -381,6 +382,7 @@ fn resolved_storage_profile_requires_the_calibration_scheduler() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .build();
     truncated.noise.enabled = false;

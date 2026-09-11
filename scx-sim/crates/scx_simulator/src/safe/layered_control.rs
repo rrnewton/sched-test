@@ -7,6 +7,7 @@
 
 use crate::layered::{LayerGrowthAlgo, LayerKind, LayerSpec};
 use crate::layered_alloc_upstream::{unified_alloc, LayerDemand};
+use crate::layered_xnuma::{xnuma_check_active, xnuma_compute_rates};
 use scx_layered_growth::layer_core_growth;
 use scx_layered_growth::{algorithm_from_bpf, CpuPool, LayerSpec as GrowthSpec, Topology};
 
@@ -18,15 +19,31 @@ pub struct LayeredControlSnapshot {
     pub usages: Vec<[u64; 2]>,
     pub node_usages: Vec<Vec<u64>>,
     pub node_pinned_usages: Vec<Vec<u64>>,
+    /// Per-(layer, node) cumulative `cpu_ctx.layer_duty_sum`, the smoothed
+    /// runnable time the BPF side accumulates in `layered_stopping()`. Unlike
+    /// `node_usages` it counts queue wait as well as CPU time, so at
+    /// saturation it exceeds utilisation — which is precisely the signal
+    /// upstream's cross-NUMA gate rebalances on.
+    pub node_duty_raw: Vec<Vec<u64>>,
     pub cpu_masks: Vec<Vec<bool>>,
 }
 
 /// Result of one userspace control-loop iteration.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LayeredControlUpdate {
     pub cpu_masks: Vec<Vec<bool>>,
     pub targets: Vec<usize>,
     pub growth_denied: Vec<Vec<bool>>,
+    /// `[layer][src][dst]` cross-NUMA migration budget, in `xnuma_gate()`'s
+    /// units: `u64::MAX` = gating off, `0` = deny, else a token-bucket rate.
+    pub xnuma_rates: Vec<Vec<Vec<u64>>>,
+    /// `[layer][node]` — whether that node may act as a cross-NUMA migration
+    /// source at all. `pick_idle_cpu()` and `try_consume_layer()` both check
+    /// this before they check the budget.
+    pub xnuma_mig_src: Vec<Vec<bool>>,
+    /// `[layer][node]` EWMA duty sums, in CPU units, exposed so tests can
+    /// assert on the input the gate decided from rather than only its output.
+    pub node_duty_sums: Vec<Vec<f64>>,
 }
 
 /// Stateful utilization EWMA and CPU allocation driver.
@@ -50,6 +67,9 @@ pub struct LayeredControl {
     node_groups: Vec<Vec<Vec<usize>>>,
     growth_denied: Vec<Vec<bool>>,
     growth_denied_counts: Vec<Vec<u64>>,
+    previous_node_duty_raw: Vec<Vec<u64>>,
+    layer_node_duty_sums: Vec<Vec<f64>>,
+    xnuma_mig_src: Vec<Vec<bool>>,
 }
 
 impl LayeredControl {
@@ -202,6 +222,9 @@ impl LayeredControl {
             node_groups,
             growth_denied: vec![vec![false; nr_nodes]; nr_layers],
             growth_denied_counts: vec![vec![0; nr_nodes]; nr_layers],
+            previous_node_duty_raw: vec![vec![0; nr_nodes]; nr_layers],
+            layer_node_duty_sums: vec![vec![0.0; nr_nodes]; nr_layers],
+            xnuma_mig_src: vec![vec![false; nr_nodes]; nr_layers],
         }
     }
 
@@ -247,6 +270,15 @@ impl LayeredControl {
             &snapshot.node_pinned_usages,
             &mut self.previous_node_pinned_usages,
             &mut self.layer_node_pinned_utils,
+        );
+        // `sched_stats.layer_node_duty_sums`, same shape as the two above:
+        // upstream `main.rs` runs `metric_decay(compute_diff(cur, prev))` over
+        // all three with the same `USAGE_DECAY`.
+        Self::update_node_utils(
+            self.period_ns,
+            &snapshot.node_duty_raw,
+            &mut self.previous_node_duty_raw,
+            &mut self.layer_node_duty_sums,
         );
 
         let raw_targets: Vec<(usize, usize)> = self
@@ -339,11 +371,88 @@ impl LayeredControl {
             }
         }
 
+        let (xnuma_rates, xnuma_mig_src) = self.refresh_xnuma(&current_node_cpus);
+
         LayeredControlUpdate {
             cpu_masks,
             targets,
             growth_denied: self.growth_denied.clone(),
+            xnuma_rates,
+            xnuma_mig_src,
+            node_duty_sums: self.layer_node_duty_sums.clone(),
         }
+    }
+
+    /// Port of `main.rs::refresh_xnuma()`.
+    ///
+    /// Upstream writes straight into `skel.maps.bss_data.layers[l].node[s]`;
+    /// here the two arrays are returned and the caller pushes them through
+    /// `layered_set_xnuma` / `layered_set_xnuma_is_mig_src`. The branch
+    /// structure is upstream's, and the policy itself is upstream's code —
+    /// [`xnuma_check_active`] and [`xnuma_compute_rates`] are vendored
+    /// token-identical (see [`crate::layered_xnuma`]).
+    ///
+    /// Three upstream behaviours that are easy to lose in a re-write, kept
+    /// deliberately:
+    ///
+    /// * `nr_nodes <= 1` returns early and writes NOTHING, leaving the BSS
+    ///   zeros in place. That is safe only because every `xnuma_gate()` call
+    ///   short-circuits on `src_nid == dst_nid`, and on one node there is no
+    ///   other pair.
+    /// * The "gating off" branch (`threshold` both `<= 0.0`) writes
+    ///   `is_mig_src = true` and `rate = u64::MAX` for EVERY pair, then
+    ///   resets the *hysteresis* state to all-false — upstream's
+    ///   `self.xnuma_mig_src[layer_idx].fill(false)` — so a later switch back
+    ///   to gating starts from closed rather than from a stale open.
+    /// * Rates are written BEFORE the flags, so a gate that activates this
+    ///   iteration never sees a stale budget.
+    #[allow(clippy::type_complexity)]
+    fn refresh_xnuma(
+        &mut self,
+        current_node_cpus: &[Vec<usize>],
+    ) -> (Vec<Vec<Vec<u64>>>, Vec<Vec<bool>>) {
+        let nr_layers = self.specs.len();
+        let nr_nodes = self.nr_nodes;
+        let mut rates = vec![vec![vec![0u64; nr_nodes]; nr_nodes]; nr_layers];
+        let mut mig_src = vec![vec![false; nr_nodes]; nr_layers];
+        if nr_nodes <= 1 {
+            return (rates, mig_src);
+        }
+
+        for layer_idx in 0..nr_layers {
+            let threshold = self.specs[layer_idx].xnuma_threshold;
+            let threshold_delta = self.specs[layer_idx].xnuma_threshold_delta;
+
+            if threshold.0 <= 0.0 && threshold.1 <= 0.0 {
+                // Off — all open, infinite budget.
+                mig_src[layer_idx].fill(true);
+                for row in rates[layer_idx].iter_mut() {
+                    row.fill(u64::MAX);
+                }
+                self.xnuma_mig_src[layer_idx].fill(false);
+                continue;
+            }
+
+            let is_mig_src = xnuma_check_active(
+                &self.layer_node_duty_sums[layer_idx],
+                &current_node_cpus[layer_idx],
+                threshold,
+                threshold_delta,
+                &self.growth_denied[layer_idx],
+                &self.xnuma_mig_src[layer_idx],
+            );
+            self.xnuma_mig_src[layer_idx] = is_mig_src.clone();
+
+            let result = xnuma_compute_rates(
+                &self.layer_node_duty_sums[layer_idx],
+                &current_node_cpus[layer_idx],
+            );
+            for (row, computed) in rates[layer_idx].iter_mut().zip(result.rates.iter()) {
+                row.copy_from_slice(&computed[..nr_nodes]);
+            }
+            mig_src[layer_idx].copy_from_slice(&is_mig_src[..nr_nodes]);
+        }
+        (rates, mig_src)
     }
 
     fn update_node_utils(
@@ -542,6 +651,7 @@ mod tests {
             usages: vec![[400_000_000, 0], [0, 0]],
             node_usages: vec![vec![400_000_000], vec![0]],
             node_pinned_usages: vec![vec![0], vec![0]],
+            node_duty_raw: vec![vec![400_000_000], vec![0]],
             cpu_masks: vec![
                 vec![true, true, false, false],
                 vec![false, false, true, true],

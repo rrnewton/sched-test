@@ -79,6 +79,7 @@ fn oneshot(pid: i32, start_ns: TimeNs, run_ns: TimeNs) -> TaskDef {
         thread_group_leader: None,
         uid: Uid(0),
         gid: Gid(0),
+        fork_cpu: None,
     }
 }
 

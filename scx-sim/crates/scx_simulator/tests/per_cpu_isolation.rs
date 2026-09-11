@@ -68,6 +68,7 @@ fn hog_on(name: &str, pid: i32, cpu: u32, run_ns: u64) -> TaskDef {
         thread_group_leader: None,
         uid: Uid(0),
         gid: Gid(0),
+        fork_cpu: None,
     }
 }
 
@@ -91,6 +92,7 @@ fn hog(name: &str, pid: i32, run_ns: u64) -> TaskDef {
         thread_group_leader: None,
         uid: Uid(0),
         gid: Gid(0),
+        fork_cpu: None,
     }
 }
 

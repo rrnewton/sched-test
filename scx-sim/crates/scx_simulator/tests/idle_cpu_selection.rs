@@ -40,6 +40,7 @@ fn task(name: &str, pid: i32, nice: i8, behavior: TaskBehavior) -> TaskDef {
         thread_group_leader: None,
         uid: Uid(0),
         gid: Gid(0),
+        fork_cpu: None,
     }
 }
 

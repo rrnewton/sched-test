@@ -71,6 +71,19 @@ pub struct SimCpu {
     /// migration penalty: cross-LLC migrations incur higher cache/TLB
     /// warming costs than intra-LLC migrations. Default: 0 (single domain).
     pub llc_id: u32,
+    /// NUMA node (socket, or NPS sub-NUMA domain).
+    ///
+    /// CPUs on the same node share a `node_id`. Two things read it: the
+    /// cross-node migration penalty
+    /// ([`OverheadConfig::cross_node_migration_penalty_ns`]), and the
+    /// topology the scheduler is told about. It does NOT imply any memory
+    /// model — see [`MachineTopology`] for what a node does and does not
+    /// mean here. Default: 0 (single node).
+    ///
+    /// [`OverheadConfig::cross_node_migration_penalty_ns`]:
+    ///     crate::scenario::OverheadConfig::cross_node_migration_penalty_ns
+    /// [`MachineTopology`]: crate::topology::MachineTopology
+    pub node_id: u32,
 }
 
 impl SimCpu {
@@ -90,6 +103,7 @@ impl SimCpu {
             irq_stolen_ns: 0,
             irq_cumulative_ns: 0,
             llc_id: 0,
+            node_id: 0,
         }
     }
 

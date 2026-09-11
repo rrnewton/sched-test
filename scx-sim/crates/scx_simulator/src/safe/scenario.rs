@@ -5,6 +5,7 @@ use tracing::warn;
 use crate::cgroup::DEFAULT_MAX_CGROUPS;
 use crate::perf::PmuEvent;
 use crate::task::{TaskBehavior, TaskDef};
+use crate::topology::MachineTopology;
 use crate::types::{CpuId, Gid, MmId, Pid, TimeNs, Uid};
 
 /// A CPU hotplug event: take a CPU offline or bring it online at a given time.
@@ -433,6 +434,25 @@ pub struct OverheadConfig {
     /// local LLC. This adds ~20-50μs on AMD Zen3/4 (cross-CCX) or ~10-20μs
     /// on Intel (cross-ring-stop). Default: 25000ns (25μs).
     pub cross_llc_migration_penalty_ns: TimeNs,
+    /// Extra latency (ns) for cross-NUMA migrations, on top of
+    /// `migration_penalty_ns` AND `cross_llc_migration_penalty_ns`.
+    ///
+    /// A task that lands on another socket refetches its working set over the
+    /// interconnect rather than from any local cache, and its pages stay
+    /// where they were. Remote-DRAM latency on a 2-socket x86 box runs
+    /// roughly 1.5-2.2x local.
+    ///
+    /// **This default is a modelling choice, not a measurement.** Unlike
+    /// `cross_llc_migration_penalty_ns`, it has not been calibrated against a
+    /// traced workload here; it is set equal to the cross-LLC penalty so that
+    /// crossing a socket costs about twice what crossing a CCX does. A
+    /// scenario that cares about the absolute number should set it
+    /// explicitly. Default: 25000ns (25μs).
+    ///
+    /// It is the ONLY thing `node_id` costs a task. The engine models no
+    /// per-node memory, no page placement and no distance matrix — see
+    /// [`MachineTopology`](crate::topology::MachineTopology).
+    pub cross_node_migration_penalty_ns: TimeNs,
 }
 
 impl Default for OverheadConfig {
@@ -453,6 +473,7 @@ impl Default for OverheadConfig {
             wakeup_jitter_stddev_ns: 2_000,
             migration_penalty_ns: 10_000,
             cross_llc_migration_penalty_ns: 25_000,
+            cross_node_migration_penalty_ns: 25_000,
         }
     }
 }
@@ -681,6 +702,13 @@ pub struct Scenario {
     pub smt_threads_per_core: u32,
     /// CPUs per LLC domain. 0 = single domain. Used to assign `llc_id` to CPUs.
     pub cpus_per_llc: u32,
+    /// The machine shape the engine simulates, and the one the scheduler must
+    /// be told about. Derived from `nr_cpus` / `cpus_per_llc` /
+    /// `smt_threads_per_core` / [`ScenarioBuilder::numa_nodes`] unless
+    /// [`ScenarioBuilder::topology`] supplied an explicit one.
+    pub topology: MachineTopology,
+    /// Which CPU each task is treated as having been forked on.
+    pub fork_placement: ForkPlacement,
     pub tasks: Vec<TaskDef>,
     /// Cgroup definitions (excluding root, which always exists).
     pub cgroups: Vec<CgroupDef>,
@@ -804,6 +832,85 @@ pub struct Scenario {
     pub warmup_ns: TimeNs,
 }
 
+/// Which CPU a task is treated as having been forked on — the `prev_cpu` its
+/// very first `ops.select_cpu` sees.
+///
+/// # Why this is a knob and not a constant
+///
+/// It used to be a constant: every task without an explicit cpumask was born
+/// on CPU 0. On a single-node machine that is harmless, because every
+/// scheduler's idle search covers the whole machine and the tasks spread out
+/// on the first wakeup.
+///
+/// On a multi-node machine it is not harmless, and it was half of mb
+/// **sim-dox34**. scx_layered's `pick_idle_cpu()` searches the task's LOCAL
+/// node first and only crosses a NUMA boundary through the cross-NUMA gate
+/// (see [`crate::layered_xnuma`]). With every task born on CPU 0, `src_nid`
+/// is 0 for every task for the whole run, and `cpus_that_ran` came out at
+/// exactly `nr_cpus / nr_nodes`. The scheduler was behaving correctly; the
+/// machine it was given was the artifact. A 384-CPU dual-socket box does not
+/// fork 768 threads from CPU 0.
+///
+/// # Why the default is not "spread over every CPU"
+///
+/// Dealing task `i` onto CPU `i % nr_cpus` would make `cpus_that_ran ==
+/// nr_cpus` true *by construction*, and a scheduler that never migrated
+/// anything would pass a coverage assertion. That destroys the property the
+/// assertion exists to check. [`ForkPlacement::RoundRobinNodes`] deals across
+/// NODES only, so every node starts live but the scheduler still has to do
+/// all the placement work inside a node — which is what the coverage
+/// assertion then measures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ForkPlacement {
+    /// [`ForkPlacement::FirstCpu`] on a single-node machine,
+    /// [`ForkPlacement::RoundRobinNodes`] once there is more than one node.
+    ///
+    /// The single-node arm is what every scenario did before this existed, so
+    /// adopting the default changes nothing for a machine that declares no
+    /// NUMA nodes.
+    #[default]
+    Auto,
+    /// Every task is born on CPU 0 (or on the first CPU of its cpumask).
+    FirstCpu,
+    /// Task `i` is born on the lowest-numbered CPU of node `i % nr_nodes`.
+    ///
+    /// Models a workload created from processes already spread across the
+    /// sockets, without pre-spreading it across the CPUs *within* a socket.
+    RoundRobinNodes,
+    /// Task `i` is born on CPU `i % nr_cpus`.
+    ///
+    /// The maximally spread option. Useful for isolating "can the engine run
+    /// on all of these CPUs" from "does the scheduler get work to all of
+    /// them" — but note that it answers the second question for the
+    /// scheduler, so do not use it under a CPU-coverage assertion.
+    RoundRobinCpus,
+}
+
+impl ForkPlacement {
+    /// The concrete CPU for the `index`-th task of a scenario.
+    ///
+    /// A task with an explicit cpumask ignores this and takes the first CPU
+    /// of its mask, matching the kernel: a new task's `cpu` is always inside
+    /// its own affinity.
+    pub fn cpu_for(&self, index: usize, topology: &MachineTopology) -> CpuId {
+        match self {
+            ForkPlacement::Auto => {
+                if topology.nr_nodes() > 1 {
+                    ForkPlacement::RoundRobinNodes.cpu_for(index, topology)
+                } else {
+                    CpuId(0)
+                }
+            }
+            ForkPlacement::FirstCpu => CpuId(0),
+            ForkPlacement::RoundRobinNodes => {
+                let firsts = topology.first_cpu_of_each_node();
+                firsts[index % firsts.len()]
+            }
+            ForkPlacement::RoundRobinCpus => CpuId(index as u32 % topology.nr_cpus()),
+        }
+    }
+}
+
 /// Builder for constructing scenarios.
 pub struct ScenarioBuilder {
     nr_cpus: u32,
@@ -812,6 +919,11 @@ pub struct ScenarioBuilder {
     /// CPUs per LLC domain. 0 = all CPUs in one domain (default).
     /// E.g., cpus_per_llc=12 with nr_cpus=48 creates 4 LLC domains.
     cpus_per_llc: u32,
+    /// NUMA nodes to deal the LLCs into. Default 1.
+    numa_nodes: u32,
+    /// Explicit topology, overriding the four uniform knobs when set.
+    explicit_topology: Option<MachineTopology>,
+    fork_placement: ForkPlacement,
     tasks: Vec<TaskDef>,
     cgroups: Vec<CgroupDef>,
     duration_ns: TimeNs,
@@ -968,6 +1080,9 @@ impl Scenario {
             required_scheduler_identity: None,
             smt_threads_per_core: 1,
             cpus_per_llc: 0,
+            numa_nodes: 1,
+            explicit_topology: None,
+            fork_placement: ForkPlacement::Auto,
             tasks: Vec::new(),
             cgroups: Vec::new(),
             duration_ns: 100_000_000, // 100ms default
@@ -1048,6 +1163,40 @@ impl ScenarioBuilder {
         self
     }
 
+    /// Deal the LLCs into `n` NUMA nodes (sockets, or NPS sub-NUMA domains).
+    ///
+    /// The engine models a node as (a) an identity every CPU carries, which
+    /// the scheduler is told about, and (b) an extra migration penalty for
+    /// crossing one ([`OverheadConfig::cross_node_migration_penalty_ns`]).
+    /// It does NOT model memory — see [`MachineTopology`] for the full list
+    /// of what a node does and does not mean here.
+    ///
+    /// Requires at least `n` LLCs, so pair it with
+    /// [`ScenarioBuilder::cpus_per_llc`]. Default: 1.
+    pub fn numa_nodes(mut self, n: u32) -> Self {
+        self.numa_nodes = n;
+        self
+    }
+
+    /// Use an explicit, possibly asymmetric [`MachineTopology`] instead of
+    /// deriving one from `cpus` / `cpus_per_llc` / `smt` / `numa_nodes`.
+    ///
+    /// `nr_cpus` is taken from the topology, so this also sets the CPU count.
+    pub fn topology(mut self, topology: MachineTopology) -> Self {
+        self.nr_cpus = topology.nr_cpus();
+        self.explicit_topology = Some(topology);
+        self
+    }
+
+    /// Choose which CPU each task is treated as having been forked on.
+    ///
+    /// Default [`ForkPlacement::Auto`]. See that type for why the default is
+    /// not simply "CPU 0" once the machine has more than one NUMA node.
+    pub fn fork_placement(mut self, placement: ForkPlacement) -> Self {
+        self.fork_placement = placement;
+        self
+    }
+
     /// Add a task with a full TaskDef.
     pub fn task(mut self, def: TaskDef) -> Self {
         // Advance next_pid past this task's PID to avoid collisions
@@ -1078,6 +1227,7 @@ impl ScenarioBuilder {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
         self
     }
@@ -1110,6 +1260,7 @@ impl ScenarioBuilder {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
         self
     }
@@ -1185,6 +1336,7 @@ impl ScenarioBuilder {
             thread_group_leader: Some(leader),
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
         self
     }
@@ -1377,6 +1529,7 @@ impl ScenarioBuilder {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
         self
     }
@@ -1735,12 +1888,40 @@ impl ScenarioBuilder {
                 self.cpus_per_llc
             );
         }
+        let topology = match self.explicit_topology {
+            Some(t) => {
+                assert_eq!(
+                    t.nr_cpus(),
+                    self.nr_cpus,
+                    "explicit topology describes {} CPUs but the scenario declares {}",
+                    t.nr_cpus(),
+                    self.nr_cpus
+                );
+                t
+            }
+            None => MachineTopology::uniform(
+                self.nr_cpus,
+                self.cpus_per_llc,
+                self.numa_nodes,
+                self.smt_threads_per_core,
+            ),
+        };
+        // Resolve each task's fork CPU now, while the topology is in hand, so
+        // the engine and the C task_struct agree on one value.
+        let mut tasks = self.tasks;
+        for (i, def) in tasks.iter_mut().enumerate() {
+            if def.fork_cpu.is_none() {
+                def.fork_cpu = Some(self.fork_placement.cpu_for(i, &topology));
+            }
+        }
         Scenario {
             nr_cpus: self.nr_cpus,
             required_scheduler_identity: self.required_scheduler_identity,
             smt_threads_per_core: self.smt_threads_per_core,
             cpus_per_llc: self.cpus_per_llc,
-            tasks: self.tasks,
+            topology,
+            fork_placement: self.fork_placement,
+            tasks,
             cgroups: self.cgroups,
             duration_ns: self.duration_ns,
             noise: self.noise,

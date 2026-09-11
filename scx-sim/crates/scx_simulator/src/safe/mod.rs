@@ -26,6 +26,9 @@ pub mod fmt;
 pub mod layered;
 pub mod layered_alloc;
 pub mod layered_control;
+/// scx_layered's cross-NUMA migration gate, vendored token-identical from
+/// upstream `main.rs` with a drift guard in `tests/layered_xnuma.rs`.
+pub mod layered_xnuma;
 
 /// scx_layered's real CPU allocator, compiled from the upstream source.
 /// See `layered_alloc` for why this is included verbatim rather than
@@ -43,6 +46,8 @@ pub mod starvation;
 pub mod stats;
 pub mod structops_jsonl;
 pub mod task;
+/// Arbitrary virtual machine topologies (sockets, NUMA, LLC, SMT).
+pub mod topology;
 pub mod trace;
 pub mod types;
 pub mod workloads;

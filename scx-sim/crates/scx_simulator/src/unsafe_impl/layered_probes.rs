@@ -109,6 +109,7 @@ type PairToI32Fn = unsafe extern "C" fn(u32, u32) -> i32;
 type PairToU32Fn = unsafe extern "C" fn(u32, u32) -> u32;
 type PairToU64Fn = unsafe extern "C" fn(u32, u32) -> u64;
 type TripleToI32Fn = unsafe extern "C" fn(u32, u32, u32) -> i32;
+type TripleToU64Fn = unsafe extern "C" fn(u32, u32, u32) -> u64;
 type NeedleFn = unsafe extern "C" fn(u32, u32, u32, *mut c_char, u32) -> i32;
 type TaskStrFn = unsafe extern "C" fn(*mut c_void, *mut c_char, u32) -> i32;
 type TaskTermFn = unsafe extern "C" fn(*mut c_void, u32, u32, u32) -> i32;
@@ -145,6 +146,9 @@ pub struct LayeredProbes {
     timer_fires_fn: VoidU64Fn,
     growth_denied_fn: PairToI32Fn,
     growth_denied_count_fn: PairToU64Fn,
+    layer_node_duty_raw_fn: PairToU64Fn,
+    xnuma_rate_fn: TripleToU64Fn,
+    xnuma_is_mig_src_fn: PairToI32Fn,
     // Per-task state (pid-keyed; reads wrapper-owned task_ctx storage).
     task_refresh_layer_fn: PidI32Fn,
     task_recheck_membership_fn: PidU64Fn,
@@ -212,6 +216,9 @@ impl LayeredProbes {
                 timer_fires_fn: resolve!(b"layered_probe_timer_fires", VoidU64Fn),
                 growth_denied_fn: resolve!(b"layered_probe_growth_denied", PairToI32Fn),
                 growth_denied_count_fn: resolve!(b"layered_probe_growth_denied_count", PairToU64Fn),
+                layer_node_duty_raw_fn: resolve!(b"layered_probe_layer_node_duty_raw", PairToU64Fn),
+                xnuma_rate_fn: resolve!(b"layered_probe_xnuma_rate", TripleToU64Fn),
+                xnuma_is_mig_src_fn: resolve!(b"layered_probe_xnuma_is_mig_src", PairToI32Fn),
                 task_refresh_layer_fn: resolve!(b"layered_probe_task_refresh_layer", PidI32Fn),
                 task_recheck_membership_fn: resolve!(
                     b"layered_probe_task_recheck_membership",
@@ -377,6 +384,39 @@ impl LayeredProbes {
     pub fn growth_denied_count(&self, layer_id: u32, node_id: u32) -> u64 {
         // SAFETY: both indices are bounds-checked C-side.
         unsafe { (self.growth_denied_count_fn)(layer_id, node_id) }
+    }
+
+    // -- Cross-NUMA migration gate (userspace-written, BPF-read) --
+
+    /// Sum of `cpu_ctx.layer_duty_sum[layer_id]` over the CPUs of `node_id`.
+    ///
+    /// The raw counter behind upstream's `layer_node_duty_sums`, and the input
+    /// the cross-NUMA gate decides from. It counts smoothed *runnable* time,
+    /// so a saturated node reports more than its CPU count — see
+    /// `layered_stopping()` in `main.bpf.c`.
+    pub fn layer_node_duty_raw(&self, layer_id: u32, node_id: u32) -> u64 {
+        // SAFETY: both indices are bounds-checked C-side.
+        unsafe { (self.layer_node_duty_raw_fn)(layer_id, node_id) }
+    }
+
+    /// `layers[layer_id].node[src].xnuma[dst].rate`.
+    ///
+    /// `u64::MAX` = gating off (always allow), `0` = deny, else a token-bucket
+    /// rate in duty-cycle units per second. Written only by the userspace
+    /// control loop; `0` on every pair is the pre-fix state of mb sim-dox34.
+    pub fn xnuma_rate(&self, layer_id: u32, src_node: u32, dst_node: u32) -> u64 {
+        // SAFETY: all three indices are bounds-checked C-side.
+        unsafe { (self.xnuma_rate_fn)(layer_id, src_node, dst_node) }
+    }
+
+    /// `layers[layer_id].node[node_id].xnuma_is_mig_src`.
+    ///
+    /// Both `pick_idle_cpu()`'s remote-node walk and `try_consume_layer()`'s
+    /// remote-LLC loop check this before they check the budget, so a false
+    /// here closes cross-NUMA migration regardless of the rates.
+    pub fn xnuma_is_mig_src(&self, layer_id: u32, node_id: u32) -> bool {
+        // SAFETY: both indices are bounds-checked C-side.
+        unsafe { (self.xnuma_is_mig_src_fn)(layer_id, node_id) != 0 }
     }
 
     // -- Membership lifecycle: "why is this task STILL in that layer?" --

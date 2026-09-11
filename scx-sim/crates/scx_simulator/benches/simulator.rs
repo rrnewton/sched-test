@@ -46,6 +46,7 @@ fn lavd_mixed_scenario() -> Scenario {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "pong".into(),
@@ -62,6 +63,7 @@ fn lavd_mixed_scenario() -> Scenario {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "cpu_hog".into(),
@@ -78,6 +80,7 @@ fn lavd_mixed_scenario() -> Scenario {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(500)
         .build()
@@ -103,6 +106,7 @@ fn contention_scenario(nr_cpus: u32, nr_tasks: i32) -> Scenario {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -130,6 +134,7 @@ fn sleep_wake_scenario(nr_cpus: u32) -> Scenario {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "sleeper2".into(),
@@ -146,6 +151,7 @@ fn sleep_wake_scenario(nr_cpus: u32) -> Scenario {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "hog".into(),
@@ -162,6 +168,7 @@ fn sleep_wake_scenario(nr_cpus: u32) -> Scenario {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(200)
         .build()
@@ -268,6 +275,7 @@ fn interleave_contention_scenario(interleave: bool, preemptive: bool) -> Scenari
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -307,6 +315,7 @@ fn interleave_sleep_wake_scenario(interleave: bool, preemptive: bool) -> Scenari
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "sleeper2".into(),
@@ -323,6 +332,7 @@ fn interleave_sleep_wake_scenario(interleave: bool, preemptive: bool) -> Scenari
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "hog".into(),
@@ -339,6 +349,7 @@ fn interleave_sleep_wake_scenario(interleave: bool, preemptive: bool) -> Scenari
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(200)
         .build()

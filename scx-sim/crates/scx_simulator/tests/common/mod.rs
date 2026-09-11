@@ -68,6 +68,7 @@ macro_rules! scheduler_tests {
                     thread_group_leader: None,
                     uid: Uid(0),
                     gid: Gid(0),
+                    fork_cpu: None,
                 })
                 .duration_ms(100)
                 .build();
@@ -113,6 +114,7 @@ macro_rules! scheduler_tests {
                     thread_group_leader: None,
                     uid: Uid(0),
                     gid: Gid(0),
+                    fork_cpu: None,
                 })
                 .task(TaskDef {
                     name: "t2".into(),
@@ -132,6 +134,7 @@ macro_rules! scheduler_tests {
                     thread_group_leader: None,
                     uid: Uid(0),
                     gid: Gid(0),
+                    fork_cpu: None,
                 })
                 .duration_ms(100)
                 .build();
@@ -173,6 +176,7 @@ macro_rules! scheduler_tests {
                     thread_group_leader: None,
                     uid: Uid(0),
                     gid: Gid(0),
+                    fork_cpu: None,
                 })
                 .task(TaskDef {
                     name: "t2".into(),
@@ -192,6 +196,7 @@ macro_rules! scheduler_tests {
                     thread_group_leader: None,
                     uid: Uid(0),
                     gid: Gid(0),
+                    fork_cpu: None,
                 })
                 .duration_ms(100)
                 .build();
@@ -244,6 +249,7 @@ macro_rules! scheduler_tests {
                         thread_group_leader: None,
                         uid: Uid(0),
                         gid: Gid(0),
+                        fork_cpu: None,
                     })
                     .task(TaskDef {
                         name: "t2".into(),
@@ -263,6 +269,7 @@ macro_rules! scheduler_tests {
                         thread_group_leader: None,
                         uid: Uid(0),
                         gid: Gid(0),
+                        fork_cpu: None,
                     })
                     .duration_ms(50)
                     .build()
@@ -328,6 +335,7 @@ macro_rules! scheduler_tests {
                     thread_group_leader: None,
                     uid: Uid(0),
                     gid: Gid(0),
+                    fork_cpu: None,
                 })
                 .task(TaskDef {
                     name: "t2".into(),
@@ -347,6 +355,7 @@ macro_rules! scheduler_tests {
                     thread_group_leader: None,
                     uid: Uid(0),
                     gid: Gid(0),
+                    fork_cpu: None,
                 })
                 .duration_ms(500)
                 .build();
@@ -398,6 +407,7 @@ macro_rules! scheduler_tests {
                     thread_group_leader: None,
                     uid: Uid(0),
                     gid: Gid(0),
+                    fork_cpu: None,
                 })
                 .duration_ms(100)
                 .build();
@@ -449,6 +459,7 @@ macro_rules! scheduler_tests {
                     thread_group_leader: None,
                     uid: Uid(0),
                     gid: Gid(0),
+                    fork_cpu: None,
                 })
                 .task(TaskDef {
                     name: "t2".into(),
@@ -468,6 +479,7 @@ macro_rules! scheduler_tests {
                     thread_group_leader: None,
                     uid: Uid(0),
                     gid: Gid(0),
+                    fork_cpu: None,
                 })
                 .duration_ms(100)
                 .build();
@@ -589,6 +601,7 @@ macro_rules! scheduler_tests {
                     thread_group_leader: None,
                     uid: Uid(0),
                     gid: Gid(0),
+                    fork_cpu: None,
                 })
                 // Add an unpinned task to occupy other CPUs
                 .task(TaskDef {
@@ -609,6 +622,7 @@ macro_rules! scheduler_tests {
                     thread_group_leader: None,
                     uid: Uid(0),
                     gid: Gid(0),
+                    fork_cpu: None,
                 })
                 .duration_ms(100)
                 .build();

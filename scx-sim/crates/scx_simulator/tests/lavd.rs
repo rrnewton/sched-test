@@ -171,6 +171,7 @@ fn test_lavd_ping_pong_is_lat_cri() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "pong".into(),
@@ -187,6 +188,7 @@ fn test_lavd_ping_pong_is_lat_cri() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(500)
         .build();
@@ -239,6 +241,7 @@ fn test_lavd_cpu_bound_not_lat_cri() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(500)
         .build();
@@ -286,6 +289,7 @@ fn test_lavd_mixed_classification() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "pong".into(),
@@ -302,6 +306,7 @@ fn test_lavd_mixed_classification() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "cpu_hog".into(),
@@ -318,6 +323,7 @@ fn test_lavd_mixed_classification() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(500)
         .build();
@@ -366,6 +372,7 @@ fn test_lavd_io_bound_vs_cpu() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "cpu_task".into(),
@@ -382,6 +389,7 @@ fn test_lavd_io_bound_vs_cpu() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(500)
         .build();
@@ -442,6 +450,7 @@ fn test_lavd_wake_chain_propagation() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
     let scenario = builder.duration_ms(500).build();
@@ -489,6 +498,7 @@ fn test_lavd_lat_cri_convergence() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "pong".into(),
@@ -505,6 +515,7 @@ fn test_lavd_lat_cri_convergence() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(500)
         .build();
@@ -574,6 +585,7 @@ fn test_lavd_multi_domain_balance() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -617,6 +629,7 @@ fn test_lavd_multi_domain_force_steal() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -659,6 +672,7 @@ fn test_lavd_multi_domain_mixed_workload() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -679,6 +693,7 @@ fn test_lavd_multi_domain_mixed_workload() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -722,6 +737,7 @@ fn test_lavd_multi_domain_mig_delta_pct() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -760,6 +776,7 @@ fn test_lavd_multi_domain_pinned_slice() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -799,6 +816,7 @@ fn test_lavd_multi_domain_per_cpu_dsq() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -841,6 +859,7 @@ fn test_lavd_three_domains_partial_load() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
     // Tasks pinned to domain 1 (CPUs 2-3), lighter load
@@ -859,6 +878,7 @@ fn test_lavd_three_domains_partial_load() {
         thread_group_leader: None,
         uid: Uid(0),
         gid: Gid(0),
+        fork_cpu: None,
     });
     // Domain 2 (CPUs 4-5) has no tasks → idle stealer
 
@@ -898,6 +918,7 @@ fn test_lavd_multi_domain_balanced_load() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -937,6 +958,7 @@ fn test_lavd_multi_domain_monitored() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -988,6 +1010,7 @@ fn test_lavd_four_domains_gradient() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -1008,6 +1031,7 @@ fn test_lavd_four_domains_gradient() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -1027,6 +1051,7 @@ fn test_lavd_four_domains_gradient() {
         thread_group_leader: None,
         uid: Uid(0),
         gid: Gid(0),
+        fork_cpu: None,
     });
 
     // Domain 3 (CPUs 6-7): empty → idle stealer
@@ -1075,6 +1100,7 @@ fn test_lavd_multi_domain_load_transition() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -1094,6 +1120,7 @@ fn test_lavd_multi_domain_load_transition() {
         thread_group_leader: None,
         uid: Uid(0),
         gid: Gid(0),
+        fork_cpu: None,
     });
 
     let trace = Simulator::new(sched).run(builder.build());
@@ -1152,6 +1179,7 @@ fn test_lavd_multi_domain_no_compact_balanced() {
                     thread_group_leader: None,
                     uid: Uid(0),
                     gid: Gid(0),
+                    fork_cpu: None,
                 });
             }
 
@@ -1204,6 +1232,7 @@ fn test_lavd_three_domains_no_compact() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -1224,6 +1253,7 @@ fn test_lavd_three_domains_no_compact() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -1243,6 +1273,7 @@ fn test_lavd_three_domains_no_compact() {
         thread_group_leader: None,
         uid: Uid(0),
         gid: Gid(0),
+        fork_cpu: None,
     });
 
     let trace = Simulator::new(sched).run(builder.build());
@@ -1289,6 +1320,7 @@ fn test_lavd_gradient_narrow_threshold() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -1308,6 +1340,7 @@ fn test_lavd_gradient_narrow_threshold() {
         thread_group_leader: None,
         uid: Uid(0),
         gid: Gid(0),
+        fork_cpu: None,
     });
 
     // Domain 2 (CPUs 4-5): empty -> stealer
@@ -1362,6 +1395,7 @@ fn test_lavd_waker_wakee_with_parent() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         // Child ping — shares parent with pong
         .task(TaskDef {
@@ -1379,6 +1413,7 @@ fn test_lavd_waker_wakee_with_parent() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         // Child pong — shares parent with ping
         .task(TaskDef {
@@ -1396,6 +1431,7 @@ fn test_lavd_waker_wakee_with_parent() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(500)
         .build();
@@ -1452,6 +1488,7 @@ fn test_lavd_waker_wakee_monitored() {
         thread_group_leader: None,
         uid: Uid(0),
         gid: Gid(0),
+        fork_cpu: None,
     });
     // Chain tasks all share parent Pid(1)
     for (i, behavior) in behaviors.into_iter().enumerate() {
@@ -1470,6 +1507,7 @@ fn test_lavd_waker_wakee_monitored() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
     let scenario = builder.duration_ms(500).build();
@@ -1521,6 +1559,7 @@ fn test_lavd_underloaded_dispatch() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(500)
         .build();
@@ -1563,6 +1602,7 @@ fn test_lavd_underloaded_pinned_overflow() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         // One IO task on any CPU
         .task(TaskDef {
@@ -1580,6 +1620,7 @@ fn test_lavd_underloaded_pinned_overflow() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(500)
         .build();
@@ -1621,6 +1662,7 @@ fn test_lavd_underloaded_per_cpu_dsq() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "worker_2".into(),
@@ -1637,6 +1679,7 @@ fn test_lavd_underloaded_per_cpu_dsq() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(500)
         .build();
@@ -1681,6 +1724,7 @@ fn test_lavd_init_task_parent_inheritance() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "child_a".into(),
@@ -1697,6 +1741,7 @@ fn test_lavd_init_task_parent_inheritance() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "child_b".into(),
@@ -1713,6 +1758,7 @@ fn test_lavd_init_task_parent_inheritance() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(500)
         .build();
@@ -1754,6 +1800,7 @@ fn test_lavd_consume_prev_queued() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -1794,6 +1841,7 @@ fn test_lavd_slice_boost_underloaded() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "long_2".into(),
@@ -1810,6 +1858,7 @@ fn test_lavd_slice_boost_underloaded() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(1000)
         .build();
@@ -1851,6 +1900,7 @@ fn test_lavd_slice_boost_lat_cri() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "ping".into(),
@@ -1867,6 +1917,7 @@ fn test_lavd_slice_boost_lat_cri() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "pong".into(),
@@ -1883,6 +1934,7 @@ fn test_lavd_slice_boost_lat_cri() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
 
     for i in 3..=4i32 {
@@ -1901,6 +1953,7 @@ fn test_lavd_slice_boost_lat_cri() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -1941,6 +1994,7 @@ fn test_lavd_underloaded_no_dsq_early_return() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(500)
         .build();
@@ -1976,6 +2030,7 @@ fn test_lavd_underloaded_cpdom_dsq_affinity() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "free".into(),
@@ -1992,6 +2047,7 @@ fn test_lavd_underloaded_cpdom_dsq_affinity() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(500)
         .build();
@@ -2039,6 +2095,7 @@ fn test_lavd_core_compaction_dispatch() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         // An unpinned task to generate some scheduling activity
         .task(TaskDef {
@@ -2056,6 +2113,7 @@ fn test_lavd_core_compaction_dispatch() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(1000)
         .build();
@@ -2100,6 +2158,7 @@ fn test_lavd_core_compaction_per_cpu_dsq() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         // Another pinned task on CPU 5
         .task(TaskDef {
@@ -2117,6 +2176,7 @@ fn test_lavd_core_compaction_per_cpu_dsq() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(1000)
         .build();
@@ -2157,6 +2217,7 @@ fn test_lavd_core_compaction_pinned_prev() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "pin7_b".into(),
@@ -2173,6 +2234,7 @@ fn test_lavd_core_compaction_pinned_prev() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(500)
         .build();
@@ -2472,6 +2534,7 @@ fn test_lavd_preemption_ping_pong_vs_hogs() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "pong".into(),
@@ -2488,6 +2551,7 @@ fn test_lavd_preemption_ping_pong_vs_hogs() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "hog-0".into(),
@@ -2504,6 +2568,7 @@ fn test_lavd_preemption_ping_pong_vs_hogs() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "hog-1".into(),
@@ -2520,6 +2585,7 @@ fn test_lavd_preemption_ping_pong_vs_hogs() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(300)
         .build();
@@ -2562,6 +2628,7 @@ fn test_lavd_pinned_task_contention() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "pinned-1".into(),
@@ -2578,6 +2645,7 @@ fn test_lavd_pinned_task_contention() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "free-0".into(),
@@ -2594,6 +2662,7 @@ fn test_lavd_pinned_task_contention() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "free-1".into(),
@@ -2610,6 +2679,7 @@ fn test_lavd_pinned_task_contention() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(200)
         .build();
@@ -2689,6 +2759,7 @@ fn test_lavd_affinitized_idle_selection() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         // Task pinned to CPUs 2,3
         .task(TaskDef {
@@ -2706,6 +2777,7 @@ fn test_lavd_affinitized_idle_selection() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         // Unpinned tasks to fill CPUs
         .task(TaskDef {
@@ -2723,6 +2795,7 @@ fn test_lavd_affinitized_idle_selection() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "free-1".into(),
@@ -2739,6 +2812,7 @@ fn test_lavd_affinitized_idle_selection() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(200)
         .build();
@@ -2801,6 +2875,7 @@ fn test_lavd_varied_nice_values() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "low-pri".into(),
@@ -2817,6 +2892,7 @@ fn test_lavd_varied_nice_values() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "normal".into(),
@@ -2833,6 +2909,7 @@ fn test_lavd_varied_nice_values() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(300)
         .build();
@@ -2874,6 +2951,7 @@ fn test_lavd_greedy_penalty_extreme_nice() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "priority".into(),
@@ -2890,6 +2968,7 @@ fn test_lavd_greedy_penalty_extreme_nice() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(300)
         .build();
@@ -2972,6 +3051,7 @@ fn test_lavd_all_power_features() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "pong".into(),
@@ -2988,6 +3068,7 @@ fn test_lavd_all_power_features() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "io".into(),
@@ -3004,6 +3085,7 @@ fn test_lavd_all_power_features() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "periodic".into(),
@@ -3020,6 +3102,7 @@ fn test_lavd_all_power_features() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "hog".into(),
@@ -3036,6 +3119,7 @@ fn test_lavd_all_power_features() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(300)
         .build();
@@ -3253,6 +3337,7 @@ fn test_lavd_staggered_task_arrival() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "mid".into(),
@@ -3269,6 +3354,7 @@ fn test_lavd_staggered_task_arrival() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "late".into(),
@@ -3285,6 +3371,7 @@ fn test_lavd_staggered_task_arrival() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(300)
         .build();
@@ -3343,6 +3430,7 @@ fn test_lavd_extreme_runtime_variation() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(300)
         .build();
@@ -3462,6 +3550,7 @@ fn test_lavd_pinned_single_cpu_overflow() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "pinned-3".into(),
@@ -3478,6 +3567,7 @@ fn test_lavd_pinned_single_cpu_overflow() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "hog-0".into(),
@@ -3494,6 +3584,7 @@ fn test_lavd_pinned_single_cpu_overflow() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(300)
         .build();
@@ -3637,6 +3728,7 @@ fn test_lavd_deep_wake_chain_lat_cri() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
     let scenario = builder.duration_ms(500).build();
@@ -3719,6 +3811,7 @@ fn test_lavd_big_little_overloaded_perf_cri() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "pong".into(),
@@ -3735,6 +3828,7 @@ fn test_lavd_big_little_overloaded_perf_cri() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "hog-0".into(),
@@ -3751,6 +3845,7 @@ fn test_lavd_big_little_overloaded_perf_cri() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "hog-1".into(),
@@ -3767,6 +3862,7 @@ fn test_lavd_big_little_overloaded_perf_cri() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "hog-2".into(),
@@ -3783,6 +3879,7 @@ fn test_lavd_big_little_overloaded_perf_cri() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "hog-3".into(),
@@ -3799,6 +3896,7 @@ fn test_lavd_big_little_overloaded_perf_cri() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(300)
         .build();
@@ -3869,6 +3967,7 @@ fn test_lavd_greedy_no_preempt_kick() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "io-lat".into(),
@@ -3885,6 +3984,7 @@ fn test_lavd_greedy_no_preempt_kick() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "hog".into(),
@@ -3901,6 +4001,7 @@ fn test_lavd_greedy_no_preempt_kick() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(300)
         .build();
@@ -3945,6 +4046,7 @@ fn test_lavd_no_wake_sync() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "pong".into(),
@@ -3961,6 +4063,7 @@ fn test_lavd_no_wake_sync() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "hog".into(),
@@ -3977,6 +4080,7 @@ fn test_lavd_no_wake_sync() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(300)
         .build();
@@ -4100,6 +4204,7 @@ fn test_lavd_autopilot_transitions() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "mid-0".into(),
@@ -4116,6 +4221,7 @@ fn test_lavd_autopilot_transitions() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "mid-1".into(),
@@ -4132,6 +4238,7 @@ fn test_lavd_autopilot_transitions() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "heavy-0".into(),
@@ -4148,6 +4255,7 @@ fn test_lavd_autopilot_transitions() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "heavy-1".into(),
@@ -4164,6 +4272,7 @@ fn test_lavd_autopilot_transitions() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "heavy-2".into(),
@@ -4180,6 +4289,7 @@ fn test_lavd_autopilot_transitions() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "heavy-3".into(),
@@ -4196,6 +4306,7 @@ fn test_lavd_autopilot_transitions() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(500)
         .build();
@@ -4243,6 +4354,7 @@ fn test_lavd_complex_affinity_patterns() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         // Task on all odd CPUs
         .task(TaskDef {
@@ -4260,6 +4372,7 @@ fn test_lavd_complex_affinity_patterns() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         // Task on just CPU 4 and 5
         .task(TaskDef {
@@ -4277,6 +4390,7 @@ fn test_lavd_complex_affinity_patterns() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         // Unpinned tasks
         .task(TaskDef {
@@ -4294,6 +4408,7 @@ fn test_lavd_complex_affinity_patterns() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "free-1".into(),
@@ -4310,6 +4425,7 @@ fn test_lavd_complex_affinity_patterns() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(300)
         .build();
@@ -4354,6 +4470,7 @@ fn test_lavd_concurrent_pinned_mixed() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "pinned-2".into(),
@@ -4370,6 +4487,7 @@ fn test_lavd_concurrent_pinned_mixed() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "free-0".into(),
@@ -4386,6 +4504,7 @@ fn test_lavd_concurrent_pinned_mixed() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "free-1".into(),
@@ -4402,6 +4521,7 @@ fn test_lavd_concurrent_pinned_mixed() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "periodic".into(),
@@ -4418,6 +4538,7 @@ fn test_lavd_concurrent_pinned_mixed() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(200)
         .build();
@@ -4579,6 +4700,7 @@ fn test_lavd_dispatch_pinned_on_inactive_cpu() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(500)
         .build();
@@ -4623,6 +4745,7 @@ fn test_lavd_dispatch_affinitized_on_inactive_cpus() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(500)
         .build();
@@ -4676,6 +4799,7 @@ fn test_lavd_idle_interval_zero_sched() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(300)
         .build();
@@ -4730,6 +4854,7 @@ fn test_lavd_idle_cpu_selection_complex() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "aff-23".into(),
@@ -4746,6 +4871,7 @@ fn test_lavd_idle_cpu_selection_complex() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "aff-45".into(),
@@ -4762,6 +4888,7 @@ fn test_lavd_idle_cpu_selection_complex() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "aff-67".into(),
@@ -4778,6 +4905,7 @@ fn test_lavd_idle_cpu_selection_complex() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         // Free-roaming CPU hogs to saturate active CPUs
         .task(TaskDef {
@@ -4795,6 +4923,7 @@ fn test_lavd_idle_cpu_selection_complex() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "hog-1".into(),
@@ -4811,6 +4940,7 @@ fn test_lavd_idle_cpu_selection_complex() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(300)
         .build();
@@ -4852,6 +4982,7 @@ fn test_lavd_idle_cpu_sticky_domain_fallback() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "pp-b".into(),
@@ -4868,6 +4999,7 @@ fn test_lavd_idle_cpu_sticky_domain_fallback() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         // Background hogs on all CPUs to prevent trivial idle selection
         .add_task("bg-0", 10, workloads::cpu_bound(30_000_000))
@@ -4925,6 +5057,7 @@ fn test_lavd_comprehensive_compaction_stress() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         // Pinned task on high CPU (inactive under compaction)
         .task(TaskDef {
@@ -4942,6 +5075,7 @@ fn test_lavd_comprehensive_compaction_stress() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         // Affinitized task on CPUs 4-6 (inactive under compaction)
         .task(TaskDef {
@@ -4959,6 +5093,7 @@ fn test_lavd_comprehensive_compaction_stress() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         // Task with long sleep to create idle intervals
         .task(TaskDef {
@@ -4982,6 +5117,7 @@ fn test_lavd_comprehensive_compaction_stress() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(2500)
         .build();
@@ -5028,6 +5164,7 @@ fn test_lavd_slice_boost_preemption_cancel() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "pp-b".into(),
@@ -5044,6 +5181,7 @@ fn test_lavd_slice_boost_preemption_cancel() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .add_task("hog-0", 0, workloads::cpu_bound(20_000_000))
         .add_task("hog-1", 0, workloads::cpu_bound(20_000_000))
@@ -5217,6 +5355,7 @@ fn test_lavd_compaction_pinned_prev_forced() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(300)
         .build();
@@ -5268,6 +5407,7 @@ fn test_lavd_compaction_affinitized_prev_forced() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(300)
         .build();
@@ -5352,6 +5492,7 @@ fn test_lavd_compaction_dsq_iteration() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "aff-45".into(),
@@ -5368,6 +5509,7 @@ fn test_lavd_compaction_dsq_iteration() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "pin-3".into(),
@@ -5384,6 +5526,7 @@ fn test_lavd_compaction_dsq_iteration() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(400)
         .build();
@@ -5467,6 +5610,7 @@ fn test_lavd_compaction_combined_stress() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "pin-7".into(),
@@ -5483,6 +5627,7 @@ fn test_lavd_compaction_combined_stress() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         // Affinitized task on inactive CPUs
         .task(TaskDef {
@@ -5500,6 +5645,7 @@ fn test_lavd_compaction_combined_stress() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(400)
         .build();
@@ -5939,6 +6085,7 @@ fn test_lavd_is_monitored() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "monitored-b".into(),
@@ -5955,6 +6102,7 @@ fn test_lavd_is_monitored() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .add_task("hog", 5, workloads::cpu_bound(20_000_000))
         .duration_ms(300)
@@ -6061,6 +6209,7 @@ fn test_lavd_slice_boost_partial_lat_cri() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "io-cri-b".into(),
@@ -6077,6 +6226,7 @@ fn test_lavd_slice_boost_partial_lat_cri() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .add_task("hog-0", 0, workloads::cpu_bound(20_000_000))
         .add_task("hog-1", 0, workloads::cpu_bound(20_000_000))
@@ -6172,6 +6322,7 @@ fn test_lavd_monitored_smt() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "pong".into(),
@@ -6188,6 +6339,7 @@ fn test_lavd_monitored_smt() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .add_task("hog-0", 5, workloads::cpu_bound(20_000_000))
         .add_task("hog-1", 5, workloads::cpu_bound(20_000_000))
@@ -6330,6 +6482,7 @@ fn test_lavd_pinned_single_cpu_slice_clamp() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "pinned-b".into(),
@@ -6346,6 +6499,7 @@ fn test_lavd_pinned_single_cpu_slice_clamp() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         // Unpinned tasks on other CPUs
         .add_task("free-0", 0, workloads::cpu_bound(10_000_000))
@@ -6409,6 +6563,7 @@ fn test_lavd_dispatch_compaction_dsq_iteration() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "affinity-7".into(),
@@ -6425,6 +6580,7 @@ fn test_lavd_dispatch_compaction_dsq_iteration() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         // Regular tasks on active CPUs
         .add_task("hog-0", 0, workloads::cpu_bound(20_000_000))
@@ -6495,6 +6651,7 @@ fn test_lavd_compaction_pinned_overflow_extend() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         // IO tasks to create dispatch pressure
         .add_task("hog-0", 0, workloads::cpu_bound(20_000_000))
@@ -6546,6 +6703,7 @@ fn test_lavd_dequeue_early_return() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "pong".into(),
@@ -6562,6 +6720,7 @@ fn test_lavd_dequeue_early_return() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .add_task("hog-0", 10, workloads::cpu_bound(20_000_000))
         .add_task("hog-1", 10, workloads::cpu_bound(20_000_000))
@@ -6680,6 +6839,7 @@ fn test_lavd_reenq_skip_recalc() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "pong".into(),
@@ -6696,6 +6856,7 @@ fn test_lavd_reenq_skip_recalc() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .add_task("hog-0", 10, workloads::cpu_bound(20_000_000))
         .add_task("hog-1", 10, workloads::cpu_bound(20_000_000))
@@ -6739,6 +6900,7 @@ fn test_lavd_preemption_affinitized_cancel_boost() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "hog-on-0".into(),
@@ -6755,6 +6917,7 @@ fn test_lavd_preemption_affinitized_cancel_boost() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .add_task("hog-1", 5, workloads::cpu_bound(20_000_000))
         .add_task("hog-2", 5, workloads::cpu_bound(20_000_000))
@@ -6799,6 +6962,7 @@ fn test_lavd_no_wake_sync_mode() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "pong".into(),
@@ -6815,6 +6979,7 @@ fn test_lavd_no_wake_sync_mode() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(200)
         .build();
@@ -6865,6 +7030,7 @@ fn test_lavd_compaction_prev_affinitized_overflow() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .add_task("hog-0", 0, workloads::cpu_bound(20_000_000))
         .add_task("hog-1", 0, workloads::cpu_bound(20_000_000))
@@ -7004,6 +7170,7 @@ fn test_lavd_combined_features() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "pong".into(),
@@ -7020,6 +7187,7 @@ fn test_lavd_combined_features() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .add_task("hog-0", 0, workloads::cpu_bound(20_000_000))
         .add_task("hog-1", 0, workloads::cpu_bound(20_000_000))
@@ -7228,6 +7396,7 @@ fn test_lavd_introspection_sched_n() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "pong".into(),
@@ -7244,6 +7413,7 @@ fn test_lavd_introspection_sched_n() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .add_task("hog", 5, workloads::cpu_bound(20_000_000))
         .duration_ms(300)
@@ -7318,6 +7488,7 @@ fn test_lavd_big_little_8cpu_ping_pong() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "lat-cri-b".into(),
@@ -7334,6 +7505,7 @@ fn test_lavd_big_little_8cpu_ping_pong() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .add_task("hog-0", 5, workloads::cpu_bound(20_000_000))
         .add_task("hog-1", 5, workloads::cpu_bound(20_000_000))
@@ -7418,6 +7590,7 @@ fn test_lavd_big_little_smt() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "pong".into(),
@@ -7434,6 +7607,7 @@ fn test_lavd_big_little_smt() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .add_task("hog-0", 0, workloads::cpu_bound(20_000_000))
         .add_task("hog-1", 0, workloads::cpu_bound(20_000_000))
@@ -7528,6 +7702,7 @@ fn test_lavd_two_domain_per_cpu_dsq() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "pong".into(),
@@ -7544,6 +7719,7 @@ fn test_lavd_two_domain_per_cpu_dsq() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .add_task("hog-0", 5, workloads::cpu_bound(20_000_000))
         .add_task("hog-1", 5, workloads::cpu_bound(20_000_000))
@@ -7590,6 +7766,7 @@ fn test_lavd_two_domain_monitored() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "pong".into(),
@@ -7606,6 +7783,7 @@ fn test_lavd_two_domain_monitored() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .add_task("hog-0", 0, workloads::cpu_bound(20_000_000))
         .add_task("hog-1", 0, workloads::cpu_bound(20_000_000))
@@ -7654,6 +7832,7 @@ fn test_lavd_two_domain_big_little() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "pong".into(),
@@ -7670,6 +7849,7 @@ fn test_lavd_two_domain_big_little() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .add_task("batch-0", 10, workloads::cpu_bound(20_000_000))
         .add_task("batch-1", 10, workloads::cpu_bound(20_000_000))
@@ -7762,6 +7942,7 @@ fn test_lavd_mostly_little_topology() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "pong".into(),
@@ -7778,6 +7959,7 @@ fn test_lavd_mostly_little_topology() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .add_task("hog-0", 5, workloads::cpu_bound(20_000_000))
         .add_task("hog-1", 5, workloads::cpu_bound(20_000_000))
@@ -7831,6 +8013,7 @@ fn test_lavd_two_domain_pinned_imbalance() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "hog-d0-1".into(),
@@ -7847,6 +8030,7 @@ fn test_lavd_two_domain_pinned_imbalance() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "hog-d0-2".into(),
@@ -7863,6 +8047,7 @@ fn test_lavd_two_domain_pinned_imbalance() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "hog-d0-3".into(),
@@ -7879,6 +8064,7 @@ fn test_lavd_two_domain_pinned_imbalance() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "hog-d0-4".into(),
@@ -7895,6 +8081,7 @@ fn test_lavd_two_domain_pinned_imbalance() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "hog-d0-5".into(),
@@ -7911,6 +8098,7 @@ fn test_lavd_two_domain_pinned_imbalance() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "hog-d0-6".into(),
@@ -7927,6 +8115,7 @@ fn test_lavd_two_domain_pinned_imbalance() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "hog-d0-7".into(),
@@ -7943,6 +8132,7 @@ fn test_lavd_two_domain_pinned_imbalance() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .add_task("io-d1", -5, workloads::io_bound(50_000, 500_000))
         .duration_ms(500)
@@ -7990,6 +8180,7 @@ fn test_lavd_two_domain_mig_delta_pct() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "hog-d0-1".into(),
@@ -8006,6 +8197,7 @@ fn test_lavd_two_domain_mig_delta_pct() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "hog-d0-2".into(),
@@ -8022,6 +8214,7 @@ fn test_lavd_two_domain_mig_delta_pct() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "hog-d0-3".into(),
@@ -8038,6 +8231,7 @@ fn test_lavd_two_domain_mig_delta_pct() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "hog-d0-4".into(),
@@ -8054,6 +8248,7 @@ fn test_lavd_two_domain_mig_delta_pct() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .add_task("io-d1", -5, workloads::io_bound(30_000, 200_000))
         .duration_ms(400)
@@ -8133,6 +8328,7 @@ fn test_lavd_mostly_big_compaction() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "pong".into(),
@@ -8149,6 +8345,7 @@ fn test_lavd_mostly_big_compaction() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .add_task("hog-0", 5, workloads::cpu_bound(20_000_000))
         .add_task("hog-1", 5, workloads::cpu_bound(20_000_000))
@@ -8273,6 +8470,7 @@ fn test_lavd_compaction_pinned_on_inactive() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .add_task("io-light", 0, workloads::io_bound(100_000, 5_000_000))
         .duration_ms(50)
@@ -8321,6 +8519,7 @@ fn test_lavd_compaction_per_cpu_dsq_overflow() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "pinned-7".into(),
@@ -8337,6 +8536,7 @@ fn test_lavd_compaction_per_cpu_dsq_overflow() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .add_task("io-light", 0, workloads::io_bound(100_000, 5_000_000))
         .duration_ms(50)
@@ -8628,6 +8828,7 @@ fn test_lavd_slice_boost_under_load() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "pong".into(),
@@ -8644,6 +8845,7 @@ fn test_lavd_slice_boost_under_load() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     // CPU-bound tasks to fill queues
     for i in 0..6 {
@@ -8941,6 +9143,7 @@ fn test_lavd_cpu_bw_with_preemption() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "pong".into(),
@@ -8957,6 +9160,7 @@ fn test_lavd_cpu_bw_with_preemption() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .add_task_in_cgroup("hog", 10, workloads::cpu_bound(10_000_000), "group-a")
         .add_task("free", 0, workloads::cpu_bound(10_000_000))
@@ -9018,6 +9222,7 @@ fn test_lavd_kernel_task_types() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         // ksoftirqd thread — triggers is_ksoftirqd() + LAVD_FLAG_KSOFTIRQD
         // Needs PF_KTHREAD and comm starting with "ksoftirqd/"
@@ -9039,6 +9244,7 @@ fn test_lavd_kernel_task_types() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         // Workqueue worker — triggers is_kernel_worker()
         .task(TaskDef {
@@ -9059,6 +9265,7 @@ fn test_lavd_kernel_task_types() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         // IO worker — triggers is_kernel_worker() via PF_IO_WORKER
         .task(TaskDef {
@@ -9079,6 +9286,7 @@ fn test_lavd_kernel_task_types() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         // Regular user task to have a mixed workload
         .task(TaskDef {
@@ -9096,6 +9304,7 @@ fn test_lavd_kernel_task_types() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(200)
         .build();
@@ -9154,6 +9363,7 @@ fn test_lavd_lat_cri_inheritance() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         // Task B: CPU-bound sleeper — long sleep then short CPU, woken by A.
         // parent_pid = A so lavd_runnable's real_parent check passes.
@@ -9178,6 +9388,7 @@ fn test_lavd_lat_cri_inheritance() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         // Background CPU load to keep sys_stat active
         .add_task("bg1", 5, workloads::cpu_bound(10_000_000))
@@ -9232,6 +9443,7 @@ fn test_lavd_api_set_power_mode_balanced() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(100)
         .build();
@@ -9273,6 +9485,7 @@ fn test_lavd_api_set_power_mode_powersave() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(100)
         .build();
@@ -9311,6 +9524,7 @@ fn test_lavd_api_set_autopilot() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(100)
         .build();
@@ -9354,6 +9568,7 @@ fn test_lavd_api_noflags() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(100)
         .build();
@@ -9457,6 +9672,7 @@ fn test_lavd_migration_disabled_kworker_scenario() {
         thread_group_leader: None,
         uid: Uid(0),
         gid: Gid(0),
+        fork_cpu: None,
     });
 
     // Add other tasks spread across CPUs to create load imbalance
@@ -9477,6 +9693,7 @@ fn test_lavd_migration_disabled_kworker_scenario() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -9508,6 +9725,7 @@ fn test_lavd_migration_disabled_kworker_scenario() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -9582,6 +9800,7 @@ fn test_lavd_pinned_task_cpumask_respected() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         // Tasks in other domains to create load
         .task(TaskDef {
@@ -9599,6 +9818,7 @@ fn test_lavd_pinned_task_cpumask_respected() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "worker_d2".into(),
@@ -9615,6 +9835,7 @@ fn test_lavd_pinned_task_cpumask_respected() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         // Waker from a different domain
         .task(TaskDef {
@@ -9642,6 +9863,7 @@ fn test_lavd_pinned_task_cpumask_respected() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(500)
         .detect_bpf_errors()
@@ -10355,6 +10577,7 @@ fn test_lavd_migrate_to_neighbor_donation() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "heavy2".into(),
@@ -10374,6 +10597,7 @@ fn test_lavd_migrate_to_neighbor_donation() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         // Light task that can migrate to any domain
         .task(TaskDef {
@@ -10394,6 +10618,7 @@ fn test_lavd_migrate_to_neighbor_donation() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(300)
         .build();
@@ -10455,6 +10680,7 @@ fn test_lavd_sticky_cpu_non_matching_type() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "pong".into(),
@@ -10471,6 +10697,7 @@ fn test_lavd_sticky_cpu_non_matching_type() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(200)
         .build();
@@ -10525,6 +10752,7 @@ fn test_lavd_sync_waker_cross_domain() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "domain1_task".into(),
@@ -10541,6 +10769,7 @@ fn test_lavd_sync_waker_cross_domain() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(200)
         .build();
@@ -10599,6 +10828,7 @@ fn test_lavd_sticky_cpu_load_comparison() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -10620,6 +10850,7 @@ fn test_lavd_sticky_cpu_load_comparison() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "pong".into(),
@@ -10636,6 +10867,7 @@ fn test_lavd_sticky_cpu_load_comparison() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
 
     let scenario = builder.duration_ms(250).build();
@@ -10739,6 +10971,7 @@ fn test_lavd_two_choice_cpu_selection() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -10807,6 +11040,7 @@ fn test_lavd_find_cpu_in_overflow_extension() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .add_task(
             "background",
@@ -10870,6 +11104,7 @@ fn test_lavd_seed_exploration_idle_paths() {
                 thread_group_leader: None,
                 uid: Uid(0),
                 gid: Gid(0),
+                fork_cpu: None,
             })
             .task(TaskDef {
                 name: "pong".into(),
@@ -10886,6 +11121,7 @@ fn test_lavd_seed_exploration_idle_paths() {
                 thread_group_leader: None,
                 uid: Uid(0),
                 gid: Gid(0),
+                fork_cpu: None,
             })
             .add_task(
                 "background",
@@ -10951,6 +11187,7 @@ fn test_lavd_exiting_waker_sync() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "wakee".into(),
@@ -10970,6 +11207,7 @@ fn test_lavd_exiting_waker_sync() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(150)
         .build();
@@ -11062,6 +11300,7 @@ fn test_lavd_preemption_no_victim() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(200)
         .build();
@@ -11190,6 +11429,7 @@ fn test_lavd_cpu_capacity_scaling() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -11210,6 +11450,7 @@ fn test_lavd_cpu_capacity_scaling() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -11253,6 +11494,7 @@ fn test_hardirq_wakeup_sets_flag() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "irq_wakee".into(),
@@ -11272,6 +11514,7 @@ fn test_hardirq_wakeup_sets_flag() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         // Hardirq on CPU 0 at 10ms wakes task B (pid=2)
         .hardirq(CpuId(0), 10_000_000, 5_000, &[Pid(2)])
@@ -11343,6 +11586,7 @@ fn test_softirq_wakeup_sets_flag() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "softirq_wakee".into(),
@@ -11362,6 +11606,7 @@ fn test_softirq_wakeup_sets_flag() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         // Softirq on CPU 0 at 10ms wakes task B
         .softirq(CpuId(0), 10_000_000, 3_000, &[Pid(2)])
@@ -11427,6 +11672,7 @@ fn test_irq_steals_time() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(100)
         .build();
@@ -11456,6 +11702,7 @@ fn test_irq_steals_time() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         // Fire IRQs during the task's execution window
         .hardirq(CpuId(0), 2_000_000, irq_duration, &[])
@@ -11531,6 +11778,7 @@ fn test_periodic_irq_load() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         // Task on CPU 1 (should not be affected)
         .task(TaskDef {
@@ -11548,6 +11796,7 @@ fn test_periodic_irq_load() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         // Periodic hardirqs on CPU 0 every 1ms, 100us each
         .periodic_irq(
@@ -11631,6 +11880,7 @@ fn test_lavd_shared_dsq_high_load() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -11699,6 +11949,7 @@ fn test_lavd_dsq_sampling_events() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -11763,6 +12014,7 @@ fn test_lavd_dsq_length_queries() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 

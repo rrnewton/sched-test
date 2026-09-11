@@ -149,6 +149,7 @@ fn random_scenario(rng: &mut Rng, nr_cpus: u32) -> Scenario {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -190,6 +191,7 @@ fn ping_pong_scenario(rng: &mut Rng, nr_cpus: u32) -> Scenario {
                 thread_group_leader: None,
                 uid: Uid(0),
                 gid: Gid(0),
+                fork_cpu: None,
             })
             .task(TaskDef {
                 name: format!("pong{pair}"),
@@ -206,6 +208,7 @@ fn ping_pong_scenario(rng: &mut Rng, nr_cpus: u32) -> Scenario {
                 thread_group_leader: None,
                 uid: Uid(0),
                 gid: Gid(0),
+                fork_cpu: None,
             });
     }
 
@@ -228,6 +231,7 @@ fn ping_pong_scenario(rng: &mut Rng, nr_cpus: u32) -> Scenario {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -267,6 +271,7 @@ fn wake_chain_scenario(rng: &mut Rng, nr_cpus: u32) -> Scenario {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -289,6 +294,7 @@ fn wake_chain_scenario(rng: &mut Rng, nr_cpus: u32) -> Scenario {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -336,6 +342,7 @@ fn contention_scenario(rng: &mut Rng, nr_cpus: u32) -> Scenario {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 

@@ -123,6 +123,7 @@ fn build_scenario_inner(with_irq: bool, with_nice_hints: bool) -> Scenario {
         thread_group_leader: None,
         uid: Uid(0),
         gid: Gid(0),
+        fork_cpu: None,
     });
 
     // --- ucache_workers (8): run(250us) + sleep(110us) = 69% util ---
@@ -146,6 +147,7 @@ fn build_scenario_inner(with_irq: bool, with_nice_hints: bool) -> Scenario {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -170,6 +172,7 @@ fn build_scenario_inner(with_irq: bool, with_nice_hints: bool) -> Scenario {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -195,6 +198,7 @@ fn build_scenario_inner(with_irq: bool, with_nice_hints: bool) -> Scenario {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -218,6 +222,7 @@ fn build_scenario_inner(with_irq: bool, with_nice_hints: bool) -> Scenario {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -889,6 +894,7 @@ fn build_calibrated_scenario() -> Scenario {
         thread_group_leader: None,
         uid: Uid(0),
         gid: Gid(0),
+        fork_cpu: None,
     });
 
     for i in 0..CAL_NUM_WORKERS {
@@ -913,6 +919,7 @@ fn build_calibrated_scenario() -> Scenario {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -938,6 +945,7 @@ fn build_calibrated_scenario() -> Scenario {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -963,6 +971,7 @@ fn build_calibrated_scenario() -> Scenario {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -1363,6 +1372,7 @@ fn build_hubspoke_scenario(with_nice_hints: bool) -> Scenario {
         thread_group_leader: None,
         uid: Uid(0),
         gid: Gid(0),
+        fork_cpu: None,
     });
 
     // Hub_0: wakes both reader and writer
@@ -1389,6 +1399,7 @@ fn build_hubspoke_scenario(with_nice_hints: bool) -> Scenario {
         thread_group_leader: None,
         uid: Uid(0),
         gid: Gid(0),
+        fork_cpu: None,
     });
 
     // Hub_1: wakes writer only (gives writer 2x wake sources)
@@ -1414,6 +1425,7 @@ fn build_hubspoke_scenario(with_nice_hints: bool) -> Scenario {
         thread_group_leader: None,
         uid: Uid(0),
         gid: Gid(0),
+        fork_cpu: None,
     });
 
     // Remaining workers: independent run/sleep
@@ -1436,6 +1448,7 @@ fn build_hubspoke_scenario(with_nice_hints: bool) -> Scenario {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -1458,6 +1471,7 @@ fn build_hubspoke_scenario(with_nice_hints: bool) -> Scenario {
         thread_group_leader: None,
         uid: Uid(0),
         gid: Gid(0),
+        fork_cpu: None,
     });
 
     // Navy writer
@@ -1479,6 +1493,7 @@ fn build_hubspoke_scenario(with_nice_hints: bool) -> Scenario {
         thread_group_leader: None,
         uid: Uid(0),
         gid: Gid(0),
+        fork_cpu: None,
     });
 
     // Background hogs
@@ -1501,6 +1516,7 @@ fn build_hubspoke_scenario(with_nice_hints: bool) -> Scenario {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 

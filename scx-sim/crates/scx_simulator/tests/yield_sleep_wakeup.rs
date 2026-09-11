@@ -59,6 +59,7 @@ fn task(pid: i32, phases: Vec<Phase>) -> TaskDef {
         thread_group_leader: None,
         uid: Uid(0),
         gid: Gid(0),
+        fork_cpu: None,
     }
 }
 

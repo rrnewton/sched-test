@@ -68,6 +68,7 @@ fn tiny_lavd_scenario(worker_pid: Pid) -> Scenario {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(50)
         .build()

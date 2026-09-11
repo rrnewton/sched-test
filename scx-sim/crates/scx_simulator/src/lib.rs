@@ -69,6 +69,7 @@ pub(crate) use safe::fmt;
 pub(crate) use safe::layered;
 pub(crate) use safe::layered_alloc_upstream;
 pub(crate) use safe::layered_control;
+pub(crate) use safe::layered_xnuma;
 // scx_layered's alloc.rs does `use crate::largest_remainder;`. Re-exporting it
 // at the crate root is what lets the upstream source compile here unmodified.
 pub(crate) use safe::layered_alloc::largest_remainder;
@@ -79,6 +80,7 @@ pub(crate) use safe::perfetto_pb;
 pub(crate) use safe::scenario;
 pub(crate) use safe::stats;
 pub(crate) use safe::task;
+pub(crate) use safe::topology;
 pub(crate) use safe::trace;
 pub(crate) use safe::types;
 pub use safe::workloads;
@@ -139,10 +141,18 @@ pub use safe::bpf_trace::{
     BpfEventKind, BpfTrace, BpfTraceEvent, TraceComparisonResult, TraceDifferences,
 };
 pub use safe::fmt::{FmtN, FmtTs, SimFormat};
-pub use safe::layered::{LayerGrowthAlgo, LayerKind, LayerMatch, LayerSpec, DEFAULT_LAYER_WEIGHT};
+pub use safe::layered::{
+    LayerGrowthAlgo, LayerKind, LayerMatch, LayerSpec, DEFAULT_LAYER_WEIGHT,
+    DEFAULT_XNUMA_THRESHOLD, DEFAULT_XNUMA_THRESHOLD_DELTA,
+};
 // scx_layered's own allocator, compiled verbatim from the scx submodule.
 // tests/layered_alloc.rs drives it directly to prove it is the real thing.
 pub use safe::layered_alloc_upstream::{unified_alloc, LayerDemand};
+// The cross-NUMA gate's policy, also compiled from upstream (vendored, with a
+// drift guard). tests/layered_xnuma.rs drives it directly.
+pub use safe::layered_xnuma::{
+    xnuma_check_active, xnuma_compute_rates, XnumaRates, DUTY_CYCLE_SCALE, XNUMA_RATE_DAMPEN,
+};
 pub use safe::monitor::{Monitor, ProbeContext, ProbePoint};
 pub use safe::perf::PmuEvent;
 pub use safe::perf::RbcCounter;
@@ -154,14 +164,15 @@ pub use safe::perf::try_create_rbc_counter;
 pub use safe::rtapp::{load_rtapp, RtAppError, RTAPP_PP_KEYS};
 pub use safe::scenario::{
     parse_duration_ns, parse_seed, CgroupBandwidth, CgroupCpusetChangeEvent, CgroupCreateEvent,
-    CgroupDef, CgroupDestroyEvent, CgroupMigrateEvent, CpuPreemptEvent, FutexEvent, FutexOp,
-    HotplugEvent, IrqEvent, IrqType, NativeConcurrentConfig, NoiseConfig, OverheadConfig,
+    CgroupDef, CgroupDestroyEvent, CgroupMigrateEvent, CpuPreemptEvent, ForkPlacement, FutexEvent,
+    FutexOp, HotplugEvent, IrqEvent, IrqType, NativeConcurrentConfig, NoiseConfig, OverheadConfig,
     PreemptMode, PreemptiveConfig, Scenario, ScenarioBuilder,
 };
 pub use safe::stats::{
     percentile, CpuStats, DistributionStats, TaskStats, TraceComparison, TraceStats,
 };
 pub use safe::structops_jsonl::write_jsonl;
+pub use safe::topology::{CpuTopology, MachineTopology};
 pub use safe::trace::{
     DsqLengthSample, DsqSampleTrigger, Trace, TraceEvent, TraceKind, TraceSummary,
 };

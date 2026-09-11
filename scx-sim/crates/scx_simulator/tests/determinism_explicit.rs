@@ -42,6 +42,7 @@ fn explicit_scenario(seed: u32) -> Scenario {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "t2".into(),
@@ -61,6 +62,7 @@ fn explicit_scenario(seed: u32) -> Scenario {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(50)
         .build()

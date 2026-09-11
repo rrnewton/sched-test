@@ -139,6 +139,7 @@ fn imbalanced_two_domain_scenario(
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
         pid += 1;
     }
@@ -158,6 +159,7 @@ fn imbalanced_two_domain_scenario(
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
         pid += 1;
     }
@@ -287,6 +289,7 @@ fn test_lavd_no_slice_boost() {
         thread_group_leader: None,
         uid: Uid(0),
         gid: Gid(0),
+        fork_cpu: None,
     });
     b = b.task(TaskDef {
         name: "pong".into(),
@@ -303,6 +306,7 @@ fn test_lavd_no_slice_boost() {
         thread_group_leader: None,
         uid: Uid(0),
         gid: Gid(0),
+        fork_cpu: None,
     });
     for i in 0..4 {
         b = b.add_task(&format!("hog{i}"), 0, workloads::cpu_bound(20_000_000));
@@ -386,6 +390,7 @@ fn test_lavd_autopilot_runtime_power_switch() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
         pid += 1;
     }
@@ -409,6 +414,7 @@ fn test_lavd_autopilot_runtime_power_switch() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
         pid += 1;
     }

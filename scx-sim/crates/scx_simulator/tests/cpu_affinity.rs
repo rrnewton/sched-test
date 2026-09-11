@@ -74,6 +74,7 @@ fn pinned_task(
         thread_group_leader: None,
         uid: Uid(0),
         gid: Gid(0),
+        fork_cpu: None,
     }
 }
 
@@ -387,6 +388,7 @@ fn test_affinity_change_mid_execution_via_cpuset() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .cgroup_cpuset_change(CgroupCpusetChangeEvent {
             cgroup_name: "cell".into(),

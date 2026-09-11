@@ -56,6 +56,7 @@ fn embedder_built_simple_so_loads_and_runs() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(50)
         .build();

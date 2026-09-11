@@ -51,6 +51,7 @@ fn task(name: &str, pid: i32, behavior: TaskBehavior, mm_id: Option<MmId>) -> Ta
         thread_group_leader: None,
         uid: Uid(0),
         gid: Gid(0),
+        fork_cpu: None,
     }
 }
 

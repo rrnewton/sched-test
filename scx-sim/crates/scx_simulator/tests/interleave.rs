@@ -37,6 +37,7 @@ fn test_interleave_smoke() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "t2".into(),
@@ -56,6 +57,7 @@ fn test_interleave_smoke() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(50)
         .build();
@@ -103,6 +105,7 @@ fn test_interleave_determinism() {
                 thread_group_leader: None,
                 uid: Uid(0),
                 gid: Gid(0),
+                fork_cpu: None,
             })
             .task(TaskDef {
                 name: "t2".into(),
@@ -122,6 +125,7 @@ fn test_interleave_determinism() {
                 thread_group_leader: None,
                 uid: Uid(0),
                 gid: Gid(0),
+                fork_cpu: None,
             })
             .duration_ms(50)
             .build()
@@ -188,6 +192,7 @@ fn test_interleave_sleep_wake() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "worker".into(),
@@ -207,6 +212,7 @@ fn test_interleave_sleep_wake() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(100)
         .build();
@@ -255,6 +261,7 @@ fn test_interleave_single_cpu_noop() {
                 thread_group_leader: None,
                 uid: Uid(0),
                 gid: Gid(0),
+                fork_cpu: None,
             })
             .duration_ms(50)
             .build()
@@ -315,6 +322,7 @@ fn test_interleave_multiple_seeds() {
                 thread_group_leader: None,
                 uid: Uid(0),
                 gid: Gid(0),
+                fork_cpu: None,
             })
             .task(TaskDef {
                 name: "t2".into(),
@@ -334,6 +342,7 @@ fn test_interleave_multiple_seeds() {
                 thread_group_leader: None,
                 uid: Uid(0),
                 gid: Gid(0),
+                fork_cpu: None,
             })
             .task(TaskDef {
                 name: "t3".into(),
@@ -353,6 +362,7 @@ fn test_interleave_multiple_seeds() {
                 thread_group_leader: None,
                 uid: Uid(0),
                 gid: Gid(0),
+                fork_cpu: None,
             })
             .duration_ms(50)
             .build();
@@ -406,6 +416,7 @@ fn preemptive_scenario(nr_cpus: u32, nr_tasks: u32, seed: u32, duration_ms: u64)
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -534,6 +545,7 @@ fn test_preemptive_sleep_wake() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "worker".into(),
@@ -553,6 +565,7 @@ fn test_preemptive_sleep_wake() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(100)
         .build();
@@ -626,6 +639,7 @@ fn test_batch_concurrent_smoke() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "t2".into(),
@@ -645,6 +659,7 @@ fn test_batch_concurrent_smoke() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "t3".into(),
@@ -664,6 +679,7 @@ fn test_batch_concurrent_smoke() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "t4".into(),
@@ -683,6 +699,7 @@ fn test_batch_concurrent_smoke() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(50)
         .build();
@@ -744,6 +761,7 @@ fn test_batch_concurrent_determinism() {
                 thread_group_leader: None,
                 uid: Uid(0),
                 gid: Gid(0),
+                fork_cpu: None,
             })
             .task(TaskDef {
                 name: "t2".into(),
@@ -763,6 +781,7 @@ fn test_batch_concurrent_determinism() {
                 thread_group_leader: None,
                 uid: Uid(0),
                 gid: Gid(0),
+                fork_cpu: None,
             })
             .task(TaskDef {
                 name: "t3".into(),
@@ -782,6 +801,7 @@ fn test_batch_concurrent_determinism() {
                 thread_group_leader: None,
                 uid: Uid(0),
                 gid: Gid(0),
+                fork_cpu: None,
             })
             .task(TaskDef {
                 name: "t4".into(),
@@ -801,6 +821,7 @@ fn test_batch_concurrent_determinism() {
                 thread_group_leader: None,
                 uid: Uid(0),
                 gid: Gid(0),
+                fork_cpu: None,
             })
             .duration_ms(50)
             .build()
@@ -870,6 +891,7 @@ fn test_batch_concurrent_with_dsq_contention() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -915,6 +937,7 @@ fn test_batch_concurrent_preemptive_smoke() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "t2".into(),
@@ -934,6 +957,7 @@ fn test_batch_concurrent_preemptive_smoke() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "t3".into(),
@@ -953,6 +977,7 @@ fn test_batch_concurrent_preemptive_smoke() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "t4".into(),
@@ -972,6 +997,7 @@ fn test_batch_concurrent_preemptive_smoke() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(50)
         .build();
@@ -1020,6 +1046,7 @@ fn test_preemptive_custom_timeslice() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "t2".into(),
@@ -1039,6 +1066,7 @@ fn test_preemptive_custom_timeslice() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(50)
         .build();
@@ -1096,6 +1124,7 @@ fn pmu_preemptive_scenario(nr_cpus: u32, nr_tasks: u32, seed: u32, duration_ms: 
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -1410,6 +1439,7 @@ fn test_replay_determinism() {
                 thread_group_leader: None,
                 uid: Uid(0),
                 gid: Gid(0),
+                fork_cpu: None,
             });
         }
 

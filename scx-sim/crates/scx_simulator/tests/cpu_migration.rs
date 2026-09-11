@@ -137,6 +137,7 @@ fn imbalance_scenario(
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
     b.duration_ms(duration_ms).build()
@@ -379,6 +380,7 @@ fn test_pinned_task_never_migrates_lavd() {
         thread_group_leader: None,
         uid: Uid(0),
         gid: Gid(0),
+        fork_cpu: None,
     });
     // Background load so the balancer is active around the pinned task.
     for i in 2..=12u32 {

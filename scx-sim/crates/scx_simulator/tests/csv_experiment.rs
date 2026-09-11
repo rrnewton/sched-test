@@ -136,6 +136,7 @@ fn build_scenario(
         thread_group_leader: None,
         uid: Uid(0),
         gid: Gid(0),
+        fork_cpu: None,
     });
 
     for i in 0..num_workers {
@@ -190,6 +191,7 @@ fn build_scenario(
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -238,6 +240,7 @@ fn build_scenario(
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -260,6 +263,7 @@ fn build_scenario(
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -282,6 +286,7 @@ fn build_scenario(
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 

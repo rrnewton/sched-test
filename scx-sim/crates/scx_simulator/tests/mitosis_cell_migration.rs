@@ -57,6 +57,7 @@ fn forever_hog_in(name: &str, pid: i32, cgroup: &str, run_ns: u64) -> TaskDef {
         thread_group_leader: None,
         uid: Uid(0),
         gid: Gid(0),
+        fork_cpu: None,
     }
 }
 

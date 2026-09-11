@@ -314,6 +314,7 @@ pub fn to_scenario(ir: &WorkloadIr) -> Result<Scenario, IngestError> {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 

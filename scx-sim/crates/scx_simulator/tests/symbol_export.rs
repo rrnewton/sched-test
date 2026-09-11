@@ -65,6 +65,7 @@ fn test_exported_symbols_resolve_in_process_image() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(50)
         .build();

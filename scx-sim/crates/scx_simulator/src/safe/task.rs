@@ -184,19 +184,33 @@ pub struct TaskDef {
     ///
     /// Read by scx_layered's `MATCH_GROUP_ID_EQUALS`. Defaults to 0.
     pub gid: Gid,
+    /// CPU this task is treated as having been forked on.
+    ///
+    /// `None` means "let the scenario decide": `ScenarioBuilder::build()`
+    /// fills it in from the scenario's
+    /// [`ForkPlacement`](crate::scenario::ForkPlacement), which needs the
+    /// machine topology and so cannot be resolved on the `TaskDef` alone. It
+    /// is only still `None` for a `TaskDef` that never went through a
+    /// builder, and [`TaskDef::initial_cpu`] falls back to CPU 0 there.
+    ///
+    /// An explicit `allowed_cpus` overrides this either way — see
+    /// [`TaskDef::initial_cpu`].
+    pub fork_cpu: Option<CpuId>,
 }
 
 impl TaskDef {
     /// Initial CPU for this task, matching kernel semantics.
     ///
     /// In the kernel, a new task's `cpu` field is set to the CPU where it was
-    /// forked, which is always within its cpumask. We model this by returning
-    /// the first allowed CPU when a cpumask is specified, or `CpuId(0)` when
-    /// the task is unrestricted.
+    /// forked, and that CPU is always inside its own cpumask. So an explicit
+    /// `allowed_cpus` wins: the first allowed CPU. Otherwise the scenario's
+    /// [`ForkPlacement`](crate::scenario::ForkPlacement) decides, via
+    /// [`TaskDef::fork_cpu`].
     pub fn initial_cpu(&self) -> CpuId {
         self.allowed_cpus
             .as_ref()
             .and_then(|cpus| cpus.first().copied())
+            .or(self.fork_cpu)
             .unwrap_or(CpuId(0))
     }
 }

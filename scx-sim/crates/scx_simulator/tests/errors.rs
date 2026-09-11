@@ -47,6 +47,7 @@ fn test_normal_exit() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(100)
         .build();
@@ -99,6 +100,7 @@ fn test_watchdog_disabled() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(50)
         .build();
@@ -150,6 +152,7 @@ fn test_watchdog_timeout_configured() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(50)
         .build();
@@ -234,6 +237,7 @@ fn test_trace_error_methods() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(10)
         .build();
@@ -275,6 +279,7 @@ fn test_default_watchdog_timeout() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(10)
         .build();

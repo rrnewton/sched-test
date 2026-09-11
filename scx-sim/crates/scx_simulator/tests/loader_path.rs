@@ -44,6 +44,7 @@ fn fixed_scenario() -> Scenario {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(100)
         .build()

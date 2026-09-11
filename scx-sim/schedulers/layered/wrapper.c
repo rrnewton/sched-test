@@ -31,10 +31,13 @@
  *    rejected before a run instead of being approximated. WITHOUT the loop
  *    the allocation is a weight-proportional slice computed once, where
  *    production would size from measured utilization.
- * 2. NUMA. The scxsim engine models LLCs and SMT siblings but has no NUMA
- *    concept at all, so `nr_numa_nodes` is a harness-supplied grouping over
- *    LLCs with no simulated distance cost. Same shape as the existing
- *    `cosmos_configure_numa()` precedent.
+ * 2. NUMA MEMORY. Since mb sim-dox34 the scxsim engine DOES model the node
+ *    partition: a per-CPU node id built from the scenario's MachineTopology,
+ *    node-scoped idle kfuncs, and a flat cross-node migration penalty. What
+ *    it still does not model is per-node MEMORY (no page placement, no
+ *    bandwidth) and inter-node DISTANCE (one flat cost, not an ACPI SLIT), so
+ *    a policy that ranks remote nodes by distance is executed but has no cost
+ *    consequence. See scx-sim/ai_docs/VIRTUAL_TOPOLOGY_EXPRESSIVENESS_20260911.md.
  * 3. Per-CPU layer-scan orders are a deterministic rotation rather than
  *    production's `fastrand`-shuffled orders. See `fill_layer_orders()`.
  */
@@ -894,6 +897,29 @@ unsigned long long layered_probe_layer_node_pinned_usage(unsigned int layer_id,
 	return total;
 }
 
+/*
+ * Per-(layer, node) sum of `cpu_ctx.layer_duty_sum`, the input to upstream's
+ * cross-NUMA gate. `main.rs::read_layer_node_duty_raw()` builds exactly this
+ * by walking every possible CPU and adding its per-layer counter into the
+ * CPU's node bucket. The counter itself is accumulated by the real BPF code
+ * in `layered_stopping()` and includes queue wait, not just CPU time, which
+ * is what lets a saturated node report a duty sum above its CPU count.
+ */
+unsigned long long layered_probe_layer_node_duty_raw(unsigned int layer_id,
+						     unsigned int node_id)
+{
+	unsigned long long total = 0;
+	u32 cpu;
+
+	if (layer_id >= nr_layers || node_id >= nr_nodes)
+		return 0;
+	for (cpu = 0; cpu < layered_nr_sim_cpus && cpu < LAYERED_MAX_SIM_CPUS; cpu++) {
+		if (layered_cpu_ctxs[cpu].node_id == node_id)
+			total += layered_cpu_ctxs[cpu].layer_duty_sum[layer_id];
+	}
+	return total;
+}
+
 /* Mirror the userspace-only signal so tests and reproducers can observe it. */
 void layered_set_growth_denied(unsigned int layer_id, unsigned int node_id,
 			       int denied, unsigned long long count)
@@ -909,6 +935,56 @@ int layered_probe_growth_denied(unsigned int layer_id, unsigned int node_id)
 	if (layer_id >= nr_layers || node_id >= nr_nodes)
 		return 0;
 	return layered_growth_denied[layer_id][node_id];
+}
+
+/*
+ * Publish one cross-NUMA migration budget, mirroring the two writes
+ * `main.rs::refresh_xnuma()` makes into `bpf_layer.node[src]`.
+ *
+ * These fields are written ONLY by userspace and read by
+ * `pick_idle_cpu()` (remote-node prox walk) and `try_consume_layer()`
+ * (remote-LLC consume loop). Left at their BSS zero they read as
+ * "no budget in any direction, on any layer", which forbids every
+ * cross-node placement AND every cross-node consume — mb sim-dox34.
+ *
+ * `rate` semantics are `xnuma_gate()`'s: (u64)-1 = infinite (gating off),
+ * 0 = deny, anything else = token-bucket rate in duty-cycle units per
+ * second. Setting a rate does NOT reset the bucket's accumulated tokens,
+ * exactly as upstream's `bpf_layer.node[src].xnuma[dst].rate = ...`
+ * assignment does not.
+ */
+void layered_set_xnuma(unsigned int layer_id, unsigned int src_node,
+		       unsigned int dst_node, unsigned long long rate)
+{
+	if (layer_id >= nr_layers || src_node >= MAX_NUMA_NODES ||
+	    dst_node >= MAX_NUMA_NODES)
+		return;
+	layers[layer_id].node[src_node].xnuma[dst_node].rate = rate;
+}
+
+void layered_set_xnuma_is_mig_src(unsigned int layer_id, unsigned int node_id,
+				  int is_src)
+{
+	if (layer_id >= nr_layers || node_id >= MAX_NUMA_NODES)
+		return;
+	layers[layer_id].node[node_id].xnuma_is_mig_src = !!is_src;
+}
+
+unsigned long long layered_probe_xnuma_rate(unsigned int layer_id,
+					    unsigned int src_node,
+					    unsigned int dst_node)
+{
+	if (layer_id >= nr_layers || src_node >= MAX_NUMA_NODES ||
+	    dst_node >= MAX_NUMA_NODES)
+		return 0;
+	return layers[layer_id].node[src_node].xnuma[dst_node].rate;
+}
+
+int layered_probe_xnuma_is_mig_src(unsigned int layer_id, unsigned int node_id)
+{
+	if (layer_id >= nr_layers || node_id >= MAX_NUMA_NODES)
+		return 0;
+	return layers[layer_id].node[node_id].xnuma_is_mig_src;
 }
 
 unsigned long long layered_probe_growth_denied_count(unsigned int layer_id,
@@ -1424,24 +1500,39 @@ void layered_set_antistall(int enable, unsigned long long sec,
  * Topology publication (the userspace half of scx_layered's init)
  * ---------------------------------------------------------------------------*/
 
-/* Harness-configured topology, mirroring the engine's own layout. */
-static u32 layered_cpus_per_llc = 1;
-static u32 layered_llcs_per_node = 1;
-static u32 layered_threads_per_core = 1;
+/*
+ * Harness-configured topology, mirroring the engine's own layout.
+ *
+ * Held as EXPLICIT per-CPU maps rather than as three divisors, so an
+ * asymmetric machine — unequal nodes, unequal LLCs, SMT on one socket only —
+ * is representable. `layered_set_topology()` fills them by division for the
+ * regular case; `layered_set_topology_explicit()` takes them verbatim from a
+ * `MachineTopology`. Everything downstream reads the maps, so the two paths
+ * cannot disagree about what the machine is.
+ */
+static u32 layered_map_cpu_llc[LAYERED_MAX_SIM_CPUS];
+static u32 layered_map_cpu_node[LAYERED_MAX_SIM_CPUS];
+static u32 layered_map_cpu_core[LAYERED_MAX_SIM_CPUS];
+static u32 layered_map_llc_node[MAX_LLCS];
 
 static u32 layered_cpu_llc(u32 cpu)
 {
-	return layered_cpus_per_llc ? cpu / layered_cpus_per_llc : 0;
+	return cpu < LAYERED_MAX_SIM_CPUS ? layered_map_cpu_llc[cpu] : 0;
 }
 
 static u32 layered_cpu_node(u32 cpu)
 {
-	return layered_llcs_per_node ? layered_cpu_llc(cpu) / layered_llcs_per_node : 0;
+	return cpu < LAYERED_MAX_SIM_CPUS ? layered_map_cpu_node[cpu] : 0;
 }
 
 static u32 layered_cpu_core(u32 cpu)
 {
-	return layered_threads_per_core ? cpu / layered_threads_per_core : cpu;
+	return cpu < LAYERED_MAX_SIM_CPUS ? layered_map_cpu_core[cpu] : 0;
+}
+
+static u32 layered_llc_node_of(u32 llc)
+{
+	return llc < MAX_LLCS ? layered_map_llc_node[llc] : 0;
 }
 
 static u32 layered_abs_diff(u32 a, u32 b)
@@ -1546,24 +1637,18 @@ static void layered_fill_cpu_prox_map(struct cpu_ctx *cpuc, u32 cpu, u32 nr_cpus
 /* Build llcc->prox_maps[*]: self, then same-node LLCs, then the rest. */
 static void layered_fill_llc_prox_maps(struct llc_ctx *llcc, u32 llc, u32 nr_llcs)
 {
-	u32 my_node = layered_llcs_per_node ? llc / layered_llcs_per_node : 0;
+	u32 my_node = layered_llc_node_of(llc);
 	u16 order[MAX_LLCS];
 	u32 idx = 0, node_end, other, m;
 
 	order[idx++] = (u16)llc;
 	for (other = 0; other < nr_llcs && other < MAX_LLCS; other++) {
-		u32 other_node =
-			layered_llcs_per_node ? other / layered_llcs_per_node : 0;
-
-		if (other != llc && other_node == my_node)
+		if (other != llc && layered_llc_node_of(other) == my_node)
 			order[idx++] = (u16)other;
 	}
 	node_end = idx;
 	for (other = 0; other < nr_llcs && other < MAX_LLCS; other++) {
-		u32 other_node =
-			layered_llcs_per_node ? other / layered_llcs_per_node : 0;
-
-		if (other != llc && other_node != my_node)
+		if (other != llc && layered_llc_node_of(other) != my_node)
 			order[idx++] = (u16)other;
 	}
 
@@ -2186,11 +2271,15 @@ static void layered_finalize_layer_rodata(void)
  * requested value would silently read a different partition than the one
  * the scheduler sees.
  */
+static unsigned int layered_publish_topology(unsigned int nr_cpus,
+					     unsigned int total_llcs,
+					     unsigned int total_nodes);
+
 unsigned int layered_set_topology(unsigned int nr_cpus, unsigned int cpus_per_llc,
 				  unsigned int nr_numa_nodes,
 				  unsigned int threads_per_core)
 {
-	u32 cpu, llc, node, total_llcs;
+	u32 cpu, llc, total_llcs, llcs_per_node;
 
 	/* 0 = rejected, nothing published. The caller must treat this as fatal
 	 * rather than proceed against whatever topology was there before. */
@@ -2211,16 +2300,84 @@ unsigned int layered_set_topology(unsigned int nr_cpus, unsigned int cpus_per_ll
 	if (nr_numa_nodes > MAX_NUMA_NODES)
 		nr_numa_nodes = MAX_NUMA_NODES;
 
+	llcs_per_node = (total_llcs + nr_numa_nodes - 1) / nr_numa_nodes;
+
+	for (cpu = 0; cpu < nr_cpus; cpu++) {
+		layered_map_cpu_llc[cpu] = cpu / cpus_per_llc;
+		layered_map_cpu_core[cpu] = cpu / threads_per_core;
+		layered_map_cpu_node[cpu] = (cpu / cpus_per_llc) / llcs_per_node;
+	}
+	for (llc = 0; llc < total_llcs; llc++)
+		layered_map_llc_node[llc] = llc / llcs_per_node;
+
+	return layered_publish_topology(nr_cpus, total_llcs, nr_numa_nodes);
+}
+
+/*
+ * Publish an arbitrary, possibly asymmetric topology.
+ *
+ * `cpu_llc`, `cpu_node` and `cpu_core` are `nr_cpus`-long arrays, one entry
+ * per CPU — exactly what `MachineTopology` holds. The Rust side has already
+ * validated that ids are dense from 0, that no SMT core spans an LLC or a
+ * node, and that no LLC spans a node, so this only re-checks the ceilings it
+ * would otherwise overrun.
+ *
+ * Returns the node count actually published, 0 on rejection. Unlike
+ * `layered_set_topology()` this does NOT clamp the node count down to fit:
+ * a caller whose machine does not fit is told so, because silently
+ * publishing a different partition than the engine simulates is the failure
+ * this whole arrangement exists to prevent.
+ */
+unsigned int layered_set_topology_explicit(unsigned int nr_cpus,
+					   const unsigned int *cpu_llc,
+					   const unsigned int *cpu_node,
+					   const unsigned int *cpu_core)
+{
+	u32 cpu, total_llcs = 0, total_nodes = 0;
+
+	if (nr_cpus == 0 || nr_cpus > LAYERED_MAX_SIM_CPUS)
+		return 0;
+	if (!cpu_llc || !cpu_node || !cpu_core)
+		return 0;
+
+	for (cpu = 0; cpu < nr_cpus; cpu++) {
+		if (cpu_llc[cpu] >= MAX_LLCS || cpu_node[cpu] >= MAX_NUMA_NODES)
+			return 0;
+		if (cpu_llc[cpu] + 1 > total_llcs)
+			total_llcs = cpu_llc[cpu] + 1;
+		if (cpu_node[cpu] + 1 > total_nodes)
+			total_nodes = cpu_node[cpu] + 1;
+	}
+
+	for (cpu = 0; cpu < nr_cpus; cpu++) {
+		layered_map_cpu_llc[cpu] = cpu_llc[cpu];
+		layered_map_cpu_node[cpu] = cpu_node[cpu];
+		layered_map_cpu_core[cpu] = cpu_core[cpu];
+		layered_map_llc_node[cpu_llc[cpu]] = cpu_node[cpu];
+	}
+
+	return layered_publish_topology(nr_cpus, total_llcs, total_nodes);
+}
+
+/*
+ * Everything downstream of the per-CPU maps: the rodata the BPF side reads,
+ * per-CPU contexts, SMT siblings, and the proximity maps. Shared by both
+ * publication paths so a uniform and an explicit machine of the same shape
+ * are published identically.
+ */
+static unsigned int layered_publish_topology(unsigned int nr_cpus,
+					     unsigned int total_llcs,
+					     unsigned int total_nodes)
+{
+	u32 cpu, llc, node;
+	bool smt = false;
+
 	layered_nr_sim_cpus = nr_cpus;
-	layered_cpus_per_llc = cpus_per_llc;
-	layered_llcs_per_node = (total_llcs + nr_numa_nodes - 1) / nr_numa_nodes;
-	layered_threads_per_core = threads_per_core;
 
 	nr_cpu_ids = nr_cpus;
 	nr_possible_cpus = nr_cpus;
 	nr_llcs = total_llcs;
-	nr_nodes = nr_numa_nodes;
-	smt_enabled = threads_per_core > 1;
+	nr_nodes = total_nodes;
 	has_little_cores = false;
 
 	/* all_cpus bitmap + per-CPU identity, LLC/node maps, SMT siblings. */
@@ -2248,31 +2405,37 @@ unsigned int layered_set_topology(unsigned int nr_cpus, unsigned int cpus_per_ll
 	}
 
 	/*
-	 * __sibling_cpu[cpu] is the SMT partner, or -1 when SMT is off. The
-	 * engine lays siblings out as consecutive blocks of threads_per_core
-	 * CPUs (see engine.rs build_cpus), so the partner of `cpu` within its
-	 * core block is the other thread. With >2 threads per core the kernel
-	 * only records one partner; take the next one, wrapping in-core.
+	 * __sibling_cpu[cpu] is the SMT partner, or -1 when the core has one
+	 * thread. Derived from the core map rather than from a divisor, so a
+	 * machine with SMT on only part of it comes out right: the partner is
+	 * the next CPU sharing this core, wrapping within the core. With more
+	 * than two threads per core the kernel only records one partner, which
+	 * is what taking "the next one" reproduces.
 	 */
 	for (cpu = 0; cpu < MAX_CPUS; cpu++)
 		__sibling_cpu[cpu] = -1;
-	if (threads_per_core > 1) {
-		for (cpu = 0; cpu < nr_cpus; cpu++) {
-			u32 base = (cpu / threads_per_core) * threads_per_core;
-			u32 off = (cpu - base + 1) % threads_per_core;
+	for (cpu = 0; cpu < nr_cpus; cpu++) {
+		u32 core = layered_cpu_core(cpu);
+		u32 step, cand;
 
-			__sibling_cpu[cpu] = (s32)(base + off);
+		for (step = 1; step < nr_cpus; step++) {
+			cand = (cpu + step) % nr_cpus;
+			if (layered_cpu_core(cand) == core) {
+				__sibling_cpu[cpu] = (s32)cand;
+				smt = true;
+				break;
+			}
 		}
 	}
+	smt_enabled = smt;
 
-	for (llc = 0; llc < total_llcs; llc++) {
-		llc_numa_id_map[llc] =
-			layered_llcs_per_node ? llc / layered_llcs_per_node : 0;
+	for (llc = 0; llc < total_llcs && llc < MAX_LLCS; llc++) {
+		llc_numa_id_map[llc] = layered_llc_node_of(llc);
 		layered_fill_llc_prox_maps(&layered_llc_ctxs[llc], llc, total_llcs);
 	}
-	for (node = 0; node < nr_numa_nodes; node++)
+	for (node = 0; node < total_nodes && node < MAX_NUMA_NODES; node++)
 		layered_fill_node_prox_map(&layered_node_ctxs[node], node,
-					   nr_numa_nodes);
+					   total_nodes);
 
 	/* fallback_cpus[node] — the CPU layered parks work on when a node has
 	 * no layer CPUs. Production picks one from the node; use its first. */
@@ -2285,7 +2448,7 @@ unsigned int layered_set_topology(unsigned int nr_cpus, unsigned int cpus_per_ll
 			fallback_cpus[n] = cpu;
 	}
 
-	return nr_numa_nodes;
+	return total_nodes;
 }
 
 /*

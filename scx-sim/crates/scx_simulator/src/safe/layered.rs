@@ -184,6 +184,12 @@ pub(crate) const MATCH_NUMA_NODE: i32 = 25;
 /// scx_layered's `DEFAULT_LAYER_WEIGHT`.
 pub const DEFAULT_LAYER_WEIGHT: u32 = 100;
 
+/// scx_layered's `default_xnuma_threshold()` (`scx_layered/src/config.rs`).
+pub const DEFAULT_XNUMA_THRESHOLD: (f64, f64) = (0.6, 0.7);
+
+/// scx_layered's `default_xnuma_threshold_delta()` (`scx_layered/src/config.rs`).
+pub const DEFAULT_XNUMA_THRESHOLD_DELTA: (f64, f64) = (0.2, 0.3);
+
 /// One layer of an scx_layered configuration.
 ///
 /// Build with [`LayerSpec::new`] and the chaining setters; the defaults match
@@ -222,8 +228,11 @@ pub struct LayerSpec {
     pub max_exec_ns: TimeNs,
     /// Growth algorithm published into `layer->growth_algo`.
     pub growth_algo: LayerGrowthAlgo,
-    /// Preferred NUMA nodes for topology-aware growth. These are harness
-    /// topology groups; scxsim does not model NUMA distance or memory cost.
+    /// Preferred NUMA nodes for topology-aware growth. The engine models the
+    /// node partition and charges a flat cross-node migration penalty, but
+    /// no memory placement and no distance matrix — see
+    /// [`MachineTopology`](crate::topology::MachineTopology) for the full
+    /// list of what a node does and does not mean here.
     pub nodes: Vec<usize>,
     /// Preferred LLCs for topology-aware growth.
     pub llcs: Vec<usize>,
@@ -234,6 +243,23 @@ pub struct LayerSpec {
     /// Explicit CPU set. `None` lets the wrapper allocate: every CPU for an
     /// open layer, a contiguous weight-proportional slice otherwise.
     pub cpus: Option<Vec<CpuId>>,
+    /// Cross-NUMA migration gate, `(close, open)` load-ratio hysteresis.
+    ///
+    /// Upstream `LayerCommon::xnuma_threshold`, default `(0.6, 0.7)`
+    /// (`scx_layered/src/config.rs::default_xnuma_threshold`). Setting BOTH
+    /// components `<= 0.0` turns gating OFF — upstream then publishes an
+    /// infinite budget in every direction, so cross-node placement and
+    /// cross-node DSQ consumption are unrestricted.
+    ///
+    /// This only has an effect once the userspace control loop is enabled
+    /// ([`crate::DynamicScheduler::layered_enable_control_loop`]): upstream
+    /// writes the gate from `refresh_xnuma()` every control iteration and
+    /// from nowhere else. See [`crate::layered_xnuma`].
+    pub xnuma_threshold: (f64, f64),
+    /// Cross-NUMA migration gate, `(close, open)` surplus-ratio hysteresis.
+    ///
+    /// Upstream `LayerCommon::xnuma_threshold_delta`, default `(0.2, 0.3)`.
+    pub xnuma_threshold_delta: (f64, f64),
 }
 
 impl LayerSpec {
@@ -258,6 +284,8 @@ impl LayerSpec {
             llcs: Vec::new(),
             matches: Vec::new(),
             cpus: None,
+            xnuma_threshold: DEFAULT_XNUMA_THRESHOLD,
+            xnuma_threshold_delta: DEFAULT_XNUMA_THRESHOLD_DELTA,
         }
     }
 
@@ -347,6 +375,24 @@ impl LayerSpec {
     /// Pin the layer to an explicit CPU set instead of auto-allocating.
     pub fn with_cpus(mut self, cpus: Vec<CpuId>) -> Self {
         self.cpus = Some(cpus);
+        self
+    }
+
+    /// Override the cross-NUMA migration gate's hysteresis bands.
+    ///
+    /// `threshold` is the `(close, open)` pair on load/alloc and
+    /// `threshold_delta` the `(close, open)` pair on surplus/alloc; see
+    /// [`LayerSpec::xnuma_threshold`]. Passing `(0.0, 0.0)` for `threshold`
+    /// selects upstream's "gating off" branch: infinite budget in every
+    /// direction, which is how a config asks for unrestricted cross-node
+    /// migration.
+    pub fn with_xnuma_threshold(
+        mut self,
+        threshold: (f64, f64),
+        threshold_delta: (f64, f64),
+    ) -> Self {
+        self.xnuma_threshold = threshold;
+        self.xnuma_threshold_delta = threshold_delta;
         self
     }
 }

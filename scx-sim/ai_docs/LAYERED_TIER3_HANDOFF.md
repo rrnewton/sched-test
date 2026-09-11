@@ -212,11 +212,14 @@ These are the traps already paid for. None are guessable from the code.
    you are asserting on a counter that might increment unconditionally. Use
    the same shape for the control loop (loop enabled vs disabled).
 
-10. **The engine has no NUMA concept at all.** `nr_numa_nodes` is a
-   harness-supplied grouping over LLCs with no distance cost. Tier 3's
-   per-node allocation will therefore exercise `unified_alloc`'s multi-node
-   paths without any simulated consequence to the placement. Say so; do not
-   imply NUMA fidelity.
+10. **SUPERSEDED 2026-09-11 (mb `sim-dox34`).** This item read "the engine
+   has no NUMA concept at all". It no longer does: the engine carries a
+   per-CPU node id, the node-scoped idle kfuncs answer per node, and a
+   cross-node migration costs extra latency. Tier 3's per-node allocation now
+   has a simulated consequence. Still absent: per-node memory and an
+   inter-node distance matrix — see
+   `ai_docs/VIRTUAL_TOPOLOGY_EXPRESSIVENESS_20260911.md` before claiming NUMA
+   fidelity for anything memory-shaped.
 
 ---
 
@@ -360,15 +363,33 @@ The layered NUMA SEV is **S692395**. It lives in the cross-NUMA gating path:
 | `xnuma_gate` | 1170 |
 | `xnuma_gate_charge` | 1201 |
 
-Those are exactly the three functions the coverage run reported unreachable,
-and the reason is structural rather than incidental: **the scxsim engine has
-no NUMA concept at all** — no per-CPU node id, no inter-node distance, no
-cost to a cross-node placement. `nr_numa_nodes` in the layered wrapper is a
-harness-supplied grouping over LLCs that exists only so layered's multi-node
-code paths can be entered; it has no simulated consequence.
-`xnuma_gate` and friends implement a token-bucket rate limit on cross-node
-migration, which cannot be meaningfully exercised until the engine models
-nodes as something a task can be placed *badly* relative to.
+Those were the three functions the coverage run reported unreachable.
+
+**RESOLVED 2026-09-11 (mb `sim-dox34`).** The diagnosis below was right about
+the cause and wrong about the remedy being far off. The reason they were
+unreachable was NOT only that the engine lacked a node id — it was that
+`layers[l].node[s].xnuma[d].rate` and `.xnuma_is_mig_src` are written solely
+by upstream's `refresh_xnuma()`, which scxsim's control loop did not port. Left
+at BSS zero they read as "deny", so `xnuma_gate` was reachable but always
+returned false on the first branch, and the callers' remote-node walks were
+skipped entirely.
+
+Both halves are now closed: the engine has a per-CPU node id and a cross-node
+migration cost, and `LayeredControl::refresh_xnuma` publishes the gate every
+control iteration from upstream's own (vendored, drift-guarded)
+`xnuma_check_active` / `xnuma_compute_rates`.
+`tests/numa_topology.rs::the_cross_numa_gate_comes_from_the_control_loop_and_nowhere_else`
+asserts the gate is shut without a control loop and open with one.
+
+The original text follows, for the record:
+
+> the scxsim engine has no NUMA concept at all — no per-CPU node id, no
+> inter-node distance, no cost to a cross-node placement. `nr_numa_nodes` in
+> the layered wrapper is a harness-supplied grouping over LLCs that exists
+> only so layered's multi-node code paths can be entered; it has no simulated
+> consequence. `xnuma_gate` and friends implement a token-bucket rate limit on
+> cross-node migration, which cannot be meaningfully exercised until the
+> engine models nodes as something a task can be placed *badly* relative to.
 
 Reaching those three functions therefore requires **engine NUMA substrate**,
 a separate project from the Tier-3 control loop. Tier 3 can be completed

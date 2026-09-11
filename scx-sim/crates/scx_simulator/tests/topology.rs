@@ -165,6 +165,7 @@ fn test_cosmos_numa_per_node_affinity() {
                 thread_group_leader: None,
                 uid: Uid(0),
                 gid: Gid(0),
+                fork_cpu: None,
             });
         }
         let scenario = b.duration_ms(200).build();

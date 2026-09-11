@@ -1,10 +1,11 @@
 ---
 title: 'scxsim: multi-NUMA-node topologies confine all execution to node 0'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-09-10T20:41:51.862563613+00:00
-updated_at: 2026-09-10T20:41:51.862563613+00:00
+updated_at: 2026-09-11T14:25:30.427095318+00:00
+closed_at: 2026-09-11T14:25:30.427095178+00:00
 ---
 
 # Description

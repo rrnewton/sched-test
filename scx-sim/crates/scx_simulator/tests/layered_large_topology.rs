@@ -60,6 +60,20 @@ struct Shape {
     threads_per_core: u32,
 }
 
+impl Shape {
+    /// The one description both the engine and the scheduler are built from.
+    /// Passing the four numbers to each side separately is what let them
+    /// disagree about the node partition; see mb sim-dox34.
+    fn topology(&self) -> MachineTopology {
+        MachineTopology::uniform(
+            self.nr_cpus,
+            self.cpus_per_llc,
+            self.nr_nodes,
+            self.threads_per_core,
+        )
+    }
+}
+
 /// Result of one measured run.
 #[derive(Debug)]
 struct Measured {
@@ -133,12 +147,8 @@ fn two_layer_specs() -> Vec<LayerSpec> {
 /// realistic case: a 384-CPU box is not running four threads.
 fn measure(shape: Shape, tasks_per_cpu: u32, duration_ms: u64, control_loop: bool) -> Measured {
     let t_setup = Instant::now();
-    let sched = DynamicScheduler::layered_with_topology(
-        shape.nr_cpus,
-        shape.cpus_per_llc,
-        shape.nr_nodes,
-        shape.threads_per_core,
-    );
+    let topo = shape.topology();
+    let sched = DynamicScheduler::layered_for_topology(&topo);
     sched.layered_layers(&two_layer_specs());
     if control_loop {
         // Production's default scx_layered scheduling interval is 100ms.
@@ -149,14 +159,10 @@ fn measure(shape: Shape, tasks_per_cpu: u32, duration_ms: u64, control_loop: boo
 
     let nr_tasks = (shape.nr_cpus * tasks_per_cpu) as usize;
     let mut b = Scenario::builder()
-        .cpus(shape.nr_cpus)
-        .cpus_per_llc(shape.cpus_per_llc)
+        .topology(topo)
         .detect_bpf_errors()
         .seed(42)
         .duration_ms(duration_ms);
-    if shape.threads_per_core > 1 {
-        b = b.smt(shape.threads_per_core);
-    }
     // A quarter of the tasks carry the "hot" prefix so both layers are live.
     for i in 0..nr_tasks {
         let name = if i % 4 == 0 {
@@ -305,60 +311,59 @@ fn a_384_cpu_machine_runs_layered_on_all_384_cpus() {
     );
 }
 
-/// KNOWN GAP: with more than one NUMA node, scx_layered under scxsim executes
-/// work on node 0 only. `cpus_that_ran` is exactly `nr_cpus / nr_nodes`, and
-/// always the lowest ids.
+/// WAS a known gap, now the positive property: with more than one NUMA node,
+/// work reaches EVERY node, not just node 0.
 ///
-/// WHY EXPECTED: scxsim has no NUMA model. `layered_with_topology`'s own doc
-/// says so — the node count is "a harness-supplied grouping over LLCs" with
-/// "no engine counterpart" and no inter-node distance cost. Measured
-/// 2026-09-10 on `integration@f418aa7`: the confinement reproduces at 32 CPUs
-/// as soon as `nr_nodes` goes 1 -> 2, with one catch-all layer or two Grouped
-/// layers, at every LLC size, and at 2 / 4 / 8 nodes. It is a NUMA defect, not
-/// a large-machine defect, and it predates the NR_CPUS work in this branch —
-/// verified by re-running `diag_node_confinement_matrix` against an unmodified
-/// tree and getting byte-identical event counts.
+/// This is the inversion of `known_gap_multi_node_confines_all_work_to_node_zero`,
+/// which asserted `cpus_that_ran == nr_cpus / nr_nodes` at these exact shapes.
+/// mb **sim-dox34** is that gap; it closed with two changes, and the numbers
+/// below are what it measured before them:
 ///
-/// It is a PLACEMENT-side failure, not a consume-side one:
-/// `diag_where_does_node1_work_go` shows `ops.enqueue` is only ever invoked
-/// from node-0 CPUs and tasks only ever land in node-0 LLC fallback DSQs
-/// (4 of the 8 that exist). Node-1 CPUs do run `ops.dispatch` and do call
-/// `scx_bpf_dsq_move_to_local` — they are asking for work that was never put
-/// where they can see it.
+/// | shape | before | after |
+/// |---|---|---|
+/// | 64c / 2 nodes | 32 | 64 |
+/// | 64c / 4 nodes | 16 | 64 |
+/// | 384c / 2 nodes | 192 | 384 |
 ///
-/// WHEN THIS GOES RED: the gap has closed. Invert the assertion — assert that
-/// work reaches every node — and keep the test.
+/// 1. The engine grew a NUMA model, and `ForkPlacement` stopped birthing
+///    every task on CPU 0. `pick_idle_cpu()` searches the task's LOCAL node
+///    first, so a machine where every task is born on node 0 keeps every task
+///    on node 0 — correct scheduler behaviour on a machine no fork ever
+///    produces.
+/// 2. scxsim's layered control loop now ports upstream's `refresh_xnuma()`.
+///    The cross-NUMA gate is userspace-written and was left at its BSS zero,
+///    which `xnuma_gate()` reads as "deny", permanently, in both directions.
 ///
-/// DO NOT: delete it (silently drops the coverage), or loosen the bound to
-/// make it pass (destroys the property that made it worth having).
+/// `crates/scx_simulator/tests/numa_topology.rs` covers the same property
+/// across more shapes, both allocation modes, and the gate itself.
 #[test]
-fn known_gap_multi_node_confines_all_work_to_node_zero() {
+fn multi_node_topologies_reach_every_node() {
     let _lock = common::setup_test();
     for (nr_cpus, nr_nodes) in [(64u32, 2u32), (64, 4), (384, 2)] {
         let shape = Shape {
-            label: "known-gap",
+            label: "multi-node",
             nr_cpus,
             cpus_per_llc: 8,
             nr_nodes,
             threads_per_core: 1,
         };
         let m = measure(shape, 2, 100, false);
-        let node0_cpus = (nr_cpus / nr_nodes) as usize;
         assert_eq!(
-            m.cpus_that_ran, node0_cpus,
-            "{nr_cpus} CPUs / {nr_nodes} nodes: expected work confined to node 0's \
-             {node0_cpus} CPUs, saw {} (max id {}). KNOWN-GAP TEST: this going red \
-             means the gap CLOSED. Invert this assertion to assert the property now \
-             holds. Do not delete it, and do not loosen the bound.",
-            m.cpus_that_ran, m.max_cpu_that_ran
+            m.cpus_that_ran,
+            nr_cpus as usize,
+            "{nr_cpus} CPUs / {nr_nodes} nodes: only {} CPUs ran (max id {}). \
+             sim-dox34 regression — the pre-fix value here was exactly {}, \
+             i.e. node 0 alone.",
+            m.cpus_that_ran,
+            m.max_cpu_that_ran,
+            nr_cpus / nr_nodes
         );
         assert_eq!(
-            m.max_cpu_that_ran as usize,
-            node0_cpus - 1,
-            "{nr_cpus} CPUs / {nr_nodes} nodes: the highest CPU that ran should be the \
-             top of node 0. KNOWN-GAP TEST: this going red means the gap CLOSED. \
-             Invert this assertion to assert the property now holds. Do not delete \
-             it, and do not loosen the bound."
+            m.max_cpu_that_ran,
+            nr_cpus - 1,
+            "{nr_cpus} CPUs / {nr_nodes} nodes: the highest CPU that ran was {}, \
+             not the top of the machine",
+            m.max_cpu_that_ran
         );
     }
 }
@@ -446,12 +451,8 @@ fn measure_fixed(shape: Shape, nr_tasks: u32, duration_ms: u64, control_loop: bo
     // Reuse `measure` by faking tasks_per_cpu when it divides evenly; else
     // build inline. Simplest correct thing: build inline.
     let t_setup = Instant::now();
-    let sched = DynamicScheduler::layered_with_topology(
-        shape.nr_cpus,
-        shape.cpus_per_llc,
-        shape.nr_nodes,
-        shape.threads_per_core,
-    );
+    let topo = shape.topology();
+    let sched = DynamicScheduler::layered_for_topology(&topo);
     sched.layered_layers(&two_layer_specs());
     if control_loop {
         sched.layered_enable_control_loop(100_000_000);
@@ -460,14 +461,10 @@ fn measure_fixed(shape: Shape, nr_tasks: u32, duration_ms: u64, control_loop: bo
     let setup_s = t_setup.elapsed().as_secs_f64();
 
     let mut b = Scenario::builder()
-        .cpus(shape.nr_cpus)
-        .cpus_per_llc(shape.cpus_per_llc)
+        .topology(topo)
         .detect_bpf_errors()
         .seed(42)
         .duration_ms(duration_ms);
-    if shape.threads_per_core > 1 {
-        b = b.smt(shape.threads_per_core);
-    }
     for i in 0..per_cpu_num as usize {
         let name = if i % 4 == 0 {
             format!("hot_{i}")
@@ -520,11 +517,12 @@ fn measure_fixed(shape: Shape, nr_tasks: u32, duration_ms: u64, control_loop: bo
 /// seconds costs the VM roughly 7 + D. The simulator's line has to stay
 /// under that.
 ///
-/// Both 384-CPU shapes are swept. FLAT_384 is the one that actually uses the
-/// whole machine; DUAL_SOCKET_384 is reported alongside it and its numbers
-/// are INFLATED by the node-0 confinement gap (see
-/// `known_gap_multi_node_confines_all_work_to_node_zero`) — half the machine
-/// carries the whole load and churns, so do not read it as the cost of NUMA.
+/// Both 384-CPU shapes are swept, and since mb sim-dox34 closed both of them
+/// use the whole machine — see `multi_node_topologies_reach_every_node`. The
+/// DUAL_SOCKET_384 line is therefore now readable as the cost of the NUMA
+/// shape rather than as the cost of half the machine spinning; earlier
+/// revisions of this comment warned the opposite, and that warning no longer
+/// applies.
 #[test]
 #[ignore = "measurement, not an assertion"]
 fn sweep_duration_at_384() {
@@ -625,13 +623,12 @@ fn control_loop_cost_at_384() {
 #[ignore = "diagnostic"]
 fn diag_layer_masks_at_384() {
     let _lock = common::setup_test();
-    let sched = DynamicScheduler::layered_with_topology(384, 16, 2, 2);
+    let topo = MachineTopology::uniform(384, 16, 2, 2);
+    let sched = DynamicScheduler::layered_for_topology(&topo);
     sched.layered_layers(&two_layer_specs());
     let probes = LayeredProbes::new(&sched);
     let mut b = Scenario::builder()
-        .cpus(384)
-        .cpus_per_llc(16)
-        .smt(2)
+        .topology(topo)
         .detect_bpf_errors()
         .seed(42)
         .duration_ms(100);
@@ -741,8 +738,13 @@ fn diag_layer_masks_at_384() {
     );
 }
 
-/// DIAGNOSTIC: is the node-0 confinement caused by the NUMA partition itself,
-/// or by having two Grouped layers that the allocator splits across nodes?
+/// DIAGNOSTIC, kept as the cheapest sim-dox34 regression probe: the node /
+/// LLC / layer matrix, printed rather than asserted.
+///
+/// It was written to isolate the node-0 confinement to `nr_nodes` alone
+/// (64c/8llc/1node gave ran_on=64, the same shape at 2 nodes gave 32, and
+/// neither the layer config nor the LLC size moved it). Every row should now
+/// read `ran_on=64/64`; a row that does not names the shape that regressed.
 #[test]
 #[ignore = "diagnostic"]
 fn diag_node_confinement_matrix() {
@@ -757,7 +759,8 @@ fn diag_node_confinement_matrix() {
         (2, 8, true),
         (2, 32, true),
     ] {
-        let sched = DynamicScheduler::layered_with_topology(64, llc, nodes, 1);
+        let topo = MachineTopology::uniform(64, llc, nodes, 1);
+        let sched = DynamicScheduler::layered_for_topology(&topo);
         if one_layer {
             sched.layered_layers(&[LayerSpec::catch_all("all")]);
         } else {
@@ -765,8 +768,7 @@ fn diag_node_confinement_matrix() {
         }
         let probes = LayeredProbes::new(&sched);
         let mut b = Scenario::builder()
-            .cpus(64)
-            .cpus_per_llc(llc)
+            .topology(topo)
             .detect_bpf_errors()
             .seed(42)
             .duration_ms(100);
@@ -794,17 +796,23 @@ fn diag_node_confinement_matrix() {
 
 /// DIAGNOSTIC: with 2 nodes, is work never ENQUEUED to node 1's DSQs, or
 /// enqueued there and never CONSUMED? Different bug, different owner.
+///
+/// This is the probe that localised mb sim-dox34 to the placement side: at
+/// the time, `ops.enqueue` was only ever invoked from node-0 CPUs and tasks
+/// only reached 4 of the 8 per-LLC DSQs, while node-1 CPUs ran `ops.dispatch`
+/// and called `scx_bpf_dsq_move_to_local` 31428 times with zero successes.
+/// Post-fix it prints 64 enqueue-from CPUs and all 8 DSQs on both arms.
 #[test]
 #[ignore = "diagnostic"]
 fn diag_where_does_node1_work_go() {
     let _lock = common::setup_test();
     for nodes in [1u32, 2] {
-        let sched = DynamicScheduler::layered_with_topology(64, 8, nodes, 1);
+        let topo = MachineTopology::uniform(64, 8, nodes, 1);
+        let sched = DynamicScheduler::layered_for_topology(&topo);
         sched.layered_layers(&[LayerSpec::catch_all("all")]);
         let probes = LayeredProbes::new(&sched);
         let mut b = Scenario::builder()
-            .cpus(64)
-            .cpus_per_llc(8)
+            .topology(topo)
             .detect_bpf_errors()
             .seed(42)
             .duration_ms(100);

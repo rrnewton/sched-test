@@ -33,6 +33,7 @@ fn test_smt_topology() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "t2".into(),
@@ -52,6 +53,7 @@ fn test_smt_topology() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(200)
         .build();
@@ -338,6 +340,7 @@ fn test_numa_restricted_affinity() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "node1_pinned".into(),
@@ -354,6 +357,7 @@ fn test_numa_restricted_affinity() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(200)
         .build();
@@ -546,6 +550,7 @@ fn test_hybrid_core_wakeup_migration() {
         thread_group_leader: None,
         uid: Uid(0),
         gid: Gid(0),
+        fork_cpu: None,
     });
     // Wakees allowed on the big core (cpu 0, the waker's CPU) plus the LITTLE
     // cores (2,3): with cpu 0 occupied by the waker they run on the slower
@@ -569,6 +574,7 @@ fn test_hybrid_core_wakeup_migration() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
     let scenario = b.duration_ms(200).build();
@@ -630,6 +636,7 @@ fn test_gpu_node_affinity() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         // A second, non-GPU task on the same node keeps the run realistic.
         .task(TaskDef {
@@ -647,6 +654,7 @@ fn test_gpu_node_affinity() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(200)
         .build();

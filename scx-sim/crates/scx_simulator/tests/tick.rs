@@ -27,6 +27,7 @@ fn test_tick_events_recorded() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "runner2".into(),
@@ -46,6 +47,7 @@ fn test_tick_events_recorded() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(100)
         .build();
@@ -89,6 +91,7 @@ fn test_lavd_tick_preemption() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "t2".into(),
@@ -108,6 +111,7 @@ fn test_lavd_tick_preemption() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "t3".into(),
@@ -127,6 +131,7 @@ fn test_lavd_tick_preemption() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "t4".into(),
@@ -146,6 +151,7 @@ fn test_lavd_tick_preemption() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(200)
         .build();

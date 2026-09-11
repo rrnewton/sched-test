@@ -60,6 +60,7 @@ fn pinned(name: &str, pid: i32, cpus: Vec<CpuId>) -> TaskDef {
         thread_group_leader: None,
         uid: Uid(0),
         gid: Gid(0),
+        fork_cpu: None,
     }
 }
 

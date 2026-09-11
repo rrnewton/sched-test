@@ -827,6 +827,7 @@ fn parse_task(
             thread_group_leader: thread_of,
             uid,
             gid,
+            fork_cpu: None,
         });
     }
 
@@ -1236,6 +1237,11 @@ pub fn load_rtapp(json_str: &str, nr_cpus: u32) -> Result<Scenario, RtAppError> 
         required_scheduler_identity: None,
         smt_threads_per_core: 1,
         cpus_per_llc: 0,
+        // rt-app files describe a workload, not a machine: one flat node,
+        // one LLC, no SMT. `ForkPlacement::Auto` on one node is CPU 0, which
+        // is what this path did before topology became explicit.
+        topology: crate::topology::MachineTopology::uniform(nr_cpus, 0, 1, 1),
+        fork_placement: crate::scenario::ForkPlacement::Auto,
         tasks: all_tasks,
         cgroups,
         duration_ns,
@@ -2217,6 +2223,7 @@ mod tests {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         }];
         let err = validate_wake_targets(&tasks).unwrap_err();
         assert!(

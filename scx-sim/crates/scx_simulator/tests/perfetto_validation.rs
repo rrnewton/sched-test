@@ -54,6 +54,7 @@ fn rich_scenario(nr_cpus: u32) -> Scenario {
         thread_group_leader: None,
         uid: Uid(0),
         gid: Gid(0),
+        fork_cpu: None,
     };
     Scenario::builder()
         .cpus(nr_cpus)

@@ -62,6 +62,7 @@ fn test_pinned_tasks_percpu_dsq() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "pin1".into(),
@@ -81,6 +82,7 @@ fn test_pinned_tasks_percpu_dsq() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "free".into(),
@@ -100,6 +102,7 @@ fn test_pinned_tasks_percpu_dsq() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(100)
         .build();
@@ -161,6 +164,7 @@ fn test_pinned_and_free_competing_on_same_cpu() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "free1".into(),
@@ -180,6 +184,7 @@ fn test_pinned_and_free_competing_on_same_cpu() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "free2".into(),
@@ -199,6 +204,7 @@ fn test_pinned_and_free_competing_on_same_cpu() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(200)
         .build();
@@ -249,6 +255,7 @@ fn test_overloaded_cpus_no_idle() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "t2".into(),
@@ -268,6 +275,7 @@ fn test_overloaded_cpus_no_idle() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "t3".into(),
@@ -287,6 +295,7 @@ fn test_overloaded_cpus_no_idle() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "t4".into(),
@@ -306,6 +315,7 @@ fn test_overloaded_cpus_no_idle() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(200)
         .build();
@@ -371,6 +381,7 @@ fn test_smt_enabled_idle_core_selection() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "t2".into(),
@@ -390,6 +401,7 @@ fn test_smt_enabled_idle_core_selection() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(100)
         .build();
@@ -435,6 +447,7 @@ fn test_smt_overloaded() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "t2".into(),
@@ -454,6 +467,7 @@ fn test_smt_overloaded() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "t3".into(),
@@ -473,6 +487,7 @@ fn test_smt_overloaded() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "t4".into(),
@@ -492,6 +507,7 @@ fn test_smt_overloaded() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "t5".into(),
@@ -511,6 +527,7 @@ fn test_smt_overloaded() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(200)
         .build();
@@ -559,6 +576,7 @@ fn test_smt_pinned_tasks() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "free".into(),
@@ -578,6 +596,7 @@ fn test_smt_pinned_tasks() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(100)
         .build();
@@ -623,6 +642,7 @@ fn test_weighted_scheduling() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "light".into(),
@@ -642,6 +662,7 @@ fn test_weighted_scheduling() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(500)
         .build();
@@ -690,6 +711,7 @@ fn test_vtime_clamping_after_sleep() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "busy".into(),
@@ -709,6 +731,7 @@ fn test_vtime_clamping_after_sleep() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(300)
         .build();
@@ -756,6 +779,7 @@ fn test_many_short_tasks_dispatch_pressure() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -796,6 +820,7 @@ fn test_mixed_pinned_free_sleepwake() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "pin2".into(),
@@ -815,6 +840,7 @@ fn test_mixed_pinned_free_sleepwake() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "free1".into(),
@@ -834,6 +860,7 @@ fn test_mixed_pinned_free_sleepwake() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "free2".into(),
@@ -853,6 +880,7 @@ fn test_mixed_pinned_free_sleepwake() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(200)
         .build();
@@ -893,6 +921,7 @@ fn test_delayed_task_start() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "late".into(),
@@ -912,6 +941,7 @@ fn test_delayed_task_start() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(200)
         .build();
@@ -965,6 +995,7 @@ fn test_timer_fires_during_simulation() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(500) // Long enough for multiple timer fires
         .build();
@@ -1008,6 +1039,7 @@ fn test_wake_chain_pattern() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "mid".into(),
@@ -1024,6 +1056,7 @@ fn test_wake_chain_pattern() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "tail".into(),
@@ -1040,6 +1073,7 @@ fn test_wake_chain_pattern() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(100)
         .build();
@@ -1081,6 +1115,7 @@ fn test_ping_pong_pattern() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "pong_b".into(),
@@ -1097,6 +1132,7 @@ fn test_ping_pong_pattern() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(50)
         .build();
@@ -1138,6 +1174,7 @@ fn test_many_cpus_stress() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -1180,6 +1217,7 @@ fn test_single_task_completes() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(50)
         .build();
@@ -1221,6 +1259,7 @@ fn test_repeat_count_mode() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "forever".into(),
@@ -1240,6 +1279,7 @@ fn test_repeat_count_mode() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(100)
         .build();
@@ -1290,6 +1330,7 @@ fn test_smt_with_varied_nice() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "t2".into(),
@@ -1309,6 +1350,7 @@ fn test_smt_with_varied_nice() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "t3".into(),
@@ -1328,6 +1370,7 @@ fn test_smt_with_varied_nice() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(200)
         .build();
@@ -1417,6 +1460,7 @@ fn test_timer_reconfiguration_path() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(500) // Multiple timer intervals (100ms each)
         .build();
@@ -1465,6 +1509,7 @@ fn test_two_tasks_both_accrue_runtime() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "worker2".into(),
@@ -1484,6 +1529,7 @@ fn test_two_tasks_both_accrue_runtime() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(100)
         .build();
@@ -1525,6 +1571,7 @@ fn test_debug_events_with_timer_reconfig() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(300)
         .build();
@@ -1567,6 +1614,7 @@ fn test_smt_pinned_timer_reconfig() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "free".into(),
@@ -1586,6 +1634,7 @@ fn test_smt_pinned_timer_reconfig() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(500)
         .build();
@@ -1629,6 +1678,7 @@ fn test_overloaded_all_features() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -1671,6 +1721,7 @@ fn test_reject_multicpu_pinning() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "free".into(),
@@ -1690,6 +1741,7 @@ fn test_reject_multicpu_pinning() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(200)
         .build();
@@ -1727,6 +1779,7 @@ fn test_high_task_churn() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -1767,6 +1820,7 @@ fn test_extreme_nice_values() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "low_prio".into(),
@@ -1786,6 +1840,7 @@ fn test_extreme_nice_values() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(200)
         .build();
@@ -1833,6 +1888,7 @@ fn test_cpu_controller_enabled() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "t2".into(),
@@ -1852,6 +1908,7 @@ fn test_cpu_controller_enabled() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(200)
         .build();
@@ -1894,6 +1951,7 @@ fn test_cpu_controller_enabled_pinned() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "free".into(),
@@ -1913,6 +1971,7 @@ fn test_cpu_controller_enabled_pinned() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(200)
         .build();
@@ -1957,6 +2016,7 @@ fn test_cpu_controller_enabled_timer_reconfig() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(500)
         .build();
@@ -2001,6 +2061,7 @@ fn test_exiting_task_workaround_enabled() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "bg".into(),
@@ -2020,6 +2081,7 @@ fn test_exiting_task_workaround_enabled() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(100)
         .build();
@@ -2065,6 +2127,7 @@ fn test_reject_multicpu_pinning_two_cpus() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "free".into(),
@@ -2084,6 +2147,7 @@ fn test_reject_multicpu_pinning_two_cpus() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(200)
         .build();
@@ -2123,6 +2187,7 @@ fn test_stopping_skip_cell_cycles() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "free".into(),
@@ -2142,6 +2207,7 @@ fn test_stopping_skip_cell_cycles() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(200)
         .build();
@@ -2190,6 +2256,7 @@ fn test_vtime_cpu_controller_enabled() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "t2".into(),
@@ -2209,6 +2276,7 @@ fn test_vtime_cpu_controller_enabled() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(200)
         .build();
@@ -2254,6 +2322,7 @@ fn test_all_features_cpu_controller_enabled() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -2296,6 +2365,7 @@ fn test_staggered_many_tasks_timer() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -2343,6 +2413,7 @@ fn test_smt_cpu_controller_enabled() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "t2".into(),
@@ -2362,6 +2433,7 @@ fn test_smt_cpu_controller_enabled() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "t3".into(),
@@ -2381,6 +2453,7 @@ fn test_smt_cpu_controller_enabled() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(200)
         .build();
@@ -2434,6 +2507,7 @@ fn test_timer_many_reconfigurations() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -2475,6 +2549,7 @@ fn test_dump_cpumask_many_cpus() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -2522,6 +2597,7 @@ fn test_many_tasks_scale_and_dump() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -2575,6 +2651,7 @@ fn test_large_cpu_count_all_features() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         });
     }
 
@@ -2621,6 +2698,7 @@ fn test_mitosis_basic_cell_isolation() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "w2_c1".into(),
@@ -2640,6 +2718,7 @@ fn test_mitosis_basic_cell_isolation() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         // Workers in cell 2
         .task(TaskDef {
@@ -2660,6 +2739,7 @@ fn test_mitosis_basic_cell_isolation() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "w2_c2".into(),
@@ -2679,6 +2759,7 @@ fn test_mitosis_basic_cell_isolation() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(200)
         .build();
@@ -2783,6 +2864,7 @@ fn test_mitosis_dynamic_cell_lifecycle() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "static_c2".into(),
@@ -2802,6 +2884,7 @@ fn test_mitosis_dynamic_cell_lifecycle() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         // A task that will be migrated into the dynamic cell
         .task(TaskDef {
@@ -2822,6 +2905,7 @@ fn test_mitosis_dynamic_cell_lifecycle() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         // At 50ms: create cell_3
         .cgroup_create_at("cell_3", None, Some(&[CpuId(2), CpuId(3)]), 50_000_000)
@@ -2933,6 +3017,7 @@ fn test_mitosis_cpu_borrowing_select_cpu() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "pipe2".into(),
@@ -2952,6 +3037,7 @@ fn test_mitosis_cpu_borrowing_select_cpu() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "pipe3".into(),
@@ -2971,6 +3057,7 @@ fn test_mitosis_cpu_borrowing_select_cpu() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "pipe4".into(),
@@ -2990,6 +3077,7 @@ fn test_mitosis_cpu_borrowing_select_cpu() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         // Idle cell: no tasks (simulating an idle cell that can lend CPUs)
         .duration_ms(200)
@@ -3105,6 +3193,7 @@ fn test_mitosis_cpu_borrowing_enqueue() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "spin2".into(),
@@ -3124,6 +3213,7 @@ fn test_mitosis_cpu_borrowing_enqueue() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "spin3".into(),
@@ -3143,6 +3233,7 @@ fn test_mitosis_cpu_borrowing_enqueue() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "spin4".into(),
@@ -3162,6 +3253,7 @@ fn test_mitosis_cpu_borrowing_enqueue() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         // Idle cell: no tasks
         .duration_ms(200)
@@ -3300,6 +3392,7 @@ fn test_mitosis_demand_rebalancing() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "hog2".into(),
@@ -3319,6 +3412,7 @@ fn test_mitosis_demand_rebalancing() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "hog3".into(),
@@ -3338,6 +3432,7 @@ fn test_mitosis_demand_rebalancing() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "hog4".into(),
@@ -3357,6 +3452,7 @@ fn test_mitosis_demand_rebalancing() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "hog5".into(),
@@ -3376,6 +3472,7 @@ fn test_mitosis_demand_rebalancing() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "hog6".into(),
@@ -3395,6 +3492,7 @@ fn test_mitosis_demand_rebalancing() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "hog7".into(),
@@ -3414,6 +3512,7 @@ fn test_mitosis_demand_rebalancing() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "hog8".into(),
@@ -3433,6 +3532,7 @@ fn test_mitosis_demand_rebalancing() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         // Idle cell: no tasks
         .duration_ms(300)
@@ -3539,6 +3639,7 @@ fn test_mitosis_cpuset_change_detection() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "worker_b".into(),
@@ -3558,6 +3659,7 @@ fn test_mitosis_cpuset_change_detection() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         // At 100ms: swap cpusets -- cell_a now gets CPUs 2-3, cell_b gets CPUs 0-1
         .cgroup_cpuset_change(CgroupCpusetChangeEvent {
@@ -3697,6 +3799,7 @@ fn test_mitosis_dynamic_affinity_multicpu_pinned_dsq() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "mc2".into(),
@@ -3716,6 +3819,7 @@ fn test_mitosis_dynamic_affinity_multicpu_pinned_dsq() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "mc3".into(),
@@ -3735,6 +3839,7 @@ fn test_mitosis_dynamic_affinity_multicpu_pinned_dsq() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "free".into(),
@@ -3754,6 +3859,7 @@ fn test_mitosis_dynamic_affinity_multicpu_pinned_dsq() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(200)
         .build();
@@ -3824,6 +3930,7 @@ fn test_mitosis_slice_shrinking() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "pin0_b".into(),
@@ -3843,6 +3950,7 @@ fn test_mitosis_slice_shrinking() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "pin1".into(),
@@ -3862,6 +3970,7 @@ fn test_mitosis_slice_shrinking() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "pin1_b".into(),
@@ -3881,6 +3990,7 @@ fn test_mitosis_slice_shrinking() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "mc01".into(),
@@ -3900,6 +4010,7 @@ fn test_mitosis_slice_shrinking() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "mc01_b".into(),
@@ -3919,6 +4030,7 @@ fn test_mitosis_slice_shrinking() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "free".into(),
@@ -3938,6 +4050,7 @@ fn test_mitosis_slice_shrinking() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(300)
         .build();
@@ -4063,6 +4176,7 @@ fn test_slice_shrinking_fires() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .task(TaskDef {
             name: "B".into(),
@@ -4082,6 +4196,7 @@ fn test_slice_shrinking_fires() {
             thread_group_leader: None,
             uid: Uid(0),
             gid: Gid(0),
+            fork_cpu: None,
         })
         .duration_ms(50)
         .build();

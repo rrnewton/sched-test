@@ -66,6 +66,7 @@ fn pinned_cpu_hog(name: &str, pid: i32, cpu: u32, start_time_ns: TimeNs) -> Task
         thread_group_leader: None,
         uid: Uid(0),
         gid: Gid(0),
+        fork_cpu: None,
     }
 }
 

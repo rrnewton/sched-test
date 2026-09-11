@@ -185,10 +185,13 @@ These are real gaps, filed rather than hidden.
    and is deliberately kept thin. Pinned-util demand, peak-util sizing
    (`util_peak_half_life_ms` is hard-coded 0) and memory-bandwidth sizing are
    not implemented. *Mitosis has the same class of userspace control gap.*
-2. **NUMA is a harness-supplied grouping.** The engine models LLCs and SMT
-   siblings but has no NUMA concept and no inter-node distance cost, so
-   `nr_numa_nodes` groups LLCs purely so layered's cross-node code paths can
-   run. Same shape as the existing `cosmos_with_numa` precedent.
+2. **NUMA memory and distance are not modelled; the node partition is.**
+   CORRECTED 2026-09-11 (mb `sim-dox34`). The engine now carries a per-CPU
+   node id built from the scenario's `MachineTopology`, node-scoped idle
+   kfuncs that answer per node, and a flat cross-node migration penalty. What
+   remains unmodelled is per-node MEMORY (no page placement, no bandwidth)
+   and inter-node DISTANCE (one flat cost, not an ACPI SLIT). Full
+   enumeration: `ai_docs/VIRTUAL_TOPOLOGY_EXPRESSIVENESS_20260911.md`.
 3. **Per-CPU layer scan orders are a deterministic rotation** rather than
    production's `fastrand`-shuffled orders, and the LLC proximity maps are
    distance-ordered rather than randomised. `bpf_get_prandom_u32()` is
@@ -285,7 +288,7 @@ compile and run?
 |---|---|---|
 | Multi-layer | genuinely exercised | 4 matching tests assert specific per-task `layer_id`. Sabotaging `layered_add_layer_match()` to install no rules fails 9 tests. |
 | LLC topology | genuinely exercised | `llc_topology_drives_dsq_selection`: tasks pinned into LLC 0 vs LLC 1 land on different DSQs (`0x40000000` / `0x40000001`); flat-topology control arm requires all on one DSQ. |
-| NUMA topology | publication only, inherently | the engine has no NUMA concept and no distance cost, so there is no observable consequence to assert on. Documented divergence #2, not a closable test gap. |
+| NUMA topology | **genuinely exercised** since 2026-09-11 | `tests/numa_topology.rs` asserts every CPU of every node runs, at 2/4/8 nodes and 32..384 CPUs, measured from `TaskScheduled` events; `the_cross_numa_gate_comes_from_the_control_loop_and_nowhere_else` asserts the gate itself. This row previously read "publication only, inherently" — that was true when the engine had no node id, and mb `sim-dox34` is what it was hiding. |
 | SMT topology | **genuinely exercised** (allocation), publication only (placement) | `smt_core_transfer_moves_whole_cores_only` forces a real core transfer under the control loop and proves whole cores move together; releasing half a core fails it. The SMT-off arm of `smt_siblings_are_published_only_when_smt_is_on` is a real discriminator (-1 short-circuits the exclusive-layer path). Still missing: a test showing SMT changing a *placement* decision. mb sim-u4the. |
 | comm matching | genuinely exercised | see Multi-layer. |
 | cgroup matching | genuinely exercised | `cgroup_prefix_match_routes_tasks_by_cgroup_path`, `cgroup_suffix_and_contains_match` drive the real `format_cgrp_path()` + `match_prefix_suffix()`/`match_substr()`; both fail under the matching sabotage. |

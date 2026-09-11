@@ -1512,24 +1512,30 @@ impl<S: Scheduler> Simulator<S> {
         kfuncs::dump_buffer_reset();
 
         let nr_cpus = scenario.nr_cpus;
-        let smt = scenario.smt_threads_per_core;
 
-        // Build CPUs with SMT sibling groups
+        // Build CPUs from the scenario's topology: SMT sibling groups, LLC
+        // domain ids and NUMA node ids all come from the one description the
+        // scheduler is also configured from.
+        let topo = &scenario.topology;
         let mut cpus: Vec<SimCpu> = (0..nr_cpus).map(|i| SimCpu::new(CpuId(i))).collect();
-        if smt > 1 {
-            for core_base in (0..nr_cpus).step_by(smt as usize) {
-                let siblings: Vec<CpuId> = (core_base..core_base + smt).map(CpuId).collect();
-                for &sib in &siblings {
-                    cpus[sib.0 as usize].siblings = siblings.clone();
-                }
+        for i in 0..nr_cpus {
+            let cpu = &mut cpus[i as usize];
+            cpu.llc_id = topo.llc_of(CpuId(i));
+            cpu.node_id = topo.node_of(CpuId(i));
+            // `siblings` stays empty without SMT, which is what the engine's
+            // full-idle-core checks expect; only populate it for real cores.
+            let sibs = topo.siblings(CpuId(i));
+            if sibs.len() > 1 {
+                cpu.siblings = sibs;
             }
         }
 
-        // Assign LLC domain IDs (CCX topology)
-        if let Some(cpus_per_llc) = std::num::NonZeroU32::new(scenario.cpus_per_llc) {
-            for i in 0..nr_cpus {
-                cpus[i as usize].llc_id = i / cpus_per_llc.get();
-            }
+        // Publish the NUMA partition into the cpumask substrate before the
+        // masks themselves, so the node-scoped `scx_bpf_*_node` kfuncs answer
+        // about this machine rather than about the previous run's.
+        ffi::cpumask_clear_cpu_nodes();
+        for i in 0..nr_cpus {
+            ffi::cpumask_set_cpu_node(i as i32, topo.node_of(CpuId(i)));
         }
 
         // Initialize all CPUs as idle in the C cpumasks
@@ -5355,6 +5361,8 @@ impl<S: Scheduler> Simulator<S> {
         let migrated = task.prev_cpu != cpu;
         let cross_llc = migrated
             && s.sim.cpus[task.prev_cpu.0 as usize].llc_id != s.sim.cpus[cpu.0 as usize].llc_id;
+        let cross_node = migrated
+            && s.sim.cpus[task.prev_cpu.0 as usize].node_id != s.sim.cpus[cpu.0 as usize].node_id;
         task.prev_cpu = cpu;
         // Task is now running. `runnable_at_ns == None` is this engine's
         // SCX_TASK_RESET_RUNNABLE_AT: the next transition to runnable stamps
@@ -5498,7 +5506,15 @@ impl<S: Scheduler> Simulator<S> {
                     } else {
                         0
                     };
-                    effective_floor + mig_penalty + cross_llc_extra
+                    // Crossing a socket is a cross-LLC migration AND an
+                    // interconnect hop, so the two penalties stack rather
+                    // than the node one replacing the LLC one.
+                    let cross_node_extra = if cross_node {
+                        s.sim.overhead.cross_node_migration_penalty_ns
+                    } else {
+                        0
+                    };
+                    effective_floor + mig_penalty + cross_llc_extra + cross_node_extra
                 } else {
                     effective_floor
                 };
@@ -5705,6 +5721,7 @@ mod tests {
                 thread_group_leader: None,
                 uid: Uid(0),
                 gid: Gid(0),
+                fork_cpu: None,
             };
             let mut t = SimTask::new(&def, 1);
             t.state = TaskState::Runnable;
