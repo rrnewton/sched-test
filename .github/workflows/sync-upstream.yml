@@ -85,12 +85,12 @@ jobs:
 
       - name: Determine source branch
         id: config
+        env:
+          SOURCE_BRANCH_INPUT: ${{ inputs.source_branch }}
         run: |
-          if [ -n "${{ inputs.source_branch }}" ]; then
-            echo "source_branch=${{ inputs.source_branch }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "source_branch=${{ env.DEFAULT_SOURCE_BRANCH }}" >> "$GITHUB_OUTPUT"
-          fi
+          SOURCE_BRANCH=${SOURCE_BRANCH_INPUT:-$DEFAULT_SOURCE_BRANCH}
+          git check-ref-format --branch "$SOURCE_BRANCH" > /dev/null
+          printf 'source_branch=%s\n' "$SOURCE_BRANCH" >> "$GITHUB_OUTPUT"
 
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -261,12 +261,13 @@ jobs:
         if: steps.check.outputs.has_changes == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # gh pr create needs this explicitly
+          SOURCE_BRANCH: ${{ steps.config.outputs.source_branch }}
         run: |
           # Check if the last commit message indicates success
           LAST_MSG=$(git log -1 --pretty=%B)
 
           if echo "$LAST_MSG" | grep -qi "Status: SUCCESS"; then
-            echo "::notice::Sync successful! Opening a PR against ${{ steps.config.outputs.source_branch }}"
+            echo "::notice::Sync successful! Opening a PR against $SOURCE_BRANCH"
 
             # Push the dated work branch and raise a PR. Deliberately NOT a
             # force-push to a standing branch: the previous shape force-pushed
@@ -278,7 +279,7 @@ jobs:
             # human in the loop for a submodule bump that can break the build.
             git push origin "$WORK_BRANCH"
             gh pr create \
-              --base "${{ steps.config.outputs.source_branch }}" \
+              --base "$SOURCE_BRANCH" \
               --head "$WORK_BRANCH" \
               --title "scx: sync submodule to upstream ${{ steps.check.outputs.latest_short }}" \
               --body "Automated nightly sync of the \`scx\` submodule.
