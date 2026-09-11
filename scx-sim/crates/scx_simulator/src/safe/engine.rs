@@ -1583,7 +1583,8 @@ impl<S: Scheduler> Simulator<S> {
             tasks.insert(task.pid, task);
         }
 
-        // Set up parent-child relationships (must happen after all tasks exist).
+        // Set up parent-child and thread-group relationships (must happen
+        // after all tasks exist, because both point at another task's struct).
         for def in &scenario.tasks {
             if let Some(parent_pid) = def.parent_pid {
                 let parent_raw = tasks
@@ -1598,6 +1599,41 @@ impl<S: Scheduler> Simulator<S> {
                 let child_raw = tasks[&def.pid].raw();
                 ffi::task_set_real_parent(child_raw, parent_raw);
             }
+            // A task that declares itself a thread of another process gets
+            // `group_leader` repointed at that leader. `None`, and the
+            // self-naming case, leave the self-reference sim_task_alloc()
+            // installed — the correct state for a single-threaded process.
+            let Some(leader_pid) = def.thread_group_leader.filter(|l| *l != def.pid) else {
+                continue;
+            };
+            let leader_raw = tasks
+                .get(&leader_pid)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "thread_group_leader {:?} for task {:?} does not exist",
+                        leader_pid, def.pid
+                    )
+                })
+                .raw();
+            // The kernel has no nested thread groups: group_leader always
+            // points at a leader. Refuse a chain rather than silently
+            // flattening it, which would put a plausible but wrong string in
+            // front of MATCH_PCOMM_PREFIX.
+            let leaders_leader = scenario
+                .tasks
+                .iter()
+                .find(|t| t.pid == leader_pid)
+                .and_then(|t| t.thread_group_leader.filter(|l| *l != t.pid));
+            assert!(
+                leaders_leader.is_none(),
+                "task {:?} names {:?} as its thread-group leader, but {:?} is itself a \
+                 thread of {:?}; thread groups do not nest — name the real leader",
+                def.pid,
+                leader_pid,
+                leader_pid,
+                leaders_leader,
+            );
+            ffi::task_set_group_leader(tasks[&def.pid].raw(), leader_raw);
         }
 
         // Build simulator state (shared with kfuncs via thread-local)
@@ -5646,6 +5682,7 @@ mod tests {
     mod watchdog_throttle_awareness {
         use super::*;
         use crate::cgroup::CgroupId;
+        use crate::types::{Gid, Uid};
         use std::collections::HashMap;
 
         /// One task, Runnable and well past the timeout, in cgroup 7.
@@ -5665,6 +5702,9 @@ mod tests {
                 cgroup_name: None,
                 task_flags: 0,
                 migration_disabled: 0,
+                thread_group_leader: None,
+                uid: Uid(0),
+                gid: Gid(0),
             };
             let mut t = SimTask::new(&def, 1);
             t.state = TaskState::Runnable;

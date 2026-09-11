@@ -51,6 +51,9 @@ fn rich_scenario(nr_cpus: u32) -> Scenario {
         cgroup_name: None,
         task_flags: 0,
         migration_disabled: 0,
+        thread_group_leader: None,
+        uid: Uid(0),
+        gid: Gid(0),
     };
     Scenario::builder()
         .cpus(nr_cpus)

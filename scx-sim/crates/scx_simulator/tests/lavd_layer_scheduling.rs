@@ -48,6 +48,9 @@ fn task(name: &str, pid: i32, behavior: TaskBehavior, mm_id: Option<MmId>) -> Ta
         cgroup_name: None,
         task_flags: 0,
         migration_disabled: 0,
+        thread_group_leader: None,
+        uid: Uid(0),
+        gid: Gid(0),
     }
 }
 

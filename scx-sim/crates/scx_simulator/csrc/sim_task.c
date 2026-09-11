@@ -78,11 +78,34 @@ struct task_struct *sim_task_alloc(void)
 		p->cgroups = &sim_root_css_set;
 		p->real_parent = p; /* self-referencing; simulates init as parent */
 		/*
-		 * Every simulated task is a single-threaded process, so it is
-		 * its own thread-group leader — that is what the kernel puts
-		 * here for such a task. (`p->tgid` should track `p->pid` for
-		 * the same reason and does not yet; see the DANGER TODO in
-		 * sim_task_set_pid below for why that half is held back.)
+		 * Every kernel task has credentials. Leaving `real_cred` NULL is
+		 * not merely incomplete, it silently disables two exposed
+		 * scx_layered match kinds: MATCH_USER_ID_EQUALS and
+		 * MATCH_GROUP_ID_EQUALS both do
+		 *   cred = p->real_cred; if (cred) result = cred->euid.val == ...
+		 * (main.bpf.c), so a NULL cred makes them return false for every
+		 * task with no error and no crash — a rule that looks configured
+		 * and can never fire.
+		 *
+		 * The kernel's `cred` is refcounted and shared between tasks with
+		 * the same identity; here each task owns one, freed by
+		 * sim_task_free(). Nothing in the scheduler surface observes the
+		 * sharing, only the values.
+		 */
+		struct cred *cred = calloc(1, sizeof(struct cred));
+		if (!cred) {
+			free(p);
+			return NULL;
+		}
+		p->real_cred = cred;
+		p->cred = cred;
+		/*
+		 * Every simulated task is a single-threaded process unless a
+		 * scenario says otherwise, so it is its own thread-group leader —
+		 * that is what the kernel puts here for such a task. (`p->tgid`
+		 * should track `p->pid` for the same reason and does not yet; see
+		 * the DANGER TODO in sim_task_set_pid below for why that half is
+		 * held back.)
 		 *
 		 * A NULL group_leader is not a state any kernel task can be
 		 * in, and it is not merely inert: scx_layered's
@@ -91,11 +114,9 @@ struct task_struct *sim_task_alloc(void)
 		 * (main.bpf.c), so leaving it NULL turned an exposed match kind
 		 * into a segfault.
 		 *
-		 * NOTE the fidelity limit this leaves: with one task per thread
-		 * group, MATCH_PCOMM_PREFIX degenerates to MATCH_COMM_PREFIX.
-		 * Production configs use pcomm precisely to catch worker
-		 * threads by their PROCESS name, which needs real thread groups
-		 * (sim-ttaa0).
+		 * A task that IS a thread of some other process has this
+		 * repointed at its leader by sim_task_set_group_leader(), driven
+		 * from TaskDef::thread_group_leader.
 		 */
 		p->group_leader = p;
 	}
@@ -104,7 +125,52 @@ struct task_struct *sim_task_alloc(void)
 
 void sim_task_free(struct task_struct *p)
 {
+	if (!p)
+		return;
+	/*
+	 * Each task owns the cred allocated for it in sim_task_alloc(). The
+	 * cast drops the `const` the kernel declares the pointer with; the
+	 * allocation itself was never const.
+	 */
+	free((void *)p->real_cred);
 	free(p);
+}
+
+/* Thread groups.
+ *
+ * Point @p at its thread-group leader's task_struct, which is what
+ * scx_layered's MATCH_PCOMM_PREFIX reads (`p->group_leader->comm`). Passing
+ * @p itself is the single-threaded-process case and is what sim_task_alloc()
+ * already established.
+ *
+ * DANGER TODO(sim-6mheb): the matching `p->tgid = leader->pid` is NOT done
+ * here, for the same reason sim_task_set_pid() does not set tgid — see the
+ * comment there. The consequence is that a real thread group is faithful on
+ * the group_leader axis (so pcomm works) and still wrong on the tgid axis (so
+ * MATCH_TGID_EQUALS and MATCH_IS_GROUP_LEADER are wrong, exactly as they
+ * already were for ungrouped tasks). Setting tgid here and not there would be
+ * worse than either: it would make adding a thread group to a workload
+ * silently change which dispatch path layered takes for those tasks.
+ */
+void sim_task_set_group_leader(struct task_struct *p,
+			       struct task_struct *leader)
+{
+	p->group_leader = leader;
+}
+
+/* Credentials. Sets both the real and effective ids; scx_layered reads the
+ * effective pair (`cred->euid.val` / `cred->egid.val`). */
+void sim_task_set_cred_ids(struct task_struct *p, unsigned int uid,
+			   unsigned int gid)
+{
+	struct cred *cred = (struct cred *)p->real_cred;
+
+	if (!cred)
+		return;
+	cred->uid.val = uid;
+	cred->euid.val = uid;
+	cred->gid.val = gid;
+	cred->egid.val = gid;
 }
 
 unsigned long sim_task_struct_size(void)

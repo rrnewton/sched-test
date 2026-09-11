@@ -33,8 +33,8 @@
 //! them is tracked work — not something this module should paper over.
 
 use scx_simulator::{
-    CgroupCpusetChangeEvent, CpuId, Phase as SimPhase, Pid, RepeatMode, Scenario, TaskBehavior,
-    TaskDef,
+    CgroupCpusetChangeEvent, CpuId, Gid, Phase as SimPhase, Pid, RepeatMode, Scenario,
+    TaskBehavior, TaskDef, Uid,
 };
 
 use crate::ir::{
@@ -311,6 +311,9 @@ pub fn to_scenario(ir: &WorkloadIr) -> Result<Scenario, IngestError> {
             cgroup_name: task.cgroup.as_ref().map(|c| c.0.clone()),
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         });
     }
 

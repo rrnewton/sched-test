@@ -151,7 +151,7 @@ pub use safe::starvation::{BailInterval, StarvationMetrics};
 // tested surface (rbc_preemption.rs, scx_bpf_helpers.rs), so re-export them at
 // the root instead of widening the module visibility back out.
 pub use safe::perf::try_create_rbc_counter;
-pub use safe::rtapp::load_rtapp;
+pub use safe::rtapp::{load_rtapp, RtAppError, RTAPP_PP_KEYS};
 pub use safe::scenario::{
     parse_duration_ns, parse_seed, CgroupBandwidth, CgroupCpusetChangeEvent, CgroupCreateEvent,
     CgroupDef, CgroupDestroyEvent, CgroupMigrateEvent, CpuPreemptEvent, FutexEvent, FutexOp,
@@ -165,7 +165,7 @@ pub use safe::structops_jsonl::write_jsonl;
 pub use safe::trace::{
     DsqLengthSample, DsqSampleTrigger, Trace, TraceEvent, TraceKind, TraceSummary,
 };
-pub use safe::types::{CpuId, DsqId, KickFlags, MmId, Pid, TimeNs, Vtime};
+pub use safe::types::{CpuId, DsqId, Gid, KickFlags, MmId, Pid, TimeNs, Uid, Vtime};
 pub use task::{nice_to_weight, sched_weight_to_cgroup, Phase, RepeatMode, TaskBehavior, TaskDef};
 pub use unsafe_impl::kfuncs::scx_bpf_task_cgroup;
 
@@ -184,7 +184,7 @@ pub mod prelude {
     pub use crate::scenario::{CgroupDef, Scenario};
     pub use crate::task::{Phase, RepeatMode, TaskBehavior, TaskDef};
     pub use crate::trace::{Trace, TraceEvent, TraceSummary};
-    pub use crate::types::{CpuId, DsqId, MmId, Pid, TimeNs, Vtime};
+    pub use crate::types::{CpuId, DsqId, Gid, MmId, Pid, TimeNs, Uid, Vtime};
     pub use scxsim_build::{ConfigValue, KernelConfig, SchedulerDefinition};
 }
 

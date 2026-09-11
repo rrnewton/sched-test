@@ -162,6 +162,9 @@ fn test_cosmos_numa_per_node_affinity() {
                 cgroup_name: None,
                 task_flags: 0,
                 migration_disabled: 0,
+                thread_group_leader: None,
+                uid: Uid(0),
+                gid: Gid(0),
             });
         }
         let scenario = b.duration_ms(200).build();

@@ -53,6 +53,9 @@ fn embedder_built_simple_so_loads_and_runs() {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         })
         .duration_ms(50)
         .build();

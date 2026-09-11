@@ -44,6 +44,9 @@ fn test_normal_exit() {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         })
         .duration_ms(100)
         .build();
@@ -93,6 +96,9 @@ fn test_watchdog_disabled() {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         })
         .duration_ms(50)
         .build();
@@ -141,6 +147,9 @@ fn test_watchdog_timeout_configured() {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         })
         .duration_ms(50)
         .build();
@@ -222,6 +231,9 @@ fn test_trace_error_methods() {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         })
         .duration_ms(10)
         .build();
@@ -260,6 +272,9 @@ fn test_default_watchdog_timeout() {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         })
         .duration_ms(10)
         .build();

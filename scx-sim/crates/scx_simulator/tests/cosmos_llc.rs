@@ -92,6 +92,9 @@ fn pinned_task(pid: i32, name: &str, lo: u32, hi: u32, behavior: TaskBehavior) -
         cgroup_name: None,
         task_flags: 0,
         migration_disabled: 0,
+        thread_group_leader: None,
+        uid: Uid(0),
+        gid: Gid(0),
     }
 }
 
@@ -425,6 +428,9 @@ fn test_cosmos_domain_local_wake_placement() {
         cgroup_name: None,
         task_flags: 0,
         migration_disabled: 0,
+        thread_group_leader: None,
+        uid: Uid(0),
+        gid: Gid(0),
     };
     let wakee = TaskDef {
         name: "wakee".into(),
@@ -441,6 +447,9 @@ fn test_cosmos_domain_local_wake_placement() {
         cgroup_name: None,
         task_flags: 0,
         migration_disabled: 0,
+        thread_group_leader: None,
+        uid: Uid(0),
+        gid: Gid(0),
     };
 
     let scenario = Scenario::builder()
@@ -521,6 +530,9 @@ fn test_cosmos_idle_domain_utilized_under_imbalance() {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         });
     }
     let trace = Simulator::new(sched).run(b.duration_ms(300).build());
@@ -588,6 +600,9 @@ fn test_cosmos_cross_llc_migration_cost() {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         });
     }
     let trace = Simulator::new(DynamicScheduler::cosmos(nr_cpus)).run(b.duration_ms(300).build());

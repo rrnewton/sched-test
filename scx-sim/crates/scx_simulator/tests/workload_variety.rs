@@ -58,6 +58,9 @@ fn task(name: &str, pid: i32, nice: i8, start_time_ns: TimeNs, behavior: TaskBeh
         cgroup_name: None,
         task_flags: 0,
         migration_disabled: 0,
+        thread_group_leader: None,
+        uid: Uid(0),
+        gid: Gid(0),
     }
 }
 

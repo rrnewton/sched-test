@@ -54,6 +54,9 @@ fn forever_hog_in(name: &str, pid: i32, cgroup: &str, run_ns: u64) -> TaskDef {
         cgroup_name: Some(cgroup.into()),
         task_flags: 0,
         migration_disabled: 0,
+        thread_group_leader: None,
+        uid: Uid(0),
+        gid: Gid(0),
     }
 }
 

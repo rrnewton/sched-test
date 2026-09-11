@@ -30,6 +30,9 @@ fn test_smt_topology() {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         })
         .task(TaskDef {
             name: "t2".into(),
@@ -46,6 +49,9 @@ fn test_smt_topology() {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         })
         .duration_ms(200)
         .build();
@@ -329,6 +335,9 @@ fn test_numa_restricted_affinity() {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         })
         .task(TaskDef {
             name: "node1_pinned".into(),
@@ -342,6 +351,9 @@ fn test_numa_restricted_affinity() {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         })
         .duration_ms(200)
         .build();
@@ -531,6 +543,9 @@ fn test_hybrid_core_wakeup_migration() {
         cgroup_name: None,
         task_flags: 0,
         migration_disabled: 0,
+        thread_group_leader: None,
+        uid: Uid(0),
+        gid: Gid(0),
     });
     // Wakees allowed on the big core (cpu 0, the waker's CPU) plus the LITTLE
     // cores (2,3): with cpu 0 occupied by the waker they run on the slower
@@ -551,6 +566,9 @@ fn test_hybrid_core_wakeup_migration() {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         });
     }
     let scenario = b.duration_ms(200).build();
@@ -609,6 +627,9 @@ fn test_gpu_node_affinity() {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         })
         // A second, non-GPU task on the same node keeps the run realistic.
         .task(TaskDef {
@@ -623,6 +644,9 @@ fn test_gpu_node_affinity() {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         })
         .duration_ms(200)
         .build();

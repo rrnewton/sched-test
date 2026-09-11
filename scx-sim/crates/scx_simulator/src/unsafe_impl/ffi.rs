@@ -69,6 +69,12 @@ extern "C" {
     // Parent-child relationship
     pub fn sim_task_set_real_parent(child: *mut c_void, parent: *mut c_void);
 
+    // Thread groups (`p->group_leader`)
+    pub fn sim_task_set_group_leader(p: *mut c_void, leader: *mut c_void);
+
+    // Credentials (`p->real_cred->{uid,euid,gid,egid}`)
+    pub fn sim_task_set_cred_ids(p: *mut c_void, uid: u32, gid: u32);
+
     // Migration disabled counter
     pub fn sim_task_set_migration_disabled(p: *mut c_void, val: u16);
     pub fn sim_task_get_migration_disabled(p: *mut c_void) -> u16;
@@ -322,6 +328,17 @@ pub fn task_set_mm(raw: *mut c_void, mm: *mut c_void) {
 pub fn task_set_real_parent(child: *mut c_void, parent: *mut c_void) {
     // SAFETY: Both pointers must be valid task_struct pointers.
     unsafe { sim_task_set_real_parent(child, parent) }
+}
+
+/// Point a raw task_struct's `group_leader` at its thread-group leader.
+///
+/// Read by scx_layered's `MATCH_PCOMM_PREFIX` as `p->group_leader->comm`.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn task_set_group_leader(thread: *mut c_void, leader: *mut c_void) {
+    // SAFETY: Both pointers must be valid task_struct pointers. The leader
+    // must outlive the thread, which the engine guarantees by owning both in
+    // the same `tasks` map for the whole run.
+    unsafe { sim_task_set_group_leader(thread, leader) }
 }
 
 /// Set `p->comm` on a raw task_struct (truncated to 15 chars + NUL, as the

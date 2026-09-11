@@ -27,6 +27,26 @@
 //!   are accepted. Implicit ancestor cgroups along the path are synthesized.
 //! - `global.duration` — scenario duration
 //!
+//! # rt-app++ extensions
+//!
+//! These keys are **not** stock rt-app. They exist because scx_layered
+//! classifies tasks by attributes rt-app's language has no way to name, so a
+//! real layer configuration cannot be driven from a stock spec at all. Each is
+//! rejected by `scenario_to_rtapp_json` on the way back out rather than
+//! silently dropped — see [`RTAPP_PP_KEYS`].
+//!
+//! - `thread_of: "<task>"` — **thread groups.** Every instance of this task
+//!   becomes a *thread* of the process led by the first instance of `<task>`,
+//!   which drives `p->group_leader` and hence `MATCH_PCOMM_PREFIX`. Naming
+//!   your own task is the compact spelling of "my instances are one process".
+//!   Threads inherit their process's cgroup (cgroup v2 domain mode); a thread
+//!   declaring a *different* `taskgroup` is refused, because that is threaded
+//!   mode and scxsim does not model it.
+//! - `parent: "<task>"` — drives `p->real_parent`, hence `MATCH_PPID_EQUALS`.
+//! - `uid` / `gid` — drive `real_cred->{euid,egid}`, hence
+//!   `MATCH_USER_ID_EQUALS` / `MATCH_GROUP_ID_EQUALS`.
+//! - `kthread: true` — sets `PF_KTHREAD`, hence `MATCH_IS_KTHREAD`.
+//!
 //! # Limitations
 //!
 //! - JSON files with duplicate keys (common in rt-app) must be preprocessed
@@ -37,6 +57,16 @@
 //!   rather than a warning. A dropped event fails visibly; a wrongly-modelled
 //!   one does not, so the profile refuses instead of guessing.
 //! - Phase-level `taskgroup` migration is not modeled.
+//! - **Instance naming diverges from stock rt-app.** rt-app names every thread
+//!   `<task>-<i>` where `i` is a *global* thread index, so a single-instance
+//!   task still gets a suffix; this parser uses the bare name at
+//!   `instance == 1` and a per-task index otherwise. Prefix rules are
+//!   unaffected; exact and longer-prefix rules are not. Pinned by
+//!   `known_gap_instance_naming_diverges_from_stock_rtapp`.
+//! - **Stock rt-app has exactly one thread group.** It runs every task as a
+//!   pthread of one process whose comm is `rt-app`, so `pcomm` is `rt-app` for
+//!   every task in every stock spec. `thread_of` exists because there is
+//!   nothing in rt-app to map a real thread group from.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -49,7 +79,11 @@ use crate::scenario::{
     NoiseConfig, OverheadConfig, Scenario, DEFAULT_WATCHDOG_TIMEOUT_NS,
 };
 use crate::task::{Phase, RepeatMode, TaskBehavior, TaskDef};
-use crate::types::{CpuId, Pid};
+use crate::types::{CpuId, Gid, Pid, Uid};
+
+/// `PF_KTHREAD` from `include/linux/sched.h`, the flag `MATCH_IS_KTHREAD`
+/// tests.
+const PF_KTHREAD: u32 = 0x0020_0000;
 
 /// Errors from parsing rt-app JSON.
 #[derive(Debug)]
@@ -62,6 +96,57 @@ pub enum RtAppError {
     InvalidValue(String),
     /// Unresolved task reference in `resume`.
     UnresolvedResume(String),
+    /// An rt-app++ key naming a task that does not exist.
+    ///
+    /// Carries the key (`thread_of` / `parent`) and the name it named. This is
+    /// an error rather than a warning for the same reason `resume` is: a
+    /// mistyped target would otherwise leave the relation silently unset, and
+    /// the whole point of the relation is a match kind that then quietly stops
+    /// firing.
+    UnresolvedTaskRef {
+        /// The rt-app++ key that carried the reference.
+        key: &'static str,
+        /// The task name it pointed at.
+        name: String,
+    },
+    /// A `thread_of` chain — the named leader is itself a thread of a third
+    /// task. The kernel has no nested thread groups.
+    NestedThreadGroup {
+        /// The task that declared `thread_of`.
+        task: String,
+        /// The task it named.
+        leader: String,
+        /// The task that `leader` is itself a thread of.
+        leaders_leader: String,
+    },
+    /// A `resume` that lowered to a wake of a pid no task carries.
+    ///
+    /// Distinct from [`RtAppError::UnresolvedResume`], which is a name that
+    /// resolved to nothing at all. This one resolved — and then the pid it
+    /// resolved to turned out to belong to no task, which is what a
+    /// pid-accounting slip between the two passes over `tasks` produces.
+    UnresolvedWakeTarget {
+        /// The task whose `resume` this was.
+        waker: String,
+        /// The pid it lowered to.
+        target: Pid,
+    },
+    /// A task-level-only rt-app++ key found inside a `phases` object, where it
+    /// would have no effect. Identity is a property of a task for its whole
+    /// life, not of one phase.
+    TaskLevelKeyInPhase(&'static str),
+    /// A `thread_of` task declaring a `taskgroup` other than its leader's.
+    /// That is cgroup-v2 threaded mode, which scxsim does not model.
+    ThreadInForeignCgroup {
+        /// The thread.
+        task: String,
+        /// The `taskgroup` it declared.
+        own: String,
+        /// Its thread-group leader.
+        leader: String,
+        /// The leader's `taskgroup`, if it has one.
+        leaders: Option<String>,
+    },
     /// An `iorun` declaration the frozen profile is not calibrated for.
     ///
     /// This is deliberately an error rather than a skipped event: silently
@@ -83,6 +168,44 @@ impl std::fmt::Display for RtAppError {
             RtAppError::UnresolvedResume(name) => {
                 write!(f, "unresolved resume target: {name:?}")
             }
+            RtAppError::UnresolvedTaskRef { key, name } => {
+                write!(f, "{key}: no task named {name:?} in this spec")
+            }
+            RtAppError::NestedThreadGroup {
+                task,
+                leader,
+                leaders_leader,
+            } => write!(
+                f,
+                "task {task:?} declares thread_of {leader:?}, but {leader:?} is itself a \
+                 thread of {leaders_leader:?}; thread groups do not nest — name \
+                 {leaders_leader:?} directly"
+            ),
+            RtAppError::UnresolvedWakeTarget { waker, target } => write!(
+                f,
+                "task {waker:?} resumes {target:?}, which belongs to no task in this \
+                 scenario; the wake would be delivered to nothing"
+            ),
+            RtAppError::TaskLevelKeyInPhase(key) => write!(
+                f,
+                "{key:?} is a task-level key and has no meaning inside \"phases\"; \
+                 move it up to the task object"
+            ),
+            RtAppError::ThreadInForeignCgroup {
+                task,
+                own,
+                leader,
+                leaders,
+            } => write!(
+                f,
+                "task {task:?} is a thread of {leader:?} but declares taskgroup {own:?} \
+                 while {leader:?} is in {}; under cgroup v2 every thread of a process \
+                 shares its cgroup unless the cgroup is in THREADED mode, which scxsim \
+                 does not model — drop the taskgroup to inherit, or make them agree",
+                leaders
+                    .as_deref()
+                    .map_or_else(|| "the root cgroup".to_string(), |c| format!("{c:?}"))
+            ),
         }
     }
 }
@@ -155,6 +278,16 @@ const TASK_PHASE_KEYS: &[&str] = &[
     "util_max",
 ];
 
+/// The rt-app++ extension keys: task attributes stock rt-app has no syntax
+/// for, added because scx_layered matches on them.
+///
+/// Kept as one list so the three places that must agree cannot drift: the
+/// parser (which must not classify them as events), the phase-level rejection
+/// (identity belongs to a task, not a phase), and the rt-app **export**, which
+/// refuses a scenario carrying any of them rather than emitting a spec that
+/// silently means something different on real hardware.
+pub const RTAPP_PP_KEYS: &[&str] = &["thread_of", "parent", "uid", "gid", "kthread"];
+
 /// Parse events from a phase/task object's key-value pairs (in insertion order).
 fn parse_events(
     obj: &Map<String, Value>,
@@ -165,7 +298,7 @@ fn parse_events(
 
     for (key, value) in obj.iter() {
         // Skip non-event keys
-        if TASK_PHASE_KEYS.contains(&key.as_str()) {
+        if TASK_PHASE_KEYS.contains(&key.as_str()) || RTAPP_PP_KEYS.contains(&key.as_str()) {
             continue;
         }
 
@@ -519,6 +652,56 @@ fn cgroup_defs_for_tasks(
         .collect()
 }
 
+/// Resolve an rt-app++ key whose value names another task, to that task's pid.
+///
+/// `name_to_pid` maps a bare task key to its **first** instance, which is the
+/// right answer for both uses: the first instance is the thread-group leader
+/// of a multi-instance task, and it is the process a `parent` reference means.
+fn resolve_task_ref(
+    key: &'static str,
+    obj: &Map<String, Value>,
+    name_to_pid: &HashMap<String, Pid>,
+) -> Result<Option<Pid>, RtAppError> {
+    let Some(value) = obj.get(key) else {
+        return Ok(None);
+    };
+    let target = value
+        .as_str()
+        .ok_or_else(|| RtAppError::InvalidValue(format!("{key}: expected a task name string")))?;
+    name_to_pid
+        .get(target)
+        .copied()
+        .map(Some)
+        .ok_or_else(|| RtAppError::UnresolvedTaskRef {
+            key,
+            name: target.to_string(),
+        })
+}
+
+/// Parse an rt-app++ `uid` / `gid` value.
+fn parse_cred_id(key: &'static str, obj: &Map<String, Value>) -> Result<Option<u32>, RtAppError> {
+    let Some(value) = obj.get(key) else {
+        return Ok(None);
+    };
+    let raw = value.as_u64().ok_or_else(|| {
+        RtAppError::InvalidValue(format!("{key}: expected a non-negative integer"))
+    })?;
+    u32::try_from(raw)
+        .map(Some)
+        .map_err(|_| RtAppError::InvalidValue(format!("{key}: {raw} does not fit in a uid_t")))
+}
+
+/// Reject a task-level-only rt-app++ key that appears inside a `phases`
+/// object, where the parser would otherwise skip it without a word.
+fn reject_task_level_keys_in_phase(phase: &Map<String, Value>) -> Result<(), RtAppError> {
+    for key in RTAPP_PP_KEYS {
+        if phase.contains_key(*key) {
+            return Err(RtAppError::TaskLevelKeyInPhase(key));
+        }
+    }
+    Ok(())
+}
+
 /// Parse a single rt-app task object into one or more `TaskDef`s.
 ///
 /// Multiple `TaskDef`s are produced when `instance > 1`.
@@ -553,6 +736,22 @@ fn parse_task(
     }
     let cgroup_name = taskgroup.map(|spec| spec.name);
 
+    // rt-app++ identity keys. Resolution happens here; the `thread_of` nesting
+    // and cgroup-inheritance checks need every task and so run in load_rtapp.
+    let thread_of = resolve_task_ref("thread_of", obj, name_to_pid)?;
+    let parent_pid = resolve_task_ref("parent", obj, name_to_pid)?;
+    let uid = Uid(parse_cred_id("uid", obj)?.unwrap_or(0));
+    let gid = Gid(parse_cred_id("gid", obj)?.unwrap_or(0));
+    let task_flags = match obj.get("kthread") {
+        None | Some(Value::Bool(false)) => 0,
+        Some(Value::Bool(true)) => PF_KTHREAD,
+        Some(v) => {
+            return Err(RtAppError::InvalidValue(format!(
+                "kthread: expected true or false, got {v}"
+            )))
+        }
+    };
+
     // Parse phases
     let all_phases = if let Some(phases_val) = obj.get("phases") {
         // Multi-phase task: each sub-object is a named phase
@@ -565,6 +764,7 @@ fn parse_task(
             let phase_obj = phase_val
                 .as_object()
                 .ok_or_else(|| RtAppError::InvalidValue("phase: expected object".into()))?;
+            reject_task_level_keys_in_phase(phase_obj)?;
 
             let phase_loop = phase_obj.get("loop").and_then(|v| v.as_i64()).unwrap_or(1);
 
@@ -620,10 +820,13 @@ fn parse_task(
             start_time_ns: 0,
             mm_id: None,
             allowed_cpus: allowed_cpus.clone(),
-            parent_pid: None,
+            parent_pid,
             cgroup_name: cgroup_name.clone(),
-            task_flags: 0,
+            task_flags,
             migration_disabled: 0,
+            thread_group_leader: thread_of,
+            uid,
+            gid,
         });
     }
 
@@ -678,6 +881,115 @@ fn extract_irq_gen_timing(obj: &Map<String, Value>) -> Result<(u64, u64), RtAppE
             "irq_gen task missing run/sleep durations".into(),
         )),
     }
+}
+
+/// Resolve the rt-app++ cross-task relations once every task exists.
+///
+/// Three things `parse_task` cannot do on its own, because they need the whole
+/// task set:
+///
+/// 1. **Check the reference resolves to a task.** A name can resolve through
+///    `name_to_pid` and still name a pid no `TaskDef` carries: `irq_gen*`
+///    entries occupy a pid slot and then become [`IrqEvent`]s rather than
+///    tasks, so `"thread_of": "irq_gen0"` parses and would panic in the
+///    engine. Caught here instead.
+/// 2. **Refuse a `thread_of` chain.** The kernel's `group_leader` always
+///    points at a leader; flattening a chain would put a plausible but wrong
+///    string in front of `MATCH_PCOMM_PREFIX`.
+/// 3. **Give a thread its process's cgroup.** Under cgroup v2's default domain
+///    mode every thread of a process is in the process's cgroup. A thread that
+///    declares no `taskgroup` inherits the leader's; one that declares a
+///    *different* one is asking for threaded mode, which scxsim does not
+///    model, and is refused rather than silently run as if it were the
+///    ordinary case.
+fn resolve_thread_groups(tasks: &mut [TaskDef]) -> Result<(), RtAppError> {
+    // Snapshot what the checks below need, so the mutable pass does not have
+    // to borrow the slice again.
+    let by_pid: HashMap<Pid, (String, Option<Pid>, Option<String>)> = tasks
+        .iter()
+        .map(|t| {
+            (
+                t.pid,
+                (
+                    t.name.clone(),
+                    t.thread_group_leader.filter(|l| *l != t.pid),
+                    t.cgroup_name.clone(),
+                ),
+            )
+        })
+        .collect();
+    let name_of = |pid: Pid| -> String {
+        by_pid
+            .get(&pid)
+            .map_or_else(|| format!("{pid:?}"), |(name, _, _)| name.clone())
+    };
+
+    for def in tasks.iter_mut() {
+        for (key, target) in [
+            ("thread_of", def.thread_group_leader),
+            ("parent", def.parent_pid),
+        ] {
+            let Some(target) = target else { continue };
+            if !by_pid.contains_key(&target) {
+                return Err(RtAppError::UnresolvedTaskRef {
+                    key,
+                    name: name_of(target),
+                });
+            }
+        }
+
+        let Some(leader) = def.thread_group_leader.filter(|l| *l != def.pid) else {
+            continue;
+        };
+        let (_, leaders_leader, leader_cgroup) = &by_pid[&leader];
+        if let Some(leaders_leader) = leaders_leader {
+            return Err(RtAppError::NestedThreadGroup {
+                task: def.name.clone(),
+                leader: name_of(leader),
+                leaders_leader: name_of(*leaders_leader),
+            });
+        }
+        match (&def.cgroup_name, leader_cgroup) {
+            (None, inherited) => def.cgroup_name = inherited.clone(),
+            (Some(own), leaders) if Some(own) != leaders.as_ref() => {
+                return Err(RtAppError::ThreadInForeignCgroup {
+                    task: def.name.clone(),
+                    own: own.clone(),
+                    leader: name_of(leader),
+                    leaders: leaders.clone(),
+                })
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Check that every `resume` lowered to a wake of a task that exists.
+///
+/// `parse_events` resolves a `resume` target through `name_to_pid`, which is
+/// built by a separate first pass over the same `tasks` object. If the two
+/// passes ever disagree about how many pid slots an entry consumes, the name
+/// resolves and the pid is wrong — and a `Phase::Wake` naming a pid no task
+/// carries is delivered to nothing, with no error and no warning.
+///
+/// The disagreement that existed (`irq_gen*` entries with `instance > 1`) is
+/// fixed at its source in `load_rtapp`. This is the check that would have
+/// caught it, and catches the next one.
+fn validate_wake_targets(tasks: &[TaskDef]) -> Result<(), RtAppError> {
+    let live: BTreeSet<Pid> = tasks.iter().map(|t| t.pid).collect();
+    for def in tasks {
+        for phase in &def.behavior.phases {
+            let Phase::Wake(target) = phase else { continue };
+            if !live.contains(target) {
+                return Err(RtAppError::UnresolvedWakeTarget {
+                    waker: def.name.clone(),
+                    target: *target,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Load an rt-app JSON workload and convert it to a simulator [`Scenario`].
@@ -801,9 +1113,22 @@ pub fn load_rtapp(json_str: &str, nr_cpus: u32) -> Result<Scenario, RtAppError> 
 
         if task_name.starts_with("irq_gen") {
             // Convert to periodic IrqEvents instead of a scheduled task.
-            // Still consume a PID slot to keep PID numbering stable.
-            let _pid = pid_counter;
-            pid_counter += 1;
+            //
+            // Still consume PID slots to keep PID numbering stable — one per
+            // INSTANCE, because that is what the first pass above consumed
+            // when it built `name_to_pid`. Consuming exactly one (as this did
+            // until the rt-app++ work) makes the two passes disagree the
+            // moment an irq_gen entry declares `instance > 1`, and every task
+            // parsed after it gets a pid lower than the one `name_to_pid`
+            // published. Measured: with `"instance": 3` on an irq_gen entry, a
+            // later `"resume": "later"` lowered to `Wake(Pid(4))` while the
+            // task named `later` had been given `Pid(2)` — a wake delivered to
+            // nothing, silently. `validate_wake_targets` is the belt to this
+            // brace.
+            pid_counter += task_obj
+                .get("instance")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1) as i32;
 
             // Extract the pinned CPU from the affinity mask.
             let cpu = if let Some(cpus_val) = task_obj.get("cpus") {
@@ -882,6 +1207,9 @@ pub fn load_rtapp(json_str: &str, nr_cpus: u32) -> Result<Scenario, RtAppError> 
             "no tasks with events found".into(),
         ));
     }
+
+    resolve_thread_groups(&mut all_tasks)?;
+    validate_wake_targets(&all_tasks)?;
 
     // Validate CPU affinity entries against available CPUs.
     for def in &all_tasks {
@@ -1559,5 +1887,346 @@ mod tests {
         for t in &scenario.tasks {
             assert_eq!(t.cgroup_name.as_deref(), Some("/test_bw_stop"));
         }
+    }
+
+    // -- rt-app++ extensions: thread groups, creds, parent, kthread --
+
+    /// `thread_of` names the FIRST instance of the target, which is the
+    /// thread-group leader, and every instance of the declaring task joins it.
+    #[test]
+    fn thread_of_points_every_instance_at_the_leaders_first_instance() {
+        let json = r#"{
+            "global": { "duration": 1 },
+            "tasks": {
+                "frontendd":    { "run": 1000, "loop": 1 },
+                "iothreadpool": { "instance": 3, "run": 1000, "loop": 1,
+                                  "thread_of": "frontendd" }
+            }
+        }"#;
+        let s = load_rtapp(json, 4).unwrap();
+        let leader = s.tasks.iter().find(|t| t.name == "frontendd").unwrap();
+        assert_eq!(leader.thread_group_leader, None, "a process leads itself");
+        for i in 0..3 {
+            let th = s
+                .tasks
+                .iter()
+                .find(|t| t.name == format!("iothreadpool-{i}"))
+                .unwrap();
+            assert_eq!(th.thread_group_leader, Some(leader.pid));
+        }
+    }
+
+    /// Naming your own task means "my instances are one process, led by
+    /// instance 0" — the compact spelling of a same-named worker pool. It is
+    /// the same rule as the cross-task form, not a special case: the leader is
+    /// the first instance of the named task, which here is instance 0 itself.
+    #[test]
+    fn thread_of_self_makes_the_instances_one_process() {
+        let json = r#"{
+            "global": { "duration": 1 },
+            "tasks": {
+                "workerpool": { "instance": 3, "run": 1000, "loop": 1,
+                                "thread_of": "workerpool" }
+            }
+        }"#;
+        let s = load_rtapp(json, 4).unwrap();
+        let first = s.tasks[0].pid;
+        assert_eq!(
+            s.tasks[0].thread_group_leader,
+            Some(first),
+            "instance 0 names itself, which the engine reads as `is its own leader`"
+        );
+        for t in &s.tasks[1..] {
+            assert_eq!(t.thread_group_leader, Some(first));
+        }
+    }
+
+    #[test]
+    fn thread_of_an_unknown_task_is_an_error() {
+        let json = r#"{
+            "tasks": { "w": { "run": 1000, "loop": 1, "thread_of": "nosuchtask" } }
+        }"#;
+        let err = load_rtapp(json, 2).unwrap_err();
+        assert!(matches!(err, RtAppError::UnresolvedTaskRef { .. }), "{err}");
+        assert!(err.to_string().contains("nosuchtask"), "{err}");
+    }
+
+    /// `irq_gen*` entries consume a pid slot and then become `IrqEvent`s, not
+    /// tasks. Resolving through `name_to_pid` therefore succeeds while the pid
+    /// names nothing the engine will build — which used to be a panic deep in
+    /// `Engine::new` rather than a parse error here.
+    #[test]
+    fn thread_of_an_irq_gen_task_is_an_error_not_an_engine_panic() {
+        let json = r#"{
+            "global": { "duration": 1 },
+            "tasks": {
+                "irq_gen0": { "cpus": "0", "run": 100, "sleep": 900, "loop": -1 },
+                "w": { "run": 1000, "loop": 1, "thread_of": "irq_gen0" }
+            }
+        }"#;
+        let err = load_rtapp(json, 2).unwrap_err();
+        assert!(matches!(err, RtAppError::UnresolvedTaskRef { .. }), "{err}");
+    }
+
+    #[test]
+    fn nested_thread_groups_are_rejected() {
+        let json = r#"{
+            "tasks": {
+                "a": { "run": 1000, "loop": 1 },
+                "b": { "run": 1000, "loop": 1, "thread_of": "a" },
+                "c": { "run": 1000, "loop": 1, "thread_of": "b" }
+            }
+        }"#;
+        let err = load_rtapp(json, 2).unwrap_err();
+        assert!(matches!(err, RtAppError::NestedThreadGroup { .. }), "{err}");
+        let msg = err.to_string();
+        assert!(msg.contains("do not nest"), "{msg}");
+        assert!(
+            msg.contains("\"a\""),
+            "the error must name the real leader: {msg}"
+        );
+    }
+
+    /// A thread with no `taskgroup` of its own joins its process's cgroup,
+    /// which is cgroup v2's domain-mode behaviour and what makes a single
+    /// `taskgroup` declaration cover a whole worker pool.
+    #[test]
+    fn a_thread_inherits_its_process_cgroup() {
+        let json = r#"{
+            "tasks": {
+                "svc": { "run": 1000, "loop": 1, "taskgroup": "/prod/svc" },
+                "pool": { "instance": 2, "run": 1000, "loop": 1, "thread_of": "svc" }
+            }
+        }"#;
+        let s = load_rtapp(json, 2).unwrap();
+        for t in &s.tasks {
+            assert_eq!(t.cgroup_name.as_deref(), Some("/prod/svc"), "{}", t.name);
+        }
+    }
+
+    /// A thread declaring a DIFFERENT cgroup from its process is cgroup-v2
+    /// threaded mode. scxsim does not model it, so it is refused by name
+    /// rather than run as if it were the ordinary case.
+    #[test]
+    fn a_thread_in_a_foreign_cgroup_is_rejected() {
+        let json = r#"{
+            "tasks": {
+                "svc":  { "run": 1000, "loop": 1, "taskgroup": "/prod/svc" },
+                "pool": { "run": 1000, "loop": 1, "thread_of": "svc",
+                          "taskgroup": "/background/batch" }
+            }
+        }"#;
+        let err = load_rtapp(json, 2).unwrap_err();
+        assert!(
+            matches!(err, RtAppError::ThreadInForeignCgroup { .. }),
+            "{err}"
+        );
+        assert!(err.to_string().contains("THREADED"), "{err}");
+    }
+
+    /// Same cgroup spelled out on both is fine — it says nothing new.
+    #[test]
+    fn a_thread_may_restate_its_process_cgroup() {
+        let json = r#"{
+            "tasks": {
+                "svc":  { "run": 1000, "loop": 1, "taskgroup": "/prod/svc" },
+                "pool": { "run": 1000, "loop": 1, "thread_of": "svc",
+                          "taskgroup": "/prod/svc" }
+            }
+        }"#;
+        let s = load_rtapp(json, 2).unwrap();
+        assert_eq!(s.tasks.len(), 2);
+    }
+
+    #[test]
+    fn uid_gid_parent_and_kthread_reach_the_task_def() {
+        let json = r#"{
+            "tasks": {
+                "boss":   { "run": 1000, "loop": 1 },
+                "worker": { "run": 1000, "loop": 1, "uid": 4711, "gid": 1000,
+                            "parent": "boss", "kthread": true }
+            }
+        }"#;
+        let s = load_rtapp(json, 2).unwrap();
+        let boss = s.tasks.iter().find(|t| t.name == "boss").unwrap();
+        let w = s.tasks.iter().find(|t| t.name == "worker").unwrap();
+        assert_eq!(w.uid, Uid(4711));
+        assert_eq!(w.gid, Gid(1000));
+        assert_eq!(w.parent_pid, Some(boss.pid));
+        assert_eq!(w.task_flags, PF_KTHREAD);
+        // Defaults, so a spec that says nothing gets the ordinary user task.
+        assert_eq!(boss.uid, Uid(0));
+        assert_eq!(boss.gid, Gid(0));
+        assert_eq!(boss.parent_pid, None);
+        assert_eq!(boss.task_flags, 0);
+    }
+
+    #[test]
+    fn malformed_rtapp_pp_values_are_rejected() {
+        for (json, needle) in [
+            (r#"{"tasks":{"w":{"run":1,"loop":1,"uid":-1}}}"#, "uid"),
+            (r#"{"tasks":{"w":{"run":1,"loop":1,"gid":"nope"}}}"#, "gid"),
+            (
+                r#"{"tasks":{"w":{"run":1,"loop":1,"kthread":1}}}"#,
+                "kthread",
+            ),
+            (
+                r#"{"tasks":{"w":{"run":1,"loop":1,"thread_of":7}}}"#,
+                "thread_of",
+            ),
+        ] {
+            let err = load_rtapp(json, 2).unwrap_err();
+            assert!(
+                matches!(err, RtAppError::InvalidValue(_)) && err.to_string().contains(needle),
+                "expected an InvalidValue naming {needle}, got: {err}"
+            );
+        }
+    }
+
+    /// Identity belongs to a task for its whole life. Silently skipping a
+    /// task-level key found inside `phases` — which is what the generic
+    /// unknown-key path would do — would leave the author believing a
+    /// per-phase identity change happened.
+    #[test]
+    fn rtapp_pp_keys_inside_phases_are_rejected() {
+        let json = r#"{
+            "tasks": {
+                "w": {
+                    "loop": 1,
+                    "phases": {
+                        "a": { "run": 1000, "uid": 4711 },
+                        "b": { "sleep": 1000 }
+                    }
+                }
+            }
+        }"#;
+        let err = load_rtapp(json, 2).unwrap_err();
+        assert!(
+            matches!(err, RtAppError::TaskLevelKeyInPhase("uid")),
+            "{err}"
+        );
+    }
+
+    /// KNOWN GAP: this parser's instance naming is not what rt-app produces,
+    /// so the same spec yields different `comm` strings in simulation and on
+    /// hardware.
+    ///
+    /// WHY EXPECTED: rt-app's `thread_data_set_unique_name()` is
+    /// `snprintf("%s-%d", name, tdata->ind)` with `tdata->ind` a GLOBAL thread
+    /// index (`data->ind = index` in `rt-app_parse_config.c`), applied to
+    /// every task including single-instance ones. Measured on `~/bin/rt-app`
+    /// at `checkouts/rt-app@9eedd75` with a two-task / three-thread spec, read
+    /// from `/proc/<pid>/task/*/comm`:
+    ///
+    /// ```text
+    ///   frontendd-0        (declared "instance": 1 — still suffixed)
+    ///   iothreadpool-1     (first instance of the second task — index 1)
+    ///   iothreadpool-2
+    /// ```
+    ///
+    /// This parser instead uses the bare name at `instance == 1` and a
+    /// per-task index otherwise. Prefix rules — which is what the deployed
+    /// corpus overwhelmingly writes — are unaffected. An exact rule, or a
+    /// prefix reaching past the base name, diverges.
+    ///
+    /// It is pinned rather than fixed because changing it touches pid
+    /// assignment, `resume`-target resolution and the export path together;
+    /// that is its own change with its own risk, and nothing here is blocked
+    /// on it.
+    ///
+    /// WHEN THIS GOES RED: the naming was aligned with rt-app. Invert it —
+    /// assert the rt-app spelling — and re-check `name_to_pid`, which maps
+    /// both the bare name and the suffixed one.
+    ///
+    /// DO NOT: delete it, and do not "fix" it by renaming only the
+    /// `instance == 1` case; the index is global, so the multi-instance case
+    /// is wrong too.
+    #[test]
+    fn known_gap_instance_naming_diverges_from_stock_rtapp() {
+        let json = r#"{
+            "tasks": {
+                "frontendd":    { "run": 1000, "loop": 1 },
+                "iothreadpool": { "instance": 2, "run": 1000, "loop": 1 }
+            }
+        }"#;
+        let s = load_rtapp(json, 2).unwrap();
+        let names: Vec<&str> = s.tasks.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["frontendd", "iothreadpool-0", "iothreadpool-1"],
+            "rt-app itself would produce [frontendd-0, iothreadpool-1, iothreadpool-2]. \
+             KNOWN-GAP TEST: this going red means the gap CLOSED. Invert this assertion to \
+             assert the property now holds. Do not delete it, and do not loosen the bound."
+        );
+    }
+
+    /// An `irq_gen*` entry with `instance > 1` used to desynchronise the two
+    /// passes over `tasks`, because the first consumed one pid per instance
+    /// and the second consumed exactly one. Every task parsed after it then
+    /// got a pid lower than the one `name_to_pid` had published, so a `resume`
+    /// naming it lowered to a wake of a pid no task carried — delivered to
+    /// nothing, with no error.
+    ///
+    /// Measured before the fix: `later` was given `Pid(2)` while `waker`
+    /// emitted `Wake(Pid(4))`.
+    #[test]
+    fn irq_gen_instances_do_not_desynchronise_pid_numbering() {
+        let json = r#"{
+            "global": { "duration": 1 },
+            "tasks": {
+                "irq_gen0": { "instance": 3, "cpus": "0", "run": 100,
+                              "sleep": 900, "loop": -1 },
+                "later":    { "run": 1000, "loop": 1 },
+                "waker":    { "run": 1000, "loop": 1, "resume": "later" }
+            }
+        }"#;
+        let s = load_rtapp(json, 2).unwrap();
+        let later = s.tasks.iter().find(|t| t.name == "later").unwrap().pid;
+        let waker = s.tasks.iter().find(|t| t.name == "waker").unwrap();
+        assert!(
+            waker
+                .behavior
+                .phases
+                .iter()
+                .any(|p| matches!(p, Phase::Wake(pid) if *pid == later)),
+            "waker must resume the pid `later` actually got ({later:?}), got {:?}",
+            waker.behavior.phases
+        );
+    }
+
+    /// The belt to that brace: a wake naming a pid no task carries is an
+    /// error, not a wake delivered to nothing. Constructed directly rather
+    /// than through a spec, because the source that produced it is fixed.
+    #[test]
+    fn a_wake_of_a_nonexistent_pid_is_rejected() {
+        let mut tasks = vec![TaskDef {
+            name: "waker".into(),
+            pid: Pid(1),
+            nice: 0,
+            behavior: TaskBehavior {
+                phases: vec![Phase::Wake(Pid(99))],
+                repeat: RepeatMode::Once,
+            },
+            start_time_ns: 0,
+            mm_id: None,
+            allowed_cpus: None,
+            parent_pid: None,
+            cgroup_name: None,
+            task_flags: 0,
+            migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
+        }];
+        let err = validate_wake_targets(&tasks).unwrap_err();
+        assert!(
+            matches!(err, RtAppError::UnresolvedWakeTarget { .. }),
+            "{err}"
+        );
+        assert!(err.to_string().contains("delivered to nothing"), "{err}");
+
+        // And the control: pointing it at a real task is fine.
+        tasks[0].behavior.phases = vec![Phase::Wake(Pid(1))];
+        validate_wake_targets(&tasks).unwrap();
     }
 }

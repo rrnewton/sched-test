@@ -74,6 +74,9 @@ fn task(name: &str, pid: i32, allowed: Option<Vec<CpuId>>, behavior: TaskBehavio
         cgroup_name: None,
         task_flags: 0,
         migration_disabled: 0,
+        thread_group_leader: None,
+        uid: Uid(0),
+        gid: Gid(0),
     }
 }
 

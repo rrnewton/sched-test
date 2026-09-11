@@ -4,7 +4,7 @@
 //! behavior, state, and configuration. No `unsafe` code lives here;
 //! the FFI-backed runtime type `SimTask` is in `unsafe_impl::sim_task`.
 
-use crate::types::{CpuId, MmId, Pid, TimeNs};
+use crate::types::{CpuId, Gid, MmId, Pid, TimeNs, Uid};
 
 /// Kernel sched_prio_to_weight table from kernel/sched/core.c.
 /// Maps nice levels -20..19 (indices 0..39) to scheduler weights.
@@ -156,6 +156,34 @@ pub struct TaskDef {
     /// code or explicitly disable migration (e.g., kworkers bound to a CPU).
     /// Defaults to 0 (migration enabled).
     pub migration_disabled: u16,
+    /// Thread-group membership: the pid of this task's thread-group leader.
+    ///
+    /// `None` — the default — means the task is a single-threaded process and
+    /// is therefore its own leader, which is what `sim_task_alloc()` already
+    /// sets up. `Some(pid)` makes this task a *thread* of the process led by
+    /// `pid`, and the engine points `task_struct->group_leader` at that
+    /// leader's struct. That is the field scx_layered's `MATCH_PCOMM_PREFIX`
+    /// reads (`p->group_leader->comm`), so it is what lets a worker thread be
+    /// matched by its *process* name rather than its own.
+    ///
+    /// The named leader must itself be a leader: the kernel has no nested
+    /// thread groups, and `group_leader` always points at one.
+    ///
+    /// NOTE this does **not** set `task_struct->tgid`, which is a separate and
+    /// currently blocked piece of state — see the `DANGER TODO(sim-6mheb)` in
+    /// `csrc/sim_task.c`. `MATCH_TGID_EQUALS` and `MATCH_IS_GROUP_LEADER`
+    /// therefore remain wrong for every task, grouped or not.
+    pub thread_group_leader: Option<Pid>,
+    /// Effective user id, published into `real_cred->{uid,euid}`.
+    ///
+    /// Read by scx_layered's `MATCH_USER_ID_EQUALS`. Defaults to 0 (root),
+    /// which is the identity a simulated workload runs under unless it says
+    /// otherwise.
+    pub uid: Uid,
+    /// Effective group id, published into `real_cred->{gid,egid}`.
+    ///
+    /// Read by scx_layered's `MATCH_GROUP_ID_EQUALS`. Defaults to 0.
+    pub gid: Gid,
 }
 
 impl TaskDef {

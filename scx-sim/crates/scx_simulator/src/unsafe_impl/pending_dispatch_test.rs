@@ -13,7 +13,8 @@ use std::collections::VecDeque;
 use std::ffi::c_void;
 
 use crate::{
-    DsqId, Phase, Pid, RepeatMode, Scenario, Scheduler, Simulator, TaskBehavior, TaskDef, TraceKind,
+    DsqId, Gid, Phase, Pid, RepeatMode, Scenario, Scheduler, Simulator, TaskBehavior, TaskDef,
+    TraceKind, Uid,
 };
 
 #[derive(Default)]
@@ -69,6 +70,9 @@ fn one_shot_task(pid: i32, name: &str) -> TaskDef {
         cgroup_name: None,
         task_flags: 0,
         migration_disabled: 0,
+        thread_group_leader: None,
+        uid: Uid(0),
+        gid: Gid(0),
     }
 }
 

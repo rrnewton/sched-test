@@ -136,6 +136,9 @@ fn imbalanced_two_domain_scenario(
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         });
         pid += 1;
     }
@@ -152,6 +155,9 @@ fn imbalanced_two_domain_scenario(
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         });
         pid += 1;
     }
@@ -278,6 +284,9 @@ fn test_lavd_no_slice_boost() {
         cgroup_name: None,
         task_flags: 0,
         migration_disabled: 0,
+        thread_group_leader: None,
+        uid: Uid(0),
+        gid: Gid(0),
     });
     b = b.task(TaskDef {
         name: "pong".into(),
@@ -291,6 +300,9 @@ fn test_lavd_no_slice_boost() {
         cgroup_name: None,
         task_flags: 0,
         migration_disabled: 0,
+        thread_group_leader: None,
+        uid: Uid(0),
+        gid: Gid(0),
     });
     for i in 0..4 {
         b = b.add_task(&format!("hog{i}"), 0, workloads::cpu_bound(20_000_000));
@@ -371,6 +383,9 @@ fn test_lavd_autopilot_runtime_power_switch() {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         });
         pid += 1;
     }
@@ -391,6 +406,9 @@ fn test_lavd_autopilot_runtime_power_switch() {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         });
         pid += 1;
     }

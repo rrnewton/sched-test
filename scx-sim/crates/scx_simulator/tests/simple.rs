@@ -31,6 +31,9 @@ fn test_weighted_fairness() {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         })
         .task(TaskDef {
             name: "light".into(),
@@ -47,6 +50,9 @@ fn test_weighted_fairness() {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         })
         .duration_ms(200)
         .build();
@@ -88,6 +94,9 @@ fn test_three_way_weighted_fairness() {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         })
         .task(TaskDef {
             name: "n2".into(),
@@ -104,6 +113,9 @@ fn test_three_way_weighted_fairness() {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         })
         .task(TaskDef {
             name: "n0".into(),
@@ -120,6 +132,9 @@ fn test_three_way_weighted_fairness() {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         })
         .duration_ms(600) // longer to allow convergence
         .build();
@@ -168,6 +183,9 @@ fn test_slice_preemption() {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         })
         .duration_ms(200)
         .build();
@@ -212,6 +230,9 @@ fn test_preemption_interleaving() {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         })
         .task(TaskDef {
             name: "t2".into(),
@@ -228,6 +249,9 @@ fn test_preemption_interleaving() {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         })
         .duration_ms(100)
         .build();

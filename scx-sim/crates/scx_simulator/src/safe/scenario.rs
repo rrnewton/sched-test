@@ -5,7 +5,7 @@ use tracing::warn;
 use crate::cgroup::DEFAULT_MAX_CGROUPS;
 use crate::perf::PmuEvent;
 use crate::task::{TaskBehavior, TaskDef};
-use crate::types::{CpuId, MmId, Pid, TimeNs};
+use crate::types::{CpuId, Gid, MmId, Pid, TimeNs, Uid};
 
 /// A CPU hotplug event: take a CPU offline or bring it online at a given time.
 #[derive(Debug, Clone)]
@@ -1075,6 +1075,9 @@ impl ScenarioBuilder {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         });
         self
     }
@@ -1104,6 +1107,84 @@ impl ScenarioBuilder {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
+        });
+        self
+    }
+
+    /// Convenience: add a task that is a *thread* of an existing task's
+    /// process, rather than a process of its own.
+    ///
+    /// The engine points the new task's `task_struct->group_leader` at
+    /// `leader`, which is what scx_layered's `MATCH_PCOMM_PREFIX` reads. That
+    /// is the whole difference between a worker thread and a process for
+    /// matching purposes: the thread keeps its own `comm` and answers to the
+    /// leader's for `pcomm`.
+    ///
+    /// `leader` must name a task that is itself a thread-group leader; the
+    /// kernel has no nested thread groups and the engine refuses a chain.
+    ///
+    /// Two things come with being a thread rather than a process, and both
+    /// are applied here because omitting either would leave a "thread" in a
+    /// state no real thread is in:
+    ///
+    /// - **the address space**, so wake-affine scheduling sees the pair as
+    ///   related. The leader is given the same `MmId` if it had none.
+    /// - **the cgroup**. Under cgroup v2's default domain mode every thread of
+    ///   a process is in the process's cgroup; only threaded mode, which
+    ///   scxsim does not model, allows otherwise.
+    pub fn add_thread_of(
+        mut self,
+        name: &str,
+        nice: i8,
+        behavior: TaskBehavior,
+        leader: Pid,
+    ) -> Self {
+        // One past the highest MmId in use, so giving a leader an address space
+        // it did not have cannot collide with one a caller chose explicitly
+        // via `add_task_with_mm` — a collision would silently make unrelated
+        // tasks look wake-affine to each other.
+        let fresh_mm = MmId(
+            self.tasks
+                .iter()
+                .filter_map(|t| t.mm_id)
+                .map(|m| m.0 + 1)
+                .max()
+                .unwrap_or(0),
+        );
+        let leader_def = self
+            .tasks
+            .iter_mut()
+            .find(|t| t.pid == leader)
+            .unwrap_or_else(|| panic!("add_thread_of: no task with pid {leader:?} yet"));
+        assert!(
+            leader_def
+                .thread_group_leader
+                .is_none_or(|l| l == leader_def.pid),
+            "add_thread_of: {leader:?} is itself a thread; thread groups do not nest"
+        );
+        let mm_id = *leader_def.mm_id.get_or_insert(fresh_mm);
+        let cgroup_name = leader_def.cgroup_name.clone();
+
+        let pid = self.next_pid;
+        self.next_pid = Pid(pid.0 + 1);
+        self.tasks.push(TaskDef {
+            name: name.to_string(),
+            pid,
+            nice,
+            behavior,
+            start_time_ns: 0,
+            mm_id: Some(mm_id),
+            allowed_cpus: None,
+            parent_pid: None,
+            cgroup_name,
+            task_flags: 0,
+            migration_disabled: 0,
+            thread_group_leader: Some(leader),
+            uid: Uid(0),
+            gid: Gid(0),
         });
         self
     }
@@ -1293,6 +1374,9 @@ impl ScenarioBuilder {
             cgroup_name: Some(cgroup.to_string()),
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         });
         self
     }

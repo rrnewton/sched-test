@@ -57,6 +57,9 @@ fn task_def(name: &str, pid: i32, behavior: TaskBehavior) -> TaskDef {
         cgroup_name: None,
         task_flags: 0,
         migration_disabled: 0,
+        thread_group_leader: None,
+        uid: Uid(0),
+        gid: Gid(0),
     }
 }
 
@@ -73,6 +76,9 @@ fn task_def_at(name: &str, pid: i32, behavior: TaskBehavior, start_ns: TimeNs) -
         cgroup_name: None,
         task_flags: 0,
         migration_disabled: 0,
+        thread_group_leader: None,
+        uid: Uid(0),
+        gid: Gid(0),
     }
 }
 
@@ -89,6 +95,9 @@ fn task_def_pinned(name: &str, pid: i32, behavior: TaskBehavior, cpu: u32) -> Ta
         cgroup_name: None,
         task_flags: 0,
         migration_disabled: 0,
+        thread_group_leader: None,
+        uid: Uid(0),
+        gid: Gid(0),
     }
 }
 
@@ -111,6 +120,9 @@ fn task_def_pinned_at(
         cgroup_name: None,
         task_flags: 0,
         migration_disabled: 0,
+        thread_group_leader: None,
+        uid: Uid(0),
+        gid: Gid(0),
     }
 }
 
@@ -205,6 +217,9 @@ fn test_lavd_futex_op_on_non_running_task_skipped() {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         })
         .futex_event(Pid(2), 10_000_000, FutexOp::WaitAcquired)
         .duration_ms(40)

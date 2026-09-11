@@ -34,6 +34,9 @@ fn test_interleave_smoke() {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         })
         .task(TaskDef {
             name: "t2".into(),
@@ -50,6 +53,9 @@ fn test_interleave_smoke() {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         })
         .duration_ms(50)
         .build();
@@ -94,6 +100,9 @@ fn test_interleave_determinism() {
                 cgroup_name: None,
                 task_flags: 0,
                 migration_disabled: 0,
+                thread_group_leader: None,
+                uid: Uid(0),
+                gid: Gid(0),
             })
             .task(TaskDef {
                 name: "t2".into(),
@@ -110,6 +119,9 @@ fn test_interleave_determinism() {
                 cgroup_name: None,
                 task_flags: 0,
                 migration_disabled: 0,
+                thread_group_leader: None,
+                uid: Uid(0),
+                gid: Gid(0),
             })
             .duration_ms(50)
             .build()
@@ -173,6 +185,9 @@ fn test_interleave_sleep_wake() {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         })
         .task(TaskDef {
             name: "worker".into(),
@@ -189,6 +204,9 @@ fn test_interleave_sleep_wake() {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         })
         .duration_ms(100)
         .build();
@@ -234,6 +252,9 @@ fn test_interleave_single_cpu_noop() {
                 cgroup_name: None,
                 task_flags: 0,
                 migration_disabled: 0,
+                thread_group_leader: None,
+                uid: Uid(0),
+                gid: Gid(0),
             })
             .duration_ms(50)
             .build()
@@ -291,6 +312,9 @@ fn test_interleave_multiple_seeds() {
                 cgroup_name: None,
                 task_flags: 0,
                 migration_disabled: 0,
+                thread_group_leader: None,
+                uid: Uid(0),
+                gid: Gid(0),
             })
             .task(TaskDef {
                 name: "t2".into(),
@@ -307,6 +331,9 @@ fn test_interleave_multiple_seeds() {
                 cgroup_name: None,
                 task_flags: 0,
                 migration_disabled: 0,
+                thread_group_leader: None,
+                uid: Uid(0),
+                gid: Gid(0),
             })
             .task(TaskDef {
                 name: "t3".into(),
@@ -323,6 +350,9 @@ fn test_interleave_multiple_seeds() {
                 cgroup_name: None,
                 task_flags: 0,
                 migration_disabled: 0,
+                thread_group_leader: None,
+                uid: Uid(0),
+                gid: Gid(0),
             })
             .duration_ms(50)
             .build();
@@ -373,6 +403,9 @@ fn preemptive_scenario(nr_cpus: u32, nr_tasks: u32, seed: u32, duration_ms: u64)
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         });
     }
 
@@ -498,6 +531,9 @@ fn test_preemptive_sleep_wake() {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         })
         .task(TaskDef {
             name: "worker".into(),
@@ -514,6 +550,9 @@ fn test_preemptive_sleep_wake() {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         })
         .duration_ms(100)
         .build();
@@ -584,6 +623,9 @@ fn test_batch_concurrent_smoke() {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         })
         .task(TaskDef {
             name: "t2".into(),
@@ -600,6 +642,9 @@ fn test_batch_concurrent_smoke() {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         })
         .task(TaskDef {
             name: "t3".into(),
@@ -616,6 +661,9 @@ fn test_batch_concurrent_smoke() {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         })
         .task(TaskDef {
             name: "t4".into(),
@@ -632,6 +680,9 @@ fn test_batch_concurrent_smoke() {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         })
         .duration_ms(50)
         .build();
@@ -690,6 +741,9 @@ fn test_batch_concurrent_determinism() {
                 cgroup_name: None,
                 task_flags: 0,
                 migration_disabled: 0,
+                thread_group_leader: None,
+                uid: Uid(0),
+                gid: Gid(0),
             })
             .task(TaskDef {
                 name: "t2".into(),
@@ -706,6 +760,9 @@ fn test_batch_concurrent_determinism() {
                 cgroup_name: None,
                 task_flags: 0,
                 migration_disabled: 0,
+                thread_group_leader: None,
+                uid: Uid(0),
+                gid: Gid(0),
             })
             .task(TaskDef {
                 name: "t3".into(),
@@ -722,6 +779,9 @@ fn test_batch_concurrent_determinism() {
                 cgroup_name: None,
                 task_flags: 0,
                 migration_disabled: 0,
+                thread_group_leader: None,
+                uid: Uid(0),
+                gid: Gid(0),
             })
             .task(TaskDef {
                 name: "t4".into(),
@@ -738,6 +798,9 @@ fn test_batch_concurrent_determinism() {
                 cgroup_name: None,
                 task_flags: 0,
                 migration_disabled: 0,
+                thread_group_leader: None,
+                uid: Uid(0),
+                gid: Gid(0),
             })
             .duration_ms(50)
             .build()
@@ -804,6 +867,9 @@ fn test_batch_concurrent_with_dsq_contention() {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         });
     }
 
@@ -846,6 +912,9 @@ fn test_batch_concurrent_preemptive_smoke() {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         })
         .task(TaskDef {
             name: "t2".into(),
@@ -862,6 +931,9 @@ fn test_batch_concurrent_preemptive_smoke() {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         })
         .task(TaskDef {
             name: "t3".into(),
@@ -878,6 +950,9 @@ fn test_batch_concurrent_preemptive_smoke() {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         })
         .task(TaskDef {
             name: "t4".into(),
@@ -894,6 +969,9 @@ fn test_batch_concurrent_preemptive_smoke() {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         })
         .duration_ms(50)
         .build();
@@ -939,6 +1017,9 @@ fn test_preemptive_custom_timeslice() {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         })
         .task(TaskDef {
             name: "t2".into(),
@@ -955,6 +1036,9 @@ fn test_preemptive_custom_timeslice() {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         })
         .duration_ms(50)
         .build();
@@ -1009,6 +1093,9 @@ fn pmu_preemptive_scenario(nr_cpus: u32, nr_tasks: u32, seed: u32, duration_ms: 
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         });
     }
 
@@ -1320,6 +1407,9 @@ fn test_replay_determinism() {
                 cgroup_name: None,
                 task_flags: 0,
                 migration_disabled: 0,
+                thread_group_leader: None,
+                uid: Uid(0),
+                gid: Gid(0),
             });
         }
 

@@ -92,6 +92,12 @@ impl SimTask {
             if def.migration_disabled > 0 {
                 ffi::sim_task_set_migration_disabled(raw, def.migration_disabled);
             }
+            // Credentials. Written unconditionally rather than only for
+            // non-default ids: `sim_task_alloc()` zeroes the cred, so the
+            // default (0, 0) already holds, but writing it keeps the one
+            // authority for the value in `TaskDef` rather than split between
+            // Rust and a calloc.
+            ffi::sim_task_set_cred_ids(raw, def.uid.0, def.gid.0);
         }
 
         // Initialize run_remaining from the first CPU-consuming phase.

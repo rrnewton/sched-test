@@ -557,6 +557,55 @@ fn command_exists(cmd: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Reject a task carrying state stock rt-app cannot reproduce.
+///
+/// Every one of these is something scxsim can drive a layer match from, so a
+/// silent drop turns "this config classified my workload" into a claim about a
+/// run that never happened.
+fn refuse_unrepresentable_attributes(task: &scx_simulator::TaskDef) -> Result<(), String> {
+    let refuse = |what: &str, why: &str| -> Result<(), String> {
+        Err(format!(
+            "task {:?} carries {what}, which stock rt-app has no syntax for: {why}. \
+             Refusing to emit a spec that would run as a different workload; see the \
+             rt-app++ section of scx_simulator::rtapp.",
+            task.name
+        ))
+    };
+
+    if task.thread_group_leader.is_some_and(|l| l != task.pid) {
+        return refuse(
+            "a thread-group membership (thread_of)",
+            "rt-app runs every task as a pthread of one process whose comm is `rt-app`, so \
+             the exported spec would give every task the same pcomm rather than this one",
+        );
+    }
+    if task.uid.0 != 0 || task.gid.0 != 0 {
+        return refuse(
+            "a non-root uid/gid",
+            "rt-app runs every thread under the invoking user's credentials",
+        );
+    }
+    if task.task_flags != 0 {
+        return refuse(
+            "task_struct flags (e.g. PF_KTHREAD)",
+            "rt-app creates ordinary user threads and cannot set PF_* flags",
+        );
+    }
+    if task.parent_pid.is_some_and(|parent| parent != task.pid) {
+        return refuse(
+            "an explicit parent",
+            "every rt-app thread has the same real_parent, the shell that launched rt-app",
+        );
+    }
+    if task.migration_disabled > 0 {
+        return refuse(
+            "a migration_disabled count",
+            "only the kernel raises this; no rt-app spec can",
+        );
+    }
+    Ok(())
+}
+
 /// Generate an rt-app JSON workload file from a scenario.
 ///
 /// This is the reverse of `load_rtapp`: given a parsed Scenario, generate
@@ -565,6 +614,14 @@ fn command_exists(cmd: &str) -> bool {
 /// Note: This is a simplified generator that may not preserve all rt-app
 /// features, but it handles the common run/sleep/wake patterns used in
 /// simulation testing.
+///
+/// It **refuses** rather than emitting a spec that means something different
+/// on real hardware. `Phase::SystemCpu` was the first such refusal; the
+/// rt-app++ identity attributes are the rest, because stock rt-app has no
+/// syntax for any of them (see [`RTAPP_PP_KEYS`]) and a silently-dropped
+/// attribute is a rule that matched in simulation and misses for real.
+///
+/// [`RTAPP_PP_KEYS`]: scx_simulator::RTAPP_PP_KEYS
 #[allow(dead_code)]
 pub fn scenario_to_rtapp_json(scenario: &scx_simulator::Scenario) -> Result<String, String> {
     use scx_simulator::Phase;
@@ -581,10 +638,25 @@ pub fn scenario_to_rtapp_json(scenario: &scx_simulator::Scenario) -> Result<Stri
     }
 
     for task in &scenario.tasks {
+        refuse_unrepresentable_attributes(task)?;
+
         let mut task_obj = Map::new();
 
         // Set priority (nice value)
         task_obj.insert("priority".into(), json!(task.nice as i64));
+
+        // Cgroup membership. rt-app has a `taskgroup` key and reproduces this
+        // for real; emitting nothing here (as this did until the rt-app++
+        // work) meant an exported spec ran with no cgroups at all, so every
+        // cgroup match rule that fired in simulation missed on hardware.
+        if let Some(ref cgroup) = task.cgroup_name {
+            task_obj.insert("taskgroup".into(), json!(cgroup));
+        }
+
+        // Start delay. rt-app's `delay` is microseconds before the first loop.
+        if task.start_time_ns > 0 {
+            task_obj.insert("delay".into(), json!(task.start_time_ns / 1_000));
+        }
 
         // Set loop count
         let loop_count: i64 = match task.behavior.repeat {
@@ -725,6 +797,106 @@ mod tests {
         assert!(err.contains("refusing"));
     }
 
+    /// Cgroup membership survives the round trip.
+    ///
+    /// It did not until the rt-app++ work: the exporter emitted
+    /// priority/loop/cpus and the events, and nothing else. A scenario built
+    /// from a `taskgroup` spec therefore exported to a spec with NO
+    /// taskgroups, so every cgroup rule that fired in simulation missed on the
+    /// real run — silently, because rt-app is perfectly happy to run tasks in
+    /// the root cgroup. Cgroup path is the most-written match kind in the
+    /// deployed corpus.
+    #[test]
+    fn export_preserves_cgroup_membership() {
+        let scenario = Scenario::builder()
+            .cpus(2)
+            .cgroup("/prod/frontend", &[CpuId(0), CpuId(1)])
+            .add_task_in_cgroup(
+                "frontendd",
+                0,
+                TaskBehavior {
+                    phases: vec![Phase::Run(1_000_000)],
+                    repeat: RepeatMode::Once,
+                },
+                "/prod/frontend",
+            )
+            .duration_ms(10)
+            .build();
+        let json = scenario_to_rtapp_json(&scenario).expect("exports");
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed["tasks"]["frontendd"]["taskgroup"],
+            serde_json::json!("/prod/frontend"),
+            "exported spec must carry the taskgroup, or the real run has no cgroups: {json}"
+        );
+    }
+
+    /// The exporter refuses every rt-app++ attribute rather than dropping it.
+    ///
+    /// Each of these drives a layer match in simulation and has no stock
+    /// rt-app counterpart, so emitting a spec without it would hand someone a
+    /// file that runs a measurably different workload under the same name.
+    /// Same discipline as the `SystemCpu` refusal above.
+    #[test]
+    fn export_refuses_every_rtapp_pp_attribute() {
+        let base = || TaskBehavior {
+            phases: vec![Phase::Run(1_000_000)],
+            repeat: RepeatMode::Once,
+        };
+        /// One case: the rt-app++ key, the mutation that sets it, and the
+        /// phrase the refusal must contain.
+        type Case = (&'static str, fn(&mut TaskDef), &'static str);
+        let mutate: [Case; 5] = [
+            (
+                "thread_of",
+                |t| t.thread_group_leader = Some(Pid(1)),
+                "thread-group membership",
+            ),
+            ("uid", |t| t.uid = Uid(4711), "non-root uid/gid"),
+            ("gid", |t| t.gid = Gid(1000), "non-root uid/gid"),
+            (
+                "kthread",
+                |t| t.task_flags = 0x0020_0000,
+                "task_struct flags",
+            ),
+            (
+                "parent",
+                |t| t.parent_pid = Some(Pid(1)),
+                "an explicit parent",
+            ),
+        ];
+        for (key, apply, needle) in mutate {
+            let mut scenario = Scenario::builder()
+                .cpus(2)
+                .add_task("leader", 0, base())
+                .add_task("worker", 0, base())
+                .duration_ms(10)
+                .build();
+            let worker = scenario
+                .tasks
+                .iter_mut()
+                .find(|t| t.name == "worker")
+                .unwrap();
+            apply(worker);
+
+            let err = scenario_to_rtapp_json(&scenario).unwrap_err();
+            assert!(
+                err.contains(needle) && err.contains("worker"),
+                "{key}: the refusal must name the attribute and the task; got: {err}"
+            );
+        }
+
+        // And the control: the same scenario with none of them exports fine,
+        // so the refusals above are not just "this builder never exports".
+        let clean = Scenario::builder()
+            .cpus(2)
+            .add_task("leader", 0, base())
+            .add_task("worker", 0, base())
+            .duration_ms(10)
+            .build();
+        scenario_to_rtapp_json(&clean).expect("a plain scenario still exports");
+    }
+
     #[test]
     fn test_scenario_to_rtapp_json_ping_pong() {
         let (ping_b, pong_b) = workloads::ping_pong(Pid(1), Pid(2), 500_000);
@@ -742,6 +914,9 @@ mod tests {
                 cgroup_name: None,
                 task_flags: 0,
                 migration_disabled: 0,
+                thread_group_leader: None,
+                uid: Uid(0),
+                gid: Gid(0),
             })
             .task(TaskDef {
                 name: "pong".into(),
@@ -755,6 +930,9 @@ mod tests {
                 cgroup_name: None,
                 task_flags: 0,
                 migration_disabled: 0,
+                thread_group_leader: None,
+                uid: Uid(0),
+                gid: Gid(0),
             })
             .duration_ms(1000)
             .build();

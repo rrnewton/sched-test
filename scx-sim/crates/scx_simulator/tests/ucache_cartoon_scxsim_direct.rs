@@ -120,6 +120,9 @@ fn build_scenario_inner(with_irq: bool, with_nice_hints: bool) -> Scenario {
         cgroup_name: None,
         task_flags: 0,
         migration_disabled: 0,
+        thread_group_leader: None,
+        uid: Uid(0),
+        gid: Gid(0),
     });
 
     // --- ucache_workers (8): run(250us) + sleep(110us) = 69% util ---
@@ -140,6 +143,9 @@ fn build_scenario_inner(with_irq: bool, with_nice_hints: bool) -> Scenario {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         });
     }
 
@@ -161,6 +167,9 @@ fn build_scenario_inner(with_irq: bool, with_nice_hints: bool) -> Scenario {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         });
     }
 
@@ -183,6 +192,9 @@ fn build_scenario_inner(with_irq: bool, with_nice_hints: bool) -> Scenario {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         });
     }
 
@@ -203,6 +215,9 @@ fn build_scenario_inner(with_irq: bool, with_nice_hints: bool) -> Scenario {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         });
     }
 
@@ -871,6 +886,9 @@ fn build_calibrated_scenario() -> Scenario {
         cgroup_name: None,
         task_flags: 0,
         migration_disabled: 0,
+        thread_group_leader: None,
+        uid: Uid(0),
+        gid: Gid(0),
     });
 
     for i in 0..CAL_NUM_WORKERS {
@@ -892,6 +910,9 @@ fn build_calibrated_scenario() -> Scenario {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         });
     }
 
@@ -914,6 +935,9 @@ fn build_calibrated_scenario() -> Scenario {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         });
     }
 
@@ -936,6 +960,9 @@ fn build_calibrated_scenario() -> Scenario {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         });
     }
 
@@ -1333,6 +1360,9 @@ fn build_hubspoke_scenario(with_nice_hints: bool) -> Scenario {
         cgroup_name: None,
         task_flags: 0,
         migration_disabled: 0,
+        thread_group_leader: None,
+        uid: Uid(0),
+        gid: Gid(0),
     });
 
     // Hub_0: wakes both reader and writer
@@ -1356,6 +1386,9 @@ fn build_hubspoke_scenario(with_nice_hints: bool) -> Scenario {
         cgroup_name: None,
         task_flags: 0,
         migration_disabled: 0,
+        thread_group_leader: None,
+        uid: Uid(0),
+        gid: Gid(0),
     });
 
     // Hub_1: wakes writer only (gives writer 2x wake sources)
@@ -1378,6 +1411,9 @@ fn build_hubspoke_scenario(with_nice_hints: bool) -> Scenario {
         cgroup_name: None,
         task_flags: 0,
         migration_disabled: 0,
+        thread_group_leader: None,
+        uid: Uid(0),
+        gid: Gid(0),
     });
 
     // Remaining workers: independent run/sleep
@@ -1397,6 +1433,9 @@ fn build_hubspoke_scenario(with_nice_hints: bool) -> Scenario {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         });
     }
 
@@ -1416,6 +1455,9 @@ fn build_hubspoke_scenario(with_nice_hints: bool) -> Scenario {
         cgroup_name: None,
         task_flags: 0,
         migration_disabled: 0,
+        thread_group_leader: None,
+        uid: Uid(0),
+        gid: Gid(0),
     });
 
     // Navy writer
@@ -1434,6 +1476,9 @@ fn build_hubspoke_scenario(with_nice_hints: bool) -> Scenario {
         cgroup_name: None,
         task_flags: 0,
         migration_disabled: 0,
+        thread_group_leader: None,
+        uid: Uid(0),
+        gid: Gid(0),
     });
 
     // Background hogs
@@ -1453,6 +1498,9 @@ fn build_hubspoke_scenario(with_nice_hints: bool) -> Scenario {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         });
     }
 

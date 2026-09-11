@@ -57,6 +57,24 @@ impl DsqId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MmId(pub u32);
 
+/// User identifier — the `val` of the kernel's `kuid_t`.
+///
+/// Published into `task_struct->real_cred->{uid,euid}`. scx_layered's
+/// `MATCH_USER_ID_EQUALS` compares against `euid`.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord, Serialize, Deserialize,
+)]
+pub struct Uid(pub u32);
+
+/// Group identifier — the `val` of the kernel's `kgid_t`.
+///
+/// Published into `task_struct->real_cred->{gid,egid}`. scx_layered's
+/// `MATCH_GROUP_ID_EQUALS` compares against `egid`.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, PartialOrd, Ord, Serialize, Deserialize,
+)]
+pub struct Gid(pub u32);
+
 /// Bitflags for `scx_bpf_kick_cpu` matching kernel `scx_kick_flags`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KickFlags(u64);

@@ -183,8 +183,8 @@ fn executes_on_the_simulator_and_produces_comparable_output() {
 #[test]
 fn resolved_storage_profile_requires_the_calibration_scheduler() {
     use scx_simulator::{
-        DynamicScheduler, ExitKind, Phase as SimPhase, Pid, RepeatMode, Scenario, Simulator,
-        TaskBehavior, TaskDef, TraceKind,
+        DynamicScheduler, ExitKind, Gid, Phase as SimPhase, Pid, RepeatMode, Scenario, Simulator,
+        TaskBehavior, TaskDef, TraceKind, Uid,
     };
 
     let _guard = scx_simulator::SIM_LOCK
@@ -316,6 +316,9 @@ fn resolved_storage_profile_requires_the_calibration_scheduler() {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         })
         .build();
     // Isolate the tagged phase invariant from optional simulator timing
@@ -375,6 +378,9 @@ fn resolved_storage_profile_requires_the_calibration_scheduler() {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         })
         .build();
     truncated.noise.enabled = false;

@@ -24,6 +24,9 @@ fn test_noise_disabled_instant_timing() {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         })
         .duration_ms(100)
         .build();
@@ -59,6 +62,9 @@ fn test_tick_jitter_varies_intervals() {
             cgroup_name: None,
             task_flags: 0,
             migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
         })
         .duration_ms(50)
         .build();
@@ -127,6 +133,9 @@ fn test_csw_overhead_consumed() {
                 cgroup_name: None,
                 task_flags: 0,
                 migration_disabled: 0,
+                thread_group_leader: None,
+                uid: Uid(0),
+                gid: Gid(0),
             },
             TaskDef {
                 name: "t2".into(),
@@ -143,6 +152,9 @@ fn test_csw_overhead_consumed() {
                 cgroup_name: None,
                 task_flags: 0,
                 migration_disabled: 0,
+                thread_group_leader: None,
+                uid: Uid(0),
+                gid: Gid(0),
             },
         ]
     };
@@ -220,6 +232,9 @@ fn test_noise_determinism() {
                 cgroup_name: None,
                 task_flags: 0,
                 migration_disabled: 0,
+                thread_group_leader: None,
+                uid: Uid(0),
+                gid: Gid(0),
             })
             .task(TaskDef {
                 name: "t2".into(),
@@ -236,6 +251,9 @@ fn test_noise_determinism() {
                 cgroup_name: None,
                 task_flags: 0,
                 migration_disabled: 0,
+                thread_group_leader: None,
+                uid: Uid(0),
+                gid: Gid(0),
             })
             .duration_ms(50)
             .build()
