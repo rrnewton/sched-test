@@ -1,8 +1,8 @@
 # Independent alarm for scx submodule pin staleness.
 #
-# DELIBERATELY STANDALONE. This workflow shares nothing with
-# `.github/workflows/sync-upstream.yml` — no job, no branch, no secret, no
-# trigger. That separation is the entire point:
+# DELIBERATELY STANDALONE. This workflow has its own job and requires no sync
+# secret or successful sync run. The nightly carrier dispatches it independently
+# of sync-upstream.yml, and relevant integration pushes also trigger it:
 #
 #     A MONITOR MUST NOT DEPEND ON THE THING IT MONITORS.
 #
@@ -18,10 +18,8 @@
 name: scx pin staleness
 
 on:
-  schedule:
-    # 07:00 UTC daily. Independent of the sync job's 04:00 cron on purpose: if
-    # they shared a schedule, one runner-wide outage would silence both.
-    - cron: '0 7 * * *'
+  # The carrier on main dispatches this nightly against integration. A second
+  # schedule here would inspect main as well after every integration import.
   workflow_dispatch:
   push:
     branches: ['integration']

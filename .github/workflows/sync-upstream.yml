@@ -1,15 +1,20 @@
 name: Sync Upstream SCX
 
 on:
-  schedule:
-    # NOTE: this cron does NOT fire. GitHub schedules only from the DEFAULT
-    # branch (main), and this file lives on integration. It is kept because it
-    # documents the intended cadence; the cron that actually fires is in
-    # .github/workflows/scheduled-dispatch.yml ON MAIN, which dispatches this
-    # workflow against integration. See CLAUDE.md, "a schedule: on an
-    # integration workflow will NEVER run".
-    - cron: '0 4 * * *'  # Nightly at 4 AM UTC (via the carrier on main)
-  workflow_dispatch:      # Manual trigger, and how the carrier reaches this
+  # scheduled-dispatch.yml on main is the sole nightly trigger. Keeping a
+  # schedule here too would run the same sync twice after an integration import.
+  workflow_dispatch:
+    inputs:
+      force_sync:
+        description: 'Force sync even if no new upstream commits'
+        required: false
+        default: false
+        type: boolean
+      source_branch:
+        description: 'Source branch to base the sync on (overrides default)'
+        required: false
+        default: ''
+        type: string
   push:
     # REGISTRATION ONLY -- deliberately the narrowest possible filter: this file
     # and nothing else.
@@ -28,17 +33,6 @@ on:
     branches: ['integration']
     paths:
       - '.github/workflows/sync-upstream.yml'
-    inputs:
-      force_sync:
-        description: 'Force sync even if no new upstream commits'
-        required: false
-        default: 'false'
-        type: boolean
-      source_branch:
-        description: 'Source branch to base the sync on (overrides default)'
-        required: false
-        default: ''
-        type: string
 
 permissions:
   contents: read
@@ -47,8 +41,7 @@ permissions:
 # development tip is `integration`, not `main`. Override per-run with the
 # workflow_dispatch `source_branch` input.
 env:
-  # sched-test is all-INTEGRATION: nothing lands on main (unresolved fbsource
-  # import problems), so the sync bases on and targets `integration`.
+  # Development continues on integration between imports to main.
   DEFAULT_SOURCE_BRANCH: integration
 
 jobs:
@@ -94,9 +87,9 @@ jobs:
         id: config
         run: |
           if [ -n "${{ inputs.source_branch }}" ]; then
-            echo "source_branch=${{ inputs.source_branch }}" >> $GITHUB_OUTPUT
+            echo "source_branch=${{ inputs.source_branch }}" >> "$GITHUB_OUTPUT"
           else
-            echo "source_branch=${{ env.DEFAULT_SOURCE_BRANCH }}" >> $GITHUB_OUTPUT
+            echo "source_branch=${{ env.DEFAULT_SOURCE_BRANCH }}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Checkout repository
@@ -115,18 +108,20 @@ jobs:
           git fetch origin main
           LATEST=$(git rev-parse origin/main)
 
-          echo "current_commit=$CURRENT" >> $GITHUB_OUTPUT
-          echo "latest_commit=$LATEST" >> $GITHUB_OUTPUT
-          echo "current_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
-          echo "latest_short=$(git rev-parse --short origin/main)" >> $GITHUB_OUTPUT
+          {
+            echo "current_commit=$CURRENT"
+            echo "latest_commit=$LATEST"
+            echo "current_short=$(git rev-parse --short HEAD)"
+            echo "latest_short=$(git rev-parse --short origin/main)"
+          } >> "$GITHUB_OUTPUT"
 
           if [ "$CURRENT" != "$LATEST" ] || [ "${{ inputs.force_sync }}" == "true" ]; then
-            echo "has_changes=true" >> $GITHUB_OUTPUT
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
             COMMIT_COUNT=$(git rev-list --count HEAD..origin/main)
-            echo "commit_count=$COMMIT_COUNT" >> $GITHUB_OUTPUT
+            echo "commit_count=$COMMIT_COUNT" >> "$GITHUB_OUTPUT"
             echo "::notice::$COMMIT_COUNT new upstream commits: $CURRENT..$LATEST"
           else
-            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
             echo "::notice::No new upstream commits"
           fi
 
@@ -148,7 +143,7 @@ jobs:
           # correct behaviour, spurious trigger.
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git checkout -b $WORK_BRANCH
+          git checkout -b "$WORK_BRANCH"
 
           # Update the submodule to upstream main, REPLAYING any local commits
           # carried on the pin. The pin is routinely NOT an ancestor of upstream
@@ -164,7 +159,7 @@ jobs:
             echo "::notice::scx pin carries $LOCAL local commit(s); rebasing onto upstream main."
             git log --oneline origin/main.."$PIN"
             git checkout --detach "$PIN"
-            if ! git rebase --onto origin/main $(git merge-base "$PIN" origin/main) "$PIN"; then
+            if ! git rebase --onto origin/main "$(git merge-base "$PIN" origin/main)" "$PIN"; then
               git rebase --abort || true
               echo "::error::Local scx commits do not rebase cleanly onto upstream main." \
                    "Refusing to drop them. Resolve this submodule pin by hand."
@@ -187,8 +182,8 @@ jobs:
           EOF
           )"
 
-          echo "WORK_BRANCH=$WORK_BRANCH" >> $GITHUB_ENV
-          echo "SYNC_DATE=$DATE" >> $GITHUB_ENV
+          echo "WORK_BRANCH=$WORK_BRANCH" >> "$GITHUB_ENV"
+          echo "SYNC_DATE=$DATE" >> "$GITHUB_ENV"
 
       - name: Install system dependencies
         if: steps.check.outputs.has_changes == 'true'
@@ -224,7 +219,7 @@ jobs:
 
       - name: Install cargo-nextest
         if: steps.check.outputs.has_changes == 'true'
-        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
 
       - name: Cache Cargo artifacts
         if: steps.check.outputs.has_changes == 'true'
@@ -281,7 +276,7 @@ jobs:
             # directly: `integration` is the branch every agent lands onto.
             # A PR is the only shape that both reaches integration and keeps a
             # human in the loop for a submodule bump that can break the build.
-            git push origin $WORK_BRANCH
+            git push origin "$WORK_BRANCH"
             gh pr create \
               --base "${{ steps.config.outputs.source_branch }}" \
               --head "$WORK_BRANCH" \
@@ -300,26 +295,26 @@ jobs:
             # Ensure WHY_THIS_BRANCH_IS_BROKEN.md exists for failed syncs
             if [ ! -f WHY_THIS_BRANCH_IS_BROKEN.md ]; then
               cat > WHY_THIS_BRANCH_IS_BROKEN.md <<BROKENEOF
-            # Why This Branch Is Broken
+          # Why This Branch Is Broken
 
-            **Date**: $(date +%Y-%m-%d)
-            **Upstream commit**: ${{ steps.check.outputs.latest_commit }}
-            **Previous commit**: ${{ steps.check.outputs.current_commit }}
+          **Date**: $(date +%Y-%m-%d)
+          **Upstream commit**: ${{ steps.check.outputs.latest_commit }}
+          **Previous commit**: ${{ steps.check.outputs.current_commit }}
 
-            ## Status
+          ## Status
 
-            The automated sync process did not report SUCCESS.
-            Check the GitHub Actions log for details.
+          The automated sync process did not report SUCCESS.
+          Check the GitHub Actions log for details.
 
-            See the commit history on this branch for any partial fixes applied.
-            BROKENEOF
+          See the commit history on this branch for any partial fixes applied.
+          BROKENEOF
               git add WHY_THIS_BRANCH_IS_BROKEN.md
               git commit -m "Add WHY_THIS_BRANCH_IS_BROKEN.md for failed sync" || true
             fi
 
             # Push the dated failure branch
             FAIL_BRANCH="sync-failed-${SYNC_DATE}"
-            git branch -M $WORK_BRANCH $FAIL_BRANCH
-            git push origin $FAIL_BRANCH
+            git branch -M "$WORK_BRANCH" "$FAIL_BRANCH"
+            git push origin "$FAIL_BRANCH"
             echo "::warning::Failed sync branch pushed as $FAIL_BRANCH"
           fi

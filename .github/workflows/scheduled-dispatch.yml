@@ -1,0 +1,47 @@
+# Cron carrier for workflows that live on `integration`.
+#
+# GitHub schedules `on: schedule:` ONLY from the repository's DEFAULT BRANCH.
+# The default branch is main; development continues on integration between
+# imports to main. Explicit dispatch keeps these checks on the development tip.
+#
+# This is the sole nightly trigger for its matrix entries. The dispatched
+# workflows must not also declare a schedule, which would start duplicate runs
+# after an import to main. Keep the carrier to a list of targets and a dispatch
+# call; job logic belongs in the dispatched workflows.
+#
+# Add a new nightly job's filename to the matrix below and declare
+# workflow_dispatch in that workflow. The carrier update must reach main before
+# its schedule can dispatch the new job.
+#
+# This is one of two independent paths. `scx-pin-staleness.yml` also triggers on
+# relevant pushes to `integration`, so if this dispatcher breaks, those pushes
+# still catch drift; and if pushes stop — which is exactly when drift
+# accumulates unnoticed — this cron still fires. Neither failing silences the
+# other.
+name: scheduled dispatch
+
+on:
+  schedule:
+    # 04:10 UTC daily. Single cron on purpose: one carrier, no scheduling logic
+    # on a branch nobody reads.
+    - cron: '10 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  actions: write   # required to dispatch workflows on another ref
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false   # one unreachable target must not silence the others
+      matrix:
+        workflow:
+          - sync-upstream.yml
+          - scx-pin-staleness.yml
+    steps:
+      - name: Dispatch ${{ matrix.workflow }} on integration
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run "${{ matrix.workflow }}" --repo "${{ github.repository }}" --ref integration
