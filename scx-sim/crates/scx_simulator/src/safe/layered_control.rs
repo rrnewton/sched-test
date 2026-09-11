@@ -61,6 +61,8 @@ pub struct LayeredControl {
     layer_node_pinned_utils: Vec<Vec<f64>>,
     core_cpus: Vec<Vec<usize>>,
     core_nodes: Vec<usize>,
+    /// Per-core LLC id, the `llcs` half of upstream's `Layer::allowed_cpus`.
+    core_llcs: Vec<usize>,
     llc_nodes: Vec<usize>,
     core_orders: Vec<Vec<Vec<usize>>>,
     node_orders: Vec<Vec<usize>>,
@@ -186,10 +188,15 @@ impl LayeredControl {
             .values()
             .map(|core| core.cpus.keys().copied().collect())
             .collect();
-        let core_nodes = topology
+        let core_nodes: Vec<usize> = topology
             .all_cores
             .values()
             .map(|core| core.node_id)
+            .collect();
+        let core_llcs: Vec<usize> = topology
+            .all_cores
+            .values()
+            .map(|core| core.llc_id)
             .collect();
         let llc_nodes = (0..nr_llcs)
             .map(|llc| {
@@ -216,6 +223,7 @@ impl LayeredControl {
             layer_node_pinned_utils: vec![vec![0.0; nr_nodes]; nr_layers],
             core_cpus,
             core_nodes,
+            core_llcs,
             llc_nodes,
             core_orders,
             node_orders,
@@ -500,6 +508,23 @@ impl LayeredControl {
         spec.nodes.contains(&node) || spec.llcs.iter().any(|&llc| self.llc_nodes[llc] == node)
     }
 
+    /// Upstream's `Layer::allowed_cpus` (`main.rs::Layer::new`, 1506-1610),
+    /// asked one core at a time because allocation here happens in core units.
+    ///
+    /// A layer with neither `nodes` nor `llcs` is `allowed_cpus.set_all()`;
+    /// otherwise the union of the named nodes' CPUs and the named LLCs' CPUs.
+    /// Upstream intersects this into the grow candidates (`main.rs:3925`,
+    /// `layer.allowed_cpus.and(node_span)`) and into the open-layer remainder
+    /// (`main.rs:4073`, `available_cpus().and(&layer.allowed_cpus)`). Neither
+    /// intersection was ported, so a node- or LLC-restricted layer could be
+    /// grown onto CPUs its config forbids.
+    fn core_allowed(&self, spec: &LayerSpec, core: usize) -> bool {
+        if spec.nodes.is_empty() && spec.llcs.is_empty() {
+            return true;
+        }
+        spec.nodes.contains(&self.core_nodes[core]) || spec.llcs.contains(&self.core_llcs[core])
+    }
+
     fn node_cpu_counts(&self, masks: &[Vec<bool>]) -> Vec<Vec<usize>> {
         masks
             .iter()
@@ -590,6 +615,14 @@ impl LayeredControl {
                     if to_grow == 0 {
                         break;
                     }
+                    // Upstream grows from `alloc_cpus(&node_allowed, ...)`
+                    // where `node_allowed = layer.allowed_cpus.and(node_span)`
+                    // (main.rs:3925). `core_order` alone is not that filter:
+                    // it honours `nodes` but NOT `llcs`, so an LLC-restricted
+                    // layer was reachable on any core of any node.
+                    if !self.core_allowed(&self.specs[idx], core) {
+                        continue;
+                    }
                     if available[core] {
                         for &cpu in &self.core_cpus[core] {
                             masks[idx][cpu] = true;
@@ -598,7 +631,14 @@ impl LayeredControl {
                         to_grow = to_grow.saturating_sub(self.threads_per_core);
                     }
                 }
-                assert_eq!(to_grow, 0, "allocator target exceeds available cores");
+                // A layer whose allowed cores are all taken simply does not
+                // reach its target, exactly as upstream's `alloc_cpus`
+                // returning `None` breaks its while loop (main.rs:3946-3952).
+                // Only an UNRESTRICTED layer failing to grow indicates the
+                // allocator asked for more than the machine has.
+                if self.specs[idx].nodes.is_empty() && self.specs[idx].llcs.is_empty() {
+                    assert_eq!(to_grow, 0, "allocator target exceeds available cores");
+                }
             }
         }
 
@@ -606,7 +646,11 @@ impl LayeredControl {
             if spec.kind == LayerKind::Open {
                 masks[idx].fill(false);
                 for (core, &is_available) in available.iter().enumerate() {
-                    if is_available {
+                    // main.rs:4073 — `available_cpus().and(&layer.allowed_cpus)`.
+                    // The `available_cpus()` half was ported; the
+                    // `allowed_cpus` half was not, so an open layer with an
+                    // affinity took the whole free pool.
+                    if is_available && self.core_allowed(spec, core) {
                         for &cpu in &self.core_cpus[core] {
                             masks[idx][cpu] = true;
                         }

@@ -1728,6 +1728,7 @@ impl DynamicScheduler {
         type AddMatchFn = unsafe extern "C" fn(u32, u32, i32, *const i8, i64, i64, i32) -> i32;
         type SetNrOrsFn = unsafe extern "C" fn(u32, u32) -> i32;
         type SetCpusFn = unsafe extern "C" fn(u32, *const u64, u32) -> i32;
+        type SetAffinityFn = unsafe extern "C" fn(u32, *const u64, u32, *const u64, u32) -> i32;
         type SetFieldFn = unsafe extern "C" fn(u32, i32, u64) -> i32;
 
         // SAFETY: Symbols resolved from a `.so` built by our build system.
@@ -1753,6 +1754,10 @@ impl DynamicScheduler {
                 ._lib
                 .get(b"layered_set_layer_cpus")
                 .expect("layered_set_layer_cpus not found");
+            let set_affinity: libloading::Symbol<SetAffinityFn> = self
+                ._lib
+                .get(b"layered_set_layer_affinity")
+                .expect("layered_set_layer_affinity not found");
             let set_field: libloading::Symbol<SetFieldFn> = self
                 ._lib
                 .get(b"layered_set_layer_field")
@@ -1816,6 +1821,32 @@ impl DynamicScheduler {
                 // explicitly or the layer would match nothing at all.
                 let rc = (set_nr_ors)(id, spec.matches.len() as u32);
                 assert_eq!(rc, 0, "layered_set_layer_nr_match_ors failed with rc={rc}");
+
+                // `nodes` / `llcs` are upstream's `allowed_cpus` input, and the
+                // static allocation needs them: without this call every layer's
+                // slice comes off the front of the machine whatever affinity the
+                // config declared. Published unconditionally, so clearing an
+                // affinity is expressible and not just setting one.
+                {
+                    let mut node_words = [0u64; 1];
+                    for &n in &spec.nodes {
+                        assert!(n < 64, "node id {n} exceeds the affinity bitmap");
+                        node_words[0] |= 1u64 << n;
+                    }
+                    let mut llc_words = [0u64; 1];
+                    for &l in &spec.llcs {
+                        assert!(l < 64, "llc id {l} exceeds the affinity bitmap");
+                        llc_words[0] |= 1u64 << l;
+                    }
+                    let rc = (set_affinity)(
+                        id,
+                        node_words.as_ptr(),
+                        node_words.len() as u32,
+                        llc_words.as_ptr(),
+                        llc_words.len() as u32,
+                    );
+                    assert_eq!(rc, 0, "layered_set_layer_affinity failed with rc={rc}");
+                }
 
                 if let Some(cpus) = &spec.cpus {
                     let mut words = [0u64; 8];

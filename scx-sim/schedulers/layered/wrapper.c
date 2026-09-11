@@ -1802,6 +1802,28 @@ static void layered_fill_one_order(u32 *dst, const u32 *src, u32 n, u32 cpu)
 static bool layered_layer_cpus_explicit[MAX_LAYERS];
 static u64 layered_layer_cpu_words[MAX_LAYERS][MAX_CPUS / 64];
 
+/*
+ * Per-layer `nodes` / `llcs` affinity — upstream's `allowed_cpus` input.
+ *
+ * scx_layered's README: "Layer affinities can be defined using the `nodes` or
+ * `llcs` layer configs. This allows for RESTRICTING a layer to a NUMA node or
+ * LLC." `layer_core_growth.rs::node_order` says the same in code terms:
+ * "spec_nodes if set (hard limit)".
+ *
+ * Upstream keeps the resolved set in USERSPACE, as `Layer::allowed_cpus`
+ * (main.rs:1447, built in `Layer::new` at 1506-1610), and intersects it at
+ * every allocation site (main.rs:3250, 3619, 3657, 3925, 4073). It is not in
+ * `struct layer`, so the BPF side never sees it — only the resulting `cpus`
+ * mask. This wrapper is the userspace side here, so it keeps it too.
+ *
+ * Stored as the raw node/LLC ids rather than a resolved cpumask because the
+ * topology may be published after the layers are added; the resolution happens
+ * in `layered_auto_allocate_cpus()`, which runs at init when both are known.
+ */
+static u64 layered_layer_node_bits[MAX_LAYERS][(MAX_NUMA_NODES + 63) / 64];
+static u64 layered_layer_llc_bits[MAX_LAYERS][(MAX_LLCS + 63) / 64];
+static bool layered_layer_has_affinity[MAX_LAYERS];
+
 static void layered_layer_set_cpu(u32 layer_id, u32 cpu)
 {
 	layered_layer_cpu_words[layer_id][cpu / 64] |= 1ULL << (cpu % 64);
@@ -1810,6 +1832,31 @@ static void layered_layer_set_cpu(u32 layer_id, u32 cpu)
 static bool layered_layer_test_cpu(u32 layer_id, u32 cpu)
 {
 	return !!(layered_layer_cpu_words[layer_id][cpu / 64] & (1ULL << (cpu % 64)));
+}
+
+/*
+ * Is `cpu` in layer `id`'s allowed set? Mirrors `Layer::new`'s construction of
+ * `allowed_cpus`: a layer with neither `nodes` nor `llcs` gets `set_all()`;
+ * otherwise the union of the named nodes' CPUs and the named LLCs' CPUs.
+ */
+static bool layered_layer_cpu_allowed(u32 id, u32 cpu)
+{
+	u32 node, llc;
+
+	if (!layered_layer_has_affinity[id])
+		return true;
+
+	node = layered_cpu_node(cpu);
+	if (node < MAX_NUMA_NODES &&
+	    (layered_layer_node_bits[id][node / 64] & (1ULL << (node % 64))))
+		return true;
+
+	llc = layered_cpu_llc(cpu);
+	if (llc < MAX_LLCS &&
+	    (layered_layer_llc_bits[id][llc / 64] & (1ULL << (llc % 64))))
+		return true;
+
+	return false;
 }
 
 /* ---------------------------------------------------------------------------
@@ -1854,6 +1901,11 @@ static void layered_reset_layers_internal(void)
 		layered_layer_cpus_explicit[i] = false;
 		memset(layered_layer_cpu_words[i], 0,
 		       sizeof(layered_layer_cpu_words[i]));
+		layered_layer_has_affinity[i] = false;
+		memset(layered_layer_node_bits[i], 0,
+		       sizeof(layered_layer_node_bits[i]));
+		memset(layered_layer_llc_bits[i], 0,
+		       sizeof(layered_layer_llc_bits[i]));
 	}
 	nr_layers = 0;
 }
@@ -2235,6 +2287,57 @@ int layered_set_layer_cpus(unsigned int layer_id, const unsigned long long *word
 }
 
 /*
+ * Publish a layer's `nodes` / `llcs` affinity — the input from which upstream
+ * builds `Layer::allowed_cpus`. Both bitmaps empty means "no restriction",
+ * which is upstream's `allowed_cpus.set_all()`.
+ *
+ * `node_words` / `llc_words` are little-endian bitmaps of node ids and LLC ids
+ * respectively, matching `layered_set_layer_cpus`' encoding.
+ */
+int layered_set_layer_affinity(unsigned int layer_id,
+			       const unsigned long long *node_words,
+			       unsigned int nr_node_words,
+			       const unsigned long long *llc_words,
+			       unsigned int nr_llc_words)
+{
+	unsigned int w;
+	bool any = false;
+
+	if (layer_id >= nr_layers)
+		return -EINVAL;
+	if (nr_node_words && !node_words)
+		return -EINVAL;
+	if (nr_llc_words && !llc_words)
+		return -EINVAL;
+
+	memset(layered_layer_node_bits[layer_id], 0,
+	       sizeof(layered_layer_node_bits[layer_id]));
+	memset(layered_layer_llc_bits[layer_id], 0,
+	       sizeof(layered_layer_llc_bits[layer_id]));
+
+	for (w = 0; w < nr_node_words &&
+		    w < sizeof(layered_layer_node_bits[0]) / sizeof(u64); w++) {
+		layered_layer_node_bits[layer_id][w] = node_words[w];
+		any |= !!node_words[w];
+	}
+	for (w = 0; w < nr_llc_words &&
+		    w < sizeof(layered_layer_llc_bits[0]) / sizeof(u64); w++) {
+		layered_layer_llc_bits[layer_id][w] = llc_words[w];
+		any |= !!llc_words[w];
+	}
+	layered_layer_has_affinity[layer_id] = any;
+	return 0;
+}
+
+/* Read back a layer's resolved allowed set, for tests. */
+int layered_probe_layer_cpu_allowed(unsigned int layer_id, unsigned int cpu)
+{
+	if (layer_id >= nr_layers)
+		return -EINVAL;
+	return layered_layer_cpu_allowed(layer_id, cpu) ? 1 : 0;
+}
+
+/*
  * Compute the static CPU allocation for every layer that did not get an
  * explicit set, then publish it into `struct layer`.
  *
@@ -2252,6 +2355,19 @@ int layered_set_layer_cpus(unsigned int layer_id, const unsigned long long *word
  * the whole machine. That matters here because `layer->cpus` and
  * `nr_llc_cpus` bound `pick_idle_cpu()`'s search: an open layer given every
  * CPU poaches idle CPUs upstream reserves for the layer sitting on them.
+ *
+ * BOTH halves of that intersection are honoured. Until 2026-09-11 only the
+ * `available_cpus()` half was: `nodes` / `llcs` never reached this file, so
+ * every layer's slice came off the front of the machine whatever affinity its
+ * config declared. Measured on 16 CPUs / 2 nodes, a layer with `nodes: [1]`
+ * was granted CPUs 0-7 — every one of them forbidden, and none of the eight it
+ * asked for. That is not a knob left unmodelled; it is an allocation upstream
+ * cannot produce, because `Layer::new` starts `cpus` EMPTY with an
+ * `allowed_cpus` mask and every growth step is confined to `core_order`.
+ * Enabling the Tier-3 loop did not repair it either: its shrink path mirrors
+ * upstream's `next_to_free(cands, core_order[n].iter().rev())`, which iterates
+ * `core_order[n]` and finds it empty for a forbidden node, so the CPUs could
+ * never be handed back. See `layered_layer_cpu_allowed()`.
  *
  * Where this still differs from production, and why: upstream sizes the
  * non-open layers from measured UTILIZATION and hands open layers the
@@ -2286,7 +2402,7 @@ static void layered_auto_allocate_cpus(u32 nr_cpus)
 		return;
 
 	for (id = 0; id < nr_layers; id++) {
-		u32 share;
+		u32 share, taken = 0, k;
 
 		if (layered_layer_cpus_explicit[id])
 			continue;
@@ -2297,23 +2413,55 @@ static void layered_auto_allocate_cpus(u32 nr_cpus)
 		if (assigned + share > nr_cpus)
 			share = assigned < nr_cpus ? nr_cpus - assigned : 1;
 
-		for (cpu = 0; cpu < share; cpu++) {
-			u32 c = (assigned + cpu) % nr_cpus;
+		/*
+		 * Walk the same rotation the contiguous window used, but skip
+		 * CPUs this layer is not allowed on. For a layer with no
+		 * `nodes`/`llcs` restriction `layered_layer_cpu_allowed()` is
+		 * true everywhere, so this takes exactly
+		 * `[assigned, assigned + share)` mod nr_cpus — byte-identical
+		 * to the pre-affinity allocation, which is what keeps every
+		 * existing scenario unchanged.
+		 *
+		 * A restricted layer additionally skips CPUs an earlier layer
+		 * already took: its allowed set is not a contiguous window, so
+		 * the monotone `assigned` cursor no longer guarantees
+		 * disjointness on its own.
+		 */
+		for (k = 0; k < nr_cpus && taken < share; k++) {
+			u32 c = (assigned + k) % nr_cpus;
 
+			if (!layered_layer_cpu_allowed(id, c))
+				continue;
+			if (layered_layer_has_affinity[id] && c < MAX_CPUS &&
+			    allocated[c])
+				continue;
 			layered_layer_set_cpu(id, c);
 			if (c < MAX_CPUS)
 				allocated[c] = true;
+			taken++;
 		}
+		/*
+		 * A restricted layer whose allowed CPUs are all spoken for gets
+		 * none, exactly as upstream's grow loop leaves it: `Layer::new`
+		 * starts `cpus` empty and `next_to_free`/the grow walk only ever
+		 * touch `core_order`, so upstream reaches the same state. It is
+		 * antistall's job from there, not ours to paper over by handing
+		 * out a CPU the config forbids.
+		 */
 		assigned += share;
 	}
 
-	/* "Give the rest to the open layers." */
+	/*
+	 * "Give the rest to the open layers" — upstream hands an open layer
+	 * `cpu_pool.available_cpus().and(&layer.allowed_cpus)` (main.rs:4073),
+	 * so the remainder is intersected with the affinity too.
+	 */
 	for (id = 0; any_open && id < nr_layers; id++) {
 		if (layered_layer_cpus_explicit[id] ||
 		    layers[id].kind != LAYER_KIND_OPEN)
 			continue;
 		for (cpu = 0; cpu < nr_cpus && cpu < MAX_CPUS; cpu++)
-			if (!allocated[cpu])
+			if (!allocated[cpu] && layered_layer_cpu_allowed(id, cpu))
 				layered_layer_set_cpu(id, cpu);
 	}
 }
