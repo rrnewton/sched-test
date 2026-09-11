@@ -376,7 +376,10 @@ fn find_csv_files(experiment_dir: &Path) -> Vec<PathBuf> {
                 let path = entry.path();
                 if path.is_dir() {
                     walk(&path, csvs);
-                } else if path.file_name().is_some_and(|f| f == "metrics.csv") {
+                } else if path.file_name().is_some_and(|f| {
+                    let s = f.to_string_lossy();
+                    s.ends_with(".csv") && !s.ends_with(".csv.done")
+                }) {
                     csvs.push(path);
                 }
             }
