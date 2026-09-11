@@ -223,7 +223,9 @@ jobs:
 
       - name: Cache Cargo artifacts
         if: steps.check.outputs.has_changes == 'true'
-        uses: actions/cache@v4
+        # Manual runs may check out another branch. Reuse trusted caches without
+        # publishing that branch's build outputs into the default-branch cache.
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/bin/
