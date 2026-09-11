@@ -3320,3 +3320,150 @@ fn test_mitosis_cpuset_change_detection() {
 // TODO(sim-llc): Add proper LLC topology support to the simulator to test
 // llc_aware.bpf.h code paths.
 // ---------------------------------------------------------------------------
+
+// ===========================================================================
+// Coverage-targeted tests (mb sim-31d4c7): exercise the config-gated
+// functions the default suite leaves dark — the multi-CPU-pinned DSQ path and
+// the slice-shrinking subsystem. See ai_docs/MITOSIS_COVERAGE_20260723.md.
+//
+// Both are reachable today with a knob + workload (not substrate-blocked):
+//   * `dynamic_affinity_cpu_selection=true` + a *multi-CPU* pinned task
+//     (allowed_cpus a strict, >1-CPU subset of the cell → all_cell_cpus_allowed
+//     is false and cpumask weight > 1) routes select_cpu/enqueue through
+//     `select_pinned_cpu` / `enqueue_pinned_cpu` / `update_pinned_dsq`.
+//   * `enable_slice_shrinking=true` makes a pinned task's enqueue shrink the
+//     running task's slice (`slice_shrink_on_enqueue`) and every `running`
+//     callback probe the per-CPU DSQ for a pinned waiter
+//     (`slice_shrink_on_running`), both calling `slice_shrink_limit` /
+//     `slice_shrink_apply`.
+// ===========================================================================
+
+/// Helper: a forever CPU-bound task pinned to a multi-CPU subset.
+fn multicpu_pinned_hog(name: &str, pid: i32, allowed: Vec<CpuId>, run_ns: u64) -> TaskDef {
+    TaskDef {
+        name: name.into(),
+        pid: Pid(pid),
+        nice: 0,
+        behavior: TaskBehavior {
+            phases: vec![Phase::Run(run_ns)],
+            repeat: RepeatMode::Forever,
+        },
+        start_time_ns: 0,
+        mm_id: None,
+        allowed_cpus: Some(allowed),
+        parent_pid: None,
+        cgroup_name: None,
+        task_flags: 0,
+        migration_disabled: 0,
+    }
+}
+
+/// Exercise the multi-CPU-pinned DSQ path: `select_pinned_cpu`,
+/// `enqueue_pinned_cpu`, and `update_pinned_dsq`.
+///
+/// With `dynamic_affinity_cpu_selection=true` and tasks pinned to a 2-CPU
+/// subset of a 4-CPU machine (so `all_cell_cpus_allowed=false` and cpumask
+/// weight=2), oversubscribing that subset drives both the select_cpu and
+/// enqueue pinned branches. Asserts the run is well-formed and pinning is
+/// respected (tasks never run outside their allowed subset).
+#[test]
+fn test_mitosis_dynamic_affinity_multicpu_pinned_dsq() {
+    let _lock = common::setup_test();
+    let nr_cpus = 4u32;
+    let sched = DynamicScheduler::mitosis(nr_cpus);
+    // SAFETY: hold SIM_LOCK (via setup_test); symbol is a valid bool global.
+    unsafe {
+        set_mitosis_bool(&sched, b"dynamic_affinity_cpu_selection\0", true);
+    }
+
+    // 4 forever tasks pinned to CPUs {0,1} → 2x oversubscribed on the subset.
+    let allowed = vec![CpuId(0), CpuId(1)];
+    let scenario = Scenario::builder()
+        .cpus(nr_cpus)
+        .task(multicpu_pinned_hog("p1", 1, allowed.clone(), 500_000))
+        .task(multicpu_pinned_hog("p2", 2, allowed.clone(), 500_000))
+        .task(multicpu_pinned_hog("p3", 3, allowed.clone(), 500_000))
+        .task(multicpu_pinned_hog("p4", 4, allowed.clone(), 500_000))
+        .duration_ms(200)
+        .build();
+
+    let trace = Simulator::new(sched).run(scenario);
+    trace.dump();
+
+    assert!(
+        matches!(trace.exit_kind(), ExitKind::Normal),
+        "simulation exited with error: {:?}",
+        trace.exit_kind()
+    );
+
+    // Every task ran, and never outside its allowed {0,1} subset.
+    let allowed_set: HashSet<CpuId> = allowed.iter().copied().collect();
+    for pid in 1..=4 {
+        assert!(
+            trace.total_runtime(Pid(pid)) > 0,
+            "pinned task {pid} got no runtime"
+        );
+        let ran_on: HashSet<CpuId> = trace
+            .events()
+            .iter()
+            .filter(|e| matches!(e.kind, TraceKind::TaskScheduled { pid: p } if p == Pid(pid)))
+            .map(|e| e.cpu)
+            .collect();
+        assert!(
+            ran_on.is_subset(&allowed_set),
+            "task {pid} ran outside its allowed CPUs: ran_on={ran_on:?}, allowed={allowed_set:?}"
+        );
+    }
+}
+
+/// Exercise the slice-shrinking subsystem: `slice_shrink_on_enqueue`,
+/// `slice_shrink_on_running`, `slice_shrink_apply`, `slice_shrink_limit`.
+///
+/// With `enable_slice_shrinking=true` (and `dynamic_affinity_cpu_selection`
+/// so pinned tasks land on per-CPU DSQs), oversubscribing a 2-CPU pinned
+/// subset creates the required conditions: a pinned task is enqueued onto a
+/// CPU with a running `curr` (→ `slice_shrink_on_enqueue`), and each `running`
+/// callback finds a pinned waiter queued on the CPU DSQ (→
+/// `slice_shrink_on_running`); both call `slice_shrink_limit`/`_apply`.
+#[test]
+fn test_mitosis_slice_shrinking() {
+    let _lock = common::setup_test();
+    let nr_cpus = 4u32;
+    let sched = DynamicScheduler::mitosis(nr_cpus);
+    // SAFETY: hold SIM_LOCK (via setup_test); symbols are valid bool globals.
+    unsafe {
+        set_mitosis_bool(&sched, b"enable_slice_shrinking\0", true);
+        set_mitosis_bool(&sched, b"dynamic_affinity_cpu_selection\0", true);
+    }
+
+    // 6 forever tasks pinned to CPUs {0,1} → 3x oversubscribed, guaranteeing
+    // that at enqueue time a task is already running on the target CPU and
+    // that CPU DSQs carry queued pinned waiters at running time.
+    let allowed = vec![CpuId(0), CpuId(1)];
+    let mut b = Scenario::builder().cpus(nr_cpus);
+    for i in 1..=6 {
+        b = b.task(multicpu_pinned_hog(
+            &format!("s{i}"),
+            i,
+            allowed.clone(),
+            500_000,
+        ));
+    }
+    let scenario = b.duration_ms(200).build();
+
+    let trace = Simulator::new(sched).run(scenario);
+    trace.dump();
+
+    assert!(
+        matches!(trace.exit_kind(), ExitKind::Normal),
+        "simulation exited with error: {:?}",
+        trace.exit_kind()
+    );
+    // All tasks made progress under the shrinking regime.
+    for pid in 1..=6 {
+        assert!(
+            trace.total_runtime(Pid(pid)) > 0,
+            "task {pid} got no runtime under slice shrinking"
+        );
+    }
+}
