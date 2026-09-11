@@ -17,7 +17,7 @@ rust_library(
     edition = "2021",
     features = ["cargo_build"],
     named_deps = {
-        "cgroups_rs": "fbsource//third-party/rust:cgroups-rs-05",
+        "cgroups_rs": "fbsource//third-party/rust:cgroups-rs-05-fs",
     },
     test_deps = ["fbsource//third-party/rust:more-asserts"],
     deps = [
