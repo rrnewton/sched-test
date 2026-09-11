@@ -556,7 +556,48 @@ fn sweep_cases() -> Vec<(String, Reached)> {
         ("16cpu/smt2/exclusive+preempt".into(), case_exclusive(true)),
         ("16cpu/2-node/node-restricted".into(), case_restricted()),
         ("flat-8cpu/yielding".into(), case_yield()),
+        ("flat-8cpu/min-exec".into(), case_min_exec()),
     ]
+}
+
+/// `min_exec_us` is applied in `layered_stopping` (`main.bpf.c:3764-3768`) and
+/// only fires when a task's runtime is BELOW it, so it needs both a non-zero
+/// `min_exec_us` and a workload that runs in shorter bursts than that. No other
+/// shape has either.
+///
+/// Note what this does and does not reach. The COUNTER is reachable; the
+/// EFFECT is not. `min_exec_us` works by inflating the vtime charged at
+/// `scx_bpf_task_set_dsq_vtime`, and vtime only orders anything once tasks are
+/// inserted with `scx_bpf_dsq_insert_vtime` onto a layer DSQ — which
+/// `known_gap_no_task_ever_reaches_a_layer_dsq` shows never happens. So this
+/// case raises coverage honestly without licensing any claim that
+/// `min_exec_us` behaves correctly.
+fn case_min_exec() -> Reached {
+    let sched = DynamicScheduler::layered(8);
+    sched.layered_layers(&[
+        {
+            // 5 ms floor against 200 us bursts. `min_exec_ns` is a public
+            // field rather than a builder method.
+            let mut tiny = LayerSpec::new("tiny", LayerKind::Open)
+                .with_match(LayerMatch::CommPrefix("t".into()));
+            tiny.min_exec_ns = 5_000_000;
+            tiny
+        },
+        LayerSpec::catch_all("rest"),
+    ]);
+    let probes = LayeredProbes::new(&sched);
+    let bursty = TaskBehavior {
+        phases: vec![Phase::Run(200_000), Phase::Sleep(200_000)],
+        repeat: RepeatMode::Forever,
+    };
+    let mut b = Scenario::builder().cpus(8).detect_bpf_errors();
+    for i in 0..16 {
+        b = b.add_task(&format!("t{i}"), 0, bursty.clone());
+        b = b.add_task(&format!("bg{i}"), 0, hog());
+    }
+    let sim = Simulator::new(sched);
+    let _ = sim.run(b.duration_ms(300).build());
+    nonzero_stats(&probes)
 }
 
 /// `layered_yield` is only reached when a task actually yields, which none of
