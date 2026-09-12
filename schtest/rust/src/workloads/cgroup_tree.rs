@@ -1,9 +1,9 @@
 //! CGroup tree workload implementation.
 
-use cgroups_rs::fs::{Resources, MaxValue};
-use cgroups_rs::fs::Cgroup;
-use cgroups_rs::fs::cgroup_builder::CgroupBuilder;
-use cgroups_rs::fs::hierarchies;
+use cgroups_rs::{Resources, MaxValue};
+use cgroups_rs::Cgroup;
+use cgroups_rs::cgroup_builder::CgroupBuilder;
+use cgroups_rs::hierarchies;
 use quickcheck::{Arbitrary, Gen};
 use anyhow::{Result, Context};
 use std::time::Duration;

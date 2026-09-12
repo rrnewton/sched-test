@@ -16,8 +16,8 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use cgroups_rs::fs::cgroup_builder::CgroupBuilder;
-use cgroups_rs::fs::hierarchies;
+use cgroups_rs::cgroup_builder::CgroupBuilder;
+use cgroups_rs::hierarchies;
 
 use crate::util::shared::{BumpAllocator, SharedBox};
 use crate::util::system::System;
