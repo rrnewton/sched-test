@@ -1,0 +1,323 @@
+name: Sync Upstream SCX
+
+on:
+  # scheduled-dispatch.yml on main is the sole nightly trigger. Keeping a
+  # schedule here too would run the same sync twice after an integration import.
+  workflow_dispatch:
+    inputs:
+      force_sync:
+        description: 'Force sync even if no new upstream commits'
+        required: false
+        default: false
+        type: boolean
+      source_branch:
+        description: 'Source branch to base the sync on (overrides default)'
+        required: false
+        default: ''
+        type: string
+  push:
+    # REGISTRATION ONLY -- deliberately the narrowest possible filter: this file
+    # and nothing else.
+    #
+    # A workflow that has never RUN is not registered with the Actions API, and
+    # an unregistered workflow cannot be dispatched at all: the carrier on main
+    # gets `HTTP 404: workflow sync-upstream.yml not found on the default
+    # branch`. That is why this job was unreachable by ANY trigger -- no cron
+    # (wrong branch), no dispatch (never registered), no push (none existed).
+    #
+    # One push to this file registers it, after which the carrier can reach it
+    # forever. The job below is skipped on push events, because the point is
+    # registration, not execution: firing a real upstream sync on unrelated
+    # pushes would turn a job that never ran into one that runs constantly, and
+    # it would be muted within a week.
+    branches: ['integration']
+    paths:
+      - '.github/workflows/sync-upstream.yml'
+
+permissions:
+  contents: read
+
+# Default source branch for the sync. sched-test is all-INTEGRATION: the
+# development tip is `integration`, not `main`. Override per-run with the
+# workflow_dispatch `source_branch` input.
+env:
+  # Development continues on integration between imports to main.
+  DEFAULT_SOURCE_BRANCH: integration
+
+jobs:
+  sync-upstream:
+    # Push events exist only to register this workflow with the Actions API so
+    # the carrier on main can dispatch it (see the `push:` comment above). They
+    # must never perform a sync.
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    # Replaces the claude-code-action `timeout_minutes` input, which @v1 rejects.
+    timeout-minutes: 60
+    permissions:
+      contents: write
+      pull-requests: write   # the success path raises a PR against integration
+      # claude-code-action@v1 mints an OIDC token REGARDLESS of whether an
+      # anthropic_api_key is supplied, so it needs this even though the key is
+      # present. Without it the action fails with
+      #   Unable to get ACTIONS_ID_TOKEN_REQUEST_URL env variable
+      #   Could not fetch an OIDC token. Did you remember to add id-token: write?
+      # which reads as a missing-secret problem and is not one. The key-presence
+      # guard in the first step covers the genuinely-missing-key case (the mirror
+      # holds zero secrets); this covers the token the action wants on top of it.
+      id-token: write
+
+    steps:
+      - name: Require the Anthropic API key
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "::error::ANTHROPIC_API_KEY is not set on ${{ github.repository }}." \
+                 "This workflow is only supported on facebookexperimental/sched-test," \
+                 "which is the only repo holding the secret. If this fired on the" \
+                 "rrnewton/sched-test mirror, the workflow should be disabled there" \
+                 "rather than given a key." \
+                 "Symptom when unguarded: claude-code-action falls back to OIDC and dies with" \
+                 "'Could not fetch an OIDC token ... add id-token: write', which misleadingly" \
+                 "looks like a permissions bug rather than a missing secret."
+            exit 1
+          fi
+
+      - name: Determine source branch
+        id: config
+        env:
+          SOURCE_BRANCH_INPUT: ${{ inputs.source_branch }}
+        run: |
+          SOURCE_BRANCH=${SOURCE_BRANCH_INPUT:-$DEFAULT_SOURCE_BRANCH}
+          git check-ref-format --branch "$SOURCE_BRANCH" > /dev/null
+          printf 'source_branch=%s\n' "$SOURCE_BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.config.outputs.source_branch }}
+          submodules: true
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check for upstream changes
+        id: check
+        run: |
+          cd scx
+          CURRENT=$(git rev-parse HEAD)
+          git fetch origin main
+          LATEST=$(git rev-parse origin/main)
+
+          {
+            echo "current_commit=$CURRENT"
+            echo "latest_commit=$LATEST"
+            echo "current_short=$(git rev-parse --short HEAD)"
+            echo "latest_short=$(git rev-parse --short origin/main)"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ "$CURRENT" != "$LATEST" ] || [ "${{ inputs.force_sync }}" == "true" ]; then
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+            COMMIT_COUNT=$(git rev-list --count HEAD..origin/main)
+            echo "commit_count=$COMMIT_COUNT" >> "$GITHUB_OUTPUT"
+            echo "::notice::$COMMIT_COUNT new upstream commits: $CURRENT..$LATEST"
+          else
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No new upstream commits"
+          fi
+
+      - name: Exit if no changes
+        if: steps.check.outputs.has_changes != 'true'
+        run: echo "No upstream changes to sync. Exiting."
+
+      - name: Setup sync branch
+        if: steps.check.outputs.has_changes == 'true'
+        run: |
+          DATE=$(date +%Y%m%d)
+          WORK_BRANCH="sync-upstream-${DATE}"
+          # --global, NOT repo-local. The rebase below runs INSIDE the scx
+          # submodule, which has its own config (.git/modules/scx/config), so a
+          # repo-local identity set here never reaches it and the rebase dies
+          # with `fatal: empty ident name`. Not hypothetical: that is exactly how
+          # this job failed on its first-ever real run (2026-08-13, run
+          # 31654870871). The fail-closed guard below then refused to proceed --
+          # correct behaviour, spurious trigger.
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$WORK_BRANCH"
+
+          # Update the submodule to upstream main, REPLAYING any local commits
+          # carried on the pin. The pin is routinely NOT an ancestor of upstream
+          # (e.g. `lib/cgroup_bw: add scxsim targeted yield hooks`); a bare
+          # `git checkout origin/main` here silently discards those commits.
+          cd scx
+          PIN=$(git rev-parse HEAD)
+          if git merge-base --is-ancestor "$PIN" origin/main; then
+            echo "::notice::scx pin is an ancestor of upstream main; fast-forwarding."
+            git checkout --detach origin/main
+          else
+            LOCAL=$(git rev-list --count origin/main.."$PIN")
+            echo "::notice::scx pin carries $LOCAL local commit(s); rebasing onto upstream main."
+            git log --oneline origin/main.."$PIN"
+            git checkout --detach "$PIN"
+            if ! git rebase --onto origin/main "$(git merge-base "$PIN" origin/main)" "$PIN"; then
+              git rebase --abort || true
+              echo "::error::Local scx commits do not rebase cleanly onto upstream main." \
+                   "Refusing to drop them. Resolve this submodule pin by hand."
+              exit 1
+            fi
+            REPLAYED=$(git rev-list --count origin/main..HEAD)
+            if [ "$REPLAYED" -ne "$LOCAL" ]; then
+              echo "::error::Expected $LOCAL local commit(s) after rebase, found $REPLAYED. Refusing to proceed."
+              exit 1
+            fi
+          fi
+          cd ..
+          git add scx
+          git commit -m "$(cat <<EOF
+          Update scx submodule to upstream ${{ steps.check.outputs.latest_short }}
+
+          Previous: ${{ steps.check.outputs.current_commit }}
+          New:      ${{ steps.check.outputs.latest_commit }}
+          Commits:  ${{ steps.check.outputs.commit_count }}
+          EOF
+          )"
+
+          echo "WORK_BRANCH=$WORK_BRANCH" >> "$GITHUB_ENV"
+          echo "SYNC_DATE=$DATE" >> "$GITHUB_ENV"
+
+      - name: Install system dependencies
+        if: steps.check.outputs.has_changes == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libelf-dev
+
+      # Honour //rust-toolchain.toml (1.97.1 + clippy/rustfmt/llvm-tools) the same
+      # way the other five workflows do: install nothing, let cargo/rustup resolve
+      # the pin from the file. `rustup show active-toolchain` both triggers the
+      # install and PRINTS which toolchain won, so the log proves the pin took
+      # effect rather than leaving it to be assumed.
+      #
+      # The previous `dtolnay/rust-toolchain@stable` was not actually defeating
+      # the pin -- validate2 verified that the action does `rustup toolchain
+      # install` + `rustup default`, and a rust-toolchain.toml outranks the
+      # DEFAULT toolchain; it never sets RUSTUP_TOOLCHAIN, which is the one thing
+      # that would win. Credit to them for checking rather than assuming. It is
+      # removed anyway because "@stable" reads as unpinned to anyone
+      # spot-checking, and this workflow was the only one of six doing something
+      # different.
+      #
+      # Do NOT reintroduce a variant that exports RUSTUP_TOOLCHAIN or runs
+      # `rustup override set`: either would silently take this job off the pin
+      # while every other workflow stayed on it, reviving the per-machine clippy
+      # drift the pin exists to prevent, in the workflow least likely to be
+      # watched.
+      - name: Show the pinned Rust toolchain
+        if: steps.check.outputs.has_changes == 'true'
+        run: |
+          rustup show active-toolchain
+          cargo --version && cargo clippy --version
+
+      - name: Install cargo-nextest
+        if: steps.check.outputs.has_changes == 'true'
+        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
+
+      - name: Cache Cargo artifacts
+        if: steps.check.outputs.has_changes == 'true'
+        # Manual runs may check out another branch. Reuse trusted caches without
+        # publishing that branch's build outputs into the default-branch cache.
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            scx-sim/target/
+          key: ${{ runner.os }}-sync-upstream-${{ hashFiles('scx-sim/Cargo.lock') }}
+
+      - name: Run Claude to sync upstream
+        if: steps.check.outputs.has_changes == 'true'
+        id: claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            Execute the /sync-upstream skill.
+
+            Context:
+            - Previous scx submodule commit: ${{ steps.check.outputs.current_commit }}
+            - New scx submodule commit: ${{ steps.check.outputs.latest_commit }}
+            - Upstream commits: ${{ steps.check.outputs.commit_count }}
+            - Working branch: ${{ env.WORK_BRANCH }}
+            - Source branch: ${{ steps.config.outputs.source_branch }}
+
+            The scx submodule has already been updated to the new commit.
+            Your job is to fix any compilation or test failures in the simulator
+            wrappers caused by the upstream changes.
+
+            Follow the skill instructions completely: analyze changes, fix builds,
+            run validate.sh, and report your final status.
+          claude_args: "--max-turns 100"
+
+      - name: Push and handle result
+        if: steps.check.outputs.has_changes == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # gh pr create needs this explicitly
+          SOURCE_BRANCH: ${{ steps.config.outputs.source_branch }}
+        run: |
+          # Check if the last commit message indicates success
+          LAST_MSG=$(git log -1 --pretty=%B)
+
+          if echo "$LAST_MSG" | grep -qi "Status: SUCCESS"; then
+            echo "::notice::Sync successful! Opening a PR against $SOURCE_BRANCH"
+
+            # Push the dated work branch and raise a PR. Deliberately NOT a
+            # force-push to a standing branch: the previous shape force-pushed
+            # `simulator-next`, a branch nothing consumes, from `simulator.v3`,
+            # a March-2026 branch nothing consumes -- so even a SUCCESSFUL sync
+            # delivered nowhere. And the target must never be force-pushed
+            # directly: `integration` is the branch every agent lands onto.
+            # A PR is the only shape that both reaches integration and keeps a
+            # human in the loop for a submodule bump that can break the build.
+            git push origin "$WORK_BRANCH"
+            gh pr create \
+              --base "$SOURCE_BRANCH" \
+              --head "$WORK_BRANCH" \
+              --title "scx: sync submodule to upstream ${{ steps.check.outputs.latest_short }}" \
+              --body "Automated nightly sync of the \`scx\` submodule.
+
+            Previous: ${{ steps.check.outputs.current_commit }}
+            New:      ${{ steps.check.outputs.latest_commit }}
+            Upstream commits absorbed: ${{ steps.check.outputs.commit_count }}
+
+            Any local commits carried on the pin were rebased onto upstream main and
+            the replayed count verified; the job fails closed rather than dropping them."
+          else
+            echo "::warning::Sync incomplete or failed."
+
+            # Ensure WHY_THIS_BRANCH_IS_BROKEN.md exists for failed syncs
+            if [ ! -f WHY_THIS_BRANCH_IS_BROKEN.md ]; then
+              cat > WHY_THIS_BRANCH_IS_BROKEN.md <<BROKENEOF
+          # Why This Branch Is Broken
+
+          **Date**: $(date +%Y-%m-%d)
+          **Upstream commit**: ${{ steps.check.outputs.latest_commit }}
+          **Previous commit**: ${{ steps.check.outputs.current_commit }}
+
+          ## Status
+
+          The automated sync process did not report SUCCESS.
+          Check the GitHub Actions log for details.
+
+          See the commit history on this branch for any partial fixes applied.
+          BROKENEOF
+              git add WHY_THIS_BRANCH_IS_BROKEN.md
+              git commit -m "Add WHY_THIS_BRANCH_IS_BROKEN.md for failed sync" || true
+            fi
+
+            # Push the dated failure branch
+            FAIL_BRANCH="sync-failed-${SYNC_DATE}"
+            git branch -M "$WORK_BRANCH" "$FAIL_BRANCH"
+            git push origin "$FAIL_BRANCH"
+            echo "::warning::Failed sync branch pushed as $FAIL_BRANCH"
+          fi

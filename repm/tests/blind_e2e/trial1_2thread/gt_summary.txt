@@ -1,0 +1,75 @@
+
+Simulation complete:
+  Logical time elapsed:   10s
+  Total tasks:            2
+  Max concurrent running: 2
+  Total time slices:      2159
+  Tasks at end:           2 alive, 1 runnable
+
+Sched_ext structop summary:
+     cpu   structops         rbc      kfuncs
+  ------  ----------  ----------  ----------
+       0       15046     1583705       66153
+       1        2070      148457        7755
+  ------  ----------  ----------  ----------
+   total       17116     1732162       73908
+
+Preemption stats:
+  longest_structop_rbc:    945
+  longest_rbc_interval:    420  (between kfuncs)
+  REPLAY_MARGIN:           200
+
+
+=== Trace Statistics ===
+
+Duration: 9000.000ms
+
+--- Per-Task Statistics ---
+  Task PID=1:
+    Schedules:       1798
+    Run duration:    0.102ms mean, 0.020ms stddev, CV=19.5%
+    Inter-arrival:   5.007ms mean, 0.021ms stddev
+    Direct dispatch: 0
+    Enqueue calls:   0
+    Yields:          0
+    Preemptions:     0
+    Sleeps:          1798
+  Task PID=2:
+    Schedules:       134
+    Run duration:    33.224ms mean, 18.143ms stddev, CV=54.6%
+    Inter-arrival:   66.961ms mean, 19.714ms stddev
+    Direct dispatch: 43
+    Enqueue calls:   0
+    Yields:          0
+    Preemptions:     43
+    Sleeps:          90
+    Sched latency:   p50=1.070us p90=1.070us p99=1.070us p999=1.070us max=1.070us (43 samples)
+
+--- Per-CPU Statistics ---
+  CPU 0:
+    Ticks:         41
+    Tick interval: 215.414ms mean, 297.612ms stddev
+    Balance calls: 1798
+    Idle events:   1798
+    Idle duration: 8815.482ms
+    Utilization:   2.1%
+  CPU 1:
+    Ticks:         1111
+    Tick interval: 8.104ms mean, 13.753ms stddev
+    Balance calls: 90
+    Idle events:   90
+    Idle duration: 4546.756ms
+    Utilization:   49.5%
+
+--- Overall CPU Utilization: 25.8% (2 CPUs, 9000.000ms) ---
+
+--- Global Statistics ---
+  DSQ inserts (FIFO):    1932
+  DSQ inserts (vtime):   0
+  DSQ move_to_local:     1888
+  Kick CPU calls:        43
+  DSQ routing:
+    Local/direct:     1932 (100.0%)
+
+scxsim: disabling ASLR and re-executing...
+wrote perfetto trace to /home/newton/work/multi_sched-test/sched-test1/repm/tests/blind_e2e/trial1_2thread/gt_trace.json

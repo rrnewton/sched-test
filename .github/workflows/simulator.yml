@@ -1,0 +1,122 @@
+name: scx_simulator
+
+on:
+  push:
+    branches:
+      - '**'
+    paths:
+      - 'scx-sim/**'
+      - 'lib/scxtest/**'
+      - 'scheds/**'
+      - '.github/workflows/simulator.yml'
+  pull_request:
+    branches:
+      - '**'
+    paths:
+      - 'scx-sim/**'
+      - 'lib/scxtest/**'
+      - 'scheds/**'
+      - '.github/workflows/simulator.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  simulator:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Free up disk space on runner
+        # The ubuntu-latest runner ships with ~15-20 GiB of pre-installed
+        # tooling (Android SDK, .NET, Haskell, etc.) that this workflow
+        # doesn't use. Cargo's incremental build + the e9patch cache
+        # routinely push the runner past its disk ceiling during link
+        # ("No space left on device" — observed 2026-05-19 on
+        # simulator.v6 / agent/cgroup-bw-real-phase2-rootcause). Clearing
+        # the unused tooling buys ~10 GiB of headroom.
+        run: |
+          df -h /
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /opt/hostedtoolcache/Java_Temurin-Hotspot_jdk || true
+          sudo apt-get autoremove -y || true
+          sudo apt-get clean || true
+          df -h /
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libelf-dev \
+            build-essential xxd markdown zlib1g-dev
+
+      # The coverage gate builds a SECOND full target tree
+      # (target/llvm-cov-target/) with -C instrument-coverage and debuginfo=2,
+      # on top of the existing target/debug/. That does not fit in a stock
+      # runner's free space: the build dies with
+      #   LLVM ERROR: IO failure on output stream: No space left on device
+      # which surfaces as a bogus "ld terminated with signal 7 [Bus error]"
+      # and an invitation to file an LLVM bug. Reclaim the preinstalled
+      # toolchains this job never uses (~25 GB) before building.
+      - name: Free runner disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                      /usr/local/.ghcup /usr/local/share/boost \
+                      /usr/share/swift "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - name: Install cargo-nextest
+        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+
+      # validate.sh has a `cargo llvm-cov nextest` gate and correctly refuses to
+      # run without this rather than skipping, so CI has to supply it or the job
+      # dies before any test runs. Prebuilt binary, same idiom as nextest above;
+      # `cargo install` would compile it on every run. The llvm-tools component
+      # it needs comes from rust-toolchain.toml.
+      - name: Install cargo-llvm-cov
+        run: curl -LsSf https://github.com/taiki-e/cargo-llvm-cov/releases/latest/download/cargo-llvm-cov-x86_64-unknown-linux-gnu.tar.gz | tar xzf - -C ${CARGO_HOME:-~/.cargo}/bin
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            scx-sim/target/
+          key: ${{ runner.os }}-simulator-${{ hashFiles('scx-sim/Cargo.lock') }}
+
+      - uses: actions/cache@v4
+        with:
+          path: scx-sim/third_party/e9patch/
+          key: ${{ runner.os }}-e9patch-v1
+
+      - name: Install e9patch
+        working-directory: scx-sim
+        run: make install-e9patch
+
+      # PR #110 made validate.sh hard-fail on missing required dependencies
+      # (venv, mypy, pandas-stubs) but did not add the matching install step
+      # here, so every run since 718e9713 has died before the first check with
+      # "validate.sh cannot run with required dependencies missing". The remedy
+      # ships in that same PR: deps.sh install provisions everything that does
+      # not need root, and prints a command for anything that does.
+      - name: Install scx-sim dependencies
+        working-directory: scx-sim
+        run: make install-deps
+
+      - name: Validate scx_simulator
+        if: hashFiles('scx-sim/validate.sh') != ''
+        working-directory: scx-sim
+        run: bash validate.sh
+
+      - name: Build scx_simulator (no validate.sh yet)
+        if: hashFiles('scx-sim/validate.sh') == ''
+        working-directory: scx-sim
+        run: cargo build --workspace

@@ -1,0 +1,28 @@
+repm gen-config --from-trace /home/newton/work/multi_sched-test/sched-test1/repm/tests/blind_e2e/trial3_ucache/gt_summary.txt
+  input type: scxsim verbose-summary
+
+  Classification:
+    fast_0 (fast): run=504µs sleep=1505µs count=4
+      <- pid_3
+      <- pid_4
+      <- pid_1
+      <- pid_2
+    fast_1 (fast): run=132µs sleep=955µs count=16
+      <- pid_5
+      <- pid_6
+      <- pid_7
+      <- pid_9
+      <- pid_12
+      <- pid_13
+      <- pid_14
+      <- pid_16
+      <- pid_17
+      <- pid_18
+      <- pid_19
+      <- pid_20
+      <- pid_8
+      <- pid_10
+      <- pid_11
+      <- pid_15
+
+Wrote /home/newton/work/multi_sched-test/sched-test1/repm/tests/blind_e2e/trial3_ucache/synthesized.json (2 classes, 20 threads, 8 cores, 10s)

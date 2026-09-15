@@ -1,0 +1,8 @@
+{
+  "global": {"default_policy": "SCHED_OTHER", "duration": 10},
+  "tasks": {
+    "fast_fg": {"run": 100, "sleep": 4900, "loop": -1, "cpus": [0,1,2,3]},
+    "medium_bg": {"run": 5000, "sleep": 15000, "loop": -1, "cpus": [0,1,2,3]},
+    "slow_hog": {"run": 50000, "sleep": 50000, "loop": -1, "cpus": [0,1,2,3]}
+  }
+}

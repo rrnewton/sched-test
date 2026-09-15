@@ -1,0 +1,57 @@
+{
+  "default_workers_per_cgroup": 1,
+  "duration": 12000000000,
+  "name": "sched_cpuset_split",
+  "steps": [
+    {
+      "hold": {
+        "frac": 1.0
+      },
+      "ops": [],
+      "setup": [
+        {
+          "cpu_quota": null,
+          "cpu_weight": null,
+          "cpuset": {
+            "disjoint": {
+              "index": 0,
+              "of": 2
+            }
+          },
+          "name": "cg_0",
+          "works": [
+            {
+              "nice": null,
+              "work_type": "spin_wait",
+              "workers": null
+            }
+          ]
+        },
+        {
+          "cpu_quota": null,
+          "cpu_weight": null,
+          "cpuset": {
+            "disjoint": {
+              "index": 1,
+              "of": 2
+            }
+          },
+          "name": "cg_1",
+          "works": [
+            {
+              "nice": null,
+              "work_type": "spin_wait",
+              "workers": null
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "topology": {
+    "cores": 4,
+    "llcs": 1,
+    "numa_nodes": 1,
+    "threads": 1
+  }
+}

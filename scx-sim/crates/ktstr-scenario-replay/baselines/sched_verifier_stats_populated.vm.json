@@ -1,0 +1,16 @@
+{
+  "per_cgroup_cpu_time_ns": {
+    "cg_0": 1988049709
+  },
+  "provenance": {
+    "kernel": "6.14.11",
+    "passed": true,
+    "project_commit": "f5d0fce",
+    "recorded_utc": "2026-08-13T15:12:52Z",
+    "scheduler": "ktstr_sched",
+    "sidecar": "sched_verifier_stats_populated-69298e1249f472ef.ktstr.json",
+    "test_name": "sched_verifier_stats_populated",
+    "topology": "1n1l2c1t"
+  },
+  "scenario": "sched_verifier_stats_populated"
+}

@@ -1,0 +1,33 @@
+[package]
+name = "embed_harness"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "In-repo proof that a downstream binary embedding scx_simulator resolves the dlopen kfunc-export link contract by re-emitting scxsim_build::EXPORTED_SYMS from its own build script."
+
+# libbpf-sys is a NORMAL dependency (not a build-dep): cargo exposes a
+# links-crate's metadata (here DEP_BPF_INCLUDE, the libbpf header dir) to a build
+# script only for the package's NORMAL dependencies, so build.rs needs it in
+# [dependencies] to read that path. A real embedder declares it the same way --
+# mirrors scx_simulator's own Cargo.toml (libbpf-sys = "=1.6.1" as a normal dep).
+[dependencies]
+libbpf-sys = "=1.6.1"
+
+# build.rs uses scxsim-build for EXPORTED_SYMS + build_schedulers + scx_include_paths.
+[build-dependencies]
+scxsim-build = { path = "../scxsim-build" }
+
+# The test links scx_simulator (a DOWNSTREAM crate that does NOT inherit
+# scx_simulator's non-transitive link args, and pulls in the C static libs that
+# DEFINE the exported symbols) and scxsim-build (for the SchedulerDefinition type
+# it constructs from scratch).
+#
+# default-features = false: an embedder does not want the `standalone` convenience
+# constructors (they bake in scx_simulator's compile-time SCHEDULER_SO_DIR). The
+# test loads via load_with_definition, so it never needs them. (Under a
+# `--workspace` build, feature unification still turns `standalone` on for the
+# shared scx_simulator because scx_simulator's own tests request it; an isolated
+# `cargo test -p embed_harness` is what links the standalone-free build.)
+[dev-dependencies]
+scx_simulator = { path = "../scx_simulator", default-features = false }
+scxsim-build = { path = "../scxsim-build" }

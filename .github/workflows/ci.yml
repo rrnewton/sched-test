@@ -1,4 +1,4 @@
-name: Build and test
+name: schtest
 
 on:
   push:
@@ -7,6 +7,9 @@ on:
   pull_request:
     branches:
       - '**'
+
+permissions:
+  contents: read
 
 jobs:
   check_and_build:
@@ -20,14 +23,17 @@ jobs:
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+            schtest/rust/target/
+          key: ${{ runner.os }}-schtest-${{ hashFiles('schtest/rust/Cargo.lock') }}
 
       - name: Clippy check
+        working-directory: schtest/rust
         run: cargo clippy -- -D warnings
 
       - name: Build
+        working-directory: schtest/rust
         run: cargo build --release
 
       - name: Test
+        working-directory: schtest/rust
         run: cargo test -- --skip test_process_iterations

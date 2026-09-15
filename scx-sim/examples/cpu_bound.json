@@ -1,0 +1,34 @@
+{
+  "_comment": "Multi-task CPU-bound example. Four 'burner' tasks each run 2ms then sleep 500us, looping for the whole simulation. With 4 simulated CPUs and 4 burners the scheduler has to fan tasks out one-per-CPU; with --cpus 2 it has to time-slice. Useful for observing per-CPU load balancing and slice-length behaviour.",
+  "_run_units": "rt-app 'run'/'sleep' are microseconds.",
+  "global": {
+    "duration": 0.2,
+    "default_policy": "SCHED_OTHER"
+  },
+  "tasks": {
+    "burner_0": {
+      "priority": 0,
+      "loop": -1,
+      "run": 2000,
+      "sleep": 500
+    },
+    "burner_1": {
+      "priority": 0,
+      "loop": -1,
+      "run": 2000,
+      "sleep": 500
+    },
+    "burner_2": {
+      "priority": 0,
+      "loop": -1,
+      "run": 2000,
+      "sleep": 500
+    },
+    "burner_3": {
+      "priority": 0,
+      "loop": -1,
+      "run": 2000,
+      "sleep": 500
+    }
+  }
+}

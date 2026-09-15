@@ -1,0 +1,11 @@
+{
+  "trial": "trial3_ucache",
+  "T_seconds": 66,
+  "tokens": 0,
+  "X_geomean": 1.0048,
+  "pass": true,
+  "classes_gt": 2,
+  "classes_syn": 2,
+  "threads_gt": 20,
+  "threads_syn": 20
+}

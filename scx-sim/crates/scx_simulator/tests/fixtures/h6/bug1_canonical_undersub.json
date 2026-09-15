@@ -1,0 +1,14 @@
+{
+  "_comment_h6": "Bug-1 canonical reproducer — UNDER-SUBSCRIBED variant. Same shared cgroup constraint (cpu.max=10000 100000 = 10% of one CPU) as `bug1_canonical.json`, but configured for the LIVE workload band (~0.13 tasks/cpu — paired with `--cpus 32` produces 4 tasks / 32 cpus = 0.125 tasks/cpu, well inside the 0.13–0.57 live band identified by `investigate-dsq-insert-vs-vtime-path-divergence`). The canonical fixture is over-subscribed at 4.0 tasks/cpu (16 tasks / 4 cpus) which biases LAVD's dispatch path toward `dsq_insert_vtime` — under-sub flips that toward simple `dsq_insert` via the wakeup → select_cpu → can_direct_dispatch chain. cpu.max constraint is identical so cgroup_bw library is exercised the same way; only the workload axis changes. See tg `bug1-canonical-fixture-add-undersub-variant`.",
+  "_comment_run_units": "rt-app units: `run` and `sleep` are microseconds. 50000us run + 50000us sleep = 50ms run + 50ms sleep cycle (50% duty cycle per task, oscillating). 4 tasks × 50% = 2.0 CPUs of aggregate demand; with `--cpus 32` available, NO CPU-side contention exists — the cgroup's 10ms-per-100ms quota is the SOLE binding constraint. This isolates whether cpu-bw-stall-bug requires CPU oversubscription to reproduce.",
+  "_comment_canonical_invocation": "scxsim --no-disable-aslr run tests/fixtures/h6/bug1_canonical_undersub.json --config tests/fixtures/h6/bug1_canonical.toml --watchdog 200ms -s lavd --cpus 32 --duration 600ms",
+  "tasks": {
+    "yes_0": { "loop": -1, "run": 50000, "sleep": 50000, "taskgroup": { "path": "/test_bw_tight", "cpu.max": "10000 100000" } },
+    "yes_1": { "loop": -1, "run": 50000, "sleep": 50000, "taskgroup": { "path": "/test_bw_tight" } },
+    "yes_2": { "loop": -1, "run": 50000, "sleep": 50000, "taskgroup": { "path": "/test_bw_tight" } },
+    "yes_3": { "loop": -1, "run": 50000, "sleep": 50000, "taskgroup": { "path": "/test_bw_tight" } }
+  },
+  "global": {
+    "duration": 0.6
+  }
+}

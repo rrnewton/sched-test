@@ -1,0 +1,34 @@
+{
+  "_comment": "Contrast CPU-bound vs IO-bound tasks. The two 'cpu_*' tasks each run 10ms then sleep only 100us — they want the CPU continuously and are good citizens for measuring throughput / fairness under contention. The two 'io_*' tasks run only 200us then sleep 2ms — they look like a network/disk-bound workload: short bursts of work interleaved with long blocking periods. A well-behaved scheduler should give the IO-bound tasks low wake-up latency (so their wake-respond-block cycle stays tight) without starving the CPU-bound tasks of forward progress. Run with --perfetto to compare wake-to-run latency for io_* vs run-time accumulated for cpu_*.",
+  "_run_units": "rt-app 'run'/'sleep' are microseconds. 10000us = 10ms.",
+  "global": {
+    "duration": 0.2,
+    "default_policy": "SCHED_OTHER"
+  },
+  "tasks": {
+    "cpu_0": {
+      "priority": 0,
+      "loop": -1,
+      "run": 10000,
+      "sleep": 100
+    },
+    "cpu_1": {
+      "priority": 0,
+      "loop": -1,
+      "run": 10000,
+      "sleep": 100
+    },
+    "io_0": {
+      "priority": 0,
+      "loop": -1,
+      "run": 200,
+      "sleep": 2000
+    },
+    "io_1": {
+      "priority": 0,
+      "loop": -1,
+      "run": 200,
+      "sleep": 2000
+    }
+  }
+}

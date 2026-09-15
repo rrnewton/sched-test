@@ -1,0 +1,25 @@
+[package]
+name = "repm"
+version = "0.1.0"
+edition = "2021"
+description = "ReproMagic — capture and reproduce scheduling behavior"
+
+[[bin]]
+name = "repm"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+anyhow = "1"
+csv = "1"
+chrono = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.dev]
+# Use Cranelift for fast dev builds (requires nightly + -Zcodegen-backend)
+# For stable toolchain, this section is ignored gracefully.

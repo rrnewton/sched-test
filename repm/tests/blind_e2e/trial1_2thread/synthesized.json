@@ -1,0 +1,30 @@
+{
+  "global": {
+    "default_policy": "SCHED_OTHER",
+    "duration": 10
+  },
+  "tasks": {
+    "fast_1": {
+      "cpus": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "loop": -1,
+      "run": 102,
+      "sleep": 4905
+    },
+    "slow_0": {
+      "cpus": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "loop": -1,
+      "run": 33224,
+      "sleep": 33737
+    }
+  }
+}

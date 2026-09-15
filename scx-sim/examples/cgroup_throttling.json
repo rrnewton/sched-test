@@ -1,0 +1,34 @@
+{
+  "_comment": "Focused cgroup bandwidth-throttling demonstration. A single cgroup '/throttled' is given a strict 10% quota (cpu.max '10000 100000' = 10ms quota per 100ms period). Two CPU-greedy tasks live inside it and would consume ~2 full CPUs without throttling — but the cgroup_bw enforcement path will repeatedly throttle and unthrottle them so their aggregate CPU consumption stays under 10ms per 100ms wall window. A third task 'free' lives in the root cgroup and is unconstrained; it should make smooth forward progress regardless of what the throttled cgroup is doing. Compare cgroup_hierarchy.json (which contrasts /background vs /interactive at 20% quota with mixed task profiles) — this example is narrower: one throttled cgroup, one free task, clear before/after the throttle fires.\n\nRun with -s lavd to exercise the LAVD cgroup-bw path (the simple scheduler has no cgroup awareness). Add --verbose-summary to see per-cgroup throttle counters.",
+  "_run_units": "rt-app 'run'/'sleep' are microseconds; cpu.max is '<quota_us> <period_us>' (cgroup-v2 convention).",
+  "global": {
+    "duration": 0.3
+  },
+  "tasks": {
+    "throttled_0": {
+      "priority": 0,
+      "loop": -1,
+      "run": 5000,
+      "sleep": 100,
+      "taskgroup": {
+        "path": "/throttled",
+        "cpu.max": "10000 100000"
+      }
+    },
+    "throttled_1": {
+      "priority": 0,
+      "loop": -1,
+      "run": 5000,
+      "sleep": 100,
+      "taskgroup": {
+        "path": "/throttled"
+      }
+    },
+    "free": {
+      "priority": 0,
+      "loop": -1,
+      "run": 1000,
+      "sleep": 1000
+    }
+  }
+}

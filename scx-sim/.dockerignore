@@ -1,0 +1,26 @@
+# Keep the docker build context small. Mirrors what `cargo build`
+# regenerates anyway, plus harness/IDE noise. Without this the
+# context can balloon to several GB of stale build artifacts.
+
+target/
+**/target/
+*.profraw
+*.profdata
+.venv/
+.beads/
+.coverage_html/
+
+# Editor / IDE / OS noise.
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Build artefacts and transient scratch.
+schedulers/build/
+csrc/build/
+docs/guide/book/
+
+# Don't ship git history into the container.
+.git/

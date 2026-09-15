@@ -1,0 +1,10 @@
+[
+  {
+    "id": "sim-lqyu9-cb2f138a177",
+    "issue_id": "sim-lqyu9",
+    "author": "devbig030",
+    "body": "Implemented on feat/layered-support after rebase as 8a1416a (cleanup 9b60292): generic optional Scheduler userspace-control period/iteration event, real scx_layered usage sampling, live CPU reallocation, and real BPF_PROG_RUN refresh. Behavior is proven by enabled (3,1) vs disabled (2,2) and a refresh sabotage that leaves serialized (3,1) but BPF (2,2). Broader scheduler-owned growth policy is tracked separately as sim-juru9; NUMA remains outside scope.",
+    "created_at": "2026-08-12T20:32:28.504732550Z",
+    "updated_at": "2026-08-12T20:32:28.504732550Z"
+  }
+]

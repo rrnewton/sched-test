@@ -1,0 +1,12 @@
+{
+  "trial": "trial4_real_ucache_0.10_v2",
+  "T_seconds": 4,
+  "tokens": 0,
+  "X_geomean": 1.0253,
+  "pass": true,
+  "classes_gt": 4,
+  "classes_syn": 4,
+  "threads_gt": 70,
+  "threads_syn": 70,
+  "notes": "Real 0.10_v2 data. Run durations near-perfect. Sleep inflated by sched latency (expected for real hw data)."
+}

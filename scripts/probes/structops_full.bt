@@ -1,0 +1,324 @@
+#!/usr/bin/env bpftrace
+/*
+ * structops_full.bt — comprehensive sched_ext structop tracer (JSONL output).
+ *
+ * GENERATED FILE. Do not edit by hand. Edit gen_structops_helpers.py instead
+ * and regenerate.
+ *
+ * Attaches kprobe+kretprobe on every `sched_ext_ops__<op>` wrapper exposed
+ * by the kernel (34 of 37 callable ops; cgroup_set_idle / sub_attach /
+ * sub_detach are not yet wrapped — see SURVEY.md). kprobe (not fentry) is
+ * required because bpftrace v0.25's strict-mode verifier rejects `printf`
+ * in several structop fentry trampoline contexts (e.g. dispatch fires
+ * from the idle loop with NULL current).
+ *
+ * Output: one JSONL record per call, schema:
+ *   {"ts_ns":<u64>,"cpu":<i32>,"pid":<i32>,
+ *    "kind":"structop","name":"<op>","phase":"<entry|exit>",
+ *    "args":{...},"ret":<val|null>}
+ *
+ * Designed to be byte-compatible with scxsim's matching `--trace-format
+ * structops-jsonl` emitter so that scripts/compare_live_vs_scxsim_calls.sh
+ * can do a mechanical sequence-diff.
+ *
+ * Usage:
+ *   sudo bpftrace structops_full.bt          # all PIDs
+ *   sudo bpftrace structops_full.bt 12345    # filter to PID 12345
+ *
+ * Tested: kernel 6.16.1-fbk2 on devbig176; bpftrace v0.25.0-be6e (May 2026).
+ * Tg:     bpftrace-structops-helpers-trace-for-scxsim-vs-live-comparison
+ */
+
+/*
+ * No BEGIN block: bpftrace v0.25's BEGIN expansion references
+ * bpf_get_smp_processor_id, which the strict-mode null-check refuses to
+ * accept inside the structops fentry trampoline context. The generated
+ * output is JSONL-only — no banner.
+ */
+
+kprobe:sched_ext_ops__select_cpu
+/* no filter — kprobe context, pid filter unreliable */
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"task_pid\":%d,\"task_comm\":\"%s\",\"prev_cpu\":%d,\"wake_flags\":%llu},\"ret\":null}\n", $ts, $c, 0, "structop", "select_cpu", "entry", ((struct task_struct *)arg0)->pid, str(((struct task_struct *)arg0)->comm), (int32)arg1, (uint64)arg2);
+}
+
+kretprobe:sched_ext_ops__select_cpu
+/* no filter — kprobe context, pid filter unreliable */
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{},\"ret\":%d}\n", $ts, $c, 0, "structop", "select_cpu", "exit", retval);
+}
+
+kprobe:sched_ext_ops__enqueue
+/* no filter — kprobe context, pid filter unreliable */
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"task_pid\":%d,\"task_comm\":\"%s\",\"enq_flags\":%llu},\"ret\":null}\n", $ts, $c, 0, "structop", "enqueue", "entry", ((struct task_struct *)arg0)->pid, str(((struct task_struct *)arg0)->comm), (uint64)arg1);
+}
+
+kprobe:sched_ext_ops__dequeue
+/* no filter — kprobe context, pid filter unreliable */
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"task_pid\":%d,\"task_comm\":\"%s\",\"deq_flags\":%llu},\"ret\":null}\n", $ts, $c, 0, "structop", "dequeue", "entry", ((struct task_struct *)arg0)->pid, str(((struct task_struct *)arg0)->comm), (uint64)arg1);
+}
+
+kprobe:sched_ext_ops__dispatch
+/* no filter — kprobe context, pid filter unreliable */
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"prev_cpu\":%d,\"prev_pid\":%d},\"ret\":null}\n", $ts, $c, 0, "structop", "dispatch", "entry", (int32)arg0, arg1 != 0 ? ((struct task_struct *)arg1)->pid : -1);
+}
+
+kprobe:sched_ext_ops__tick
+/* no filter — kprobe context, pid filter unreliable */
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"task_pid\":%d,\"task_comm\":\"%s\"},\"ret\":null}\n", $ts, $c, 0, "structop", "tick", "entry", ((struct task_struct *)arg0)->pid, str(((struct task_struct *)arg0)->comm));
+}
+
+kprobe:sched_ext_ops__runnable
+/* no filter — kprobe context, pid filter unreliable */
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"task_pid\":%d,\"task_comm\":\"%s\",\"enq_flags\":%llu},\"ret\":null}\n", $ts, $c, 0, "structop", "runnable", "entry", ((struct task_struct *)arg0)->pid, str(((struct task_struct *)arg0)->comm), (uint64)arg1);
+}
+
+kprobe:sched_ext_ops__running
+/* no filter — kprobe context, pid filter unreliable */
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"task_pid\":%d,\"task_comm\":\"%s\"},\"ret\":null}\n", $ts, $c, 0, "structop", "running", "entry", ((struct task_struct *)arg0)->pid, str(((struct task_struct *)arg0)->comm));
+}
+
+kprobe:sched_ext_ops__stopping
+/* no filter — kprobe context, pid filter unreliable */
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"task_pid\":%d,\"task_comm\":\"%s\",\"still_runnable\":%d},\"ret\":null}\n", $ts, $c, 0, "structop", "stopping", "entry", ((struct task_struct *)arg0)->pid, str(((struct task_struct *)arg0)->comm), (int32)arg1);
+}
+
+kprobe:sched_ext_ops__quiescent
+/* no filter — kprobe context, pid filter unreliable */
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"task_pid\":%d,\"task_comm\":\"%s\",\"deq_flags\":%llu},\"ret\":null}\n", $ts, $c, 0, "structop", "quiescent", "entry", ((struct task_struct *)arg0)->pid, str(((struct task_struct *)arg0)->comm), (uint64)arg1);
+}
+
+kprobe:sched_ext_ops__yield
+/* no filter — kprobe context, pid filter unreliable */
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"from_pid\":%d,\"to_pid\":%d},\"ret\":null}\n", $ts, $c, 0, "structop", "yield", "entry", ((struct task_struct *)arg0)->pid, arg1 != 0 ? ((struct task_struct *)arg1)->pid : -1);
+}
+
+kretprobe:sched_ext_ops__yield
+/* no filter — kprobe context, pid filter unreliable */
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{},\"ret\":%d}\n", $ts, $c, 0, "structop", "yield", "exit", retval);
+}
+
+kprobe:sched_ext_ops__core_sched_before
+/* no filter — kprobe context, pid filter unreliable */
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"a_pid\":%d,\"b_pid\":%d},\"ret\":null}\n", $ts, $c, 0, "structop", "core_sched_before", "entry", ((struct task_struct *)arg0)->pid, ((struct task_struct *)arg1)->pid);
+}
+
+kretprobe:sched_ext_ops__core_sched_before
+/* no filter — kprobe context, pid filter unreliable */
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{},\"ret\":%d}\n", $ts, $c, 0, "structop", "core_sched_before", "exit", retval);
+}
+
+kprobe:sched_ext_ops__set_weight
+/* no filter — kprobe context, pid filter unreliable */
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"task_pid\":%d,\"weight\":%u},\"ret\":null}\n", $ts, $c, 0, "structop", "set_weight", "entry", ((struct task_struct *)arg0)->pid, (uint32)arg1);
+}
+
+kprobe:sched_ext_ops__set_cpumask
+/* no filter — kprobe context, pid filter unreliable */
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"task_pid\":%d},\"ret\":null}\n", $ts, $c, 0, "structop", "set_cpumask", "entry", ((struct task_struct *)arg0)->pid);
+}
+
+kprobe:sched_ext_ops__update_idle
+/* no filter — kprobe context, pid filter unreliable */
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"cpu_arg\":%d,\"idle\":%d},\"ret\":null}\n", $ts, $c, 0, "structop", "update_idle", "entry", (int32)arg0, (int32)arg1);
+}
+
+kprobe:sched_ext_ops__cpu_acquire
+/* no filter — kprobe context, pid filter unreliable */
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"cpu_arg\":%d},\"ret\":null}\n", $ts, $c, 0, "structop", "cpu_acquire", "entry", (int32)arg0);
+}
+
+kprobe:sched_ext_ops__cpu_release
+/* no filter — kprobe context, pid filter unreliable */
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"cpu_arg\":%d},\"ret\":null}\n", $ts, $c, 0, "structop", "cpu_release", "entry", (int32)arg0);
+}
+
+kprobe:sched_ext_ops__init_task
+/* no filter — kprobe context, pid filter unreliable */
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"task_pid\":%d,\"task_comm\":\"%s\"},\"ret\":null}\n", $ts, $c, 0, "structop", "init_task", "entry", ((struct task_struct *)arg0)->pid, str(((struct task_struct *)arg0)->comm));
+}
+
+kretprobe:sched_ext_ops__init_task
+/* no filter — kprobe context, pid filter unreliable */
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{},\"ret\":%d}\n", $ts, $c, 0, "structop", "init_task", "exit", retval);
+}
+
+kprobe:sched_ext_ops__exit_task
+/* no filter — kprobe context, pid filter unreliable */
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"task_pid\":%d,\"task_comm\":\"%s\"},\"ret\":null}\n", $ts, $c, 0, "structop", "exit_task", "entry", ((struct task_struct *)arg0)->pid, str(((struct task_struct *)arg0)->comm));
+}
+
+kprobe:sched_ext_ops__enable
+/* no filter — kprobe context, pid filter unreliable */
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"task_pid\":%d,\"task_comm\":\"%s\"},\"ret\":null}\n", $ts, $c, 0, "structop", "enable", "entry", ((struct task_struct *)arg0)->pid, str(((struct task_struct *)arg0)->comm));
+}
+
+kprobe:sched_ext_ops__disable
+/* no filter — kprobe context, pid filter unreliable */
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"task_pid\":%d,\"task_comm\":\"%s\"},\"ret\":null}\n", $ts, $c, 0, "structop", "disable", "entry", ((struct task_struct *)arg0)->pid, str(((struct task_struct *)arg0)->comm));
+}
+
+kprobe:sched_ext_ops__dump
+/* no filter — kprobe context, pid filter unreliable */
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{},\"ret\":null}\n", $ts, $c, 0, "structop", "dump", "entry");
+}
+
+kprobe:sched_ext_ops__dump_cpu
+/* no filter — kprobe context, pid filter unreliable */
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"cpu_arg\":%d,\"idle\":%d},\"ret\":null}\n", $ts, $c, 0, "structop", "dump_cpu", "entry", (int32)arg1, (int32)arg2);
+}
+
+kprobe:sched_ext_ops__dump_task
+/* no filter — kprobe context, pid filter unreliable */
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"task_pid\":%d},\"ret\":null}\n", $ts, $c, 0, "structop", "dump_task", "entry", ((struct task_struct *)arg1)->pid);
+}
+
+kprobe:sched_ext_ops__cgroup_init
+/* no filter — kprobe context, pid filter unreliable */
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"cgrp_id\":%llu},\"ret\":null}\n", $ts, $c, 0, "structop", "cgroup_init", "entry", ((struct cgroup *)arg0)->kn->id);
+}
+
+kretprobe:sched_ext_ops__cgroup_init
+/* no filter — kprobe context, pid filter unreliable */
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{},\"ret\":%d}\n", $ts, $c, 0, "structop", "cgroup_init", "exit", retval);
+}
+
+kprobe:sched_ext_ops__cgroup_exit
+/* no filter — kprobe context, pid filter unreliable */
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"cgrp_id\":%llu},\"ret\":null}\n", $ts, $c, 0, "structop", "cgroup_exit", "entry", ((struct cgroup *)arg0)->kn->id);
+}
+
+kprobe:sched_ext_ops__cgroup_prep_move
+/* no filter — kprobe context, pid filter unreliable */
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"task_pid\":%d,\"from_cgid\":%llu,\"to_cgid\":%llu},\"ret\":null}\n", $ts, $c, 0, "structop", "cgroup_prep_move", "entry", ((struct task_struct *)arg0)->pid, ((struct cgroup *)arg1)->kn->id, ((struct cgroup *)arg2)->kn->id);
+}
+
+kretprobe:sched_ext_ops__cgroup_prep_move
+/* no filter — kprobe context, pid filter unreliable */
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{},\"ret\":%d}\n", $ts, $c, 0, "structop", "cgroup_prep_move", "exit", retval);
+}
+
+kprobe:sched_ext_ops__cgroup_move
+/* no filter — kprobe context, pid filter unreliable */
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"task_pid\":%d,\"from_cgid\":%llu,\"to_cgid\":%llu},\"ret\":null}\n", $ts, $c, 0, "structop", "cgroup_move", "entry", ((struct task_struct *)arg0)->pid, ((struct cgroup *)arg1)->kn->id, ((struct cgroup *)arg2)->kn->id);
+}
+
+kprobe:sched_ext_ops__cgroup_cancel_move
+/* no filter — kprobe context, pid filter unreliable */
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"task_pid\":%d,\"from_cgid\":%llu,\"to_cgid\":%llu},\"ret\":null}\n", $ts, $c, 0, "structop", "cgroup_cancel_move", "entry", ((struct task_struct *)arg0)->pid, ((struct cgroup *)arg1)->kn->id, ((struct cgroup *)arg2)->kn->id);
+}
+
+kprobe:sched_ext_ops__cgroup_set_weight
+/* no filter — kprobe context, pid filter unreliable */
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"cgrp_id\":%llu,\"weight\":%u},\"ret\":null}\n", $ts, $c, 0, "structop", "cgroup_set_weight", "entry", ((struct cgroup *)arg0)->kn->id, (uint32)arg1);
+}
+
+kprobe:sched_ext_ops__cgroup_set_bandwidth
+/* no filter — kprobe context, pid filter unreliable */
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"cgrp_id\":%llu,\"period_us\":%llu,\"quota_us\":%llu,\"burst_us\":%llu},\"ret\":null}\n", $ts, $c, 0, "structop", "cgroup_set_bandwidth", "entry", ((struct cgroup *)arg0)->kn->id, (uint64)arg1, (uint64)arg2, (uint64)arg3);
+}
+
+kprobe:sched_ext_ops__cpu_online
+/* no filter — kprobe context, pid filter unreliable */
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"cpu_arg\":%d},\"ret\":null}\n", $ts, $c, 0, "structop", "cpu_online", "entry", (int32)arg0);
+}
+
+kprobe:sched_ext_ops__cpu_offline
+/* no filter — kprobe context, pid filter unreliable */
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{\"cpu_arg\":%d},\"ret\":null}\n", $ts, $c, 0, "structop", "cpu_offline", "entry", (int32)arg0);
+}
+
+kprobe:sched_ext_ops__init
+/* no filter — kprobe context, pid filter unreliable */
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{},\"ret\":null}\n", $ts, $c, 0, "structop", "init", "entry");
+}
+
+kretprobe:sched_ext_ops__init
+/* no filter — kprobe context, pid filter unreliable */
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{},\"ret\":%d}\n", $ts, $c, 0, "structop", "init", "exit", retval);
+}
+
+kprobe:sched_ext_ops__exit
+/* no filter — kprobe context, pid filter unreliable */
+{
+    $ts = nsecs; $c = cpu;
+    printf("{\"ts_ns\":%llu,\"cpu\":%d,\"pid\":%d,\"kind\":\"%s\",\"name\":\"%s\",\"phase\":\"%s\",\"args\":{},\"ret\":null}\n", $ts, $c, 0, "structop", "exit", "entry");
+}

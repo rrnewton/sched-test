@@ -1,0 +1,17 @@
+{
+  "per_cgroup_cpu_time_ns": {
+    "cg_0": 11948334412,
+    "cg_1": 11949274116
+  },
+  "provenance": {
+    "kernel": "6.14.11",
+    "passed": true,
+    "project_commit": "f5d0fce",
+    "recorded_utc": "2026-08-13T15:12:52Z",
+    "scheduler": "ktstr_sched",
+    "sidecar": "sched_cpuset_split-187cba827571473b.ktstr.json",
+    "test_name": "sched_cpuset_split",
+    "topology": "1n1l4c1t"
+  },
+  "scenario": "sched_cpuset_split"
+}

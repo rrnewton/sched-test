@@ -1,0 +1,88 @@
+{
+    "folders": [
+        {
+            "name": "scx-sim",
+            "path": "scx-sim"
+        },
+        {
+            "name": "scx (upstream schedulers)",
+            "path": "scx"
+        },
+        {
+            "name": "scheds",
+            "path": "scheds"
+        }
+    ],
+    "settings": {
+        "files.watcherExclude": {
+            "**/target/**": true,
+            "**/.git/**": true
+        },
+        "search.exclude": {
+            "**/target/**": true
+        }
+    },
+    "launch": {
+        "version": "0.2.0",
+        "configurations": [
+            {
+                "name": "Attach to scxsim (simple)",
+                "type": "fb-lldb",
+                "request": "attach",
+                "pid": "${input:pid}",
+                "initCommands": [
+                    "settings set target.process.thread.step-avoid-regexp \"^(scx_bpf_|bpf_|scx_test_|sim_|_ZN)\"",
+                    "process handle SIGFPE -s false -n false -p true"
+                ],
+                "postRunCommands": [
+                    "breakpoint set --name simple_init",
+                    "breakpoint set --name simple_select_cpu",
+                    "breakpoint set --name simple_enqueue",
+                    "breakpoint set --name simple_dispatch",
+                    "breakpoint set --name simple_running",
+                    "breakpoint set --name simple_stopping",
+                    "breakpoint set --name simple_enable",
+                    "breakpoint set --name simple_exit"
+                ]
+            },
+            {
+                "name": "Attach to scxsim (LAVD)",
+                "type": "fb-lldb",
+                "request": "attach",
+                "pid": "${input:pid}",
+                "initCommands": [
+                    "settings set target.process.thread.step-avoid-regexp \"^(scx_bpf_|bpf_|scx_test_|sim_|_ZN)\"",
+                    "process handle SIGFPE -s false -n false -p true"
+                ],
+                "postRunCommands": [
+                    "breakpoint set --name lavd_init",
+                    "breakpoint set --name lavd_select_cpu",
+                    "breakpoint set --name lavd_enqueue",
+                    "breakpoint set --name lavd_dispatch",
+                    "breakpoint set --name lavd_running",
+                    "breakpoint set --name lavd_stopping",
+                    "breakpoint set --name lavd_enable",
+                    "breakpoint set --name lavd_exit"
+                ]
+            },
+            {
+                "name": "Attach to scxsim (pick process)",
+                "type": "fb-lldb",
+                "request": "attach",
+                "pid": "${command:pickProcess}",
+                "processName": "scxsim",
+                "initCommands": [
+                    "settings set target.process.thread.step-avoid-regexp \"^(scx_bpf_|bpf_|scx_test_|sim_|_ZN)\"",
+                    "process handle SIGFPE -s false -n false -p true"
+                ]
+            }
+        ],
+        "inputs": [
+            {
+                "id": "pid",
+                "type": "promptString",
+                "description": "Enter the PID from --wait-debugger output"
+            }
+        ]
+    }
+}

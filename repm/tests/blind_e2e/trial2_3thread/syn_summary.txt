@@ -1,0 +1,92 @@
+
+Simulation complete:
+  Logical time elapsed:   10s
+  Total tasks:            3
+  Max concurrent running: 3
+  Total time slices:      2926
+  Tasks at end:           3 alive, 1 runnable
+
+Sched_ext structop summary:
+     cpu   structops         rbc      kfuncs
+  ------  ----------  ----------  ----------
+       0        6408      975703       38206
+       1       14013      982957       46072
+       2        2450      175887        9016
+  ------  ----------  ----------  ----------
+   total       22871     2134547       93294
+
+Preemption stats:
+  longest_structop_rbc:    945
+  longest_rbc_interval:    420  (between kfuncs)
+  REPLAY_MARGIN:           200
+
+
+=== Trace Statistics ===
+
+Duration: 9000.000ms
+
+--- Per-Task Statistics ---
+  Task PID=1:
+    Schedules:       1795
+    Run duration:    0.103ms mean, 0.020ms stddev, CV=19.4%
+    Inter-arrival:   5.013ms mean, 0.022ms stddev
+    Direct dispatch: 0
+    Enqueue calls:   0
+    Yields:          0
+    Preemptions:     0
+    Sleeps:          1795
+  Task PID=2:
+    Schedules:       199
+    Run duration:    21.993ms mean, 11.494ms stddev, CV=52.3%
+    Inter-arrival:   45.340ms mean, 13.071ms stddev
+    Direct dispatch: 59
+    Enqueue calls:   0
+    Yields:          0
+    Preemptions:     59
+    Sleeps:          139
+    Sched latency:   p50=1.060us p90=1.060us p99=1.060us p999=1.060us max=1.060us (59 samples)
+  Task PID=3:
+    Schedules:       627
+    Run duration:    3.568ms mean, 0.969ms stddev, CV=27.2%
+    Inter-arrival:   14.335ms mean, 1.971ms stddev
+    Direct dispatch: 21
+    Enqueue calls:   0
+    Yields:          0
+    Preemptions:     21
+    Sleeps:          607
+    Sched latency:   p50=1.010us p90=1.010us p99=1.010us p999=1.010us max=1.010us (21 samples)
+
+--- Per-CPU Statistics ---
+  CPU 0:
+    Ticks:         557
+    Tick interval: 16.165ms mean, 5.476ms stddev
+    Balance calls: 607
+    Idle events:   607
+    Idle duration: 6759.002ms
+    Utilization:   24.9%
+  CPU 1:
+    Ticks:         44
+    Tick interval: 206.452ms mean, 192.534ms stddev
+    Balance calls: 1795
+    Idle events:   1795
+    Idle duration: 8813.905ms
+    Utilization:   2.1%
+  CPU 2:
+    Ticks:         1087
+    Tick interval: 8.309ms mean, 11.228ms stddev
+    Balance calls: 139
+    Idle events:   139
+    Idle duration: 4631.651ms
+    Utilization:   48.5%
+
+--- Overall CPU Utilization: 25.2% (3 CPUs, 9000.000ms) ---
+
+--- Global Statistics ---
+  DSQ inserts (FIFO):    2621
+  DSQ inserts (vtime):   0
+  DSQ move_to_local:     2541
+  Kick CPU calls:        80
+  DSQ routing:
+    Local/direct:     2621 (100.0%)
+
+scxsim: disabling ASLR and re-executing...

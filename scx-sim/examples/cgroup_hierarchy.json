@@ -1,0 +1,47 @@
+{
+  "_comment": "Cgroup-hierarchy example. Two cgroups: /background (CPU-throttled to 20% of one CPU via cpu.max '20000 100000') and /interactive (unconstrained via cpu.max 'max 100000'). Each cgroup has two tasks; background tasks are long-running and bursty (5ms run / 1ms sleep), interactive tasks are short and idle most of the time (1ms run / 9ms sleep). Run with -s lavd to exercise the LAVD cgroup-bandwidth path; run with --verbose-summary to see per-cgroup throttle counters.",
+  "_run_units": "rt-app 'run'/'sleep' are microseconds; cpu.max is '<quota_us> <period_us>' (cgroup-v2 convention).",
+  "global": {
+    "duration": 0.2
+  },
+  "tasks": {
+    "background_0": {
+      "priority": 0,
+      "loop": -1,
+      "run": 5000,
+      "sleep": 1000,
+      "taskgroup": {
+        "path": "/background",
+        "cpu.max": "20000 100000"
+      }
+    },
+    "background_1": {
+      "priority": 0,
+      "loop": -1,
+      "run": 5000,
+      "sleep": 1000,
+      "taskgroup": {
+        "path": "/background"
+      }
+    },
+    "interactive_0": {
+      "priority": 0,
+      "loop": -1,
+      "run": 1000,
+      "sleep": 9000,
+      "taskgroup": {
+        "path": "/interactive",
+        "cpu.max": "max 100000"
+      }
+    },
+    "interactive_1": {
+      "priority": 0,
+      "loop": -1,
+      "run": 1000,
+      "sleep": 9000,
+      "taskgroup": {
+        "path": "/interactive"
+      }
+    }
+  }
+}

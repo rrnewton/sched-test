@@ -1,0 +1,17 @@
+{
+  "per_cgroup_cpu_time_ns": {
+    "cg_0": 5979817046,
+    "cg_1": 5962224889
+  },
+  "provenance": {
+    "kernel": "6.14.11",
+    "passed": true,
+    "project_commit": "f5d0fce",
+    "recorded_utc": "2026-08-13T15:12:52Z",
+    "scheduler": "ktstr_sched",
+    "sidecar": "sched_dynamic_add-69298e1249f472ef.ktstr.json",
+    "test_name": "sched_dynamic_add",
+    "topology": "1n1l2c1t"
+  },
+  "scenario": "sched_dynamic_add"
+}

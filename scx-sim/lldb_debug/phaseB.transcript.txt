@@ -1,0 +1,63 @@
+(lldb) target create "/home/newton/work/multi_sched-test/worktrees/scxsim-tooling-integrator/sched-test/scx-sim/target/release/scxsim"
+Current executable set to '/home/newton/work/multi_sched-test/worktrees/scxsim-tooling-integrator/sched-test/scx-sim/target/release/scxsim' (x86_64).
+(lldb) settings set -- target.run-args  "--no-disable-aslr" "run" "tests/fixtures/h6/bug1_canonical.json" "--config" "tests/fixtures/h6/bug1_canonical.toml" "--watchdog" "80ms" "-s" "lavd" "--cpus" "4" "--duration" "500ms"
+(lldb) command source /home/newton/work/multi_sched-test/worktrees/scxsim-tooling-integrator/sched-test/scx-sim/lldb_debug/init.lldb
+Executing commands in '/home/newton/work/multi_sched-test/worktrees/scxsim-tooling-integrator/sched-test/scx-sim/lldb_debug/init.lldb'.
+(lldb) # scxsim debug helpers — settings + formatter loader.
+(lldb) #
+(lldb) # Use one of:
+(lldb) #
+(lldb) #   # Auto-load formatters via LAVD_DBG_DIR env var:
+(lldb) #   LAVD_DBG_DIR=/abs/path/to/scx-sim/debug \
+(lldb) #     lldb -b -o "command source $LAVD_DBG_DIR/init.lldb" -- ./scxsim ...
+(lldb) #
+(lldb) #   # Or pass the formatters path explicitly:
+(lldb) #   lldb -b \
+(lldb) #     -o "command source scx-sim/lldb_debug/init.lldb" \
+(lldb) #     -o "command script import scx-sim/lldb_debug/lldb_lavd_formatters.py" \
+(lldb) #     -- ./scxsim ...
+(lldb) #
+(lldb) # This script configures stepping defaults but does NOT load the .py
+(lldb) # (multi-line `script` blocks are awkward in batch mode). The wrapper
+(lldb) # script in `scx-sim/lldb_debug/run-with-formatters.sh` handles auto-load
+(lldb) # via the env var.
+(lldb) # Don't trip on BPF div-by-zero semantics replicated in the wrapper.
+(lldb) process handle SIGFPE -s false -n false -p true
+NAME         PASS     STOP     NOTIFY
+===========  =======  =======  =======
+SIGFPE       true     false    false  
+(lldb) # Keep ASLR settings in sync with `scxsim --no-disable-aslr`.
+(lldb) settings set target.disable-aslr false
+(lldb) # Skip stepping into low-level Rust std/core/alloc and BPF helper noise.
+(lldb) settings set target.process.thread.step-avoid-regexp ^(scx_bpf_|bpf_|scx_test_|sim_|_ZN|std::|core::|alloc::)
+(lldb) command script import /home/newton/work/multi_sched-test/worktrees/scxsim-tooling-integrator/sched-test/scx-sim/lldb_debug/lldb_lavd_formatters.py
+[lldb_lavd_formatters] registered 10 type summaries + command `bug1_diagnose`
+(lldb) command source -s 0 '/tmp/tmp.uYFl6NY1lQ.lldb'
+Executing commands in '/tmp/tmp.uYFl6NY1lQ.lldb'.
+(lldb) breakpoint set --file engine.rs --line 1266
+Breakpoint 1: where = scxsim`scx_simulator::safe::engine::Simulator$LT$S$GT$::process_event_inner::h16cef0dcc6d48297 + 9138 [inlined] scx_simulator::safe::engine::Simulator$LT$S$GT$::check_watchdog::h0aa470a0999de16a + 101 at engine.rs:1266:16, address = 0x00000000001a6c42
+(lldb) run
+Process 3992455 launched: '/home/newton/work/multi_sched-test/worktrees/scxsim-tooling-integrator/sched-test/scx-sim/target/release/scxsim' (x86_64)
+Process 3992455 stopped
+* thread #1, name = 'scxsim', stop reason = breakpoint 1.1
+       frame #0: 0x000056414ce79c42 scxsim`scx_simulator::safe::engine::Simulator$LT$S$GT$::check_watchdog::h0aa470a0999de16a(tasks=0x000056414f230008, current_time=4000000, timeout_ns=80000000) at engine.rs:1266:16
+   1263	    ) -> Option<ExitKind> {
+   1264	        let mut worst: Option<(Pid, TimeNs)> = None;
+   1265	        for task in tasks.values() {
+-> 1266	            if matches!(task.state, TaskState::Runnable) {
+    	               ^
+   1267	                if let Some(runnable_at) = task.runnable_at_ns {
+   1268	                    let runnable_for = current_time.saturating_sub(runnable_at);
+   1269	                    if runnable_for > timeout_ns {
+(lldb) script print("=== bug1_diagnose at first check_watchdog stop ===")
+=== bug1_diagnose at first check_watchdog stop ===
+(lldb) bug1_diagnose
+== bug1_diagnose ==
+frame: scx_simulator::safe::engine::Simulator$LT$S$GT$::check_watchdog::h0aa470a0999de16a
+could not reach SimState via {self,s,guard,fields}.sim — select a frame that holds it (e.g. process_event_inner).
+(lldb) script print("=== frame variable task (SimTask formatter) ===")
+=== frame variable task (SimTask formatter) ===
+(lldb) frame variable task
+(scx_simulator::unsafe_impl::sim_task::SimTask *) task = <variable not available>
+
+(lldb) quit

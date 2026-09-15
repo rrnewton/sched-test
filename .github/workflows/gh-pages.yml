@@ -1,0 +1,78 @@
+name: Deploy scxsim guide to GitHub Pages
+
+# Build the mdbook under scx-sim/docs/guide/ and publish the rendered
+# HTML to GitHub Pages. Triggered on pushes to simulator.v6 (the
+# current dev tip) that touch the guide source, the book config, or
+# this workflow itself. `workflow_dispatch` lets a maintainer kick a
+# rebuild manually after enabling Pages.
+#
+# Pages source for this repo MUST be set to "GitHub Actions" (not the
+# legacy branch-based source) for this workflow's deploy-pages step to
+# succeed. Configure once at:
+#   https://github.com/<owner>/<repo>/settings/pages
+# or via:
+#   gh api repos/<owner>/<repo>/pages -X POST \
+#     -f 'build_type=workflow'
+
+on:
+  push:
+    branches:
+      - simulator.v6
+      - main
+    paths:
+      - 'scx-sim/docs/guide/**'
+      - '.github/workflows/gh-pages.yml'
+  workflow_dispatch:
+
+# Pages deploy requires write access to pages + id-token for the
+# OIDC-signed artifact upload.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow one concurrent deployment; cancel any in-flight runs when a
+# newer commit lands. Don't cancel a deploy that's actively publishing.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      # Pin a known-good mdbook release. Bump as needed; binary
+      # download is ~30s vs ~5min for `cargo install mdbook`.
+      MDBOOK_VERSION: "0.4.40"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install mdbook (prebuilt binary)
+        run: |
+          set -euxo pipefail
+          mkdir -p "$HOME/.local/bin"
+          curl -sSL \
+            "https://github.com/rust-lang/mdBook/releases/download/v${MDBOOK_VERSION}/mdbook-v${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar -xz -C "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/mdbook" --version
+
+      - name: Build mdbook
+        working-directory: scx-sim/docs/guide
+        run: mdbook build
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: scx-sim/docs/guide/book
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

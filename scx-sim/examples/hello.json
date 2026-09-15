@@ -1,0 +1,16 @@
+{
+  "_comment": "Minimal scxsim example: one task, five iterations of (run 1ms, sleep 1ms). Intended as the absolute simplest workload that exercises the simulator end-to-end. Referenced from docs/guide/src/getting-started/quick-start.md.",
+  "_run_units": "rt-app 'run' and 'sleep' are in microseconds. 1000us = 1ms.",
+  "global": {
+    "duration": 0.05,
+    "default_policy": "SCHED_OTHER"
+  },
+  "tasks": {
+    "hello": {
+      "priority": 0,
+      "loop": 5,
+      "run": 1000,
+      "sleep": 1000
+    }
+  }
+}

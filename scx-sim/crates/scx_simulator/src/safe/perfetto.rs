@@ -1,0 +1,740 @@
+//! Chrome Trace Event Format (JSON) export for Perfetto.
+//!
+//! Writes the simulation trace as a JSON file loadable in
+//! [ui.perfetto.dev](https://ui.perfetto.dev). Each CPU is a Perfetto
+//! process (pid = cpu index) with a single "running" thread showing task
+//! execution as colored duration blocks.
+
+use std::io::Write;
+
+use serde_json::json;
+
+use crate::scenario::IrqType;
+use crate::trace::{DispatchRejectReason, Trace, TraceKind};
+use crate::types::DsqId;
+
+/// Write the trace as Chrome Trace Event Format JSON.
+///
+/// Stream-writes events one at a time (no intermediate `Vec<Value>`) to
+/// avoid unnecessary allocation per coding conventions.
+pub(crate) fn write_json(trace: &Trace, writer: &mut impl Write) -> std::io::Result<()> {
+    writer.write_all(b"{\"traceEvents\":[")?;
+
+    let mut need_comma = false;
+
+    // Emit process metadata: one "process" per CPU
+    for cpu in 0..trace.nr_cpus {
+        write_comma(writer, &mut need_comma)?;
+        serde_json::to_writer(
+            &mut *writer,
+            &json!({
+                "ph": "M",
+                "pid": cpu,
+                "tid": 0,
+                "name": "process_name",
+                "args": { "name": format!("CPU {cpu}") }
+            }),
+        )?;
+
+        write_comma(writer, &mut need_comma)?;
+        serde_json::to_writer(
+            &mut *writer,
+            &json!({
+                "ph": "M",
+                "pid": cpu,
+                "tid": 0,
+                "name": "thread_name",
+                "args": { "name": "running" }
+            }),
+        )?;
+    }
+
+    // Emit trace events
+    for event in trace.events() {
+        let cpu = event.cpu.0;
+        let ts = event.time_ns / 1000; // ns → μs
+
+        write_comma(writer, &mut need_comma)?;
+        let value = match &event.kind {
+            TraceKind::TaskScheduled { pid } => {
+                let name = trace.task_name(*pid);
+                json!({
+                    "ph": "B",
+                    "pid": cpu,
+                    "tid": 0,
+                    "ts": ts,
+                    "name": name,
+                    "cat": "sched",
+                    "args": { "pid": pid.0 }
+                })
+            }
+
+            TraceKind::TaskPreempted { pid } => {
+                json!({
+                    "ph": "E",
+                    "pid": cpu,
+                    "tid": 0,
+                    "ts": ts,
+                    "cat": "sched",
+                    "args": { "reason": "preempted", "pid": pid.0 }
+                })
+            }
+
+            TraceKind::TaskYielded { pid } => {
+                json!({
+                    "ph": "E",
+                    "pid": cpu,
+                    "tid": 0,
+                    "ts": ts,
+                    "cat": "sched",
+                    "args": { "reason": "yielded", "pid": pid.0 }
+                })
+            }
+
+            TraceKind::TaskSlept { pid } => {
+                json!({
+                    "ph": "E",
+                    "pid": cpu,
+                    "tid": 0,
+                    "ts": ts,
+                    "cat": "sched",
+                    "args": { "reason": "slept", "pid": pid.0 }
+                })
+            }
+
+            TraceKind::TaskParked { pid } => {
+                json!({
+                    "ph": "i",
+                    "pid": cpu,
+                    "tid": 0,
+                    "ts": ts,
+                    "cat": "sched",
+                    "name": "parked",
+                    "s": "t",
+                    "args": { "reason": "parked", "pid": pid.0 }
+                })
+            }
+
+            TraceKind::TaskCompleted { pid } => {
+                json!({
+                    "ph": "E",
+                    "pid": cpu,
+                    "tid": 0,
+                    "ts": ts,
+                    "cat": "sched",
+                    "args": { "reason": "completed", "pid": pid.0 }
+                })
+            }
+
+            TraceKind::SimulationEnd { pid } => {
+                json!({
+                    "ph": "E",
+                    "pid": cpu,
+                    "tid": 0,
+                    "ts": ts,
+                    "cat": "sched",
+                    "args": { "reason": "sim_end", "pid": pid.0 }
+                })
+            }
+
+            TraceKind::CpuIdle => {
+                json!({
+                    "ph": "i",
+                    "pid": cpu,
+                    "tid": 0,
+                    "ts": ts,
+                    "name": "idle",
+                    "s": "t"
+                })
+            }
+
+            TraceKind::TaskWoke { pid } => {
+                let name = trace.task_name(*pid);
+                json!({
+                    "ph": "i",
+                    "pid": cpu,
+                    "tid": 0,
+                    "ts": ts,
+                    "name": "wake",
+                    "s": "t",
+                    "args": { "task": name, "pid": pid.0 }
+                })
+            }
+
+            // Ops events
+            TraceKind::PutPrevTask {
+                pid,
+                still_runnable,
+            } => {
+                json!({
+                    "ph": "i",
+                    "pid": cpu,
+                    "tid": 0,
+                    "ts": ts,
+                    "name": "put_prev_task",
+                    "cat": "ops",
+                    "s": "t",
+                    "args": { "pid": pid.0, "still_runnable": still_runnable }
+                })
+            }
+
+            TraceKind::SelectTaskRq {
+                pid,
+                prev_cpu,
+                selected_cpu,
+            } => {
+                json!({
+                    "ph": "i",
+                    "pid": cpu,
+                    "tid": 0,
+                    "ts": ts,
+                    "name": "select_task_rq",
+                    "cat": "ops",
+                    "s": "t",
+                    "args": {
+                        "pid": pid.0,
+                        "prev_cpu": prev_cpu.0,
+                        "selected_cpu": selected_cpu.0
+                    }
+                })
+            }
+
+            TraceKind::EnqueueTask { pid, enq_flags } => {
+                json!({
+                    "ph": "i",
+                    "pid": cpu,
+                    "tid": 0,
+                    "ts": ts,
+                    "name": "enqueue",
+                    "cat": "ops",
+                    "s": "t",
+                    "args": { "pid": pid.0, "enq_flags": format!("{enq_flags:#x}") }
+                })
+            }
+
+            TraceKind::Balance { prev_pid } => {
+                json!({
+                    "ph": "i",
+                    "pid": cpu,
+                    "tid": 0,
+                    "ts": ts,
+                    "name": "balance",
+                    "cat": "ops",
+                    "s": "t",
+                    "args": { "prev_pid": prev_pid.map(|p| p.0) }
+                })
+            }
+
+            TraceKind::PickTask { pid } => {
+                json!({
+                    "ph": "i",
+                    "pid": cpu,
+                    "tid": 0,
+                    "ts": ts,
+                    "name": "pick_task",
+                    "cat": "ops",
+                    "s": "t",
+                    "args": { "pid": pid.0 }
+                })
+            }
+
+            TraceKind::SetNextTask { pid } => {
+                json!({
+                    "ph": "i",
+                    "pid": cpu,
+                    "tid": 0,
+                    "ts": ts,
+                    "name": "set_next_task",
+                    "cat": "ops",
+                    "s": "t",
+                    "args": { "pid": pid.0 }
+                })
+            }
+
+            // Kfunc events
+            TraceKind::DsqInsert { pid, dsq_id, slice } => {
+                json!({
+                    "ph": "i",
+                    "pid": cpu,
+                    "tid": 0,
+                    "ts": ts,
+                    "name": "dsq_insert",
+                    "cat": "kfunc",
+                    "s": "t",
+                    "args": {
+                        "pid": pid.0,
+                        "dsq_id": format_dsq_id(*dsq_id),
+                        "slice_ns": slice
+                    }
+                })
+            }
+
+            TraceKind::DsqInsertVtime {
+                pid,
+                dsq_id,
+                slice,
+                vtime,
+            } => {
+                json!({
+                    "ph": "i",
+                    "pid": cpu,
+                    "tid": 0,
+                    "ts": ts,
+                    "name": "dsq_insert_vtime",
+                    "cat": "kfunc",
+                    "s": "t",
+                    "args": {
+                        "pid": pid.0,
+                        "dsq_id": format_dsq_id(*dsq_id),
+                        "slice_ns": slice,
+                        "vtime": vtime.0
+                    }
+                })
+            }
+
+            TraceKind::DsqMoveToLocal { dsq_id, success } => {
+                json!({
+                    "ph": "i",
+                    "pid": cpu,
+                    "tid": 0,
+                    "ts": ts,
+                    "name": "dsq_move_to_local",
+                    "cat": "kfunc",
+                    "s": "t",
+                    "args": {
+                        "dsq_id": format_dsq_id(*dsq_id),
+                        "success": success
+                    }
+                })
+            }
+
+            TraceKind::KickCpu { target_cpu } => {
+                json!({
+                    "ph": "i",
+                    "pid": cpu,
+                    "tid": 0,
+                    "ts": ts,
+                    "name": "kick_cpu",
+                    "cat": "kfunc",
+                    "s": "t",
+                    "args": { "target_cpu": target_cpu.0 }
+                })
+            }
+
+            TraceKind::Tick { pid } => {
+                json!({
+                    "ph": "i",
+                    "pid": cpu,
+                    "tid": 0,
+                    "ts": ts,
+                    "name": "tick",
+                    "cat": "kfunc",
+                    "s": "t",
+                    "args": { "pid": pid.0 }
+                })
+            }
+
+            TraceKind::DispatchRejected {
+                pid,
+                target_cpu,
+                reason,
+            } => {
+                let reason_str = match reason {
+                    DispatchRejectReason::CpumaskViolation => "cpumask_violation",
+                    DispatchRejectReason::MigrationDisabled => "migration_disabled",
+                };
+                json!({
+                    "ph": "i",
+                    "pid": cpu,
+                    "tid": 0,
+                    "ts": ts,
+                    "name": "dispatch_rejected",
+                    "cat": "error",
+                    "s": "t",
+                    "args": {
+                        "pid": pid.0,
+                        "target_cpu": target_cpu.0,
+                        "reason": reason_str
+                    }
+                })
+            }
+
+            TraceKind::IrqStart {
+                cpu: irq_cpu,
+                irq_type,
+            } => {
+                let kind_str = match irq_type {
+                    IrqType::HardIrq => "hardirq",
+                    IrqType::SoftIrq => "softirq",
+                };
+                json!({
+                    "ph": "i",
+                    "pid": cpu,
+                    "tid": 0,
+                    "ts": ts,
+                    "name": "irq_start",
+                    "cat": "irq",
+                    "s": "t",
+                    "args": {
+                        "cpu": irq_cpu.0,
+                        "type": kind_str
+                    }
+                })
+            }
+
+            TraceKind::IrqEnd { cpu: irq_cpu } => {
+                json!({
+                    "ph": "i",
+                    "pid": cpu,
+                    "tid": 0,
+                    "ts": ts,
+                    "name": "irq_end",
+                    "cat": "irq",
+                    "s": "t",
+                    "args": {
+                        "cpu": irq_cpu.0
+                    }
+                })
+            }
+
+            // Futex lock-holder boost: instant event on the task's lane.
+            TraceKind::FutexBoost { pid, op, boosted } => {
+                json!({
+                    "ph": "i",
+                    "pid": cpu,
+                    "tid": pid.0,
+                    "ts": ts,
+                    "name": "futex_boost",
+                    "cat": "futex",
+                    "s": "t",
+                    "args": {
+                        "pid": pid.0,
+                        "op": format!("{op:?}"),
+                        "boosted": boosted
+                    }
+                })
+            }
+
+            // Diff 3 wiring: cgroup bandwidth (cpu.max) trace events.
+            // Emitted as instant events keyed to the CPU lane so they
+            // line up visually with the affected task's slice in Perfetto.
+            TraceKind::CgroupBwCharge {
+                pid,
+                cgid,
+                delta_ns,
+            } => {
+                json!({
+                    "ph": "i",
+                    "pid": cpu,
+                    "tid": 0,
+                    "ts": ts,
+                    "name": "cgroup_bw_charge",
+                    "cat": "cgroup_bw",
+                    "s": "t",
+                    "args": { "pid": pid.0, "cgid": cgid.0, "delta_ns": delta_ns }
+                })
+            }
+            TraceKind::CgroupBwDenied { pid, cgid } => {
+                json!({
+                    "ph": "i",
+                    "pid": cpu,
+                    "tid": 0,
+                    "ts": ts,
+                    "name": "cgroup_bw_denied",
+                    "cat": "cgroup_bw",
+                    "s": "t",
+                    "args": { "pid": pid.0, "cgid": cgid.0 }
+                })
+            }
+            TraceKind::CgroupBwDequeueOnThrottle { pid, cgid } => {
+                json!({
+                    "ph": "i",
+                    "pid": cpu,
+                    "tid": 0,
+                    "ts": ts,
+                    "name": "cgroup_bw_dequeue_on_throttle",
+                    "cat": "cgroup_bw",
+                    "s": "t",
+                    "args": { "pid": pid.0, "cgid": cgid.0 }
+                })
+            }
+            TraceKind::CgroupBwReenqueueOnReplenish { pid, cgid } => {
+                json!({
+                    "ph": "i",
+                    "pid": cpu,
+                    "tid": 0,
+                    "ts": ts,
+                    "name": "cgroup_bw_reenqueue_on_replenish",
+                    "cat": "cgroup_bw",
+                    "s": "t",
+                    "args": { "pid": pid.0, "cgid": cgid.0 }
+                })
+            }
+            TraceKind::LavdBailOnCgroupThrottle { pid, cgid } => {
+                json!({
+                    "ph": "i",
+                    "pid": cpu,
+                    "tid": 0,
+                    "ts": ts,
+                    "name": "lavd_bail_on_cgroup_throttle",
+                    "cat": "cgroup_bw",
+                    "s": "t",
+                    "args": { "pid": pid.0, "cgid": cgid.0 }
+                })
+            }
+            TraceKind::LavdReenqueueViaBtqDrain { cgid } => {
+                json!({
+                    "ph": "i",
+                    "pid": cpu,
+                    "tid": 0,
+                    "ts": ts,
+                    "name": "lavd_reenqueue_via_btq_drain",
+                    "cat": "cgroup_bw",
+                    "s": "t",
+                    "args": { "cgid": cgid.0 }
+                })
+            }
+            TraceKind::CgroupBwConsumeNs { cgid, ns } => {
+                json!({
+                    "ph": "i",
+                    "pid": cpu,
+                    "tid": 0,
+                    "ts": ts,
+                    "name": "cgroup_bw_consume",
+                    "cat": "cgroup_bw",
+                    "s": "t",
+                    "args": { "cgid": cgid.0, "ns": ns }
+                })
+            }
+            TraceKind::CgroupBwReplenish {
+                cgid,
+                runtime_total_last,
+                period_budget_in,
+                debt,
+                burst_credit,
+                period_budget_out,
+                keep_throttled,
+            } => {
+                json!({
+                    "ph": "i",
+                    "pid": cpu,
+                    "tid": 0,
+                    "ts": ts,
+                    "name": "cgroup_bw_replenish",
+                    "cat": "cgroup_bw",
+                    "s": "g",
+                    "args": {
+                        "cgid": cgid.0,
+                        "runtime_total_last": runtime_total_last,
+                        "period_budget_in": period_budget_in,
+                        "debt": debt,
+                        "burst_credit": burst_credit,
+                        "period_budget_out": period_budget_out,
+                        "keep_throttled": keep_throttled,
+                    }
+                })
+            }
+            // tg `bundle-implement-cpu-bw-critical-tracekind-easy-wins`:
+            // perfetto Chrome-JSON instants for the 8 new structop hooks.
+            // Emitted at the structop call site so timeline viewers (and
+            // scxtop) can show the LAVD callback fire alongside the
+            // CgroupBwReplenish smoking gun.
+            TraceKind::Runnable { pid, enq_flags } => json!({
+                "ph": "i", "pid": cpu, "tid": pid.0, "ts": ts,
+                "name": "ops.runnable", "cat": "structop", "s": "t",
+                "args": { "pid": pid.0, "enq_flags": enq_flags }
+            }),
+            TraceKind::Dequeue { pid, deq_flags } => json!({
+                "ph": "i", "pid": cpu, "tid": pid.0, "ts": ts,
+                "name": "ops.dequeue", "cat": "structop", "s": "t",
+                "args": { "pid": pid.0, "deq_flags": deq_flags }
+            }),
+            TraceKind::Quiescent { pid, deq_flags } => json!({
+                "ph": "i", "pid": cpu, "tid": pid.0, "ts": ts,
+                "name": "ops.quiescent", "cat": "structop", "s": "t",
+                "args": { "pid": pid.0, "deq_flags": deq_flags }
+            }),
+            TraceKind::UpdateIdle {
+                cpu: idle_cpu,
+                idle,
+            } => json!({
+                "ph": "i", "pid": cpu, "tid": 0, "ts": ts,
+                "name": "ops.update_idle", "cat": "structop", "s": "t",
+                "args": { "cpu": idle_cpu.0, "idle": idle }
+            }),
+            TraceKind::CgroupInit { cgid, rc } => json!({
+                "ph": "i", "pid": cpu, "tid": 0, "ts": ts,
+                "name": "ops.cgroup_init", "cat": "structop", "s": "g",
+                "args": { "cgid": cgid.0, "rc": rc }
+            }),
+            TraceKind::CgroupExit { cgid } => json!({
+                "ph": "i", "pid": cpu, "tid": 0, "ts": ts,
+                "name": "ops.cgroup_exit", "cat": "structop", "s": "g",
+                "args": { "cgid": cgid.0 }
+            }),
+            TraceKind::CgroupSetBandwidth {
+                cgid,
+                period_us,
+                quota_us,
+                burst_us,
+            } => json!({
+                "ph": "i", "pid": cpu, "tid": 0, "ts": ts,
+                "name": "ops.cgroup_set_bandwidth", "cat": "structop", "s": "g",
+                "args": {
+                    "cgid": cgid.0,
+                    "period_us": period_us,
+                    "quota_us": quota_us,
+                    "burst_us": burst_us,
+                }
+            }),
+            TraceKind::CgroupMove {
+                pid,
+                from_cgid,
+                to_cgid,
+            } => json!({
+                "ph": "i", "pid": cpu, "tid": pid.0, "ts": ts,
+                "name": "ops.cgroup_move", "cat": "structop", "s": "t",
+                "args": {
+                    "pid": pid.0,
+                    "from_cgid": from_cgid.0,
+                    "to_cgid": to_cgid.0,
+                }
+            }),
+
+            // tg `bundle-implement-secondary-tracekind-easy-wins`:
+            // Chrome-JSON instants for the 10 new structop / helper hooks
+            // (TOP-5 task lifecycle, TOP-7 affinity, TOP-8 BPF time/cgroup
+            // helpers, TOP-9 DSQ-creation helpers).
+            TraceKind::InitTask { pid, rc } => json!({
+                "ph": "i", "pid": cpu, "tid": pid.0, "ts": ts,
+                "name": "ops.init_task", "cat": "structop", "s": "t",
+                "args": { "pid": pid.0, "rc": rc }
+            }),
+            TraceKind::ExitTask { pid } => json!({
+                "ph": "i", "pid": cpu, "tid": pid.0, "ts": ts,
+                "name": "ops.exit_task", "cat": "structop", "s": "t",
+                "args": { "pid": pid.0 }
+            }),
+            TraceKind::Enable { pid } => json!({
+                "ph": "i", "pid": cpu, "tid": pid.0, "ts": ts,
+                "name": "ops.enable", "cat": "structop", "s": "t",
+                "args": { "pid": pid.0 }
+            }),
+            TraceKind::SetWeight { pid, weight } => json!({
+                "ph": "i", "pid": cpu, "tid": pid.0, "ts": ts,
+                "name": "ops.set_weight", "cat": "structop", "s": "t",
+                "args": { "pid": pid.0, "weight": weight }
+            }),
+            TraceKind::Disable { pid } => json!({
+                "ph": "i", "pid": cpu, "tid": pid.0, "ts": ts,
+                "name": "ops.disable", "cat": "structop", "s": "t",
+                "args": { "pid": pid.0 }
+            }),
+            TraceKind::TaskYield { pid, handled } => json!({
+                "ph": "i", "pid": cpu, "tid": pid.0, "ts": ts,
+                "name": "ops.yield", "cat": "structop", "s": "t",
+                "args": { "pid": pid.0, "handled": handled }
+            }),
+            TraceKind::SetCpumask { pid, cpumask_hex } => json!({
+                "ph": "i", "pid": cpu, "tid": pid.0, "ts": ts,
+                "name": "ops.set_cpumask", "cat": "structop", "s": "t",
+                "args": { "pid": pid.0, "cpumask_hex": cpumask_hex }
+            }),
+            TraceKind::HelperNow { ret_ns } => json!({
+                "ph": "i", "pid": cpu, "tid": 0, "ts": ts,
+                "name": "scx_bpf_now", "cat": "helper", "s": "t",
+                "args": { "ret_ns": ret_ns }
+            }),
+            TraceKind::HelperTaskCgroup { pid, cgid } => json!({
+                "ph": "i", "pid": cpu, "tid": pid.0, "ts": ts,
+                "name": "scx_bpf_task_cgroup", "cat": "helper", "s": "t",
+                "args": { "pid": pid.0, "cgid": cgid.0 }
+            }),
+            TraceKind::HelperTaskCpu { pid, ret_cpu } => json!({
+                "ph": "i", "pid": cpu, "tid": pid.0, "ts": ts,
+                "name": "scx_bpf_task_cpu", "cat": "helper", "s": "t",
+                "args": { "pid": pid.0, "ret_cpu": ret_cpu.0 }
+            }),
+            TraceKind::CreateDsq { dsq_id, node, rc } => json!({
+                "ph": "i", "pid": cpu, "tid": 0, "ts": ts,
+                "name": "scx_bpf_create_dsq", "cat": "helper", "s": "g",
+                "args": { "dsq_id": dsq_id.0, "node": node, "rc": rc }
+            }),
+            TraceKind::DestroyDsq { dsq_id } => json!({
+                "ph": "i", "pid": cpu, "tid": 0, "ts": ts,
+                "name": "scx_bpf_destroy_dsq", "cat": "helper", "s": "g",
+                "args": { "dsq_id": dsq_id.0 }
+            }),
+            TraceKind::DsqNrQueued { dsq_id, ret } => json!({
+                "ph": "i", "pid": cpu, "tid": 0, "ts": ts,
+                "name": "scx_bpf_dsq_nr_queued", "cat": "helper", "s": "g",
+                "args": { "dsq_id": dsq_id.0, "ret": ret }
+            }),
+
+            // tg `add-cbw-put-aside-and-drain-btq-batch-tracekinds` (A1+A2):
+            // perfetto Chrome-JSON global instants for BTQ park/unpark.
+            TraceKind::CbwPutAside {
+                cgid,
+                count,
+                btq_len_after,
+            } => json!({
+                "ph": "i", "pid": cpu, "tid": 0, "ts": ts,
+                "name": "cbw_put_aside", "cat": "cgroup_bw", "s": "g",
+                "args": {
+                    "cgid": cgid.0,
+                    "count": count,
+                    "btq_len_after": btq_len_after,
+                }
+            }),
+            TraceKind::CbwDrainBtqBatch {
+                cgid,
+                count,
+                btq_len_after,
+            } => json!({
+                "ph": "i", "pid": cpu, "tid": 0, "ts": ts,
+                "name": "cbw_drain_btq_batch", "cat": "cgroup_bw", "s": "g",
+                "args": {
+                    "cgid": cgid.0,
+                    "count": count,
+                    "btq_len_after": btq_len_after,
+                }
+            }),
+            // tg `add-cbw-throttle-cgroups-tracekind` (A3): Chrome-JSON
+            // global instant for top-down throttle propagation transitions.
+            TraceKind::CbwThrottleCgroups { cgid, throttled } => json!({
+                "ph": "i", "pid": cpu, "tid": 0, "ts": ts,
+                "name": "cbw_throttle_cgroups", "cat": "cgroup_bw", "s": "g",
+                "args": {
+                    "cgid": cgid.0,
+                    "throttled": throttled,
+                }
+            }),
+        };
+        serde_json::to_writer(&mut *writer, &value)?;
+    }
+
+    writer.write_all(b"]}")?;
+    Ok(())
+}
+
+/// Write a comma separator if this is not the first entry.
+fn write_comma(writer: &mut impl Write, need_comma: &mut bool) -> std::io::Result<()> {
+    if *need_comma {
+        writer.write_all(b",")?;
+    }
+    *need_comma = true;
+    Ok(())
+}
+
+/// Format a DSQ ID for display in trace args.
+fn format_dsq_id(dsq_id: DsqId) -> String {
+    if dsq_id == DsqId::GLOBAL {
+        "GLOBAL".to_string()
+    } else if dsq_id.is_local() {
+        "LOCAL".to_string()
+    } else if dsq_id.is_local_on() {
+        format!("LOCAL_ON({})", dsq_id.local_on_cpu().0)
+    } else {
+        format!("{:#x}", dsq_id.0)
+    }
+}
