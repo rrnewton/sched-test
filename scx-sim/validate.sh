@@ -80,6 +80,38 @@ fi
 echo "  No host-specific absolute paths — OK"
 
 echo ""
+echo "=== Checking no #[path] literal reaches into the scx submodule ==="
+# scx-sim compiles two upstream scx_layered Rust files verbatim (alloc.rs and
+# layer_core_growth.rs). They used to be located with
+# `#[path = "../../../../scx/..."]`, and a `#[path]` attribute takes a string
+# LITERAL: it is nailed to the bundled submodule and cannot see SCX_ROOT.
+#
+# That is not cosmetic. `scxsim_build::resolve_scx_root` honours SCX_ROOT for
+# every OTHER scx source, so an embedder pointing SCX_ROOT at their own scx
+# checkout got the scheduler .so built from THEIR tree and scx_layered's
+# allocator and growth policy from OURS, in one binary, with no warning.
+# Measured with a marker planted in an override tree: 0/2 modules followed
+# SCX_ROOT before the fix, 2/2 after.
+#
+# The fix generates the `#[path]` attribute into OUT_DIR from the resolved
+# scx_root. This guard stops the literal form coming back — an easy regression,
+# because the literal is the obvious way to write it and works fine until
+# somebody sets SCX_ROOT.
+SCXPATH_ROOT=$(git rev-parse --show-toplevel)
+SCX_PATH_LITERALS=$(git -C "$SCXPATH_ROOT" grep -nIE '#\[path *= *"[^"]*scx/scheds' -- '*.rs' || true)
+if [ -n "$SCX_PATH_LITERALS" ]; then
+    echo "ERROR: #[path] literal pointing into the scx submodule:"
+    echo "$SCX_PATH_LITERALS"
+    echo ""
+    echo "  A #[path] literal cannot see SCX_ROOT, so this file would be taken"
+    echo "  from the bundled submodule even when the rest of the build uses an"
+    echo "  override. Generate the attribute from build.rs instead — see"
+    echo "  crates/scx_layered_growth/build.rs for the pattern."
+    exit 1
+fi
+echo "  No scx-submodule #[path] literals — OK"
+
+echo ""
 echo "=== Checking Makefile syntax ==="
 # Dry-run the Makefile to catch parse errors (missing separators, conflict
 # markers, etc.). make -n prints commands without running them; a parse error
