@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use scxsim_build::{
-    build_schedulers, cgroup_bw_new_api, resolve_scx_root, scx_include_paths,
-    standalone_definitions, KernelConfig, EXPORTED_SYMS,
+    EXPORTED_SYMS, KernelConfig, build_schedulers, cgroup_bw_new_api, resolve_scx_root,
+    scx_include_paths, standalone_definitions,
 };
 
 fn main() {

@@ -64,7 +64,7 @@
 //! `ai_docs/WATCHDOG_THROTTLE_SUPPRESSION_IS_A_FIDELITY_GAP_20260813.md`);
 //! deciding it by implementation here would pre-empt that.
 
-use crate::safe::stats::{percentile, DistributionStats};
+use crate::safe::stats::{DistributionStats, percentile};
 use crate::safe::trace::{Trace, TraceKind};
 use crate::types::{Pid, TimeNs};
 use std::collections::BTreeMap;

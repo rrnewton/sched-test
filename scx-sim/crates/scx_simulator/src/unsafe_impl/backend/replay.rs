@@ -21,7 +21,7 @@ use crate::engine_ring::EngineRing;
 use crate::interleave::WorkerId;
 use crate::perf;
 use crate::preempt::trace::PreemptionTrace;
-use crate::preempt::{self, PreemptRing, ReplayCursor, REPLAY_MARGIN};
+use crate::preempt::{self, PreemptRing, REPLAY_MARGIN, ReplayCursor};
 
 /// Hardware breakpoint replay preemption backend.
 ///

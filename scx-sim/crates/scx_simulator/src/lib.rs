@@ -115,25 +115,25 @@ pub use cgroup::{CgroupId, CgroupInfo, CgroupRegistry, DEFAULT_MAX_CGROUPS};
 pub use clock_mode::ClockMode;
 pub use engine::{ExitKind, SimulationResult, Simulator};
 pub use ffi::{
-    discover_schedulers, set_task_alloc_fail_pid, DebuggerInfo, DynamicScheduler, LavdPowerMode,
-    LoadError, Scheduler, SchedulerInfo,
+    DebuggerInfo, DynamicScheduler, LavdPowerMode, LoadError, Scheduler, SchedulerInfo,
+    discover_schedulers, set_task_alloc_fail_pid,
 };
 pub use kfuncs::{dump_buffer_reset, dump_buffer_take, sim_clock};
 #[cfg(feature = "standalone")]
 pub use layered_probes::{
-    GlobalStat, LayerMatchTrace, LayerStat, LayerUsage, LayeredEnumProbe, LayeredMatchKind,
-    LayeredMonitor, LayeredProbes, LayeredSnapshot, MatchTrace, MatchVerdict, MemberState,
-    OrGroupVerdict, LAYERED_NO_LAYER,
+    GlobalStat, LAYERED_NO_LAYER, LayerMatchTrace, LayerStat, LayerUsage, LayeredEnumProbe,
+    LayeredMatchKind, LayeredMonitor, LayeredProbes, LayeredSnapshot, MatchTrace, MatchVerdict,
+    MemberState, OrGroupVerdict,
 };
 pub use preempt::trace::PreemptionTrace;
 pub use preempt::trace::TraceMetadata;
 pub use preempt::{
-    compare_checkpoints, compute_so_hash, compute_so_hash_from_path, drain_determinism_checkpoints,
-    drain_preemption_records, enable_determinism_mode, enable_preemption_collection, fnv1a_combine,
-    fnv1a_hash_bytes, fnv1a_hash_u64, is_determinism_mode_enabled, mmap_shared_rbc,
-    record_checkpoint, reset_preemption_sequence, scheduler_so_base, scheduler_so_path,
-    CheckpointDivergence, CheckpointEvent, DeterminismCheckpoint, DivergenceType, PreemptionRecord,
-    StructopInfo, INSN_BYTES_LEN,
+    CheckpointDivergence, CheckpointEvent, DeterminismCheckpoint, DivergenceType, INSN_BYTES_LEN,
+    PreemptionRecord, StructopInfo, compare_checkpoints, compute_so_hash,
+    compute_so_hash_from_path, drain_determinism_checkpoints, drain_preemption_records,
+    enable_determinism_mode, enable_preemption_collection, fnv1a_combine, fnv1a_hash_bytes,
+    fnv1a_hash_u64, is_determinism_mode_enabled, mmap_shared_rbc, record_checkpoint,
+    reset_preemption_sequence, scheduler_so_base, scheduler_so_path,
 };
 #[cfg(feature = "standalone")]
 pub use probes::{LavdMonitor, LavdProbes, LavdSnapshot};
@@ -142,23 +142,23 @@ pub use safe::bpf_trace::{
 };
 pub use safe::fmt::{FmtN, FmtTs, SimFormat};
 pub use safe::layered::{
-    LayerField, LayerGrowthAlgo, LayerKind, LayerMatch, LayerPlacement, LayerSpec,
     DEFAULT_LAYER_WEIGHT, DEFAULT_XNUMA_THRESHOLD, DEFAULT_XNUMA_THRESHOLD_DELTA,
-    DISALLOW_AFTER_NEVER,
+    DISALLOW_AFTER_NEVER, LayerField, LayerGrowthAlgo, LayerKind, LayerMatch, LayerPlacement,
+    LayerSpec,
 };
 // Loading a real scx_layered JSON layer config. Public because the point of
 // it is that a configuration written for the production scheduler runs here.
 pub use safe::layered_config::{
-    load_layer_config, parse_layer_config, Disposition, LayerConfigError, LayerConfigOptions,
-    LoadedLayerConfig, Rejection, Unsupported,
+    Disposition, LayerConfigError, LayerConfigOptions, LoadedLayerConfig, Rejection, Unsupported,
+    load_layer_config, parse_layer_config,
 };
 // scx_layered's own allocator, compiled verbatim from the scx submodule.
 // tests/layered_alloc.rs drives it directly to prove it is the real thing.
-pub use safe::layered_alloc_upstream::{unified_alloc, LayerDemand};
+pub use safe::layered_alloc_upstream::{LayerDemand, unified_alloc};
 // The cross-NUMA gate's policy, also compiled from upstream (vendored, with a
 // drift guard). tests/layered_xnuma.rs drives it directly.
 pub use safe::layered_xnuma::{
-    xnuma_check_active, xnuma_compute_rates, XnumaRates, DUTY_CYCLE_SCALE, XNUMA_RATE_DAMPEN,
+    DUTY_CYCLE_SCALE, XNUMA_RATE_DAMPEN, XnumaRates, xnuma_check_active, xnuma_compute_rates,
 };
 pub use safe::monitor::{Monitor, ProbeContext, ProbePoint};
 pub use safe::perf::PmuEvent;
@@ -168,15 +168,15 @@ pub use safe::starvation::{BailInterval, StarvationMetrics};
 // tested surface (rbc_preemption.rs, scx_bpf_helpers.rs), so re-export them at
 // the root instead of widening the module visibility back out.
 pub use safe::perf::try_create_rbc_counter;
-pub use safe::rtapp::{load_rtapp, RtAppError, RTAPP_PP_KEYS};
+pub use safe::rtapp::{RTAPP_PP_KEYS, RtAppError, load_rtapp};
 pub use safe::scenario::{
-    parse_duration_ns, parse_seed, CgroupBandwidth, CgroupCpusetChangeEvent, CgroupCreateEvent,
-    CgroupDef, CgroupDestroyEvent, CgroupMigrateEvent, CpuPreemptEvent, ForkPlacement, FutexEvent,
-    FutexOp, HotplugEvent, IrqEvent, IrqType, NativeConcurrentConfig, NoiseConfig, OverheadConfig,
-    PreemptMode, PreemptiveConfig, Scenario, ScenarioBuilder,
+    CgroupBandwidth, CgroupCpusetChangeEvent, CgroupCreateEvent, CgroupDef, CgroupDestroyEvent,
+    CgroupMigrateEvent, CpuPreemptEvent, ForkPlacement, FutexEvent, FutexOp, HotplugEvent,
+    IrqEvent, IrqType, NativeConcurrentConfig, NoiseConfig, OverheadConfig, PreemptMode,
+    PreemptiveConfig, Scenario, ScenarioBuilder, parse_duration_ns, parse_seed,
 };
 pub use safe::stats::{
-    percentile, CpuStats, DistributionStats, TaskStats, TraceComparison, TraceStats,
+    CpuStats, DistributionStats, TaskStats, TraceComparison, TraceStats, percentile,
 };
 pub use safe::structops_jsonl::write_jsonl;
 pub use safe::topology::{CpuTopology, MachineTopology};
@@ -184,7 +184,7 @@ pub use safe::trace::{
     DsqLengthSample, DsqSampleTrigger, Trace, TraceEvent, TraceKind, TraceSummary,
 };
 pub use safe::types::{CpuId, DsqId, Gid, KickFlags, MmId, Pid, TimeNs, Uid, Vtime};
-pub use task::{nice_to_weight, sched_weight_to_cgroup, Phase, RepeatMode, TaskBehavior, TaskDef};
+pub use task::{Phase, RepeatMode, TaskBehavior, TaskDef, nice_to_weight, sched_weight_to_cgroup};
 pub use unsafe_impl::kfuncs::scx_bpf_task_cgroup;
 
 /// Curated public surface for embedding scx-sim as a library.

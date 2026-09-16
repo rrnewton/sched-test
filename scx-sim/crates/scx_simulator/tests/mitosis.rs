@@ -1288,10 +1288,12 @@ fn test_repeat_count_mode() {
     trace.dump();
 
     // Counted task should complete
-    assert!(trace
-        .events()
-        .iter()
-        .any(|e| matches!(e.kind, TraceKind::TaskCompleted { pid } if pid == Pid(1))));
+    assert!(
+        trace
+            .events()
+            .iter()
+            .any(|e| matches!(e.kind, TraceKind::TaskCompleted { pid } if pid == Pid(1)))
+    );
 
     // Background task keeps running
     assert!(trace.total_runtime(Pid(2)) > 0);

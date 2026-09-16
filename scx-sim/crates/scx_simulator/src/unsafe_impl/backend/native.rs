@@ -6,8 +6,8 @@
 //! dispatch path where threads run with true OS-level concurrency and no
 //! serialisation.
 
-use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::sync::Barrier;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 use tracing::{debug, info};
 

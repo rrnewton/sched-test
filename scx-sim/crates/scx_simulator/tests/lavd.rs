@@ -7296,10 +7296,10 @@ unsafe fn lavd_setup_two_domains(sched: &DynamicScheduler, nr_cpus: u32, split: 
     const OFF_IS_BIG: usize = 18; // u8
     const OFF_IS_VALID: usize = 19; // u8
     const OFF_NR_NEIGHBORS: usize = 20; // u8[3]
-                                        // padding to align __cpumask to u64
+    // padding to align __cpumask to u64
     const OFF_CPUMASK: usize = 24; // u64[8] (512/64=8)
     const OFF_NEIGHBOR_IDS: usize = 24 + 8 * 8; // = 88, u8[3*128=384]
-                                                // End of first section: 88 + 384 = 472, padded to 512
+    // End of first section: 88 + 384 = 472, padded to 512
     const SECTION2_START: usize = 512;
     const OFF_NR_ACTIVE_CPUS: usize = SECTION2_START + 2; // u16
     const OFF_CAP_SUM_ACTIVE: usize = SECTION2_START + 12; // u32

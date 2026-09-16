@@ -12,7 +12,7 @@ use crate::backend::{PreemptTarget, PreemptionBackend, RbcTarget, RelativeRbc, S
 use crate::engine_ring::EngineRing;
 use crate::interleave::WorkerId;
 use crate::perf::{self, PmuEvent, RbcTimer};
-use crate::preempt::{self, is_determinism_mode_enabled, PreemptRing};
+use crate::preempt::{self, PreemptRing, is_determinism_mode_enabled};
 
 /// PMU timer preemption backend.
 ///

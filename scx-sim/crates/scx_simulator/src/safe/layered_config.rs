@@ -45,8 +45,8 @@ use std::path::Path;
 use serde::Deserialize;
 
 use crate::layered::{
-    LayerGrowthAlgo, LayerKind, LayerMatch, LayerPlacement, LayerSpec, DEFAULT_XNUMA_THRESHOLD,
-    DEFAULT_XNUMA_THRESHOLD_DELTA, DISALLOW_AFTER_NEVER,
+    DEFAULT_XNUMA_THRESHOLD, DEFAULT_XNUMA_THRESHOLD_DELTA, DISALLOW_AFTER_NEVER, LayerGrowthAlgo,
+    LayerKind, LayerMatch, LayerPlacement, LayerSpec,
 };
 use crate::types::TimeNs;
 
@@ -427,11 +427,7 @@ impl LayerConfigOptions {
                 None => bad.push(format!("{name}: not a refusable scx_layered config field")),
             }
         }
-        if bad.is_empty() {
-            Ok(())
-        } else {
-            Err(bad)
-        }
+        if bad.is_empty() { Ok(()) } else { Err(bad) }
     }
 }
 

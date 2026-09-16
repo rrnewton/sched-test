@@ -87,9 +87,9 @@ fn lavd(nr_cpus: u32) -> DynamicScheduler {
 fn test_nested_different_bandwidth_limits_lavd() {
     let _lock = common::setup_test();
     let period_us = 100_000u64; // 100ms period
-                                // Single CPU so the two hierarchies genuinely contend and each parent's
-                                // cpu.max quota actually bites (on multiple idle CPUs the demand fits and
-                                // enforcement barely differentiates).
+    // Single CPU so the two hierarchies genuinely contend and each parent's
+    // cpu.max quota actually bites (on multiple idle CPUs the demand fits and
+    // enforcement barely differentiates).
     let scenario = Scenario::builder()
         .cpus(1)
         .seed(42)

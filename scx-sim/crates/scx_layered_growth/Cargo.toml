@@ -1,7 +1,11 @@
 [package]
 name = "scx_layered_growth"
 version = "0.1.0"
-edition = "2021"
+# 2024, NOT 2021 — see the matching note in crates/scx_simulator/Cargo.toml.
+# src/lib.rs #[path]-includes upstream
+# scx/scheds/rust/scx_layered/src/layer_core_growth.rs, which is edition-2024
+# source and now uses let chains.
+edition = "2024"
 publish = false
 
 [lib]

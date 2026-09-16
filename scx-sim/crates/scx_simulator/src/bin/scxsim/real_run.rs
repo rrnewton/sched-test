@@ -625,7 +625,7 @@ fn refuse_unrepresentable_attributes(task: &scx_simulator::TaskDef) -> Result<()
 #[allow(dead_code)]
 pub fn scenario_to_rtapp_json(scenario: &scx_simulator::Scenario) -> Result<String, String> {
     use scx_simulator::Phase;
-    use serde_json::{json, Map, Value};
+    use serde_json::{Map, Value, json};
 
     let duration_secs = (scenario.duration_ns / 1_000_000_000) as i64;
 

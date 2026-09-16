@@ -327,8 +327,7 @@ fn preemptions_are_well_formed_context_switches() {
         assert!(
             set_next,
             "TaskPreempted(pid={}) on CPU{} at {i} not followed by SetNextTask (switch never completed)",
-            pid.0,
-            cpu.0
+            pid.0, cpu.0
         );
     }
     assert!(

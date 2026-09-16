@@ -49,8 +49,8 @@
 use core::fmt::Write as FmtWrite;
 use std::cell::Cell;
 use std::os::unix::io::RawFd;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::SeqCst};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::SeqCst};
 
 use crate::engine_ring::{EngineRing, TimeslicePrng, YieldReason};
 use crate::interleave::WorkerId;
@@ -1743,11 +1743,7 @@ fn read_rbc_count(timer_fd: RawFd) -> u64 {
             std::mem::size_of::<u64>(),
         )
     };
-    if ret < 0 {
-        0
-    } else {
-        count
-    }
+    if ret < 0 { 0 } else { count }
 }
 
 /// Signal handler for preemptive interleaving.
@@ -1847,7 +1843,7 @@ extern "C" fn preempt_handler(
 
     // 6. Yield to engine (futex-based, signal-safe). Blocks until re-selected.
     ring.inc_signal_preempt(); // atomic, signal-safe
-                               // SAFETY: `pctx.engine` was set from a valid `&EngineRing` in `install()`.
+    // SAFETY: `pctx.engine` was set from a valid `&EngineRing` in `install()`.
     let engine = unsafe { &*pctx.engine };
     if engine.yield_to_engine(pctx.worker_id, YieldReason::Preemption) {
         inc_interleave(); // TLS, safe (signal masked during handler)

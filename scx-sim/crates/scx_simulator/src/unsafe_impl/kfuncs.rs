@@ -32,14 +32,14 @@ use std::os::unix::io::RawFd;
 use std::ptr;
 use std::sync::{Arc, Mutex};
 
-use rand::rngs::SmallRng;
 use rand::RngCore;
+use rand::rngs::SmallRng;
 use tracing::debug;
 
 use crate::cgroup::{CgroupId, CgroupRegistry};
 use crate::cpu::{LastStopReason, SimCpu};
 use crate::dsq::DsqManager;
-use crate::engine::{flush_staged_events, EventKind, EventQueue};
+use crate::engine::{EventKind, EventQueue, flush_staged_events};
 use crate::ffi;
 use crate::fmt::FmtN;
 use crate::perf::RbcCounter;
@@ -3365,11 +3365,7 @@ pub extern "C" fn bpf_cgrp_storage_delete(map: *mut c_void, cgrp: *mut c_void) -
     }
     // SAFETY: same key-by-address convention as bpf_cgrp_storage_get.
     let rc = unsafe { scx_test_cgrp_storage_delete(map, &cgrp as *const _ as *const c_void) };
-    if rc == 0 {
-        0
-    } else {
-        -2
-    } // -ENOENT
+    if rc == 0 { 0 } else { -2 } // -ENOENT
 }
 
 /// Get per-task BPF local storage.
@@ -3403,11 +3399,7 @@ pub extern "C" fn bpf_task_storage_delete(map: *mut c_void, task: *mut c_void) -
         return -2; // -ENOENT
     }
     let rc = unsafe { scx_storage_delete(map, &task as *const _ as *const c_void) };
-    if rc == 0 {
-        0
-    } else {
-        -2
-    }
+    if rc == 0 { 0 } else { -2 }
 }
 
 /// Look up per-CPU array element.
@@ -3603,6 +3595,7 @@ static SCX_ATQ_KEEPALIVE: unsafe extern "C" fn() -> i32 = scx_atq_init;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SIM_LOCK;
     use crate::cgroup::CgroupRegistry;
     use crate::cpu::SimCpu;
     use crate::dsq::DsqManager;
@@ -3610,7 +3603,6 @@ mod tests {
     use crate::scenario::{NoiseConfig, OverheadConfig};
     use crate::trace::Trace;
     use crate::types::{CpuId, DsqId, KickFlags, Pid};
-    use crate::SIM_LOCK;
     use rand::SeedableRng;
 
     /// Create a minimal SimulatorState for unit testing.
@@ -5106,7 +5098,7 @@ mod tests {
             assert_eq!(scx_atq_pop(atq), taskc_ptr(&mut t1) as u64);
             assert_eq!(scx_atq_nr_queued(atq), 0);
             assert_eq!(scx_atq_pop(atq), 0); // empty -> NULL
-                                             // Back-pointers cleared.
+            // Back-pointers cleared.
             assert_eq!(taskc_get_atq(&t1), 0);
             assert_eq!(taskc_get_atq(&t2), 0);
             assert_eq!(taskc_get_atq(&t3), 0);

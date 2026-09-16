@@ -14,7 +14,7 @@
 //! Plus a behavioural check that the policy is reachable and does what makes
 //! it worth vendoring rather than approximating.
 
-use scx_simulator::{xnuma_check_active, xnuma_compute_rates, DUTY_CYCLE_SCALE, XNUMA_RATE_DAMPEN};
+use scx_simulator::{DUTY_CYCLE_SCALE, XNUMA_RATE_DAMPEN, xnuma_check_active, xnuma_compute_rates};
 
 /// Repo root, derived from the crate manifest rather than hardcoded.
 fn repo_root() -> std::path::PathBuf {

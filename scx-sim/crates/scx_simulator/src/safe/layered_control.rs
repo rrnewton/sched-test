@@ -6,10 +6,10 @@
 //! `scx_layered_growth` topology adapter.
 
 use crate::layered::{LayerGrowthAlgo, LayerKind, LayerSpec};
-use crate::layered_alloc_upstream::{unified_alloc, LayerDemand};
+use crate::layered_alloc_upstream::{LayerDemand, unified_alloc};
 use crate::layered_xnuma::{xnuma_check_active, xnuma_compute_rates};
 use scx_layered_growth::layer_core_growth;
-use scx_layered_growth::{algorithm_from_bpf, CpuPool, LayerSpec as GrowthSpec, Topology};
+use scx_layered_growth::{CpuPool, LayerSpec as GrowthSpec, Topology, algorithm_from_bpf};
 
 const USAGE_HALF_LIFE_NS: f64 = 100_000_000.0;
 
@@ -247,14 +247,18 @@ impl LayeredControl {
         assert_eq!(snapshot.node_pinned_usages.len(), self.specs.len());
         assert_eq!(snapshot.cpu_masks.len(), self.specs.len());
         assert!(snapshot.cpu_masks.iter().all(|m| m.len() == self.nr_cpus));
-        assert!(snapshot
-            .node_usages
-            .iter()
-            .all(|usage| usage.len() == self.nr_nodes));
-        assert!(snapshot
-            .node_pinned_usages
-            .iter()
-            .all(|usage| usage.len() == self.nr_nodes));
+        assert!(
+            snapshot
+                .node_usages
+                .iter()
+                .all(|usage| usage.len() == self.nr_nodes)
+        );
+        assert!(
+            snapshot
+                .node_pinned_usages
+                .iter()
+                .all(|usage| usage.len() == self.nr_nodes)
+        );
 
         let elapsed = self.period_ns as f64 / 1_000_000_000.0;
         let decay = 0.5f64.powf(self.period_ns as f64 / USAGE_HALF_LIFE_NS);

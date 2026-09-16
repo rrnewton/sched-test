@@ -1,6 +1,6 @@
 use std::sync::MutexGuard;
 
-use scx_simulator::{SimFormat, SIM_LOCK};
+use scx_simulator::{SIM_LOCK, SimFormat};
 
 /// Acquire the simulator lock and initialize tracing from `RUST_LOG`.
 ///

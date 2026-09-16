@@ -10,7 +10,14 @@
 extern crate self as scx_utils;
 extern crate self as walkdir;
 
-use anyhow::{bail, Result};
+// Edition-2024 import order (uppercase before lowercase). Hand-applied, NOT
+// `cargo fmt`: this crate is workspace-EXCLUDED (see ../../Cargo.toml
+// `exclude`), so `cargo fmt` will not rewrite it even though
+// `cargo fmt --all -- --check` still reports it — and running rustfmt on this
+// file directly would follow the `#[path]` include below into the scx
+// submodule and reformat upstream source in place, which validate.sh's
+// "scx submodule is unmodified" gate exists to prevent.
+use anyhow::{Result, bail};
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -147,7 +154,14 @@ impl Topology {
         for node_id in 0..nr_nodes {
             let llcs = all_llcs
                 .iter()
-                .filter(|(&llc_id, _)| llc_id / llcs_per_node == node_id)
+                // The outer `&` is required under edition 2024's match
+                // ergonomics (RFC 3627): `filter` hands the closure a
+                // `&(&K, &V)`, and a non-reference pattern that implicitly
+                // borrows may no longer contain an explicit `&` subpattern.
+                // The neighbouring `.map(|(&id, ...)|)` needs no change —
+                // `map` passes the item by value, so nothing is implicitly
+                // borrowed there.
+                .filter(|&(&llc_id, _)| llc_id / llcs_per_node == node_id)
                 .map(|(&id, llc)| (id, Arc::clone(llc)))
                 .collect();
             let node_cores = all_cores

@@ -5,11 +5,12 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand, ValueEnum};
 
 use scx_simulator::{
-    compare_checkpoints, compute_so_hash, discover_schedulers, drain_determinism_checkpoints,
-    drain_preemption_records, enable_determinism_mode, enable_preemption_collection, load_rtapp,
-    scheduler_so_base, scheduler_so_path, DynamicScheduler, ExitKind, NativeConcurrentConfig,
-    Phase, PmuEvent, PreemptMode, PreemptionTrace, PreemptiveConfig, RepeatMode, Scenario,
-    SimFormat, Simulator, TaskBehavior, TraceMetadata, TraceStats, SIM_LOCK,
+    DynamicScheduler, ExitKind, NativeConcurrentConfig, Phase, PmuEvent, PreemptMode,
+    PreemptionTrace, PreemptiveConfig, RepeatMode, SIM_LOCK, Scenario, SimFormat, Simulator,
+    TaskBehavior, TraceMetadata, TraceStats, compare_checkpoints, compute_so_hash,
+    discover_schedulers, drain_determinism_checkpoints, drain_preemption_records,
+    enable_determinism_mode, enable_preemption_collection, load_rtapp, scheduler_so_base,
+    scheduler_so_path,
 };
 // The layered match probes live behind `standalone` (see `unsafe_impl/mod.rs`:
 // an embed build has no consumer for them), and `--layer-config` reads the
@@ -18,8 +19,8 @@ use scx_simulator::{
 // when they are used in a build that does not have it.
 #[cfg(feature = "standalone")]
 use scx_simulator::{
-    load_layer_config, Disposition, LayerConfigOptions, LayeredEnumProbe, LayeredMonitor,
-    LayeredProbes, LoadedLayerConfig, OrGroupVerdict, Pid, Unsupported, LAYERED_NO_LAYER,
+    Disposition, LAYERED_NO_LAYER, LayerConfigOptions, LayeredEnumProbe, LayeredMonitor,
+    LayeredProbes, LoadedLayerConfig, OrGroupVerdict, Pid, Unsupported, load_layer_config,
 };
 use scx_simulator::{parse_duration_ns, parse_seed};
 
@@ -2091,40 +2092,43 @@ mod tests {
             Cli::try_parse_from(["scxsim", "run", "--wprof", "workloads/two_runners.json",])
                 .is_err()
         );
-        assert!(Cli::try_parse_from([
-            "scxsim",
-            "run",
-            "--bpf-trace",
-            "workloads/two_runners.json",
-        ])
-        .is_err());
-        assert!(Cli::try_parse_from([
-            "scxsim",
-            "run",
-            "--real-run",
-            "vm",
-            "workloads/two_runners.json",
-        ])
-        .is_err());
+        assert!(
+            Cli::try_parse_from(["scxsim", "run", "--bpf-trace", "workloads/two_runners.json",])
+                .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "scxsim",
+                "run",
+                "--real-run",
+                "vm",
+                "workloads/two_runners.json",
+            ])
+            .is_err()
+        );
     }
 
     #[test]
     fn vm_run_rejects_simulation_only_flags() {
-        assert!(Cli::try_parse_from([
-            "scxsim",
-            "vm-run",
-            "--smt",
-            "2",
-            "workloads/two_runners.json",
-        ])
-        .is_err());
-        assert!(Cli::try_parse_from([
-            "scxsim",
-            "vm-run",
-            "--preemptive",
-            "workloads/two_runners.json",
-        ])
-        .is_err());
+        assert!(
+            Cli::try_parse_from([
+                "scxsim",
+                "vm-run",
+                "--smt",
+                "2",
+                "workloads/two_runners.json",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "scxsim",
+                "vm-run",
+                "--preemptive",
+                "workloads/two_runners.json",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

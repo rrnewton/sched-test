@@ -612,7 +612,9 @@ fn csv_experiment_run() {
     let nr_domains = nr_cpus.checked_div(cpus_per_llc).unwrap_or(1);
 
     if print_header {
-        println!("timestamp,mode,scheduler,condition,thread_type,thread_id,metric_name,percentile,value,unit,sample_count,rep,notes");
+        println!(
+            "timestamp,mode,scheduler,condition,thread_type,thread_id,metric_name,percentile,value,unit,sample_count,rep,notes"
+        );
     }
 
     let trace = if use_lavd {
@@ -922,7 +924,13 @@ fn csv_experiment_run() {
 
     eprintln!(
         "csv_experiment: scheduler={} condition={} cores={} cpus_per_llc={} domains={} threads={} duration={}ms seed={}",
-        scheduler, condition, nr_cpus, cpus_per_llc, nr_domains,
-        num_workers + num_readers + num_writers + _num_hogs, duration_ms, seed
+        scheduler,
+        condition,
+        nr_cpus,
+        cpus_per_llc,
+        nr_domains,
+        num_workers + num_readers + num_writers + _num_hogs,
+        duration_ms,
+        seed
     );
 }

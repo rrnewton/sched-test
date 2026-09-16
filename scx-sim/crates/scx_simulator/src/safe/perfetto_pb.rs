@@ -58,13 +58,13 @@
 use std::io::Write;
 
 use perfetto_protos::{
-    debug_annotation::{debug_annotation, DebugAnnotation},
+    debug_annotation::{DebugAnnotation, debug_annotation},
     process_descriptor::ProcessDescriptor,
     thread_descriptor::ThreadDescriptor,
     trace::Trace as TraceProto,
-    trace_packet::{trace_packet, TracePacket},
+    trace_packet::{TracePacket, trace_packet},
     track_descriptor::TrackDescriptor,
-    track_event::{track_event, TrackEvent},
+    track_event::{TrackEvent, track_event},
 };
 use protobuf::{Message, MessageField};
 

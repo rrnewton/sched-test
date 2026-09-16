@@ -90,8 +90,8 @@ fn test_exported_symbols_resolve_in_process_image() {
     for sym in &syms {
         let mut name = sym.as_bytes().to_vec();
         name.push(0); // dlsym needs a NUL-terminated name
-                      // SAFETY: we only take the symbol's address and never call through it
-                      // or assume a type; a lookup error means the symbol is absent.
+        // SAFETY: we only take the symbol's address and never call through it
+        // or assume a type; a lookup error means the symbol is absent.
         let resolved = unsafe { this.get::<*const std::ffi::c_void>(&name).is_ok() };
         if !resolved {
             missing.push(*sym);

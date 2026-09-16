@@ -46,16 +46,18 @@ fn test_parse_minimal_valid() {
     assert_eq!(t.nice, 0);
     assert_eq!(t.behavior.repeat, RepeatMode::Forever, "loop -1 -> Forever");
     // run 1000us -> Run(1_000_000ns), sleep 2000us -> Sleep(2_000_000ns).
-    assert!(t
-        .behavior
-        .phases
-        .iter()
-        .any(|p| matches!(p, Phase::Run(1_000_000))));
-    assert!(t
-        .behavior
-        .phases
-        .iter()
-        .any(|p| matches!(p, Phase::Sleep(2_000_000))));
+    assert!(
+        t.behavior
+            .phases
+            .iter()
+            .any(|p| matches!(p, Phase::Run(1_000_000)))
+    );
+    assert!(
+        t.behavior
+            .phases
+            .iter()
+            .any(|p| matches!(p, Phase::Sleep(2_000_000)))
+    );
 }
 
 #[test]

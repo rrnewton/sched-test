@@ -61,8 +61,33 @@ MSG
         exit 1
     fi
 
-    # Edition matches scx-sim/crates/scx_simulator/Cargo.toml.
-    # rustfmt processes each file with that edition's formatting rules.
+    # Resolve each file's edition from the nearest Cargo.toml rather than
+    # hardcoding one. This USED to say `--edition 2021` with a comment claiming
+    # it matched scx_simulator/Cargo.toml — and then scx_simulator and
+    # scx_layered_growth moved to 2024 (they #[path]-inline upstream
+    # scx_layered, which is edition 2024 and now uses let chains). The hook went
+    # on formatting them as 2021 and rejected every correctly-formatted file in
+    # both crates, because the two editions sort imports differently. A hook
+    # that disagrees with `cargo fmt` is worse than no hook: the "Fix:" advice
+    # it prints is `cargo fmt --all`, which produces exactly the output the hook
+    # then refuses. Crates on 2021 are unaffected; they resolve to 2021 here.
+    rs_edition() {
+        _dir=$(dirname -- "$1")
+        while [ "$_dir" != "/" ] && [ -n "$_dir" ] && [ "$_dir" != "." ]; do
+            if [ -f "$_dir/Cargo.toml" ]; then
+                _ed=$(sed -n 's/^edition[[:space:]]*=[[:space:]]*"\([0-9]*\)".*/\1/p' \
+                          "$_dir/Cargo.toml" | head -1)
+                if [ -n "$_ed" ]; then
+                    echo "$_ed"
+                    return 0
+                fi
+            fi
+            _dir=$(dirname -- "$_dir")
+        done
+        # No manifest found (or an edition-less one): rustfmt's own default.
+        echo 2015
+    }
+
     fmt_start=$(date +%s 2>/dev/null || echo 0)
     fmt_failed=0
     fmt_failures=""
@@ -73,7 +98,7 @@ MSG
         [ -n "$f" ] || continue
         # Only check files that still exist (skip deletes / renames-away).
         [ -f "$f" ] || continue
-        if ! rustfmt --edition 2021 --check -- "$f" >/dev/null 2>&1; then
+        if ! rustfmt --edition "$(rs_edition "$f")" --check -- "$f" >/dev/null 2>&1; then
             fmt_failed=1
             fmt_failures="$fmt_failures
   $f"
@@ -91,8 +116,10 @@ Fix:
     cd $repo_root/scx-sim && cargo fmt --all
 ... then re-stage the formatted files and re-run \`git commit\`.
 
-Or fix only the staged files:
-    rustfmt --edition 2021 -- <file>
+Or fix only the staged files (edition must match the file's own crate —
+scx_simulator and scx_layered_growth are 2024, the rest are 2021):
+    rustfmt --edition \$(sed -n 's/^edition *= *"\([0-9]*\)".*/\1/p' \\
+        "\$(dirname <file>)/../../Cargo.toml" | head -1) -- <file>
 
 To bypass (NOT recommended; CI will reject):
     SKIP_SCXSIM_HOOK=1 git commit ...

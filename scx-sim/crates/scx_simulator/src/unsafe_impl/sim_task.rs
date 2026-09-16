@@ -8,7 +8,7 @@ use std::ffi::c_void;
 
 use crate::ffi;
 use crate::task::{
-    nice_to_weight, sched_weight_to_cgroup, Phase, RepeatMode, TaskBehavior, TaskDef, TaskState,
+    Phase, RepeatMode, TaskBehavior, TaskDef, TaskState, nice_to_weight, sched_weight_to_cgroup,
 };
 use crate::types::{CpuId, Pid, TimeNs, Vtime};
 

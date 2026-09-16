@@ -12,7 +12,7 @@ use crate::kfuncs::OpsContext;
 use crate::perf::PmuEvent;
 use crate::types::CpuId;
 
-use super::{format_insn_bytes, PreemptionRecord, PreemptionRecordStore, INSN_BYTES_LEN};
+use super::{INSN_BYTES_LEN, PreemptionRecord, PreemptionRecordStore, format_insn_bytes};
 
 /// Scenario metadata stored in the trace file header.
 ///
@@ -680,8 +680,7 @@ mod tests {
 
     #[test]
     fn test_parse_preemption_line_new_format() {
-        let line =
-            "seq=5 structop=2:3 kfunc_count=7 rbc=100 timeslice=42 rip=0x1000 rip_offset=0x100 insn=48890424ff cpu=1 worker=0";
+        let line = "seq=5 structop=2:3 kfunc_count=7 rbc=100 timeslice=42 rip=0x1000 rip_offset=0x100 insn=48890424ff cpu=1 worker=0";
         let rec = parse_preemption_line(line, 0x2000).unwrap();
         assert_eq!(rec.sequence, 5);
         assert_eq!(rec.rbc_count, 42); // timeslice takes precedence

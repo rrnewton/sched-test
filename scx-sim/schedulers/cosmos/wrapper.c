@@ -181,14 +181,15 @@ void cosmos_register_maps(void)
 	SCX_REGISTER_STORAGE(scx_pmu_tasks);
 
 	/*
-	 * cpu_util_map (BPF_MAP_TYPE_ARRAY): per-CPU user utilization in
-	 * [0..1024], written periodically by cosmos userspace (main.rs poll
-	 * loop) and read by is_cpu_busy(). Pre-seeded so the scheduler can
-	 * always look it up; cosmos_set_cpu_util() lets tests play userspace's
-	 * role and drive the busy/deadline-mode path.
+	 * cpu_util_map is GONE as of upstream 49c65ba6 ("scx_cosmos: Replace
+	 * polled CPU utilization with in-BPF accounting"). Utilization is no
+	 * longer pushed in from userspace at all: the BPF side charges p->utime
+	 * deltas to the CPU from ops.tick()/ops.stopping() and folds them into
+	 * cpu_ctx->busy_avg itself, so there is no map to register and nothing
+	 * for userspace to poll. cosmos_set_cpu_util() below now writes that
+	 * per-CPU state directly. Registered per-CPU storage (cpu_ctx_stor,
+	 * just below) is what backs it.
 	 */
-	SCX_REGISTER_ARRAY(cpu_util_map, true);
-
 	SCX_REGISTER_ARRAY(node_ctx_stor, true);
 	SCX_REGISTER_ARRAY(cpu_node_map, false);
 	SCX_REGISTER_PERCPU(cpu_ctx_stor, true);
@@ -302,22 +303,51 @@ void cosmos_set_cpu_capacity(unsigned int num_cpus, const unsigned long long *ca
  * ordered sibling pair within each core, exactly as userspace does at init.
  */
 /*
- * Test knob: set per-CPU user utilization (the signal cosmos userspace polls
- * and writes into cpu_util_map every --polling-ms; see main.rs). @util is on
- * the production [0..1024] scale. is_cpu_busy(cpu) returns true when
- * cpu_util_map[cpu] >= busy_threshold, switching COSMOS from per-CPU
- * round-robin queues to the global deadline queue (task_dl / shared DSQ).
+ * Test knob: set per-CPU user utilization. @util is on the production
+ * [0..1024] scale, unchanged. is_cpu_busy(cpu) true switches COSMOS from
+ * per-CPU round-robin queues to the global deadline queue (task_dl / shared
+ * DSQ), which is the path these tests exist to reach.
  *
- * The simulator does not yet compute per-CPU utilization automatically
+ * The simulator does not compute per-CPU utilization automatically
  * (mb sim-642cb2), so tests set it explicitly to match their workload — e.g.
  * a saturated oversubscribed run sets util near 1024.
+ *
+ * HOW THIS CHANGED AT UPSTREAM 49c65ba6. It used to write cpu_util_map, the
+ * array cosmos userspace polled /proc/stat into every --polling-ms. That map
+ * no longer exists: the accounting moved into BPF, into per-CPU cpu_ctx. So we
+ * now write the three fields is_cpu_busy() actually reads, via upstream's own
+ * try_lookup_cpu_ctx() rather than reaching into the map ourselves:
+ *
+ *   busy_avg      the EWMA the real code maintains from p->utime deltas
+ *   busy          the hysteresis state (enter at busy_threshold, exit at 3/4)
+ *   busy_eval_at  when the EWMA was last refreshed
+ *
+ * busy_eval_at is NOT optional padding. is_cpu_busy() returns false outright
+ * if the last evaluation is more than BUSY_STALE_NS (50 ms) old, on the
+ * reasoning that a CPU which has not ticked recently has been idle. Leaving it
+ * at zero would make this knob silently do nothing.
+ *
+ * BEHAVIOURAL DIFFERENCE WORTH KNOWING, because it is upstream's and we are
+ * faithfully reproducing it rather than papering over it: the old map was
+ * sticky — set it once and the CPU stayed busy forever. The new state decays.
+ * A test that sets utilization once and then runs for more than 50 ms of
+ * simulated time will see is_cpu_busy() go false again unless the workload
+ * actually keeps the CPU ticking. That is what the real scheduler now does.
  */
 void cosmos_set_cpu_util(unsigned int num_cpus, unsigned long long util)
 {
 	unsigned int cpu;
 
-	for (cpu = 0; cpu < num_cpus && cpu < MAX_CPUS; cpu++)
-		bpf_map_update_elem(&cpu_util_map, &cpu, &util, 0);
+	for (cpu = 0; cpu < num_cpus && cpu < MAX_CPUS; cpu++) {
+		struct cpu_ctx *cctx = try_lookup_cpu_ctx((s32)cpu);
+
+		if (!cctx)
+			continue;
+
+		cctx->busy_avg = util;
+		cctx->busy = util >= busy_threshold;
+		cctx->busy_eval_at = bpf_ktime_get_ns();
+	}
 }
 
 void cosmos_enable_smt_siblings(unsigned int num_cpus, unsigned int threads_per_core)

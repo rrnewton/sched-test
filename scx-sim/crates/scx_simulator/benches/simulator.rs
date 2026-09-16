@@ -8,7 +8,7 @@
 //! The `SIM_LOCK` mutex is held for each iteration so benchmarks are
 //! compatible with the C scheduler's global state.
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 
 use scx_simulator::*;
 

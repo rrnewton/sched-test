@@ -1321,7 +1321,7 @@ fn test_determinism_mode_disabled_by_default() {
 #[test]
 fn test_checkpoint_divergence_detection() {
     use scx_simulator::{
-        compare_checkpoints, drain_determinism_checkpoints, enable_determinism_mode, DivergenceType,
+        DivergenceType, compare_checkpoints, drain_determinism_checkpoints, enable_determinism_mode,
     };
 
     let _lock = common::setup_test();

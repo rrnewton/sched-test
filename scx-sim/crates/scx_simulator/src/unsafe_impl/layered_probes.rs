@@ -43,7 +43,7 @@
 //! at. The failure is a segfault with no message, which is why it is spelled
 //! out here.
 
-use std::ffi::{c_char, c_void, CStr};
+use std::ffi::{CStr, c_char, c_void};
 
 use crate::ffi::DynamicScheduler;
 use crate::kfuncs::{self, CallbackContext, OpsContext};

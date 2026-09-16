@@ -75,8 +75,8 @@ use tracing::{info, warn};
 
 use crate::safe::rtapp_iorun::{self, IoRunGlobals, IoRunRefusal};
 use crate::scenario::{
-    sched_overhead_rbc_ns_from_env, seed_from_env, CgroupBandwidth, CgroupDef, IrqEvent, IrqType,
-    NoiseConfig, OverheadConfig, Scenario, DEFAULT_WATCHDOG_TIMEOUT_NS,
+    CgroupBandwidth, CgroupDef, DEFAULT_WATCHDOG_TIMEOUT_NS, IrqEvent, IrqType, NoiseConfig,
+    OverheadConfig, Scenario, sched_overhead_rbc_ns_from_env, seed_from_env,
 };
 use crate::task::{Phase, RepeatMode, TaskBehavior, TaskDef};
 use crate::types::{CpuId, Gid, Pid, Uid};
@@ -224,7 +224,7 @@ fn strip_comments(input: &str) -> String {
         if c == '/' {
             if chars.peek() == Some(&'*') {
                 chars.next(); // consume '*'
-                              // Skip until '*/'
+                // Skip until '*/'
                 loop {
                     match chars.next() {
                         Some('*') if chars.peek() == Some(&'/') => {
@@ -748,7 +748,7 @@ fn parse_task(
         Some(v) => {
             return Err(RtAppError::InvalidValue(format!(
                 "kthread: expected true or false, got {v}"
-            )))
+            )));
         }
     };
 
@@ -958,7 +958,7 @@ fn resolve_thread_groups(tasks: &mut [TaskDef]) -> Result<(), RtAppError> {
                     own: own.clone(),
                     leader: name_of(leader),
                     leaders: leaders.clone(),
-                })
+                });
             }
             _ => {}
         }

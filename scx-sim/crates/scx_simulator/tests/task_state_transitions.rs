@@ -74,11 +74,7 @@ fn task_events(trace: &Trace, pid: Pid) -> Vec<Ev> {
                 TraceKind::ExitTask { pid: p } if *p == pid => Ev::Exit,
                 _ => Ev::Other,
             };
-            if ev == Ev::Other {
-                None
-            } else {
-                Some(ev)
-            }
+            if ev == Ev::Other { None } else { Some(ev) }
         })
         .collect()
 }

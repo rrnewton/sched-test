@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 
 use crate::cgroup_wrapper::{
-    free_cgroup_raw, CgroupAlloc, CgroupPtr, CssIterGuard, SimCgroupHandle,
+    CgroupAlloc, CgroupPtr, CssIterGuard, SimCgroupHandle, free_cgroup_raw,
 };
 use crate::types::CpuId;
 

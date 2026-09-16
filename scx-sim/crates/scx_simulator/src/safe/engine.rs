@@ -24,7 +24,7 @@ use crate::kfuncs::{self, OpsContext, SimArc, SimState, SimulatorState, StagedEv
 use crate::monitor::{Monitor, ProbeContext, ProbePoint};
 use crate::perf;
 use crate::preempt::{
-    is_determinism_mode_enabled, record_checkpoint, scheduler_so_path, CheckpointEvent,
+    CheckpointEvent, is_determinism_mode_enabled, record_checkpoint, scheduler_so_path,
 };
 use crate::scenario::{
     CgroupCpusetChangeEvent, CgroupCreateEvent, CgroupDestroyEvent, FutexOp, IrqType, PreemptMode,
@@ -1033,11 +1033,7 @@ fn pid_is_bw_throttled<S: crate::ffi::Scheduler>(
 ) -> Option<CgroupId> {
     let cgid = *fields.task_to_cgid.get(&pid)?;
     let throttled = scheduler.is_cgroup_throttled(cgid.0)?;
-    if throttled {
-        Some(cgid)
-    } else {
-        None
-    }
+    if throttled { Some(cgid) } else { None }
 }
 
 /// Eagerly remove a bw-throttled task from its local DSQ + stash it in

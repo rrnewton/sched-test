@@ -543,11 +543,7 @@ impl OverheadConfig {
 
     /// Effective DSQ consume overhead: 0 when overhead is disabled.
     pub fn effective_dsq_consume_ns(&self) -> TimeNs {
-        if self.enabled {
-            self.dsq_consume_ns
-        } else {
-            0
-        }
+        if self.enabled { self.dsq_consume_ns } else { 0 }
     }
 
     /// Effective running callback overhead: 0 when overhead is disabled.

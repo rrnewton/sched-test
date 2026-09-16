@@ -1,7 +1,14 @@
 [package]
 name = "scx_simulator"
 version = "1.0.0"
-edition = "2021"
+# 2024, NOT 2021, because src/safe/mod.rs #[path]-includes upstream
+# scx/scheds/rust/scx_layered/src/alloc.rs, and upstream scx_layered is itself
+# edition 2024 (rust-version 1.91). Upstream started using let chains, which
+# only parse under 2024 — on 2021 this crate fails at `cargo fmt` with
+# "let chains are only allowed in Rust 2024 or later" before it even compiles.
+# The edition of a crate that inlines upstream source must track the edition of
+# that source; it is not a free choice.
+edition = "2024"
 publish = false
 
 [features]

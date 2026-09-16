@@ -559,8 +559,8 @@ unsafe impl<T> Sync for SendRawPtr<T> {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst as TestSeqCst};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst as TestSeqCst};
 
     #[test]
     fn test_single_worker_dispatch() {
