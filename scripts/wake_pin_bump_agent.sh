@@ -101,7 +101,12 @@ Issue: $URL
 Title: $TITLE
 
 Read the issue first — it names the stage that failed, the current and target
-pins, and the branch where the mechanical bump's work was preserved.
+pins, and where the mechanical bump's work was preserved. That is usually a
+workflow ARTIFACT (a format-patch, 30-day retention) rather than a branch: the
+Meta CLA Enforcement ruleset covers ~ALL refs and does not bypass
+github-actions[bot], so the job cannot push branches. Download the artifact and
+'git am' it to recover the bump without re-running it — or just re-run
+scripts/scx_pin_bump.sh --fetch, which is cheap and deterministic.
 
 Rules that bind you here, from the harness CLAUDE.md:
 
