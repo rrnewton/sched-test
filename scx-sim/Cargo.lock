@@ -908,6 +908,7 @@ dependencies = [
  "anyhow",
  "clap",
  "fastrand",
+ "scxsim-build",
  "serde",
 ]
 
