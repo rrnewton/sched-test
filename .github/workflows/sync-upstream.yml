@@ -251,15 +251,63 @@ jobs:
       # ---------------------------------------------------------------------
       # GREEN: land it. This is the whole point of the job.
       # ---------------------------------------------------------------------
+      # PIN_BUMP_TOKEN, NOT GITHUB_TOKEN — and the difference is load-bearing.
+      #
+      # The "Meta CLA Enforcement" ruleset covers `~ALL` refs with a
+      # required_status_checks rule, and its bypass list is RepositoryRole 2/4/5
+      # plus two named Integrations. `github-actions[bot]` is in none of them, so
+      # a GITHUB_TOKEN push of ANY branch is rejected:
+      #
+      #     remote: error: GH013: Repository rule violations found
+      #     remote: - Required status check "Meta CLA Check" is expected.
+      #
+      # Discovered by running this job for real (run 35136021677), not by
+      # reading it. A brand-new branch has no checks yet, so it can never
+      # satisfy the rule, and no amount of retrying helps.
+      #
+      # The fix is a token belonging to a principal that DOES bypass: any user
+      # with the Write role (RepositoryRole:2). Add a fine-grained PAT with
+      # contents:write + pull_requests:write as the repo secret PIN_BUMP_TOKEN.
+      # Until that exists this step cannot land, and says so loudly through the
+      # normal escalation path rather than dying with a confusing git error.
       - name: Land the bump
         if: steps.bump.outputs.rc == '0' && steps.validate.outputs.rc == '0' && steps.mode.outputs.may_land == 'true'
         id: land
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.PIN_BUMP_TOKEN || secrets.GITHUB_TOKEN }}
+          PIN_BUMP_TOKEN: ${{ secrets.PIN_BUMP_TOKEN }}
         run: |
           set -euo pipefail
+
+          if [ -z "${PIN_BUMP_TOKEN:-}" ]; then
+            echo "::error::Cannot land: repo secret PIN_BUMP_TOKEN is not set, and GITHUB_TOKEN cannot push here (the Meta CLA Enforcement ruleset covers ~ALL refs and does not bypass github-actions[bot]). THE BUMP ITSELF SUCCEEDED AND VALIDATE PASSED — only the landing is blocked."
+            {
+              echo "stage=land (blocked: no PIN_BUMP_TOKEN)"
+              echo "FAILED=1"
+              echo 'detail<<VEOF'
+              echo "The bump is GREEN. validate.sh passed on the bumped pin."
+              echo ""
+              echo "It could not be landed because this repository has no PIN_BUMP_TOKEN"
+              echo "secret, and the default GITHUB_TOKEN is refused by the"
+              echo "'Meta CLA Enforcement' ruleset, which applies required status checks"
+              echo "to ~ALL refs and bypasses only RepositoryRole 2/4/5 and two named"
+              echo "Integrations -- github-actions[bot] is not among them."
+              echo ""
+              echo "To enable automatic landing, add a fine-grained PAT owned by a user"
+              echo "with the Write role, scoped to this repository with"
+              echo "contents:write + pull_requests:write, as the secret PIN_BUMP_TOKEN."
+              echo ""
+              echo "Until then a human can land this bump in one command:"
+              echo "    scripts/scx_pin_bump.sh --fetch && cd scx-sim && bash validate.sh"
+              echo 'VEOF'
+            } >> $GITHUB_ENV
+            exit 0
+          fi
+
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin \
+            "https://x-access-token:${PIN_BUMP_TOKEN}@github.com/${{ github.repository }}.git"
 
           BRANCH="scx-pin-bump-$(date -u +%Y%m%d-%H%M)"
           git checkout -b "$BRANCH"
@@ -333,28 +381,63 @@ jobs:
       # survives the agent runner being unavailable. `scripts/wake_pin_bump_agent.sh`
       # turns an open issue into a woken agent on a machine that has one.
       # ---------------------------------------------------------------------
-      - name: Preserve the failed bump on a branch
-        if: env.FAILED == '1' && steps.bump.outputs.rc == '0'
+      # Preserve as an ARTIFACT FIRST, because an artifact needs no push rights
+      # and therefore cannot be blocked by the CLA ruleset. The branch push is
+      # attempted afterwards, best-effort, and its failure must not take the
+      # escalation down with it — which is exactly what happened on run
+      # 35136021677: the push was rejected, the step failed, and every later
+      # step (including "Escalate to an agent") was skipped by the implicit
+      # success() guard. The bump failed and NOBODY WAS TOLD. A tier-2 path that
+      # only fires when tier 1 fails in the expected way is not a tier-2 path.
+      - name: Preserve the failed bump
+        if: always() && env.FAILED == '1' && steps.bump.outputs.rc == '0'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PIN_BUMP_TOKEN: ${{ secrets.PIN_BUMP_TOKEN }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           BRANCH="scx-pin-bump-failed-$(date -u +%Y%m%d-%H%M)"
           git checkout -b "$BRANCH"
           git add -A
-          git commit -m "WIP: scx pin bump to ${{ steps.bump.outputs.new_pin_short }} — ${{ env.stage }} FAILED
+          git commit -q -m "WIP: scx pin bump to ${{ steps.bump.outputs.new_pin_short }} — ${{ env.stage }} FAILED
 
-          Pushed so the bump is not repeated from scratch by whoever picks this up.
           Absorbed ${{ steps.bump.outputs.upstream_commits }} upstream commits and
           replayed ${{ steps.bump.outputs.carried_count }} local patch(es) intact;
           the failure is downstream of the bump itself."
-          git push origin "$BRANCH"
-          echo "FAIL_BRANCH=$BRANCH" >> $GITHUB_ENV
 
+          # The patch is the durable artifact. It carries the gitlink change too,
+          # so `git am` reproduces the bump exactly without re-running it.
+          git format-patch -1 --stdout > /tmp/scx-pin-bump.patch
+          echo "PATCH_READY=1" >> $GITHUB_ENV
+
+          if [ -n "${PIN_BUMP_TOKEN:-}" ]; then
+            git remote set-url origin \
+              "https://x-access-token:${PIN_BUMP_TOKEN}@github.com/${{ github.repository }}.git"
+            if git push origin "$BRANCH"; then
+              echo "FAIL_BRANCH=$BRANCH" >> $GITHUB_ENV
+            else
+              echo "::warning::could not push $BRANCH; the patch artifact is the copy of record."
+            fi
+          else
+            echo "::warning::no PIN_BUMP_TOKEN, so the failed bump is preserved as a workflow ARTIFACT only (github-actions[bot] cannot push branches here — see the Land step)."
+          fi
+          exit 0
+
+      - name: Upload the failed bump as an artifact
+        if: always() && env.PATCH_READY == '1'
+        uses: actions/upload-artifact@v4
+        with:
+          name: scx-pin-bump-${{ steps.bump.outputs.new_pin_short }}
+          path: /tmp/scx-pin-bump.patch
+          retention-days: 30
+
+      # always(), NOT the implicit success(). This step is the ONLY thing that
+      # tells anyone the bump failed, so it must survive any earlier step
+      # failing — including the preservation step it follows. Filing an issue
+      # needs only issues:write, which GITHUB_TOKEN has and no ruleset blocks.
       - name: Escalate to an agent
-        if: env.FAILED == '1'
+        if: always() && env.FAILED == '1'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -372,7 +455,7 @@ jobs:
           | target upstream | \`${{ steps.bump.outputs.new_pin_short }}\` |
           | upstream commits | ${{ steps.bump.outputs.upstream_commits }} |
           | local patches carried | ${{ steps.bump.outputs.carried_count }} |
-          | work preserved on | \`${{ env.FAIL_BRANCH || 'nothing to preserve — the bump itself refused' }}\` |
+          | work preserved on | ${{ env.FAIL_BRANCH && format('branch `{0}`', env.FAIL_BRANCH) || (env.PATCH_READY == '1' && 'the `scx-pin-bump-*` workflow **artifact** on the run below (30-day retention) — no branch, because github-actions[bot] cannot push here' || 'nothing to preserve — the bump itself refused') }} |
           | run | ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} |
 
           **The pin on \`integration\` is unchanged.** Nothing was landed and no
@@ -430,7 +513,7 @@ jobs:
           fi
 
       - name: Fail the run if the bump did not succeed
-        if: env.FAILED == '1'
+        if: always() && env.FAILED == '1'
         run: |
           echo "::error::scx pin bump failed at ${{ env.stage }}. An escalation issue is open; the pin on integration is unchanged."
           exit 1
