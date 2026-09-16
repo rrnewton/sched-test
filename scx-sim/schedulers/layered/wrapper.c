@@ -719,6 +719,97 @@ enum layered_layer_field {
 	LAYER_FIELD_NR_INVALID,
 };
 
+/*
+ * Every `enum layer_stat_id` / `enum global_stat_id` member scxsim names, as
+ * (selector suffix, the real intf.h constant). ONE list drives both the
+ * selector enum and the resolver switch below, so those two cannot disagree.
+ *
+ * Why this exists: the Rust `LayerStat` / `GlobalStat` discriminants are
+ * POSITIONAL indices into upstream's enums, passed straight through to
+ * layered_probe_layer_stat(), which only bounds-checks. An upstream insertion
+ * anywhere before a member silently shifts it and the simulator reads a
+ * DIFFERENT counter -- no error, no failing test. These lists make the drift
+ * observable in two ways, and between them they cover every way the upstream
+ * enum can move:
+ *
+ *   - a RENAME or REMOVAL upstream stops this file compiling, because each
+ *     entry names its constant;
+ *   - a REORDER or INSERT upstream changes the value returned here, which
+ *     `layer_stat_ids_match_the_compiled_scheduler` (tests/layered_probes.rs)
+ *     compares against the Rust discriminant.
+ *
+ * Keep the list in upstream declaration order and in step with the Rust
+ * enums; the tests assert both the per-member values and the member count.
+ */
+#define LAYERED_LSTAT_PROBES(X)						\
+	X(SEL_LOCAL,		LSTAT_SEL_LOCAL)			\
+	X(ENQ_LOCAL,		LSTAT_ENQ_LOCAL)			\
+	X(ENQ_WAKEUP,		LSTAT_ENQ_WAKEUP)			\
+	X(ENQ_EXPIRE,		LSTAT_ENQ_EXPIRE)			\
+	X(ENQ_REENQ,		LSTAT_ENQ_REENQ)			\
+	X(ENQ_DSQ,		LSTAT_ENQ_DSQ)				\
+	X(KEEP,			LSTAT_KEEP)				\
+	X(MIN_EXEC,		LSTAT_MIN_EXEC)				\
+	X(MIN_EXEC_NS,		LSTAT_MIN_EXEC_NS)			\
+	X(OPEN_IDLE,		LSTAT_OPEN_IDLE)			\
+	X(AFFN_VIOL,		LSTAT_AFFN_VIOL)			\
+	X(KEEP_FAIL_MAX_EXEC,	LSTAT_KEEP_FAIL_MAX_EXEC)		\
+	X(KEEP_FAIL_BUSY,	LSTAT_KEEP_FAIL_BUSY)			\
+	X(PREEMPT,		LSTAT_PREEMPT)				\
+	X(PREEMPT_FIRST,	LSTAT_PREEMPT_FIRST)			\
+	X(PREEMPT_XLLC,		LSTAT_PREEMPT_XLLC)			\
+	X(PREEMPT_XNUMA,	LSTAT_PREEMPT_XNUMA)			\
+	X(PREEMPT_IDLE,		LSTAT_PREEMPT_IDLE)			\
+	X(PREEMPT_FAIL,		LSTAT_PREEMPT_FAIL)			\
+	X(EXCL_COLLISION,	LSTAT_EXCL_COLLISION)			\
+	X(EXCL_PREEMPT,		LSTAT_EXCL_PREEMPT)			\
+	X(YIELD,		LSTAT_YIELD)				\
+	X(YIELD_IGNORE,		LSTAT_YIELD_IGNORE)			\
+	X(MIGRATION,		LSTAT_MIGRATION)			\
+	X(XNUMA_MIGRATION,	LSTAT_XNUMA_MIGRATION)			\
+	X(XLLC_MIGRATION,	LSTAT_XLLC_MIGRATION)			\
+	X(XLLC_MIGRATION_SKIP,	LSTAT_XLLC_MIGRATION_SKIP)		\
+	X(XLAYER_WAKE,		LSTAT_XLAYER_WAKE)			\
+	X(XLAYER_REWAKE,	LSTAT_XLAYER_REWAKE)			\
+	X(LLC_DRAIN_TRY,	LSTAT_LLC_DRAIN_TRY)			\
+	X(LLC_DRAIN,		LSTAT_LLC_DRAIN)			\
+	X(SKIP_REMOTE_NODE,	LSTAT_SKIP_REMOTE_NODE)			\
+	X(RUNQ_LAT_BASE,	LSTAT_RUNQ_LAT_BASE)
+
+#define LAYERED_GSTAT_PROBES(X)						\
+	X(EXCL_IDLE,		GSTAT_EXCL_IDLE)			\
+	X(EXCL_WAKEUP,		GSTAT_EXCL_WAKEUP)			\
+	X(HI_FB_EVENTS,		GSTAT_HI_FB_EVENTS)			\
+	X(HI_FB_USAGE,		GSTAT_HI_FB_USAGE)			\
+	X(LO_FB_EVENTS,		GSTAT_LO_FB_EVENTS)			\
+	X(LO_FB_USAGE,		GSTAT_LO_FB_USAGE)			\
+	X(FB_CPU_USAGE,		GSTAT_FB_CPU_USAGE)			\
+	X(ANTISTALL,		GSTAT_ANTISTALL)			\
+	X(SKIP_PREEMPT,		GSTAT_SKIP_PREEMPT)			\
+	X(FIXUP_VTIME,		GSTAT_FIXUP_VTIME)			\
+	X(PREEMPTING_MISMATCH,	GSTAT_PREEMPTING_MISMATCH)
+
+/*
+ * Selector namespaces for layered_probe_lstat_id() / layered_probe_gstat_id().
+ *
+ * Generated from the lists above, so selector N is the Nth entry there. The
+ * Rust `LayerStat` / `GlobalStat` discriminants are these ordinals AND their
+ * claim about the upstream value; the resolver returns the upstream value, and
+ * the test asserts the two agree. Positions here are ours and stable -- it is
+ * the values they resolve to that can move underneath us.
+ */
+enum layered_lstat_probe_id {
+#define LAYERED_LSTAT_SELECTOR(name, _constant)	LAYERED_LSTAT_SEL_##name,
+	LAYERED_LSTAT_PROBES(LAYERED_LSTAT_SELECTOR)
+#undef LAYERED_LSTAT_SELECTOR
+};
+
+enum layered_gstat_probe_id {
+#define LAYERED_GSTAT_SELECTOR(name, _constant)	LAYERED_GSTAT_SEL_##name,
+	LAYERED_GSTAT_PROBES(LAYERED_GSTAT_SELECTOR)
+#undef LAYERED_GSTAT_SELECTOR
+};
+
 /* Selector namespace for layered_probe_enum(). */
 enum layered_enum_probe_id {
 	LAYERED_PROBE_KIND_OPEN,
@@ -763,6 +854,20 @@ enum layered_enum_probe_id {
 	LAYERED_PROBE_SCX_SLICE_DFL,
 	LAYERED_PROBE_DEFAULT_SLICE_NS,
 	LAYERED_PROBE_LAYER_FIELD_COUNT,
+	/*
+	 * APPEND ONLY below this point, and append only at the end generally:
+	 * the Rust `LayeredEnumProbe` mirrors these values positionally, so
+	 * inserting in the middle is the very bug the stat lists above exist
+	 * to prevent.
+	 *
+	 * Stat-array widths. NR_LSTATS is NOT the number of named members --
+	 * LSTAT_RUNQ_LAT_BASE opens a NR_RUNQ_LAT_BUCKETS-wide histogram that
+	 * runs to LSTAT_RUNQ_LAT_END -- so the Rust side pins the named count
+	 * against LSTAT_RUNQ_LAT_BASE + 1 and the histogram width separately.
+	 */
+	LAYERED_PROBE_NR_LSTATS,
+	LAYERED_PROBE_NR_GSTATS,
+	LAYERED_PROBE_NR_RUNQ_LAT_BUCKETS,
 	LAYERED_PROBE_NR_INVALID,
 };
 
@@ -813,7 +918,43 @@ int layered_probe_enum(int which)
 	/* The `--slice-us` equivalent an unset per-layer slice inherits. */
 	case LAYERED_PROBE_DEFAULT_SLICE_NS:		return (int)slice_ns;
 	case LAYERED_PROBE_LAYER_FIELD_COUNT:		return LAYER_FIELD_NR_INVALID;
+	case LAYERED_PROBE_NR_LSTATS:			return NR_LSTATS;
+	case LAYERED_PROBE_NR_GSTATS:			return NR_GSTATS;
+	case LAYERED_PROBE_NR_RUNQ_LAT_BUCKETS:		return NR_RUNQ_LAT_BUCKETS;
 	default:					return -1;
+	}
+}
+
+/*
+ * Resolve one LAYERED_LSTAT_PROBES / LAYERED_GSTAT_PROBES selector to the real
+ * `enum layer_stat_id` / `enum global_stat_id` value the scheduler was
+ * COMPILED against, or -1 when out of range.
+ *
+ * Same shape as layered_probe_enum() above: the caller names a selector in a
+ * namespace this wrapper owns (and only ever appends to), and gets back the
+ * upstream value. That indirection is the whole point -- it is what lets the
+ * Rust side check its positional discriminants against ground truth instead of
+ * assuming them.
+ */
+int layered_probe_lstat_id(int which)
+{
+	switch (which) {
+#define LAYERED_LSTAT_CASE(name, constant)				\
+	case LAYERED_LSTAT_SEL_##name:		return constant;
+	LAYERED_LSTAT_PROBES(LAYERED_LSTAT_CASE)
+#undef LAYERED_LSTAT_CASE
+	default:				return -1;
+	}
+}
+
+int layered_probe_gstat_id(int which)
+{
+	switch (which) {
+#define LAYERED_GSTAT_CASE(name, constant)				\
+	case LAYERED_GSTAT_SEL_##name:		return constant;
+	LAYERED_GSTAT_PROBES(LAYERED_GSTAT_CASE)
+#undef LAYERED_GSTAT_CASE
+	default:				return -1;
 	}
 }
 

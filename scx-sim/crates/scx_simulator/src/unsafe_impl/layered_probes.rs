@@ -130,6 +130,8 @@ type TaskOrFn = unsafe extern "C" fn(*mut c_void, u32, u32) -> i32;
 /// resolved pointers live as long as that scheduler.
 pub struct LayeredProbes {
     enum_fn: EnumFn,
+    lstat_id_fn: EnumFn,
+    gstat_id_fn: EnumFn,
     task_layer_fn: PidU32Fn,
     task_dsq_fn: PidU64Fn,
     nr_layers_fn: VoidU32Fn,
@@ -200,6 +202,8 @@ impl LayeredProbes {
             }
             LayeredProbes {
                 enum_fn: resolve!(b"layered_probe_enum", EnumFn),
+                lstat_id_fn: resolve!(b"layered_probe_lstat_id", EnumFn),
+                gstat_id_fn: resolve!(b"layered_probe_gstat_id", EnumFn),
                 task_layer_fn: resolve!(b"layered_probe_task_layer", PidU32Fn),
                 task_dsq_fn: resolve!(b"layered_probe_task_dsq", PidU64Fn),
                 nr_layers_fn: resolve!(b"layered_probe_nr_layers", VoidU32Fn),
@@ -349,6 +353,35 @@ impl LayeredProbes {
     pub fn layer_stat(&self, layer_id: u32, stat: LayerStat) -> u64 {
         // SAFETY: both indices are bounds-checked C-side.
         unsafe { (self.layer_stat_fn)(layer_id, stat as u32) }
+    }
+
+    /// The real `enum layer_stat_id` value of the `position`-th member of
+    /// `LAYERED_LSTAT_PROBES` (`schedulers/layered/wrapper.c`), as the
+    /// scheduler was COMPILED; `-1` past the end.
+    ///
+    /// Takes a POSITION, deliberately, not a [`LayerStat`]. [`LayerStat`]'s
+    /// discriminant is its *claim* about the upstream index, and
+    /// [`layer_stat`](Self::layer_stat) passes that claim straight through as
+    /// a raw array index. A checker that fed the claim back in as the
+    /// selector would be self-satisfying — under a swap of two variants it
+    /// looks up the other one and agrees with itself. So the selector is the
+    /// variant's position in [`LayerStat::ALL`] and the returned value is
+    /// compared against the discriminant: two independent quantities, which
+    /// is what makes the comparison able to fail.
+    ///
+    /// See `layer_stat_ids_match_the_compiled_scheduler`.
+    pub fn lstat_id_at(&self, position: usize) -> i32 {
+        // SAFETY: pure switch over an integer selector, no pointers;
+        // out-of-range returns -1 rather than reading anything.
+        unsafe { (self.lstat_id_fn)(position as i32) }
+    }
+
+    /// The real `enum global_stat_id` value of the `position`-th member of
+    /// `LAYERED_GSTAT_PROBES`. Peer of [`lstat_id_at`](Self::lstat_id_at),
+    /// including why it takes a position.
+    pub fn gstat_id_at(&self, position: usize) -> i32 {
+        // SAFETY: pure switch over an integer selector, no pointers.
+        unsafe { (self.gstat_id_fn)(position as i32) }
     }
 
     /// Cumulative runtime (ns) a layer accrued in one usage class, summed
@@ -947,6 +980,17 @@ pub enum LayeredEnumProbe {
     /// `LAYER_FIELD_NR_INVALID` — how many [`LayerField`] selectors the
     /// scheduler knows about.
     LayerFieldCount = 36,
+    /// `NR_LSTATS` — the width of `cpu_ctx.lstats[layer]`. NOT the number of
+    /// named [`LayerStat`] variants: `LSTAT_RUNQ_LAT_BASE` opens a
+    /// [`NrRunqLatBuckets`](Self::NrRunqLatBuckets)-wide histogram that runs
+    /// to `LSTAT_RUNQ_LAT_END`, so `NR_LSTATS` counts every bucket too.
+    NrLstats = 37,
+    /// `NR_GSTATS` — the width of `cpu_ctx.gstats`, and (no histogram tail
+    /// here) exactly the number of [`GlobalStat`] variants.
+    NrGstats = 38,
+    /// `NR_RUNQ_LAT_BUCKETS` — the runqueue-latency histogram width that sits
+    /// on top of `LSTAT_RUNQ_LAT_BASE`.
+    NrRunqLatBuckets = 39,
 }
 
 /// `enum layer_match_kind` from `intf.h`, in declaration order.
@@ -1064,8 +1108,12 @@ pub enum LayerUsage {
 /// `enum layer_stat_id` from `intf.h`, in declaration order.
 ///
 /// The values are positional in the BPF enum, so a reorder upstream silently
-/// shifts every one of them. `layer_stat_ids_are_positionally_stable` pins the
-/// count so that a reorder-plus-insert cannot pass unnoticed.
+/// shifts every one of them and [`LayeredProbes::layer_stat`] starts reading a
+/// different counter. `layer_stat_ids_match_the_compiled_scheduler`
+/// (`tests/layered_probes.rs`) pins every discriminant AND the member count
+/// against what the compiled `.so` reports, via
+/// [`LayeredProbes::lstat_id`]. Add a variant here and to [`LayerStat::ALL`]
+/// together — the count assertion fails if they disagree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum LayerStat {
@@ -1138,7 +1186,56 @@ pub enum LayerStat {
     RunqLatBase = 32,
 }
 
+impl LayerStat {
+    /// Every variant, in declaration order.
+    ///
+    /// `layer_stat_ids_match_the_compiled_scheduler` walks this and pins its
+    /// length, so a variant missing here is a failing test rather than a
+    /// silently unchecked index.
+    pub const ALL: &'static [LayerStat] = &[
+        LayerStat::SelLocal,
+        LayerStat::EnqLocal,
+        LayerStat::EnqWakeup,
+        LayerStat::EnqExpire,
+        LayerStat::EnqReenq,
+        LayerStat::EnqDsq,
+        LayerStat::Keep,
+        LayerStat::MinExec,
+        LayerStat::MinExecNs,
+        LayerStat::OpenIdle,
+        LayerStat::AffnViol,
+        LayerStat::KeepFailMaxExec,
+        LayerStat::KeepFailBusy,
+        LayerStat::Preempt,
+        LayerStat::PreemptFirst,
+        LayerStat::PreemptXllc,
+        LayerStat::PreemptXnuma,
+        LayerStat::PreemptIdle,
+        LayerStat::PreemptFail,
+        LayerStat::ExclCollision,
+        LayerStat::ExclPreempt,
+        LayerStat::Yield,
+        LayerStat::YieldIgnore,
+        LayerStat::Migration,
+        LayerStat::XnumaMigration,
+        LayerStat::XllcMigration,
+        LayerStat::XllcMigrationSkip,
+        LayerStat::XlayerWake,
+        LayerStat::XlayerRewake,
+        LayerStat::LlcDrainTry,
+        LayerStat::LlcDrain,
+        LayerStat::SkipRemoteNode,
+        LayerStat::RunqLatBase,
+    ];
+}
+
 /// `enum global_stat_id` from `intf.h`, in declaration order.
+///
+/// Positional, with the same drift hazard as [`LayerStat`] and the same guard:
+/// `global_stat_ids_match_the_compiled_scheduler` pins every discriminant and
+/// the member count against the compiled `.so` via
+/// [`LayeredProbes::gstat_id`]. Add a variant here and to [`GlobalStat::ALL`]
+/// together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum GlobalStat {
@@ -1164,6 +1261,23 @@ pub enum GlobalStat {
     FixupVtime = 9,
     /// `GSTAT_PREEMPTING_MISMATCH`
     PreemptingMismatch = 10,
+}
+
+impl GlobalStat {
+    /// Every variant, in declaration order. See [`LayerStat::ALL`].
+    pub const ALL: &'static [GlobalStat] = &[
+        GlobalStat::ExclIdle,
+        GlobalStat::ExclWakeup,
+        GlobalStat::HiFbEvents,
+        GlobalStat::HiFbUsage,
+        GlobalStat::LoFbEvents,
+        GlobalStat::LoFbUsage,
+        GlobalStat::FbCpuUsage,
+        GlobalStat::Antistall,
+        GlobalStat::SkipPreempt,
+        GlobalStat::FixupVtime,
+        GlobalStat::PreemptingMismatch,
+    ];
 }
 
 /// A snapshot of scx_layered's per-task state at a single probe point.

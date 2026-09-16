@@ -674,3 +674,114 @@ fn out_of_range_match_indices_report_absence() {
     assert_eq!(p.match_nr_ands(1, 0), 0, "...with no AND terms in it");
     assert_eq!(p.match_kind(1, 0, 0), None, "so there is no term 0 to read");
 }
+
+// ---------------------------------------------------------------------------
+// ABI guard: the stat enums are positional indices into upstream's intf.h
+// ---------------------------------------------------------------------------
+//
+// `LayeredProbes::layer_stat` / `global_stat` pass the Rust discriminant
+// straight through as an index into `cpu_ctx.lstats[layer][]` / `gstats[]`,
+// and the C side only bounds-checks it. So an upstream INSERT or REORDER
+// anywhere before a member shifts it, and the simulator reads a different
+// counter with no error and no failing assertion anywhere else.
+//
+// Note what does NOT catch this, because it is the trap that left the hazard
+// standing: a value assertion such as `assert_eq!(layer_stat(0, Yield), 0)`
+// passes just as happily while reading some OTHER zero. Only comparing the
+// index itself against the compiled scheduler can tell the difference.
+//
+// The two tests below close every way the upstream enum can move:
+//
+//   - RENAME / REMOVAL upstream — `LAYERED_LSTAT_PROBES` in
+//     `schedulers/layered/wrapper.c` names each constant, so the wrapper stops
+//     COMPILING. Caught before these tests run.
+//   - REORDER / INSERT upstream — the resolver returns the real value, which
+//     stops matching the Rust discriminant here.
+//   - a variant added to the Rust enum but not to `ALL`, or vice versa — the
+//     member-count assertions.
+
+/// Every [`LayerStat`] discriminant equals the `enum layer_stat_id` value the
+/// compiled scheduler was built against, and the variant set is complete.
+#[test]
+fn layer_stat_ids_match_the_compiled_scheduler() {
+    let _lock = common::setup_test();
+    let sched = DynamicScheduler::layered(1);
+    let p = LayeredProbes::new(&sched);
+
+    // Selector is the POSITION in ALL; the value compared against it is the
+    // discriminant. Two independent quantities — feeding the discriminant back
+    // in as the selector would agree with itself under a swap.
+    for (position, &stat) in LayerStat::ALL.iter().enumerate() {
+        assert_eq!(
+            p.lstat_id_at(position),
+            stat as i32,
+            "LayerStat::{stat:?} claims index {} but the compiled scheduler \
+             puts the stat at position {position} of LAYERED_LSTAT_PROBES at \
+             index {}. Upstream `enum layer_stat_id` moved, so this and every \
+             later LayerStat now read a DIFFERENT counter. Re-sync the Rust \
+             enum, LayerStat::ALL, and LAYERED_LSTAT_PROBES in \
+             schedulers/layered/wrapper.c with scx_layered/src/bpf/intf.h — \
+             all of them, not just the variant named here.",
+            stat as i32,
+            p.lstat_id_at(position),
+        );
+    }
+
+    // Completeness. `NR_LSTATS` counts the runqueue-latency histogram too, so
+    // the named region ends at LSTAT_RUNQ_LAT_BASE and the histogram width is
+    // checked separately — asserting ALL.len() == NR_LSTATS would be wrong.
+    let runq_lat_base =
+        p.enum_value(LayeredEnumProbe::NrLstats) - p.enum_value(LayeredEnumProbe::NrRunqLatBuckets);
+    assert_eq!(
+        LayerStat::ALL.len() as i32,
+        runq_lat_base + 1,
+        "LayerStat::ALL has {} members but the compiled scheduler has {} \
+         named layer stats before the runq-latency histogram. An upstream \
+         insert or delete, or a variant added to the enum without adding it \
+         to ALL.",
+        LayerStat::ALL.len(),
+        runq_lat_base + 1,
+    );
+    assert_eq!(
+        LayerStat::RunqLatBase as i32,
+        runq_lat_base,
+        "the histogram base moved; see the per-member message above",
+    );
+}
+
+/// Every [`GlobalStat`] discriminant equals the `enum global_stat_id` value
+/// the compiled scheduler was built against, and the variant set is complete.
+#[test]
+fn global_stat_ids_match_the_compiled_scheduler() {
+    let _lock = common::setup_test();
+    let sched = DynamicScheduler::layered(1);
+    let p = LayeredProbes::new(&sched);
+
+    // Position in, discriminant out — see the note in the LayerStat twin.
+    for (position, &stat) in GlobalStat::ALL.iter().enumerate() {
+        assert_eq!(
+            p.gstat_id_at(position),
+            stat as i32,
+            "GlobalStat::{stat:?} claims index {} but the compiled scheduler \
+             puts the stat at position {position} of LAYERED_GSTAT_PROBES at \
+             index {}. Upstream `enum global_stat_id` moved, so this and every \
+             later GlobalStat now read a DIFFERENT counter. Re-sync the Rust \
+             enum, GlobalStat::ALL, and LAYERED_GSTAT_PROBES in \
+             schedulers/layered/wrapper.c with scx_layered/src/bpf/intf.h.",
+            stat as i32,
+            p.gstat_id_at(position),
+        );
+    }
+
+    // `enum global_stat_id` has no histogram tail, so NR_GSTATS is exactly the
+    // member count.
+    assert_eq!(
+        GlobalStat::ALL.len() as i32,
+        p.enum_value(LayeredEnumProbe::NrGstats),
+        "GlobalStat::ALL has {} members but the compiled scheduler reports \
+         NR_GSTATS = {}. An upstream insert or delete, or a variant added to \
+         the enum without adding it to ALL.",
+        GlobalStat::ALL.len(),
+        p.enum_value(LayeredEnumProbe::NrGstats),
+    );
+}
