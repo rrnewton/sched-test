@@ -752,12 +752,26 @@ it with an invisibility problem.
 > landed — and say so explicitly in your final note.
 
 Pause for the owner only to land something **red**, to rewrite shared history,
-or to change the **scx pin**. Everything else you land.
+or to change the **scx pin by hand**. Everything else you land. (The nightly
+mechanical bump in `.github/workflows/sync-upstream.yml` lands its own green pin
+bumps without a human — see the repo-root `CLAUDE.md`.)
 
 None of this relaxes the surrounding rules: `agent/*` names are local scratch
 and get renamed before any push, sched-test pushes go to `origin` AND `mirror`
-in lockstep, PRs target `integration` rather than `main`, and an scx pin that
-is not an ancestor of upstream `main` is never committed.
+in lockstep, PRs target `integration` rather than `main`, and an scx pin whose
+**base** does not share history with upstream `main` is never committed.
+
+**"base", not "pin" — the difference matters and the naive form is dangerous.**
+The pin routinely is NOT an ancestor of upstream `main`; it carries local
+patches on purpose. Reading this as *"the pin must be an ancestor"* makes it
+false every day, and the obvious way to "fix" the apparent violation —
+`git -C scx checkout origin/main` — silently deletes those patches. Check it
+this way instead:
+
+```bash
+BASE=$(git -C scx merge-base HEAD origin/main)
+git -C scx log --oneline "$BASE"..HEAD    # every line must be one we put there
+```
 
 **Second corollary for the orchestrator:** do not tell an agent "commit but do
 not push" or "report before landing". That instruction is what produced the

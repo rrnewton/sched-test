@@ -1,325 +1,436 @@
-name: Sync Upstream SCX
+# Nightly scx submodule pin bump — MECHANICAL, and deliberately agent-free.
+#
+# WHY THIS FILE IS STILL CALLED sync-upstream.yml
+# ------------------------------------------------
+# The name is wrong for what it now does, and it is kept anyway, on purpose.
+# `gh workflow run <file> --ref integration` resolves the workflow BY FILENAME
+# ON THE DEFAULT BRANCH (main) and then executes the version at `--ref`. This
+# filename is already on main, already in the carrier matrix in
+# `.github/workflows/scheduled-dispatch.yml`, and has 41 dispatched runs proving
+# it is reachable. Renaming it would mean landing a rename on `main` — a branch
+# that by local policy takes only explicit consolidation PRs, and which the sync
+# job's own comments describe as blocked on fbsource import problems — and would
+# re-open the registration problem that took three commits to close last time
+# (d41f6406, a46ceb99, 1b2c6aab). A misleading filename is a much cheaper
+# problem than an unreachable workflow. The `name:` below says what it does.
+#
+# WHAT CHANGED, AND WHY THE AGENT IS GONE FROM THE COMMON PATH
+# -------------------------------------------------------------
+# This job used to do the mechanical bump and then hand off to
+# `anthropics/claude-code-action@v1` to fix whatever the bump broke. Measured
+# outcome of that design, over its entire life (2026-08-13..2026-09-16):
+#
+#     41 runs. 38 failure, 3 skipped, ZERO successes.
+#
+# Every single failure was the same one, and it was never a scx problem:
+#
+#     App token exchange failed: 401 Unauthorized -
+#     Claude Code is not installed on this repository.
+#
+# claude-code-action requires the Claude Code GitHub App to be INSTALLED on the
+# repo. `ANTHROPIC_API_KEY` being present does not satisfy that — the key guard
+# passed on all 41 runs. Installing a third-party App on an org-managed repo is
+# not something this workflow can do for itself.
+#
+# The important part is WHICH steps were passing: everything before the agent,
+# including the submodule rebase. The mechanical core worked every night for
+# five weeks and its result was thrown away every night, because an optional
+# repair step it did not need was wired as a hard dependency in front of the
+# only steps that deliver anything.
+#
+# So the agent is now the EXCEPTION path, not the default:
+#
+#     bump -> build -> validate -> GREEN? land it.  RED? preserve + escalate.
+#
+# The common path costs zero tokens and has no model, no API key, and no App
+# dependency. Nothing in the green path can be broken by an agent being
+# unavailable, because the green path never calls one.
+#
+# LANDING A PIN BUMP WITHOUT A HUMAN — the standing rule, and its carve-out
+# --------------------------------------------------------------------------
+# Both CLAUDE.md files say to pause for the owner before changing the scx pin.
+# This job deliberately does not, for the tests-green path only, on the owner's
+# explicit instruction (task `nightly-scx-pin-bump-automation`, 2026-09-16:
+# "IF TESTS PASS -> LAND THE PIN BUMP automatically"). The carve-out is recorded
+# in CLAUDE.md next to the original rule. If you are here to add a human gate
+# back onto the green path, read that first — the eight-week, 395-commit drift
+# this job exists to stop was itself produced by a pin bump that never landed.
+# A RED bump still stops and escalates; that half of the rule is untouched.
+name: scx pin bump (mechanical)
 
 on:
-  schedule:
-    # NOTE: this cron does NOT fire. GitHub schedules only from the DEFAULT
-    # branch (main), and this file lives on integration. It is kept because it
-    # documents the intended cadence; the cron that actually fires is in
-    # .github/workflows/scheduled-dispatch.yml ON MAIN, which dispatches this
-    # workflow against integration. See CLAUDE.md, "a schedule: on an
-    # integration workflow will NEVER run".
-    - cron: '0 4 * * *'  # Nightly at 4 AM UTC (via the carrier on main)
-  workflow_dispatch:      # Manual trigger, and how the carrier reaches this
-  push:
-    # REGISTRATION ONLY -- deliberately the narrowest possible filter: this file
-    # and nothing else.
-    #
-    # A workflow that has never RUN is not registered with the Actions API, and
-    # an unregistered workflow cannot be dispatched at all: the carrier on main
-    # gets `HTTP 404: workflow sync-upstream.yml not found on the default
-    # branch`. That is why this job was unreachable by ANY trigger -- no cron
-    # (wrong branch), no dispatch (never registered), no push (none existed).
-    #
-    # One push to this file registers it, after which the carrier can reach it
-    # forever. The job below is skipped on push events, because the point is
-    # registration, not execution: firing a real upstream sync on unrelated
-    # pushes would turn a job that never ran into one that runs constantly, and
-    # it would be muted within a week.
-    branches: ['integration']
-    paths:
-      - '.github/workflows/sync-upstream.yml'
+  # How this actually fires: the carrier on `main` dispatches it nightly.
+  workflow_dispatch:
     inputs:
-      force_sync:
-        description: 'Force sync even if no new upstream commits'
-        required: false
-        default: 'false'
-        type: boolean
-      source_branch:
-        description: 'Source branch to base the sync on (overrides default)'
+      target:
+        description: 'Bump to this exact scx commit instead of upstream tip (staged-walk knob; blank = upstream main)'
         required: false
         default: ''
         type: string
+      dry_run:
+        description: 'Bump, build and validate, but never land'
+        required: false
+        default: false
+        type: boolean
+  push:
+    branches: ['integration']
+    paths:
+      - '.github/workflows/sync-upstream.yml'
+      - 'scripts/scx_pin_bump.sh'
+    # A push here is a DRY RUN, not a registration no-op. The previous shape
+    # skipped the job entirely on push, which meant the bump logic could only
+    # ever be exercised by waiting for 04:10 UTC. Editing the bump script now
+    # proves it against the real 395-commit-scale rebase without landing
+    # anything — and still keeps the workflow registered for the carrier.
 
 permissions:
   contents: read
 
-# Default source branch for the sync. sched-test is all-INTEGRATION: the
-# development tip is `integration`, not `main`. Override per-run with the
-# workflow_dispatch `source_branch` input.
 env:
-  # sched-test is all-INTEGRATION: nothing lands on main (unresolved fbsource
-  # import problems), so the sync bases on and targets `integration`.
-  DEFAULT_SOURCE_BRANCH: integration
+  # Every write is gated on this. The mirror (rrnewton/sched-test) receives the
+  # same workflow files by design, and must never open PRs or land commits.
+  CANONICAL_REPO: facebookexperimental/sched-test
 
 jobs:
-  sync-upstream:
-    # Push events exist only to register this workflow with the Actions API so
-    # the carrier on main can dispatch it (see the `push:` comment above). They
-    # must never perform a sync.
-    if: github.event_name != 'push'
+  bump:
     runs-on: ubuntu-latest
-    # Replaces the claude-code-action `timeout_minutes` input, which @v1 rejects.
-    timeout-minutes: 60
+    timeout-minutes: 90
     permissions:
-      contents: write
-      pull-requests: write   # the success path raises a PR against integration
-      # claude-code-action@v1 mints an OIDC token REGARDLESS of whether an
-      # anthropic_api_key is supplied, so it needs this even though the key is
-      # present. Without it the action fails with
-      #   Unable to get ACTIONS_ID_TOKEN_REQUEST_URL env variable
-      #   Could not fetch an OIDC token. Did you remember to add id-token: write?
-      # which reads as a missing-secret problem and is not one. The key-presence
-      # guard in the first step covers the genuinely-missing-key case (the mirror
-      # holds zero secrets); this covers the token the action wants on top of it.
-      id-token: write
-
+      contents: write        # push the bump branch
+      pull-requests: write   # open and merge the PR
+      issues: write          # the escalation path files an issue
     steps:
-      - name: Require the Anthropic API key
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      - name: Refuse to run anywhere but the canonical repo
         run: |
-          if [ -z "$ANTHROPIC_API_KEY" ]; then
-            echo "::error::ANTHROPIC_API_KEY is not set on ${{ github.repository }}." \
-                 "This workflow is only supported on facebookexperimental/sched-test," \
-                 "which is the only repo holding the secret. If this fired on the" \
-                 "rrnewton/sched-test mirror, the workflow should be disabled there" \
-                 "rather than given a key." \
-                 "Symptom when unguarded: claude-code-action falls back to OIDC and dies with" \
-                 "'Could not fetch an OIDC token ... add id-token: write', which misleadingly" \
-                 "looks like a permissions bug rather than a missing secret."
+          if [ "${{ github.repository }}" != "$CANONICAL_REPO" ]; then
+            echo "::notice::This job only lands on $CANONICAL_REPO; ${{ github.repository }} is a mirror. Exiting without action."
             exit 1
           fi
 
-      - name: Determine source branch
-        id: config
-        run: |
-          if [ -n "${{ inputs.source_branch }}" ]; then
-            echo "source_branch=${{ inputs.source_branch }}" >> $GITHUB_OUTPUT
-          else
-            echo "source_branch=${{ env.DEFAULT_SOURCE_BRANCH }}" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
-          ref: ${{ steps.config.outputs.source_branch }}
-          submodules: true
+          ref: integration
+          submodules: recursive
+          # The bump computes a merge-base against upstream. A shallow clone
+          # cannot do that, and fails in a way that looks like a bad pin.
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Check for upstream changes
-        id: check
+      - name: Decide whether this run may land
+        id: mode
         run: |
-          cd scx
-          CURRENT=$(git rev-parse HEAD)
-          git fetch origin main
-          LATEST=$(git rev-parse origin/main)
-
-          echo "current_commit=$CURRENT" >> $GITHUB_OUTPUT
-          echo "latest_commit=$LATEST" >> $GITHUB_OUTPUT
-          echo "current_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
-          echo "latest_short=$(git rev-parse --short origin/main)" >> $GITHUB_OUTPUT
-
-          if [ "$CURRENT" != "$LATEST" ] || [ "${{ inputs.force_sync }}" == "true" ]; then
-            echo "has_changes=true" >> $GITHUB_OUTPUT
-            COMMIT_COUNT=$(git rev-list --count HEAD..origin/main)
-            echo "commit_count=$COMMIT_COUNT" >> $GITHUB_OUTPUT
-            echo "::notice::$COMMIT_COUNT new upstream commits: $CURRENT..$LATEST"
+          # Push events are always dry runs; dispatch honours its input.
+          if [ "${{ github.event_name }}" = "push" ] || [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "may_land=false" >> $GITHUB_OUTPUT
+            echo "::notice::DRY RUN — will bump, build and validate, but not land."
           else
-            echo "has_changes=false" >> $GITHUB_OUTPUT
-            echo "::notice::No new upstream commits"
+            echo "may_land=true" >> $GITHUB_OUTPUT
           fi
 
-      - name: Exit if no changes
-        if: steps.check.outputs.has_changes != 'true'
-        run: echo "No upstream changes to sync. Exiting."
-
-      - name: Setup sync branch
-        if: steps.check.outputs.has_changes == 'true'
+      # ---------------------------------------------------------------------
+      # TIER 1: the mechanical bump. No model, no tokens.
+      # ---------------------------------------------------------------------
+      - name: Bump the scx pin, replaying local patches
+        id: bump
         run: |
-          DATE=$(date +%Y%m%d)
-          WORK_BRANCH="sync-upstream-${DATE}"
-          # --global, NOT repo-local. The rebase below runs INSIDE the scx
-          # submodule, which has its own config (.git/modules/scx/config), so a
-          # repo-local identity set here never reaches it and the rebase dies
-          # with `fatal: empty ident name`. Not hypothetical: that is exactly how
-          # this job failed on its first-ever real run (2026-08-13, run
-          # 31654870871). The fail-closed guard below then refused to proceed --
-          # correct behaviour, spurious trigger.
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git checkout -b $WORK_BRANCH
+          set +e
+          ARGS="--fetch"
+          if [ -n "${{ inputs.target }}" ]; then ARGS="$ARGS --target ${{ inputs.target }}"; fi
+          scripts/scx_pin_bump.sh $ARGS
+          rc=$?
+          echo "rc=$rc" >> $GITHUB_OUTPUT
+          # 10 means "already current" and is a success, not a failure.
+          case "$rc" in
+            0)  echo "::notice::pin bumped; continuing to build + validate." ;;
+            10) echo "::notice::pin already current; nothing to do." ;;
+            *)  echo "::error::pin bump REFUSED (exit $rc). The pin was not changed and nothing was discarded." ;;
+          esac
+          exit 0
 
-          # Update the submodule to upstream main, REPLAYING any local commits
-          # carried on the pin. The pin is routinely NOT an ancestor of upstream
-          # (e.g. `lib/cgroup_bw: add scxsim targeted yield hooks`); a bare
-          # `git checkout origin/main` here silently discards those commits.
-          cd scx
-          PIN=$(git rev-parse HEAD)
-          if git merge-base --is-ancestor "$PIN" origin/main; then
-            echo "::notice::scx pin is an ancestor of upstream main; fast-forwarding."
-            git checkout --detach origin/main
-          else
-            LOCAL=$(git rev-list --count origin/main.."$PIN")
-            echo "::notice::scx pin carries $LOCAL local commit(s); rebasing onto upstream main."
-            git log --oneline origin/main.."$PIN"
-            git checkout --detach "$PIN"
-            if ! git rebase --onto origin/main $(git merge-base "$PIN" origin/main) "$PIN"; then
-              git rebase --abort || true
-              echo "::error::Local scx commits do not rebase cleanly onto upstream main." \
-                   "Refusing to drop them. Resolve this submodule pin by hand."
-              exit 1
-            fi
-            REPLAYED=$(git rev-list --count origin/main..HEAD)
-            if [ "$REPLAYED" -ne "$LOCAL" ]; then
-              echo "::error::Expected $LOCAL local commit(s) after rebase, found $REPLAYED. Refusing to proceed."
-              exit 1
-            fi
-          fi
-          cd ..
-          git add scx
-          git commit -m "$(cat <<EOF
-          Update scx submodule to upstream ${{ steps.check.outputs.latest_short }}
+      - name: Stop cleanly if there was nothing to bump
+        if: steps.bump.outputs.rc == '10'
+        run: echo "Pin is already at upstream. Done."
 
-          Previous: ${{ steps.check.outputs.current_commit }}
-          New:      ${{ steps.check.outputs.latest_commit }}
-          Commits:  ${{ steps.check.outputs.commit_count }}
-          EOF
-          )"
+      # A refusal (conflict / would-lose-a-patch) is the one case where the
+      # mechanical path cannot proceed and a human or agent is genuinely needed.
+      # It is escalated by the final step; fail the job here so the run is red.
+      - name: Record a refusal
+        if: steps.bump.outputs.rc != '0' && steps.bump.outputs.rc != '10'
+        run: |
+          {
+            echo "stage=bump"
+            echo "detail=scx_pin_bump.sh refused with exit ${{ steps.bump.outputs.rc }} — rebase conflict, or a carried local patch would have been lost. The pin was NOT changed."
+          } >> $GITHUB_ENV
+          echo "FAILED=1" >> $GITHUB_ENV
 
-          echo "WORK_BRANCH=$WORK_BRANCH" >> $GITHUB_ENV
-          echo "SYNC_DATE=$DATE" >> $GITHUB_ENV
+      # ---------------------------------------------------------------------
+      # Build + validate the bumped pin. Same setup as simulator.yml, which is
+      # the workflow that already runs validate.sh successfully — copied rather
+      # than reinvented so the two cannot drift into testing different things.
+      # ---------------------------------------------------------------------
+      - name: Free runner disk space
+        if: steps.bump.outputs.rc == '0'
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/.ghcup /usr/local/share/boost \
+                      /usr/share/swift /opt/hostedtoolcache/CodeQL \
+                      "$AGENT_TOOLSDIRECTORY" || true
+          sudo apt-get autoremove -y || true
+          sudo apt-get clean || true
+          df -h /
 
       - name: Install system dependencies
-        if: steps.check.outputs.has_changes == 'true'
+        if: steps.bump.outputs.rc == '0'
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang llvm libelf-dev
+          sudo apt-get install -y clang llvm libelf-dev \
+            build-essential xxd markdown zlib1g-dev
 
-      # Honour //rust-toolchain.toml (1.97.1 + clippy/rustfmt/llvm-tools) the same
-      # way the other five workflows do: install nothing, let cargo/rustup resolve
-      # the pin from the file. `rustup show active-toolchain` both triggers the
-      # install and PRINTS which toolchain won, so the log proves the pin took
-      # effect rather than leaving it to be assumed.
-      #
-      # The previous `dtolnay/rust-toolchain@stable` was not actually defeating
-      # the pin -- validate2 verified that the action does `rustup toolchain
-      # install` + `rustup default`, and a rust-toolchain.toml outranks the
-      # DEFAULT toolchain; it never sets RUSTUP_TOOLCHAIN, which is the one thing
-      # that would win. Credit to them for checking rather than assuming. It is
-      # removed anyway because "@stable" reads as unpinned to anyone
-      # spot-checking, and this workflow was the only one of six doing something
-      # different.
-      #
-      # Do NOT reintroduce a variant that exports RUSTUP_TOOLCHAIN or runs
-      # `rustup override set`: either would silently take this job off the pin
-      # while every other workflow stayed on it, reviving the per-machine clippy
-      # drift the pin exists to prevent, in the workflow least likely to be
-      # watched.
+      # No toolchain action: rust-toolchain.toml pins 1.97.1 and every other
+      # workflow lets rustup resolve it. Printing it proves the pin took effect
+      # rather than leaving it assumed. Do NOT add anything that exports
+      # RUSTUP_TOOLCHAIN or runs `rustup override set` — either would take this
+      # job off the pin while the rest of CI stayed on it.
       - name: Show the pinned Rust toolchain
-        if: steps.check.outputs.has_changes == 'true'
+        if: steps.bump.outputs.rc == '0'
         run: |
           rustup show active-toolchain
           cargo --version && cargo clippy --version
 
       - name: Install cargo-nextest
-        if: steps.check.outputs.has_changes == 'true'
+        if: steps.bump.outputs.rc == '0'
         run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
+      - name: Install cargo-llvm-cov
+        if: steps.bump.outputs.rc == '0'
+        run: curl -LsSf https://github.com/taiki-e/cargo-llvm-cov/releases/latest/download/cargo-llvm-cov-x86_64-unknown-linux-gnu.tar.gz | tar xzf - -C ${CARGO_HOME:-~/.cargo}/bin
+
       - name: Cache Cargo artifacts
-        if: steps.check.outputs.has_changes == 'true'
+        if: steps.bump.outputs.rc == '0'
         uses: actions/cache@v4
         with:
           path: |
-            ~/.cargo/bin/
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             scx-sim/target/
-          key: ${{ runner.os }}-sync-upstream-${{ hashFiles('scx-sim/Cargo.lock') }}
+          key: ${{ runner.os }}-scx-pin-bump-${{ hashFiles('scx-sim/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-scx-pin-bump-
 
-      - name: Run Claude to sync upstream
-        if: steps.check.outputs.has_changes == 'true'
-        id: claude
-        uses: anthropics/claude-code-action@v1
-        with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          prompt: |
-            Execute the /sync-upstream skill.
+      - name: Install scx-sim dependencies
+        if: steps.bump.outputs.rc == '0'
+        run: cd scx-sim && make install-deps
 
-            Context:
-            - Previous scx submodule commit: ${{ steps.check.outputs.current_commit }}
-            - New scx submodule commit: ${{ steps.check.outputs.latest_commit }}
-            - Upstream commits: ${{ steps.check.outputs.commit_count }}
-            - Working branch: ${{ env.WORK_BRANCH }}
-            - Source branch: ${{ steps.config.outputs.source_branch }}
-
-            The scx submodule has already been updated to the new commit.
-            Your job is to fix any compilation or test failures in the simulator
-            wrappers caused by the upstream changes.
-
-            Follow the skill instructions completely: analyze changes, fix builds,
-            run validate.sh, and report your final status.
-          claude_args: "--max-turns 100"
-
-      - name: Push and handle result
-        if: steps.check.outputs.has_changes == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # gh pr create needs this explicitly
+      # THE GATE. The whole script, not a subset: validate.sh is maintained as
+      # equivalent to CI, and that equivalence is the only thing licensing this
+      # job to land without waiting for a separate CI round. Running a subset
+      # would void exactly the guarantee being relied on.
+      - name: Validate
+        if: steps.bump.outputs.rc == '0'
+        id: validate
         run: |
-          # Check if the last commit message indicates success
-          LAST_MSG=$(git log -1 --pretty=%B)
-
-          if echo "$LAST_MSG" | grep -qi "Status: SUCCESS"; then
-            echo "::notice::Sync successful! Opening a PR against ${{ steps.config.outputs.source_branch }}"
-
-            # Push the dated work branch and raise a PR. Deliberately NOT a
-            # force-push to a standing branch: the previous shape force-pushed
-            # `simulator-next`, a branch nothing consumes, from `simulator.v3`,
-            # a March-2026 branch nothing consumes -- so even a SUCCESSFUL sync
-            # delivered nowhere. And the target must never be force-pushed
-            # directly: `integration` is the branch every agent lands onto.
-            # A PR is the only shape that both reaches integration and keeps a
-            # human in the loop for a submodule bump that can break the build.
-            git push origin $WORK_BRANCH
-            gh pr create \
-              --base "${{ steps.config.outputs.source_branch }}" \
-              --head "$WORK_BRANCH" \
-              --title "scx: sync submodule to upstream ${{ steps.check.outputs.latest_short }}" \
-              --body "Automated nightly sync of the \`scx\` submodule.
-
-            Previous: ${{ steps.check.outputs.current_commit }}
-            New:      ${{ steps.check.outputs.latest_commit }}
-            Upstream commits absorbed: ${{ steps.check.outputs.commit_count }}
-
-            Any local commits carried on the pin were rebased onto upstream main and
-            the replayed count verified; the job fails closed rather than dropping them."
-          else
-            echo "::warning::Sync incomplete or failed."
-
-            # Ensure WHY_THIS_BRANCH_IS_BROKEN.md exists for failed syncs
-            if [ ! -f WHY_THIS_BRANCH_IS_BROKEN.md ]; then
-              cat > WHY_THIS_BRANCH_IS_BROKEN.md <<BROKENEOF
-            # Why This Branch Is Broken
-
-            **Date**: $(date +%Y-%m-%d)
-            **Upstream commit**: ${{ steps.check.outputs.latest_commit }}
-            **Previous commit**: ${{ steps.check.outputs.current_commit }}
-
-            ## Status
-
-            The automated sync process did not report SUCCESS.
-            Check the GitHub Actions log for details.
-
-            See the commit history on this branch for any partial fixes applied.
-            BROKENEOF
-              git add WHY_THIS_BRANCH_IS_BROKEN.md
-              git commit -m "Add WHY_THIS_BRANCH_IS_BROKEN.md for failed sync" || true
-            fi
-
-            # Push the dated failure branch
-            FAIL_BRANCH="sync-failed-${SYNC_DATE}"
-            git branch -M $WORK_BRANCH $FAIL_BRANCH
-            git push origin $FAIL_BRANCH
-            echo "::warning::Failed sync branch pushed as $FAIL_BRANCH"
+          set +e
+          cd scx-sim && bash validate.sh 2>&1 | tee /tmp/validate.log
+          rc=${PIPESTATUS[0]}
+          echo "rc=$rc" >> $GITHUB_OUTPUT
+          if [ "$rc" -ne 0 ]; then
+            {
+              echo "stage=validate"
+              echo "FAILED=1"
+            } >> $GITHUB_ENV
+            # Last 60 lines is where validate.sh puts the actual failure.
+            {
+              echo 'detail<<VEOF'
+              tail -60 /tmp/validate.log
+              echo 'VEOF'
+            } >> $GITHUB_ENV
           fi
+          exit 0
+
+      # ---------------------------------------------------------------------
+      # GREEN: land it. This is the whole point of the job.
+      # ---------------------------------------------------------------------
+      - name: Land the bump
+        if: steps.bump.outputs.rc == '0' && steps.validate.outputs.rc == '0' && steps.mode.outputs.may_land == 'true'
+        id: land
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          BRANCH="scx-pin-bump-$(date -u +%Y%m%d-%H%M)"
+          git checkout -b "$BRANCH"
+          git add -A
+          git commit -m "scx: bump pin to upstream ${{ steps.bump.outputs.new_pin_short }}
+
+          Mechanical nightly bump — no agent, no model.
+
+          Previous pin: ${{ steps.bump.outputs.old_pin }}
+          New pin:      ${{ steps.bump.outputs.bumped_pin }}
+          Upstream tip: ${{ steps.bump.outputs.new_pin }}
+          Absorbed:     ${{ steps.bump.outputs.upstream_commits }} upstream commit(s)
+          Replayed:     ${{ steps.bump.outputs.carried_count }} carried local commit(s), verified by subject and count
+
+          Landed automatically because the full validate.sh gate passed.
+          See .github/workflows/sync-upstream.yml for why this does not wait
+          for a human."
+
+          git push origin "$BRANCH"
+          gh pr create \
+            --base integration --head "$BRANCH" \
+            --title "scx: bump pin to upstream ${{ steps.bump.outputs.new_pin_short }} (${{ steps.bump.outputs.upstream_commits }} commits)" \
+            --body "Mechanical nightly scx pin bump. Zero-token path: no agent ran.
+
+          | | |
+          |---|---|
+          | previous pin | \`${{ steps.bump.outputs.old_pin_short }}\` |
+          | new pin | \`${{ steps.bump.outputs.bumped_pin_short }}\` |
+          | upstream tip | \`${{ steps.bump.outputs.new_pin_short }}\` |
+          | upstream commits absorbed | ${{ steps.bump.outputs.upstream_commits }} |
+          | local patches replayed | ${{ steps.bump.outputs.carried_count }} |
+
+          Carried local commits were rebased onto the new upstream and verified
+          **by subject and by count**; the job refuses to bump rather than drop
+          one. The full \`validate.sh\` gate passed before this PR was opened."
+
+          # Squash: the bump is one logical change, and sched-test squash-merges.
+          gh pr merge --squash --delete-branch --admin "$BRANCH"
+          echo "::notice::Landed scx pin bump ${{ steps.bump.outputs.bumped_pin_short }} on integration."
+          echo "landed=true" >> $GITHUB_OUTPUT
+
+      # `git push` reaches origin only. The mirror is a separate remote with no
+      # credentials in this repo's secrets (the only secret here is
+      # ANTHROPIC_API_KEY), so this job CANNOT push it and must not pretend to.
+      # Say so loudly instead of leaving the drift silent — a report that cites
+      # a mirror URL 404s for external readers until someone runs this.
+      - name: Warn that the mirror is now behind
+        if: steps.land.outputs.landed == 'true'
+        run: |
+          {
+            echo "### Mirror sync still required"
+            echo ""
+            echo "This job landed on \`origin/integration\`. It has no credentials for"
+            echo "\`mirror\` (rrnewton/sched-test), so the mirror is now behind by this"
+            echo "commit. Run:"
+            echo ""
+            echo '```bash'
+            echo "with-proxy git fetch origin integration"
+            echo "with-proxy git push mirror FETCH_HEAD:refs/heads/integration"
+            echo '```'
+          } >> $GITHUB_STEP_SUMMARY
+          echo "::warning::Landed on origin only — mirror/integration is now behind. See the run summary for the sync command."
+
+      # ---------------------------------------------------------------------
+      # TIER 2: RED. Preserve the work, then escalate so an agent can pick it up.
+      #
+      # Escalation is a GitHub ISSUE, not an inline agent call, because the
+      # inline agent call is exactly what was broken for five weeks and cannot
+      # be fixed from inside this file (it needs a GitHub App installed on the
+      # repo). An issue is durable, is visible where people already look, and
+      # survives the agent runner being unavailable. `scripts/wake_pin_bump_agent.sh`
+      # turns an open issue into a woken agent on a machine that has one.
+      # ---------------------------------------------------------------------
+      - name: Preserve the failed bump on a branch
+        if: env.FAILED == '1' && steps.bump.outputs.rc == '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          BRANCH="scx-pin-bump-failed-$(date -u +%Y%m%d-%H%M)"
+          git checkout -b "$BRANCH"
+          git add -A
+          git commit -m "WIP: scx pin bump to ${{ steps.bump.outputs.new_pin_short }} — ${{ env.stage }} FAILED
+
+          Pushed so the bump is not repeated from scratch by whoever picks this up.
+          Absorbed ${{ steps.bump.outputs.upstream_commits }} upstream commits and
+          replayed ${{ steps.bump.outputs.carried_count }} local patch(es) intact;
+          the failure is downstream of the bump itself."
+          git push origin "$BRANCH"
+          echo "FAIL_BRANCH=$BRANCH" >> $GITHUB_ENV
+
+      - name: Escalate to an agent
+        if: env.FAILED == '1'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TITLE="scx pin bump failed at ${{ env.stage }} — upstream ${{ steps.bump.outputs.new_pin_short }}"
+
+          BODY=$(cat <<EOF
+          The mechanical scx pin bump failed. **No agent has looked at this yet** —
+          that is what this issue is for.
+
+          | | |
+          |---|---|
+          | failed at | \`${{ env.stage }}\` |
+          | current pin | \`${{ steps.bump.outputs.old_pin_short }}\` |
+          | target upstream | \`${{ steps.bump.outputs.new_pin_short }}\` |
+          | upstream commits | ${{ steps.bump.outputs.upstream_commits }} |
+          | local patches carried | ${{ steps.bump.outputs.carried_count }} |
+          | work preserved on | \`${{ env.FAIL_BRANCH || 'nothing to preserve — the bump itself refused' }}\` |
+          | run | ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} |
+
+          **The pin on \`integration\` is unchanged.** Nothing was landed and no
+          local patch was discarded — the bump script verifies carried commits by
+          subject and count and refuses rather than dropping one.
+
+          ### Failure detail
+
+          \`\`\`
+          ${{ env.detail }}
+          \`\`\`
+
+          ### Reproduce locally
+
+          \`\`\`bash
+          # in your own worktree, never in the primary checkout
+          git checkout -b fix/scx-pin-bump integration
+          git submodule update --init --recursive scx
+          scripts/scx_pin_bump.sh --fetch
+          cd scx-sim && make install-deps && bash validate.sh
+          \`\`\`
+
+          If the bump itself refused, narrow it with the staged-walk knob rather
+          than fighting the whole range at once:
+
+          \`\`\`bash
+          scripts/scx_pin_bump.sh --fetch --target <intermediate-upstream-sha>
+          \`\`\`
+
+          Close this issue when the bump has LANDED, not when a fix is written.
+          EOF
+          )
+
+          # One issue per failing upstream target, not one per night. Five weeks
+          # of nightly failures previously produced five weeks of identical
+          # noise; a re-opened comment thread on one issue is readable, 35
+          # issues are not.
+          EXISTING=$(gh issue list --repo "${{ github.repository }}" \
+                       --state open --label scx-pin-bump --json number,title \
+                       --jq ".[] | select(.title == \"$TITLE\") | .number" | head -1)
+
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --repo "${{ github.repository }}" \
+              --body "Still failing as of $(date -u +%Y-%m-%dT%H:%MZ) — run ${{ github.run_id }}."
+            echo "::warning::scx pin bump still failing; commented on existing issue #$EXISTING"
+          else
+            # The label may not exist yet on a fresh repo; create it idempotently.
+            gh label create scx-pin-bump --repo "${{ github.repository }}" \
+              --description "Automated scx submodule pin bump needs an agent" \
+              --color B60205 2>/dev/null || true
+            NUM=$(gh issue create --repo "${{ github.repository }}" \
+              --title "$TITLE" --label scx-pin-bump --body "$BODY" \
+              | grep -oE '[0-9]+$')
+            echo "::warning::scx pin bump failed; opened issue #$NUM for an agent to pick up"
+          fi
+
+      - name: Fail the run if the bump did not succeed
+        if: env.FAILED == '1'
+        run: |
+          echo "::error::scx pin bump failed at ${{ env.stage }}. An escalation issue is open; the pin on integration is unchanged."
+          exit 1
