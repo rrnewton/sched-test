@@ -455,7 +455,7 @@ jobs:
           | target upstream | \`${{ steps.bump.outputs.new_pin_short }}\` |
           | upstream commits | ${{ steps.bump.outputs.upstream_commits }} |
           | local patches carried | ${{ steps.bump.outputs.carried_count }} |
-          | work preserved on | ${{ env.FAIL_BRANCH && format('branch `{0}`', env.FAIL_BRANCH) || (env.PATCH_READY == '1' && 'the `scx-pin-bump-*` workflow **artifact** on the run below (30-day retention) — no branch, because github-actions[bot] cannot push here' || 'nothing to preserve — the bump itself refused') }} |
+          | work preserved on | ${{ env.FAIL_BRANCH && format('branch \`{0}\`', env.FAIL_BRANCH) || (env.PATCH_READY == '1' && format('the \`scx-pin-bump-{0}\` workflow **artifact** on the run below (30-day retention) — no branch, because github-actions[bot] cannot push here', steps.bump.outputs.new_pin_short) || 'nothing to preserve — the bump itself refused') }} |
           | run | ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }} |
 
           **The pin on \`integration\` is unchanged.** Nothing was landed and no
