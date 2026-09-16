@@ -891,12 +891,35 @@ task. The flow is:
   landed — and say so explicitly in your final note.
 
 Pause for the owner only to land something RED, to rewrite shared history, or
-to change the scx submodule pin. Everything else you land.
+to change the scx submodule pin **by hand**. Everything else you land.
+
+The nightly mechanical pin bump is exempt: `.github/workflows/sync-upstream.yml`
+bumps the pin, runs the whole of `validate.sh`, and lands it automatically when
+green, on the owner's explicit instruction (2026-09-16, task
+`nightly-scx-pin-bump-automation`). It is safe to automate because
+`scripts/scx_pin_bump.sh` verifies every carried local patch by subject and
+count and refuses rather than dropping one. A RED bump still escalates to an
+agent instead of landing. See the repo-root `CLAUDE.md` for the full rule.
 
 This does not relax anything above: `agent/*` names are local scratch and must
 be renamed before any push, both remotes stay in lockstep, PRs target
-`integration` rather than `main`, and an scx pin that is not an ancestor of
-upstream `main` is never committed.
+`integration` rather than `main`, and an scx pin whose **base** does not share
+history with upstream `main` is never committed.
+
+**Read that last clause exactly as written — "base", not "pin".** The pin itself
+is routinely NOT an ancestor of upstream `main`, because it legitimately carries
+local patches (today exactly one: `lib/cgroup_bw: add scxsim targeted yield
+hooks`). The naive phrasing — *"an scx pin that is not an ancestor of upstream
+main is never committed"* — is **false every single day**, and an agent acting on
+it would "resolve the violation" by running `git -C scx checkout origin/main`,
+which silently DELETES the local patch. The real gate is:
+
+```bash
+BASE=$(git -C scx merge-base HEAD origin/main)
+git -C scx log --oneline "$BASE"..HEAD    # every line must be one we put there
+```
+
+A non-empty list is normal. An *unrecognised* line in it is the actual problem.
 
 Note the interaction with the testing rule above: "do not push untested code"
 still stands and is not an exception to this. It means *test it, then push* —

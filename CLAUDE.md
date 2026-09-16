@@ -128,11 +128,43 @@ and the worked example are in `scx-sim/CLAUDE.md`.
 Never leave uncommitted changes locally, and before going idle or finishing,
 confirm in your final note that the worktree is clean, the work is pushed, and
 the PR is open or landed. Pause for the owner only to land something RED, to
-rewrite shared history, or to change the scx submodule pin.
+rewrite shared history, or to change the scx submodule pin **by hand** — the
+nightly mechanical bump is exempt and lands itself when green (see "The nightly
+scx pin bump lands itself" below).
 
 Full text, including the push-target rules this depends on, is in the harness
 `CLAUDE.md` (the parent workspace above this checkout) and in
 `scx-sim/CLAUDE.md`.
+
+The nightly scx pin bump lands itself
+----------------------------------------
+
+`.github/workflows/sync-upstream.yml` bumps the `scx` submodule pin every night,
+runs the whole of `scx-sim/validate.sh`, and **lands the result automatically
+when it is green** — no human, no agent, no tokens. That is deliberate and was
+asked for explicitly (owner, 2026-09-16, task `nightly-scx-pin-bump-automation`).
+Do not add a review gate to the green path.
+
+Three things about it that are easy to get wrong:
+
+- **The filename is a lie and must stay one.** It no longer syncs anything with
+  an agent, but `gh workflow run` resolves a workflow by filename **on the
+  default branch**, and this name is already on `main` and in the carrier matrix
+  in `.github/workflows/scheduled-dispatch.yml`. Renaming it means landing a
+  rename on `main` and re-opening the registration problem that took three
+  commits to close. The `name:` field says what it actually does.
+- **The agent is the exception path, not the default.** The previous design put
+  `claude-code-action` in the common path and scored 0 successes in 41 runs —
+  every failure was `401: Claude Code is not installed on this repository`,
+  which an API key does not fix. On a red bump the job now preserves its work on
+  a branch and opens a `scx-pin-bump` issue;
+  `scripts/wake_pin_bump_agent.sh` turns that issue into a woken agent on a
+  machine that has one.
+- **The bump never drops a carried patch.** `scripts/scx_pin_bump.sh` rebases the
+  pin's local commits onto the new upstream and verifies them by subject and by
+  count, refusing the whole bump if either differs. A bare
+  `git checkout origin/main` inside the submodule does the opposite, silently.
+  That guard is what makes landing without review safe; do not route around it.
 
 Issue Tracking
 ----------------------------------------
