@@ -1,7 +1,9 @@
-//! CPU utilization benchmark using rdtsc-based spin loop
+//! CPU utilization benchmark using a cycle-counter spin loop
 //!
 //! This module provides a CPU-intensive workload that measures its own scheduling
-//! behavior by tracking time slices and descheduling events via TSC (Time Stamp Counter).
+//! behavior by tracking time slices and descheduling events via the platform's
+//! free-running counter: the TSC (Time Stamp Counter) on x86_64, and the
+//! architectural virtual counter (`cntvct_el0`) on aarch64.
 
 use crate::util::shared::SharedBox;
 use serde::{Deserialize, Serialize};
@@ -48,18 +50,56 @@ pub struct BenchmarkResults {
     pub timeslice_pcts: Percentiles,
 }
 
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+compile_error!(
+    "spinner_utilization needs a free-running cycle counter; only x86_64 (rdtsc) \
+     and aarch64 (cntvct_el0) are implemented"
+);
+
+/// Where `read_tsc_hz` gets the counter frequency, for verbose logging.
+#[cfg(target_arch = "x86_64")]
+const TSC_HZ_SOURCE: &str = "sysfs";
+#[cfg(target_arch = "aarch64")]
+const TSC_HZ_SOURCE: &str = "cntfrq_el0";
+
 /// Read the current cycle count using rdtsc
+///
+/// The tick rate is not comparable across architectures — x86_64's TSC runs at
+/// GHz while aarch64's virtual counter is typically tens of MHz — so callers
+/// must convert through [`get_tsc_hz`] rather than assume a rate.
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 pub fn rdtsc() -> u64 {
+    let low: u32;
+    let high: u32;
+    // SAFETY: `rdtsc` is unprivileged on x86_64 and part of the baseline ISA,
+    // so it needs no feature detection. It reads no memory, touches no stack
+    // and writes only the two output registers declared here.
     unsafe {
-        let low: u32;
-        let high: u32;
         asm!("rdtsc", out("eax") low, out("edx") high);
-        ((high as u64) << 32) | (low as u64)
     }
+    ((high as u64) << 32) | (low as u64)
+}
+
+/// Read the current cycle count from the architectural virtual counter
+///
+/// See the x86_64 variant for the tick-rate caveat.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+pub fn rdtsc() -> u64 {
+    let cnt: u64;
+    // SAFETY: Linux enables EL0 access to `cntvct_el0` (CNTKCTL_EL1.EL0VCTEN),
+    // which is what the vDSO clock source itself relies on, so the read cannot
+    // trap in userspace. It reads no memory, touches no stack and writes only
+    // the output register declared here.
+    unsafe {
+        asm!("mrs {}, cntvct_el0", out(reg) cnt);
+    }
+    cnt
 }
 
 /// Read invariant TSC frequency (Hz) from sysfs if available
+#[cfg(target_arch = "x86_64")]
 pub fn read_tsc_hz() -> Option<u64> {
     let path = "/sys/devices/system/cpu/cpu0/tsc_freq_khz";
     if let Ok(khz_str) = std::fs::read_to_string(path) {
@@ -68,6 +108,25 @@ pub fn read_tsc_hz() -> Option<u64> {
         }
     }
     None
+}
+
+/// Read the virtual counter frequency (Hz) from `cntfrq_el0`
+///
+/// Firmware programs this register, so it is authoritative when set. Some
+/// firmware leaves it at zero; return None there so the caller falls back to
+/// calibration rather than dividing by a bogus rate.
+#[cfg(target_arch = "aarch64")]
+pub fn read_tsc_hz() -> Option<u64> {
+    let hz: u64;
+    // SAFETY: `cntfrq_el0` is architecturally readable from EL0 on every
+    // aarch64 implementation. It reads no memory, touches no stack and writes
+    // only the output register declared here.
+    unsafe {
+        asm!("mrs {}, cntfrq_el0", out(reg) hz);
+    }
+    // The architecture defines the frequency as the low 32 bits; the rest is RES0.
+    let hz = hz & 0xffff_ffff;
+    (hz > 0).then_some(hz)
 }
 
 /// Calibrate TSC frequency over a short interval; returns measured Hz and elapsed seconds
@@ -88,18 +147,22 @@ pub fn calibrate_tsc_short(duration_ms: u64) -> (u64, f64) {
     (measured_hz, elapsed)
 }
 
-/// Get TSC frequency: prefer sysfs, fallback to calibration
+/// Get TSC frequency: prefer the platform's own value, fallback to calibration
 pub fn get_tsc_hz(verbose: bool) -> u64 {
     match read_tsc_hz() {
         Some(hz) => {
             if verbose {
-                eprintln!("TSC frequency: {} Hz (from sysfs)", format_with_commas(hz));
+                eprintln!(
+                    "TSC frequency: {} Hz (from {})",
+                    format_with_commas(hz),
+                    TSC_HZ_SOURCE
+                );
             }
             hz
         }
         None => {
             if verbose {
-                eprintln!("TSC frequency: sysfs unavailable, calibrating...");
+                eprintln!("TSC frequency: {TSC_HZ_SOURCE} unavailable, calibrating...");
             }
             let calib_ms = 5u64;
             let (measured_hz, elapsed) = calibrate_tsc_short(calib_ms);
