@@ -8,6 +8,14 @@ on:
       - 'scx-sim/**'
       - 'lib/scxtest/**'
       - 'scheds/**'
+      # The `scx` gitlink. Without this line a commit that bumps ONLY the
+      # submodule pin fires nothing here — despite changing the exact BPF
+      # source compiled into every libscx_*.so. `scheds/rust|include|vmlinux`
+      # are symlinks INTO the submodule, so their own paths never change on a
+      # pin bump and the filter above does not cover it. That is precisely the
+      # commit shape the connection gate below exists to check, so leaving it
+      # out would mean the gate never runs when it matters most.
+      - 'scx'
       - '.github/workflows/simulator.yml'
   pull_request:
     branches:
@@ -16,13 +24,66 @@ on:
       - 'scx-sim/**'
       - 'lib/scxtest/**'
       - 'scheds/**'
+      - 'scx'
       - '.github/workflows/simulator.yml'
 
 permissions:
   contents: read
 
 jobs:
+  # THE GATE. Decides whether running the real scheduler tests below is
+  # meaningful at all, and — the harder half — says WHO is at fault when it is
+  # not.
+  #
+  # `sched-test` submodules `scx`, and the schedulers compile the genuine
+  # upstream BPF C from it. When the pin moves ahead of what scx-sim supports,
+  # the connection breaks and **scx-sim is behind — the scheduler import is not
+  # at fault**. A gate that blames the import for that gets ignored, and an
+  # ignored gate is worse than none. See
+  # `scx-sim/scripts/scheduler_connection_gate.sh` for the attribution rules.
+  #
+  # Deliberately a SEPARATE job rather than a step inside `simulator`, for two
+  # reasons. It makes "blocked by drift" render as a grey SKIPPED on the
+  # dependent job instead of another red X, so skipped-due-to-drift and failed
+  # are visibly different states. And it puts the cheap answer first: this job
+  # is minutes where `simulator` is ~28.
+  connection-smoke:
+    name: scheduler<>sim connection gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libelf-dev \
+            build-essential xxd zlib1g-dev
+
+      # Its own cache key, not shared with `simulator`. This job builds only
+      # the library plus one test binary; the simulator job additionally builds
+      # an instrumented coverage tree. Sharing a key would let the smaller tree
+      # overwrite the larger one and slow the job this is supposed to gate.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            scx-sim/target/
+          key: ${{ runner.os }}-connection-gate-${{ hashFiles('scx-sim/Cargo.lock') }}
+
+      - name: Scheduler<->simulator connection gate
+        run: bash scx-sim/scripts/scheduler_connection_gate.sh
+
   simulator:
+    # If the connection is broken, these tests cannot say anything useful about
+    # the scheduler — they would report the loader failing, over and over. They
+    # are skipped instead, which is a different and more honest state than
+    # failed.
+    needs: connection-smoke
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

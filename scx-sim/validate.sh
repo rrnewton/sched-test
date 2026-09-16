@@ -92,6 +92,21 @@ fi
 echo "  Makefile syntax OK"
 
 echo ""
+echo "=== Scheduler<->simulator connection gate ==="
+# THE SAME GATE CI RUNS, and deliberately placed before everything expensive.
+#
+# It builds the real upstream scheduler C into the six libscx_*.so, dlopen()s
+# each under RTLD_NOW, and requires observable scheduling. If that connection
+# is broken, every scheduler result below describes the loader rather than the
+# scheduler, so there is no point paying for them.
+#
+# Running it here keeps validate.sh equivalent to CI, which is the property
+# that licenses landing without waiting for GH Actions. CI runs it as a
+# separate JOB so a drift failure renders downstream work as skipped rather
+# than failed; locally a plain early exit is the same idea.
+bash scripts/scheduler_connection_gate.sh
+
+echo ""
 echo "=== Running cargo fmt --check ==="
 cargo fmt --all -- --check
 
