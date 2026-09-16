@@ -24,7 +24,47 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             schtest/rust/target/
-          key: ${{ runner.os }}-schtest-${{ hashFiles('schtest/rust/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-schtest-${{ hashFiles('schtest/rust/Cargo.lock') }}
+
+      - name: Clippy check
+        working-directory: schtest/rust
+        run: cargo clippy -- -D warnings
+
+      - name: Build
+        working-directory: schtest/rust
+        run: cargo build --release
+
+      - name: Test
+        working-directory: schtest/rust
+        run: cargo test -- --skip test_process_iterations
+
+  # Same gate as check_and_build, on arm64. schtest reads a free-running cycle
+  # counter through per-arch inline asm, so an x86_64-only CI cannot see an
+  # aarch64 build break: `rdtsc` with `out("eax")` compiled everywhere until it
+  # reached an arm64 consumer, and nothing here failed. This job is the gate
+  # that would have caught it.
+  #
+  # Runs natively on a GitHub-hosted arm64 runner rather than under emulation,
+  # which keeps it in the same wall-clock class as the x86_64 job. Do not
+  # replace this with a QEMU or cross-compile step without saying so: emulation
+  # costs roughly an order of magnitude more time, and cross-compiling cannot
+  # run the tests at all.
+  check_and_build_aarch64:
+    runs-on: ubuntu-24.04-arm
+    # arm64 runner minutes are billed on a private repository, so fail a hung
+    # job rather than letting it run to the six-hour default.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            schtest/rust/target/
+          key: ${{ runner.os }}-${{ runner.arch }}-schtest-${{ hashFiles('schtest/rust/Cargo.lock') }}
 
       - name: Clippy check
         working-directory: schtest/rust
