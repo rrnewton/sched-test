@@ -960,6 +960,7 @@ impl SimulatorState {
 
             if (target_cpu.0 as usize) < self.cpus.len() {
                 self.cpus[target_cpu.0 as usize].local_dsq.push_back(pd.pid);
+                self.resched_if_remote_idle(local_cpu, target_cpu);
             }
             Some(target_cpu)
         } else if let Some(vtime) = pd.vtime {
@@ -977,6 +978,34 @@ impl SimulatorState {
                 .sample_dsq_lengths(local_t, &self.dsqs, DsqSampleTrigger::Insert, Some(dsq));
             None
         }
+    }
+
+    /// Wake `target_cpu` if a task was just queued on its local DSQ from
+    /// another CPU while it sits idle.
+    ///
+    /// Mirrors the kernel's `local_dsq_post_enq()`: after inserting into a
+    /// local DSQ it calls `resched_curr(rq)` whenever the rq's current task
+    /// is of a lower class than ext — the idle task included — and for a
+    /// remote rq that is a reschedule IPI. Without it, a remote
+    /// `SCX_DSQ_LOCAL_ON` insert (e.g. scx_cosmos' `SCX_ENQ_IMMED` direct
+    /// dispatch from `ops.enqueue`) strands the task on a CPU that nothing
+    /// will ever wake. The IPI is staged as an `IDLE` kick, which is a no-op
+    /// if the CPU picked up work before delivery; unlike
+    /// `scx_bpf_kick_cpu` it records no `KickCpu` trace event, because the
+    /// scheduler issued no kick.
+    fn resched_if_remote_idle(&mut self, local_cpu: CpuId, target_cpu: CpuId) {
+        if target_cpu == local_cpu || !self.cpus[target_cpu.0 as usize].is_idle() {
+            return;
+        }
+        let local_t = self.cpus[self.current_cpu.0 as usize].local_clock;
+        let delivery_t = local_t + self.overhead.effective_ipi_delivery_ns();
+        self.staged_events.push((
+            delivery_t,
+            StagedEvent::KickDelivered {
+                cpu: target_cpu,
+                flags: KickFlags::IDLE,
+            },
+        ));
     }
 
     /// Check if a dispatch to `SCX_DSQ_LOCAL_ON | target_cpu` is valid.
@@ -4079,6 +4108,62 @@ mod tests {
 
         drop(guard);
         free_task(&mut arc.lock().unwrap().sim, Pid(1));
+    }
+
+    /// A LOCAL_ON insert onto an idle remote CPU must wake it (kernel
+    /// `local_dsq_post_enq` → `resched_curr`); one onto the resolving CPU
+    /// itself or onto a busy CPU must not.
+    #[test]
+    fn test_resolve_local_on_resched_ipi_only_for_idle_remote() {
+        let _lock = SIM_LOCK.lock().unwrap();
+        let state = test_state(4);
+        let arc = test_sim_arc(state);
+        arc.lock().unwrap().sim.cpus[3].current_task = Some(Pid(99));
+
+        let pids = [Pid(1), Pid(2), Pid(3)];
+        let targets = [0u64, 2, 3];
+        let ps: Vec<_> = pids
+            .iter()
+            .map(|&pid| register_task(&mut arc.lock().unwrap().sim, pid))
+            .collect();
+
+        let cpu = arc.lock().unwrap().sim.current_cpu;
+        enter_test_sim(&arc, cpu);
+        for (&p, &t) in ps.iter().zip(&targets) {
+            scx_bpf_dsq_insert(p, DsqId::LOCAL_ON_MASK | t, 5_000_000, 0);
+        }
+        exit_test_sim();
+
+        let mut guard = arc.lock().unwrap();
+        guard.sim.resolve_pending_dispatch(CpuId(0));
+        let woken: Vec<_> = guard
+            .sim
+            .staged_events
+            .iter()
+            .map(|(_, ev)| ev.clone())
+            .collect();
+        assert_eq!(
+            woken,
+            vec![StagedEvent::KickDelivered {
+                cpu: CpuId(2),
+                flags: KickFlags::IDLE,
+            }],
+            "only idle remote CPU 2 should get a resched IPI"
+        );
+        assert!(
+            !guard
+                .sim
+                .trace
+                .events()
+                .iter()
+                .any(|e| matches!(e.kind, TraceKind::KickCpu { .. })),
+            "a kernel resched IPI is not a scheduler-issued scx_bpf_kick_cpu"
+        );
+
+        drop(guard);
+        for pid in pids {
+            free_task(&mut arc.lock().unwrap().sim, pid);
+        }
     }
 
     /// Test that SCX_DSQ_LOCAL_ON dispatch to a CPU outside cpumask fails.

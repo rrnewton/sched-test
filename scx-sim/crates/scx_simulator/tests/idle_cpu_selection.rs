@@ -261,7 +261,8 @@ fn test_all_idle_vs_all_busy() {
 }
 
 // ---------------------------------------------------------------------------
-// 5. Wakeup / IPI path: lavd and cosmos kick idle CPUs under contention.
+// 5. Wakeup / IPI path: lavd kicks under contention; cosmos kicks for
+//    affinity-constrained wakeups only.
 //    simple has no explicit kick path (documented) — asserted to be zero.
 // ---------------------------------------------------------------------------
 
@@ -278,19 +279,12 @@ fn test_wakeup_kick_cpu_paths() {
         "[lavd] no KickCpu (IPI wakeup) events under contention"
     );
 
-    // cosmos only ever issues SCX_KICK_IDLE, so it can only kick when a CPU is
-    // actually idle to be woken. Under-load it: 2 tasks / 4 CPUs.
-    //
-    // This used to be asserted on the same saturated 8/4 workload as lavd and
-    // passed only because the build manifest forced perf_config=1 and the
-    // wrapper fed cosmos fabricated PMU counts, which made is_event_heavy()
-    // permanently true and pushed every enqueue down the pick_idle_cpu()
-    // branch. With the real no-PMU path restored, a saturated cosmos correctly
-    // issues no IPI wakeups -- there is no idle CPU to wake. Measured kicks by
-    // load on 4 CPUs: cosmos 7/12/20 at 1/2/3 tasks and 0 at 4+; lavd 1/2/3/4
-    // and 4 at every saturated load. Both directions are asserted below so the
-    // distinction cannot silently regress again.
-    let trace = Simulator::new(new_sched("cosmos", 4)).run(hogs(4, 2, 5));
+    // cosmos only kicks for tasks whose shared-DSQ insert could otherwise go
+    // unnoticed: upstream (sched-ext/scx 8258404d4 / ed4734da1) dropped the kick
+    // for unbound tasks, whose wakeup side effect now comes from select_cpu and
+    // the SCX_ENQ_IMMED direct dispatch. Drive the path that remains —
+    // task_needs_shared_dsq_kick() — with affinity-constrained wakers.
+    let trace = Simulator::new(new_sched("cosmos", 4)).run(common::cosmos_affinity_kick_scenario());
     assert!(
         !trace.has_error(),
         "[cosmos] error: {:?}",
@@ -298,21 +292,25 @@ fn test_wakeup_kick_cpu_paths() {
     );
     assert!(
         kick_count(&trace) > 0,
-        "[cosmos] no KickCpu (IPI wakeup) events with idle CPUs available"
+        "[cosmos] no KickCpu (IPI wakeup) events for affinity-constrained wakeups"
     );
 
-    let trace = Simulator::new(new_sched("cosmos", 4)).run(hogs(4, 8, 5));
-    assert!(
-        !trace.has_error(),
-        "[cosmos] error: {:?}",
-        trace.exit_kind()
-    );
-    assert_eq!(
-        kick_count(&trace),
-        0,
-        "[cosmos] issued SCX_KICK_IDLE with every CPU busy — there is no idle \
-         CPU to wake, so this indicates fabricated PMU input has returned"
-    );
+    // And the other direction: unbound hogs never kick, whether idle CPUs
+    // exist (2/4) or not (8/4).
+    for n in [2, 8] {
+        let trace = Simulator::new(new_sched("cosmos", 4)).run(hogs(4, n, 5));
+        assert!(
+            !trace.has_error(),
+            "[cosmos] {n} hogs error: {:?}",
+            trace.exit_kind()
+        );
+        assert_eq!(
+            kick_count(&trace),
+            0,
+            "[cosmos] kicked for {n} unbound hogs; upstream only kicks when \
+             task_needs_shared_dsq_kick() holds"
+        );
+    }
     // simple issues no explicit KickCpu — matches its no-preemption design.
     let trace = Simulator::new(DynamicScheduler::simple()).run(hogs(4, 8, 5));
     assert!(
