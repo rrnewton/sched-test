@@ -6,6 +6,7 @@ members = [
     "crates/scx_cgroup_tree",
     "crates/scxsim-build",
     "crates/embed_harness",
+    "crates/embed_unexported",
     "crates/scxsim-workload-ir",
     "crates/scxsim-calibration",
     "crates/ktstr-scenario-replay",

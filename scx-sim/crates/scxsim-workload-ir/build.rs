@@ -1,19 +1,22 @@
-//! Re-emit the kfunc-export link contract for the `ingest` feature.
+//! Emit the host-export link args for this package's own `ingest` binaries.
 //!
 //! A scheduler `.so` resolves kfunc / SDT / arena symbols from the *loading
-//! binary's* dynamic symbol table. `scx_simulator`'s build script forces those
-//! symbols into its own binaries with `-rdynamic` + per-symbol
-//! `-Wl,--undefined`, but `cargo:rustc-link-arg` is **NOT transitive**: a
-//! downstream crate that loads a `.so` must re-emit them or the load fails at
-//! `RTLD_NOW` with `undefined symbol: sim_arena_offset`.
+//! binary's* dynamic symbol table, and `scx_simulator` refuses to load one into
+//! a binary that does not export them all (`LoadError::HostSymbolsNotExported`).
+//! `scxsim_build::emit_host_link_args` puts them there, but
+//! `cargo:rustc-link-arg` reaches only the calling package's own binaries,
+//! tests, examples and benches: it is **NOT transitive**. So this covers this
+//! crate's `tests/sched_basic_proportional.rs`, which loads a scheduler and runs
+//! a lowered scenario, and nothing downstream: a consumer that enables `ingest`
+//! and loads a scheduler must call `emit_host_link_args()` from its own build
+//! script.
 //!
-//! That is documented in `scx-sim/ai_docs/ktstr_scxsim_embed_contract.md` §2 and
-//! proved by `crates/embed_harness`. This crate hits it for real in
-//! `tests/sched_basic_proportional.rs`, which loads a scheduler and runs a
-//! lowered scenario.
+//! Documented in `scx-sim/ai_docs/ktstr_scxsim_embed_contract.md` §2; proved by
+//! `crates/embed_harness`, with `crates/embed_unexported` as the negative
+//! control.
 //!
-//! Emitted only when `ingest` is on, so a consumer taking just the IR and the
-//! lowering — ktstr's DSL PR, which stays scx-sim-free — links normally.
+//! Emitted only when `ingest` is on, the only configuration in which this
+//! package's binaries load a scheduler (the one test that does requires it).
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");

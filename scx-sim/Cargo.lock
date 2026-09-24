@@ -271,6 +271,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "embed_unexported"
+version = "0.1.0"
+dependencies = [
+ "scx_simulator",
+ "scxsim-build",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

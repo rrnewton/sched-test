@@ -29,8 +29,8 @@ default = []
 ingest = ["dep:scx_simulator"]
 
 [build-dependencies]
-# Only for EXPORTED_SYMS — the non-transitive link contract the `ingest` feature
-# needs re-emitted. See build.rs.
+# Only for emit_host_link_args(), which this package's own `ingest` binaries
+# need because link arguments are not transitive. See build.rs.
 scxsim-build = { version = "0.1.0", path = "../scxsim-build" }
 
 [dev-dependencies]

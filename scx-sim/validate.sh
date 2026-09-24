@@ -205,10 +205,13 @@ echo "=== Running cargo llvm-cov nextest (instrumented; Rust library coverage) =
 # instruments RUST only (SCX_SIM_COVERAGE unset) — scheduler .so C coverage stays
 # coverage.sh's separate concern.
 #
-# embed_harness (a workspace member) is built and its link-contract test runs
-# here: a broken EXPORTED_SYMS re-emission -> RTLD_NOW load failure -> test
-# failure -> this aborts under set -e. That IS the embedder link-contract guard
-# (no separate embed step needed).
+# embed_harness and embed_unexported (workspace members) are built and their
+# link-contract tests run here. A downstream build script whose
+# emit_host_link_args() call stops reaching its binary -> the loader refuses with
+# HostSymbolsNotExported -> embed_harness fails; a loader that stops refusing to
+# dlopen into a binary without those args -> embed_unexported fails. Either
+# aborts this under set -e. That IS the embedder link-contract guard (no
+# separate embed step needed).
 command -v cargo-llvm-cov >/dev/null 2>&1 || {
     echo "ERROR: cargo-llvm-cov is required for the Rust coverage gate." >&2
     echo "       Install: cargo install cargo-llvm-cov && rustup component add llvm-tools-preview" >&2

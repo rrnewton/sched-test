@@ -3,7 +3,7 @@ name = "embed_harness"
 version = "0.1.0"
 edition = "2021"
 publish = false
-description = "In-repo proof that a downstream binary embedding scx_simulator resolves the dlopen kfunc-export link contract by re-emitting scxsim_build::EXPORTED_SYMS from its own build script."
+description = "In-repo proof that a downstream binary embedding scx_simulator satisfies the dlopen host-export link contract by calling scxsim_build::emit_host_link_args from its own build script."
 
 # scx_simulator is a NORMAL dependency (not a dev-dependency) for the build
 # script's sake: cargo hands a `links` crate's metadata -- here scx_simulator's

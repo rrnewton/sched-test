@@ -1,24 +1,19 @@
-//! End-to-end proof of the dlopen kfunc-export link contract for a DOWNSTREAM
+//! End-to-end proof of the dlopen host-export link contract for a DOWNSTREAM
 //! embedder.
 //!
-//! `embed_harness` depends on `scx_simulator` (so its test binary links the C
-//! static libs that DEFINE the exported kfunc/SDT/arena symbols, and is a
-//! downstream crate that does NOT inherit scx_simulator's `-rdynamic` /
-//! `-Wl,--undefined` link args -- those are non-transitive). The harness'
-//! `build.rs` re-emits that set from `scxsim_build::EXPORTED_SYMS`. This test
-//! loads the harness-built `libscx_simple.so` through
-//! `DynamicScheduler::load_with_definition` (which dlopens with RTLD_NOW, so all
-//! of the `.so`'s undefined symbols are resolved eagerly at load) and runs a
-//! real 1-CPU simulation. `simple.so` UND-references 3 of the 15 EXPORTED_SYMS
-//! (scx_test_map_lookup_elem, sim_arena_buf, sim_arena_offset); `sim_arena_offset`
-//! is held in SOLELY by the re-emitted `--undefined`, so reaching
-//! `ExitKind::Normal` proves the re-emission is load-bearing and non-transitive
-//! for the simple-reachable subset. The remaining EXPORTED_SYMS (e.g.
-//! scx_arena_subprog_init, the scx_task_* SDT path) are exercised by
-//! scx_simulator's own per-scheduler runtime suites, which load the schedulers
-//! that reference them. (Removing the re-emission from build.rs makes the load
-//! fail with `undefined symbol: sim_arena_offset` -- the implicit negative
-//! control, verified once manually.)
+//! `embed_harness` depends on `scx_simulator`, so its test binary is linked
+//! against the definitions of every `scxsim_build::HOST_EXPORTS` symbol, and it
+//! is a downstream crate that does NOT inherit scx_simulator's `-rdynamic` /
+//! `-Wl,--undefined` link args (cargo does not pass link arguments on to
+//! dependents). The harness' `build.rs` emits them itself with
+//! `scxsim_build::emit_host_link_args()`. This test loads the harness-built
+//! `libscx_simple.so` through `DynamicScheduler::load_with_definition`, which
+//! first checks that every host export is in the process's global symbol scope
+//! (refusing with `LoadError::HostSymbolsNotExported` otherwise) and then
+//! dlopens with RTLD_NOW, and runs a real 1-CPU simulation. Reaching
+//! `ExitKind::Normal` proves the emitted args reached this binary; the
+//! `embed_unexported` crate is the negative control, the same dependency
+//! without the build-script call, which the loader must refuse.
 
 // One import: the curated embed surface (re-exports scxsim_build::SchedulerDefinition).
 use scx_simulator::prelude::*;
@@ -64,7 +59,6 @@ fn embedder_built_simple_so_loads_and_runs() {
     assert_eq!(
         trace.exit_kind(),
         &ExitKind::Normal,
-        "embedder-built simple.so did not run to normal completion -- without the \
-         re-emitted link args the RTLD_NOW load fails on an undefined symbol"
+        "embedder-built simple.so did not run to normal completion"
     );
 }
