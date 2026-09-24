@@ -359,6 +359,30 @@ void sim_task_set_sum_exec_runtime(struct task_struct *p, u64 ns)
 	p->se.sum_exec_runtime = ns;
 }
 
+/*
+ * Tick-sampled cputime (p->utime / p->stime). The engine charges these from
+ * its tick handler the way the kernel's account_process_tick() does.
+ */
+u64 sim_task_get_utime(struct task_struct *p)
+{
+	return p->utime;
+}
+
+void sim_task_set_utime(struct task_struct *p, u64 ns)
+{
+	p->utime = ns;
+}
+
+u64 sim_task_get_stime(struct task_struct *p)
+{
+	return p->stime;
+}
+
+void sim_task_set_stime(struct task_struct *p, u64 ns)
+{
+	p->stime = ns;
+}
+
 /* Address space (mm_struct pointer) */
 void sim_task_set_mm(struct task_struct *p, void *mm)
 {
