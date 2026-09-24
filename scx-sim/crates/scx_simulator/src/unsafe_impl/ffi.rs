@@ -62,6 +62,12 @@ extern "C" {
     pub fn sim_task_get_sum_exec_runtime(p: *mut c_void) -> u64;
     pub fn sim_task_set_sum_exec_runtime(p: *mut c_void, ns: u64);
 
+    // Tick-sampled cputime (p->utime / p->stime)
+    pub fn sim_task_get_utime(p: *mut c_void) -> u64;
+    pub fn sim_task_set_utime(p: *mut c_void, ns: u64);
+    pub fn sim_task_get_stime(p: *mut c_void) -> u64;
+    pub fn sim_task_set_stime(p: *mut c_void, ns: u64);
+
     // Address space (mm_struct pointer)
     pub fn sim_task_set_mm(p: *mut c_void, mm: *mut c_void);
     pub fn sim_task_get_mm(p: *mut c_void) -> *mut c_void;
@@ -309,6 +315,34 @@ pub fn task_set_sum_exec_runtime(raw: *mut c_void, ns: u64) {
 pub fn task_get_sum_exec_runtime(raw: *mut c_void) -> u64 {
     // SAFETY: The caller guarantees `raw` is a valid task_struct pointer.
     unsafe { sim_task_get_sum_exec_runtime(raw) }
+}
+
+/// Get `p->utime` (tick-sampled user cputime, ns) from a raw task_struct.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn task_get_utime(raw: *mut c_void) -> u64 {
+    // SAFETY: The caller guarantees `raw` is a valid task_struct pointer.
+    unsafe { sim_task_get_utime(raw) }
+}
+
+/// Set `p->utime` on a raw task_struct.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn task_set_utime(raw: *mut c_void, ns: u64) {
+    // SAFETY: The caller guarantees `raw` is a valid task_struct pointer.
+    unsafe { sim_task_set_utime(raw, ns) }
+}
+
+/// Get `p->stime` (tick-sampled system cputime, ns) from a raw task_struct.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn task_get_stime(raw: *mut c_void) -> u64 {
+    // SAFETY: The caller guarantees `raw` is a valid task_struct pointer.
+    unsafe { sim_task_get_stime(raw) }
+}
+
+/// Set `p->stime` on a raw task_struct.
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub fn task_set_stime(raw: *mut c_void, ns: u64) {
+    // SAFETY: The caller guarantees `raw` is a valid task_struct pointer.
+    unsafe { sim_task_set_stime(raw, ns) }
 }
 
 /// Convert a simulated nanosecond timestamp to jiffies.

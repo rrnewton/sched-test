@@ -118,6 +118,7 @@ pub use ffi::{
     discover_schedulers, set_task_alloc_fail_pid, DebuggerInfo, DynamicScheduler, LavdPowerMode,
     LoadError, Scheduler, SchedulerInfo,
 };
+pub use ffi::{task_get_stime, task_get_utime};
 pub use kfuncs::{dump_buffer_reset, dump_buffer_take, sim_clock};
 #[cfg(feature = "standalone")]
 pub use layered_probes::{
