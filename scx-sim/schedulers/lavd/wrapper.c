@@ -193,104 +193,24 @@ bool CONFIG_NO_HZ_IDLE;
 #define bpf_probe_read_kernel(dst, sz, src) \
 	(__builtin_memset((dst), 0, (sz)), (long)(-14))
 /*
- * struct ravg_data -- running average data structure used in lavd.bpf.h.
- * Defined in scheds/include/lib/ravg.h inside #ifdef __BPF__, so it's
- * not available in userspace compilation. Provide the definition here.
+ * Running averages. Upstream lib/ravg.h keeps struct ravg_data and its inline
+ * helpers inside #ifdef __BPF__, so include it with __BPF__ defined for that one
+ * header, spelling the arena qualifiers the way host code does (the
+ * non-__BPF__ branch of lib/alloc/bpf_arena_common.h). The sim used to carry a
+ * vendored copy of these helpers instead; it went stale when upstream replaced
+ * ravg_add() with ravg_sat_add(), leaving ravg.bpf.c calling an undeclared
+ * function -- implicitly an int, so a truncated u64 had it linked at all -- and
+ * the .so failing to dlopen. Including the header keeps them upstream's.
  */
-/*
- * ravg constants from ravg.h (inside #ifdef __BPF__).
- */
-enum ravg_consts {
-	RAVG_VAL_BITS = 44,
-	RAVG_FRAC_BITS = 20,
-};
-
-struct ravg_data {
-	u64 val;
-	u64 val_at;
-	u64 old;
-	u64 cur;
-};
-
-/*
- * ravg helper functions and implementations.
- * These are defined inside #ifdef __BPF__ in ravg.h and implemented in
- * scx/lib/ravg.bpf.c. We need them for userspace compilation.
- */
-#define RAVG_FN_ATTRS __attribute__((unused, always_inline))
-
-static RAVG_FN_ATTRS void ravg_add(u64 *sum, u64 addend)
-{
-	u64 new = *sum + addend;
-	if (new >= *sum)
-		*sum = new;
-	else
-		*sum = -1;
-}
-
-static RAVG_FN_ATTRS inline u64 ravg_decay(u64 v, u32 shift)
-{
-	if (shift >= 64)
-		return 0;
-	else
-		return v >> shift;
-}
-
-static RAVG_FN_ATTRS u32 ravg_normalize_dur(u32 dur, u32 half_life)
-{
-	if (dur < half_life)
-		return (((u64)dur << RAVG_FRAC_BITS) + half_life - 1) /
-			half_life;
-	else
-		return 1 << RAVG_FRAC_BITS;
-}
-
 #ifndef __arena
 #define __arena
 #endif
-
-static RAVG_FN_ATTRS void ravg_transfer(struct ravg_data *base, u64 base_new_val,
-					 struct ravg_data *xfer, u64 xfer_new_val,
-					 u32 half_life, bool is_xfer_in)
-{
-	if ((s64)(base->val_at - xfer->val_at) < 0)
-		ravg_accumulate(base, base_new_val, xfer->val_at, half_life);
-	else if ((s64)(base->val_at - xfer->val_at) > 0)
-		ravg_accumulate(xfer, xfer_new_val, base->val_at, half_life);
-
-	if (is_xfer_in) {
-		base->old += xfer->old;
-		base->cur += xfer->cur;
-	} else {
-		if (base->old > xfer->old)
-			base->old -= xfer->old;
-		else
-			base->old = 0;
-
-		if (base->cur > xfer->cur)
-			base->cur -= xfer->cur;
-		else
-			base->cur = 0;
-	}
-}
-
-static RAVG_FN_ATTRS int ravg_to_arena(struct ravg_data __arena *to, struct ravg_data *from)
-{
-	*to = *from;
-	return 0;
-}
-
-static RAVG_FN_ATTRS int ravg_from_arena(struct ravg_data *to, struct ravg_data __arena *from)
-{
-	*to = *from;
-	return 0;
-}
-
-/*
- * Include ravg.bpf.c for ravg_accumulate, ravg_read, ravg_scale implementations.
- * Guard the header include since common.bpf.h is already included.
- */
-#define __SCX_RAVG_BPF_H__  /* prevent ravg.h re-include */
+#ifndef __arg_arena
+#define __arg_arena
+#endif
+#define __BPF__ 1
+#include <lib/ravg.h>
+#undef __BPF__
 #include "ravg.bpf.c"  /* resolved via -I<scx_root>/lib */
 
 /*
@@ -378,6 +298,11 @@ extern unsigned long long scxsim_cgroup_bw_consume_sum_ns;
 unsigned long long scxsim_cgroup_bw_consume_sum_ns __attribute__((visibility("default")));
 extern int scxsim_probe_dprintf(int fd, const char *fmt, ...) __asm__("dprintf");
 #endif
+
+/* idle.bpf.c calls topo_cpu_to_llc_id() (upstream 7b0b432b9), which
+ * lib/topology.h declares only under __BPF__. Defined with the other
+ * topology stubs ahead of cgroup_bw.bpf.c below. */
+int topo_cpu_to_llc_id(u32 cpu);
 
 #include "util.bpf.c"
 #include "power.bpf.c"
@@ -1156,6 +1081,13 @@ extern void sim_bpf_iter_css_destroy(struct bpf_iter_css *it);
 #ifndef smp_mb
 #define smp_mb() __asm__ __volatile__("" ::: "memory")
 #endif
+/* smp_rmb: cgroup_bw.bpf.c's cbw_claim_free() orders its supply and
+ * reservation-floor loads with it. bpf_atomic.h, which defines it, is
+ * kept out along with bpf_arena_spin_lock.h by the guard above; on
+ * x86-64 it is barrier(), a compiler barrier, which is what this is. */
+#ifndef smp_rmb
+#define smp_rmb() __asm__ __volatile__("" ::: "memory")
+#endif
 
 /* `scx_atq_create(fifo)` is a macro inside `lib/atq.h` under
  * `#ifdef __BPF__`. The function declaration of
@@ -1223,7 +1155,14 @@ extern int dprintf(int fd, const char *fmt, ...);
 /* Topology stubs: single-LLC simulator. cgroup_bw uses TOPO_NR(LLC)
  * to size per-LLC backlog walks. Pull in lib/topology.h for the
  * TOPO_MAX_LEVEL constant; the stubs must be visible BEFORE
- * cgroup_bw.bpf.c is included. */
+ * cgroup_bw.bpf.c is included.
+ *
+ * DANGER TODO(sim-0z6u0): these stand in for scx/lib/topology.bpf.c,
+ * which is not compiled in. lavd's own idle-CPU selection now consults
+ * topo_cpu_to_llc_id() too (find_cpu_for_ovrflw_extend(), upstream
+ * 7b0b432b9), so after lavd_setup_multi_domain() -- whose compute domains
+ * each get their own llc_id -- lavd may extend its overflow set across
+ * LLCs, which production lavd never does. */
 #include <lib/topology.h>
 int nr_topo_nodes[TOPO_MAX_LEVEL] = {1, 1, 1, 1, 1};
 int topo_cpu_to_llc_id(u32 cpu) { (void)cpu; return 0; }

@@ -158,10 +158,12 @@ pub const SCHEDULERS: &[SchedulerManifest] = &[
         extra_local_include: false,
         source_patches: &[],
         // Migrated from mitosis_setup's config-global writes. nr_possible_cpus
-        // resolves to num_cpus at apply time; root_cgid is a u64 (cgid width). The 3
+        // resolves to num_cpus at apply time; root_cgid is a u64 (cgid width). The 2
         // flags whose C rodata default differs from the value here (smt_enabled,
-        // exiting_task_workaround_enabled, cpu_controller_disabled) make these writes
-        // load-bearing, not redundant. The all_cpus bitmask (computed) and the
+        // exiting_task_workaround_enabled) make these writes load-bearing, not
+        // redundant. There is no cpu_controller_disabled: upstream 929f6c370 made
+        // tracepoint cgroup tracking, which the sim had selected with it, the only
+        // path and deleted the flag. The all_cpus bitmask (computed) and the
         // timer-state clears stay in mitosis_setup -- not const-volatile scalar rodata.
         runtime: SchedulerRuntime {
             rodata: &[
@@ -170,7 +172,6 @@ pub const SCHEDULERS: &[SchedulerManifest] = &[
                 ("slice_ns", ConfigValue::U64(20_000_000)),
                 ("root_cgid", ConfigValue::U64(1)),
                 ("exiting_task_workaround_enabled", ConfigValue::Bool(false)),
-                ("cpu_controller_disabled", ConfigValue::Bool(true)),
                 ("reject_multicpu_pinning", ConfigValue::Bool(false)),
             ],
         },

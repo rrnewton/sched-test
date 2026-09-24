@@ -156,6 +156,10 @@ static void mitosis_register_maps(void)
 	/* ARRAY maps: register + pre-seed [0..max_entries) with zeroed values. */
 	SCX_REGISTER_ARRAY(cells, true);
 	SCX_REGISTER_ARRAY(cell_cpumasks, true);
+	/* Upstream bc7e20b53 ("Wire subcell logic on BPF side"): per-(cell,
+	 * subcell) cpumask pairs. mitosis_init() initializes every slot and
+	 * returns -ENOENT on the first lookup miss. */
+	SCX_REGISTER_ARRAY(subcell_cpumasks, true);
 
 	/* PERCPU_ARRAY maps: per-CPU storage + pre-seed every key on every CPU. */
 	SCX_REGISTER_PERCPU(cpu_ctxs, true);

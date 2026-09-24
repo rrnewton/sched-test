@@ -1866,7 +1866,7 @@ impl<S: Scheduler> Simulator<S> {
 
         // Build cgroup registry from scenario definitions. We create and
         // install it before ops.init() so that bpf_for_each(css, ...) inside
-        // init can discover cgroups (e.g. mitosis with cpu_controller_disabled).
+        // init can discover cgroups (e.g. mitosis, which walks them all).
         // In the real kernel the cgroup hierarchy already exists when init runs.
         let mut cgroup_registry = CgroupRegistry::new(nr_cpus, scenario.max_cgroups);
         for cg_def in &scenario.cgroups {
