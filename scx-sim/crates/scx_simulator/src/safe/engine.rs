@@ -971,6 +971,27 @@ fn update_sum_exec(raw: *mut c_void, base: TimeNs, elapsed: TimeNs) {
     ffi::task_set_sum_exec_runtime(raw, base + elapsed);
 }
 
+/// Charge one tick of cputime to the task the tick interrupted.
+///
+/// Mirrors the kernel's default `CONFIG_TICK_CPU_ACCOUNTING`:
+/// `update_process_times()` -> `account_process_tick()` charges a full
+/// `TICK_NSEC` to `p->utime` when the tick lands in user mode and to
+/// `p->stime` otherwise, and it does so BEFORE `sched_tick()` runs
+/// `ops.tick`. The charge is the nominal tick length, not the jittered
+/// interval, exactly as the kernel charges `TICK_NSEC` regardless of timer
+/// skew.
+///
+/// [`Phase::Run`] is user compute; [`Phase::SystemCpu`] is task-context
+/// kernel time. scx_cosmos derives its per-CPU busy state from `p->utime`
+/// deltas and deliberately excludes system time, so the split matters.
+fn account_process_tick(raw: *mut c_void, phase: Option<&Phase>) {
+    if matches!(phase, Some(Phase::Run(_))) {
+        ffi::task_set_utime(raw, ffi::task_get_utime(raw) + TICK_INTERVAL_NS);
+    } else {
+        ffi::task_set_stime(raw, ffi::task_get_stime(raw) + TICK_INTERVAL_NS);
+    }
+}
+
 /// Charge `delta_ns` of CPU time consumed by `pid` against its cgroup's
 /// `cpu.max` quota (and finite ancestors).
 ///
@@ -3257,6 +3278,7 @@ impl<S: Scheduler> Simulator<S> {
                 .local_clock
                 .saturating_sub(started_at);
             update_sum_exec(raw, task.sum_exec_base, elapsed);
+            account_process_tick(raw, task.current_phase());
         }
 
         set_ops_context(&mut s.sim, OpsContext::Tick);
