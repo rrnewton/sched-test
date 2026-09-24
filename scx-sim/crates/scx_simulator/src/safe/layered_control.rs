@@ -778,6 +778,11 @@ mod tests {
         // indentation makes the guard fail on a pure reformat, which trains
         // readers to "fix" it by pasting in whatever upstream now says —
         // exactly the reflex that would wave through a real new host read.
+        //
+        // Last reviewed at scx 413031d44: upstream c0f27f2e8 (clippy
+        // collapsible_if) and 13a2c69ac (rustfmt) folded the enclosing
+        // `if let` into a let-chain. Same single `fs::read_to_string` of the
+        // same walk entry, inside the same `/sys/fs/cgroup` walk.
         let fs_calls: Vec<&str> = upstream
             .lines()
             .map(str::trim)
@@ -785,7 +790,7 @@ mod tests {
             .collect();
         assert_eq!(
             fs_calls,
-            ["if let Ok(content) = fs::read_to_string(entry.path()) {"],
+            ["&& let Ok(content) = fs::read_to_string(entry.path())"],
             "upstream growth changed its filesystem access; review before updating this guard"
         );
 
