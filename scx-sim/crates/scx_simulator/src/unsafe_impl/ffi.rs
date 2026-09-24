@@ -1323,19 +1323,23 @@ impl std::error::Error for LoadError {}
 /// For a class under which a missing export still LOADS, the sentence saying
 /// what the scheduler would have run instead, as the text before and after the
 /// names of the missing exports in that class. `None` for the loud class.
+///
+/// Conditional ("where a scheduler library ..."), because the class is a
+/// property of the symbol across the bundled schedulers, not a fact checked
+/// against this `.so`: the probe runs before `dlopen` and does not read it.
 fn silent_binding(class: scxsim_build::IfUnexported) -> Option<(&'static str, &'static str)> {
     match class {
         scxsim_build::IfUnexported::DlopenFails => None,
         scxsim_build::IfUnexported::OwnDefinitionBinds => Some((
-            "The .so defines its own ",
-            ", so dlopen would have succeeded and the scheduler would have run those \
-             copies (stubs, for most) in place of the simulator's definitions, silently. ",
+            "Where a scheduler library carries its own copy of ",
+            ", dlopen would have succeeded and the scheduler would have run that copy \
+             (a stub, for most) in place of the simulator's definition, silently. ",
         )),
         scxsim_build::IfUnexported::ResolvesToNull => Some((
-            "The .so references ",
-            " only weakly, so dlopen would have succeeded with them bound to NULL and the \
-             scheduler would have taken its path for a kernel without those kfuncs, silently \
-             (or, where a call is unguarded, jumped to address 0). ",
+            "Where a scheduler library references ",
+            " only weakly, dlopen would have succeeded with the reference bound to NULL and \
+             the scheduler would have taken its path for a kernel without that kfunc, \
+             silently (or, where a call is unguarded, jumped to address 0). ",
         )),
     }
 }
@@ -3207,7 +3211,7 @@ mod tests {
         assert!(
             mixed.contains(
                 "does not export scx_task_init, scx_task_alloc, scx_bpf_create_dsq, scx_bpf_now "
-            ) && mixed.contains("defines its own scx_task_alloc, scx_bpf_create_dsq, so dlopen")
+            ) && mixed.contains("its own copy of scx_task_alloc, scx_bpf_create_dsq, dlopen")
                 && mixed.contains("references scx_bpf_now only weakly")
                 && mixed.contains("bound to NULL"),
             "{mixed}"
@@ -3216,7 +3220,7 @@ mod tests {
         let null_only = host_symbols_message(vec![host_export("scx_bpf_dsq_insert___v1")]);
         assert!(
             null_only.contains("references scx_bpf_dsq_insert___v1 only weakly")
-                && !null_only.contains("defines its own"),
+                && !null_only.contains("its own copy"),
             "{null_only}"
         );
     }
