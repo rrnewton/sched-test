@@ -5025,6 +5025,62 @@ mod tests {
         free_task(&mut arc.lock().unwrap().sim, Pid(20));
     }
 
+    /// Freeing one task's data must not hide any other live task's data.
+    ///
+    /// 2000 tasks in the 16 384-slot table guarantee home-slot collisions, so
+    /// some entries sit displaced past others. Clearing a freed slot to empty
+    /// (the original deletion) ended those entries' probe chains: at 2000
+    /// tasks with every other one freed, 49 of the 1000 survivors looked up
+    /// as NULL. Real task storage never loses a live task's entry.
+    #[test]
+    fn test_sdt_task_free_keeps_displaced_entries_reachable() {
+        let _lock = SIM_LOCK.lock().unwrap();
+        let state = test_state(1);
+        let arc = test_sim_arc(state);
+        let pids: Vec<Pid> = (1..=2000).map(Pid).collect();
+        let tasks: Vec<*mut c_void> = pids
+            .iter()
+            .map(|&pid| register_task(&mut arc.lock().unwrap().sim, pid))
+            .collect();
+        assert_eq!(unsafe { ffi::scx_task_init(64) }, 0);
+        let alloc = |p: *mut c_void| {
+            let d = unsafe { ffi::scx_task_alloc(p) };
+            assert!(!d.is_null());
+            d
+        };
+        let mut data: Vec<*mut c_void> = tasks.iter().map(|&p| alloc(p)).collect();
+        let lookup_mismatches = |data: &[*mut c_void], freed: &dyn Fn(usize) -> bool| {
+            (0..tasks.len())
+                .filter(|&i| {
+                    let want = if freed(i) { ptr::null_mut() } else { data[i] };
+                    (unsafe { ffi::scx_task_data(tasks[i]) }) != want
+                })
+                .count()
+        };
+
+        // Free every other task: survivors must all still resolve.
+        for &p in tasks.iter().step_by(2) {
+            unsafe { ffi::scx_task_free(p) };
+        }
+        assert_eq!(lookup_mismatches(&data, &|i| i % 2 == 0), 0);
+
+        // Re-allocate the freed half into the reshuffled table.
+        for i in (0..tasks.len()).step_by(2) {
+            data[i] = alloc(tasks[i]);
+        }
+        assert_eq!(lookup_mismatches(&data, &|_| false), 0);
+
+        // Drain in reverse insertion order: everything ends up absent.
+        for &p in tasks.iter().rev() {
+            unsafe { ffi::scx_task_free(p) };
+        }
+        assert_eq!(lookup_mismatches(&data, &|_| true), 0);
+
+        for &pid in &pids {
+            free_task(&mut arc.lock().unwrap().sim, pid);
+        }
+    }
+
     #[test]
     fn test_sdt_task_data_null_before_alloc() {
         let _lock = SIM_LOCK.lock().unwrap();

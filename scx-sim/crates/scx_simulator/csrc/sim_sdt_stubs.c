@@ -52,15 +52,21 @@ extern void sim_rbc_resume(void);
  * in the cpu-bw-stall-bug stress matrix). Open-addressing probe distance
  * stays bounded under 50% load so determinism holds.
  *
- * Memory cost: SDT_HASH_SLOTS * sizeof(struct sdt_entry) = 16 384 * 16
- * bytes = 256 KB BSS. Negligible vs the 32 MB arena.
+ * Memory cost: SDT_HASH_SLOTS * sizeof(struct sdt_entry) = 16 384 * 24
+ * bytes = 384 KB BSS. Negligible vs the 32 MB arena.
+ *
+ * Removal uses backward-shift deletion (sdt_remove), not a plain clear: a
+ * cleared slot would end the probe chain of every entry that had been
+ * displaced past it, and those live tasks would then look up as having no
+ * data.
  */
 #define SDT_HASH_SLOTS 16384
 #define SDT_HASH_MASK (SDT_HASH_SLOTS - 1)
 
 struct sdt_entry {
 	struct task_struct *key; /* NULL = empty slot */
-	void *data;             /* malloc'd per-task context */
+	void *data;             /* arena-allocated per-task context */
+	unsigned long home;     /* sdt_hash_pid() of key's PID at insert */
 };
 
 static struct sdt_entry sdt_table[SDT_HASH_SLOTS];
@@ -103,6 +109,12 @@ static unsigned long sdt_hash_pid(int pid)
 	return v & SDT_HASH_MASK;
 }
 
+/* Home slot of a task: where its probe sequence starts. */
+static unsigned long sdt_home(struct task_struct *p)
+{
+	return sdt_hash_pid(p ? sim_task_get_pid(p) : 0);
+}
+
 /*
  * Find a slot in the hash table for the given task.
  *
@@ -110,16 +122,40 @@ static unsigned long sdt_hash_pid(int pid)
  * and matches by task_struct pointer for correctness (PIDs are unique
  * per-task but the pointer is the actual key).
  */
-static struct sdt_entry *sdt_find_slot(struct task_struct *p)
+static struct sdt_entry *sdt_find_slot(struct task_struct *p, unsigned long home)
 {
-	int pid = p ? sim_task_get_pid(p) : 0;
-	unsigned long idx = sdt_hash_pid(pid);
 	for (unsigned long i = 0; i < SDT_HASH_SLOTS; i++) {
-		unsigned long slot = (idx + i) & SDT_HASH_MASK;
+		unsigned long slot = (home + i) & SDT_HASH_MASK;
 		if (sdt_table[slot].key == p || sdt_table[slot].key == (void *)0)
 			return &sdt_table[slot];
 	}
 	return (void *)0; /* table full — should never happen */
+}
+
+/*
+ * Remove an entry without breaking any other entry's probe chain (Knuth's
+ * Algorithm R). Walk the cluster after the hole; an entry whose home slot
+ * does not lie cyclically in (hole, slot] probed past the hole to get where
+ * it is, so move it back into the hole and continue from its old slot. The
+ * stored home is used rather than re-hashing the key, because the key's
+ * task_struct may already have been freed.
+ */
+static void sdt_remove(struct sdt_entry *entry)
+{
+	unsigned long hole = (unsigned long)(entry - sdt_table);
+	unsigned long slot = hole;
+
+	for (unsigned long i = 1; i < SDT_HASH_SLOTS; i++) {
+		slot = (slot + 1) & SDT_HASH_MASK;
+		if (sdt_table[slot].key == (void *)0)
+			break;
+		if (((slot - sdt_table[slot].home) & SDT_HASH_MASK) >=
+		    ((slot - hole) & SDT_HASH_MASK)) {
+			sdt_table[hole] = sdt_table[slot];
+			hole = slot;
+		}
+	}
+	sdt_table[hole] = (struct sdt_entry){ 0 };
 }
 
 /*
@@ -147,6 +183,7 @@ int scx_task_init(u64 data_size)
 void *scx_task_alloc(struct task_struct *p)
 {
 	struct sdt_entry *entry;
+	unsigned long home;
 	void *data;
 
 	sim_rbc_pause();
@@ -173,7 +210,8 @@ void *scx_task_alloc(struct task_struct *p)
 		return (void *)0;
 	}
 
-	entry = sdt_find_slot(p);
+	home = sdt_home(p);
+	entry = sdt_find_slot(p, home);
 	if (!entry) {
 		sim_arena_free(data);
 		sim_rbc_resume();
@@ -186,6 +224,7 @@ void *scx_task_alloc(struct task_struct *p)
 
 	entry->key = p;
 	entry->data = data;
+	entry->home = home;
 	sim_rbc_resume();
 	return data;
 }
@@ -206,7 +245,7 @@ void *scx_task_data(struct task_struct *p)
 		return (void *)0;
 	}
 
-	entry = sdt_find_slot(p);
+	entry = sdt_find_slot(p, sdt_home(p));
 	if (!entry || entry->key != p) {
 		sim_rbc_resume();
 		return (void *)0;
@@ -230,15 +269,14 @@ void scx_task_free(struct task_struct *p)
 		return;
 	}
 
-	entry = sdt_find_slot(p);
+	entry = sdt_find_slot(p, sdt_home(p));
 	if (!entry || entry->key != p) {
 		sim_rbc_resume();
 		return;
 	}
 
 	sim_arena_free(entry->data);
-	entry->key = (void *)0;
-	entry->data = (void *)0;
+	sdt_remove(entry);
 	sim_rbc_resume();
 }
 
