@@ -1032,15 +1032,26 @@ fn charge_cgroup_bw(
     );
 }
 
-/// Returns `Some(cgid)` if `pid`'s cgroup is currently throttled by
-/// the scheduler-side `cpu.max` library. Used by the DSQ-pop
-/// admission gate to refuse dispatch of tasks in a throttled cgroup.
+/// Returns `Some(cgid)` if `pid` is currently held back by the
+/// scheduler-side `cpu.max` library, naming the throttled cgroup: the
+/// task's own cgroup when it is limited, else the nearest limited
+/// ancestor it bills to (upstream scx f437eaa1f gives an
+/// infinite-`cpu.max` cgroup no context, so only that ancestor
+/// replenishes and releases the task). Used by the DSQ-pop admission
+/// gate to refuse dispatch of tasks in a throttled cgroup.
 ///
 /// Sole data source is the loaded scheduler's `cgroup_bw` library
-/// (via wrapper.c forwarder `scxsim_cgroup_bw_is_cgroup_throttled`).
+/// (via wrapper.c forwarder `scxsim_cgroup_bw_throttled_by`).
 /// Schedulers that do not link the library (simple, tickless) get
 /// `None` -- the only honest answer when the scheduler does not
 /// model cpu.max.
+///
+/// The library takes the `struct cgroup *` (upstream scx 972abf782), so
+/// the query hands over the registry's raw pointer; the engine holds the
+/// sim-state lock here, which rules out resolving an id C-side. A task
+/// still mapped to a cgroup the registry no longer holds answers `None`,
+/// as the id-keyed library lookup did before that change (the cgroup's
+/// context is deleted at `cgroup_exit`).
 ///
 /// History: pre-Stage-E, this function had a fallback to an engine-
 /// side `BandwidthManager` Rust mirror. That mirror was deleted in
@@ -1053,12 +1064,8 @@ fn pid_is_bw_throttled<S: crate::ffi::Scheduler>(
     pid: Pid,
 ) -> Option<CgroupId> {
     let cgid = *fields.task_to_cgid.get(&pid)?;
-    let throttled = scheduler.is_cgroup_throttled(cgid.0)?;
-    if throttled {
-        Some(cgid)
-    } else {
-        None
-    }
+    let cgrp_raw = fields.cgroup_registry.get_raw(cgid)?;
+    scheduler.cgroup_bw_throttled_by(cgrp_raw)?.map(CgroupId)
 }
 
 /// Eagerly remove a bw-throttled task from its local DSQ + stash it in
@@ -1859,7 +1866,7 @@ impl<S: Scheduler> Simulator<S> {
 
         // Build cgroup registry from scenario definitions. We create and
         // install it before ops.init() so that bpf_for_each(css, ...) inside
-        // init can discover cgroups (e.g. mitosis with cpu_controller_disabled).
+        // init can discover cgroups (e.g. mitosis, which walks them all).
         // In the real kernel the cgroup hierarchy already exists when init runs.
         let mut cgroup_registry = CgroupRegistry::new(nr_cpus, scenario.max_cgroups);
         for cg_def in &scenario.cgroups {
@@ -2581,7 +2588,7 @@ impl<S: Scheduler> Simulator<S> {
                     eprintln!(
                         "[SCXSIM-CBW-PROBE-PRE-EXIT] cgid={} llc=0 rc={} cgrp_id_seen={} \
                          cgrp_ptr={:?} cgx={:?} llcx_helper={:?} llcx_direct={:?} \
-                         has_llcx={} is_throttled={} runtime_total_sloppy={} \
+                         is_throttled={} runtime_total_sloppy={} \
                          runtime_total_in_llcx={} consume_count_pre={} \
                          cbw_cgrp_map_nr={} cbw_cgrp_map_first_key={:?} \
                          cbw_cgrp_llc_map_nr={}",
@@ -2592,7 +2599,6 @@ impl<S: Scheduler> Simulator<S> {
                         out.cgx,
                         out.llcx_via_helper,
                         out.llcx_via_direct_map,
-                        out.has_llcx,
                         out.is_throttled,
                         out.runtime_total_sloppy,
                         out.runtime_total_in_llcx,
@@ -2681,7 +2687,7 @@ impl<S: Scheduler> Simulator<S> {
                     eprintln!(
                         "[SCXSIM-CBW-PROBE] cgid={} llc=0 rc={} cgrp_id_seen={} \
                          cgrp_ptr={:?} cgx={:?} llcx_helper={:?} llcx_direct={:?} \
-                         has_llcx={} is_throttled={} runtime_total_sloppy={} \
+                         is_throttled={} runtime_total_sloppy={} \
                          runtime_total_in_llcx={} consume_count_pre={} \
                          cbw_cgrp_map_nr={} cbw_cgrp_map_first_key={:?} \
                          cbw_cgrp_llc_map_nr={}",
@@ -2692,7 +2698,6 @@ impl<S: Scheduler> Simulator<S> {
                         out.cgx,
                         out.llcx_via_helper,
                         out.llcx_via_direct_map,
-                        out.has_llcx,
                         out.is_throttled,
                         out.runtime_total_sloppy,
                         out.runtime_total_in_llcx,

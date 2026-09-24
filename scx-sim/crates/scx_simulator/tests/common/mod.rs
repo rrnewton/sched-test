@@ -654,3 +654,56 @@ macro_rules! scheduler_tests {
         }
     };
 }
+
+/// A 4-CPU workload that drives scx_cosmos' remaining `scx_bpf_kick_cpu`
+/// path: I/O tasks confined to CPUs {0,1} alongside two unbound hogs.
+///
+/// Upstream cosmos (sched-ext/scx 8258404d4 / ed4734da1) stopped kicking for
+/// unbound tasks: `ops.select_cpu()` and the `SCX_ENQ_IMMED` direct dispatch
+/// provide their wakeup side effect. `cosmos_enqueue()` now kicks only when
+/// `task_needs_shared_dsq_kick()` holds — affinity-constrained or
+/// migration-disabled tasks, or enqueues that bypassed `ops.select_cpu()` —
+/// because such a task can otherwise sit in a shared DSQ that no eligible CPU
+/// is checking. With the confined I/O tasks waking into a contended {0,1},
+/// every such wakeup lands in the shared DSQ and kicks `prev_cpu`.
+#[allow(dead_code)] // Used by only some of the test binaries that include this module.
+pub fn cosmos_affinity_kick_scenario() -> scx_simulator::Scenario {
+    use scx_simulator::*;
+    let confined = vec![CpuId(0), CpuId(1)];
+    let td =
+        |name: String, pid: i32, behavior: TaskBehavior, allowed: Option<Vec<CpuId>>| TaskDef {
+            name,
+            pid: Pid(pid),
+            nice: 0,
+            behavior,
+            start_time_ns: 0,
+            mm_id: None,
+            allowed_cpus: allowed,
+            parent_pid: None,
+            cgroup_name: None,
+            task_flags: 0,
+            migration_disabled: 0,
+            thread_group_leader: None,
+            uid: Uid(0),
+            gid: Gid(0),
+            fork_cpu: None,
+        };
+    let mut b = Scenario::builder().cpus(4).detect_bpf_errors();
+    for i in 0..3 {
+        b = b.task(td(
+            format!("io{i}"),
+            1 + i,
+            workloads::io_bound(500_000, 3_000_000),
+            Some(confined.clone()),
+        ));
+    }
+    for i in 0..2 {
+        b = b.task(td(
+            format!("hog{i}"),
+            20 + i,
+            workloads::cpu_bound(50_000_000),
+            None,
+        ));
+    }
+    b.duration_ms(300).build()
+}

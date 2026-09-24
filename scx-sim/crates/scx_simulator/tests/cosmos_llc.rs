@@ -232,9 +232,6 @@ fn test_cosmos_per_node_dsq_routing() {
     let tasks_per_node = 4u32; // > cpus_per_node (2) → nodes stay oversubscribed
 
     let sched = DynamicScheduler::cosmos_with_numa(nr_cpus, nr_nodes);
-    // Report a saturated system so is_cpu_busy() routes enqueues onto the
-    // per-node shared DSQ (the vtime/deadline path) rather than per-CPU queues.
-    sched.cosmos_set_cpu_util(nr_cpus, 1024);
 
     let mut b = Scenario::builder().cpus(nr_cpus).seed(42).instant_timing();
     // `tasks_per_node` tasks per node, all pinned to their node's CPUs and

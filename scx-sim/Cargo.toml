@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/scx_simulator",
+    "crates/scx_layered_alloc",
     "crates/scx_perf",
     "crates/scx_cgroup_tree",
     "crates/scxsim-build",

@@ -127,6 +127,15 @@ pub const SCHEDULERS: &[SchedulerManifest] = &[
         // globals the scheduler overwrites at runtime (nr_cpus_onln, power_mode,
         // is_powersave_mode, no_core_compaction, no_freq_scaling, no_preemption),
         // the computed per-CPU arrays, and the cpdom init stay in lavd_setup.
+        //
+        // bw_kick_builtin_idle belongs to lib/cgroup_bw and is load-bearing:
+        // scx_lavd's main.rs sets it unconditionally, and with it left at the
+        // rodata default the replenish timer calls the weak
+        // scx_cgroup_bw_kick_idle_cb(), which scx_bpf_error()s. Its sibling
+        // bw_set_sleepable is deliberately absent (false): scx_utils'
+        // setup_cgroup_bw() leaves it off on a kernel without the
+        // cgroup_set_bandwidth may-sleep marker -- the RESERVED tier, whose
+        // contexts are pre-reserved in ops.cgroup_init().
         runtime: SchedulerRuntime {
             rodata: &[
                 ("nr_cpu_ids", ConfigValue::NumCpus),
@@ -138,6 +147,7 @@ pub const SCHEDULERS: &[SchedulerManifest] = &[
                 ("no_slice_boost", ConfigValue::Bool(false)),
                 ("no_use_em", ConfigValue::U8(1)),
                 ("verbose", ConfigValue::U8(0)),
+                ("bw_kick_builtin_idle", ConfigValue::Bool(true)),
             ],
         },
     },
@@ -148,10 +158,12 @@ pub const SCHEDULERS: &[SchedulerManifest] = &[
         extra_local_include: false,
         source_patches: &[],
         // Migrated from mitosis_setup's config-global writes. nr_possible_cpus
-        // resolves to num_cpus at apply time; root_cgid is a u64 (cgid width). The 3
+        // resolves to num_cpus at apply time; root_cgid is a u64 (cgid width). The 2
         // flags whose C rodata default differs from the value here (smt_enabled,
-        // exiting_task_workaround_enabled, cpu_controller_disabled) make these writes
-        // load-bearing, not redundant. The all_cpus bitmask (computed) and the
+        // exiting_task_workaround_enabled) make these writes load-bearing, not
+        // redundant. There is no cpu_controller_disabled: upstream 929f6c370 made
+        // tracepoint cgroup tracking, which the sim had selected with it, the only
+        // path and deleted the flag. The all_cpus bitmask (computed) and the
         // timer-state clears stay in mitosis_setup -- not const-volatile scalar rodata.
         runtime: SchedulerRuntime {
             rodata: &[
@@ -160,7 +172,6 @@ pub const SCHEDULERS: &[SchedulerManifest] = &[
                 ("slice_ns", ConfigValue::U64(20_000_000)),
                 ("root_cgid", ConfigValue::U64(1)),
                 ("exiting_task_workaround_enabled", ConfigValue::Bool(false)),
-                ("cpu_controller_disabled", ConfigValue::Bool(true)),
                 ("reject_multicpu_pinning", ConfigValue::Bool(false)),
             ],
         },
@@ -336,7 +347,8 @@ pub fn standalone_definitions() -> Vec<SchedulerDefinition> {
 /// them, so without `--undefined` the linker drops them and a `.so` SIGSEGVs at
 /// its first kfunc call; `-rdynamic` puts them in the binary's dynamic symbol
 /// table so dlopen can find them. Grouped: `scx_test_map_*` (bpf_map_* macros),
-/// `scx_task_*`/`scx_arena_subprog_init` (per-task SDT storage), `sim_arena_*`
+/// `scx_task_*`/`__scx_task_data`/`scx_arena_subprog_init` (per-task SDT
+/// storage, upstream's `lib/sdt_task.h` API), `sim_arena_*`
 /// (arena allocator), `scx_atq_create_internal` (forces the sim_atq TU),
 /// `e9_preempt_yield`/`E9_SHARED_RBC` (e9patch-instrumented variants).
 ///
@@ -350,8 +362,10 @@ pub const EXPORTED_SYMS: &[&str] = &[
     "scx_test_map_clear_all",
     "scx_task_init",
     "scx_task_alloc",
+    "__scx_task_data",
     "scx_task_data",
     "scx_task_free",
+    "scx_task_free_rcu",
     "scx_arena_subprog_init",
     "e9_preempt_yield",
     "E9_SHARED_RBC",
@@ -422,6 +436,40 @@ pub fn resolve_scx_root(default: &Path) -> PathBuf {
         }
         Err(_) => default.to_path_buf(),
     }
+}
+
+/// Compile one upstream scx Rust source verbatim as a module of the calling
+/// crate: writes `OUT_DIR/<module>_mod.rs` holding
+/// `#[path = "<scx_root>/<rel>"] pub mod <module>;`, which the crate pulls in
+/// with `include!(concat!(env!("OUT_DIR"), "/<module>_mod.rs"))`, and emits
+/// `cargo:rerun-if-changed` for the source. Call it only from a build script.
+///
+/// Why generated: a `#[path]` attribute takes a string LITERAL, so written in
+/// source it is nailed to the bundled submodule and blind to `SCX_ROOT` -- an
+/// embedder pointing `SCX_ROOT` at their own scx tree got the scheduler `.so`
+/// from their tree and the upstream Rust from ours, in one binary, silently.
+/// `include!`ing the file straight into an inline `mod` is not an option
+/// either: upstream files open with `//!` module docs, and inner doc comments
+/// are illegal in a macro expansion (E0753). The one-line wrapper keeps the
+/// upstream file an ordinary file module, byte-identical to the pin.
+///
+/// The file is parsed under the CALLING crate's edition, so that crate must be
+/// on the upstream crate's edition (scx_layered: 2024).
+pub fn emit_upstream_module(scx_root: &Path, rel: &str, module: &str) {
+    let src = scx_root.join(rel);
+    assert!(
+        src.is_file(),
+        "{rel} not found at {} (is SCX_ROOT an scx checkout?)",
+        src.display()
+    );
+    let out_dir =
+        PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR unset: not a build script"));
+    std::fs::write(
+        out_dir.join(format!("{module}_mod.rs")),
+        format!("#[path = {src:?}]\npub mod {module};\n"),
+    )
+    .unwrap_or_else(|e| panic!("write {module}_mod.rs: {e}"));
+    println!("cargo:rerun-if-changed={}", src.display());
 }
 
 /// Whether the scx tree at `scx_root` uses the NEW cgroup_bw function signatures,
@@ -547,6 +595,16 @@ pub fn build_schedulers(
     let kconfig_defines = kernel_config.cflag_defines();
 
     // CFLAGS_BASE — applied to every scheduler TU (mirrors Makefile CFLAGS_BASE).
+    //
+    // An implicitly declared function is an ERROR, not the warning the build
+    // used to silence. Upstream scx declares much of its lib API only under
+    // `#ifdef __BPF__`, which this userspace build never defines, so a newly
+    // called lib function is undeclared here and C would type it as returning
+    // `int`: a pointer or u64 result is silently truncated, and a missing
+    // symbol only surfaces when the .so is dlopen'd, one symbol per run. The
+    // 81738161 scx bump hit both (`__scx_task_data`'s task-ctx pointer,
+    // `ravg_sat_add`'s u64). Declare such functions where the sim provides
+    // them (scxtest/overrides.h, or the scheduler's wrapper).
     let cflags_base: &[&str] = &[
         "-fPIC",
         "-DSCX_BPF_UNITTEST",
@@ -554,7 +612,7 @@ pub fn build_schedulers(
         "-O2",
         "-Wno-unused-parameter",
         "-Wno-unknown-attributes",
-        "-Wno-implicit-function-declaration",
+        "-Werror=implicit-function-declaration",
     ];
 
     // Discover schedulers: subdirs of schedulers_src that contain wrapper.c.
@@ -594,7 +652,14 @@ pub fn build_schedulers(
         .chain(std::iter::once(scx_lib.as_path()))
         .collect();
 
-    for name in &names {
+    // A scheduler that fails to compile or link must not hide the ones after
+    // it: record the failure, move on to the next scheduler, and fail the
+    // build once at the end naming every broken scheduler. The nightly scx
+    // pin bump reported only cosmos (first in sort order) for nine nights
+    // while lavd and cgroup_bw were broken behind it.
+    let mut failed: Vec<String> = Vec::new();
+
+    'sched: for name in &names {
         let sched_dir = schedulers_src.join(name);
 
         // Per-scheduler build variation is declared in the manifest (strip-const,
@@ -685,7 +750,10 @@ pub fn build_schedulers(
                 cmd.arg("-I").arg(inc);
             }
             cmd.arg("-c").arg("-o").arg(&obj).arg(src);
-            run(cmd, &format!("compile {} for {name}", src.display()));
+            if let Err(e) = run(cmd, &format!("compile {} for {name}", src.display())) {
+                failed.push(e);
+                continue 'sched;
+            }
             objs.push(obj);
         }
 
@@ -700,7 +768,10 @@ pub fn build_schedulers(
             let mut cmd = Command::new(compiler);
             cmd.args(cflags_base);
             cmd.arg("-c").arg("-o").arg(&obj).arg(&src);
-            run(cmd, &format!("compile {tu} for {name}"));
+            if let Err(e) = run(cmd, &format!("compile {tu} for {name}")) {
+                failed.push(e);
+                continue 'sched;
+            }
             objs.push(obj);
         }
 
@@ -720,8 +791,16 @@ pub fn build_schedulers(
         for obj in &objs {
             link.arg(obj);
         }
-        run(link, &format!("link libscx_{name}.so"));
+        if let Err(e) = run(link, &format!("link libscx_{name}.so")) {
+            failed.push(e);
+        }
     }
+    assert!(
+        failed.is_empty(),
+        "{} scheduler build step(s) failed (compiler diagnostics above):\n  {}",
+        failed.len(),
+        failed.join("\n  ")
+    );
 }
 
 /// File stem of a C source as a `&str` (e.g. `sim_bpf_stubs.c` → `sim_bpf_stubs`).
@@ -731,13 +810,18 @@ fn file_stem(p: &Path) -> &str {
         .unwrap_or_else(|| panic!("source path has no UTF-8 stem: {}", p.display()))
 }
 
-/// Run a compile/link command, panicking with `desc` on spawn failure or a
-/// non-zero exit (a failed scheduler build must fail the cargo build loudly).
-fn run(mut cmd: Command, desc: &str) {
+/// Run a compile/link command. A non-zero exit is returned as `Err(desc)` so
+/// the caller can collect every failing scheduler before failing the build;
+/// failing to spawn the compiler at all still panics immediately.
+fn run(mut cmd: Command, desc: &str) -> Result<(), String> {
     let status = cmd
         .status()
         .unwrap_or_else(|e| panic!("spawn failed ({desc}): {e}"));
-    assert!(status.success(), "{desc} failed: {status}");
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{desc} failed: {status}"))
+    }
 }
 
 #[cfg(test)]

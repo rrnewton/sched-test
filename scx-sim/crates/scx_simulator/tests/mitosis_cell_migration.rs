@@ -7,9 +7,9 @@
 //! checkout's scx pin, `scx_mitosis` has **no BPF timer and no `.tick`**;
 //! cell membership is applied wholesale by a userspace-driven
 //! `apply_cell_config` (`SEC("syscall")`) program. The simulator has **no
-//! hook that invokes `apply_cell_config`**, and forces
-//! `cpu_controller_disabled = true` (`schedulers/mitosis/wrapper.c`), which
-//! makes `mitosis_cgroup_move` / `mitosis_cgroup_init` early-return. The net
+//! hook that invokes `apply_cell_config`**, and mitosis tracks cgroups only
+//! through the `cgroup_mkdir` tracepoint and `p->cgroups` (scx `929f6c370`),
+//! so `mitosis_cgroup_move` / `mitosis_cgroup_init` are no-ops. The net
 //! effect: every cgroup stays bound to cell 0 (root) with a full cpumask, so
 //! **cell cpuset confinement, cross-cell rebalancing, cell split/merge, and
 //! migration-cost accounting are NOT modeled today** (tracked by the epic
@@ -295,8 +295,8 @@ fn test_multi_cell_topology_all_tasks_run() {
 /// `cgroup_migrate` should keep making forward progress after the move, just
 /// like the uncontended case. Today it is STRANDED: post-migration schedule
 /// count is 0 while co-resident tasks keep running (`mb sim-89948f`, the
-/// `mb sim-03229` scenario recurring for the mitosis `cpu_controller_disabled`
-/// path). Un-`#[ignore]` this when sim-89948f is fixed.
+/// `mb sim-03229` scenario recurring for mitosis's tracepoint cgroup
+/// tracking). Un-`#[ignore]` this when sim-89948f is fixed.
 #[test]
 #[ignore = "mb sim-89948f: queued task strands after cgroup_migrate under mitosis; \
             un-ignore when the re-enqueue path is fixed"]

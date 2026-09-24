@@ -1,5 +1,4 @@
 use std::env;
-use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -23,40 +22,6 @@ fn main() {
     // every scheduler's scx sources (headers, BPF source, the scx/lib bodies lavd
     // compiles in) follow one override path.
     let scx_root = resolve_scx_root(&root_dir.join("scx"));
-
-    // scx_layered's real CPU allocator, compiled into the lib verbatim (see
-    // safe/layered_alloc.rs for why). Resolve its path HERE, from the same
-    // `scx_root` every other scx source follows, and hand it to the source via
-    // `cargo:rustc-env`.
-    //
-    // It used to be a `#[path = "../../../../../scx/..."]` literal in
-    // safe/mod.rs. A `#[path]` attribute takes a string LITERAL, so it is fixed
-    // at the bundled submodule and CANNOT see SCX_ROOT -- an embedder pointing
-    // SCX_ROOT at their own scx tree got the C side from their tree and this
-    // allocator from ours, in one binary, with no warning.
-    //
-    // So generate the literal instead. The alternative, `include!`ing alloc.rs
-    // straight into an inline `mod`, does not work: alloc.rs opens with 226
-    // lines of `//!` module docs, and inner doc comments are only legal at the
-    // start of a module, never in a macro expansion (E0753). Emitting a
-    // one-line `#[path = "<abs>"] pub mod ...;` wrapper into OUT_DIR keeps
-    // alloc.rs loaded as an ordinary file module -- byte-identical to the pin,
-    // no source rewriting -- while the path itself follows scx_root.
-    let layered_alloc_rs = scx_root.join("scheds/rust/scx_layered/src/alloc.rs");
-    assert!(
-        layered_alloc_rs.is_file(),
-        "scx_layered's alloc.rs not found at {} (is SCX_ROOT an scx checkout?)",
-        layered_alloc_rs.display()
-    );
-    fs::write(
-        out_dir.join("layered_alloc_upstream_mod.rs"),
-        format!(
-            "#[path = {:?}]\npub mod layered_alloc_upstream;\n",
-            layered_alloc_rs
-        ),
-    )
-    .expect("write layered_alloc_upstream_mod.rs");
-    println!("cargo:rerun-if-changed={}", layered_alloc_rs.display());
 
     let coverage = env::var("SCX_SIM_COVERAGE").as_deref() == Ok("1");
 

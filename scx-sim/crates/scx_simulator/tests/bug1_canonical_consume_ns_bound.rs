@@ -33,10 +33,13 @@
 //! The averaging is essential because scxsim's lib-side enforcement is
 //! INTRINSICALLY loose on a per-period basis:
 //!
-//!   * Period 0 has no throttle history, so a runnable task burns
-//!     down a full slice (~100ms) before the first replenishment
-//!     calculates its debt. Any per-period bound would fail here on a
-//!     correctly-functioning fix.
+//!   * Period 0 has no consumption history (the library starts from a
+//!     zero rate estimate), so the task overshoots the quota before the
+//!     first throttle takes hold: 17.6ms against a 10ms quota at scx
+//!     413031d44. Before upstream f437eaa1f / 1d2b7224b (scx pin bump
+//!     of 2026-09-24) period 0 was not enforced at all and a runnable
+//!     task burned a full ~100ms. Either way, a per-period bound at the
+//!     quota would fail here on a correctly-functioning fix.
 //!
 //!   * Subsequent periods see ~2× over-shoot from in-flight consume
 //!     that races with the throttle decision (the lib observes the
@@ -52,9 +55,10 @@
 //!   avg ≈ 100M ≫ bound.
 //!
 //! Post-V4-C: only periods with actual runnable work produce consume
-//!   charges. Average across the 600ms / 6-period run drops to ~25M
-//!   (initial burn-down period + occasional active periods + zero
-//!   during STALL recovery). avg ≪ bound.
+//!   charges. Average across the 1200ms / 12-period run is ~10.7M at
+//!   scx 413031d44 (active periods + zero during STALL recovery). It
+//!   was ~25M over the 600ms run this test used before the 2026-09-24
+//!   pin bump, when period 0 was unenforced. avg ≪ bound.
 //!
 //! # CRITICAL CAVEAT
 //!
@@ -72,7 +76,8 @@ mod common;
 
 // ---------------------------------------------------------------------------
 // Constants matching the canonical bug-1 fixture (smoking-gun variant:
-// single hog, 4 CPUs, 600ms duration, 10ms/100ms quota).
+// single hog, 4 CPUs, 10ms/100ms quota). The duration is longer than the
+// fixture's 600ms; see `DURATION_MS`.
 // ---------------------------------------------------------------------------
 
 /// Replenish period in ns (matches lib's CBW_REPLENISH_PERIOD = 100ms).
@@ -84,13 +89,23 @@ const NR_TASKS: i64 = 1;
 /// Defensive 4× slack absorbs legitimate in-flight consume that races
 /// with the throttle decision (the lib observes consume after the
 /// engine has already dispatched the next slice) AND the period-0
-/// warm-up burn-down. Empirically the post-V4-C average lands ~25M
-/// for the H6 cell-C scenario; the bound 4× × 10M × 1 = 40M leaves
-/// ~38% headroom while still being well below the pre-V4-C ~100M
-/// every-period floor.
+/// overshoot. Empirically the post-V4-C average lands ~10.7M for the
+/// H6 cell-C scenario at scx 413031d44 (~25M before the 2026-09-24 pin
+/// bump; see `DURATION_MS`). The bound 4× × 10M × 1 = 40M is unchanged
+/// by that bump and sits well below the pre-V4-C ~100M every-period
+/// floor.
 const SLACK_FACTOR: i64 = 4;
-/// Simulated wall duration. 600ms / 100ms-period = 6 replenishments.
-const DURATION_MS: u64 = 600;
+/// Simulated wall duration. 1200ms / 100ms-period = 12 replenishments.
+///
+/// It was 600ms up to the scx pin bump of 2026-09-24 (59c30baee ->
+/// 413031d44). Upstream f437eaa1f ("manage only cgroups that define a
+/// limit") and 1d2b7224b ("manage a cgroup that gains a cpu.max limit
+/// at runtime") enforce the quota from period 0, and the first STALL
+/// window — a period with zero consume, which test 2 requires — now
+/// comes at period index 7, after a 600ms run has ended. 1200ms observes
+/// two (indices 7 and 10). Same change, and the same measurements, as
+/// `build_h6_scenario` in `cgroup_bw_replenish_smoking_gun.rs`.
+const DURATION_MS: u64 = 1200;
 
 /// LAVD `enable_cpu_bw` boolean global setter (mirrors the helper in
 /// `cgroup_bw_replenish_smoking_gun.rs` — kept local-private here to
@@ -148,7 +163,8 @@ fn aggregate_consume_per_period(trace: &Trace) -> BTreeMap<u64, BTreeMap<u64, u6
 /// the engine charged ~100M ns every period from stale-prev
 /// consume_prev fall-through (avg ≈ 100M ≫ bound). Post-V4-C the
 /// charges reflect only legitimate task runtime — STALL periods drop
-/// to zero, balancing out the active periods (avg ≈ 25M).
+/// to zero, balancing out the active periods (avg ≈ 10.7M at scx
+/// 413031d44).
 ///
 /// REGRESSION SEMANTICS: if this test fails on simulator.v6 or later
 /// with "avg consume X exceeds bound Y", the V4-C engine fix has
@@ -158,7 +174,7 @@ fn aggregate_consume_per_period(trace: &Trace) -> BTreeMap<u64, BTreeMap<u64, u6
 /// `prev_task = None` clears) and `experiments/scxsim_cbw_engine_fix_v4c_20260513/REPORT.md`.
 ///
 /// See module-level docs above for why a per-period bound is NOT
-/// asserted here (period 0 burn-down + 2× over-shoot from skid make
+/// asserted here (period 0 overshoot + 2× over-shoot from skid make
 /// per-period bounds intrinsically loose; the average captures the
 /// fundamental V4-C property).
 ///
@@ -187,7 +203,7 @@ fn test_bug1_canonical_consume_ns_bound() {
     let per_cg_per_period = aggregate_consume_per_period(&trace);
     assert!(
         !per_cg_per_period.is_empty(),
-        "expected at least one CgroupBwConsumeNs event over a 600ms run \
+        "expected at least one CgroupBwConsumeNs event over a {DURATION_MS}ms run \
          under LAVD + enable_cpu_bw + finite-quota cgroup. Got zero — the \
          V4-A CgroupBwConsumeNs trace observer may have regressed, or the \
          LAVD .so was built without SCXSIM_PHASE2_REAL_CGROUP_BW=1."
@@ -265,8 +281,8 @@ fn test_bug1_canonical_consume_ns_zero_during_stall() {
     );
 
     // Compute total periods elapsed (final event timestamp / period).
-    // The H6 scenario runs 600ms = 6 periods; we expect at least 4
-    // periods to elapse (some scheduling slack at start/end).
+    // The H6 scenario runs 1200ms = 12 periods (see `DURATION_MS`); the
+    // first zero-consume period is index 7.
     let max_period_idx: u64 = per_cg_per_period
         .values()
         .flat_map(|m| m.keys().copied())

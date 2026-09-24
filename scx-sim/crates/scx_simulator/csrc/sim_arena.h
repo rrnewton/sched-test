@@ -81,6 +81,23 @@ static inline void *sim_arena_calloc(unsigned long size)
 }
 
 /*
+ * sim_arena_calloc() with the start aligned to `align`, a power of two. Every
+ * allocation is already SIM_ARENA_ALIGN-aligned, so only a larger alignment
+ * moves the bump pointer. Honoured up to the page size, the alignment of the
+ * buffer itself (sim_arena.c); upstream's arena allocator carves elements out
+ * of pages and has the same bound. SIM_ARENA_SIZE is a multiple of every such
+ * alignment, so the rounded offset never passes the end of the buffer.
+ */
+static inline void *sim_arena_calloc_aligned(unsigned long size,
+					     unsigned long align)
+{
+	if (align > SIM_ARENA_ALIGN)
+		sim_arena_offset = (sim_arena_offset + align - 1) &
+				   ~(align - 1);
+	return sim_arena_calloc(size);
+}
+
+/*
  * Free is a no-op — the arena is bulk-reset between simulation runs.
  */
 static inline void sim_arena_free(void *ptr)

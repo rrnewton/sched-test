@@ -1,0 +1,16 @@
+[package]
+name = "scx_layered_alloc"
+version = "0.1.0"
+# 2024, NOT 2021, and this is why the crate exists at all. src/lib.rs compiles
+# upstream scx/scheds/rust/scx_layered/src/alloc.rs verbatim, and an included
+# file is parsed under the INCLUDING crate's edition. Upstream scx_layered is
+# edition 2024 and alloc.rs uses let chains, which do not parse under 2021 —
+# "let chains are only allowed in Rust 2024 or later". The edition of a crate
+# that inlines upstream source must track that source; it is not a free choice.
+# Isolating the one file here lets it follow upstream while scx_simulator stays
+# on 2021.
+edition = "2024"
+publish = false
+
+[build-dependencies]
+scxsim-build = { path = "../scxsim-build" }

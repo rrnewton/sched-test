@@ -1,9 +1,10 @@
 /*
  * sim_sdt_stubs.c - Simulator implementations of BPF arena / SDT task storage
  *
- * In the real kernel, scx_task_alloc/data/free use BPF arena memory and
- * task-local storage maps for per-task scheduler context. In the simulator,
- * we use malloc and a simple hash table keyed by task_struct pointer.
+ * In the real kernel, the scx_task_* API (scx/lib/sdt_task.bpf.c) keeps each
+ * task's scheduler context in BPF arena memory, found through a task-local
+ * storage map. In the simulator, the context comes from the deterministic sim
+ * arena and is found through a hash table keyed by task_struct pointer.
  *
  * These are strong definitions that override the __weak stubs in
  * scxtest/overrides.c (vendored in this crate).
@@ -18,6 +19,9 @@
 
 /* Use kern_types.h for basic types (u32, u64, etc.) */
 #include "kern_types.h"
+
+#include <errno.h>
+#include <stdio.h>
 
 /* Opaque — we only handle pointers, never dereference task_struct here */
 struct task_struct;
@@ -52,20 +56,41 @@ extern void sim_rbc_resume(void);
  * in the cpu-bw-stall-bug stress matrix). Open-addressing probe distance
  * stays bounded under 50% load so determinism holds.
  *
- * Memory cost: SDT_HASH_SLOTS * sizeof(struct sdt_entry) = 16 384 * 16
- * bytes = 256 KB BSS. Negligible vs the 32 MB arena.
+ * Memory cost: SDT_HASH_SLOTS * sizeof(struct sdt_entry) = 16 384 * 24
+ * bytes = 384 KB BSS. Negligible vs the 32 MB arena.
+ *
+ * Removal uses backward-shift deletion (sdt_remove), not a plain clear: a
+ * cleared slot would end the probe chain of every entry that had been
+ * displaced past it, and those live tasks would then look up as having no
+ * data.
  */
 #define SDT_HASH_SLOTS 16384
 #define SDT_HASH_MASK (SDT_HASH_SLOTS - 1)
 
 struct sdt_entry {
 	struct task_struct *key; /* NULL = empty slot */
-	void *data;             /* malloc'd per-task context */
+	void *data;             /* arena-allocated per-task context */
+	unsigned long home;     /* sdt_hash_pid() of key's PID at insert */
 };
 
 static struct sdt_entry sdt_table[SDT_HASH_SLOTS];
 static u64 sdt_data_size;
+static u64 sdt_align;
 static int sdt_initialized;
+
+/*
+ * Upstream reports API misuse and failed lookups with scx_err_loc(): a line on
+ * the program's BPF stderr stream, which scx userspace forwards to its own
+ * stderr. It is a report, not an abort. The simulator writes the line to
+ * stderr directly. Call only between sim_rbc_pause() and sim_rbc_resume().
+ */
+#define sdt_err(fmt, ...) fprintf(stderr, fmt "\n", ##__VA_ARGS__)
+
+/*
+ * Count of failed scx_task_data() lookups reported on stderr. Exposed
+ * (non-static) so tests can tell the reporting lookup from the quiet one.
+ */
+unsigned long sim_sdt_missing_data_reports;
 
 /*
  * Test-only fault injection for scx_task_alloc().
@@ -103,6 +128,12 @@ static unsigned long sdt_hash_pid(int pid)
 	return v & SDT_HASH_MASK;
 }
 
+/* Home slot of a task: where its probe sequence starts. */
+static unsigned long sdt_home(struct task_struct *p)
+{
+	return sdt_hash_pid(p ? sim_task_get_pid(p) : 0);
+}
+
 /*
  * Find a slot in the hash table for the given task.
  *
@@ -110,12 +141,10 @@ static unsigned long sdt_hash_pid(int pid)
  * and matches by task_struct pointer for correctness (PIDs are unique
  * per-task but the pointer is the actual key).
  */
-static struct sdt_entry *sdt_find_slot(struct task_struct *p)
+static struct sdt_entry *sdt_find_slot(struct task_struct *p, unsigned long home)
 {
-	int pid = p ? sim_task_get_pid(p) : 0;
-	unsigned long idx = sdt_hash_pid(pid);
 	for (unsigned long i = 0; i < SDT_HASH_SLOTS; i++) {
-		unsigned long slot = (idx + i) & SDT_HASH_MASK;
+		unsigned long slot = (home + i) & SDT_HASH_MASK;
 		if (sdt_table[slot].key == p || sdt_table[slot].key == (void *)0)
 			return &sdt_table[slot];
 	}
@@ -123,15 +152,67 @@ static struct sdt_entry *sdt_find_slot(struct task_struct *p)
 }
 
 /*
+ * Remove an entry without breaking any other entry's probe chain (Knuth's
+ * Algorithm R). Walk the cluster after the hole; an entry whose home slot
+ * does not lie cyclically in (hole, slot] probed past the hole to get where
+ * it is, so move it back into the hole and continue from its old slot. The
+ * stored home is used rather than re-hashing the key, because the key's
+ * task_struct may already have been freed.
+ */
+static void sdt_remove(struct sdt_entry *entry)
+{
+	unsigned long hole = (unsigned long)(entry - sdt_table);
+	unsigned long slot = hole;
+
+	for (unsigned long i = 1; i < SDT_HASH_SLOTS; i++) {
+		slot = (slot + 1) & SDT_HASH_MASK;
+		if (sdt_table[slot].key == (void *)0)
+			break;
+		if (((slot - sdt_table[slot].home) & SDT_HASH_MASK) >=
+		    ((slot - hole) & SDT_HASH_MASK)) {
+			sdt_table[hole] = sdt_table[slot];
+			hole = slot;
+		}
+	}
+	sdt_table[hole] = (struct sdt_entry){ 0 };
+}
+
+/* The live entry for @p, or NULL if it has none. Call while RBC-paused. */
+static struct sdt_entry *sdt_lookup(struct task_struct *p)
+{
+	struct sdt_entry *entry;
+
+	if (!sdt_initialized || !p)
+		return (void *)0;
+
+	entry = sdt_find_slot(p, sdt_home(p));
+	return entry && entry->key == p ? entry : (void *)0;
+}
+
+/*
  * Initialize the per-task allocator. Called once during scheduler init.
  *
  * In the real kernel, this sets up the radix-tree allocator with arena
- * pages. In the simulator, we just record the data size for malloc.
+ * pages; in the simulator, per-task data comes from the sim arena, so only
+ * the size and alignment are recorded. The argument checks are upstream's
+ * (scx_alloc_init): align 0 means the default of 8, and an alignment below
+ * 8 or not a power of two is reported and rejected with -EINVAL, leaving
+ * any earlier configuration in place.
  */
-int scx_task_init(u64 data_size)
+int scx_task_init(u64 data_size, u64 align)
 {
 	sim_rbc_pause();
+
+	if (!align)
+		align = 8;
+	if (align < 8 || (align & (align - 1))) {
+		sdt_err("scx_task_init: invalid alignment %llu", align);
+		sim_rbc_resume();
+		return -EINVAL;
+	}
+
 	sdt_data_size = data_size;
+	sdt_align = align;
 	__builtin_memset(sdt_table, 0, sizeof(sdt_table));
 	sdt_initialized = 1;
 	sim_rbc_resume();
@@ -142,11 +223,12 @@ int scx_task_init(u64 data_size)
  * Allocate per-task scheduler context for a task.
  *
  * Returns a pointer to zero-initialized memory of sdt_data_size bytes,
- * or NULL on failure.
+ * aligned to sdt_align, or NULL on failure.
  */
 void *scx_task_alloc(struct task_struct *p)
 {
 	struct sdt_entry *entry;
+	unsigned long home;
 	void *data;
 
 	sim_rbc_pause();
@@ -167,13 +249,14 @@ void *scx_task_alloc(struct task_struct *p)
 		return (void *)0;
 	}
 
-	data = sim_arena_calloc(sdt_data_size);
+	data = sim_arena_calloc_aligned(sdt_data_size, sdt_align);
 	if (!data) {
 		sim_rbc_resume();
 		return (void *)0;
 	}
 
-	entry = sdt_find_slot(p);
+	home = sdt_home(p);
+	entry = sdt_find_slot(p, home);
 	if (!entry) {
 		sim_arena_free(data);
 		sim_rbc_resume();
@@ -186,60 +269,75 @@ void *scx_task_alloc(struct task_struct *p)
 
 	entry->key = p;
 	entry->data = data;
+	entry->home = home;
 	sim_rbc_resume();
 	return data;
 }
 
 /*
- * Look up existing per-task context for a task.
- *
- * Returns NULL if the task has no allocated context.
+ * Look up existing per-task context for a task: __scx_task_data() returns
+ * NULL quietly, for callers where absence is expected; scx_task_data() also
+ * reports the miss, as upstream does through scx_err_loc().
  */
-void *scx_task_data(struct task_struct *p)
+static void *sdt_task_data(struct task_struct *p, int report_missing)
 {
 	struct sdt_entry *entry;
+	void *data;
 
 	sim_rbc_pause();
-
-	if (!sdt_initialized || !p) {
-		sim_rbc_resume();
-		return (void *)0;
+	entry = sdt_lookup(p);
+	data = entry ? entry->data : (void *)0;
+	if (!data && report_missing) {
+		sim_sdt_missing_data_reports++;
+		sdt_err("scx_task_data: no task data (pid %d)",
+			p ? sim_task_get_pid(p) : 0);
 	}
-
-	entry = sdt_find_slot(p);
-	if (!entry || entry->key != p) {
-		sim_rbc_resume();
-		return (void *)0;
-	}
-
 	sim_rbc_resume();
-	return entry->data;
+	return data;
+}
+
+void *__scx_task_data(struct task_struct *p)
+{
+	return sdt_task_data(p, 0);
+}
+
+void *scx_task_data(struct task_struct *p)
+{
+	return sdt_task_data(p, 1);
 }
 
 /*
- * Free per-task context when a task exits.
+ * Drop a task's context. Repeated frees and frees of a task that never had
+ * context are no-ops, as upstream, where the first caller claims the data.
  */
-void scx_task_free(struct task_struct *p)
+static void sdt_task_free(struct task_struct *p)
 {
 	struct sdt_entry *entry;
 
 	sim_rbc_pause();
-
-	if (!sdt_initialized || !p) {
-		sim_rbc_resume();
-		return;
+	entry = sdt_lookup(p);
+	if (entry) {
+		sim_arena_free(entry->data);
+		sdt_remove(entry);
 	}
-
-	entry = sdt_find_slot(p);
-	if (!entry || entry->key != p) {
-		sim_rbc_resume();
-		return;
-	}
-
-	sim_arena_free(entry->data);
-	entry->key = (void *)0;
-	entry->data = (void *)0;
 	sim_rbc_resume();
+}
+
+void scx_task_free(struct task_struct *p)
+{
+	sdt_task_free(p);
+}
+
+/*
+ * The deferred free: upstream unlinks the data at once and returns it to the
+ * allocator only after an RCU grace period, so a pointer borrowed inside a
+ * read-side critical section stays valid. sim_arena_free() never reclaims
+ * within a run, which keeps every borrowed pointer valid at least that long,
+ * so the immediate path is already the deferred one.
+ */
+void scx_task_free_rcu(struct task_struct *p)
+{
+	sdt_task_free(p);
 }
 
 /*
@@ -259,7 +357,7 @@ void scx_arena_subprog_init(void)
  * The simulator binary links sim_sdt_stubs.c into the main executable,
  * so its static variables persist across simulation runs. This function
  * resets the SDT hash table state to what it would be after a fresh
- * scx_task_init() call with the same data_size.
+ * scx_task_init() call with the same data_size and align.
  *
  * NOTE: This does NOT reset sdt_initialized to 0 because scx_task_init()
  * is only called during scheduler load (lavd_setup), not at the start of
@@ -276,7 +374,7 @@ void sim_sdt_reset(void)
 	/* Reset the arena so the next run's allocations get the same
 	 * addresses as the first run (deterministic bump pointer). */
 	sim_arena_reset();
-	/* Note: sdt_initialized and sdt_data_size are NOT reset here.
+	/* Note: sdt_initialized, sdt_data_size and sdt_align are NOT reset here.
 	 * They are set during scheduler load (scx_task_init) and must
 	 * persist across simulation runs with the same scheduler. */
 }

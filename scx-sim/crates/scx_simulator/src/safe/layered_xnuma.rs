@@ -27,7 +27,7 @@
 //!
 //! The two functions that carry the policy — [`xnuma_check_active`] and
 //! [`xnuma_compute_rates`] — are copied from upstream `main.rs` token for
-//! token, the same way `layered_alloc.rs` copies `largest_remainder`. They
+//! token, the same way scx_layered_alloc copies `largest_remainder`. They
 //! cannot be `#[path]`-included the way `alloc.rs` is: they live in the
 //! middle of a 5000-line `main.rs` that pulls in the generated BPF skeleton.
 //!

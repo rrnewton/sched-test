@@ -56,12 +56,27 @@ unsafe fn lavd_set_bool(sched: &DynamicScheduler, name: &str, val: bool) {
 
 /// Single shared scenario builder for the two tests below: 4 CPUs, one
 /// finite-quota cgroup ("tight" = 10% of one CPU), one CPU-bound task
-/// in that cgroup, 600ms simulated duration so the lib's 100ms-period
-/// replenish_timer fires ~6 times.
+/// in that cgroup, 1200ms simulated duration so the lib's 100ms-period
+/// replenish_timer fires ~12 times.
 ///
 /// Mirrors the constants from `tests/fixtures/h6/bug1_canonical.json`
 /// (the canonical reproducer fixture) but built in-process so we get
 /// the live `Trace` object back, not a subprocess stderr stream.
+///
+/// WHY 1200ms (it was 600ms up to the scx pin bump of 2026-09-24,
+/// 59c30baee -> 413031d44). Upstream f437eaa1f ("manage only cgroups
+/// that define a limit") and 1d2b7224b ("manage a cgroup that gains a
+/// cpu.max limit at runtime") make `scx_cgroup_bw_set` enforce the
+/// quota from the first period, starting from a zero consumption-rate
+/// estimate; before them period 1 ran unlimited. The throttle cycle now
+/// takes longer to establish on this workload: the first
+/// `keep_throttled=true` comes at the 7th replenish (was the 3rd) and
+/// the first clean recovery at the 8th (was the 4th) — both after a
+/// 600ms run has ended. From there on the throttle/recovery pattern is
+/// the same at both pins (checked over 2s at each). 1200ms covers that
+/// warm-up plus two full cycles (7/8 and 10/11), so each property test
+/// 2 asserts is observed twice. The assertions themselves are
+/// unchanged.
 fn build_h6_scenario() -> Scenario {
     Scenario::builder()
         .cpus(4)
@@ -73,7 +88,7 @@ fn build_h6_scenario() -> Scenario {
             0,       // burst_us  = 0
         )
         .add_task_in_cgroup("hog", 0, workloads::cpu_bound(2_000_000_000), "tight")
-        .duration_ms(600)
+        .duration_ms(1200)
         .build()
 }
 
@@ -82,7 +97,7 @@ fn build_h6_scenario() -> Scenario {
 // ---------------------------------------------------------------------------
 
 /// Under LAVD with `enable_cpu_bw=true` and a finite-quota cgroup that
-/// crosses multiple 100ms replenish periods in 600ms of simulated time,
+/// crosses multiple 100ms replenish periods in 1200ms of simulated time,
 /// the trace MUST contain at least one `CgroupBwReplenish` event.
 ///
 /// If this assertion fails, either:
@@ -114,7 +129,7 @@ fn test_cgroup_bw_replenish_events_fire_under_lavd_with_cpu_bw() {
     assert!(
         n_replenish > 0,
         "expected at least one CgroupBwReplenish event under LAVD + \
-         enable_cpu_bw + finite-quota cgroup over 600ms (>= 6 replenish \
+         enable_cpu_bw + finite-quota cgroup over 1200ms (>= 12 replenish \
          periods). Got {n_replenish}. Likely causes: (a) LAVD not built \
          with SCXSIM_PHASE2_REAL_CGROUP_BW=1, (b) wrapper.c's \
          scxsim_cbw_snapshot_all_cgroups not exported with default \

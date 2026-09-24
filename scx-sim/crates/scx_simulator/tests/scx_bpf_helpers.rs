@@ -296,7 +296,7 @@ fn test_create_dsq_return_code_and_node() {
 
 // ---------------------------------------------------------------------------
 // 5. scx_bpf_kick_cpu(): targets an in-range CPU.
-//    Contract: the kicked CPU id is always < nr_cpu_ids. Under hog contention
+//    Contract: the kicked CPU id is always < nr_cpu_ids. Under contention
 //    lavd/cosmos issue cross-CPU kicks; every target must be a real CPU.
 //    (Presence is already covered by idle_cpu_selection.rs; here we pin the
 //    *target validity* of the argument the scheduler passed.)
@@ -306,12 +306,13 @@ fn test_create_dsq_return_code_and_node() {
 fn test_kick_cpu_targets_valid_cpu() {
     let _lock = common::setup_test();
     let cpus = 4u32;
-    // lavd kicks under saturation (preemption-driven); cosmos only issues
-    // SCX_KICK_IDLE, so it needs an idle CPU to exist before it kicks at all.
-    // See idle_cpu_selection::test_wakeup_kick_cpu_paths for why cosmos is no
-    // longer expected to kick on a saturated 8/4 workload.
-    for (label, nr_tasks) in [("lavd", 8), ("cosmos", 2)] {
-        let trace = run(label, cpus, hogs(cpus, nr_tasks, 5));
+    // lavd kicks under saturation (preemption-driven); cosmos only kicks for
+    // affinity-constrained tasks. See idle_cpu_selection::test_wakeup_kick_cpu_paths.
+    for (label, scenario) in [
+        ("lavd", hogs(cpus, 8, 5)),
+        ("cosmos", common::cosmos_affinity_kick_scenario()),
+    ] {
+        let trace = run(label, cpus, scenario);
 
         let mut kicks = 0usize;
         for e in trace.events() {

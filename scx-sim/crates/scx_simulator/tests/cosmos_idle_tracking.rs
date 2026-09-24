@@ -19,10 +19,10 @@
 //!    move is a CPU stealing queued work from the shared (busy) domain queue.
 //!
 //! COSMOS routes enqueues onto the per-node shared DSQ (the vtime/deadline path)
-//! only when userspace reports the system busy — the sim doesn't derive per-CPU
-//! utilization yet (mb sim-642cb2), so the stealing test sets it explicitly with
-//! `cosmos_set_cpu_util`, exactly as `cosmos.rs::test_shared_dsq_contention`
-//! does. Under sim COSMOS's real schedulable domain is the NUMA node, not the
+//! only when its in-BPF accounting of `p->utime` marks the CPU busy. The engine
+//! charges `p->utime` on each tick of a CPU-bound task, so the stealing test's
+//! oversubscribed run/sleep load gets there on its own, as in
+//! `cosmos.rs::test_shared_dsq_contention`. Under sim COSMOS's real schedulable domain is the NUMA node, not the
 //! LLC (its `cpus_share_cache` logic is inert — see `cosmos_llc.rs`'s header and
 //! mb sim-439319 / sim-e10316); none of the assertions here depend on LLC
 //! placement.
@@ -222,10 +222,6 @@ fn test_cosmos_steals_queued_work() {
     let nr_tasks = 10u32; // 2.5x oversubscribed → work backs up on the shared DSQ
 
     let sched = DynamicScheduler::cosmos(nr_cpus);
-    // Report a saturated system so enqueues route to the shared DSQ (deadline
-    // path) rather than per-CPU queues — the sim doesn't derive util yet
-    // (mb sim-642cb2), matching cosmos.rs::test_shared_dsq_contention.
-    sched.cosmos_set_cpu_util(nr_cpus, 1024);
 
     let mut b = Scenario::builder().cpus(nr_cpus).seed(42).instant_timing();
     for i in 1..=nr_tasks {
@@ -496,11 +492,7 @@ fn test_cosmos_idle_tracking_determinism() {
         }
         b.duration_ms(150).build()
     };
-    let mk = || {
-        let s = DynamicScheduler::cosmos(4);
-        s.cosmos_set_cpu_util(4, 1024);
-        s
-    };
+    let mk = || DynamicScheduler::cosmos(4);
     let t1 = Simulator::new(mk()).run(build());
     let t2 = Simulator::new(mk()).run(build());
     assert_identical(&t1, &t2, "cosmos idle-tracking");

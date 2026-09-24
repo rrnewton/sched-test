@@ -86,39 +86,18 @@ fn kick_burst_scenario() -> Scenario {
     b.duration_ms(300).build()
 }
 
-/// A mutual-wake + hog mix on 4 CPUs that reliably drives kicks (including
-/// self-kicks) on `cosmos`.
-fn mixed_kick_scenario() -> Scenario {
-    let (a, bb) = workloads::ping_pong(Pid(1), Pid(2), 300_000);
-    let mut b = Scenario::builder()
-        .cpus(4)
-        .task(td("ping", 1, a, Some(MmId(1))))
-        .task(td("pong", 2, bb, Some(MmId(1))));
-    for i in 0..3 {
-        b = b.task(td(
-            &format!("io{i}"),
-            3 + i,
-            workloads::io_bound(500_000, 3_000_000),
-            None,
-        ));
-    }
-    for i in 0..2 {
-        b = b.task(td(
-            &format!("hog{i}"),
-            20 + i,
-            workloads::cpu_bound(50_000_000),
-            None,
-        ));
-    }
-    b.duration_ms(300).build()
-}
-
 /// Schedulers paired with a workload under which they reliably issue kicks:
-/// `lavd` kicks heavily under the 2-CPU burst, `cosmos` under the 4-CPU mix.
+/// `lavd` kicks heavily under the 2-CPU burst; `cosmos` only kicks for
+/// affinity-constrained tasks now, so it gets the confined-I/O workload (see
+/// `common::cosmos_affinity_kick_scenario`).
 fn reliable_kicker_runs() -> [(&'static str, DynamicScheduler, Scenario); 2] {
     [
         ("lavd", DynamicScheduler::lavd(2), kick_burst_scenario()),
-        ("cosmos", DynamicScheduler::cosmos(4), mixed_kick_scenario()),
+        (
+            "cosmos",
+            DynamicScheduler::cosmos(4),
+            common::cosmos_affinity_kick_scenario(),
+        ),
     ]
 }
 

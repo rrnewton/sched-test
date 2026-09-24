@@ -960,6 +960,7 @@ impl SimulatorState {
 
             if (target_cpu.0 as usize) < self.cpus.len() {
                 self.cpus[target_cpu.0 as usize].local_dsq.push_back(pd.pid);
+                self.resched_if_remote_idle(local_cpu, target_cpu);
             }
             Some(target_cpu)
         } else if let Some(vtime) = pd.vtime {
@@ -977,6 +978,34 @@ impl SimulatorState {
                 .sample_dsq_lengths(local_t, &self.dsqs, DsqSampleTrigger::Insert, Some(dsq));
             None
         }
+    }
+
+    /// Wake `target_cpu` if a task was just queued on its local DSQ from
+    /// another CPU while it sits idle.
+    ///
+    /// Mirrors the kernel's `local_dsq_post_enq()`: after inserting into a
+    /// local DSQ it calls `resched_curr(rq)` whenever the rq's current task
+    /// is of a lower class than ext — the idle task included — and for a
+    /// remote rq that is a reschedule IPI. Without it, a remote
+    /// `SCX_DSQ_LOCAL_ON` insert (e.g. scx_cosmos' `SCX_ENQ_IMMED` direct
+    /// dispatch from `ops.enqueue`) strands the task on a CPU that nothing
+    /// will ever wake. The IPI is staged as an `IDLE` kick, which is a no-op
+    /// if the CPU picked up work before delivery; unlike
+    /// `scx_bpf_kick_cpu` it records no `KickCpu` trace event, because the
+    /// scheduler issued no kick.
+    fn resched_if_remote_idle(&mut self, local_cpu: CpuId, target_cpu: CpuId) {
+        if target_cpu == local_cpu || !self.cpus[target_cpu.0 as usize].is_idle() {
+            return;
+        }
+        let local_t = self.cpus[self.current_cpu.0 as usize].local_clock;
+        let delivery_t = local_t + self.overhead.effective_ipi_delivery_ns();
+        self.staged_events.push((
+            delivery_t,
+            StagedEvent::KickDelivered {
+                cpu: target_cpu,
+                flags: KickFlags::IDLE,
+            },
+        ));
     }
 
     /// Check if a dispatch to `SCX_DSQ_LOCAL_ON | target_cpu` is valid.
@@ -4081,6 +4110,62 @@ mod tests {
         free_task(&mut arc.lock().unwrap().sim, Pid(1));
     }
 
+    /// A LOCAL_ON insert onto an idle remote CPU must wake it (kernel
+    /// `local_dsq_post_enq` → `resched_curr`); one onto the resolving CPU
+    /// itself or onto a busy CPU must not.
+    #[test]
+    fn test_resolve_local_on_resched_ipi_only_for_idle_remote() {
+        let _lock = SIM_LOCK.lock().unwrap();
+        let state = test_state(4);
+        let arc = test_sim_arc(state);
+        arc.lock().unwrap().sim.cpus[3].current_task = Some(Pid(99));
+
+        let pids = [Pid(1), Pid(2), Pid(3)];
+        let targets = [0u64, 2, 3];
+        let ps: Vec<_> = pids
+            .iter()
+            .map(|&pid| register_task(&mut arc.lock().unwrap().sim, pid))
+            .collect();
+
+        let cpu = arc.lock().unwrap().sim.current_cpu;
+        enter_test_sim(&arc, cpu);
+        for (&p, &t) in ps.iter().zip(&targets) {
+            scx_bpf_dsq_insert(p, DsqId::LOCAL_ON_MASK | t, 5_000_000, 0);
+        }
+        exit_test_sim();
+
+        let mut guard = arc.lock().unwrap();
+        guard.sim.resolve_pending_dispatch(CpuId(0));
+        let woken: Vec<_> = guard
+            .sim
+            .staged_events
+            .iter()
+            .map(|(_, ev)| ev.clone())
+            .collect();
+        assert_eq!(
+            woken,
+            vec![StagedEvent::KickDelivered {
+                cpu: CpuId(2),
+                flags: KickFlags::IDLE,
+            }],
+            "only idle remote CPU 2 should get a resched IPI"
+        );
+        assert!(
+            !guard
+                .sim
+                .trace
+                .events()
+                .iter()
+                .any(|e| matches!(e.kind, TraceKind::KickCpu { .. })),
+            "a kernel resched IPI is not a scheduler-issued scx_bpf_kick_cpu"
+        );
+
+        drop(guard);
+        for pid in pids {
+            free_task(&mut arc.lock().unwrap().sim, pid);
+        }
+    }
+
     /// Test that SCX_DSQ_LOCAL_ON dispatch to a CPU outside cpumask fails.
     #[test]
     fn test_resolve_pending_dispatch_local_on_cpumask_violation() {
@@ -4966,8 +5051,8 @@ mod tests {
 
         let p = register_task(&mut arc.lock().unwrap().sim, Pid(100));
 
-        // Initialize the allocator with 256 bytes per task
-        let ret = unsafe { ffi::scx_task_init(256) };
+        // Initialize the allocator with 256 bytes per task, default alignment
+        let ret = unsafe { ffi::scx_task_init(256, 0) };
         assert_eq!(ret, 0);
 
         // Allocate per-task data
@@ -4987,8 +5072,8 @@ mod tests {
         unsafe { ffi::scx_task_free(p) };
 
         // After free, data should be gone
-        let data3 = unsafe { ffi::scx_task_data(p) };
-        assert!(data3.is_null(), "scx_task_data must return null after free");
+        let data3 = unsafe { ffi::__scx_task_data(p) };
+        assert!(data3.is_null(), "task data must be gone after free");
 
         free_task(&mut arc.lock().unwrap().sim, Pid(100));
     }
@@ -5002,7 +5087,7 @@ mod tests {
         let p1 = register_task(&mut arc.lock().unwrap().sim, Pid(10));
         let p2 = register_task(&mut arc.lock().unwrap().sim, Pid(20));
 
-        let ret = unsafe { ffi::scx_task_init(64) };
+        let ret = unsafe { ffi::scx_task_init(64, 0) };
         assert_eq!(ret, 0);
 
         let d1 = unsafe { ffi::scx_task_alloc(p1) };
@@ -5017,12 +5102,68 @@ mod tests {
 
         // Free one, other remains
         unsafe { ffi::scx_task_free(p1) };
-        assert!(unsafe { ffi::scx_task_data(p1) }.is_null());
+        assert!(unsafe { ffi::__scx_task_data(p1) }.is_null());
         assert_eq!(unsafe { ffi::scx_task_data(p2) }, d2);
 
         unsafe { ffi::scx_task_free(p2) };
         free_task(&mut arc.lock().unwrap().sim, Pid(10));
         free_task(&mut arc.lock().unwrap().sim, Pid(20));
+    }
+
+    /// Freeing one task's data must not hide any other live task's data.
+    ///
+    /// 2000 tasks in the 16 384-slot table guarantee home-slot collisions, so
+    /// some entries sit displaced past others. Clearing a freed slot to empty
+    /// (the original deletion) ended those entries' probe chains: at 2000
+    /// tasks with every other one freed, 49 of the 1000 survivors looked up
+    /// as NULL. Real task storage never loses a live task's entry.
+    #[test]
+    fn test_sdt_task_free_keeps_displaced_entries_reachable() {
+        let _lock = SIM_LOCK.lock().unwrap();
+        let state = test_state(1);
+        let arc = test_sim_arc(state);
+        let pids: Vec<Pid> = (1..=2000).map(Pid).collect();
+        let tasks: Vec<*mut c_void> = pids
+            .iter()
+            .map(|&pid| register_task(&mut arc.lock().unwrap().sim, pid))
+            .collect();
+        assert_eq!(unsafe { ffi::scx_task_init(64, 0) }, 0);
+        let alloc = |p: *mut c_void| {
+            let d = unsafe { ffi::scx_task_alloc(p) };
+            assert!(!d.is_null());
+            d
+        };
+        let mut data: Vec<*mut c_void> = tasks.iter().map(|&p| alloc(p)).collect();
+        let lookup_mismatches = |data: &[*mut c_void], freed: &dyn Fn(usize) -> bool| {
+            (0..tasks.len())
+                .filter(|&i| {
+                    let want = if freed(i) { ptr::null_mut() } else { data[i] };
+                    (unsafe { ffi::__scx_task_data(tasks[i]) }) != want
+                })
+                .count()
+        };
+
+        // Free every other task: survivors must all still resolve.
+        for &p in tasks.iter().step_by(2) {
+            unsafe { ffi::scx_task_free(p) };
+        }
+        assert_eq!(lookup_mismatches(&data, &|i| i % 2 == 0), 0);
+
+        // Re-allocate the freed half into the reshuffled table.
+        for i in (0..tasks.len()).step_by(2) {
+            data[i] = alloc(tasks[i]);
+        }
+        assert_eq!(lookup_mismatches(&data, &|_| false), 0);
+
+        // Drain in reverse insertion order: everything ends up absent.
+        for &p in tasks.iter().rev() {
+            unsafe { ffi::scx_task_free(p) };
+        }
+        assert_eq!(lookup_mismatches(&data, &|_| true), 0);
+
+        for &pid in &pids {
+            free_task(&mut arc.lock().unwrap().sim, pid);
+        }
     }
 
     #[test]
@@ -5033,14 +5174,142 @@ mod tests {
 
         let p = register_task(&mut arc.lock().unwrap().sim, Pid(50));
 
-        let ret = unsafe { ffi::scx_task_init(32) };
+        let ret = unsafe { ffi::scx_task_init(32, 0) };
         assert_eq!(ret, 0);
 
         // Before alloc, data should be null
-        let data = unsafe { ffi::scx_task_data(p) };
-        assert!(data.is_null(), "scx_task_data before alloc must be null");
+        let data = unsafe { ffi::__scx_task_data(p) };
+        assert!(data.is_null(), "task data before alloc must be null");
 
         free_task(&mut arc.lock().unwrap().sim, Pid(50));
+    }
+
+    /// scx_task_data() reports a failed lookup, as upstream does through
+    /// scx_err_loc(); __scx_task_data() is the quiet lookup for callers that
+    /// expect absence (lavd's find_task_ctx()). A hit is never reported.
+    #[test]
+    fn test_sdt_task_data_reports_miss_quiet_lookup_does_not() {
+        let _lock = SIM_LOCK.lock().unwrap();
+        let arc = test_sim_arc(test_state(1));
+        let p = register_task(&mut arc.lock().unwrap().sim, Pid(60));
+        assert_eq!(unsafe { ffi::scx_task_init(32, 0) }, 0);
+        // SAFETY: a plain C counter in sim_sdt_stubs.c, read by value;
+        // SIM_LOCK serializes every writer.
+        let reports = || unsafe { ffi::sim_sdt_missing_data_reports };
+        let before = reports();
+
+        assert!(unsafe { ffi::__scx_task_data(p) }.is_null());
+        assert_eq!(reports(), before, "__scx_task_data must not report");
+        assert!(unsafe { ffi::scx_task_data(p) }.is_null());
+        assert_eq!(reports(), before + 1, "scx_task_data must report a miss");
+
+        let d = unsafe { ffi::scx_task_alloc(p) };
+        assert_eq!(unsafe { ffi::scx_task_data(p) }, d);
+        assert_eq!(reports(), before + 1, "a hit must not be reported");
+
+        unsafe { ffi::scx_task_free(p) };
+        free_task(&mut arc.lock().unwrap().sim, Pid(60));
+    }
+
+    /// scx_task_init() takes upstream's (scx_alloc_init) alignment rule: 0
+    /// selects the default of 8, anything below 8 or not a power of two is
+    /// rejected with -EINVAL, and an accepted alignment is honoured.
+    #[test]
+    fn test_sdt_task_init_alignment() {
+        let _lock = SIM_LOCK.lock().unwrap();
+        let arc = test_sim_arc(test_state(1));
+        let pids = [Pid(70), Pid(71), Pid(72)];
+        let tasks = pids.map(|pid| register_task(&mut arc.lock().unwrap().sim, pid));
+
+        for bad in [1, 3, 4, 24, 100] {
+            let ret = unsafe { ffi::scx_task_init(40, bad) };
+            assert_eq!(ret, -libc::EINVAL, "align {bad} must be rejected");
+        }
+        for good in [0, 8, 16] {
+            assert_eq!(unsafe { ffi::scx_task_init(40, good) }, 0, "align {good}");
+        }
+
+        // A 40-byte context at align 256: every allocation starts on a
+        // 256-byte boundary, even though the bump pointer alone would not.
+        assert_eq!(unsafe { ffi::scx_task_init(40, 256) }, 0);
+        for &p in &tasks {
+            let d = unsafe { ffi::scx_task_alloc(p) };
+            assert!(!d.is_null());
+            assert_eq!(d as usize % 256, 0, "allocation {d:p} is not 256-aligned");
+        }
+
+        for (&p, &pid) in tasks.iter().zip(&pids) {
+            unsafe { ffi::scx_task_free(p) };
+            free_task(&mut arc.lock().unwrap().sim, pid);
+        }
+    }
+
+    /// Frees are idempotent, as upstream's are (the first caller claims the
+    /// data): freeing twice, freeing a task that never had data, and mixing
+    /// scx_task_free() with scx_task_free_rcu() are all no-ops after the
+    /// first, and none of them disturbs another task's data.
+    #[test]
+    fn test_sdt_task_free_is_idempotent() {
+        let _lock = SIM_LOCK.lock().unwrap();
+        let arc = test_sim_arc(test_state(1));
+        let pids = [Pid(80), Pid(81), Pid(82), Pid(83)];
+        let [a, b, never, other] = pids.map(|pid| register_task(&mut arc.lock().unwrap().sim, pid));
+        assert_eq!(unsafe { ffi::scx_task_init(64, 0) }, 0);
+        let (da, db, d_other) = unsafe {
+            (
+                ffi::scx_task_alloc(a),
+                ffi::scx_task_alloc(b),
+                ffi::scx_task_alloc(other),
+            )
+        };
+        assert!(!da.is_null() && !db.is_null() && !d_other.is_null());
+
+        unsafe {
+            ffi::scx_task_free(a);
+            ffi::scx_task_free(a);
+            ffi::scx_task_free_rcu(a);
+            ffi::scx_task_free_rcu(b);
+            ffi::scx_task_free_rcu(b);
+            ffi::scx_task_free(b);
+            ffi::scx_task_free(never);
+            ffi::scx_task_free_rcu(never);
+        }
+        for p in [a, b, never] {
+            assert!(unsafe { ffi::__scx_task_data(p) }.is_null());
+        }
+        assert_eq!(unsafe { ffi::scx_task_data(other) }, d_other);
+
+        unsafe { ffi::scx_task_free(other) };
+        for pid in pids {
+            free_task(&mut arc.lock().unwrap().sim, pid);
+        }
+    }
+
+    /// scx_task_free_rcu() unlinks the data at once, but a pointer borrowed
+    /// before the free stays readable: upstream returns the memory to the
+    /// allocator only after an RCU grace period.
+    #[test]
+    fn test_sdt_task_free_rcu_keeps_borrowed_pointer_readable() {
+        let _lock = SIM_LOCK.lock().unwrap();
+        let arc = test_sim_arc(test_state(1));
+        let p = register_task(&mut arc.lock().unwrap().sim, Pid(90));
+        assert_eq!(unsafe { ffi::scx_task_init(64, 0) }, 0);
+        let borrowed = unsafe { ffi::scx_task_alloc(p) } as *mut u64;
+        assert!(!borrowed.is_null());
+        unsafe { *borrowed = 0x5EED };
+
+        unsafe { ffi::scx_task_free_rcu(p) };
+        assert!(
+            unsafe { ffi::__scx_task_data(p) }.is_null(),
+            "unlinked at once"
+        );
+        assert_eq!(
+            unsafe { *borrowed },
+            0x5EED,
+            "still readable after free_rcu"
+        );
+
+        free_task(&mut arc.lock().unwrap().sim, Pid(90));
     }
 
     // -----------------------------------------------------------------------

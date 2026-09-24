@@ -265,19 +265,41 @@ bool bpf_cpumask_intersects(const struct cpumask *src1,
 	return false;
 }
 
-bool bpf_cpumask_test_and_set_cpu(u32 cpu, struct bpf_cpumask *cpumask)
+/*
+ * Shared body of bpf_cpumask_test_and_{set,clear}_cpu: report whether `cpu`
+ * was set, then set or clear it. An out-of-range cpu returns false and leaves
+ * the mask alone, as the kernel kfuncs' cpu_valid() check does.
+ */
+static bool sim_cpumask_test_and_assign_cpu(u32 cpu,
+					    struct bpf_cpumask *cpumask,
+					    bool set)
 {
+	unsigned long *word, bit;
 	bool was_set;
 	sim_rbc_pause();
 	if (cpu >= NR_CPUS) {
 		sim_rbc_resume();
 		return false;
 	}
-	was_set = !!(cpumask->bits[cpu / BITS_PER_LONG] &
-		     (1UL << (cpu % BITS_PER_LONG)));
-	cpumask->bits[cpu / BITS_PER_LONG] |= (1UL << (cpu % BITS_PER_LONG));
+	word = &cpumask->bits[cpu / BITS_PER_LONG];
+	bit = 1UL << (cpu % BITS_PER_LONG);
+	was_set = !!(*word & bit);
+	if (set)
+		*word |= bit;
+	else
+		*word &= ~bit;
 	sim_rbc_resume();
 	return was_set;
+}
+
+bool bpf_cpumask_test_and_set_cpu(u32 cpu, struct bpf_cpumask *cpumask)
+{
+	return sim_cpumask_test_and_assign_cpu(cpu, cpumask, true);
+}
+
+bool bpf_cpumask_test_and_clear_cpu(u32 cpu, struct bpf_cpumask *cpumask)
+{
+	return sim_cpumask_test_and_assign_cpu(cpu, cpumask, false);
 }
 
 /*

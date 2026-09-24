@@ -1,6 +1,6 @@
 //! Guards on scx_layered's real allocator being compiled into scxsim.
 //!
-//! `safe/layered_alloc_upstream` is `scx_layered/src/alloc.rs` compiled
+//! `scx_layered_alloc::layered_alloc_upstream` is `scx_layered/src/alloc.rs` compiled
 //! verbatim, so that Tier-3 CPU reallocation runs layered's actual policy
 //! instead of a re-implementation of it. Two things need guarding:
 //!
@@ -24,7 +24,7 @@ fn repo_root() -> std::path::PathBuf {
 ///
 /// Anchored at line start so a mention of the name inside a doc comment is
 /// not mistaken for the definition — the first version of this matched the
-/// provenance comment in `layered_alloc.rs` and compared docs against code.
+/// provenance comment on the vendored copy and compared docs against code.
 fn extract_fn(src: &str, name: &str) -> String {
     let needle = format!("\npub fn {name}");
     let start = src
@@ -51,11 +51,11 @@ fn normalize(s: &str) -> String {
 ///
 /// A silent copy drifts, so compare it against upstream at test time. If this
 /// fails after an scx submodule bump, re-copy the upstream body into
-/// `safe/layered_alloc.rs` — do not patch one side.
+/// `crates/scx_layered_alloc/src/lib.rs` — do not patch one side.
 #[test]
 fn vendored_largest_remainder_matches_upstream() {
     let upstream_path = repo_root().join("scx/scheds/rust/scx_layered/src/lib.rs");
-    let ours_path = repo_root().join("scx-sim/crates/scx_simulator/src/safe/layered_alloc.rs");
+    let ours_path = repo_root().join("scx-sim/crates/scx_layered_alloc/src/lib.rs");
 
     let upstream = std::fs::read_to_string(&upstream_path)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", upstream_path.display()));
@@ -69,7 +69,7 @@ fn vendored_largest_remainder_matches_upstream() {
         normalize(&ours_fn),
         normalize(&upstream_fn),
         "the vendored copy of largest_remainder has drifted from\n  {}\nRe-copy \
-         the upstream body into safe/layered_alloc.rs rather than patching \
+         the upstream body into crates/scx_layered_alloc/src/lib.rs rather than patching \
          either side.",
         upstream_path.display()
     );
