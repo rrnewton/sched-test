@@ -902,6 +902,13 @@ name = "scx_cgroup_tree"
 version = "0.1.0"
 
 [[package]]
+name = "scx_layered_alloc"
+version = "0.1.0"
+dependencies = [
+ "scxsim-build",
+]
+
+[[package]]
 name = "scx_layered_growth"
 version = "0.1.0"
 dependencies = [
@@ -935,6 +942,7 @@ dependencies = [
  "perfetto_protos",
  "protobuf",
  "rand",
+ "scx_layered_alloc",
  "scx_layered_growth",
  "scx_perf",
  "scxsim-build",

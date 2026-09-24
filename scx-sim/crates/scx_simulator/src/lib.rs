@@ -67,12 +67,8 @@ pub(crate) use safe::dsq;
 pub(crate) use safe::engine;
 pub(crate) use safe::fmt;
 pub(crate) use safe::layered;
-pub(crate) use safe::layered_alloc_upstream;
 pub(crate) use safe::layered_control;
 pub(crate) use safe::layered_xnuma;
-// scx_layered's alloc.rs does `use crate::largest_remainder;`. Re-exporting it
-// at the crate root is what lets the upstream source compile here unmodified.
-pub(crate) use safe::layered_alloc::largest_remainder;
 pub(crate) use safe::monitor;
 pub(crate) use safe::perf;
 pub(crate) use safe::perfetto;
@@ -84,6 +80,10 @@ pub(crate) use safe::topology;
 pub(crate) use safe::trace;
 pub(crate) use safe::types;
 pub use safe::workloads;
+
+// scx_layered's real CPU allocator, compiled verbatim from upstream in its own
+// crate because it must be on upstream's edition (see scx_layered_alloc).
+pub(crate) use scx_layered_alloc::layered_alloc_upstream;
 
 // Re-export the unsafe_impl sub-modules at the crate root so internal
 // `crate::ffi`, `crate::kfuncs`, etc. paths resolve. All are `pub(crate)` -- the
@@ -155,7 +155,7 @@ pub use safe::layered_config::{
 };
 // scx_layered's own allocator, compiled verbatim from the scx submodule.
 // tests/layered_alloc.rs drives it directly to prove it is the real thing.
-pub use safe::layered_alloc_upstream::{unified_alloc, LayerDemand};
+pub use scx_layered_alloc::layered_alloc_upstream::{unified_alloc, LayerDemand};
 // The cross-NUMA gate's policy, also compiled from upstream (vendored, with a
 // drift guard). tests/layered_xnuma.rs drives it directly.
 pub use safe::layered_xnuma::{

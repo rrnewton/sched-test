@@ -270,17 +270,20 @@ impl<S: Scheduler> SchedulerWrapper<S> {
 
     /// Phase 2 Stage C (tg `compile-scx-cgroup-bw-library-into-scxsim-phase2`):
     /// query the scheduler-loaded cgroup_bw library for the throttle
-    /// state of `cgrp_id`. `Some(true)` / `Some(false)` if the
-    /// scheduler models cgroup_bw and answered; `None` if the
-    /// scheduler does not link the library at all.
+    /// state of the cgroup at `cgrp_raw` (a registry-owned
+    /// `struct cgroup *`, see `CgroupRegistry::get_raw`). `None` if the
+    /// scheduler does not link the library at all; otherwise
+    /// `Some(throttled_by)`, where `throttled_by` names the throttled
+    /// cgroup holding the cgroup's tasks back, if any (see the trait
+    /// method for why that can be an ancestor).
     ///
     /// The engine's DSQ-pop admission gate (`pid_is_bw_throttled`)
     /// consults this so the library is the single source of truth for
     /// throttle state -- replacing the engine-side
     /// `BandwidthManager::is_throttled` direct read.
-    pub fn is_cgroup_throttled(&self, cgrp_id: u64) -> Option<bool> {
+    pub fn cgroup_bw_throttled_by(&self, cgrp_raw: *mut c_void) -> Option<Option<u64>> {
         // No unsafe needed: the trait method handles the FFI call site.
-        self.inner.is_cgroup_throttled(cgrp_id)
+        self.inner.cgroup_bw_throttled_by(cgrp_raw)
     }
 
     /// Phase 2 Stage E diagnostic: query the library's per-cgroup state

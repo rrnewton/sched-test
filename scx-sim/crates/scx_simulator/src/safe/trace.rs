@@ -347,8 +347,8 @@ pub enum TraceKind {
     },
     /// Engine refused to admit `pid` from a local DSQ because the
     /// scheduler-side cgroup_bw library reported its cgroup throttled
-    /// (`scxsim_cgroup_bw_is_cgroup_throttled` returned true). The task
-    /// remains queued and will be re-checked on the next dispatch.
+    /// (`scxsim_cgroup_bw_throttled_by` named a throttled cgroup). The
+    /// task remains queued and will be re-checked on the next dispatch.
     ///
     /// (Legacy lazy-throttle path — see `CgroupBwDequeueOnThrottle` /
     /// `CgroupBwReenqueueOnReplenish` for the eager-throttle replacement.)
@@ -360,7 +360,10 @@ pub enum TraceKind {
     /// admission gate because its cgroup is throttled, called
     /// `ops.dequeue` + `ops.quiescent` to remove it from the BPF
     /// scheduler's queues, and stashed it in `bw_blocked[cgid]` to be
-    /// re-runnabled on the next replenish.
+    /// re-runnabled on the next replenish. `cgid` is the throttled
+    /// cgroup the library answered for: the task's own cgroup, or the
+    /// nearest limited ancestor it bills to when its own cgroup has an
+    /// infinite `cpu.max`.
     ///
     /// Mirrors what the kernel's bandwidth controller does when a task
     /// crosses a cgroup quota: dequeue the task entirely from

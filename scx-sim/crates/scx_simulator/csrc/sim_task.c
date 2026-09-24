@@ -34,10 +34,20 @@ int LINUX_KERNEL_VERSION = SIM_LINUX_KERNEL_VERSION;
  * which in turn points at a root cgroup.  Schedulers that use cgroups
  * (e.g., mitosis) access p->cgroups->dfl_cgrp->kn->id and expect
  * consistent pointers.
+ *
+ * A task reaches its cgroup by a second route too: p->sched_task_group,
+ * the cpu controller's task_group, whose css.cgroup is the cgroup. The
+ * kernel's scx_bpf_task_cgroup() answers from that route (tg_cgrp()), and
+ * so does cgroup_bw.bpf.c's cbw_task_cgroup(), which BPF_CORE_READs it to
+ * find the cgroup a task is billed to. Every cgroup here has the cpu
+ * controller enabled — one task_group per cgroup, wired into
+ * subsys[cpu_cgrp_id] — and sim_task_set_cgroup() keeps both routes
+ * pointing at the same cgroup.
  */
 static struct kernfs_node sim_root_kn;
 static struct cgroup sim_root_cgroup;
 static struct css_set sim_root_css_set;
+static struct task_group sim_root_task_group;
 static int sim_root_cgroup_initialized;
 
 static void sim_init_root_cgroup(void)
@@ -56,7 +66,13 @@ static void sim_init_root_cgroup(void)
 	sim_root_cgroup.kn = &sim_root_kn;
 	sim_root_cgroup.self.cgroup = &sim_root_cgroup;
 	sim_root_cgroup.level = 0;
-	/* subsys[] is zeroed (no cpuset), percpu_count_ptr is 0 (not dying) */
+	/* subsys[] holds only the cpu css (no cpuset), percpu_count_ptr is 0
+	 * (not dying) */
+
+	/* The kernel's root_task_group, whose css.cgroup is the root cgroup. */
+	memset(&sim_root_task_group, 0, sizeof(sim_root_task_group));
+	sim_root_task_group.css.cgroup = &sim_root_cgroup;
+	sim_root_cgroup.subsys[cpu_cgrp_id] = &sim_root_task_group.css;
 
 	memset(&sim_root_css_set, 0, sizeof(sim_root_css_set));
 	sim_root_css_set.dfl_cgrp = &sim_root_cgroup;
@@ -76,6 +92,7 @@ struct task_struct *sim_task_alloc(void)
 	if (p) {
 		sim_init_root_cgroup();
 		p->cgroups = &sim_root_css_set;
+		p->sched_task_group = &sim_root_task_group;
 		p->real_parent = p; /* self-referencing; simulates init as parent */
 		/*
 		 * Every kernel task has credentials. Leaving `real_cred` NULL is
@@ -444,6 +461,7 @@ struct scx_exit_task_args *sim_get_exit_task_args(void)
  * - struct cgroup (main structure)
  * - struct kernfs_node (for kn->id)
  * - struct css_set (for task->cgroups)
+ * - struct task_group (the cpu css, for task->sched_task_group)
  * - struct cpuset + cpumask (for cpuset modeling)
  *
  * We allocate these together and wire up the pointers.
@@ -498,6 +516,7 @@ void *sim_cgroup_alloc(u64 cgid, u32 level, void *parent)
 	struct cgroup *cgrp;
 	struct kernfs_node *kn;
 	struct css_set *css_set;
+	struct task_group *tg;
 
 	cgrp = calloc(1, SIM_CGROUP_ALLOC_SIZE);
 	if (!cgrp)
@@ -516,6 +535,14 @@ void *sim_cgroup_alloc(u64 cgid, u32 level, void *parent)
 		return NULL;
 	}
 
+	tg = calloc(1, sizeof(struct task_group));
+	if (!tg) {
+		free(css_set);
+		free(kn);
+		free(cgrp);
+		return NULL;
+	}
+
 	/* Set up kernfs_node. The name defaults to the co-allocated (zeroed,
 	 * hence empty) buffer so it is never NULL; sim_cgroup_set_name() fills
 	 * it in. */
@@ -527,6 +554,12 @@ void *sim_cgroup_alloc(u64 cgid, u32 level, void *parent)
 	cgrp->self.cgroup = cgrp;
 	cgrp->level = level;
 	/* percpu_count_ptr = 0 means not dying */
+
+	/* The cgroup's cpu css: the task_group its tasks' sched_task_group
+	 * names. Only css.cgroup is filled in — tg_cgrp() is the one read the
+	 * scheduler surface makes of it. */
+	tg->css.cgroup = cgrp;
+	cgrp->subsys[cpu_cgrp_id] = &tg->css;
 
 	/* Set up css_set to point at this cgroup */
 	css_set->dfl_cgrp = cgrp;
@@ -604,6 +637,12 @@ void sim_cgroup_free(void *cgrp_ptr)
 	if (cgrp->kn)
 		free(cgrp->kn);
 
+	/* Free the task_group (css is its first member, so the pointers
+	 * coincide). */
+	if (cgrp->subsys[cpu_cgrp_id])
+		free(container_of(cgrp->subsys[cpu_cgrp_id], struct task_group,
+				  css));
+
 	/* Free the cpuset if allocated (cpuset_cgrp_id == 0) */
 	if (cgrp->subsys[cpuset_cgrp_id]) {
 		struct cpuset *cs = container_of(
@@ -674,8 +713,25 @@ void sim_cgroup_set_cpuset(void *cgrp_ptr, const u32 *cpus, u32 nr_cpus)
 }
 
 /*
- * Assign a task to a cgroup (update task->cgroups to point to the cgroup's css_set).
+ * Assign a task to a cgroup: update task->cgroups to point to the cgroup's
+ * css_set, and task->sched_task_group to the cgroup's task_group.
+ *
+ * The second half is the kernel's sched_cgroup_fork() / sched_change_group(),
+ * which set sched_task_group from the task's cpu css on fork and on every
+ * cgroup migration. Leaving it at the root while p->cgroups moves would make
+ * every task look like a root task to cgroup_bw.bpf.c — which bills the root,
+ * never throttles, and so silently disables cpu.max for the whole run.
  */
+static void sim_task_point_at_cgroup(struct task_struct *p, struct css_set *css,
+				     struct cgroup *cgrp)
+{
+	p->cgroups = css;
+	/* Always set: sim_init_root_cgroup() and sim_cgroup_alloc() wire a cpu
+	 * css into every cgroup they hand out. */
+	p->sched_task_group = container_of(cgrp->subsys[cpu_cgrp_id],
+					   struct task_group, css);
+}
+
 void sim_task_set_cgroup(struct task_struct *p, void *cgrp_ptr)
 {
 	struct cgroup *cgrp = (struct cgroup *)cgrp_ptr;
@@ -684,7 +740,7 @@ void sim_task_set_cgroup(struct task_struct *p, void *cgrp_ptr)
 	if (!cgrp) {
 		/* Fall back to root */
 		sim_init_root_cgroup();
-		p->cgroups = &sim_root_css_set;
+		sim_task_point_at_cgroup(p, &sim_root_css_set, &sim_root_cgroup);
 		return;
 	}
 
@@ -695,11 +751,11 @@ void sim_task_set_cgroup(struct task_struct *p, void *cgrp_ptr)
 	if (!css) {
 		/* Fall back to root on allocation failure */
 		sim_init_root_cgroup();
-		p->cgroups = &sim_root_css_set;
+		sim_task_point_at_cgroup(p, &sim_root_css_set, &sim_root_cgroup);
 		return;
 	}
 	css->dfl_cgrp = cgrp;
-	p->cgroups = css;
+	sim_task_point_at_cgroup(p, css, cgrp);
 }
 
 /*

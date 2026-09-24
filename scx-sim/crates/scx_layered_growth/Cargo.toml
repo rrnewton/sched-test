@@ -1,7 +1,11 @@
 [package]
 name = "scx_layered_growth"
 version = "0.1.0"
-edition = "2021"
+# 2024, NOT 2021 — see the matching note in crates/scx_layered_alloc/Cargo.toml.
+# src/lib.rs #[path]-includes upstream
+# scx/scheds/rust/scx_layered/src/layer_core_growth.rs, which is edition-2024
+# source and now uses let chains.
+edition = "2024"
 publish = false
 
 [lib]
@@ -13,8 +17,8 @@ publish = false
 # schema — do not compile against it. Enabling this yields ~20 hard errors,
 # not failures.
 #
-# Note the asymmetry with alloc.rs, which scx_simulator links against its real
-# dependencies and whose 80 upstream tests DO run in our suite: that is a
+# Note the asymmetry with alloc.rs, which scx_layered_alloc compiles against its
+# real dependencies and whose 80 upstream tests DO run in our suite: that is a
 # materially stronger guarantee than this module has. What backs
 # layer_core_growth.rs instead is differential behaviour testing from
 # scx_simulator's integration tests — `upstream_linear_and_reverse_choose_

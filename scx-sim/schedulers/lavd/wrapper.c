@@ -413,8 +413,8 @@ extern void scxsim_cgroup_bw_yield_reenqueue(void);
 extern void scxsim_cgroup_bw_observe_put_aside(int pid, unsigned long long cgid);
 extern void scxsim_cgroup_bw_observe_reenqueue(unsigned long long cgid);
 /*
- * V4-A observer for scx_cgroup_bw_consume(cgrp, ns) call args.
- * tg scxsim-disambiguate-runtime-overcharge-vs-lib-idealized-accounting.
+ * V4-A observer for scx_cgroup_bw_consume(): (billing cgid, ns billed) per
+ * call. tg scxsim-disambiguate-runtime-overcharge-vs-lib-idealized-accounting.
  */
 extern void scxsim_cgroup_bw_observe_consume(unsigned long long cgid, unsigned long long ns);
 extern void scxsim_cgroup_bw_yield_cancel(void);
@@ -497,38 +497,64 @@ extern void sim_cgroup_registry_free(void);
 	scx_cgroup_bw_set((cgrp), (period_us), (quota_us), (burst_us)); \
 })
 /*
- * Upstream sched-ext/scx 776ae41e ("lib/cgroup_bw: use cgrp_id instead of
- * cgroup pointer in throttle/consume/put_aside") changed the first argument
- * of throttle/consume and the last argument of put_aside from
- * `struct cgroup *` to `u64 cgrp_id`. The per-task caching series
- * (f4fbc4f1/335e754e/d8481623, "scx_task_cgroup_bw ... per-task caching")
- * also added a trailing `u64 taskc` cache argument to throttle and consume.
- * The macros now mirror the new arity, and the scxsim observe hooks consume
- * the cgrp_id directly (it is no longer a dereferenceable pointer).
+ * Upstream sched-ext/scx 972abf782 ("lib/cgroup_bw: resolve a task's billing
+ * cgroup from the task, not its id") made the task the subject of
+ * throttle/consume/put_aside, replacing the cgroup-id arguments:
+ *
+ *   scx_cgroup_bw_throttled(p, taskc)
+ *   scx_cgroup_bw_consume(p, taskc, ns)
+ *   scx_cgroup_bw_put_aside(p, taskc, vtime)
+ *
+ * The library resolves the task's BILLING cgroup itself -- the nearest
+ * managed (finite cpu.max) ancestor-or-self of the task's cgroup, else the
+ * root -- reading the task's cgroup from p->sched_task_group (see
+ * sim_task_set_cgroup() in csrc/sim_task.c) and caching the result in the
+ * per-task context as scx_task_cgroup_bw.bill_cgrp_id. A NULL @p is a
+ * cache-only caller: with a cold cache, consume defers the interval into
+ * scx_task_cgroup_bw.pending_ns and bills it together with the next
+ * resolving call.
+ *
+ * The observe hooks therefore report what the library attributed: the
+ * billing cgroup id read back from the per-task context after the call. A
+ * task in an unlimited child cgroup is reported under its billing ancestor
+ * (or the root, cgid 1) rather than under its own cgroup, which is where the
+ * library charges it.
  */
-#define scx_cgroup_bw_throttled(cgrp_id, p, taskc) ({ \
+#define SCXSIM_CBW_TASKC(taskc) \
+	((struct scx_task_cgroup_bw *)(unsigned long)(taskc))
+#define scx_cgroup_bw_throttled(p, taskc) ({ \
 	SCXSIM_CGROUP_BW_YIELD(scxsim_cgroup_bw_yield_throttled); \
-	scx_cgroup_bw_throttled((cgrp_id), (p), (taskc)); \
+	scx_cgroup_bw_throttled((p), (taskc)); \
 })
-#define scx_cgroup_bw_consume(c, n, taskc) ({ \
+#define scx_cgroup_bw_consume(p, taskc, n) ({ \
 	SCXSIM_CGROUP_BW_YIELD(scxsim_cgroup_bw_yield_consume); \
-	int _rc = scx_cgroup_bw_consume((c), (n), (taskc)); \
-	SCXSIM_DEBUG_CONSUME_PROBE_BODY(c, n, _rc); \
-	/* V4-A observe: record (cgid, ns) on every consume call. (c) is now the
-	 * `u64 cgrp_id` directly (post-776ae41e), so emit it as-is. Skip emit on
-	 * cgrp_id 0 (initial period before cgroup is registered).
+	unsigned long long _scxsim_ctaskc = (unsigned long long)(taskc); \
+	unsigned long long _scxsim_cns = (unsigned long long)(n); \
+	struct scx_task_cgroup_bw *_scxsim_ctc = SCXSIM_CBW_TASKC(_scxsim_ctaskc); \
+	unsigned long long _scxsim_pend = _scxsim_ctc ? _scxsim_ctc->pending_ns : 0; \
+	int _rc = scx_cgroup_bw_consume((p), _scxsim_ctaskc, _scxsim_cns); \
+	unsigned long long _scxsim_bill = _scxsim_ctc ? _scxsim_ctc->bill_cgrp_id : 0; \
+	SCXSIM_DEBUG_CONSUME_PROBE_BODY(_scxsim_bill, _scxsim_cns, _rc); \
+	/* V4-A observe: record (billing cgid, ns billed) per consume call. A
+	 * resolving call bills its own interval plus any carry it absorbed
+	 * (pending_ns before minus pending_ns after). A deferred call leaves
+	 * bill_cgrp_id 0 and is not emitted: its interval is carried and
+	 * reported by the call that bills it.
 	 */ \
-	if ((c)) scxsim_cgroup_bw_observe_consume((unsigned long long)(c), (unsigned long long)(n)); \
+	if (_scxsim_bill) \
+		scxsim_cgroup_bw_observe_consume(_scxsim_bill, \
+			_scxsim_cns + _scxsim_pend - _scxsim_ctc->pending_ns); \
 	_rc; \
 })
-#define scx_cgroup_bw_put_aside(p, taskc, vtime, cgrp_id) ({ \
+#define scx_cgroup_bw_put_aside(p, taskc, vtime) ({ \
 	SCXSIM_CGROUP_BW_YIELD(scxsim_cgroup_bw_yield_put_aside); \
-	int _scxsim_pa_rc = scx_cgroup_bw_put_aside((p), (taskc), (vtime), (cgrp_id)); \
-	/* V2 observe: only emit if put_aside succeeded (rc == 0). The cgroup is
-	 * now identified by `u64 cgrp_id` directly (post-776ae41e).
+	int _scxsim_pa_rc = scx_cgroup_bw_put_aside((p), (taskc), (vtime)); \
+	/* V2 observe: only emit if put_aside succeeded (rc == 0), under the
+	 * billing cgroup whose BTQ the library parked the task on.
 	 */ \
 	if (_scxsim_pa_rc == 0) \
-		scxsim_cgroup_bw_observe_put_aside((p)->pid, (unsigned long long)(cgrp_id)); \
+		scxsim_cgroup_bw_observe_put_aside((p)->pid, \
+			SCXSIM_CBW_TASKC(taskc)->bill_cgrp_id); \
 	_scxsim_pa_rc; \
 })
 #define scx_cgroup_bw_reenqueue() ({ \
@@ -546,9 +572,9 @@ extern void sim_cgroup_registry_free(void);
 	SCXSIM_CGROUP_BW_YIELD(scxsim_cgroup_bw_yield_cancel); \
 	scx_cgroup_bw_cancel((taskc), (flags)); \
 })
-#define scx_cgroup_bw_is_cgroup_throttled(cgrp_id) ({ \
+#define scx_cgroup_bw_is_cgroup_throttled(cgrp) ({ \
 	SCXSIM_CGROUP_BW_YIELD(scxsim_cgroup_bw_yield_is_cgroup_throttled); \
-	scx_cgroup_bw_is_cgroup_throttled((cgrp_id)); \
+	scx_cgroup_bw_is_cgroup_throttled((cgrp)); \
 })
 #define scx_cgroup_bw_is_task_throttled(taskc) ({ \
 	SCXSIM_CGROUP_BW_YIELD(scxsim_cgroup_bw_yield_is_task_throttled); \
@@ -568,7 +594,7 @@ extern void sim_cgroup_registry_free(void);
 	scxsim_cgroup_bw_consume_count_pre++; \
 	scxsim_cgroup_bw_consume_sum_ns += (unsigned long long)(n); \
 	if ((scxsim_cgroup_bw_consume_count_pre & 0xfff) == 1) \
-		scxsim_probe_dprintf(2, "[SCXSIM-PROBE] consume cgrp_id=%llu ns=%llu count=%llu sum_ns=%llu rc=%d\n", \
+		scxsim_probe_dprintf(2, "[SCXSIM-PROBE] consume bill_cgid=%llu ns=%llu count=%llu sum_ns=%llu rc=%d\n", \
 			(unsigned long long)(c), \
 			(unsigned long long)(n), scxsim_cgroup_bw_consume_count_pre, \
 			scxsim_cgroup_bw_consume_sum_ns, (rc)); \
@@ -1207,6 +1233,13 @@ extern int dprintf(int fd, const char *fmt, ...);
 #include <lib/topology.h>
 int nr_topo_nodes[TOPO_MAX_LEVEL] = {1, 1, 1, 1, 1};
 int topo_cpu_to_llc_id(u32 cpu) { (void)cpu; return 0; }
+/* Upstream 484e0d1fe ("scx: lib - Fix the userspace half of the lib selftests
+ * build") put TOPO_NR() behind `#ifdef __BPF__` in lib/topology.h, which this
+ * userspace build does not define. Restate the identical definition so
+ * cgroup_bw's per-LLC walks keep reading nr_topo_nodes[] above. */
+#ifndef TOPO_NR
+#define TOPO_NR(type) nr_topo_nodes[TOPO_##type - 1]
+#endif
 
 /* Map registration glue: cgroup_bw declares cbw_cgrp_map (CGRP_STORAGE),
  * cbw_cgrp_llc_map (HASH), tree_levels_map (PERCPU_ARRAY), and the
@@ -1327,12 +1360,12 @@ struct scxsim_cbw_cgroup_snapshot {
 	 * BTQ-unpark (`cbw_drain_btq_batch`) flux that the cpu-bw-stall-bug
 	 * needs to make observable. Computed by summing
 	 * `scx_atq_nr_queued(llcx->btq)` across `bpf_for(i, 0, TOPO_NR(LLC))`
-	 * (matches lib/cgroup_bw.bpf.c:1623 cbw_has_backlogged_tasks).
+	 * (matches the loop in lib/cgroup_bw.bpf.c cbw_has_backlogged_tasks).
 	 *
-	 * Sentinel `-1` means the lookup couldn't read any LLC ctx (defensive
-	 * — should not happen for finite-quota cgroups that pass the
-	 * earlier gates), in which case the engine treats the snapshot as
-	 * "BTQ unknown" and emits no BTQ-flux event.
+	 * Sentinel `-1` ("BTQ unknown", no BTQ-flux event) is kept in the
+	 * ABI for the engine's diff helper, but is no longer produced:
+	 * upstream e2106f5d3 removed the `has_llcx` flag it was derived
+	 * from, because every managed cgroup now has its LLC contexts.
 	 */
 	int			btq_total_len;
 };
@@ -1402,17 +1435,14 @@ int scxsim_cbw_snapshot_by_raw_cgrp(
 	 * sum BTQ length across all LLC contexts for this cgroup so the
 	 * Rust-side snapshot/diff helper can detect cbw_put_aside (delta>0)
 	 * and cbw_drain_btq_batch (delta<0) events between BEFORE/AFTER
-	 * fire_timer snapshots. Mirrors lib/cgroup_bw.bpf.c:1623
-	 * `cbw_has_backlogged_tasks` summing-loop, but counts queued
-	 * tasks instead of returning a boolean.
-	 *
-	 * Defensive: if `cgx->has_llcx` is false the lib has no LLC state
-	 * for this cgroup, return sentinel -1 ("BTQ unknown") so the
-	 * Rust diff helper skips emitting BTQ-flux events for it.
+	 * fire_timer snapshots. Mirrors the lib/cgroup_bw.bpf.c
+	 * `cbw_has_backlogged_tasks` loop, but counts queued tasks instead
+	 * of returning a boolean. Upstream e2106f5d3 removed `has_llcx`
+	 * ("The flag is therefore true at every reader"), so there is no
+	 * per-cgroup gate left to consult: every managed cgroup has its
+	 * LLC contexts, and a missing one is skipped as the library does.
 	 */
-	if (!cgx->has_llcx) {
-		out->btq_total_len = -1;
-	} else {
+	{
 		int btq_total = 0;
 		struct scx_cgroup_llc_ctx *llcx;
 		scx_atq_t *btq;
@@ -1464,11 +1494,17 @@ static void lavd_register_cbw_maps(void)
 	__builtin_memset(cbw_accounting_timer_storage, 0,
 			 sizeof(cbw_accounting_timer_storage));
 	cbw_nr_cgroups = 0;
+	cbw_nr_cgx = 0;
 	cbw_last_replenish_at = 0;
 	cbw_backlog_stat.val = 0;
-	__builtin_memset(cbw_cgroup_ids, 0, sizeof(cbw_cgroup_ids));
-	__builtin_memset(cbw_throttled_cgroup_ids, 0,
-			 sizeof(cbw_throttled_cgroup_ids));
+
+	/* BPF_MAP_TYPE_ARRAY u32 -> u64 cgroup-id tables (upstream turned the
+	 * former static u64[] into maps so userspace can size them with
+	 * nr_cgrp_max; scx_lavd keeps the CBW_NR_CGRP_MAX default). A kernel
+	 * ARRAY map exists zero-filled at every index, so pre-seed all
+	 * max_entries keys; the library then only ever updates them. */
+	SCX_REGISTER_ARRAY(cbw_cgroup_ids, true);
+	SCX_REGISTER_ARRAY(cbw_throttled_cgroup_ids, true);
 
 	/* HASH keyed by u64 cgrp_id (BPF_MAP_TYPE_HASH, lib/cgroup_bw.bpf.c),
 	 * accessed via bpf_map_lookup_elem(&cbw_cgrp_map, &cgrp_id) -- NOT
@@ -1559,39 +1595,37 @@ static void lavd_register_cbw_maps(void)
  * The `scxsim_` prefix avoids any chance of name collision with the
  * library's own symbols and makes the boundary explicit.
  *
- * Diagnostic counter `scxsim_cgroup_bw_consume_count` is incremented
- * on every consume call so the engine can verify that the
- * scheduler-side `account_task_runtime -> scx_cgroup_bw_consume`
- * chain is reaching the library at all (Prong B in the root-cause
- * note).
+ * Only the cgroup throttle query is forwarded. The consume/throttled
+ * entry points take the per-task cgroup_bw context since upstream
+ * 972abf782, which only the scheduler holds; lavd's own call sites
+ * reach them through the observe macros above.
  */
 
+/*
+ * Returns the id of the throttled cgroup that holds back tasks in
+ * @cgrp_raw, or 0 when the library reports it not throttled.
+ *
+ * The engine passes the cgroup registry's raw `struct cgroup *` rather
+ * than a cgroup id. Resolving an id here (bpf_cgroup_from_id ->
+ * sim_cgroup_lookup_by_id) would need the sim-state lock, which the
+ * engine holds while it asks and which is not installed outside a
+ * callback at all; the lookup then silently falls back to the root
+ * cgroup and every answer would describe root.
+ *
+ * The answer names a cgroup, not just a verdict, because since upstream
+ * f437eaa1f a cgroup with an infinite cpu.max has no context of its own:
+ * the library answers for the nearest limited ancestor it bills to, and
+ * only that ancestor replenishes. The engine parks the task under the id
+ * returned here, so it must be the cgroup whose replenish releases it.
+ */
 __attribute__((visibility("default")))
-unsigned long long scxsim_cgroup_bw_consume_count;
-
-__attribute__((visibility("default")))
-int scxsim_cgroup_bw_is_cgroup_throttled(unsigned long long cgrp_id)
+unsigned long long scxsim_cgroup_bw_throttled_by(void *cgrp_raw)
 {
-	return scx_cgroup_bw_is_cgroup_throttled(cgrp_id);
-}
+	struct cgroup *cgrp = cgrp_raw;
 
-__attribute__((visibility("default")))
-int scxsim_cgroup_bw_consume(struct cgroup *cgrp, unsigned long long consumed_ns)
-{
-	scxsim_cgroup_bw_consume_count++;
-	/*
-	 * Post-776ae41e the library takes a u64 cgrp_id (not a cgroup pointer)
-	 * plus a trailing per-task cache arg. The engine's FFI still hands us a
-	 * struct cgroup *, so resolve the id here (cgroup_get_id == cgrp->kn->id)
-	 * and pass taskc=0 (no per-task context available at this call site).
-	 */
-	return scx_cgroup_bw_consume(cgrp ? cgrp->kn->id : 0, consumed_ns, 0);
-}
-
-__attribute__((visibility("default")))
-int scxsim_cgroup_bw_throttled(struct cgroup *cgrp, struct task_struct *p)
-{
-	return scx_cgroup_bw_throttled(cgrp ? cgrp->kn->id : 0, p, 0);
+	if (!cgrp || !scx_cgroup_bw_is_cgroup_throttled(cgrp))
+		return 0;
+	return cbw_resolve_bill_cgid(cgrp);
 }
 
 /*
@@ -1673,7 +1707,6 @@ struct scxsim_cbw_probe_result {
 	void                  *llcx_via_helper;      /* cbw_get_llc_ctx(cgrp, llc_id) */
 	void                  *llcx_via_direct_map;  /* bpf_map_lookup_elem direct */
 	unsigned long long     cgrp_id_seen;         /* cgroup_get_id(cgrp) */
-	int                    has_llcx;             /* cgx->has_llcx */
 	int                    is_throttled;         /* cgx->is_throttled */
 	long long              runtime_total_sloppy;
 	long long              runtime_total_in_llcx;/* llcx->runtime_total */
@@ -1716,7 +1749,6 @@ int scxsim_probe_cbw_state(unsigned long long cgrp_id, int llc_id,
 	cgx = cbw_get_cgroup_ctx(cgrp);
 	out->cgx = cgx;
 	if (cgx) {
-		out->has_llcx = cgx->has_llcx;
 		out->is_throttled = cgx->is_throttled;
 		out->runtime_total_sloppy = cgx->runtime_total_sloppy;
 	}

@@ -325,7 +325,8 @@ in the failure message so the next occurrence is recognisable on sight.
 
 `xnuma_check_active` and `xnuma_compute_rates` are vendored token-for-token
 from upstream `main.rs` into `safe/layered_xnuma.rs` — the same treatment
-`alloc.rs`'s `largest_remainder` gets in `safe/layered_alloc.rs`, and for the
+`alloc.rs`'s `largest_remainder` gets in `crates/scx_layered_alloc/src/lib.rs`
+(formerly `safe/layered_alloc.rs`), and for the
 same reason: they carry policy, and a re-implementation would agree on the
 easy cases and diverge on the corner cases. They cannot be `#[path]`-included
 the way `alloc.rs` is, because they sit in the middle of a 5000-line file that

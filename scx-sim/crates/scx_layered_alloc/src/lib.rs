@@ -1,6 +1,6 @@
 //! scx_layered's **real** CPU allocator, compiled into scxsim.
 //!
-//! # Why this file exists
+//! # Why this crate exists
 //!
 //! Tier 3 of scx_layered support means modelling the userspace control loop
 //! that continuously re-allocates CPUs between layers. That allocation policy
@@ -20,10 +20,22 @@
 //! * `alloc.rs` is self-contained. Its only crate-local dependency is
 //!   [`largest_remainder`], and it references no `Topology`, no libbpf, no
 //!   filesystem, and no `unsafe`. Its public entry point
-//!   [`unified_alloc`] is a pure function over `Vec<usize>` and plain structs.
-//! * It ships ~80 of its own unit tests, which are compiled and run here too.
-//!   Upstream's allocator test suite therefore becomes part of scxsim's, and
-//!   an upstream change that breaks its own invariants fails our build.
+//!   [`unified_alloc`](layered_alloc_upstream::unified_alloc) is a pure
+//!   function over `Vec<usize>` and plain structs.
+//! * It ships ~80 of its own unit tests, which are compiled and run here too,
+//!   as this crate's unit tests. Upstream's allocator test suite therefore
+//!   becomes part of scxsim's, and an upstream change that breaks its own
+//!   invariants fails our build.
+//!
+//! # Why a separate crate
+//!
+//! An included file is parsed under the edition of the crate that includes it,
+//! so whatever crate compiles `alloc.rs` must be on upstream scx_layered's
+//! edition — 2024, and `alloc.rs` uses let chains, which do not parse under
+//! 2021. This used to be a module of scx_simulator; giving the one upstream
+//! file its own crate lets it follow upstream's edition while scx_simulator
+//! stays on 2021. scx_simulator re-exports [`layered_alloc_upstream`] at its
+//! crate root, so nothing that uses it had to change.
 //!
 //! # The one vendored piece
 //!
@@ -32,17 +44,21 @@
 //! BPF skeleton and cannot be included here. It is a ~30-line pure function,
 //! reproduced below verbatim with its provenance recorded.
 //!
-//! Because a silent copy is a copy that drifts, `tests/layered_alloc.rs`
-//! re-reads the upstream `lib.rs` at test time and asserts our copy is still
-//! token-identical to it. If upstream edits `largest_remainder`, that test
-//! fails rather than the two quietly disagreeing.
+//! Because a silent copy is a copy that drifts, scx_simulator's
+//! `tests/layered_alloc.rs` re-reads the upstream `lib.rs` at test time and
+//! asserts our copy is still token-identical to it. If upstream edits
+//! `largest_remainder`, that test fails rather than the two quietly
+//! disagreeing.
+
+#![forbid(unsafe_code)]
 
 /// Distribute `total` across `quotas` by the largest-remainder method.
 ///
 /// VENDORED VERBATIM from `scx/scheds/rust/scx_layered/src/lib.rs`
-/// (`pub fn largest_remainder`). Do not edit: `tests/layered_alloc.rs`
-/// asserts this body still matches upstream token-for-token, so an edit here
-/// registers as drift. If upstream changes, re-copy rather than patch.
+/// (`pub fn largest_remainder`). Do not edit: scx_simulator's
+/// `tests/layered_alloc.rs` asserts this body still matches upstream
+/// token-for-token, so an edit here registers as drift. If upstream changes,
+/// re-copy rather than patch.
 ///
 /// It lives here instead of being `include!`d because upstream's `lib.rs`
 /// also contains the BPF skeleton bindings, which scxsim cannot build.
@@ -87,11 +103,8 @@ pub fn largest_remainder(total: usize, quotas: &[f64]) -> Vec<usize> {
     result
 }
 
-// The upstream allocator itself is declared in `safe/mod.rs` as
-// `#[path = "<scx>/scx_layered/src/alloc.rs"] pub mod layered_alloc_upstream;`
-// and re-exported from the crate root. It has to be declared from a `mod.rs`
-// so the `#[path]` resolves relative to `safe/` rather than to a
-// `layered_alloc/` subdirectory that does not exist.
-//
-// It is a module rather than an `include!` because the upstream file opens
-// with `//!` inner doc comments, which are only legal at the top of a module.
+// The upstream allocator itself: `pub mod layered_alloc_upstream`, declared by
+// a one-line `#[path = "<scx_root>/.../alloc.rs"]` wrapper that build.rs
+// generates into OUT_DIR, so the path follows `SCX_ROOT` like every other scx
+// source (see `scxsim_build::emit_upstream_module` for why it is generated).
+include!(concat!(env!("OUT_DIR"), "/layered_alloc_upstream_mod.rs"));

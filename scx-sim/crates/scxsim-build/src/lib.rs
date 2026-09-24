@@ -127,6 +127,15 @@ pub const SCHEDULERS: &[SchedulerManifest] = &[
         // globals the scheduler overwrites at runtime (nr_cpus_onln, power_mode,
         // is_powersave_mode, no_core_compaction, no_freq_scaling, no_preemption),
         // the computed per-CPU arrays, and the cpdom init stay in lavd_setup.
+        //
+        // bw_kick_builtin_idle belongs to lib/cgroup_bw and is load-bearing:
+        // scx_lavd's main.rs sets it unconditionally, and with it left at the
+        // rodata default the replenish timer calls the weak
+        // scx_cgroup_bw_kick_idle_cb(), which scx_bpf_error()s. Its sibling
+        // bw_set_sleepable is deliberately absent (false): scx_utils'
+        // setup_cgroup_bw() leaves it off on a kernel without the
+        // cgroup_set_bandwidth may-sleep marker -- the RESERVED tier, whose
+        // contexts are pre-reserved in ops.cgroup_init().
         runtime: SchedulerRuntime {
             rodata: &[
                 ("nr_cpu_ids", ConfigValue::NumCpus),
@@ -138,6 +147,7 @@ pub const SCHEDULERS: &[SchedulerManifest] = &[
                 ("no_slice_boost", ConfigValue::Bool(false)),
                 ("no_use_em", ConfigValue::U8(1)),
                 ("verbose", ConfigValue::U8(0)),
+                ("bw_kick_builtin_idle", ConfigValue::Bool(true)),
             ],
         },
     },
@@ -424,6 +434,40 @@ pub fn resolve_scx_root(default: &Path) -> PathBuf {
     }
 }
 
+/// Compile one upstream scx Rust source verbatim as a module of the calling
+/// crate: writes `OUT_DIR/<module>_mod.rs` holding
+/// `#[path = "<scx_root>/<rel>"] pub mod <module>;`, which the crate pulls in
+/// with `include!(concat!(env!("OUT_DIR"), "/<module>_mod.rs"))`, and emits
+/// `cargo:rerun-if-changed` for the source. Call it only from a build script.
+///
+/// Why generated: a `#[path]` attribute takes a string LITERAL, so written in
+/// source it is nailed to the bundled submodule and blind to `SCX_ROOT` -- an
+/// embedder pointing `SCX_ROOT` at their own scx tree got the scheduler `.so`
+/// from their tree and the upstream Rust from ours, in one binary, silently.
+/// `include!`ing the file straight into an inline `mod` is not an option
+/// either: upstream files open with `//!` module docs, and inner doc comments
+/// are illegal in a macro expansion (E0753). The one-line wrapper keeps the
+/// upstream file an ordinary file module, byte-identical to the pin.
+///
+/// The file is parsed under the CALLING crate's edition, so that crate must be
+/// on the upstream crate's edition (scx_layered: 2024).
+pub fn emit_upstream_module(scx_root: &Path, rel: &str, module: &str) {
+    let src = scx_root.join(rel);
+    assert!(
+        src.is_file(),
+        "{rel} not found at {} (is SCX_ROOT an scx checkout?)",
+        src.display()
+    );
+    let out_dir =
+        PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR unset: not a build script"));
+    std::fs::write(
+        out_dir.join(format!("{module}_mod.rs")),
+        format!("#[path = {src:?}]\npub mod {module};\n"),
+    )
+    .unwrap_or_else(|e| panic!("write {module}_mod.rs: {e}"));
+    println!("cargo:rerun-if-changed={}", src.display());
+}
+
 /// Whether the scx tree at `scx_root` uses the NEW cgroup_bw function signatures,
 /// gated on `struct scx_task_cgroup_bw` in scheds/include/lib/cgroup.h. The
 /// result is passed to [`build_schedulers`] as its `cgroup_bw_new_api` flag; a
@@ -594,7 +638,14 @@ pub fn build_schedulers(
         .chain(std::iter::once(scx_lib.as_path()))
         .collect();
 
-    for name in &names {
+    // A scheduler that fails to compile or link must not hide the ones after
+    // it: record the failure, move on to the next scheduler, and fail the
+    // build once at the end naming every broken scheduler. The nightly scx
+    // pin bump reported only cosmos (first in sort order) for nine nights
+    // while lavd and cgroup_bw were broken behind it.
+    let mut failed: Vec<String> = Vec::new();
+
+    'sched: for name in &names {
         let sched_dir = schedulers_src.join(name);
 
         // Per-scheduler build variation is declared in the manifest (strip-const,
@@ -685,7 +736,10 @@ pub fn build_schedulers(
                 cmd.arg("-I").arg(inc);
             }
             cmd.arg("-c").arg("-o").arg(&obj).arg(src);
-            run(cmd, &format!("compile {} for {name}", src.display()));
+            if let Err(e) = run(cmd, &format!("compile {} for {name}", src.display())) {
+                failed.push(e);
+                continue 'sched;
+            }
             objs.push(obj);
         }
 
@@ -700,7 +754,10 @@ pub fn build_schedulers(
             let mut cmd = Command::new(compiler);
             cmd.args(cflags_base);
             cmd.arg("-c").arg("-o").arg(&obj).arg(&src);
-            run(cmd, &format!("compile {tu} for {name}"));
+            if let Err(e) = run(cmd, &format!("compile {tu} for {name}")) {
+                failed.push(e);
+                continue 'sched;
+            }
             objs.push(obj);
         }
 
@@ -720,8 +777,16 @@ pub fn build_schedulers(
         for obj in &objs {
             link.arg(obj);
         }
-        run(link, &format!("link libscx_{name}.so"));
+        if let Err(e) = run(link, &format!("link libscx_{name}.so")) {
+            failed.push(e);
+        }
     }
+    assert!(
+        failed.is_empty(),
+        "{} scheduler build step(s) failed (compiler diagnostics above):\n  {}",
+        failed.len(),
+        failed.join("\n  ")
+    );
 }
 
 /// File stem of a C source as a `&str` (e.g. `sim_bpf_stubs.c` → `sim_bpf_stubs`).
@@ -731,13 +796,18 @@ fn file_stem(p: &Path) -> &str {
         .unwrap_or_else(|| panic!("source path has no UTF-8 stem: {}", p.display()))
 }
 
-/// Run a compile/link command, panicking with `desc` on spawn failure or a
-/// non-zero exit (a failed scheduler build must fail the cargo build loudly).
-fn run(mut cmd: Command, desc: &str) {
+/// Run a compile/link command. A non-zero exit is returned as `Err(desc)` so
+/// the caller can collect every failing scheduler before failing the build;
+/// failing to spawn the compiler at all still panics immediately.
+fn run(mut cmd: Command, desc: &str) -> Result<(), String> {
     let status = cmd
         .status()
         .unwrap_or_else(|e| panic!("spawn failed ({desc}): {e}"));
-    assert!(status.success(), "{desc} failed: {status}");
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{desc} failed: {status}"))
+    }
 }
 
 #[cfg(test)]

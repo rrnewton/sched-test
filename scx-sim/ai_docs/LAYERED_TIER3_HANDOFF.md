@@ -79,15 +79,19 @@ interesting. `scx-sim/CLAUDE.md` forbids that.
 
 This is already done (`2b23577`):
 
-- `safe/layered_alloc_upstream` **is** `scx_layered/src/alloc.rs`, compiled
-  verbatim via `#[path]` from `safe/mod.rs`.
-  - `#[path]`, not `include!`, because the upstream file opens with `//!`
-    inner doc comments, legal only at the top of a module.
-  - Declared from `mod.rs` so the path resolves relative to `safe/` and not
-    to a `layered_alloc/` subdirectory that does not exist.
+- `layered_alloc_upstream` **is** `scx_layered/src/alloc.rs`, compiled
+  verbatim in its own crate, `crates/scx_layered_alloc`, and re-exported by
+  scx_simulator at its crate root.
+  - Its own crate because upstream scx_layered is edition 2024 and `alloc.rs`
+    uses let chains; an included file parses under the including crate's
+    edition, and scx_simulator stays on 2021.
+  - The `#[path]` wrapper is generated into OUT_DIR by that crate's
+    `build.rs` (`scxsim_build::emit_upstream_module`) so it follows
+    `SCX_ROOT`. `#[path]`, not a plain `include!`, because the upstream file
+    opens with `//!` inner doc comments, legal only at the top of a module.
 - Its ~80 upstream unit tests now run in our suite. That is the load-bearing
   evidence that it is genuinely the real allocator and genuinely executing.
-- `safe/layered_alloc.rs` holds the single vendored helper,
+- `crates/scx_layered_alloc/src/lib.rs` holds the single vendored helper,
   `largest_remainder` (it lives in upstream's `lib.rs` next to the BPF
   skeleton, which scxsim cannot build), plus the provenance docs.
 - `tests/layered_alloc.rs` re-reads upstream's `lib.rs` at test time and
@@ -274,8 +278,8 @@ These are the traps already paid for. None are guessable from the code.
 |---|---|
 | `schedulers/layered/wrapper.c` | plays scx_layered's userspace; publishes topology + layers, exports probes. ~2000 lines. |
 | `crates/scx_simulator/src/safe/layered.rs` | `LayerSpec`/`LayerMatch`/`LayerKind` — the layer-config API. |
-| `crates/scx_simulator/src/safe/layered_alloc.rs` | vendored `largest_remainder` + provenance. |
-| `crates/scx_simulator/src/safe/mod.rs` | declares `layered_alloc_upstream` via `#[path]`. |
+| `crates/scx_layered_alloc/src/lib.rs` | vendored `largest_remainder` + provenance; includes `layered_alloc_upstream`. |
+| `crates/scx_layered_alloc/build.rs` | generates the `#[path]` wrapper for upstream `alloc.rs`. |
 | `crates/scx_simulator/src/unsafe_impl/ffi.rs` | `DynamicScheduler::layered*` constructors and config entry points. |
 | `crates/scx_simulator/src/unsafe_impl/probes.rs` | `LayeredProbes` — read-only scheduler state. |
 | `crates/scx_simulator/src/safe/engine.rs` | event loop; where a periodic hook goes. |

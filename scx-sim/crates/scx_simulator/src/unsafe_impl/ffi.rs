@@ -791,16 +791,26 @@ pub trait Scheduler {
     unsafe fn cpu_offline(&self, _cpu: i32) {}
 
     /// Phase 2 Stage C (tg `compile-scx-cgroup-bw-library-into-scxsim-phase2`):
-    /// Ask the scheduler whether `cgrp_id` is throttled by `cpu.max`.
-    /// Returns `Some(true)` / `Some(false)` if the scheduler links the
-    /// cgroup_bw library and answered; `None` if the scheduler does not
-    /// model cgroup_bw at all (e.g. simple, tickless).
+    /// Ask the scheduler whether tasks in the cgroup at `cgrp_raw` are held
+    /// back by `cpu.max`. `cgrp_raw` is the `struct cgroup *` the engine's
+    /// cgroup registry owns (see `CgroupRegistry::get_raw`), not a cgroup
+    /// id: the library takes the pointer since upstream scx 972abf782, and
+    /// resolving an id C-side would need the sim-state lock the engine
+    /// already holds.
+    ///
+    /// Returns `None` if the scheduler does not model cgroup_bw at all
+    /// (e.g. simple, tickless); `Some(None)` if not throttled; and
+    /// `Some(Some(cgid))` naming the throttled cgroup -- `cgrp_raw` itself
+    /// when it is limited, else the nearest limited ancestor it bills to
+    /// (upstream scx f437eaa1f gives an infinite-`cpu.max` cgroup no
+    /// context of its own). That cgroup's replenish is what releases the
+    /// task.
     ///
     /// The engine's DSQ-pop admission gate (`pid_is_bw_throttled`)
     /// consults this to make the library the single source of truth
     /// for throttle state -- replacing the engine-side
     /// `BandwidthManager::is_throttled` direct read.
-    fn is_cgroup_throttled(&self, _cgrp_id: u64) -> Option<bool> {
+    fn cgroup_bw_throttled_by(&self, _cgrp_raw: *mut c_void) -> Option<Option<u64>> {
         None
     }
 
@@ -974,15 +984,14 @@ type CgroupMoveFn = unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void);
 type CpuAcquireFn = unsafe extern "C" fn(i32, *mut c_void);
 /*
  * Phase 2 Stage C (tg `compile-scx-cgroup-bw-library-into-scxsim-phase2`):
- * type for `scx_cgroup_bw_is_cgroup_throttled(u64 cgrp_id) -> int`.
- * NOT prefixed by scheduler name -- the symbol comes from
- * `scx/lib/cgroup_bw.bpf.c` (when Phase 2 ON) or from wrapper.c's
- * compatibility forwarder (when Phase 2 OFF -- delegates to
- * `sim_cgroup_bw_is_cgroup_throttled` which reads the engine
- * BandwidthManager). Either way the symbol exists in the .so and
- * returns the right answer.
+ * type for wrapper.c's `u64 scxsim_cgroup_bw_throttled_by(void *cgrp_raw)`,
+ * which asks the library's `scx_cgroup_bw_is_cgroup_throttled(struct
+ * cgroup *)` and returns the id of the throttled cgroup it answered for,
+ * or 0 when not throttled. The argument is the registry-owned
+ * `struct cgroup *` (the library takes a pointer since upstream scx
+ * 972abf782); NULL answers "not throttled".
  */
-type IsCgroupThrottledFn = unsafe extern "C" fn(u64) -> i32;
+type CgroupBwThrottledByFn = unsafe extern "C" fn(*mut c_void) -> u64;
 /*
  * Phase 2 Stage E diagnostic probe (tg
  * `investigate-scxsim-engine-throttles-before-scheduler-cgroup-bw`):
@@ -997,7 +1006,6 @@ pub struct CbwProbeResult {
     pub llcx_via_helper: *mut c_void,
     pub llcx_via_direct_map: *mut c_void,
     pub cgrp_id_seen: u64,
-    pub has_llcx: i32,
     pub is_throttled: i32,
     pub runtime_total_sloppy: i64,
     pub runtime_total_in_llcx: i64,
@@ -1120,16 +1128,15 @@ struct SchedOps {
     cpu_offline: Option<CpuOfflineFn>,
     /*
      * Phase 2 Stage C: cross-binary call into the .so's
-     * `scx_cgroup_bw_is_cgroup_throttled(u64 cgrp_id) -> int`. Loaded
-     * via dlsym (NOT prefixed with the scheduler name -- it's a
-     * library symbol provided by `scx/lib/cgroup_bw.bpf.c` when
-     * Phase 2 ON, or by wrapper.c's compatibility forwarder when
-     * Phase 2 OFF). Engine `pid_is_bw_throttled` consults this so the
-     * library is the single source of truth for throttle state.
-     * `None` for schedulers (e.g. simple, tickless) that don't link
-     * the cgroup_bw library at all.
+     * `scxsim_cgroup_bw_throttled_by(struct cgroup *) -> u64`,
+     * wrapper.c's forwarder to the library's
+     * `scx_cgroup_bw_is_cgroup_throttled`. Loaded via dlsym (NOT
+     * prefixed with the scheduler name). Engine `pid_is_bw_throttled`
+     * consults this so the library is the single source of truth for
+     * throttle state. `None` for schedulers (e.g. simple, tickless)
+     * that don't link the cgroup_bw library at all.
      */
-    is_cgroup_throttled: Option<IsCgroupThrottledFn>,
+    cgroup_bw_throttled_by: Option<CgroupBwThrottledByFn>,
     /*
      * tg `wprof-r2-add-cgroup-bw-replenish-tracekind-smoking-gun`:
      * `scxsim_cbw_snapshot_one_cgroup(cgid, out)` exported by the LAVD
@@ -2367,23 +2374,22 @@ impl DynamicScheduler {
             // library declares its public entry points with `__hidden`
             // (visibility("hidden")), so they are NOT reachable via
             // dlsym. The cleanest path is to dlsym wrapper.c's
-            // default-visibility forwarder `scxsim_cgroup_bw_is_cgroup_
-            // throttled`, which internally calls the still-`__hidden`
-            // library function from inside the same translation unit.
+            // default-visibility forwarder `scxsim_cgroup_bw_throttled_by`,
+            // which internally calls the still-`__hidden` library
+            // function from inside the same translation unit.
             //
             // The historical probe for `cbw_alloc_llc_ctx` (a library
             // symbol that was supposed to indicate Phase 2 ON) became
             // unreliable after the library inlined that helper away,
             // and was redundant once the wrapper provides a stable
             // `scxsim_*` re-export name we can probe directly: if the
-            // wrapper exports the forwarder, Phase 2 is ON; if not,
-            // Phase 2 is OFF and we fall back to the engine
-            // `BandwidthManager`. See the wrapper.c "Stage E" block
-            // for the full forwarder set + diagnostic counter.
-            is_cgroup_throttled: lib
-                .get::<*const ()>(b"scxsim_cgroup_bw_is_cgroup_throttled")
+            // wrapper exports the forwarder, the scheduler links
+            // cgroup_bw; if not, it does not model cpu.max. See the
+            // wrapper.c "Stage E" block for the forwarder.
+            cgroup_bw_throttled_by: lib
+                .get::<*const ()>(b"scxsim_cgroup_bw_throttled_by")
                 .ok()
-                .map(|sym| std::mem::transmute::<*const (), IsCgroupThrottledFn>(*sym)),
+                .map(|sym| std::mem::transmute::<*const (), CgroupBwThrottledByFn>(*sym)),
             snapshot_by_raw_cgrp: lib
                 .get::<*const ()>(b"scxsim_cbw_snapshot_by_raw_cgrp")
                 .ok()
@@ -2834,13 +2840,20 @@ impl Scheduler for DynamicScheduler {
         }
     }
 
-    fn is_cgroup_throttled(&self, cgrp_id: u64) -> Option<bool> {
+    // `cgrp_raw` must be NULL or a live `struct cgroup *` owned by the
+    // engine's `cgroup_registry`: the library reads its id and walks its
+    // `ancestors[]` to find the limited cgroup it bills to. Same reasoning
+    // as `snapshot_by_raw_cgrp` below for not marking the method `unsafe`.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)]
+    fn cgroup_bw_throttled_by(&self, cgrp_raw: *mut c_void) -> Option<Option<u64>> {
         // SAFETY: f is dlsym'd at scheduler load; pointer is valid for
-        // the lifetime of self._lib. The library contract is `int
-        // scx_cgroup_bw_is_cgroup_throttled(u64) -> 0 or 1`.
-        self.ops
-            .is_cgroup_throttled
-            .map(|f| unsafe { f(cgrp_id) != 0 })
+        // the lifetime of self._lib. The forwarder contract is `u64
+        // scxsim_cgroup_bw_throttled_by(struct cgroup *)` -> throttled
+        // cgroup id, or 0 when not throttled.
+        self.ops.cgroup_bw_throttled_by.map(|f| {
+            let cgid = unsafe { f(cgrp_raw) };
+            (cgid != 0).then_some(cgid)
+        })
     }
 
     fn probe_cbw_state(&self, cgrp_id: u64, llc_id: i32, out: &mut CbwProbeResult) -> Option<i32> {
@@ -2865,12 +2878,12 @@ impl Scheduler for DynamicScheduler {
     // CGRP_STORAGE map lookup keyed by the pointer value. Marking the
     // method `unsafe` would propagate up to every Scheduler trait
     // implementer and the engine call site without buying anything --
-    // the constraint is identical to `is_cgroup_throttled` /
-    // `probe_cbw_state` (both take cgrp ids that the trait method
-    // turns into pointers internally), but we expose the raw pointer
-    // here only because the engine already holds the SIM_ARC mutex
-    // and cannot safely call `bpf_cgroup_from_id` to do the lookup
-    // C-side. The lint is acknowledged with allow.
+    // the constraint is identical to `probe_cbw_state` (which takes a
+    // cgrp id that the C side turns into a pointer internally), but we
+    // expose the raw pointer here, as `cgroup_bw_throttled_by` does, because
+    // the engine already holds the SIM_ARC mutex and cannot safely call
+    // `bpf_cgroup_from_id` to do the lookup C-side. The lint is
+    // acknowledged with allow.
     #[allow(clippy::not_unsafe_ptr_arg_deref)]
     fn snapshot_by_raw_cgrp(
         &self,
