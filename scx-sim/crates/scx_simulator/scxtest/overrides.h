@@ -38,7 +38,6 @@
 
 /* Function declarations for BPF functions overridden in overrides.c */
 struct task_struct;
-void *scx_task_data(struct task_struct *p);
 void *scx_minheap_alloc(unsigned int nr_elems);
 int scx_minheap_insert(void *heap_ptr, unsigned long long key, unsigned long long value);
 struct scx_minheap_elem;
@@ -55,8 +54,18 @@ void scx_atq_task_hold(void *taskc);
 void scx_atq_task_drop(void *taskc);
 int scx_atq_task_detach(void *taskc);
 int scx_atq_task_fini(void *taskc);
+/*
+ * Per-task SDT storage: upstream's lib/sdt_task.h API, which that header
+ * declares only under __BPF__. Implemented in scx-sim/csrc/sim_sdt_stubs.c.
+ * Declaring it here is not optional: an undeclared call compiles as returning
+ * int, truncating the pointer it returns.
+ */
+int scx_task_init(unsigned long long data_size, unsigned long long align);
 void *scx_task_alloc(struct task_struct *p);
+void *__scx_task_data(struct task_struct *p);
+void *scx_task_data(struct task_struct *p);
 void scx_task_free(struct task_struct *p);
+void scx_task_free_rcu(struct task_struct *p);
 #define scx_atq_create_size(fifo, capacity) scx_atq_create_internal((fifo), (capacity))
 
 

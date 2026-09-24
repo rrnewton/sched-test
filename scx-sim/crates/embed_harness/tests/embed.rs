@@ -9,7 +9,7 @@
 //! loads the harness-built `libscx_simple.so` through
 //! `DynamicScheduler::load_with_definition` (which dlopens with RTLD_NOW, so all
 //! of the `.so`'s undefined symbols are resolved eagerly at load) and runs a
-//! real 1-CPU simulation. `simple.so` UND-references 3 of the 13 EXPORTED_SYMS
+//! real 1-CPU simulation. `simple.so` UND-references 3 of the 15 EXPORTED_SYMS
 //! (scx_test_map_lookup_elem, sim_arena_buf, sim_arena_offset); `sim_arena_offset`
 //! is held in SOLELY by the re-emitted `--undefined`, so reaching
 //! `ExitKind::Normal` proves the re-emission is load-bearing and non-transitive

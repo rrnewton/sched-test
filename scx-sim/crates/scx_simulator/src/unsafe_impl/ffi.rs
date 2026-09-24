@@ -105,11 +105,19 @@ extern "C" {
     // Exit task args for the exit_task callback (implemented in sim_task.c)
     pub fn sim_get_exit_task_args() -> *mut c_void;
 
-    // SDT / arena per-task storage (implemented in sim_sdt_stubs.c)
-    pub fn scx_task_init(data_size: u64) -> i32;
+    // SDT / arena per-task storage: upstream's scx/scheds/include/lib/sdt_task.h
+    // API, implemented in sim_sdt_stubs.c
+    pub fn scx_task_init(data_size: u64, align: u64) -> i32;
     pub fn scx_task_alloc(p: *mut c_void) -> *mut c_void;
+    pub fn __scx_task_data(p: *mut c_void) -> *mut c_void;
     pub fn scx_task_data(p: *mut c_void) -> *mut c_void;
     pub fn scx_task_free(p: *mut c_void);
+    pub fn scx_task_free_rcu(p: *mut c_void);
+
+    // Failed scx_task_data() lookups the SDT substrate has reported on
+    // stderr; the quiet __scx_task_data() never counts. Defined in
+    // sim_sdt_stubs.c.
+    pub static mut sim_sdt_missing_data_reports: std::ffi::c_ulong;
 
     // Test-only fault injector for scx_task_alloc (scx GitHub #3564
     // reproducer). When nonzero, scx_task_alloc() returns NULL for the

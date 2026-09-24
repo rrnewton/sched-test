@@ -144,12 +144,6 @@ static void *lavd_map_lookup(void *map, const void *key);
 extern void sim_install_sigfpe_handler(void);
 
 /*
- * Per-task arena storage initialization (sim_sdt_stubs.c).
- * Must be called before any scx_task_alloc() calls.
- */
-extern int scx_task_init(u64 data_size);
-
-/*
  * Kernel symbols that LAVD references but are not available in userspace.
  *
  * nr_cpu_ids: kernel global variable for number of possible CPUs.
@@ -1807,8 +1801,14 @@ void lavd_setup(unsigned int num_cpus)
 	/* Install SIGFPE handler for BPF div-by-zero semantics */
 	sim_install_sigfpe_handler();
 
-	/* Initialize per-task arena storage for task_ctx */
-	scx_task_init(sizeof(struct task_ctx));
+	/*
+	 * Initialize per-task arena storage for task_ctx, with the arguments
+	 * lavd's userspace passes (main.rs: ArenaLib::setup(.., size_of::<task_ctx>(),
+	 * 0, ..); align 0 selects the default). A failure there fails the load,
+	 * and scx_task_init() has already said why on stderr.
+	 */
+	if (scx_task_init(sizeof(struct task_ctx), 0))
+		__builtin_trap();
 
 	/* Register maps */
 	lavd_register_maps();
@@ -2074,13 +2074,14 @@ void lavd_set_cgroup_bw_max(unsigned int max)
  * task_ctx lookup per CPU") changed get_task_ctx(p) to read the per-CPU
  * task_ctx cache via get_cpu_ctx(), which resolves the current CPU (through the
  * generic per-CPU map lookup) and is valid only inside a callback. Probes must
- * not depend on the current CPU, so they call the underlying slowpath
- * directly with cpuc=NULL: a pure task-storage lookup (scx_task_data(p)) with
- * no per-CPU cache read/write.
+ * not depend on the current CPU, so they use find_task_ctx(p), upstream's
+ * lookup for tasks other than the callback's own: a pure task-storage lookup
+ * (__scx_task_data(p)) with no per-CPU cache read/write, and quiet on a miss,
+ * since a monitor sample of a task without a context is not a scheduler error.
  */
 static inline struct task_ctx *lavd_probe_task_ctx(struct task_struct *p)
 {
-	return (struct task_ctx *)__get_task_ctx_slowpath(p, NULL);
+	return find_task_ctx(p);
 }
 
 u16 lavd_probe_lat_cri(struct task_struct *p)

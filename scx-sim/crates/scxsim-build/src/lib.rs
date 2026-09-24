@@ -346,7 +346,8 @@ pub fn standalone_definitions() -> Vec<SchedulerDefinition> {
 /// them, so without `--undefined` the linker drops them and a `.so` SIGSEGVs at
 /// its first kfunc call; `-rdynamic` puts them in the binary's dynamic symbol
 /// table so dlopen can find them. Grouped: `scx_test_map_*` (bpf_map_* macros),
-/// `scx_task_*`/`scx_arena_subprog_init` (per-task SDT storage), `sim_arena_*`
+/// `scx_task_*`/`__scx_task_data`/`scx_arena_subprog_init` (per-task SDT
+/// storage, upstream's `lib/sdt_task.h` API), `sim_arena_*`
 /// (arena allocator), `scx_atq_create_internal` (forces the sim_atq TU),
 /// `e9_preempt_yield`/`E9_SHARED_RBC` (e9patch-instrumented variants).
 ///
@@ -360,8 +361,10 @@ pub const EXPORTED_SYMS: &[&str] = &[
     "scx_test_map_clear_all",
     "scx_task_init",
     "scx_task_alloc",
+    "__scx_task_data",
     "scx_task_data",
     "scx_task_free",
+    "scx_task_free_rcu",
     "scx_arena_subprog_init",
     "e9_preempt_yield",
     "E9_SHARED_RBC",
