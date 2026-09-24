@@ -24,3 +24,9 @@ void sim_arena_mark_persistent(void)
 {
 	sim_arena_floor = sim_arena_offset;
 }
+
+void sim_arena_release_all(void)
+{
+	sim_arena_floor = 0;
+	sim_arena_reset();
+}

@@ -11,7 +11,7 @@
 
 use std::ffi::c_void;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
 
 use crate::layered::{LayerField, LayerSpec};
 use crate::layered_control::{LayeredControl, LayeredControlSnapshot};
@@ -168,6 +168,9 @@ extern "C" {
     /// Freeze everything allocated so far as scheduler-lifetime state, so
     /// the per-run arena reset does not reclaim it. See csrc/sim_arena.h.
     pub fn sim_arena_mark_persistent();
+    /// Return the whole arena, persistent floor included, to its initial
+    /// state. Only legal while no scheduler is alive; see [`ArenaTenant`].
+    pub fn sim_arena_release_all();
 
     // BPF map registry reset (implemented in scx_test_map.c).
     // Clears the thread-local map registration arrays to prevent
@@ -1285,6 +1288,50 @@ pub struct DynamicScheduler {
     so_path: String,
     /// scx_layered's userspace-only state. `None` for every other scheduler.
     layered_userspace: Mutex<Option<LayeredUserspaceState>>,
+    /// This scheduler's claim on the shared arena. Declared last so it is
+    /// dropped after `_lib`: the `.so` is unmapped before the claim ends.
+    _arena: ArenaTenant,
+}
+
+/// Number of live [`DynamicScheduler`]s. They share one deterministic bump
+/// arena, which lives in this binary and outlives all of them.
+static ARENA_TENANTS: Mutex<usize> = Mutex::new(0);
+
+/// A live scheduler's claim on the shared arena (`csrc/sim_arena.h`).
+///
+/// Each load's `<prefix>_setup()` leaves scheduler-lifetime objects in the
+/// arena and raises its persistent floor over them, and the per-run reset
+/// never reclaims below that floor. Nothing else ever lowered it, so a
+/// process that loaded schedulers one after another held every earlier
+/// load's setup objects, plus the last run's allocations, until the 32 MiB
+/// arena ran out and init failed with -ENOMEM (mb sim-ytru8).
+///
+/// So the first claim on an empty set releases the whole arena before its
+/// `.so` is opened. Every earlier scheduler has been dropped by then and its
+/// `.so` unmapped, so nothing can reach those objects, and this load's setup
+/// starts at offset 0 exactly as it would in a fresh process. While another
+/// scheduler is alive its setup objects must survive, so a load then keeps
+/// them and stacks its own on top.
+struct ArenaTenant;
+
+impl ArenaTenant {
+    fn enter() -> Self {
+        let mut tenants = ARENA_TENANTS.lock().unwrap_or_else(PoisonError::into_inner);
+        if *tenants == 0 {
+            // SAFETY: no scheduler is alive, so no loaded code holds a
+            // pointer into the arena. The SDT table's stale entries are
+            // cleared by the per-run reset before any lookup.
+            unsafe { sim_arena_release_all() };
+        }
+        *tenants += 1;
+        ArenaTenant
+    }
+}
+
+impl Drop for ArenaTenant {
+    fn drop(&mut self) {
+        *ARENA_TENANTS.lock().unwrap_or_else(PoisonError::into_inner) -= 1;
+    }
 }
 
 struct LayeredUserspaceState {
@@ -1436,6 +1483,7 @@ impl DynamicScheduler {
         nr_cpus: u32,
     ) -> Result<Self, LoadError> {
         let prefix = def.name.as_str();
+        let arena = ArenaTenant::enter();
         // SAFETY: The .so is built by our build system from known-safe C source.
         // Use RTLD_NOW for eager binding so all PLT entries are resolved at
         // load time. Without this, lazy PLT resolution during simulation adds
@@ -1470,7 +1518,8 @@ impl DynamicScheduler {
             // reset from zeroing them and from handing the same bytes to the
             // next run's allocations. Without it is_primary_cpu() was false
             // for the entire run, so tickless never reached init_timer() and
-            // its whole timer path went unexecuted (mb sim-hfvmf).
+            // its whole timer path went unexecuted (mb sim-hfvmf). The floor
+            // comes back down only through `ArenaTenant::enter`.
             sim_arena_mark_persistent();
         }
 
@@ -1491,6 +1540,7 @@ impl DynamicScheduler {
                 specs: vec![LayerSpec::catch_all("default")],
                 control: None,
             })),
+            _arena: arena,
         };
         // Apply the definition's rodata (config globals) before run -- the
         // kernel-faithful analog of patching .rodata before BPF_PROG_LOAD, and

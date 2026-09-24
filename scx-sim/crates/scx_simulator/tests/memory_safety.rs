@@ -417,3 +417,88 @@ fn cgroup_map_at_and_over_limit() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// (6) Scheduler reloads — the arena's persistent floor must not ratchet.
+// ---------------------------------------------------------------------------
+
+extern "C" {
+    /// The arena's persistent floor (`csrc/sim_arena.c`): the bytes held as
+    /// scheduler-lifetime state, which the per-run reset never reclaims.
+    static sim_arena_floor: std::ffi::c_ulong;
+}
+
+fn arena_floor() -> u64 {
+    // SAFETY: a plain integer global in this binary, written only while a
+    // scheduler loads or a run starts; the caller holds SIM_LOCK, so neither
+    // can happen concurrently.
+    unsafe { std::ptr::read_volatile(std::ptr::addr_of!(sim_arena_floor)) }
+}
+
+/// Load and run every scheduler many times in one process, one scheduler alive
+/// at a time, which is what `cargo test` does across the tests of a binary. The
+/// floor after each load must equal the first load's, because the setup objects
+/// of a dropped scheduler are released.
+///
+/// Before the fix each load raised the floor by its setup plus the previous
+/// run's allocations. Mitosis allocates about 4.5 MiB per run since upstream
+/// `bc7e20b53` (subcell cpumasks), so after six loads the 32 MiB arena was
+/// exhausted and init failed with -ENOMEM: 38 mitosis tests failed under
+/// `cargo test` while passing under nextest (mb sim-ytru8).
+///
+/// The release must never reach a scheduler that is still alive. Tickless is
+/// the witness: its primary-CPU cpumask is a setup-time arena object, and its
+/// only kick site is gated on reading that mask (`is_primary_cpu()`). Were the
+/// mask zeroed, as every run did before mb sim-hfvmf, tickless would issue no
+/// kicks at all.
+#[test]
+fn scheduler_reloads_do_not_ratchet_the_arena_floor() {
+    let _lock = common::setup_test();
+    let loads = 16;
+
+    let all: [NamedSchedFactory; 6] = [
+        ("simple", |_n| DynamicScheduler::simple()),
+        ("lavd", DynamicScheduler::lavd),
+        ("cosmos", DynamicScheduler::cosmos),
+        ("mitosis", DynamicScheduler::mitosis),
+        ("tickless", DynamicScheduler::tickless),
+        ("layered", DynamicScheduler::layered),
+    ];
+    for (name, make) in all {
+        let mut first_floor = None;
+        for load in 0..loads {
+            let sched = make(4);
+            let floor = arena_floor();
+            let scenario = Scenario::builder()
+                .cpus(4)
+                .add_task("t", 0, hog())
+                .duration_ms(5)
+                .build();
+            let trace = Simulator::new(sched).run(scenario);
+
+            assert!(
+                !trace.has_error(),
+                "{name}: load {load} of {loads} surfaced an error: {:?}",
+                trace.exit_kind()
+            );
+            let first = *first_floor.get_or_insert(floor);
+            assert_eq!(
+                floor, first,
+                "{name}: the arena floor after load {load} is {floor} bytes, after the \
+                 first load {first}; a dropped scheduler's arena was not released"
+            );
+            if name == "tickless" {
+                let kicks = trace
+                    .events()
+                    .iter()
+                    .filter(|e| matches!(e.kind, TraceKind::KickCpu { .. }))
+                    .count();
+                assert!(
+                    kicks > 0,
+                    "tickless: load {load} of {loads} issued no kicks, so its setup-time \
+                     primary cpumask did not survive to the run (mb sim-hfvmf)"
+                );
+            }
+        }
+    }
+}

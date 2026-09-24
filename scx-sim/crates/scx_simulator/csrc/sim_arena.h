@@ -123,15 +123,34 @@ static inline void sim_arena_free(void *ptr)
  * Recording a floor after setup keeps the determinism guarantee intact (the
  * floor is fixed once the .so is loaded, so every run still starts its
  * allocations at the same address) while leaving setup-time objects alone.
+ *
+ * The arena lives in the simulator binary and outlives every scheduler, so
+ * the floor must also come back DOWN when the schedulers that own the state
+ * below it are gone; see sim_arena_release_all().
  */
 extern unsigned long sim_arena_floor;
 
 /*
  * Freeze everything allocated so far as scheduler-lifetime state.
  *
- * Called by the engine immediately after `<name>_setup()`. Idempotent.
+ * Called by the engine immediately after `<name>_setup()`. This raises the
+ * floor to the current watermark, so each call keeps every earlier setup's
+ * objects as well: it is NOT idempotent, and N loads without a release in
+ * between hold N setups' worth of arena. That is correct while those
+ * schedulers are alive and a leak once they are gone (mb sim-ytru8).
  */
 void sim_arena_mark_persistent(void);
+
+/*
+ * Return the whole arena, persistent floor included, to its initial state.
+ *
+ * Only legal when no loaded scheduler still points into the arena: the
+ * engine calls it before loading a scheduler while no other is alive. The
+ * previous schedulers' .so files are unmapped by then, so nothing can
+ * reach their setup-time objects, and this load's setup starts at offset
+ * 0 exactly as it would in a fresh process.
+ */
+void sim_arena_release_all(void);
 
 /*
  * Reset the arena for a new simulation run.
