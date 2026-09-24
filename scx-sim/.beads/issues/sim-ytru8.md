@@ -1,10 +1,11 @@
 ---
 title: 'scxsim: sim_arena_mark_persistent() ratchets the arena floor on every scheduler load, exhausting the 32 MiB arena'
-status: open
+status: closed
 priority: 1
 issue_type: bug
 created_at: 2026-09-10T21:15:25.789164718+00:00
-updated_at: 2026-09-10T21:15:25.789164718+00:00
+updated_at: 2026-09-24T22:20:23.478294248+00:00
+closed_at: 2026-09-24T22:20:23.478294108+00:00
 ---
 
 # Description

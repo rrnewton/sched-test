@@ -89,7 +89,7 @@ void *memcpy(void *dst, const void *src, size_t n)
  * Deterministic malloc using the bump allocator.
  * Aligns all allocations to 16 bytes for consistency.
  * Returns NULL if the arena is exhausted (should not happen
- * in practice — arena is 64 MiB).
+ * in practice — arena is SIM_ARENA_SIZE, 32 MiB).
  */
 void *malloc(size_t size)
 {
@@ -131,7 +131,8 @@ void *realloc(void *ptr, size_t size)
 
 /*
  * No-op free: the bump allocator does not reclaim memory.
- * The arena is reset between simulation runs via sim_arena_offset = 0.
+ * The arena is rewound between runs by sim_arena_reset(), down to the
+ * persistent floor, and released whole between schedulers (sim_arena.h).
  */
 void free(void *ptr)
 {
