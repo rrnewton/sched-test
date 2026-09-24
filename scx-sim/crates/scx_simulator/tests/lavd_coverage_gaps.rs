@@ -13,9 +13,7 @@
 //! `set_aggressive_migration` hook is `SEC("?tracepoint/...sys_enter_execve")`
 //! and the simulator does not deliver syscall tracepoints, so it and its
 //! sole callee `set_aggressive_migration` (a `static`, i.e. non-exported
-//! function) cannot be reached; `conv_wall_to_invr` is a `static __inline`
-//! with zero live callers so the compiler never emits it (confirmed absent
-//! from the `.so` symbol table); `set_cpu_flag` is a `__hidden inline` with
+//! function) cannot be reached; `set_cpu_flag` is a `__hidden inline` with
 //! zero live callers (never emitted, never dynamically resolvable); and
 //! `get_nice_prio` is `__hidden` and only reachable through
 //! `introspec.bpf.c::submit_task_ctx`, whose `bpf_ringbuf_reserve` the
@@ -27,8 +25,12 @@
 //! Newly covered here (previously listed as out of scope): the power-profile
 //! switch `do_set_power_profile` via the autopilot runtime path
 //! (`do_autopilot` → `do_set_power_profile`, PERFORMANCE transition +
-//! `update_power_mode_time`), and `get_cpuperf_cap` (exported accessor,
-//! exercised over FFI).
+//! `update_power_mode_time`).
+//!
+//! Gone upstream: `conv_wall_to_invr` and the exported `get_cpuperf_cap`
+//! accessor this file used to exercise over FFI were both deleted by scx
+//! 0ed245e2d ("scx_lavd: Drop the unused conv_wall_to_invr() and
+//! get_cpuperf_cap()"), so there is nothing left to cover.
 //!
 //! Still NOT test-addressable and documented below with the empirically
 //! confirmed mechanism (each measured 0% under coverage instrumentation): the
@@ -60,22 +62,6 @@ unsafe fn lavd_set_u8(sched: &DynamicScheduler, name: &str, val: u8) {
         .get_symbol(name.as_bytes())
         .unwrap_or_else(|| panic!("symbol {name} not found"));
     std::ptr::write_volatile(*sym, val);
-}
-
-/// Read one `u16` slot of a LAVD `u16[]` global (e.g. `cpu_capacity`).
-unsafe fn lavd_get_u16_at(sched: &DynamicScheduler, name: &str, idx: usize) -> u16 {
-    let sym: libloading::Symbol<'_, *mut u16> = sched
-        .get_symbol(name.as_bytes())
-        .unwrap_or_else(|| panic!("symbol {name} not found"));
-    std::ptr::read_volatile((*sym).add(idx))
-}
-
-/// Write one `u16` slot of a LAVD `u16[]` global.
-unsafe fn lavd_set_u16_at(sched: &DynamicScheduler, name: &str, idx: usize, val: u16) {
-    let sym: libloading::Symbol<'_, *mut u16> = sched
-        .get_symbol(name.as_bytes())
-        .unwrap_or_else(|| panic!("symbol {name} not found"));
-    std::ptr::write_volatile((*sym).add(idx), val);
 }
 
 /// Set up a minimal valid PCO (power/core-order) table so the core-compaction
@@ -436,45 +422,6 @@ fn test_lavd_autopilot_runtime_power_switch() {
         trace.total_runtime(Pid(1)) > 0,
         "light I/O task never ran; low-load phase never materialized"
     );
-}
-
-// ---------------------------------------------------------------------------
-// Target: power.bpf.c `get_cpuperf_cap` (exported accessor).
-//
-// `get_cpuperf_cap(cpu)` returns `cpu_capacity[cpu]`. Its only in-tree caller
-// is `conv_wall_to_invr`, which itself has zero callers, so it is dead under
-// the current scx source — but it is an *exported* symbol, so we exercise the
-// real accessor (and its bounds handling) directly over FFI. This is a
-// regression guard for the accessor, not a claim that the live scheduler
-// reaches it.
-// ---------------------------------------------------------------------------
-
-/// `get_cpuperf_cap(cpu)` reads back the per-CPU capacity table entry.
-#[test]
-fn test_lavd_get_cpuperf_cap_reads_capacity_table() {
-    let _lock = common::setup_test();
-
-    let sched = DynamicScheduler::lavd(4);
-    type GetCpuperfCapFn = unsafe extern "C" fn(i32) -> u16;
-
-    unsafe {
-        let sym: libloading::Symbol<'_, GetCpuperfCapFn> = sched
-            .get_symbol(b"get_cpuperf_cap\0")
-            .expect("get_cpuperf_cap symbol not found");
-
-        // Write a known capacity to a slot, then confirm the accessor returns
-        // it. Save/restore the slot so we do not perturb the shared `.so`
-        // state for subsequent tests under the serialized SIM_LOCK.
-        let saved = lavd_get_u16_at(&sched, "cpu_capacity\0", 2);
-        lavd_set_u16_at(&sched, "cpu_capacity\0", 2, 777);
-        assert_eq!(
-            (sym)(2),
-            777,
-            "get_cpuperf_cap must return the cpu_capacity[] slot"
-        );
-        lavd_set_u16_at(&sched, "cpu_capacity\0", 2, saved);
-        assert_eq!((sym)(2), saved, "capacity slot restored");
-    }
 }
 
 // ---------------------------------------------------------------------------
