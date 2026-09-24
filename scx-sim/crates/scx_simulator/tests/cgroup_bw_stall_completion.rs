@@ -153,15 +153,34 @@ fn test_all_tasks_forward_progress_under_throttle() {
         "expected repeated throttle+unthrottle (not stuck): throttled={throttled} unthrottled={unthrottled}"
     );
 
-    // Every one of the N tasks: bailed while throttled, re-enqueued on
+    // Every one of the N tasks: put aside while throttled, re-enqueued on
     // replenish, AND ran in the final quarter of the run (still alive at the
     // end — not lost in the BTQ).
+    //
+    // A task is put aside by one of two paths, and the premise accepts
+    // either. LAVD's own bail (`LavdBailOnCgroupThrottle`) fires only when
+    // `lavd_enqueue` runs while the cgroup is throttled; on this one-CPU
+    // workload that is the task that was running when the quota ran out.
+    // Tasks already waiting in the local DSQ are taken off it by the engine's
+    // pick-time admission gate instead (`eager_stash_throttled`, recorded as
+    // `CgroupBwDequeueOnThrottle`). These are the only two put-aside events
+    // that name a pid (`CbwPutAside` is a per-cgroup count).
+    //
+    // Which path a given task takes depends on which task happens to be
+    // running at each throttle instant. At scx 59c30baee the bail counts per
+    // pid were {1: 2, 2: 1, 3: 4}; at 413031d44, which enforces the quota
+    // from the first period, they are {1: 1, 3: 6}, and pid 2 is put aside
+    // only by the engine gate (7 times). Requiring the LAVD bail for every
+    // pid asserted that timing accident, not the property. The LAVD bail
+    // chain itself is asserted by `test_h6_bail_reenqueue_causal_chain`.
     let tail = duration_ns * 3 / 4;
     for p in 1..=N as i32 {
         let pid = Pid(p);
-        let bailed = trace.events().iter().any(
-            |e| matches!(&e.kind, TraceKind::LavdBailOnCgroupThrottle { pid: x, .. } if *x == pid),
-        );
+        let put_aside = trace.events().iter().any(|e| {
+            matches!(&e.kind,
+                TraceKind::LavdBailOnCgroupThrottle { pid: x, .. }
+                | TraceKind::CgroupBwDequeueOnThrottle { pid: x, .. } if *x == pid)
+        });
         let reenqueued = trace.events().iter().any(|e| {
             matches!(&e.kind, TraceKind::CgroupBwReenqueueOnReplenish { pid: x, .. } if *x == pid)
         });
@@ -169,8 +188,9 @@ fn test_all_tasks_forward_progress_under_throttle() {
             e.time_ns >= tail && matches!(&e.kind, TraceKind::TaskScheduled { pid: x } if *x == pid)
         });
         assert!(
-            bailed,
-            "task pid={p} was never put aside on throttle (LavdBailOnCgroupThrottle)"
+            put_aside,
+            "task pid={p} was never put aside on throttle \
+             (neither LavdBailOnCgroupThrottle nor CgroupBwDequeueOnThrottle)"
         );
         assert!(
             reenqueued,

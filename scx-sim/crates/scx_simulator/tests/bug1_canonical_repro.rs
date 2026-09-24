@@ -521,7 +521,10 @@ fn test_bug1_canonical_per_sha_discrimination() {
 //   rc=0 (no false stall),
 //   is_throttled=1,
 //   nr_throttled_tasks=4 (all yes-loop workers in the BTQ),
-//   nr_throttled_periods >= 4/N (out of N=6 periods in a 600ms run).
+//   nr_throttled_periods == 6/6 (every period of a 600ms run).
+//
+// Only the last is asserted; the comment inside the test says why the two
+// end-of-run readings were dropped and why the period count is 6/6.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -546,8 +549,8 @@ fn test_bug1_canonical_undersub_subprocess_reproduces_throttle() {
     // window of the 100ms bandwidth cycle. Charging re-dispatch the modelled
     // kernel cost moved the end of the run by a few microseconds per dispatch,
     // and it now lands in an unthrottled part of the same cycle — `is_throttled`
-    // reads 0 and the BTQ is empty, while `nr_throttled_periods` is unchanged at
-    // 5/6. The throttling behaviour did not change; only where in the cycle we
+    // reads 0 and the BTQ is empty, while `nr_throttled_periods` did not move.
+    // The throttling behaviour did not change; only where in the cycle we
     // happened to look did.
     //
     // This is the SECOND instance of that shape found in this codebase. The
@@ -563,6 +566,19 @@ fn test_bug1_canonical_undersub_subprocess_reproduces_throttle() {
     // pinned exactly rather than as a lower bound, which is strictly more test
     // than the `>= 4` it replaces.
     //
+    // WHY 6/6 AND NOT 5/6. It was 5/6 up to the scx pin bump of 2026-09-24
+    // (59c30baee -> 413031d44), because period 1 was never enforced. The engine
+    // creates each cgroup unlimited (`cgroup_init` with quota -1) and then
+    // writes the limit (`cgroup_set_bandwidth`), and the old library left the
+    // cgroup's period budget at infinity when the limit arrived, so period 1
+    // ran free. Upstream f437eaa1f ("manage only cgroups that define a limit")
+    // and 1d2b7224b ("manage a cgroup that gains a cpu.max limit at runtime")
+    // make `scx_cgroup_bw_set` initialise the budget from the new quota when the
+    // limit is written, so period 1 is throttled like the other five. The
+    // per-period counting in `replenish_timerfn` is identical in both library
+    // versions; the count moved by exactly the period that used to go
+    // unenforced.
+    //
     // Coverage deliberately given up: `nr_throttled_tasks == 4` checked that ALL
     // FOUR workers were in the bandwidth-throttle queue together, and the
     // fingerprint carries no cumulative counterpart to that. It is dropped
@@ -571,8 +587,8 @@ fn test_bug1_canonical_undersub_subprocess_reproduces_throttle() {
     // cumulative per-task throttle count on the library side — see mb sim-560f79
     // / mb sim-1ei8j, which track the end-of-run sampling question generally.
     assert_eq!(
-        fp.nr_throttled_periods, "5/6",
-        "undersub: expected the cgroup to be throttled in 5 of the 6 periods of a \
+        fp.nr_throttled_periods, "6/6",
+        "undersub: expected the cgroup to be throttled in all 6 periods of a \
          600ms run; got {fp:?}.\nstderr:\n{stderr}"
     );
 }
