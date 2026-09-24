@@ -371,23 +371,22 @@ fn test_numa_restricted_affinity() {
 /// Shared-DSQ deadline path (`task_dl`).
 ///
 /// COSMOS switches from per-CPU round-robin queues to the global deadline DSQ
-/// only when `is_cpu_busy(prev_cpu)` is true, i.e. when userspace has reported
-/// `cpu_util_map[cpu] >= busy_threshold`. In that mode cosmos_enqueue() falls
+/// only when `is_cpu_busy(prev_cpu)` is true, i.e. when the CPU's in-BPF user
+/// utilization EWMA (`cpu_ctx.busy_avg`, fed by `p->utime` deltas in
+/// `update_cpu_busy()`) has crossed `busy_threshold`. In that mode cosmos_enqueue() falls
 /// through to `scx_bpf_dsq_insert_vtime(..., task_dl(p, tctx), ...)` on the
 /// shared DSQ (main.bpf.c ~1233), so `task_dl()` — never covered otherwise
 /// (audit §4.4) — computes the virtual deadline.
 ///
-/// The sim doesn't yet derive per-CPU utilization automatically (mb sim-642cb2),
-/// so we set it explicitly to 1024 (100%) to match this saturated,
-/// oversubscribed workload (6 always-runnable tasks on 2 CPUs), exactly as
-/// cosmos userspace would report for a pegged system. `dsq_dispatch_counts().0`
-/// (global DSQ inserts, i.e. the vtime path) must then be non-zero.
+/// Nothing forces the mode: the engine charges `p->utime` on every tick of a
+/// `Phase::Run` task (as the kernel's `account_process_tick()` does), so this
+/// saturated, oversubscribed CPU-bound workload drives cosmos's own accounting
+/// over the threshold. `dsq_dispatch_counts().0` (global DSQ inserts, i.e. the
+/// vtime path) must then be non-zero.
 #[test]
 fn test_shared_dsq_contention() {
     let _lock = common::setup_test();
     let sched = DynamicScheduler::cosmos(2);
-    // Report a saturated system so is_cpu_busy() → deadline mode (task_dl).
-    sched.cosmos_set_cpu_util(2, 1024);
 
     // 8 mostly-CPU-bound tasks that briefly sleep, so demand (~7 CPUs) far
     // exceeds the 2 CPUs (keeps the run queue backed → shared-DSQ deadline

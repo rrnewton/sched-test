@@ -2233,28 +2233,6 @@ impl DynamicScheduler {
         }
     }
 
-    /// Set per-CPU user utilization (the signal cosmos userspace polls and
-    /// writes into `cpu_util_map`). `util` is on the production `[0, 1024]`
-    /// scale. When `cpu_util_map[cpu] >= busy_threshold`, `is_cpu_busy()`
-    /// returns true and COSMOS switches from per-CPU round-robin queues to the
-    /// global deadline queue (exercising `task_dl()` / the shared-DSQ path).
-    ///
-    /// The simulator does not yet derive utilization automatically, so tests
-    /// set it to match their workload (e.g. `1024` for a saturated run).
-    ///
-    /// Must be called after construction and before `Simulator::run()`.
-    pub fn cosmos_set_cpu_util(&self, nr_cpus: u32, util: u64) {
-        type SetUtilFn = unsafe extern "C" fn(u32, u64);
-        // SAFETY: Symbol resolved from a `.so` built by our build system.
-        unsafe {
-            let sym: libloading::Symbol<SetUtilFn> = self
-                ._lib
-                .get(b"cosmos_set_cpu_util")
-                .expect("cosmos_set_cpu_util not found");
-            (sym)(nr_cpus, util);
-        }
-    }
-
     /// Populate per-CPU SMT sibling masks, mirroring COSMOS's
     /// `init_smt_domains()` which calls the `enable_sibling_cpu` syscall prog
     /// for every SMT sibling pair. `threads_per_core` must match the

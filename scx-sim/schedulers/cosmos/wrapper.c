@@ -180,15 +180,6 @@ void cosmos_register_maps(void)
 	 */
 	SCX_REGISTER_STORAGE(scx_pmu_tasks);
 
-	/*
-	 * cpu_util_map (BPF_MAP_TYPE_ARRAY): per-CPU user utilization in
-	 * [0..1024], written periodically by cosmos userspace (main.rs poll
-	 * loop) and read by is_cpu_busy(). Pre-seeded so the scheduler can
-	 * always look it up; cosmos_set_cpu_util() lets tests play userspace's
-	 * role and drive the busy/deadline-mode path.
-	 */
-	SCX_REGISTER_ARRAY(cpu_util_map, true);
-
 	SCX_REGISTER_ARRAY(node_ctx_stor, true);
 	SCX_REGISTER_ARRAY(cpu_node_map, false);
 	SCX_REGISTER_PERCPU(cpu_ctx_stor, true);
@@ -301,25 +292,6 @@ void cosmos_set_cpu_capacity(unsigned int num_cpus, const unsigned long long *ca
  * reproduce that grouping here and invoke enable_sibling_cpu() for every
  * ordered sibling pair within each core, exactly as userspace does at init.
  */
-/*
- * Test knob: set per-CPU user utilization (the signal cosmos userspace polls
- * and writes into cpu_util_map every --polling-ms; see main.rs). @util is on
- * the production [0..1024] scale. is_cpu_busy(cpu) returns true when
- * cpu_util_map[cpu] >= busy_threshold, switching COSMOS from per-CPU
- * round-robin queues to the global deadline queue (task_dl / shared DSQ).
- *
- * The simulator does not yet compute per-CPU utilization automatically
- * (mb sim-642cb2), so tests set it explicitly to match their workload — e.g.
- * a saturated oversubscribed run sets util near 1024.
- */
-void cosmos_set_cpu_util(unsigned int num_cpus, unsigned long long util)
-{
-	unsigned int cpu;
-
-	for (cpu = 0; cpu < num_cpus && cpu < MAX_CPUS; cpu++)
-		bpf_map_update_elem(&cpu_util_map, &cpu, &util, 0);
-}
-
 void cosmos_enable_smt_siblings(unsigned int num_cpus, unsigned int threads_per_core)
 {
 	unsigned int base, a, b;
