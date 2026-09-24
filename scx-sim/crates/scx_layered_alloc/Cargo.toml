@@ -10,6 +10,10 @@ version = "0.1.0"
 # Isolating the one file here lets it follow upstream while scx_simulator stays
 # on 2021.
 edition = "2024"
+# Measured, not guessed: 1.87.0 fails on the let chains in the upstream file this
+# crate compiles (stable from 1.88); 1.88.0 builds the whole publish set and
+# reproduces the 1.97.1 run fingerprints. Nothing re-checks it yet: sim-ojycs.
+rust-version = "1.88"
 publish = false
 description = "scx_layered's alloc.rs CPU allocator, compiled verbatim for scx_simulator"
 # BSD-3-Clause: this crate's own code (src/). GPL-2.0-only: the upstream

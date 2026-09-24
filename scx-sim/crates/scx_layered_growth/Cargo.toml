@@ -6,6 +6,10 @@ version = "0.1.0"
 # scx/scheds/rust/scx_layered/src/layer_core_growth.rs, which is edition-2024
 # source and now uses let chains.
 edition = "2024"
+# Measured, not guessed: 1.87.0 fails on the let chains in the upstream file this
+# crate compiles (stable from 1.88); 1.88.0 builds the whole publish set and
+# reproduces the 1.97.1 run fingerprints. Nothing re-checks it yet: sim-ojycs.
+rust-version = "1.88"
 publish = false
 description = "scx_layered's layer_core_growth.rs core-ordering policy, compiled verbatim against a simulator topology for scx_simulator"
 # BSD-3-Clause: the adapter (src/). GPL-2.0-only: the upstream scx_layered
