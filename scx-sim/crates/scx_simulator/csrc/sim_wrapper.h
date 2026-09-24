@@ -177,6 +177,39 @@ extern u64 sim_bpf_ktime_get_ns(void);
 #undef bpf_ktime_get_ns
 #define bpf_ktime_get_ns() sim_bpf_ktime_get_ns()
 
+/*
+ * bpf_get_func_ret (helper 184). The kernel never calls it as a helper: the
+ * verifier inlines it (the BPF_FUNC_get_func_ret case of do_misc_fixups() in
+ * kernel/bpf/verifier.c) as two loads from the fexit trampoline frame, whose
+ * layout is
+ *
+ *	ctx[-1]              number of register args the traced function takes
+ *	ctx[0 .. nr_args-1]  the args
+ *	ctx[nr_args]         the traced function's return value
+ *
+ * This models exactly those loads, so whoever delivers an fexit program must
+ * build that frame: SIM_FEXIT_CTX below.
+ */
+static __always_inline long sim_bpf_get_func_ret(void *ctx, u64 *value)
+{
+	u64 nr_args = ((u64 *)ctx)[-1];
+
+	*value = ((u64 *)ctx)[nr_args];
+	return 0;
+}
+
+#undef bpf_get_func_ret
+#define bpf_get_func_ret(ctx, value) sim_bpf_get_func_ret((ctx), (value))
+
+/*
+ * The ctx pointer an fexit BPF_PROG receives for a traced function taking
+ * NR_ARGS register args and returning RET: a block-scoped trampoline frame
+ * { nr_args, args..., ret } (layout above), pointed at its first arg. The args
+ * are zero; a program that reads them needs a caller that supplies them.
+ */
+#define SIM_FEXIT_CTX(nr_args, ret) \
+	(&((u64[(nr_args) + 2]){ [0] = (nr_args), [(nr_args) + 1] = (u64)(ret) })[1])
+
 extern void *sim_dsq_iter_begin(u64 dsq_id, u64 flags);
 extern void *sim_dsq_iter_next(void);
 

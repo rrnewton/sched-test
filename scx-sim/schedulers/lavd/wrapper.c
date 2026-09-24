@@ -716,33 +716,33 @@ long lavd_futex_hook(int op, long ret)
 	 * ret semantics: wait/lock_pi -> inc on ret==0; waitv -> inc on ret>=0;
 	 * wake/wake_op -> dec on ret>=0; unlock_pi -> dec on ret==0.
 	 * inc_futex_boost/dec_futex_boost wrappers covered transitively via fexit.
+	 *
+	 * Upstream 86714edb7 made the fexit hooks read their return value with
+	 * bpf_get_func_ret() instead of a prototype argument, so each needs a real
+	 * trampoline frame (SIM_FEXIT_CTX). The arg counts are the traced kernel
+	 * functions' own, as listed in lock.bpf.c before that commit:
+	 * __futex_wait 5, futex_wait_multiple 3, futex_wait_requeue_pi 6,
+	 * futex_lock_pi 4, futex_wake 4, futex_wake_op 6, futex_unlock_pi 2.
 	 */
 	if (ret == 0) {
 		/* Acquire side only — must NOT call any dec hooks here. */
-		unsigned long long __futex_ctx_wait[] = {0,0,0,0,0,(unsigned long long)0};
-		unsigned long long __futex_ctx_wait_multi[] = {0,0,0,(unsigned long long)0};
-		unsigned long long __futex_ctx_wait_requeue[] = {0,0,0,0,0,0,(unsigned long long)0};
-		unsigned long long __futex_ctx_lock_pi[] = {0,0,0,0,(unsigned long long)0};
 		struct tp_syscall_exit __fxw = {.ret = 0};
 		struct tp_syscall_exit __fxwv = {.ret = 0};
-		fexit___futex_wait(__futex_ctx_wait);
-		fexit_futex_wait_multiple(__futex_ctx_wait_multi);
-		fexit_futex_wait_requeue_pi(__futex_ctx_wait_requeue);
-		fexit_futex_lock_pi(__futex_ctx_lock_pi);
+		fexit___futex_wait(SIM_FEXIT_CTX(5, 0));
+		fexit_futex_wait_multiple(SIM_FEXIT_CTX(3, 0));
+		fexit_futex_wait_requeue_pi(SIM_FEXIT_CTX(6, 0));
+		fexit_futex_lock_pi(SIM_FEXIT_CTX(4, 0));
 		rtp_sys_exit_futex_wait(&__fxw);
 		rtp_sys_exit_futex_waitv(&__fxwv);
 	}
 	if (ret > 0) {
 		/* Release side: wake variants + also unlock_pi for full coverage (dec). */
-		unsigned long long __futex_ctx_wake[] = {0,0,0,0,(unsigned long long)1};
-		unsigned long long __futex_ctx_wake_op[] = {0,0,0,0,0,0,(unsigned long long)1};
-		unsigned long long __futex_ctx_unlock[] = {0,0,(unsigned long long)0};
 		struct tp_syscall_exit __fxwk = {.ret = 1};
-		fexit_futex_wake(__futex_ctx_wake);
-		fexit_futex_wake_op(__futex_ctx_wake_op);
+		fexit_futex_wake(SIM_FEXIT_CTX(4, 1));
+		fexit_futex_wake_op(SIM_FEXIT_CTX(6, 1));
 		rtp_sys_exit_futex_wake(&__fxwk);
 		/* Bonus dec via unlock_pi path (ret==0) for symbol coverage. */
-		fexit_futex_unlock_pi(__futex_ctx_unlock);
+		fexit_futex_unlock_pi(SIM_FEXIT_CTX(2, 0));
 	}
 
 	p = bpf_get_current_task_btf();
