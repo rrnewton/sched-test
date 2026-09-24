@@ -24,7 +24,8 @@
 //! (`perf_event_open`-based [`RbcCounter`]/[`RbcTimer`]/[`HwBreakpoint`]) still
 //! compiles on any Linux target.
 //!
-//! Extracted from Reverie (BSD-2-Clause).
+//! Extracted from Reverie (BSD-2-Clause); its copyright notice and licence
+//! text ship alongside this crate as `LICENSE-REVERIE`.
 
 use std::fmt;
 use std::io;

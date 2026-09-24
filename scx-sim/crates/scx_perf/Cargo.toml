@@ -4,6 +4,13 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 description = "Minimal PMU-based Retired Branch Conditional (RBC) counter"
+# BSD-2-Clause: the code extracted from Reverie, whose copyright notice ships
+# as LICENSE-REVERIE. BSD-3-Clause: this repository's changes to it.
+license = "BSD-3-Clause AND BSD-2-Clause"
+repository = "https://github.com/rrnewton/sched-test"
+keywords = ["perf", "pmu", "rbc", "linux"]
+categories = ["os::linux-apis"]
+include = ["/src/**", "/examples/**", "/LICENSE", "/LICENSE-REVERIE"]
 
 [dependencies]
 libc = "0.2"

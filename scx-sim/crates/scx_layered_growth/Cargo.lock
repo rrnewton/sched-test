@@ -153,6 +153,14 @@ dependencies = [
  "anyhow",
  "clap",
  "fastrand",
+ "scxsim-build",
+ "serde",
+]
+
+[[package]]
+name = "scxsim-build"
+version = "0.1.0"
+dependencies = [
  "serde",
 ]
 

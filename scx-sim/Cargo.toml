@@ -10,6 +10,12 @@ members = [
     "crates/scxsim-calibration",
     "crates/ktstr-scenario-replay",
 ]
+# scx_layered_growth compiles scx_layered's layer_core_growth.rs verbatim, so it
+# cannot be held to this workspace's gates: that upstream file trips
+# `clippy -D warnings`, and `clippy --all-targets` builds its in-file tests even
+# with `test = false`, which cannot compile against the adapter. It is built as
+# a path dependency of scx_simulator (under the workspace lock) and packaged and
+# published on its own (`--manifest-path`), ahead of scx_simulator.
 exclude = ["crates/scx_layered_growth"]
 resolver = "2"
 

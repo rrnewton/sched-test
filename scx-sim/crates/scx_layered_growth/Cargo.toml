@@ -7,6 +7,22 @@ version = "0.1.0"
 # source and now uses let chains.
 edition = "2024"
 publish = false
+description = "scx_layered's layer_core_growth.rs core-ordering policy, compiled verbatim against a simulator topology for scx_simulator"
+# BSD-3-Clause: the adapter (src/). GPL-2.0-only: the upstream scx_layered
+# policy file it compiles (vendor/scx). Both licence texts ship in the package.
+license = "BSD-3-Clause AND GPL-2.0-only"
+repository = "https://github.com/rrnewton/sched-test"
+keywords = ["sched_ext", "scheduler", "simulator"]
+categories = ["simulation"]
+# `vendor/scx` is a symlink tree into the scx submodule in a checkout; cargo
+# packages the target file itself.
+include = [
+    "/build.rs",
+    "/src/**",
+    "/vendor/scx/scheds/rust/scx_layered/src/layer_core_growth.rs",
+    "/vendor/scx/LICENSE",
+    "/LICENSE",
+]
 
 [lib]
 # The 43 #[test]s inside the included upstream layer_core_growth.rs do NOT run,
@@ -28,7 +44,7 @@ test = false
 doctest = false
 
 [build-dependencies]
-scxsim-build = { path = "../scxsim-build" }
+scxsim-build = { version = "0.1.0", path = "../scxsim-build" }
 
 [dependencies]
 anyhow = "1"

@@ -283,6 +283,19 @@ extern void bpf_iter_scx_dsq_destroy(struct bpf_iter_scx_dsq *it);
 #undef SCX_ENQ_DSQ_PRIQ
 
 /*
+ * SCX_ENQ_IMMED (vmlinux.h: 0x200000000) does NOT take its vmlinux.h value: the
+ * simulator does not model the kernel's IMMED bounce-back, so it presents a
+ * kernel without IMMED, where the CO-RE enum reads 0 and scx_cosmos runs its
+ * documented fallback. Pinned here rather than left to the weak
+ * __SCX_ENQ_IMMED: that reads 0 too, but through a relocation the -rdynamic
+ * host's same-named copy (its C objects include this header) interposes --
+ * tests/symbol_export.rs refuses any such silent binding.
+ * DANGER TODO(sim-0qzq6): undef it and model the bounce-back.
+ */
+#undef SCX_ENQ_IMMED
+#define SCX_ENQ_IMMED 0ULL
+
+/*
  * Undo compat macros from compat.bpf.h.
  *
  * compat.bpf.h wraps kfunc calls like scx_bpf_dsq_insert() with

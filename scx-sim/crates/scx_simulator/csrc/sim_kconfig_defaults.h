@@ -11,13 +11,14 @@
  * header and the -D flag share one encoding regardless of whether <stdbool.h> is
  * in scope at the include site.
  *
- * Single source of truth: LINUX_KERNEL_VERSION is defined in BOTH a .so TU
- * (sim_bpf_stubs.c) and the host static lib (sim_task.c); both include this
- * header so the two definitions cannot diverge.
+ * These values live in the scheduler .so only. The host never defines them:
+ * the host is built once with the defaults while each .so is built with its
+ * embedder's KernelConfig, so a host copy would disagree and, through -rdynamic,
+ * override the .so's (see LINUX_KERNEL_VERSION in sim_bpf_stubs.c).
  *
  * No includes, no types: this header is included from both kern_types.h-world
- * TUs (sim_bpf_stubs.c, sim_task.c) and sim_wrapper.h-world TUs (the scheduler
- * wrapper.c files), which have incompatible include topologies.
+ * TUs (sim_bpf_stubs.c) and sim_wrapper.h-world TUs (the scheduler wrapper.c
+ * files), which have incompatible include topologies.
  */
 #ifndef SIM_KCONFIG_DEFAULTS_H
 #define SIM_KCONFIG_DEFAULTS_H

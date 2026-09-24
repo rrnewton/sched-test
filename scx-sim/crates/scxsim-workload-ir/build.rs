@@ -21,8 +21,5 @@ fn main() {
     if std::env::var_os("CARGO_FEATURE_INGEST").is_none() {
         return;
     }
-    println!("cargo:rustc-link-arg=-rdynamic");
-    for sym in scxsim_build::EXPORTED_SYMS {
-        println!("cargo:rustc-link-arg=-Wl,--undefined={sym}");
-    }
+    scxsim_build::emit_host_link_args();
 }

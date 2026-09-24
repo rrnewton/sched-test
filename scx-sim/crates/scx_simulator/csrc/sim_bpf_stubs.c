@@ -366,7 +366,16 @@ void bpf_cgroup_release(struct cgroup *cgrp)
  * Provide a definition so scheduler .so files link. Default 6.18.0 (encoded
  * major << 16 | minor << 8 | patch); an embedder overrides via
  * -DSIM_LINUX_KERNEL_VERSION (see sim_kconfig_defaults.h).
+ *
+ * Hidden: the value is per-object, like the kernel's __kconfig patching, so
+ * each .so must read the one it was compiled with. A default-visibility copy is
+ * reached through a GLOB_DAT relocation (mitosis and layered read it that way),
+ * and the dynamic linker binds that to any same-named export of the -rdynamic
+ * host first -- the host then decides which kernel version the scheduler
+ * branches on, not the embedder's KernelConfig. The host used to export one
+ * (sim_task.c, always the default), which is exactly how that happened.
  */
+__attribute__((visibility("hidden")))
 int LINUX_KERNEL_VERSION = SIM_LINUX_KERNEL_VERSION;
 
 /*
