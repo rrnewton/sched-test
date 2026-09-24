@@ -54,6 +54,12 @@ void scx_atq_task_hold(void *taskc);
 void scx_atq_task_drop(void *taskc);
 int scx_atq_task_detach(void *taskc);
 int scx_atq_task_fini(void *taskc);
+/* The caller-holds-the-lock halves cgroup_bw.bpf.c calls directly; lib/atq.h
+ * declares them only under __BPF__. Implemented in sim_atq.c. */
+int scx_atq_insert_vtime_unlocked(void *atq, void *taskc, unsigned long long vtime);
+int scx_atq_remove_unlocked(void *atq, void *taskc);
+/* lib/sdt_alloc.h, also __BPF__-only; implemented in sim_sdt_stubs.c. */
+void scx_arena_subprog_init(void);
 /*
  * Per-task SDT storage: upstream's lib/sdt_task.h API, which that header
  * declares only under __BPF__. Implemented in scx-sim/csrc/sim_sdt_stubs.c.

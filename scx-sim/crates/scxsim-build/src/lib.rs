@@ -595,6 +595,16 @@ pub fn build_schedulers(
     let kconfig_defines = kernel_config.cflag_defines();
 
     // CFLAGS_BASE — applied to every scheduler TU (mirrors Makefile CFLAGS_BASE).
+    //
+    // An implicitly declared function is an ERROR, not the warning the build
+    // used to silence. Upstream scx declares much of its lib API only under
+    // `#ifdef __BPF__`, which this userspace build never defines, so a newly
+    // called lib function is undeclared here and C would type it as returning
+    // `int`: a pointer or u64 result is silently truncated, and a missing
+    // symbol only surfaces when the .so is dlopen'd, one symbol per run. The
+    // 81738161 scx bump hit both (`__scx_task_data`'s task-ctx pointer,
+    // `ravg_sat_add`'s u64). Declare such functions where the sim provides
+    // them (scxtest/overrides.h, or the scheduler's wrapper).
     let cflags_base: &[&str] = &[
         "-fPIC",
         "-DSCX_BPF_UNITTEST",
@@ -602,7 +612,7 @@ pub fn build_schedulers(
         "-O2",
         "-Wno-unused-parameter",
         "-Wno-unknown-attributes",
-        "-Wno-implicit-function-declaration",
+        "-Werror=implicit-function-declaration",
     ];
 
     // Discover schedulers: subdirs of schedulers_src that contain wrapper.c.
