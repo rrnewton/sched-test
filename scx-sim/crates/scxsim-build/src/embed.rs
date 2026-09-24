@@ -254,15 +254,13 @@ impl SimBuildInputs {
 
     /// The `-I` set for [`build_schedulers`] (and the host static libs): the sim
     /// C dirs, then [`scx_include_paths`]. `-I` resolution is first-match, so this
-    /// order is part of the build contract; `vmlinux_override` is passed through.
-    pub fn include_paths(&self, vmlinux_override: Option<&Path>) -> Vec<PathBuf> {
+    /// order is part of the build contract. Scheduler `.so` files must be built
+    /// with exactly this set: the host static libs are, and the two share struct
+    /// layouts through `vmlinux.h` (see [`scx_include_paths`]).
+    pub fn include_paths(&self) -> Vec<PathBuf> {
         [self.csrc.clone(), self.scxtest.clone()]
             .into_iter()
-            .chain(scx_include_paths(
-                &self.scx_root,
-                &self.bpf_include,
-                vmlinux_override,
-            ))
+            .chain(scx_include_paths(&self.scx_root, &self.bpf_include))
             .collect()
     }
 
@@ -295,14 +293,14 @@ impl SimBuildInputs {
     /// it from a build script with `out_dir` = `OUT_DIR`; with
     /// [`emit_host_link_args`] it is the whole build-side embedder contract.
     ///
-    /// The compiler is `$BPF_CLANG`, else `clang`. `vmlinux_override` and
-    /// `kernel_config` are passed through (see [`scx_include_paths`] and
-    /// [`KernelConfig`]). Emits the rerun triggers for everything it reads.
+    /// The compiler is `$BPF_CLANG`, else `clang`; the `-I` set is
+    /// [`include_paths`](Self::include_paths), and `kernel_config` is passed
+    /// through (see [`KernelConfig`]). Emits the rerun triggers for everything it
+    /// reads.
     pub fn build_bundled(
         &self,
         defs: &[SchedulerDefinition],
         out_dir: &Path,
-        vmlinux_override: Option<&Path>,
         kernel_config: &KernelConfig,
     ) -> PathBuf {
         let staged = out_dir.join("schedulers_src");
@@ -318,7 +316,7 @@ impl SimBuildInputs {
             &so_dir,
             &self.csrc,
             &self.scxtest,
-            &self.include_paths(vmlinux_override),
+            &self.include_paths(),
             &self.scx_root,
             &compiler,
             false, // coverage
@@ -326,11 +324,7 @@ impl SimBuildInputs {
             kernel_config,
         );
         let sources = defs.iter().map(|d| self.schedulers.join(&d.name));
-        for path in self
-            .rerun_paths(defs)
-            .chain(sources)
-            .chain(vmlinux_override.map(Path::to_path_buf))
-        {
+        for path in self.rerun_paths(defs).chain(sources) {
             println!("cargo:rerun-if-changed={}", path.display());
         }
         so_dir
@@ -542,13 +536,9 @@ mod tests {
         let inputs = sample_inputs(Path::new("/scx"), Path::new("/c/schedulers"));
         let want: Vec<PathBuf> = [PathBuf::from("/c/csrc"), PathBuf::from("/c/scxtest")]
             .into_iter()
-            .chain(scx_include_paths(
-                Path::new("/scx"),
-                Path::new("/bpf"),
-                None,
-            ))
+            .chain(scx_include_paths(Path::new("/scx"), Path::new("/bpf")))
             .collect();
-        assert_eq!(inputs.include_paths(None), want);
+        assert_eq!(inputs.include_paths(), want);
     }
 
     /// With `SCX_ROOT` set, the default is never evaluated -- so a bundled

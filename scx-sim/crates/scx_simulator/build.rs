@@ -49,10 +49,11 @@ fn main() {
     // for the order, shared with embedders). -I resolution is first-match, so
     // this reproduces the standalone build's historical -I sequence exactly --
     // keep crate-local dirs ahead of the scx trees and preserve the order (the
-    // .so build is sensitive to it). None vmlinux override: the standalone build
-    // uses the vendored, scx-versioned vmlinux (an embedder passes
-    // Some(kernel_vmlinux_dir)).
-    let include_paths = inputs.include_paths(None);
+    // .so build is sensitive to it). The static libs and every .so use this one
+    // set, so both see the same vmlinux.h: the static libs allocate the kernel
+    // structs a scheduler reads, and nothing relocates a field offset between
+    // two layouts (see scxsim_build::scx_include_paths).
+    let include_paths = inputs.include_paths();
 
     // Common compiler: BPF scheduler code compiled as userspace C has
     // inherently unused parameters (fixed BPF ops signatures) and unknown

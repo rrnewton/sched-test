@@ -1,5 +1,5 @@
-//! Embedder build script: re-emit the non-transitive kfunc-export link args and
-//! build `libscx_simple.so` the way an external embedder (cargo-ktstr) would.
+//! Embedder build script: emit the host-export link args and build
+//! `libscx_simple.so` the way an external embedder (cargo-ktstr) would.
 //!
 //! This is deliberately the SAME code an external embedder writes, and it
 //! reaches scx_simulator only the way one can: through the `links = "scxsim"`
@@ -13,12 +13,14 @@ use std::path::PathBuf;
 use scxsim_build::{emit_host_link_args, KernelConfig, SchedulerDefinition, SimBuildInputs};
 
 fn main() {
-    // (1) Re-emit the link args that put the kfunc/SDT/arena symbols (defined in
-    // scx_simulator's C static libs, linked into this binary) in this binary's
-    // dynamic symbol table so a dlopen'd `.so` resolves them. These
-    // `cargo:rustc-link-arg` directives are NON-TRANSITIVE -- scx_simulator's own
-    // build.rs emits them for ITS binaries only, so every downstream embedder
-    // must re-emit them. This call IS the contract under test.
+    // (1) Put the host exports (`HOST_EXPORTS`: the map, kfunc, SDT, arena and
+    // ATQ symbols scx_simulator's C static libs define and link into this
+    // binary) in this binary's dynamic symbol table, so a dlopen'd `.so` binds
+    // the simulator's definitions. `cargo:rustc-link-arg` is NON-TRANSITIVE --
+    // scx_simulator's own build.rs emits it for ITS binaries only -- so every
+    // package whose binaries load a `.so` must call this itself; without it the
+    // loader refuses with `LoadError::HostSymbolsNotExported` (`embed_unexported`
+    // is that negative control). This call IS the contract under test.
     emit_host_link_args();
 
     // (2) scx_simulator's C substrate, scx tree and libbpf headers, as it was
@@ -34,14 +36,11 @@ fn main() {
         .with_strip_const(false)
         .with_scx_bpf_dir(false);
 
-    // None vmlinux override -- this in-repo proof uses the bundled vmlinux; a
-    // real embedder driving a booted kernel passes Some(its kernel-derived
-    // vmlinux dir). KernelConfig::default() keeps the standalone defaults.
+    // KernelConfig::default() keeps the standalone defaults.
     let out_dir: PathBuf = env::var("OUT_DIR").unwrap().into();
     let so_dir = inputs.build_bundled(
         std::slice::from_ref(&simple_def),
         &out_dir,
-        None,
         &KernelConfig::default(),
     );
     println!("cargo:rustc-env=HARNESS_SO_DIR={}", so_dir.display());

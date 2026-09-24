@@ -49,7 +49,7 @@ impl SchedulerRuntime {
 /// Declarative per-scheduler descriptor: build-side fields (read by build.rs)
 /// plus the runtime register/setup half (read by the lib).
 pub struct SchedulerManifest {
-    /// Scheduler name; matches the schedulers/<name>/ directory.
+    /// Scheduler name; matches the `schedulers/<name>/` directory.
     pub name: &'static str,
     /// Strip `const` so the BPF const-volatile globals are writable. True for
     /// every scheduler except `simple`, whose source is local and needs no
@@ -58,21 +58,25 @@ pub struct SchedulerManifest {
     /// Add `-I <scx_root>/scheds/rust/scx_<name>/src/bpf` (where the scheduler's
     /// BPF source and headers live). True for every scheduler except `simple`.
     pub scx_bpf_dir: bool,
-    /// Add `-I <schedulers>/<name>` -- lavd and cosmos keep a generated/patched
-    /// source (e.g. cosmos_main_patched.c) in their own directory.
+    /// Add `-I <schedulers>/<name>`, the scheduler's own wrapper directory. Set
+    /// for lavd and cosmos, although that directory holds nothing for an `-I` to
+    /// resolve today: a quoted include already searches the includer's
+    /// directory, and a patched source is generated into `OUT_DIR` (see
+    /// `source_patches`).
     pub extra_local_include: bool,
     /// Source-text find/replace patches applied to the scheduler's upstream
     /// `main.bpf.c` before compilation, as `(find, replace)`. Empty for none.
     /// A pre-existing build step (not manifest-generated code): the patched copy
-    /// is written next to the wrapper as `<name>_main_patched.c`, which the
-    /// wrapper `#include`s (resolved via `extra_local_include`).
+    /// is written to `OUT_DIR` as `<name>_main_patched.c`, which the wrapper
+    /// includes with an angle `#include`, resolved through the `-I<OUT_DIR>`
+    /// [`build_schedulers`] prepends.
     pub source_patches: &'static [(&'static str, &'static str)],
     /// Runtime register/setup data consumed by the generic setup path.
     pub runtime: SchedulerRuntime,
 }
 
 /// The declared scheduler set. The build cross-checks this against the
-/// discovered schedulers/<name>/ directories so neither can drift silently.
+/// discovered `schedulers/<name>/` directories so neither can drift silently.
 pub const SCHEDULERS: &[SchedulerManifest] = &[
     SchedulerManifest {
         name: "cosmos",
@@ -238,13 +242,14 @@ pub const SCHEDULERS: &[SchedulerManifest] = &[
 /// from `schedulers_src` + name, so the name is the only source key.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SchedulerDefinition {
-    /// Scheduler name; matches the schedulers/<name>/ dir and the .so/ops prefix.
+    /// Scheduler name; matches the `schedulers/<name>/` dir and the .so/ops prefix.
     pub name: String,
     /// Strip `const` so BPF const-volatile globals are writable (all but `simple`).
     pub strip_const: bool,
-    /// Add -I <scx_root>/scheds/rust/scx_<name>/src/bpf (all but `simple`).
+    /// Add `-I <scx_root>/scheds/rust/scx_<name>/src/bpf` (all but `simple`).
     pub scx_bpf_dir: bool,
-    /// Add -I <schedulers>/<name> (a generated/patched source lives there).
+    /// Add `-I <schedulers>/<name>`, the wrapper's own directory (see
+    /// [`SchedulerManifest::extra_local_include`]).
     pub extra_local_include: bool,
     /// Source-text find/replace patches applied to the upstream `main.bpf.c`
     /// before compilation, as `(find, replace)`. Empty for none.
@@ -256,8 +261,8 @@ pub struct SchedulerDefinition {
 impl SchedulerDefinition {
     /// Embedder-facing constructor. `name` is the scheduler's `.so` / ops prefix
     /// and the key `build_schedulers` derives the BPF source dir
-    /// (`scx_root`/scheds/rust/scx_<name>/src/bpf) and `wrapper.c` dir
-    /// (`schedulers_src`/<name>) from. Build-side policy flags default to the
+    /// (`<scx_root>/scheds/rust/scx_<name>/src/bpf`) and `wrapper.c` dir
+    /// (`<schedulers_src>/<name>`) from. Build-side policy flags default to the
     /// common non-`simple` profile: `strip_const` and `scx_bpf_dir` true,
     /// `extra_local_include` false, no `source_patches`. (`strip_const`/`scx_bpf_dir`
     /// are false only for `simple`; lavd and cosmos override
@@ -316,8 +321,8 @@ impl SchedulerDefinition {
         self
     }
 
-    /// Override `extra_local_include` (default `false`; set `true` for a scheduler
-    /// that keeps a generated/patched source in its own dir, e.g. lavd/cosmos).
+    /// Override `extra_local_include` (default `false`; lavd and cosmos set it --
+    /// see [`SchedulerManifest::extra_local_include`]).
     pub fn with_extra_local_include(mut self, extra_local_include: bool) -> Self {
         self.extra_local_include = extra_local_include;
         self
@@ -520,33 +525,23 @@ pub const HOST_EXPORTS: &[HostExport] = &[
 /// nor `<scx_root>/lib` ([`build_schedulers`] appends that itself), so neither is
 /// double-added.
 ///
-/// `vmlinux_override`: when `Some(dir)`, `dir` (which must contain a `vmlinux.h`)
-/// REPLACES the two vendored `scheds/vmlinux` entries -- `scheds/vmlinux`
-/// symlinks `vmlinux.h` into `scheds/vmlinux/arch/x86` (the symlink target dir,
-/// where the version-pinned header lives), so both `-I` entries serve only to
-/// resolve `#include "vmlinux.h"`. The vendored vmlinux is pinned to one scx
-/// version, so an embedder (e.g. ktstr) passes the vmlinux it derived from the
-/// kernel under test, compiling the `.so` against the matching kernel ABI.
-/// `None` keeps the vendored, scx-versioned vmlinux (the standalone default).
-pub fn scx_include_paths(
-    scx_root: &Path,
-    bpf_include: &Path,
-    vmlinux_override: Option<&Path>,
-) -> Vec<PathBuf> {
-    let mut paths = vec![
+/// `#include "vmlinux.h"` always resolves to the vendored, scx-versioned header
+/// (`scheds/vmlinux` symlinks it into `scheds/vmlinux/arch/x86`), and there is
+/// deliberately no per-`.so` override. The host static libraries are compiled
+/// from this same set and allocate the `task_struct`, `cgroup` and `css_set` a
+/// scheduler reads; with no CO-RE relocation in the sim, every field offset is
+/// fixed when the `.so` is compiled, so a `.so` built against any other header
+/// reads the host's structs at the wrong offsets. A kernel-derived header must
+/// switch the whole build at once (sim-004y6).
+pub fn scx_include_paths(scx_root: &Path, bpf_include: &Path) -> Vec<PathBuf> {
+    vec![
         scx_root.join("scheds/include"),
         scx_root.join("scheds/include/lib"),
-    ];
-    match vmlinux_override {
-        Some(dir) => paths.push(dir.to_path_buf()),
-        None => {
-            paths.push(scx_root.join("scheds/vmlinux"));
-            paths.push(scx_root.join("scheds/vmlinux/arch/x86"));
-        }
-    }
-    paths.push(scx_root.join("scheds/include/bpf-compat"));
-    paths.push(bpf_include.to_path_buf());
-    paths
+        scx_root.join("scheds/vmlinux"),
+        scx_root.join("scheds/vmlinux/arch/x86"),
+        scx_root.join("scheds/include/bpf-compat"),
+        bpf_include.to_path_buf(),
+    ]
 }
 
 /// Whether the scx tree at `scx_root` uses the NEW cgroup_bw function signatures,
@@ -746,7 +741,7 @@ pub fn build_schedulers(
         // `simple` strips no `const` and pulls no scx BPF include (local source);
         // every other scheduler strips `const` (BPF const-volatile globals must be
         // writable) and adds scheds/rust/scx_<name>/src/bpf; lavd/cosmos also
-        // include their own dir (a generated/patched source lives there).
+        // add their own wrapper dir (`extra_local_include`).
         let m = defs
             .iter()
             .find(|m| m.name.as_str() == name.as_str())
@@ -1030,20 +1025,15 @@ mod tests {
         );
     }
 
-    /// `scx_include_paths` with `None` returns exactly the scx-derived `-I` dirs
-    /// in the order the standalone build.rs used inline, excluding `<scx_root>/lib`
-    /// (build_schedulers appends that -- double-add hazard) and the caller's
-    /// crate-local csrc/scxtest; with `Some(override)` it replaces the two vendored
-    /// vmlinux entries in-slot with the override dir.
+    /// `scx_include_paths` returns exactly the scx-derived `-I` dirs in the order
+    /// the standalone build.rs used inline -- the vendored, scx-versioned vmlinux
+    /// entries included -- excluding `<scx_root>/lib` (build_schedulers appends
+    /// that -- double-add hazard) and the caller's crate-local csrc/scxtest.
     #[test]
     fn scx_include_paths_order_and_contents() {
         let scx = Path::new("/scx");
         let bpf = Path::new("/bpf/include");
-
-        // Default (None): the vendored, scx-versioned vmlinux entries, in the
-        // historical -I order. Must exclude <scx_root>/lib (build_schedulers
-        // appends it) and the caller's crate-local csrc/scxtest.
-        let got = scx_include_paths(scx, bpf, None);
+        let got = scx_include_paths(scx, bpf);
         assert_eq!(
             got,
             vec![
@@ -1056,26 +1046,6 @@ mod tests {
             ]
         );
         assert!(!got.iter().any(|p| p == Path::new("/scx/lib")));
-
-        // Override (Some): the embedder's kernel-derived vmlinux dir REPLACES the
-        // two vendored scheds/vmlinux entries in the same slot; the vendored ones
-        // no longer appear, and the surrounding order is preserved.
-        let km = Path::new("/kernel/vmlinux");
-        let got = scx_include_paths(scx, bpf, Some(km));
-        assert_eq!(
-            got,
-            vec![
-                PathBuf::from("/scx/scheds/include"),
-                PathBuf::from("/scx/scheds/include/lib"),
-                PathBuf::from("/kernel/vmlinux"),
-                PathBuf::from("/scx/scheds/include/bpf-compat"),
-                PathBuf::from("/bpf/include"),
-            ]
-        );
-        assert!(!got.iter().any(|p| p == Path::new("/scx/scheds/vmlinux")));
-        assert!(!got
-            .iter()
-            .any(|p| p == Path::new("/scx/scheds/vmlinux/arch/x86")));
     }
 
     /// `header_has_new_cgroup_bw_api` matches only a line-anchored
