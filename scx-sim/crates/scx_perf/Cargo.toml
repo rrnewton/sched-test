@@ -5,7 +5,6 @@ edition = "2021"
 # One floor for the whole publish set, measured end to end; see the note in
 # crates/scx_layered_alloc/Cargo.toml. Nothing re-checks it yet: sim-ojycs.
 rust-version = "1.88"
-publish = false
 description = "Minimal PMU-based Retired Branch Conditional (RBC) counter"
 # BSD-2-Clause: the code extracted from Reverie, whose copyright notice ships
 # as LICENSE-REVERIE. BSD-3-Clause: this repository's changes to it.

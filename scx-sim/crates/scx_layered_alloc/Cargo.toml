@@ -14,7 +14,6 @@ edition = "2024"
 # crate compiles (stable from 1.88); 1.88.0 builds the whole publish set and
 # reproduces the 1.97.1 run fingerprints. Nothing re-checks it yet: sim-ojycs.
 rust-version = "1.88"
-publish = false
 description = "scx_layered's alloc.rs CPU allocator, compiled verbatim for scx_simulator"
 # BSD-3-Clause: this crate's own code (src/). GPL-2.0-only: the upstream
 # scx_layered alloc.rs it compiles (vendor/scx), and the vendored

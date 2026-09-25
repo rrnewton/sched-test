@@ -5,7 +5,6 @@ edition = "2021"
 # One floor for the whole publish set, measured end to end; see the note in
 # crates/scx_layered_alloc/Cargo.toml. Nothing re-checks it yet: sim-ojycs.
 rust-version = "1.88"
-publish = false
 description = "Deterministic simulator for sched_ext schedulers: runs the real BPF scheduler C code in-process against a simulated kernel"
 # BSD-3-Clause: this crate's own code. GPL-2.0-only: the scx sources it builds
 # and links (vendor/scx, and scxtest/, which is vendored from scx's former

@@ -5,7 +5,6 @@ edition = "2021"
 # One floor for the whole publish set, measured end to end; see the note in
 # crates/scx_layered_alloc/Cargo.toml. Nothing re-checks it yet: sim-ojycs.
 rust-version = "1.88"
-publish = false
 description = "Build-time scheduler .so compilation plus the declarative per-scheduler manifest, shared by scx_simulator's build script and embedders."
 license = "BSD-3-Clause"
 repository = "https://github.com/rrnewton/sched-test"
