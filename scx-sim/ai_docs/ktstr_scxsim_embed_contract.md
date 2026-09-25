@@ -227,6 +227,24 @@ package that produces a loading binary must. In this tree these packages do:
 - `ktstr-scenario-replay`
 - `embed_harness`
 
+`emit_host_link_args()` reaches every target the package links, including any
+binaries it ships: `-rdynamic` puts every global symbol of each into its
+dynamic symbol table, and the `--undefined` arguments link the simulator's
+definitions of the 55 names into each. A package in
+which only some targets load a `.so` can scope the same arguments with cargo's
+per-target instructions:
+
+```rust
+for arg in scxsim_build::host_link_args() {
+    println!("cargo:rustc-link-arg-tests={arg}");
+}
+```
+
+`-tests` reaches `[[test]]` targets only, not the library's unit tests. The
+other scopes are `-bins`, `-bin=<NAME>`, `-examples` and `-benches`. The probe
+checks the result whichever you choose. ktstr's candidate `scxsim` feature
+scopes them this way, because only one of its test targets loads a `.so`.
+
 You can use a selective export list instead of `-rdynamic`: a version script,
 `--dynamic-list` or `--export-dynamic-symbol`. If you do, it must cover every
 symbol any `.so` resolves from the binary. That is the 55 `HOST_EXPORTS`
