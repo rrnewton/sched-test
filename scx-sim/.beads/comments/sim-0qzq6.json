@@ -1,0 +1,10 @@
+[
+  {
+    "id": "sim-0qzq6-c20c44bf206",
+    "issue_id": "sim-0qzq6",
+    "author": "devbig030",
+    "body": "Interim state on feat/scxsim-cratesio-release-candidate: csrc/sim_wrapper.h now pins SCX_ENQ_IMMED to 0ULL explicitly (#undef + #define, marked DANGER TODO(sim-0qzq6)) instead of leaving it to the weak const volatile __SCX_ENQ_IMMED. Behaviour is unchanged (both read 0, i.e. a kernel without IMMED), but the weak global was reached through a relocation that the -rdynamic host's same-named copy interposes, which tests/symbol_export.rs (every_silent_binding_to_this_binary_is_listed) refuses. The fix this issue asks for is unchanged: undef it AND model the bounce-back through ops.enqueue (SCX_ENQ_REENQ); removing the pin alone would re-open the interposition.",
+    "created_at": "2026-09-25T02:04:06.572841782Z",
+    "updated_at": "2026-09-25T02:04:06.572841782Z"
+  }
+]

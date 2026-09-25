@@ -5,11 +5,10 @@ edition = "2021"
 publish = false
 description = "Replays a ktstr scenario record on the simulator: SourceScenario JSON -> lower -> IR -> ingest -> Scenario -> Simulator, so one ktstr test definition can drive both the VM backend and scx-sim."
 
-# See embed_harness's Cargo.toml for why libbpf-sys is a NORMAL dependency: cargo
-# only exposes a links-crate's metadata (DEP_BPF_INCLUDE) to a build script for
-# the package's normal deps, and build.rs needs that path.
+# scx_simulator must stay a NORMAL dependency: cargo only exposes a links-crate's
+# metadata (scx_simulator's DEP_SCXSIM_* build inputs) to a build script for the
+# package's normal deps, and build.rs needs it. See embed_harness's Cargo.toml.
 [dependencies]
-libbpf-sys = "=1.6.1"
 # `ingest` is what pulls in to_scenario (IR -> scx_simulator::Scenario);
 # without it the crate is source+IR only and this replay cannot exist.
 scxsim-workload-ir = { path = "../scxsim-workload-ir", features = ["ingest"] }

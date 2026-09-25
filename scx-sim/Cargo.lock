@@ -266,7 +266,14 @@ checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 name = "embed_harness"
 version = "0.1.0"
 dependencies = [
- "libbpf-sys",
+ "scx_simulator",
+ "scxsim-build",
+]
+
+[[package]]
+name = "embed_unexported"
+version = "0.1.0"
+dependencies = [
  "scx_simulator",
  "scxsim-build",
 ]
@@ -431,7 +438,6 @@ dependencies = [
 name = "ktstr-scenario-replay"
 version = "0.1.0"
 dependencies = [
- "libbpf-sys",
  "scx_simulator",
  "scxsim-build",
  "scxsim-workload-ir",
@@ -539,6 +545,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "object"
+version = "0.39.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e5a6c098c7a3b6547378093f5cc30bc54fd361ce711e05293a5cc589562739b"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]
@@ -938,6 +953,7 @@ dependencies = [
  "libbpf-sys",
  "libc",
  "libloading",
+ "object",
  "perf-event-open-sys",
  "perfetto_protos",
  "protobuf",

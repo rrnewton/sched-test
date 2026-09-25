@@ -1,0 +1,18 @@
+[package]
+name = "embed_unexported"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Negative control for embed_harness: a downstream binary linked WITHOUT scxsim_build::emit_host_link_args, which scx_simulator must refuse to load a scheduler into."
+
+# No build script, deliberately: leaving out the emit_host_link_args() call is
+# the mistake under test. scx_simulator is an ordinary dependency, so the link
+# sees every host export's definition and only the arguments that keep and
+# export them are missing, as for an embedder that forgot the call.
+# default-features = false for the same reason as embed_harness.
+[dependencies]
+scx_simulator = { path = "../scx_simulator", default-features = false }
+
+# The test compares the refusal against the contract itself.
+[dev-dependencies]
+scxsim-build = { path = "../scxsim-build" }

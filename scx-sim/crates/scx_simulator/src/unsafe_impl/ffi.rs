@@ -19,7 +19,7 @@ use crate::layered_control::{LayeredControl, LayeredControlSnapshot};
 // ---------------------------------------------------------------------------
 // task_struct accessors (implemented in csrc/sim_task.c)
 // ---------------------------------------------------------------------------
-// These `extern "C"` decls bind C symbols (several are in the EXPORTED_SYMS
+// These `extern "C"` decls bind C symbols (several are in the HOST_EXPORTS
 // dlopen kfunc-export contract); rustc sees no Rust caller for some, so dead_code
 // is allowed at the BLOCK level only -- the lint stays live over the module's
 // Rust public API (the bulk of this file).
@@ -1222,8 +1222,31 @@ pub fn discover_schedulers(dir: &Path) -> Vec<SchedulerInfo> {
 /// wrappers `panic!` on these (correct for the standalone binary, per No Silent
 /// Failures); an embedder calls the `try_*` forms and handles the error instead of
 /// taking a process abort across the FFI boundary.
+///
+/// `#[non_exhaustive]`: match with a wildcard arm, so a new failure mode is not
+/// a breaking change.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LoadError {
+    /// The running binary does not export every symbol a scheduler `.so`
+    /// resolves from its host ([`scxsim_build::HOST_EXPORTS`]): it was linked
+    /// without the arguments [`scxsim_build::emit_host_link_args`] emits.
+    /// Checked BEFORE `dlopen`, because for most of those symbols a missing
+    /// export does not fail the load. Either the `.so` carries its own copy
+    /// ([`scxsim_build::IfUnexported::OwnDefinitionBinds`]) -- `scx_task_alloc`
+    /// returning NULL, `scx_bpf_create_dsq` returning -1, `scx_bpf_error_bstr`
+    /// doing nothing -- and binds it in place of the simulator's definition, or
+    /// it holds only a weak reference
+    /// ([`scxsim_build::IfUnexported::ResolvesToNull`]) that binds to NULL, and
+    /// the scheduler takes its path for a kernel without that kfunc. Either way
+    /// it loads and runs on something other than the simulator, with nothing to
+    /// say so.
+    HostSymbolsNotExported {
+        /// The `.so` that was not loaded.
+        path: String,
+        /// The host exports absent from the process's global symbol scope.
+        missing: Vec<scxsim_build::HostExport>,
+    },
     /// The `.so` file could not be opened (dlopen failure).
     LibraryOpen {
         /// Path that failed to open.
@@ -1255,6 +1278,30 @@ pub enum LoadError {
 impl std::fmt::Display for LoadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            LoadError::HostSymbolsNotExported { path, missing } => {
+                write!(f, "not loading {path}: this binary does not export ")?;
+                write_export_names(f, missing, |_| true)?;
+                f.write_str(" for the scheduler to resolve. ")?;
+                for class in [
+                    scxsim_build::IfUnexported::DlopenFails,
+                    scxsim_build::IfUnexported::OwnDefinitionBinds,
+                    scxsim_build::IfUnexported::ResolvesToNull,
+                ] {
+                    let Some((lead_in, consequence)) = silent_binding(class) else {
+                        continue;
+                    };
+                    if missing.iter().any(|e| e.if_unexported == class) {
+                        f.write_str(lead_in)?;
+                        write_export_names(f, missing, |e| e.if_unexported == class)?;
+                        f.write_str(consequence)?;
+                    }
+                }
+                f.write_str(
+                    "Fix: call scxsim_build::emit_host_link_args() from the build script of \
+                     the package that builds this binary (cargo does not pass link arguments \
+                     on to dependents)",
+                )
+            }
             LoadError::LibraryOpen { path, message } => {
                 write!(f, "failed to load {path}: {message}")
             }
@@ -1272,6 +1319,61 @@ impl std::fmt::Display for LoadError {
 }
 
 impl std::error::Error for LoadError {}
+
+/// For a class under which a missing export still LOADS, the sentence saying
+/// what the scheduler would have run instead, as the text before and after the
+/// names of the missing exports in that class. `None` for the loud class.
+///
+/// Conditional ("where a scheduler library ..."), because the class is a
+/// property of the symbol across the bundled schedulers, not a fact checked
+/// against this `.so`: the probe runs before `dlopen` and does not read it.
+fn silent_binding(class: scxsim_build::IfUnexported) -> Option<(&'static str, &'static str)> {
+    match class {
+        scxsim_build::IfUnexported::DlopenFails => None,
+        scxsim_build::IfUnexported::OwnDefinitionBinds => Some((
+            "Where a scheduler library carries its own copy of ",
+            ", dlopen would have succeeded and the scheduler would have run that copy \
+             (a stub, for most) in place of the simulator's definition, silently. ",
+        )),
+        scxsim_build::IfUnexported::ResolvesToNull => Some((
+            "Where a scheduler library references ",
+            " only weakly, dlopen would have succeeded with the reference bound to NULL and \
+             the scheduler would have taken its path for a kernel without that kfunc, \
+             silently (or, where a call is unguarded, jumped to address 0). ",
+        )),
+    }
+}
+
+/// Writes the names of the `exports` that `keep` selects, comma-separated.
+fn write_export_names(
+    f: &mut std::fmt::Formatter<'_>,
+    exports: &[scxsim_build::HostExport],
+    keep: impl Fn(&scxsim_build::HostExport) -> bool,
+) -> std::fmt::Result {
+    for (i, export) in exports.iter().filter(|e| keep(e)).enumerate() {
+        if i > 0 {
+            f.write_str(", ")?;
+        }
+        f.write_str(export.name)?;
+    }
+    Ok(())
+}
+
+/// The `exports` absent from this process's global symbol scope -- the scope a
+/// `dlopen`ed `.so` resolves its undefined symbols in, so exactly the ones a
+/// scheduler referencing them could not bind to the host's definition.
+fn unexported_symbols(exports: &[scxsim_build::HostExport]) -> Vec<scxsim_build::HostExport> {
+    exports
+        .iter()
+        .filter(|export| {
+            let name = std::ffi::CString::new(export.name).expect("symbol names contain no NUL");
+            // SAFETY: dlsym only reads the NUL-terminated name; RTLD_DEFAULT
+            // searches the global scope and loads nothing.
+            unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) }.is_null()
+        })
+        .copied()
+        .collect()
+}
 
 /// A scheduler loaded dynamically from a `.so` shared library.
 ///
@@ -1483,6 +1585,15 @@ impl DynamicScheduler {
         nr_cpus: u32,
     ) -> Result<Self, LoadError> {
         let prefix = def.name.as_str();
+        // A pure check, made before claiming the arena, so a refused load
+        // has no side effects.
+        let missing = unexported_symbols(scxsim_build::HOST_EXPORTS);
+        if !missing.is_empty() {
+            return Err(LoadError::HostSymbolsNotExported {
+                path: path.to_owned(),
+                missing,
+            });
+        }
         let arena = ArenaTenant::enter();
         // SAFETY: The .so is built by our build system from known-safe C source.
         // Use RTLD_NOW for eager binding so all PLT entries are resolved at
@@ -3033,6 +3144,85 @@ mod tests {
         )]);
         let result = DynamicScheduler::try_load_with_definition(&path, &def, 1);
         assert!(matches!(result, Err(LoadError::MissingRodataGlobal { .. })));
+    }
+
+    /// The `HOST_EXPORTS` entry named `name`.
+    fn host_export(name: &str) -> scxsim_build::HostExport {
+        *scxsim_build::HOST_EXPORTS
+            .iter()
+            .find(|e| e.name == name)
+            .unwrap_or_else(|| panic!("{name} is not in HOST_EXPORTS"))
+    }
+
+    /// The `HostSymbolsNotExported` message for `missing`.
+    fn host_symbols_message(missing: Vec<scxsim_build::HostExport>) -> String {
+        LoadError::HostSymbolsNotExported {
+            path: "libscx_simple.so".to_owned(),
+            missing,
+        }
+        .to_string()
+    }
+
+    /// This crate's test binaries are linked with `emit_host_link_args`, so every
+    /// symbol a scheduler resolves from its host is in the global scope -- the
+    /// precondition `try_load_with_definition` checks before `dlopen`.
+    #[test]
+    fn host_link_args_export_every_host_symbol() {
+        assert_eq!(
+            unexported_symbols(scxsim_build::HOST_EXPORTS),
+            Vec::<scxsim_build::HostExport>::new()
+        );
+    }
+
+    /// The probe reports exactly the exports the process lacks, and the error it
+    /// becomes names the fix, since the embedder hitting it is the one who has
+    /// to apply it in their own build script.
+    #[test]
+    fn unexported_symbols_names_only_the_missing_ones() {
+        let absent = scxsim_build::HostExport {
+            name: "__scxsim_no_such_symbol__",
+            if_unexported: scxsim_build::IfUnexported::DlopenFails,
+        };
+        let missing = unexported_symbols(&[host_export("scx_task_alloc"), absent]);
+        assert_eq!(missing, [absent]);
+        let message = host_symbols_message(missing);
+        assert!(
+            message.contains("__scxsim_no_such_symbol__")
+                && message.contains("scxsim_build::emit_host_link_args()"),
+            "{message}"
+        );
+    }
+
+    /// The error claims the load would have bound something silently exactly
+    /// when a missing export would have, and names each such export under the
+    /// class that says what it would have bound: the embedder reading it has
+    /// to be able to trust those sentences in both directions.
+    #[test]
+    fn host_symbols_error_names_silent_bindings_only_when_one_would_bind() {
+        let loud_only = host_symbols_message(vec![host_export("scx_task_init")]);
+        assert!(!loud_only.contains("silently"), "{loud_only}");
+
+        let mixed = host_symbols_message(vec![
+            host_export("scx_task_init"),
+            host_export("scx_task_alloc"),
+            host_export("scx_bpf_create_dsq"),
+            host_export("scx_bpf_now"),
+        ]);
+        assert!(
+            mixed.contains(
+                "does not export scx_task_init, scx_task_alloc, scx_bpf_create_dsq, scx_bpf_now "
+            ) && mixed.contains("its own copy of scx_task_alloc, scx_bpf_create_dsq, dlopen")
+                && mixed.contains("references scx_bpf_now only weakly")
+                && mixed.contains("bound to NULL"),
+            "{mixed}"
+        );
+
+        let null_only = host_symbols_message(vec![host_export("scx_bpf_dsq_insert___v1")]);
+        assert!(
+            null_only.contains("references scx_bpf_dsq_insert___v1 only weakly")
+                && !null_only.contains("its own copy"),
+            "{null_only}"
+        );
     }
 
     #[test]

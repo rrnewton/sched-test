@@ -1,6 +1,6 @@
 //! IR -> `scx_simulator::Scenario`: the far half of the bridge.
 //!
-//! With [`crate::lower`] this completes `ktstr ops -> IR -> Scenario`, which is
+//! With [`crate::lower()`] this completes `ktstr ops -> IR -> Scenario`, which is
 //! what lets one ktstr scenario execute on the simulator backend.
 //!
 //! # Why this is a walk and not a compiler

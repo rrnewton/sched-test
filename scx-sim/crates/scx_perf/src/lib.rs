@@ -24,7 +24,8 @@
 //! (`perf_event_open`-based [`RbcCounter`]/[`RbcTimer`]/[`HwBreakpoint`]) still
 //! compiles on any Linux target.
 //!
-//! Extracted from Reverie (BSD-2-Clause).
+//! Extracted from Reverie (BSD-2-Clause); its copyright notice and licence
+//! text ship alongside this crate as `LICENSE-REVERIE`.
 
 use std::fmt;
 use std::io;
@@ -575,7 +576,7 @@ fn set_signal_delivery(fd: RawFd, tid: libc::pid_t, signo: libc::c_int) -> Resul
 ///
 /// `x86_64`-only: `read()` issues the `rdpmc` instruction. Off `x86_64` the
 /// whole handle (and the `mmap_rdpmc` constructors) is not compiled — see the
-/// [`rdpmc`] free function.
+/// crate-private `rdpmc` function.
 #[cfg(target_arch = "x86_64")]
 pub struct RdpmcHandle {
     mmap_page: *const perf::bindings::perf_event_mmap_page,

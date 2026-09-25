@@ -15,9 +15,13 @@
  * same code path executes regardless of pointer alignment, ensuring
  * perfectly deterministic retired-branch-conditional counts.
  *
- * Since the .so is linked with -nostdlib and these provide strong
- * definitions, the linker uses these instead of resolving from the
- * main binary's glibc.
+ * CAVEAT (sim-o3kct): -nostdlib keeps glibc out of the .so's static link,
+ * not out of its run-time binding. These definitions have default
+ * visibility, so a call the .so makes through a dynamic relocation (its
+ * PLT) binds to the first definition in the process's global scope, which
+ * is glibc's. Today that sends calloc, free, memcpy and memset (every .so)
+ * and strncmp (lavd, layered) to glibc; tests/symbol_export.rs tracks it
+ * (known_gap_libc_takes_the_so_memory_functions).
  */
 
 typedef unsigned long size_t;

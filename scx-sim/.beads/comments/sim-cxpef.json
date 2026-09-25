@@ -1,0 +1,10 @@
+[
+  {
+    "id": "sim-cxpef-cb35bca299f",
+    "issue_id": "sim-cxpef",
+    "author": "devbig030",
+    "body": "From the crates.io release candidate: scxtest/ has to be in scope, at least for scx_simulator's published files. sim-kqri1 has the detail.\n\n- scxtest/ holds 9 files derived from upstream scx lib/scxtest, which upstream deleted at 54e1ea429. Two are identical to upstream's last version, and seven have been extended here.\n- They are compiled into the published crates. scx_simulator's build.rs compiles scx_test.c, scx_test_map.c and scx_test_cpumask.c, and scxsim-build compiles overrides.c into every scheduler .so.\n- None of the 9 has an SPDX line, a copyright notice or an origin note. They sit outside vendor/, so the only licence text next to them is the crate's BSD-3-Clause LICENSE, while the code is GPL-2.0.\n\nFor scale: of the 272 .c/.h/.rs files packaged in scx_simulator, vendor/ included, 161 have no SPDX line.",
+    "created_at": "2026-09-25T03:49:44.375388119Z",
+    "updated_at": "2026-09-25T03:49:44.375388119Z"
+  }
+]

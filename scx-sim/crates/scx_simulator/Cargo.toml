@@ -2,7 +2,42 @@
 name = "scx_simulator"
 version = "1.0.0"
 edition = "2021"
+# One floor for the whole publish set, measured end to end; see the note in
+# crates/scx_layered_alloc/Cargo.toml. Nothing re-checks it yet: sim-ojycs.
+rust-version = "1.88"
 publish = false
+description = "Deterministic simulator for sched_ext schedulers: runs the real BPF scheduler C code in-process against a simulated kernel"
+# BSD-3-Clause: this crate's own code. GPL-2.0-only: the scx sources it builds
+# and links (vendor/scx, and scxtest/, which is vendored from scx's former
+# lib/scxtest). Both licence texts ship in the package.
+license = "BSD-3-Clause AND GPL-2.0-only"
+repository = "https://github.com/rrnewton/sched-test"
+keywords = ["sched_ext", "scheduler", "simulator", "bpf", "linux"]
+categories = ["simulation", "development-tools::testing"]
+# Publishes the C substrate this build used as DEP_SCXSIM_* to the build
+# scripts of direct dependents (see scxsim_build::SimBuildInputs), so an
+# embedder builds its scheduler `.so` against exactly what the host library
+# was built with. Also limits a dependency graph to one scx_simulator.
+links = "scxsim"
+# Everything build.rs and the sources read. `vendor/scx` and `schedulers` are
+# symlinks into the scx submodule and scx-sim/schedulers in a checkout; cargo
+# packages their targets as ordinary files. Keep the scx subset to what the
+# build compiles (the vmlinux directory alone is 26M; only vmlinux.h is used).
+include = [
+    "/build.rs",
+    "/src/**",
+    "/benches/simulator.rs",
+    "/csrc/**",
+    "/scxtest/**",
+    "/schedulers/*/wrapper.c",
+    "/schedulers/simple/scx_simple.bpf.c",
+    "/scripts/trace_scx_ops.bt",
+    "/vendor/scx/**/*.c",
+    "/vendor/scx/**/*.h",
+    "!/vendor/scx/**/selftests/**",
+    "/vendor/scx/LICENSE",
+    "/LICENSE",
+]
 
 [features]
 # `standalone` (default-on) gates the convenience constructors
@@ -16,17 +51,22 @@ standalone = []
 
 [dependencies]
 clap = { version = "4.5", features = ["derive", "env"] }
-libbpf-sys = "=1.6.1"
+# Headers only (build.rs compiles the scheduler C against them; no libbpf_sys
+# symbol is used). A caret requirement, not an exact pin: libbpf-sys is
+# `links = "bpf"`, so a graph holds exactly one version, and an embedder that
+# also uses libbpf-rs >= 0.26 needs 1.7. Default features stay on: without
+# `vendored-libbpf`, DEP_BPF_INCLUDE names a directory libbpf-sys never fills.
+libbpf-sys = "1.6.1"
 libc = "0.2"
 libloading = "0.8"
 perf-event-open-sys = "5"
 perfetto_protos = "0.51"
 protobuf = "3"
 rand = { version = "0.8", features = ["small_rng"] }
-scx_perf = { path = "../scx_perf" }
-scx_layered_alloc = { path = "../scx_layered_alloc" }
-scx_layered_growth = { path = "../scx_layered_growth" }
-scxsim-build = { path = "../scxsim-build" }
+scx_perf = { version = "0.1.0", path = "../scx_perf" }
+scx_layered_alloc = { version = "0.1.0", path = "../scx_layered_alloc" }
+scx_layered_growth = { version = "0.1.0", path = "../scx_layered_growth" }
+scxsim-build = { version = "0.1.0", path = "../scxsim-build" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 toml = "0.8"
@@ -35,10 +75,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 criterion = { version = "0.6", features = ["html_reports"] }
+# tests/symbol_export.rs reads the scheduler `.so` files' dynamic symbols.
+object = { version = "0.39", default-features = false, features = ["read_core", "elf", "std"] }
 
 [build-dependencies]
 cc = "1.2.29"
-scxsim-build = { path = "../scxsim-build" }
+scxsim-build = { version = "0.1.0", path = "../scxsim-build" }
 
 [[bench]]
 name = "simulator"

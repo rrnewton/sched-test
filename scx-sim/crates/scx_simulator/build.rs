@@ -1,50 +1,59 @@
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use scxsim_build::{
-    build_schedulers, cgroup_bw_new_api, resolve_scx_root, scx_include_paths,
-    standalone_definitions, KernelConfig, EXPORTED_SYMS,
+    build_schedulers, bundled_scx_root, cgroup_bw_new_api, emit_host_link_args, resolve_scx_root,
+    standalone_definitions, KernelConfig, SchedulerDefinition, SimBuildInputs,
 };
 
 fn main() {
     let manifest_dir: PathBuf = env::var("CARGO_MANIFEST_DIR").unwrap().into();
-    // Workspace root is two levels up from crates/scx_simulator
-    let workspace_dir = manifest_dir.join("../..").canonicalize().unwrap();
-    // Repo root is one level up from the workspace (scx-sim/)
-    let root_dir = workspace_dir.join("..").canonicalize().unwrap();
     let out_dir: PathBuf = env::var("OUT_DIR").unwrap().into();
 
     // scx source root: the SCX_ROOT override (so a crate embedding scx_simulator
-    // can supply its own scx sources -- the published crate carries no submodule)
-    // or the bundled submodule at <repo-root>/scx. Resolution + validity check
-    // live in scxsim_build::resolve_scx_root, shared with the embed harness, so
+    // can supply its own scx sources), else the scx subset this crate bundles
+    // under vendor/scx -- symlinks into the scx submodule in a sched-test
+    // checkout, real files in a published crate (see
+    // scxsim_build::bundled_scx_root). Resolution + validity check live in
+    // scxsim_build, shared with every build script that compiles scx sources, so
     // every scheduler's scx sources (headers, BPF source, the scx/lib bodies lavd
     // compiles in) follow one override path.
-    let scx_root = resolve_scx_root(&root_dir.join("scx"));
+    let scx_root = resolve_scx_root(|| {
+        bundled_scx_root(
+            &manifest_dir.join("vendor/scx"),
+            Path::new("scheds/include"),
+        )
+    });
 
     let coverage = env::var("SCX_SIM_COVERAGE").as_deref() == Ok("1");
 
-    // C substrate vendored into this crate so `cargo package` ships it
-    // (previously at scx-sim/csrc and repo-root lib/scxtest, outside the crate).
-    let csrc_dir = manifest_dir.join("csrc");
-    let scxtest_dir = manifest_dir.join("scxtest");
-
-    // libbpf headers (libbpf-sys exports its include dir as DEP_BPF_INCLUDE).
-    let bpf_include: PathBuf = env::var("DEP_BPF_INCLUDE")
-        .expect("libbpf-sys include must be available")
-        .into();
-    // Crate-local C dirs first, then the scx-derived -I set (shared with
-    // embedders via scxsim_build::scx_include_paths, one source of truth for the
-    // order). -I resolution is first-match, so this reproduces the standalone
-    // build's historical -I sequence exactly -- keep crate-local dirs ahead of
-    // the scx trees and preserve the order (the .so build is sensitive to it).
-    // None vmlinux override: the standalone build uses the vendored,
-    // scx-versioned vmlinux (an embedder passes Some(kernel_vmlinux_dir)).
-    let include_paths: Vec<PathBuf> = [csrc_dir.clone(), scxtest_dir.clone()]
-        .into_iter()
-        .chain(scx_include_paths(&scx_root, &bpf_include, None))
-        .collect();
+    // Everything the C side is compiled from. csrc/scxtest are the C substrate
+    // vendored into this crate so `cargo package` ships it (previously at
+    // scx-sim/csrc and repo-root lib/scxtest, outside the crate); the libbpf
+    // headers come from libbpf-sys, which exports its include dir as
+    // DEP_BPF_INCLUDE. Published to direct dependents via `links = "scxsim"`, so
+    // an embedder compiles its own scheduler `.so` against exactly this
+    // substrate -- see SimBuildInputs.
+    let inputs = SimBuildInputs {
+        csrc: manifest_dir.join("csrc"),
+        scxtest: manifest_dir.join("scxtest"),
+        scx_root,
+        bpf_include: env::var("DEP_BPF_INCLUDE")
+            .expect("libbpf-sys include must be available")
+            .into(),
+        schedulers: in_crate(&manifest_dir, "schedulers"),
+    };
+    inputs.emit_metadata();
+    // Crate-local C dirs first, then the scx-derived -I set (one source of truth
+    // for the order, shared with embedders). -I resolution is first-match, so
+    // this reproduces the standalone build's historical -I sequence exactly --
+    // keep crate-local dirs ahead of the scx trees and preserve the order (the
+    // .so build is sensitive to it). The static libs and every .so use this one
+    // set, so both see the same vmlinux.h: the static libs allocate the kernel
+    // structs a scheduler reads, and nothing relocates a field offset between
+    // two layouts (see scxsim_build::scx_include_paths).
+    let include_paths = inputs.include_paths();
 
     // Common compiler: BPF scheduler code compiled as userspace C has
     // inherently unused parameters (fixed BPF ops signatures) and unknown
@@ -53,16 +62,109 @@ fn main() {
 
     // Standalone uses the kernel-config defaults baked into sim_kconfig_defaults.h
     // (no overrides). An embedder constructs a non-default KernelConfig to compile
-    // the .so + host sim_task against the kernel under test. Default => empty
+    // its .so files against the kernel under test; the host static libs below take
+    // none, because every kernel-config value lives in the .so. Default => empty
     // cflag_defines => byte-identical .so.
     let kernel_config = KernelConfig::default();
+
+    build_static_libs(&inputs, &include_paths, &compiler, coverage);
+
+    // ---------------------------------------------------------------
+    // Shared libraries (.so) for schedulers — compiled here via clang.
+    // Ported from `make -C schedulers` so the .so build is self-contained
+    // and uses the same toolchain as the cc::Build static libs. The
+    // Makefile is retained only for the optional `make e9` post-processing,
+    // which instruments the .so files produced here.
+    // ---------------------------------------------------------------
+
+    let scheduler_dir = if coverage {
+        out_dir.join("schedulers_cov")
+    } else {
+        out_dir.join("schedulers")
+    };
+    std::fs::create_dir_all(&scheduler_dir).expect("create scheduler output dir");
+
+    // The standalone scheduler set as owned definitions; an embedder drives the
+    // same build_schedulers with its own definitions (one build path, two providers).
+    let defs = standalone_definitions();
+    build_schedulers(
+        &inputs.schedulers,
+        &defs,
+        &scheduler_dir,
+        &inputs.csrc,
+        &inputs.scxtest,
+        &include_paths,
+        &inputs.scx_root,
+        &compiler,
+        coverage,
+        // SCX cgroup_bw API flag-day probe (shared with embedders): the NEW
+        // function signatures are gated on `struct scx_task_cgroup_bw` in
+        // scheds/include/lib/cgroup.h, matching schedulers/Makefile's grep.
+        cgroup_bw_new_api(&inputs.scx_root),
+        &kernel_config,
+    );
+
+    println!("cargo:rerun-if-env-changed=SCXSIM_PHASE2_REAL_CGROUP_BW");
+
+    // ---------------------------------------------------------------
+    // Linker flags for the main binary
+    // ---------------------------------------------------------------
+
+    // The kfunc/SDT/arena/atq/e9 symbols the dlopen'd `.so` resolve from this
+    // binary at load time live in scxsim_build::HOST_EXPORTS (see that const for
+    // the grouped rationale): -rdynamic + per-symbol --undefined on this
+    // package's binaries, through the same helper every embedder calls from its
+    // own build script, since link args do not propagate.
+    emit_host_link_args();
+
+    if coverage {
+        link_profile_runtime(&compiler);
+    }
+
+    // Expose scheduler .so directory to Rust code
+    println!(
+        "cargo:rustc-env=SCHEDULER_SO_DIR={}",
+        scheduler_dir.display()
+    );
+
+    // Expose bpftrace script path for --bpf-trace option
+    println!(
+        "cargo:rustc-env=BPFTRACE_SCRIPT={}",
+        in_crate(&manifest_dir, "scripts/trace_scx_ops.bt").display()
+    );
+
+    emit_rerun_triggers(&manifest_dir, &inputs, &defs);
+}
+
+/// A path this crate carries under `manifest_dir`, canonicalized. In a
+/// sched-test checkout `schedulers/` and `scripts/trace_scx_ops.bt` are symlinks
+/// into the scx-sim workspace (`cargo package` materializes them), so
+/// canonicalizing keeps the compile paths -- and the `.so` bytes -- exactly what
+/// they were when this script read the workspace copies directly.
+fn in_crate(manifest_dir: &Path, rel: &str) -> PathBuf {
+    let p = manifest_dir.join(rel);
+    p.canonicalize()
+        .unwrap_or_else(|e| panic!("{} does not resolve: {e}", p.display()))
+}
+
+/// The static libraries linked into this crate (and so into every binary that
+/// links it), compiled with the same `-I` set and compiler as the scheduler
+/// `.so` files.
+fn build_static_libs(
+    inputs: &SimBuildInputs,
+    include_paths: &[PathBuf],
+    compiler: &str,
+    coverage: bool,
+) {
+    let csrc_dir = &inputs.csrc;
+    let scxtest_dir = &inputs.scxtest;
 
     // DRY helper: apply common config to a cc::Build
     let configure_build = |build: &mut cc::Build| {
         build
-            .compiler(&compiler)
+            .compiler(compiler)
             .define("SCX_BPF_UNITTEST", None)
-            .includes(&include_paths)
+            .includes(include_paths)
             .flag("-Wno-unused-parameter")
             .flag("-Wno-unknown-attributes");
         if coverage {
@@ -71,10 +173,6 @@ fn main() {
                 .flag("-fcoverage-mapping");
         }
     };
-
-    // ---------------------------------------------------------------
-    // Static libraries (linked into the main binary)
-    // ---------------------------------------------------------------
 
     // Build the scxtest support library (map emulation, cpumask, test assert).
     // NOTE: overrides.c is NOT included here — it goes into each .so instead.
@@ -89,18 +187,10 @@ fn main() {
     configure_build(&mut scxtest);
     scxtest.compile("scxtest");
 
-    // Build the task_struct accessor library. sim_task.c carries the host-side
-    // LINUX_KERNEL_VERSION definition, so an embedder's kernel_config overrides
-    // reach it too (no-op for the standalone default).
+    // Build the task_struct accessor library.
     let mut sim_task = cc::Build::new();
     sim_task.file(csrc_dir.join("sim_task.c"));
     configure_build(&mut sim_task);
-    // Apply the kernel_config -D flags via .flag() (not .define()) so the single
-    // cflag_defines() encoder is reused for both the .so Command path and this
-    // cc::Build path -- .define() would force a second name/value split.
-    for d in kernel_config.cflag_defines() {
-        sim_task.flag(&d);
-    }
     sim_task.compile("sim_task");
 
     // Build the SDT / arena per-task storage stubs.
@@ -134,147 +224,63 @@ fn main() {
     sim_atq.file(csrc_dir.join("sim_atq.c"));
     configure_build(&mut sim_atq);
     sim_atq.compile("sim_atq");
+}
 
-    // ---------------------------------------------------------------
-    // Shared libraries (.so) for schedulers — compiled here via clang.
-    // Ported from `make -C schedulers` so the .so build is self-contained
-    // and uses the same toolchain as the cc::Build static libs above. The
-    // Makefile is retained only for the optional `make e9` post-processing,
-    // which instruments the .so files produced here.
-    // ---------------------------------------------------------------
-
-    let scheduler_dir = if coverage {
-        out_dir.join("schedulers_cov")
+/// Link the clang profile runtime, which provides the `__llvm_profile_*`
+/// symbols the coverage-instrumented `.so` files need.
+fn link_profile_runtime(compiler: &str) {
+    let rt_dir_output = Command::new(compiler)
+        .arg("--print-runtime-dir")
+        .output()
+        .expect("failed to run clang --print-runtime-dir");
+    assert!(
+        rt_dir_output.status.success(),
+        "clang --print-runtime-dir failed"
+    );
+    let rt_dir = String::from_utf8(rt_dir_output.stdout)
+        .expect("non-UTF8 runtime dir")
+        .trim()
+        .to_string();
+    // Detect the actual library name (may or may not have arch suffix)
+    let profile_lib = if Path::new(&format!("{rt_dir}/libclang_rt.profile.a")).exists() {
+        "clang_rt.profile"
     } else {
-        out_dir.join("schedulers")
+        "clang_rt.profile-x86_64"
     };
-    std::fs::create_dir_all(&scheduler_dir).expect("create scheduler output dir");
+    println!("cargo:rustc-link-search=native={rt_dir}");
+    println!("cargo:rustc-link-lib=static={profile_lib}");
+}
 
-    // SCX cgroup_bw API flag-day probe (shared with the embed harness): the NEW
-    // function signatures are gated on `struct scx_task_cgroup_bw` in
-    // scheds/include/lib/cgroup.h, matching schedulers/Makefile's grep.
-    let cgroup_bw_new_api = cgroup_bw_new_api(&scx_root);
-
-    // The standalone scheduler set as owned definitions; an embedder drives the
-    // same build_schedulers with its own definitions (one build path, two providers).
-    let defs = standalone_definitions();
-    build_schedulers(
-        &workspace_dir.join("schedulers"),
-        &defs,
-        &scheduler_dir,
-        &csrc_dir,
-        &scxtest_dir,
-        &include_paths,
-        &scx_root,
-        &compiler,
-        coverage,
-        cgroup_bw_new_api,
-        &kernel_config,
-    );
-
-    println!("cargo:rerun-if-env-changed=SCXSIM_PHASE2_REAL_CGROUP_BW");
-
-    // ---------------------------------------------------------------
-    // Linker flags for the main binary
-    // ---------------------------------------------------------------
-
-    // The kfunc/SDT/arena/atq/e9 symbols the dlopen'd `.so` resolve from this
-    // binary at load time live in scxsim_build::EXPORTED_SYMS (the single source
-    // of truth an embedder re-emits; see that const for the grouped rationale).
-    // Emitted three ways below: -rdynamic + per-symbol --undefined on this
-    // binary, plus SCXSIM_EXPORTED_SYMS for tests/symbol_export.rs.
-    // Export all symbols so `.so` files can resolve kfuncs and scxtest funcs.
-    println!("cargo:rustc-link-arg=-rdynamic");
-    for sym in EXPORTED_SYMS {
-        println!("cargo:rustc-link-arg=-Wl,--undefined={sym}");
-    }
-    println!(
-        "cargo:rustc-env=SCXSIM_EXPORTED_SYMS={}",
-        EXPORTED_SYMS.join(",")
-    );
-
-    // Link the clang profile runtime when coverage is enabled.
-    // This provides __llvm_profile_* symbols for the instrumented .so files.
-    if coverage {
-        let rt_dir_output = Command::new(&compiler)
-            .arg("--print-runtime-dir")
-            .output()
-            .expect("failed to run clang --print-runtime-dir");
-        assert!(
-            rt_dir_output.status.success(),
-            "clang --print-runtime-dir failed"
-        );
-        let rt_dir = String::from_utf8(rt_dir_output.stdout)
-            .expect("non-UTF8 runtime dir")
-            .trim()
-            .to_string();
-        // Detect the actual library name (may or may not have arch suffix)
-        let profile_lib =
-            if std::path::Path::new(&format!("{rt_dir}/libclang_rt.profile.a")).exists() {
-                "clang_rt.profile"
-            } else {
-                "clang_rt.profile-x86_64"
-            };
-        println!("cargo:rustc-link-search=native={rt_dir}");
-        println!("cargo:rustc-link-lib=static={profile_lib}");
-    }
-
-    // Expose scheduler .so directory to Rust code
-    println!(
-        "cargo:rustc-env=SCHEDULER_SO_DIR={}",
-        scheduler_dir.display()
-    );
-
-    // Expose bpftrace script path for --bpf-trace option
-    println!(
-        "cargo:rustc-env=BPFTRACE_SCRIPT={}",
-        workspace_dir.join("scripts/trace_scx_ops.bt").display()
-    );
-
-    // Rebuild triggers (relative to workspace root, which is ../../ from crate).
-    //
-    // The list MUST cover every directory whose contents the scheduler `.so`
-    // build depends on. If a directory is omitted, swapping the scx submodule
-    // SHA can silently leave a STALE `.so` in place: cargo's incremental
-    // logic skips the build script, the Makefile is never re-invoked, and
-    // the cached `.so` from the previous SHA is reused unchanged.
-    //
-    // Worked example (the bug this list exists to prevent): pre-fix, only
-    // `scx_tickless/src/bpf` and `scx_cosmos/src/bpf` were watched. Swapping
-    // the scx submodule between two SHAs that differed only in
-    // `scheds/rust/scx_lavd/src/bpf/` produced a 0.06s no-op `cargo build`
-    // and the stale `libscx_lavd.so` from the prior SHA was reused. The
-    // workaround was `touch crates/scx_simulator/build.rs`. See:
-    // - tg `official-scheduler-rebuild-action-replace-touch-build-rs-hack`
-    // - experiments/lavd_cpubw_stalls_202604/CPU_BW_STALL_BUG_REPRODUCER_REPORT.md
-    //
-    // The scx watch list below is GENERATED from the manifest (each scheduler's
-    // scx_bpf_dir subtree + the shared header/lib trees), so a NEW scheduler's
-    // subtree is covered automatically -- no manual edit to a hardcoded list.
-    // Vendored C substrate (lives in this crate).
-    println!("cargo:rerun-if-changed={}", csrc_dir.display());
-    println!("cargo:rerun-if-changed={}", scxtest_dir.display());
-
-    let rerun_dirs: &[&str] = &[
-        // scx-sim local source — Makefile + wrapper.c per scheduler
-        "schedulers",
-    ];
-    for d in rerun_dirs {
-        println!("cargo:rerun-if-changed={}", workspace_dir.join(d).display());
-    }
-    // Shared scx trees every scheduler pulls in, plus each scheduler's own scx
-    // BPF subtree (generated from the manifest's scx_bpf_dir flag).
-    let mut scx_rerun_dirs: Vec<PathBuf> = vec![
-        scx_root.join("lib"),            // ravg.bpf.c, cgroup_bw.bpf.c, ...
-        scx_root.join("scheds/include"), // headers used by ALL schedulers
-        scx_root.join("scheds/vmlinux"),
-    ];
-    for m in &defs {
-        if m.scx_bpf_dir {
-            scx_rerun_dirs.push(scx_root.join(format!("scheds/rust/scx_{}/src/bpf", m.name)));
-        }
-    }
-    for d in &scx_rerun_dirs {
+/// Rebuild triggers.
+///
+/// The list MUST cover every directory whose contents the scheduler `.so`
+/// build depends on. If a directory is omitted, swapping the scx submodule
+/// SHA can silently leave a STALE `.so` in place: cargo's incremental
+/// logic skips the build script, the Makefile is never re-invoked, and
+/// the cached `.so` from the previous SHA is reused unchanged.
+///
+/// Worked example (the bug this list exists to prevent): pre-fix, only
+/// `scx_tickless/src/bpf` and `scx_cosmos/src/bpf` were watched. Swapping
+/// the scx submodule between two SHAs that differed only in
+/// `scheds/rust/scx_lavd/src/bpf/` produced a 0.06s no-op `cargo build`
+/// and the stale `libscx_lavd.so` from the prior SHA was reused. The
+/// workaround was `touch crates/scx_simulator/build.rs`. See:
+/// - tg `official-scheduler-rebuild-action-replace-touch-build-rs-hack`
+/// - experiments/lavd_cpubw_stalls_202604/CPU_BW_STALL_BUG_REPRODUCER_REPORT.md
+///
+/// The scx watch list is GENERATED from the manifest by
+/// `SimBuildInputs::rerun_paths` (each scheduler's scx_bpf_dir subtree + the
+/// shared header/lib trees, one list shared with embedders), so a NEW
+/// scheduler's subtree is covered automatically -- no manual edit to a
+/// hardcoded list.
+fn emit_rerun_triggers(manifest_dir: &Path, inputs: &SimBuildInputs, defs: &[SchedulerDefinition]) {
+    // Beyond the shared list: the scx-sim local scheduler sources (Makefile +
+    // wrapper.c per scheduler), and the vendored scx subset itself, so
+    // re-pointing one of its symlinks re-runs this script too.
+    for d in [inputs.schedulers.clone(), manifest_dir.join("vendor")]
+        .into_iter()
+        .chain(inputs.rerun_paths(defs))
+    {
         println!("cargo:rerun-if-changed={}", d.display());
     }
     println!("cargo:rerun-if-env-changed=SCX_SIM_COVERAGE");

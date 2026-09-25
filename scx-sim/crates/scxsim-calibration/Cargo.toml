@@ -21,8 +21,8 @@ default = []
 sim = ["dep:scx_simulator"]
 
 [build-dependencies]
-# Only for EXPORTED_SYMS — the non-transitive link contract the `sim` feature
-# needs re-emitted. See build.rs.
+# Only for emit_host_link_args(), which this package's own `sim` binaries
+# need because link arguments are not transitive. See build.rs.
 scxsim-build = { path = "../scxsim-build" }
 
 [dev-dependencies]

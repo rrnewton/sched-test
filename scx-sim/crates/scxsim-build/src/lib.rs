@@ -9,10 +9,17 @@
 //! `scx_simulator` depends on this crate both as a normal dependency (the
 //! runtime applies a [`SchedulerDefinition`]'s rodata via
 //! `DynamicScheduler::load_with_definition`) and as a build-dependency (its build
-//! script calls [`build_schedulers`] and iterates [`EXPORTED_SYMS`]).
+//! script calls [`build_schedulers`] and emits the link args for
+//! [`HOST_EXPORTS`]).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+mod embed;
+pub use embed::{
+    bundled_scx_root, emit_bundled_upstream_module, emit_host_link_args, emit_upstream_module,
+    host_link_args, resolve_scx_root, SimBuildInputs,
+};
 
 /// A scheduler config global's value, written before run via write_*_global.
 /// `NumCpus` resolves to the simulator's CPU count at apply time (e.g. the
@@ -42,7 +49,7 @@ impl SchedulerRuntime {
 /// Declarative per-scheduler descriptor: build-side fields (read by build.rs)
 /// plus the runtime register/setup half (read by the lib).
 pub struct SchedulerManifest {
-    /// Scheduler name; matches the schedulers/<name>/ directory.
+    /// Scheduler name; matches the `schedulers/<name>/` directory.
     pub name: &'static str,
     /// Strip `const` so the BPF const-volatile globals are writable. True for
     /// every scheduler except `simple`, whose source is local and needs no
@@ -51,21 +58,25 @@ pub struct SchedulerManifest {
     /// Add `-I <scx_root>/scheds/rust/scx_<name>/src/bpf` (where the scheduler's
     /// BPF source and headers live). True for every scheduler except `simple`.
     pub scx_bpf_dir: bool,
-    /// Add `-I <schedulers>/<name>` -- lavd and cosmos keep a generated/patched
-    /// source (e.g. cosmos_main_patched.c) in their own directory.
+    /// Add `-I <schedulers>/<name>`, the scheduler's own wrapper directory. Set
+    /// for lavd and cosmos, although that directory holds nothing for an `-I` to
+    /// resolve today: a quoted include already searches the includer's
+    /// directory, and a patched source is generated into `OUT_DIR` (see
+    /// `source_patches`).
     pub extra_local_include: bool,
     /// Source-text find/replace patches applied to the scheduler's upstream
     /// `main.bpf.c` before compilation, as `(find, replace)`. Empty for none.
     /// A pre-existing build step (not manifest-generated code): the patched copy
-    /// is written next to the wrapper as `<name>_main_patched.c`, which the
-    /// wrapper `#include`s (resolved via `extra_local_include`).
+    /// is written to `OUT_DIR` as `<name>_main_patched.c`, which the wrapper
+    /// includes with an angle `#include`, resolved through the `-I<OUT_DIR>`
+    /// [`build_schedulers`] prepends.
     pub source_patches: &'static [(&'static str, &'static str)],
     /// Runtime register/setup data consumed by the generic setup path.
     pub runtime: SchedulerRuntime,
 }
 
 /// The declared scheduler set. The build cross-checks this against the
-/// discovered schedulers/<name>/ directories so neither can drift silently.
+/// discovered `schedulers/<name>/` directories so neither can drift silently.
 pub const SCHEDULERS: &[SchedulerManifest] = &[
     SchedulerManifest {
         name: "cosmos",
@@ -231,13 +242,14 @@ pub const SCHEDULERS: &[SchedulerManifest] = &[
 /// from `schedulers_src` + name, so the name is the only source key.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SchedulerDefinition {
-    /// Scheduler name; matches the schedulers/<name>/ dir and the .so/ops prefix.
+    /// Scheduler name; matches the `schedulers/<name>/` dir and the .so/ops prefix.
     pub name: String,
     /// Strip `const` so BPF const-volatile globals are writable (all but `simple`).
     pub strip_const: bool,
-    /// Add -I <scx_root>/scheds/rust/scx_<name>/src/bpf (all but `simple`).
+    /// Add `-I <scx_root>/scheds/rust/scx_<name>/src/bpf` (all but `simple`).
     pub scx_bpf_dir: bool,
-    /// Add -I <schedulers>/<name> (a generated/patched source lives there).
+    /// Add `-I <schedulers>/<name>`, the wrapper's own directory (see
+    /// [`SchedulerManifest::extra_local_include`]).
     pub extra_local_include: bool,
     /// Source-text find/replace patches applied to the upstream `main.bpf.c`
     /// before compilation, as `(find, replace)`. Empty for none.
@@ -249,8 +261,8 @@ pub struct SchedulerDefinition {
 impl SchedulerDefinition {
     /// Embedder-facing constructor. `name` is the scheduler's `.so` / ops prefix
     /// and the key `build_schedulers` derives the BPF source dir
-    /// (`scx_root`/scheds/rust/scx_<name>/src/bpf) and `wrapper.c` dir
-    /// (`schedulers_src`/<name>) from. Build-side policy flags default to the
+    /// (`<scx_root>/scheds/rust/scx_<name>/src/bpf`) and `wrapper.c` dir
+    /// (`<schedulers_src>/<name>`) from. Build-side policy flags default to the
     /// common non-`simple` profile: `strip_const` and `scx_bpf_dir` true,
     /// `extra_local_include` false, no `source_patches`. (`strip_const`/`scx_bpf_dir`
     /// are false only for `simple`; lavd and cosmos override
@@ -309,8 +321,8 @@ impl SchedulerDefinition {
         self
     }
 
-    /// Override `extra_local_include` (default `false`; set `true` for a scheduler
-    /// that keeps a generated/patched source in its own dir, e.g. lavd/cosmos).
+    /// Override `extra_local_include` (default `false`; lavd and cosmos set it --
+    /// see [`SchedulerManifest::extra_local_include`]).
     pub fn with_extra_local_include(mut self, extra_local_include: bool) -> Self {
         self.extra_local_include = extra_local_include;
         self
@@ -342,42 +354,172 @@ pub fn standalone_definitions() -> Vec<SchedulerDefinition> {
         .collect()
 }
 
-/// Symbols DEFINED in the static C libs compiled into the main binary that the
-/// dlopen'd scheduler `.so` files resolve at load time. Rust does not reference
-/// them, so without `--undefined` the linker drops them and a `.so` SIGSEGVs at
-/// its first kfunc call; `-rdynamic` puts them in the binary's dynamic symbol
-/// table so dlopen can find them. Grouped: `scx_test_map_*` (bpf_map_* macros),
-/// `scx_task_*`/`__scx_task_data`/`scx_arena_subprog_init` (per-task SDT
-/// storage, upstream's `lib/sdt_task.h` API), `sim_arena_*`
-/// (arena allocator), `scx_atq_create_internal` (forces the sim_atq TU),
-/// `e9_preempt_yield`/`E9_SHARED_RBC` (e9patch-instrumented variants).
+/// What a dlopen'd scheduler `.so` does when the host binary does NOT export a
+/// [`HostExport`] -- which is why the symbol is on the list.
 ///
-/// Exposed as the single source of truth so a downstream binary embedding
-/// scx_simulator re-emits the same set for its own test/embed binaries (the
-/// `-rdynamic`/`--undefined` link args are non-transitive) without a hand-copied
-/// list that could drift.
-pub const EXPORTED_SYMS: &[&str] = &[
-    "scx_test_map_lookup_elem",
-    "scx_test_map_delete_elem",
-    "scx_test_map_clear_all",
-    "scx_task_init",
-    "scx_task_alloc",
-    "__scx_task_data",
-    "scx_task_data",
-    "scx_task_free",
-    "scx_task_free_rcu",
-    "scx_arena_subprog_init",
-    "e9_preempt_yield",
-    "E9_SHARED_RBC",
-    "sim_arena_buf",
-    "sim_arena_offset",
-    "scx_atq_create_internal",
+/// Only the first is loud. The other two load cleanly and run something other
+/// than the simulator's definition, with nothing to say so: the scheduler runs,
+/// and it is not the scheduler -- a No-Stub violation no later check can see,
+/// which is why the load path probes for every entry before `dlopen`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum IfUnexported {
+    /// No `.so` defines it and every reference is strong, so `dlopen`
+    /// (`RTLD_NOW`) of any `.so` that references it fails with "undefined
+    /// symbol". Loud.
+    DlopenFails,
+    /// The `.so` carries its own definition -- a weak fallback from
+    /// scxtest's `overrides.c` or `csrc/sim_bpf_stubs.c`, a scheduler wrapper's
+    /// own copy, or a strong duplicate of the host's. `dlopen` SUCCEEDS and the
+    /// `.so` binds its own copy in place of the simulator's definition: for most
+    /// of these a NULL/0-returning stub standing in for the real kfunc, SDT, ATQ
+    /// or cgroup code.
+    OwnDefinitionBinds,
+    /// The `.so` holds only a weak undefined reference (`__ksym __weak`), so
+    /// `dlopen` SUCCEEDS and the reference resolves to NULL. `bpf_ksym_exists()`
+    /// and the `__COMPAT_*` helpers then report the kfunc absent, and the
+    /// scheduler takes its path for a kernel without it; a call the scheduler
+    /// does not guard jumps to address 0.
+    ResolvesToNull,
+}
+
+/// A symbol DEFINED by the host binary (a linked C static lib, or a Rust
+/// `#[no_mangle]` kfunc) that the scheduler `.so` files it dlopens resolve from
+/// it, with what happens when the host does not export it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct HostExport {
+    /// The ELF symbol name.
+    pub name: &'static str,
+    /// The consequence of the host not exporting it.
+    pub if_unexported: IfUnexported,
+}
+
+impl HostExport {
+    const fn dlopen_fails(name: &'static str) -> Self {
+        Self {
+            name,
+            if_unexported: IfUnexported::DlopenFails,
+        }
+    }
+
+    const fn own_definition(name: &'static str) -> Self {
+        Self {
+            name,
+            if_unexported: IfUnexported::OwnDefinitionBinds,
+        }
+    }
+
+    const fn resolves_to_null(name: &'static str) -> Self {
+        Self {
+            name,
+            if_unexported: IfUnexported::ResolvesToNull,
+        }
+    }
+}
+
+/// The symbols a host binary must force into its dynamic symbol table for the
+/// scheduler `.so` files it dlopens: every one whose absence a `.so` would NOT
+/// report, plus the loud ones the link would otherwise drop. The single source
+/// of truth for the link args ([`host_link_args`]) and for the load-time probe
+/// that refuses to `dlopen` without them (`scx_simulator`'s
+/// `LoadError::HostSymbolsNotExported`). `-rdynamic` puts what the link kept
+/// into the binary's dynamic symbol table; `--undefined` makes the link keep
+/// each symbol here even when nothing in the binary calls it (static-lib
+/// members are otherwise dropped, and a Rust kfunc is kept only by accident of
+/// what else shares its object file).
+///
+/// The [`IfUnexported::OwnDefinitionBinds`] and [`IfUnexported::ResolvesToNull`]
+/// entries are the reason the probe exists: a host that under-exports them
+/// loads a scheduler that silently runs something other than the simulator.
+/// `scx_simulator`'s `tests/symbol_export.rs` reads the built `.so` files and
+/// fails if a symbol the host exports binds silently without being listed
+/// here, or if an entry's [`IfUnexported`] is not what the `.so` files show.
+pub const HOST_EXPORTS: &[HostExport] = &[
+    // --- No fallback in any `.so`: an unexported symbol fails dlopen. ---
+    // bpf_map_* macros (scxtest).
+    HostExport::dlopen_fails("scx_test_map_lookup_elem"),
+    HostExport::dlopen_fails("scx_test_map_delete_elem"),
+    HostExport::dlopen_fails("scx_test_map_clear_all"),
+    // Per-task SDT storage (upstream's `lib/sdt_task.h` API; lavd calls
+    // `__scx_task_data` and `scx_task_free_rcu` directly) and the arena
+    // allocator.
+    HostExport::dlopen_fails("scx_task_init"),
+    HostExport::dlopen_fails("__scx_task_data"),
+    HostExport::dlopen_fails("scx_task_free_rcu"),
+    HostExport::dlopen_fails("scx_arena_subprog_init"),
+    HostExport::dlopen_fails("sim_arena_buf"),
+    HostExport::dlopen_fails("sim_arena_offset"),
+    // e9patch-instrumented variants.
+    HostExport::dlopen_fails("e9_preempt_yield"),
+    HostExport::dlopen_fails("E9_SHARED_RBC"),
+    // --- Own copy in every `.so`: an unexported symbol binds it silently. ---
+    // Kfuncs the simulator implements in Rust (`kfuncs.rs`); `overrides.c`
+    // stubs them out (-1 / NULL / nothing).
+    HostExport::own_definition("scx_bpf_create_dsq"),
+    HostExport::own_definition("scx_bpf_dsq_nr_queued"),
+    HostExport::own_definition("scx_bpf_error_bstr"),
+    HostExport::own_definition("scx_bpf_kick_cpu"),
+    HostExport::own_definition("scx_bpf_put_cpumask"),
+    HostExport::own_definition("scx_bpf_task_cpu"),
+    HostExport::own_definition("bpf_task_from_pid"),
+    HostExport::own_definition("bpf_task_release"),
+    HostExport::own_definition("bpf_rcu_read_lock"),
+    HostExport::own_definition("bpf_rcu_read_unlock"),
+    // SDT task storage (`sim_sdt_stubs.c`); `overrides.c` returns NULL.
+    HostExport::own_definition("scx_task_alloc"),
+    HostExport::own_definition("scx_task_data"),
+    HostExport::own_definition("scx_task_free"),
+    // ATQ (`sim_atq.c`); `overrides.c` returns 0 or does nothing.
+    HostExport::own_definition("scx_atq_create_internal"),
+    HostExport::own_definition("scx_atq_insert"),
+    HostExport::own_definition("scx_atq_insert_vtime"),
+    HostExport::own_definition("scx_atq_nr_queued"),
+    HostExport::own_definition("scx_atq_peek"),
+    HostExport::own_definition("scx_atq_pop"),
+    // Cgroup kfuncs. The host's `bpf_cgroup_from_id` / `bpf_cgroup_ancestor`
+    // (`kfuncs.rs`) look the cgroup up in the simulator's registry; the
+    // `csrc/sim_bpf_stubs.c` fallbacks every `.so` carries return NULL. (lavd
+    // defines its own strong copies and calls them directly, so lavd is
+    // unaffected; mitosis binds through a relocation.) acquire / release are
+    // identity / no-op on both sides.
+    HostExport::own_definition("bpf_cgroup_acquire"),
+    HostExport::own_definition("bpf_cgroup_ancestor"),
+    HostExport::own_definition("bpf_cgroup_from_id"),
+    HostExport::own_definition("bpf_cgroup_release"),
+    // A strong duplicate of the host's (`scxtest/scx_test_cpumask.c`) in
+    // `csrc/sim_bpf_stubs.c`; the two compute the same bounded bit test today.
+    HostExport::own_definition("bpf_cpumask_test_cpu"),
+    // --- Weak undefined in the `.so`: an unexported symbol resolves to NULL. ---
+    // Kfuncs the simulator implements in Rust (`kfuncs.rs`), most reached
+    // through `__COMPAT_*` / `bpf_ksym_exists()` probes.
+    HostExport::resolves_to_null("scx_bpf_cpu_curr"),
+    HostExport::resolves_to_null("scx_bpf_cpuperf_cap"),
+    HostExport::resolves_to_null("scx_bpf_cpuperf_cur"),
+    HostExport::resolves_to_null("scx_bpf_cpuperf_set"),
+    HostExport::resolves_to_null("scx_bpf_dispatch___compat"),
+    HostExport::resolves_to_null("scx_bpf_dispatch_vtime___compat"),
+    HostExport::resolves_to_null("scx_bpf_dsq_insert___v1"),
+    HostExport::resolves_to_null("scx_bpf_dsq_insert___v2___compat"),
+    HostExport::resolves_to_null("scx_bpf_dsq_insert_vtime___compat"),
+    HostExport::resolves_to_null("scx_bpf_dsq_peek"),
+    HostExport::resolves_to_null("scx_bpf_dump_bstr"),
+    HostExport::resolves_to_null("scx_bpf_now"),
+    HostExport::resolves_to_null("scx_bpf_nr_cpu_ids"),
+    HostExport::resolves_to_null("scx_bpf_reenqueue_local___v1"),
+    HostExport::resolves_to_null("scx_bpf_reenqueue_local___v2___compat"),
+    HostExport::resolves_to_null("scx_bpf_select_cpu_and___compat"),
+    // Cpumask kfuncs (`scxtest/scx_test_cpumask.c`).
+    HostExport::resolves_to_null("scx_bpf_get_idle_cpumask_node"),
+    HostExport::resolves_to_null("scx_bpf_get_idle_smtmask_node"),
+    HostExport::resolves_to_null("scx_bpf_get_online_cpumask"),
+    HostExport::resolves_to_null("scx_bpf_pick_idle_cpu_node"),
 ];
 
 /// The scx-derived `-I` directories for the scheduler `.so` build, computed from
 /// an explicit `scx_root` (no submodule assumption, no cargo-metadata
-/// derivation). `bpf_include` is the libbpf-sys header dir (the standalone build
-/// passes its `DEP_BPF_INCLUDE`; an embedder passes its own). The returned
+/// derivation). `bpf_include` is libbpf's header dir: `scx_simulator`'s build
+/// passes libbpf-sys's `DEP_BPF_INCLUDE`, and an embedder passes
+/// [`SimBuildInputs::bpf_include`] -- or calls [`SimBuildInputs::include_paths`],
+/// which prepends the sim C dirs to this set, instead of this function. The returned
 /// sequence reproduces the standalone build's historical `-I` order exactly:
 /// `-I` resolution is first-match, so the order is part of the build contract
 /// (changing it can change which header wins, and the resulting `.so` bytes).
@@ -385,91 +527,23 @@ pub const EXPORTED_SYMS: &[&str] = &[
 /// nor `<scx_root>/lib` ([`build_schedulers`] appends that itself), so neither is
 /// double-added.
 ///
-/// `vmlinux_override`: when `Some(dir)`, `dir` (which must contain a `vmlinux.h`)
-/// REPLACES the two vendored `scheds/vmlinux` entries -- `scheds/vmlinux`
-/// symlinks `vmlinux.h` into `scheds/vmlinux/arch/x86` (the symlink target dir,
-/// where the version-pinned header lives), so both `-I` entries serve only to
-/// resolve `#include "vmlinux.h"`. The vendored vmlinux is pinned to one scx
-/// version, so an embedder (e.g. ktstr) passes the vmlinux it derived from the
-/// kernel under test, compiling the `.so` against the matching kernel ABI.
-/// `None` keeps the vendored, scx-versioned vmlinux (the standalone default).
-pub fn scx_include_paths(
-    scx_root: &Path,
-    bpf_include: &Path,
-    vmlinux_override: Option<&Path>,
-) -> Vec<PathBuf> {
-    let mut paths = vec![
+/// `#include "vmlinux.h"` always resolves to the vendored, scx-versioned header
+/// (`scheds/vmlinux` symlinks it into `scheds/vmlinux/arch/x86`), and there is
+/// deliberately no per-`.so` override. The host static libraries are compiled
+/// from this same set and allocate the `task_struct`, `cgroup` and `css_set` a
+/// scheduler reads; with no CO-RE relocation in the sim, every field offset is
+/// fixed when the `.so` is compiled, so a `.so` built against any other header
+/// reads the host's structs at the wrong offsets. A kernel-derived header must
+/// switch the whole build at once (sim-004y6).
+pub fn scx_include_paths(scx_root: &Path, bpf_include: &Path) -> Vec<PathBuf> {
+    vec![
         scx_root.join("scheds/include"),
         scx_root.join("scheds/include/lib"),
-    ];
-    match vmlinux_override {
-        Some(dir) => paths.push(dir.to_path_buf()),
-        None => {
-            paths.push(scx_root.join("scheds/vmlinux"));
-            paths.push(scx_root.join("scheds/vmlinux/arch/x86"));
-        }
-    }
-    paths.push(scx_root.join("scheds/include/bpf-compat"));
-    paths.push(bpf_include.to_path_buf());
-    paths
-}
-
-/// Resolve the scx source root for a scheduler `.so` build. Returns the
-/// `SCX_ROOT` env override if set -- canonicalized and asserted to look like an
-/// scx checkout (must contain `scheds/include`), failing loud otherwise -- else
-/// the supplied `default` (the bundled submodule, for in-repo builds). Emits
-/// `cargo:rerun-if-env-changed=SCX_ROOT`, so call it only from a build script.
-/// Shared by scx_simulator's build script and the embed harness so the override
-/// and the validity check are one source of truth.
-pub fn resolve_scx_root(default: &Path) -> PathBuf {
-    println!("cargo:rerun-if-env-changed=SCX_ROOT");
-    match std::env::var("SCX_ROOT") {
-        Ok(v) => {
-            let canon = PathBuf::from(&v)
-                .canonicalize()
-                .unwrap_or_else(|e| panic!("SCX_ROOT={v} is not accessible: {e}"));
-            assert!(
-                canon.join("scheds/include").is_dir(),
-                "SCX_ROOT={v} does not look like an scx checkout (missing scheds/include)"
-            );
-            canon
-        }
-        Err(_) => default.to_path_buf(),
-    }
-}
-
-/// Compile one upstream scx Rust source verbatim as a module of the calling
-/// crate: writes `OUT_DIR/<module>_mod.rs` holding
-/// `#[path = "<scx_root>/<rel>"] pub mod <module>;`, which the crate pulls in
-/// with `include!(concat!(env!("OUT_DIR"), "/<module>_mod.rs"))`, and emits
-/// `cargo:rerun-if-changed` for the source. Call it only from a build script.
-///
-/// Why generated: a `#[path]` attribute takes a string LITERAL, so written in
-/// source it is nailed to the bundled submodule and blind to `SCX_ROOT` -- an
-/// embedder pointing `SCX_ROOT` at their own scx tree got the scheduler `.so`
-/// from their tree and the upstream Rust from ours, in one binary, silently.
-/// `include!`ing the file straight into an inline `mod` is not an option
-/// either: upstream files open with `//!` module docs, and inner doc comments
-/// are illegal in a macro expansion (E0753). The one-line wrapper keeps the
-/// upstream file an ordinary file module, byte-identical to the pin.
-///
-/// The file is parsed under the CALLING crate's edition, so that crate must be
-/// on the upstream crate's edition (scx_layered: 2024).
-pub fn emit_upstream_module(scx_root: &Path, rel: &str, module: &str) {
-    let src = scx_root.join(rel);
-    assert!(
-        src.is_file(),
-        "{rel} not found at {} (is SCX_ROOT an scx checkout?)",
-        src.display()
-    );
-    let out_dir =
-        PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR unset: not a build script"));
-    std::fs::write(
-        out_dir.join(format!("{module}_mod.rs")),
-        format!("#[path = {src:?}]\npub mod {module};\n"),
-    )
-    .unwrap_or_else(|e| panic!("write {module}_mod.rs: {e}"));
-    println!("cargo:rerun-if-changed={}", src.display());
+        scx_root.join("scheds/vmlinux"),
+        scx_root.join("scheds/vmlinux/arch/x86"),
+        scx_root.join("scheds/include/bpf-compat"),
+        bpf_include.to_path_buf(),
+    ]
 }
 
 /// Whether the scx tree at `scx_root` uses the NEW cgroup_bw function signatures,
@@ -494,10 +568,12 @@ fn header_has_new_cgroup_bw_api(header: &str) -> bool {
 }
 
 /// Kernel-config / version scalars an embedder can override so a scheduler `.so`
-/// (and the host static lib) compiles against the kernel under test instead of
-/// the standalone defaults in `csrc/sim_kconfig_defaults.h`. Each `None` field
-/// keeps the C default (byte-identical build); each `Some` emits
-/// `-DSIM_<NAME>=<value>` via [`cflag_defines`](Self::cflag_defines).
+/// compiles against the kernel under test instead of the standalone defaults in
+/// `csrc/sim_kconfig_defaults.h`. Each `None` field keeps the C default
+/// (byte-identical build); each `Some` emits `-DSIM_<NAME>=<value>` via
+/// [`cflag_defines`](Self::cflag_defines). The values live in the `.so` alone:
+/// the host static libs are built once, with no `KernelConfig`, and define none
+/// of these symbols.
 ///
 /// IN-SIM REALITY (today): only [`no_hz_idle`](Self::no_hz_idle) changes
 /// scheduling behavior -- it gates lavd's sys_stat idle-drift branch.
@@ -667,7 +743,7 @@ pub fn build_schedulers(
         // `simple` strips no `const` and pulls no scx BPF include (local source);
         // every other scheduler strips `const` (BPF const-volatile globals must be
         // writable) and adds scheds/rust/scx_<name>/src/bpf; lavd/cosmos also
-        // include their own dir (a generated/patched source lives there).
+        // add their own wrapper dir (`extra_local_include`).
         let m = defs
             .iter()
             .find(|m| m.name.as_str() == name.as_str())
@@ -951,20 +1027,15 @@ mod tests {
         );
     }
 
-    /// `scx_include_paths` with `None` returns exactly the scx-derived `-I` dirs
-    /// in the order the standalone build.rs used inline, excluding `<scx_root>/lib`
-    /// (build_schedulers appends that -- double-add hazard) and the caller's
-    /// crate-local csrc/scxtest; with `Some(override)` it replaces the two vendored
-    /// vmlinux entries in-slot with the override dir.
+    /// `scx_include_paths` returns exactly the scx-derived `-I` dirs in the order
+    /// the standalone build.rs used inline -- the vendored, scx-versioned vmlinux
+    /// entries included -- excluding `<scx_root>/lib` (build_schedulers appends
+    /// that -- double-add hazard) and the caller's crate-local csrc/scxtest.
     #[test]
     fn scx_include_paths_order_and_contents() {
         let scx = Path::new("/scx");
         let bpf = Path::new("/bpf/include");
-
-        // Default (None): the vendored, scx-versioned vmlinux entries, in the
-        // historical -I order. Must exclude <scx_root>/lib (build_schedulers
-        // appends it) and the caller's crate-local csrc/scxtest.
-        let got = scx_include_paths(scx, bpf, None);
+        let got = scx_include_paths(scx, bpf);
         assert_eq!(
             got,
             vec![
@@ -977,26 +1048,6 @@ mod tests {
             ]
         );
         assert!(!got.iter().any(|p| p == Path::new("/scx/lib")));
-
-        // Override (Some): the embedder's kernel-derived vmlinux dir REPLACES the
-        // two vendored scheds/vmlinux entries in the same slot; the vendored ones
-        // no longer appear, and the surrounding order is preserved.
-        let km = Path::new("/kernel/vmlinux");
-        let got = scx_include_paths(scx, bpf, Some(km));
-        assert_eq!(
-            got,
-            vec![
-                PathBuf::from("/scx/scheds/include"),
-                PathBuf::from("/scx/scheds/include/lib"),
-                PathBuf::from("/kernel/vmlinux"),
-                PathBuf::from("/scx/scheds/include/bpf-compat"),
-                PathBuf::from("/bpf/include"),
-            ]
-        );
-        assert!(!got.iter().any(|p| p == Path::new("/scx/scheds/vmlinux")));
-        assert!(!got
-            .iter()
-            .any(|p| p == Path::new("/scx/scheds/vmlinux/arch/x86")));
     }
 
     /// `header_has_new_cgroup_bw_api` matches only a line-anchored

@@ -1,0 +1,10 @@
+[
+  {
+    "id": "sim-4e4c0a-c1a97de4924",
+    "issue_id": "sim-4e4c0a",
+    "author": "devbig030",
+    "body": "Re-read at integration 24d864c6 (scx pin 413031d4) while preparing the crates.io release candidate. This is from reading the code. The nested-ancestor case was not re-run.\n\n1. Upstream cgroup_bw no longer finds a cgroup's parent through the path described above. After the pin bump, lib/cgroup_bw.bpf.c computes the parent in `cbw_eff_parent_cgid()`. That walks `cbw_cgroup_ancestor()`, a CO-RE read of `cgrp->ancestors[level]`, and does not call the `bpf_cgroup_ancestor` kfunc. The field is now `eff_parent_id`, set in `cbw_init_cgx()`. The simulator's `sim_cgroup_alloc()` (csrc/sim_task.c) fills `ancestors[]` from the parent's array. So the NULL return this issue blames is no longer on the parent walk. cgroup_bw still calls `bpf_cgroup_ancestor(cgrp, 0)` to resolve the root.\n\n2. The kfunc has three definitions today:\n   - kfuncs.rs, in the host: looks the ancestor up in the cgroup registry (`sim_cgroup_lookup_ancestor`).\n   - csrc/sim_bpf_stubs.c, in every .so: a weak fallback that returns NULL. It binds only when the host does not export the symbol. It is one of the 24 own_definition names in sim-3geoh.\n   - schedulers/lavd/wrapper.c: a strong copy that returns the root for level 0 and NULL for every other level (a flat-hierarchy model). lavd uses it whatever the host exports.\n\n3. Whether a nested cgroup without its own cpu.max is now bounded by its ancestor's limit needs a re-run. The #[ignore]d spec named above left with cgroup_bw_throttle_cycle.rs (929abf8). tests/cgroup_bw_throttle_unthrottle.rs `test_throttle_unthrottle_in_nested_hierarchy` limits the inner cgroup directly, so no test in the tree covers the ancestor case. If a re-run shows the ancestor limit now holds, this can close with a test. If not, the cause is somewhere other than the kfunc stub.",
+    "created_at": "2026-09-25T03:49:03.190750681Z",
+    "updated_at": "2026-09-25T03:49:03.190750681Z"
+  }
+]

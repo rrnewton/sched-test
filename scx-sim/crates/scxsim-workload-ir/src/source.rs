@@ -10,7 +10,7 @@
 //! ktstr's `WorkType` and `WorkSpec` already derive serde with
 //! `#[serde(rename_all = "snake_case")]`. These types use the same
 //! representation, so ktstr's own serialised output deserialises here. The
-//! round-trip is the contract; [`crate::lower`]'s tests pin the variant set so a
+//! round-trip is the contract; [`crate::lower`](mod@crate::lower)'s tests pin the variant set so a
 //! new ktstr work type shows up as a compile or test failure rather than as a
 //! silently-ignored field.
 //!

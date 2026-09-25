@@ -1,0 +1,10 @@
+[
+  {
+    "id": "sim-o3kct-c9fc4eb4a5f",
+    "issue_id": "sim-o3kct",
+    "author": "devbig030",
+    "body": "Detector soundness, measured on feat/scxsim-cratesio-release-candidate: as mutation M4 (of four used to test symbol_export.rs), the sim_deterministic_mem.c definitions were given hidden visibility. known_gap_libc_takes_the_so_memory_functions then went red, as it should: the known-gap test fires when the fix sketched above is applied, so its red is trustworthy. The mutation was reverted; the arena-headroom and cross-allocator checks in the fix sketch were NOT done and still gate a real fix.",
+    "created_at": "2026-09-25T02:04:06.570090068Z",
+    "updated_at": "2026-09-25T02:04:06.570090068Z"
+  }
+]
