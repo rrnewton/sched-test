@@ -6,7 +6,7 @@ issue_type: task
 labels:
 - cratesio
 created_at: 2026-09-25T03:43:12.625623193+00:00
-updated_at: 2026-09-25T03:43:12.625623193+00:00
+updated_at: 2026-09-25T04:50:46.010577974+00:00
 ---
 
 # Description
@@ -20,7 +20,7 @@ The crates.io release candidate (branch feat/scxsim-cratesio-release-candidate) 
    - Options: (a) keep the scx_ names with the sched-ext co-owners' agreement; (b) use the scxsim- prefix that scxsim-build and scxsim-workload-ir already use. Under (b), `[lib] name = "scx_simulator"` keeps every `use scx_simulator::...` path working.
    - Recommendation: (b) for scx_perf, scx_layered_alloc and scx_layered_growth. Only scx_simulator depends on them, so the rename costs nothing. Settle scx_simulator's own name with the co-owners.
 
-2. scx_simulator 1.0.0 or 0.1.0. The task asked for 1.0.0 and the branch carries it. Recommendation: 0.1.0, like the other five.
+2. scx_simulator 1.0.0 or 0.1.0. The branch carries 1.0.0 only because integration already did: the version arrived with #18 (ee906b05, 'scxsim 1.0 Release Candidate', 2026-05-04), an internal milestone, and the release-candidate task did not ask for it. The other five crates are new and start at 0.1.0. Recommendation: 0.1.0 for scx_simulator too.
    - sim-c8949e ('1.0 Release Candidate validation', P0) is still open with 22 unchecked items.
    - The fixes for several release-candidate findings change the public API or its behaviour: sim-4xdj4 (safe functions become `unsafe fn` or lose their re-export), sim-cp5c0 (a public KernelConfig field), sim-0qpv9 (the library takes SIM_LOCK or refuses a second load), sim-yrtox (the stdout report leaves Simulator::run), sim-dneoq (libbpf-sys features). Under 1.0.0 each of those is a 2.0.0. Under 0.1.0 they go into 0.2.0 without breaking a stability promise.
 
