@@ -6,7 +6,7 @@ issue_type: task
 labels:
 - cratesio
 created_at: 2026-09-25T03:43:12.625623193+00:00
-updated_at: 2026-09-25T04:50:46.010577974+00:00
+updated_at: 2026-09-25T06:29:50.253306734+00:00
 ---
 
 # Description
@@ -32,6 +32,6 @@ The crates.io release candidate (branch feat/scxsim-cratesio-release-candidate) 
    - Unsound or silently wrong for an in-process consumer: sim-4xdj4, sim-0qpv9, sim-3geoh, sim-kuhrw, sim-6vhbq, sim-4b77c, sim-ld1ro.
    - Breaking to change after publication: sim-cp5c0, sim-yrtox, sim-dneoq, sim-jnh26, sim-fmijm, and item 3 above.
    - Licensing: sim-kqri1.
-   - Everything else filed under the cratesio label can follow a release. Two phrases need a yes or no: 'the fbk kernel' in scxtest/kern_types.h and '(devserver toolchains)' in schedulers/lavd/wrapper.c. Neither is secret. See sim-yc6z3, item 5.
+   - Everything else filed under the cratesio label can follow a release. Two source comments need a yes or no, one in scxtest/kern_types.h and one in schedulers/lavd/wrapper.c; each names internal infrastructure. Neither is secret. See sim-yc6z3, item 5.
 
 Found while preparing the crates.io release candidate (tg scxsim-cratesio-release-candidate).

@@ -6,7 +6,7 @@ issue_type: task
 labels:
 - cratesio
 created_at: 2026-09-25T03:43:12.614424627+00:00
-updated_at: 2026-09-25T03:50:34.273755495+00:00
+updated_at: 2026-09-25T06:29:50.250659528+00:00
 ---
 
 # Description
@@ -33,7 +33,7 @@ Measured on the .crate files packaged from the release-candidate branch (integra
 
 4. The vendored lib/ tree ships four times. Upstream's scheds/rust/scx_{cosmos,lavd,layered}/src/bpf/lib are symlinks to the top-level lib/, and cargo package stores each one as a full copy. So scx_simulator carries its 23 lib files four times: 69 extra entries and 987,699 extra bytes uncompressed. The three copies gzip to 265,555 bytes on their own, about 13% of the 2,036,244-byte .crate.
 
-5. Two phrases an external reader may ask about. This is the owner's call, since neither is secret. scxtest/kern_types.h cites 'the CONFIG_NR_CPUS=512 of the fbk kernel', and schedulers/lavd/wrapper.c says '(devserver toolchains)'. A case-insensitive search of own files found only these two. It searched for Meta-internal host, tool, repository and domain names, Meta email domains, diff and task numbers, and facebookexperimental. The term list is in the task's notes, not here, since this issue is public. The search found two other hits, both public: David Vernet's upstream copyright line (dvernet@meta.com) in schedulers/simple/scx_simple.bpf.c, and a link to the public facebookexperimental/hermit repo.
+5. Two phrases an external reader may ask about. This is the owner's call, since neither is secret. A comment in scxtest/kern_types.h names an internal kernel build as the source of its CONFIG_NR_CPUS value, and a comment in schedulers/lavd/wrapper.c names an internal class of build hosts. The exact phrases are in the task's notes. A case-insensitive search of own files found only these two. It searched for Meta-internal host, tool, repository and domain names, Meta email domains, diff and task numbers, and facebookexperimental. The term list is in the task's notes, not here, since this issue is public. The search found two other hits, both public: David Vernet's upstream copyright line (dvernet@meta.com) in schedulers/simple/scx_simple.bpf.c, and a link to the public facebookexperimental/hermit repo.
 
 Fix, most valuable first:
 - Replace the tg references with a commit or a public doc where the provenance matters, and drop them where it does not.
