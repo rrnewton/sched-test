@@ -1,0 +1,10 @@
+[
+  {
+    "id": "sim-c8949e-c25db95a4d4",
+    "issue_id": "sim-c8949e",
+    "author": "devbig030",
+    "body": "Status check at integration 24d864c6, from the crates.io release candidate (tg scxsim-cratesio-release-candidate).\n\nThe release candidate recommends publishing scx_simulator as 0.1.0, not 1.0.0 (sim-rzyx9, item 2). One reason is that this tracker is still open. The other is that several fixes found by the release candidate change the public API.\n\nThe tracker is stale:\n- It has 22 unchecked items. 18 name an issue, and 9 of those are closed: sim-09a30, sim-d80a1, sim-d46dd, sim-e5076, sim-ed0d6, sim-c3fd09, sim-ac6b5a, sim-466a13, sim-094402. Still open: sim-010a1, sim-880544, sim-80ce04, sim-943dc0, sim-d9988, sim-6b003, sim-c5dbf, sim-4c1e5, sim-d848e.\n- Two unnamed items look done. 'SimCgroupHandle refactor': `CgroupInfo` (src/safe/cgroup.rs) now holds a `CgroupAlloc` whose variants wrap a `SimCgroupHandle`. 'cgroup.rs: move to safe/': the file is src/safe/cgroup.rs.\n- The P3 item 'RAII migration for CgroupInfo (eliminate remaining unsafe Send/Sync)' has moved rather than gone. `CgroupInfo` has no unsafe impl now, but `CgroupPtr` and `SimCgroupHandle` carry `unsafe impl Send` and `unsafe impl Sync` in unsafe_impl/cgroup_wrapper.rs.\n- The header names branch simulator.v4 at 15a3d0c. The development tip is now integration.\n\nThe release candidate filed 17 new issues under the label cratesio. sim-rzyx9 lists the ones it recommends fixing before any publish: sim-4xdj4, sim-0qpv9, sim-3geoh, sim-kuhrw, sim-6vhbq, sim-4b77c and sim-ld1ro (unsound or silently wrong for an in-process consumer); sim-cp5c0, sim-yrtox, sim-dneoq, sim-jnh26 and sim-fmijm (breaking to change after publication); and sim-kqri1 (licensing).",
+    "created_at": "2026-09-25T03:49:03.196720594Z",
+    "updated_at": "2026-09-25T03:49:03.196720594Z"
+  }
+]
