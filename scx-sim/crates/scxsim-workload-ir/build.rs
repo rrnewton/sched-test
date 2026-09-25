@@ -17,12 +17,11 @@
 //!
 //! Emitted only when `ingest` is on, the only configuration in which this
 //! package's binaries load a scheduler (the one test that does requires it).
+//! `ingest` is also what enables the `scxsim-build` build-dependency, so a
+//! default build compiles this script without it.
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    // Cargo sets CARGO_FEATURE_<NAME> for each enabled feature.
-    if std::env::var_os("CARGO_FEATURE_INGEST").is_none() {
-        return;
-    }
+    #[cfg(feature = "ingest")]
     scxsim_build::emit_host_link_args();
 }

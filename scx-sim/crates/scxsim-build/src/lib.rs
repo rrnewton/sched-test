@@ -516,8 +516,10 @@ pub const HOST_EXPORTS: &[HostExport] = &[
 
 /// The scx-derived `-I` directories for the scheduler `.so` build, computed from
 /// an explicit `scx_root` (no submodule assumption, no cargo-metadata
-/// derivation). `bpf_include` is the libbpf-sys header dir (the standalone build
-/// passes its `DEP_BPF_INCLUDE`; an embedder passes its own). The returned
+/// derivation). `bpf_include` is libbpf's header dir: `scx_simulator`'s build
+/// passes libbpf-sys's `DEP_BPF_INCLUDE`, and an embedder passes
+/// [`SimBuildInputs::bpf_include`] -- or calls [`SimBuildInputs::include_paths`],
+/// which prepends the sim C dirs to this set, instead of this function. The returned
 /// sequence reproduces the standalone build's historical `-I` order exactly:
 /// `-I` resolution is first-match, so the order is part of the build contract
 /// (changing it can change which header wins, and the resulting `.so` bytes).

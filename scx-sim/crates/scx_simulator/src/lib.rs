@@ -40,9 +40,13 @@
 //! `standalone` convenience constructors above) and loads a scheduler it built
 //! itself: pass an explicit `.so` path plus a `SchedulerDefinition` to
 //! [`DynamicScheduler::load_with_definition`], or the fallible
-//! [`DynamicScheduler::try_load_with_definition`]. The `embed_harness` crate is
-//! a worked downstream example, and `ai_docs/ktstr_scxsim_embed_contract.md`
-//! documents the full link/build contract.
+//! [`DynamicScheduler::try_load_with_definition`]. Its build script must call
+//! `scxsim_build::emit_host_link_args()`, or the load is refused with
+//! [`LoadError::HostSymbolsNotExported`]. The `embed_harness` crate is a worked
+//! downstream example, and the [embedding contract] documents the full
+//! link/build contract.
+//!
+//! [embedding contract]: https://github.com/rrnewton/sched-test/blob/integration/scx-sim/ai_docs/ktstr_scxsim_embed_contract.md
 
 // === Safe modules (zero unsafe) — grouped under safe/ ===
 // `pub(crate)`: the public surface is the curated re-exports below + the

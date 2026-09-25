@@ -26,12 +26,14 @@ serde_json = "1"
 
 [features]
 default = []
-ingest = ["dep:scx_simulator"]
+ingest = ["dep:scx_simulator", "dep:scxsim-build"]
 
 [build-dependencies]
 # Only for emit_host_link_args(), which this package's own `ingest` binaries
-# need because link arguments are not transitive. See build.rs.
-scxsim-build = { version = "0.1.0", path = "../scxsim-build" }
+# need because link arguments are not transitive. See build.rs. Optional, so a
+# consumer of the IR and lowering alone has no scx-sim crate anywhere in its
+# graph, build dependencies included.
+scxsim-build = { version = "0.1.0", path = "../scxsim-build", optional = true }
 
 [dev-dependencies]
 serde_json = "1"
