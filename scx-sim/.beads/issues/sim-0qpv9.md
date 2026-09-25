@@ -1,12 +1,12 @@
 ---
 title: Only one simulation may run per process, and nothing in the library enforces it (SIM_LOCK is a caller contract)
 status: open
-priority: 2
+priority: 1
 issue_type: bug
 labels:
 - cratesio
 created_at: 2026-09-25T00:19:31.017698933+00:00
-updated_at: 2026-09-25T00:19:31.017698933+00:00
+updated_at: 2026-09-25T03:41:10.602802082+00:00
 ---
 
 # Description

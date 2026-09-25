@@ -1,0 +1,631 @@
+<<BD_INVOKE>> 2026-09-24T18:44:44.889820162+00:00 "create" "Gate the standalone scheduler .so build behind the standalone feature" "-p" "2" "-t" "task" "-d" "Embedders that build scx_simulator with default-features = false still pay for build_schedulers compiling all six bundled scheduler .so files (simple, tickless, cosmos, mitosis, lavd, layered), because build.rs runs it unconditionally. It cannot simply be gated on CARGO_FEATURE_STANDALONE today, because non-standalone code still reads the compile-time SCHEDULER_SO_DIR: DynamicScheduler::layered / layered_with_topology / layered_for_topology (unsafe_impl/ffi.rs) are not cfg(feature = "standalone"), and the scxsim bin's scheduler lookup and list_schedulers use env!("SCHEDULER_SO_DIR") under every feature set. Gating the build alone would turn those into runtime missing-.so failures (No Silent Failures). Fix order: (1) cfg-gate the layered convenience constructors like simple/lavd/etc (layered_for_topology callers that need an embedder path get a load_with_definition-based equivalent); (2) make the scxsim bin require the standalone feature (required-features) or resolve .so dirs another way; (3) only then gate build_schedulers + the SCHEDULER_SO_DIR rustc-env on CARGO_FEATURE_STANDALONE. Also fix validate.sh's stale comment on the --no-default-features build, which claims the crate only uses load_with_definition in that configuration. Found while preparing the crates.io release candidate (tg scxsim-cratesio-release-candidate)."
+<<BD_INVOKE>> 2026-09-24T20:51:29.657504812+00:00 "list" "--status" "open"
+<<BD_INVOKE>> 2026-09-24T20:51:35.844095810+00:00 "show" "sim-70abc8"
+<<BD_INVOKE>> 2026-09-24T20:51:54.599573652+00:00 "create" "scxsim: glibc takes the .so's own calloc/free/memcpy/memset/strncmp bindings, bypassing sim_deterministic_mem.c" "-t" "bug" "-p" "1" "--deps" "related:sim-70abc8" "-d" "csrc/sim_deterministic_mem.c is compiled into every scheduler .so to replace glibc's
+memory functions with fixed-branch versions (and calloc/free with the sim_arena bump
+allocator), so glibc's alignment- and heap-state-dependent branches stay out of the PMU
+RBC count (motivated by sim-70abc8). Its header comment says the linker "uses these
+instead of resolving from the main binary's glibc". For the calls that matter, that is
+false.
+
+Measured (feat/scxsim-cratesio-release-candidate, based on integration 13543138):
+
+- Every bundled .so (cosmos, lavd, mitosis, layered, simple, tickless) reaches calloc,
+  free, memcpy and memset through R_X86_64_JUMP_SLOT relocations; lavd and layered also
+  strncmp (`readelf -rW libscx_<name>.so`).
+- The definitions have default visibility, and a dlopen'd .so resolves relocations in
+  the global scope first -- the host and the libraries it started with, glibc included.
+- `LD_DEBUG=bindings` on the symbol_export test binary: libscx_simple.so binds calloc,
+  free, memcpy and memset to /lib64/libc.so.6.
+
+So for every PLT call the scheduler runs glibc's implementations, not the deterministic
+ones. malloc/realloc/memmove/memcmp/strcmp/strlen are defined too but not relocated, so
+only direct calls (if any) reach them.
+
+Impact: the determinism mechanism is silently not in effect for those calls. glibc's
+memcpy/memset branch on size and alignment, and calloc/free on heap state; with ASLR
+the addresses differ between runs. That is a plausible contributor to sim-70abc8's
+small (1-8 branch) RBC deltas, NOT a demonstrated one: measure before claiming it.
+Not a No-Stub issue (no scheduler logic is replaced).
+
+Same mechanism as the host-export silent bindings (scxsim_build::HOST_EXPORTS,
+LoadError::HostSymbolsNotExported), with glibc instead of the host binary as the
+interposer.
+
+Fix sketch: give the sim_deterministic_mem.c definitions hidden visibility, so the
+static link binds every reference in the .so (including compiler-generated memcpy/memset
+from other TUs) to them directly and the .so exports none of them. Before landing:
+calloc then draws from the 32 MiB arena instead of glibc's heap, so check arena
+headroom (see sim-ytru8) and that nothing frees a glibc pointer through the arena or
+vice versa. Re-measure with LD_DEBUG=bindings.
+
+Acceptance: `known_gap_libc_takes_the_so_memory_functions` in
+crates/scx_simulator/tests/symbol_export.rs goes red; invert it per the known-gap
+convention (assert no .so definition binds to another object). LD_DEBUG=bindings shows
+no libscx_*.so binding of these names to libc."
+<<BD_INVOKE>> 2026-09-24T20:59:47.328305929+00:00 "list"
+<<BD_INVOKE>> 2026-09-24T23:10:34.984426883+00:00 "list" "--status" "open"
+<<BD_INVOKE>> 2026-09-24T23:10:34.994325638+00:00 "list"
+<<BD_INVOKE>> 2026-09-24T23:10:48.400260495+00:00 "create" "scx-sim: the publish set's rust-version = 1.88 is measured once and not gated" "-p" "2" "-t" "task" "-l" "release" "-l" "cratesio" "-d" "The six crates.io publish-set crates (scxsim-build, scx_perf, scx_layered_growth, scx_layered_alloc, scx_simulator, scxsim-workload-ir) declare rust-version = "1.88". That floor was MEASURED on 2026-09-24, not guessed: a scratch consumer depending on the six packaged .crate files, with a fresh MSRV-aware lockfile (resolver 3), fails on 1.87.0 (let chains in the upstream scx_layered alloc.rs and layer_core_growth.rs that scx_layered_alloc / scx_layered_growth compile verbatim; stable from 1.88) and on 1.85.0 (the same plus u*::is_multiple_of, stable from 1.87), and on 1.88.0 builds in 56 s and reproduces the 1.97.1 run fingerprints for simple and lavd.
+
+Nothing re-checks it. validate.sh runs on the pinned 1.97.1 only, so the declared floor goes stale silently the first time upstream scx_layered (pulled in by the nightly scx pin bump, which lands itself when green) or our own code uses a newer std API. The failure a user sees is loud (a compile error on their toolchain, not a wrong run), but it breaks a published promise, and cargo's MSRV-aware resolver cannot help: it picks dependency versions, not our source.
+
+Fix: a CI stage that builds the publish set on the declared rust-version (cargo +1.88 check -p <each crate> with --locked against an MSRV-resolved lockfile, or cargo-msrv verify), wired so a pin bump that raises the floor goes red and forces an explicit rust-version bump." "--acceptance" "A pin bump or source change that needs a newer toolchain than rust-version fails a gate that runs before landing; the gate runs at the same feature sets the published crates are consumed at."
+<<BD_INVOKE>> 2026-09-24T23:50:22.891448761+00:00 "list" "--status" "open"
+<<BD_INVOKE>> 2026-09-24T23:50:36.561427154+00:00 "create" "scxsim-build: a sound kernel-derived vmlinux override (one header for the whole build + a load-time identity check)" "-t" "feature" "-p" "2" "-l" "embed" "-l" "cratesio" "-d" "The crates.io RC removed scxsim-build's per-.so vmlinux_override parameter (scx_include_paths / SimBuildInputs::include_paths / build_bundled). It was unsound: scx_simulator's host static libraries (sim_task.c via sim_wrapper.h -> scx/common.bpf.h -> vmlinux.h) are always compiled against the vendored header, and they allocate the task_struct, cgroup, css_set, kernfs_node and task_group the scheduler reads. The sim has no CO-RE relocation (the __builtin_preserve_* builtins are compiled out), so a .so compiled against any other vmlinux.h reads the host's structs at the wrong offsets.
+
+Measured 2026-09-24 on 17 offsetof/sizeof probes. Vendored x86 v7.2-rc6 vs the 7.1.3 kernel on the dev host: 15 differ. Vendored x86 vs vendored arm64, same kernel commit: 8 differ (task_struct pid/cpus_ptr/cgroups/comm/sizeof, sizeof(cgroup), css_set.dfl_cgrp). End to end: with the 7.1.3 header the .so does not compile (no struct scx_cmask), which is loud. With the arm64 header it compiles: simple runs with an identical fingerprint (it touches only sched_ext_entity, whose layout matches), while lavd, mitosis and cosmos die with SIGSEGV (lavd in lavd_init_task at p->real_parent->pid) and print no diagnostic. A header whose differences fall only on non-pointer fields would read wrong integers without faulting. That case follows from the mechanism but was not measured.
+
+A sound design needs both of these:
+(1) The override is a property of the WHOLE build. Pass it the way SCX_ROOT is passed: an env var read by scx_simulator's build.rs, with the resolved dir published as DEP_SCXSIM_VMLINUX metadata. Then the host static libs and every .so compile against one header. Separately, check the Rust side's hardcoded enum/flag values against the header; those do not follow a header switch.
+(2) A load-time identity check. Hash the resolved vmlinux.h, pass the hash as -D to both the host compile and each .so compile, and have DynamicScheduler refuse a mismatch with a new LoadError variant naming both headers. This is the same pattern as the host-export probe (LoadError::HostSymbolsNotExported). It also catches a .so built by a different scx_simulator build.
+
+Until this lands, an embedder has no supported way to compile against the kernel under test's vmlinux. In the sim the kernel is the sim, so the vendored header is the correct one for every in-process use."
+<<BD_INVOKE>> 2026-09-24T23:53:10.629039097+00:00 "create" "scxsim-build: extra_local_include looks vestigial; verify the .so bytes are unchanged without it, then decide before publishing 1.0" "-t" "task" "-p" "3" "-l" "embed" "-l" "cratesio" "-d" "SchedulerManifest/SchedulerDefinition::extra_local_include (builder: with_extra_local_include) adds -I <schedulers>/<name>, the scheduler's own wrapper directory. lavd and cosmos set it. Today those directories hold only config.mk and wrapper.c. A quoted include already searches the includer's directory. A patched source (cosmos_main_patched.c) is generated into OUT_DIR and found through the -I<OUT_DIR> that build_schedulers prepends. So the flag appears to resolve nothing. It dates from when the patched source was written next to the wrapper.
+
+It is part of the public scxsim-build API in the crates.io RC. Removing it after publishing is a semver break.
+
+To verify: build lavd and cosmos with extra_local_include=false and compare the libscx_lavd.so / libscx_cosmos.so sha256 against the current build. If they are byte-identical, remove the field and builder (or deprecate them) before the first publish. If they differ, find which include resolves through that directory and document it."
+<<BD_INVOKE>> 2026-09-25T00:06:02.529452066+00:00 "show" "sim-004y6"
+<<BD_INVOKE>> 2026-09-25T00:11:37.410893422+00:00 "show" "sim-004y6"
+<<BD_INVOKE>> 2026-09-25T00:11:37.422234877+00:00 "show" "sim-5z1nt"
+<<BD_INVOKE>> 2026-09-25T00:18:49.966529454+00:00 "list" "--status" "open"
+<<BD_INVOKE>> 2026-09-25T00:19:13.115421398+00:00 "list"
+<<BD_INVOKE>> 2026-09-25T00:19:31.013829709+00:00 "create" "-t" "bug" "-p" "2" "-l" "cratesio" "Rodata is written at the definition's declared width; nothing checks it against the symbol's size" "-d" "DynamicScheduler::try_apply_rodata (called by try_load_with_definition) resolves each rodata global with dlsym, which yields an address and no size, and writes the ConfigValue's width via write_{bool,u8,u32,u64}_global (NumCpus writes u32). Nothing compares that width with the ELF symbol's st_size.
+
+A declared width WIDER than the global writes past it into whatever the linker placed next. A NARROWER one writes the low bytes only and leaves the rest. Neither is reported.
+
+Measured on libscx_lavd.so (debug build, branch feat/scxsim-cratesio-release-candidate):
+- verbose (size 1) is followed directly by per_cpu_dsq (size 1) at +1. So ("verbose", ConfigValue::U32(_)) also overwrites per_cpu_dsq.
+- no_use_em (size 1) is followed by padding. The same mistake there is harmless in today's layout.
+
+Whether a given mistake corrupts anything depends on link layout and on the neighbour's value when the write happens. So this is latent, not a demonstrated miscompare.
+
+Why it matters for publishing: try_load_with_definition is a safe fn, and SchedulerDefinition is data the embedder writes. ktstr's declare_scheduler! carries no build info, so ktstr would write these definitions by hand.
+
+Fix: check each write against st_size, and on a mismatch return a new LoadError variant naming the global, its declared width and its actual size. LoadError is #[non_exhaustive], so the new variant is semver-compatible after 1.0.0. Two ways to get st_size:
+- dladdr1(addr, RTLD_DL_SYMENT). glibc only. The libc crate binds dladdr1 but not the RTLD_DL_SYMENT constant (value 1).
+- Read .dynsym from the .so at load time with the object crate, today a dev-dependency (tests/symbol_export.rs)."
+<<BD_INVOKE>> 2026-09-25T00:19:31.017384798+00:00 "create" "-t" "bug" "-p" "2" "-l" "cratesio" "Only one simulation may run per process, and nothing in the library enforces it (SIM_LOCK is a caller contract)" "-d" "SIM_LOCK's own doc: the compiled C scheduler has global mutable state, so only one simulation can run at a time within a process, and callers must hold SIM_LOCK. The library never takes it:
+- DynamicScheduler::try_load_with_definition does not;
+- Simulator::run does not;
+- ArenaTenant is a live-scheduler counter (ARENA_TENANTS; the first tenant releases the arena), not a lock.
+
+The host static libs (the arena, the map registry, the kfunc substrate) are process-global and shared by every loaded .so. So two concurrent runs share them even when the .so differ.
+
+An in-process embedder that runs two scenarios on two threads, as ktstr's test harness would under cargo test, gets whatever interleaving the globals produce, with no error. Not measured here. This rests on SIM_LOCK's doc and the shared-globals structure.
+
+Fix: turn the silent race into a wait or an error. Either take a process-wide lock inside run (or for the DynamicScheduler's lifetime), or refuse a second concurrent load with a LoadError.
+
+Until then, ai_docs/ktstr_scxsim_embed_contract.md section 8 documents it as a caller obligation."
+<<BD_INVOKE>> 2026-09-25T00:19:31.020053008+00:00 "create" "-t" "bug" "-p" "2" "-l" "cratesio" "scxsim-workload-ir: YieldNotRepresentable refusal is obsolete and its message is false (scx_simulator::Phase has Yield)" "-d" "ingest.rs to_scenario refuses Phase::Yield with IngestError::YieldNotRepresentable. Its Display text says "scx_simulator::Phase is Run|Sleep|Wake with no yield ... Closing this means adding a Yield phase to the simulator."
+
+scx_simulator::Phase::Yield exists; the crate's own test code notes this at the SimPhase::Yield arm. So the message sends a user to add something that already exists. The module doc ("Phase is Run | Sleep | Wake") is stale too.
+
+Decide before scxsim-workload-ir 0.1.0 is published, because the variant is public API:
+- lower Phase::Yield to scx_simulator::Phase::Yield, if the semantics match (check what the IR's yield means against the engine's Yield); or
+- keep the refusal and correct the message to say why a yield cannot be lowered."
+<<BD_INVOKE>> 2026-09-25T00:19:31.022867729+00:00 "create" "-t" "task" "-p" "2" "-l" "cratesio" "scxsim-workload-ir: mark IngestError and LoweringError #[non_exhaustive] before 0.1.0 is published" "-d" "Both are exhaustive public enums, so every variant added after publication is a breaking change and needs a 0.2.0. scx_simulator's LoadError is already #[non_exhaustive].
+
+IngestError has 7 variants today. One of them, YieldNotRepresentable, is already slated to change (see the Yield issue). Mark both enums before the first publish; afterwards, doing so is itself a breaking change."
+<<BD_INVOKE>> 2026-09-25T00:29:06.631401686+00:00 "show" "sim-65zbt"
+<<BD_INVOKE>> 2026-09-25T00:29:32.455325421+00:00 "create" "with_source_patches is a silent no-op for tickless, lavd and layered: only cosmos's wrapper includes the patched copy" "-t" "bug" "-p" "1" "-l" "cratesio" "-d" "build_schedulers applies SchedulerDefinition::source_patches by writing a patched copy of <scx_root>/scheds/rust/scx_<name>/src/bpf/main.bpf.c into its output dir as <name>_main_patched.c and prepending -I<out>. The patch reaches the compiler only if the scheduler wrapper.c includes <NAME_main_patched.c> with an angle include. Only cosmos/wrapper.c does. tickless, lavd and layered include "main.bpf.c", which resolves to the unpatched upstream file through -I<scx_root>/scheds/rust/scx_<name>/src/bpf.
+
+Measured on branch feat/scxsim-cratesio-release-candidate (scratch consumer built against the worktree sources, rustc 1.97.1, SimBuildInputs::build_bundled). Each scheduler got one extra patch that inserts "#error SOURCE_PATCH_APPLIED" before the line char _license[] SEC("license") = "GPL";
+- cosmos: the build fails at the #error, in cosmos_main_patched.c. The patch was applied.
+- tickless, lavd, layered: the find-assert passes and <name>_main_patched.c contains the #error. libscx_<name>.so still builds, from the unpatched source. Silent.
+- mitosis, simple: the build panics with "read .../scheds/rust/scx_<name>/src/bpf/main.bpf.c: No such file or directory". mitosis compiles mitosis.bpf.c and simple has local source. Loud, but the message does not say the scheduler cannot take patches.
+
+Why it matters for publishing: with_source_patches is part of the documented onboarding chain (SchedulerDefinition::new names it "for a patched scheduler"). The embedder-facing docs on SchedulerDefinition::source_patches and with_source_patches do not mention the wrapper requirement; only the SchedulerManifest field doc does. The existing drift guard (the find-assert) passes, so an embedder has every reason to believe the patch was applied. cosmos has its patch because BPF integer divide-by-zero yields 0 while native C raises SIGFPE. The same kind of fix on lavd would be dropped without a word, and the .so would run the unpatched logic.
+
+Fix, either of:
+(a) build_schedulers refuses when source_patches is non-empty and the wrapper text does not include <NAME_main_patched.c>. The refusal names the include to add. Cheap and loud.
+(b) Make patching independent of the wrapper: write the patched copy as <out>/<name>_patched/main.bpf.c and prepend that directory to -I. A quoted "main.bpf.c" from wrapper.c then finds it first, because the staged wrapper directory holds no main.bpf.c. The patched file's own quoted includes still resolve through the scx_bpf_dir -I. cosmos could then drop its special include.
+In both cases, give mitosis and simple a message that names the real reason.
+
+Acceptance: a test builds a bundled scheduler other than cosmos with a patch that plants #error. Under (b) the build must fail at the #error; under (a) it must fail with the refusal."
+<<BD_INVOKE>> 2026-09-25T00:33:44.748310234+00:00 "show" "sim-65zbt"
+<<BD_INVOKE>> 2026-09-25T00:33:44.758010996+00:00 "show" "sim-0qpv9"
+<<BD_INVOKE>> 2026-09-25T00:33:44.767571576+00:00 "show" "sim-fmijm"
+<<BD_INVOKE>> 2026-09-25T00:33:44.776902158+00:00 "show" "sim-jnh26"
+<<BD_INVOKE>> 2026-09-25T00:33:44.786895502+00:00 "show" "sim-ld1ro"
+<<BD_INVOKE>> 2026-09-25T00:33:44.796637757+00:00 "show" "sim-004y6"
+<<BD_INVOKE>> 2026-09-25T00:33:44.805842780+00:00 "show" "sim-5z1nt"
+<<BD_INVOKE>> 2026-09-25T00:33:44.815472564+00:00 "show" "sim-ybrh9"
+<<BD_INVOKE>> 2026-09-25T00:33:44.824871420+00:00 "show" "sim-ojycs"
+<<BD_INVOKE>> 2026-09-25T00:33:44.834141922+00:00 "show" "sim-o3kct"
+<<BD_INVOKE>> 2026-09-25T00:33:44.844047312+00:00 "show" "sim-0qzq6"
+<<BD_INVOKE>> 2026-09-25T00:33:48.884971294+00:00 "show" "sim-65zbt"
+<<BD_INVOKE>> 2026-09-25T00:33:48.894462319+00:00 "show" "sim-5z1nt"
+<<BD_INVOKE>> 2026-09-25T01:14:36.677388146+00:00 "update" "sim-004y6" "--search" "same kernel commit: 8 differ (task_struct pid/cpus_ptr/cgroups/comm/sizeof, sizeof(cgroup), css_set.dfl_cgrp)" "--replace" "same kernel commit: 7 differ (sizeof(task_struct); task_struct pid, cpus_ptr, cgroups and comm; sizeof(cgroup); css_set.dfl_cgrp)"
+<<BD_INVOKE>> 2026-09-25T01:18:13.621595760+00:00 "show" "sim-0qpv9"
+<<BD_INVOKE>> 2026-09-25T01:18:13.631668850+00:00 "show" "sim-65zbt"
+<<BD_INVOKE>> 2026-09-25T01:18:13.641211049+00:00 "show" "sim-ld1ro"
+<<BD_INVOKE>> 2026-09-25T01:18:13.650515569+00:00 "show" "sim-fmijm"
+<<BD_INVOKE>> 2026-09-25T01:18:13.659958338+00:00 "show" "sim-jnh26"
+<<BD_INVOKE>> 2026-09-25T01:18:13.669627588+00:00 "show" "sim-ybrh9"
+<<BD_INVOKE>> 2026-09-25T01:18:13.678784184+00:00 "show" "sim-ojycs"
+<<BD_INVOKE>> 2026-09-25T01:18:13.688267814+00:00 "show" "sim-5z1nt"
+<<BD_INVOKE>> 2026-09-25T01:18:13.698223587+00:00 "show" "sim-o3kct"
+<<BD_INVOKE>> 2026-09-25T01:18:13.707757213+00:00 "show" "sim-004y6"
+<<BD_INVOKE>> 2026-09-25T01:18:13.716949623+00:00 "show" "sim-0qzq6"
+<<BD_INVOKE>> 2026-09-25T01:20:12.001500529+00:00 "create" "-p" "1" "-t" "bug" "-l" "cratesio" "-l" "no-stub" "--title" "Host-export probe covers only the bundled schedulers' symbols: an embedder-built .so can bind its own fallbacks silently" "-d" "HOST_EXPORTS is the list of symbols the six bundled scheduler .so files resolve from their host; tests/symbol_export.rs derives it from those six and fails on drift. The load-time probe (unexported_symbols in ffi.rs, called first in DynamicScheduler::try_load_with_definition) checks exactly that list, before dlopen, and never reads the .so being loaded.
+
+An embedder that compiles its own wrapper.c through scxsim_build::build_schedulers links the same scxtest/overrides.c and csrc/sim_bpf_stubs.c weak fallbacks, and its scheduler may reference host symbols the bundled six never do (a kfunc behind __ksym __weak, say). If the embedder's binary does not export such a name, the .so binds its own fallback or NULL and runs, silently: the No-Stub failure the probe exists to stop, and the probe passes because the name is not on its list. A strong reference outside the list still fails dlopen, loudly.
+
+tests/symbol_export.rs states the gap in its header ('Not covered: ... a scheduler .so an embedder builds itself'). No test builds an out-of-tree wrapper.c at all; embed_harness and ktstr-scenario-replay build bundled ones through SimBuildInputs::build_bundled.
+
+Fix direction: derive the check from the .so being loaded. Either read its dynamic symbols and relocations (what symbol_export.rs already does with the object crate) at build time in build_schedulers, refusing a .so whose silently-binding names are not all in HOST_EXPORTS, or do the same at load time before dlopen. Until then ai_docs/ktstr_scxsim_embed_contract.md lists it under the guards' gaps."
+<<BD_INVOKE>> 2026-09-25T01:20:22.029975158+00:00 "create" "-p" "2" "-t" "bug" "-l" "cratesio" "-l" "no-stub" "--title" "Host-export probe checks presence, not identity: a same-named export elsewhere in an embedder's process takes the binding (fat-host interposition)" "-d" "The probe (unexported_symbols in ffi.rs) asks only whether dlsym(RTLD_DEFAULT, name) is non-NULL. It does not check that the definition it found is scx_simulator's.
+
+A .so loaded RTLD_NOW|RTLD_LOCAL binds each dynamic relocation to the first definition in the global scope (the executable, then the libraries it started with and any RTLD_GLOBAL loads) before its own. emit_host_link_args() passes -rdynamic, which exports every global the binary links: 193,080 dynamic symbols in the debug scratch consumer of the crates.io RC, against 126 with a selective list. So any name a scheduler .so defines interposably, or references, that the embedder's binary also exports for its own reasons binds to that copy. For a HOST_EXPORTS name the probe then passes on the wrong definition; for any other name nothing checks.
+
+In-tree instance today: glibc takes the bindings of the .so's own calloc/free/memcpy/memset (all six) and strncmp (lavd, layered), bypassing sim_deterministic_mem.c (sim-o3kct, known_gap_libc_takes_the_so_memory_functions). tests/symbol_export.rs checks the sim's own test binary only and lists this as not covered ('a same-named export an embedder's binary carries for its own reasons').
+
+NOT measured for a real embedder. ktstr links far more than the scratch consumer did, so the candidate set is larger.
+
+Fix direction: in the probe, dladdr each definition found and require it to come from the object that carries scx_simulator's static libs (the executable). For names outside HOST_EXPORTS that a .so defines interposably, compare dlsym(handle) with dlsym(RTLD_DEFAULT) after dlopen and refuse an unintended host binding. Alternatively build the .so so that its own copies bind locally (-Bsymbolic, or hidden visibility for everything that is not a host export); that also changes sim-o3kct's behaviour, so the two need deciding together."
+<<BD_INVOKE>> 2026-09-25T02:00:14.314014364+00:00 "show" "sim-o3kct"
+<<BD_INVOKE>> 2026-09-25T02:03:48.743024557+00:00 "show" "sim-0qzq6"
+<<BD_INVOKE>> 2026-09-25T02:04:06.569905420+00:00 "comments" "add" "sim-o3kct" "--body" "Detector soundness, measured on feat/scxsim-cratesio-release-candidate: as mutation M4 (of four used to test symbol_export.rs), the sim_deterministic_mem.c definitions were given hidden visibility. known_gap_libc_takes_the_so_memory_functions then went red, as it should: the known-gap test fires when the fix sketched above is applied, so its red is trustworthy. The mutation was reverted; the arena-headroom and cross-allocator checks in the fix sketch were NOT done and still gate a real fix."
+<<BD_INVOKE>> 2026-09-25T02:04:06.572686558+00:00 "comments" "add" "sim-0qzq6" "--body" "Interim state on feat/scxsim-cratesio-release-candidate: csrc/sim_wrapper.h now pins SCX_ENQ_IMMED to 0ULL explicitly (#undef + #define, marked DANGER TODO(sim-0qzq6)) instead of leaving it to the weak const volatile __SCX_ENQ_IMMED. Behaviour is unchanged (both read 0, i.e. a kernel without IMMED), but the weak global was reached through a relocation that the -rdynamic host's same-named copy interposes, which tests/symbol_export.rs (every_silent_binding_to_this_binary_is_listed) refuses. The fix this issue asks for is unchanged: undef it AND model the bounce-back through ops.enqueue (SCX_ENQ_REENQ); removing the pin alone would re-open the interposition."
+<<BD_INVOKE>> 2026-09-25T02:04:06.576227333+00:00 "show" "sim-0qzq6"
+<<BD_INVOKE>> 2026-09-25T02:34:38.399652038+00:00 "show" "sim-ybrh9"
+<<BD_INVOKE>> 2026-09-25T02:34:46.285205160+00:00 "list" "--title" "atq"
+<<BD_INVOKE>> 2026-09-25T02:34:46.294504899+00:00 "list" "--title" "minheap"
+<<BD_INVOKE>> 2026-09-25T02:34:46.303953743+00:00 "list" "--title" "weak"
+<<BD_INVOKE>> 2026-09-25T02:34:46.312866879+00:00 "list" "--title" "fallback"
+<<BD_INVOKE>> 2026-09-25T02:34:46.322351226+00:00 "list" "--title" "stub"
+<<BD_INVOKE>> 2026-09-25T02:34:46.331212624+00:00 "list" "--title" "rustdoc"
+<<BD_INVOKE>> 2026-09-25T02:34:46.340552884+00:00 "list" "--title" "update_curr"
+<<BD_INVOKE>> 2026-09-25T02:34:46.349363115+00:00 "list" "--title" "slice"
+<<BD_INVOKE>> 2026-09-25T02:34:46.358214798+00:00 "list" "--title" "ksyms"
+<<BD_INVOKE>> 2026-09-25T02:34:46.368259502+00:00 "list" "--title" "RWX"
+<<BD_INVOKE>> 2026-09-25T02:34:46.377872183+00:00 "list" "--title" "stdout"
+<<BD_INVOKE>> 2026-09-25T02:34:46.387125212+00:00 "list" "--title" "println"
+<<BD_INVOKE>> 2026-09-25T02:34:46.396112710+00:00 "list" "--title" "warning"
+<<BD_INVOKE>> 2026-09-25T02:34:46.404933667+00:00 "list" "--title" "libbpf"
+<<BD_INVOKE>> 2026-09-25T02:34:46.413986202+00:00 "list" "--title" "docs.rs"
+<<BD_INVOKE>> 2026-09-25T02:34:46.423150818+00:00 "list" "--title" "hz"
+<<BD_INVOKE>> 2026-09-25T02:34:46.432396635+00:00 "list" "--title" "CONFIG_HZ"
+<<BD_INVOKE>> 2026-09-25T02:34:46.440985151+00:00 "list" "--title" "license"
+<<BD_INVOKE>> 2026-09-25T02:34:46.449743944+00:00 "list" "--title" "SPDX"
+<<BD_INVOKE>> 2026-09-25T02:34:46.459019016+00:00 "list" "--title" "package"
+<<BD_INVOKE>> 2026-09-25T02:34:46.468421420+00:00 "list" "--title" "publish"
+<<BD_INVOKE>> 2026-09-25T02:34:46.477666066+00:00 "list" "--title" "crates.io"
+<<BD_INVOKE>> 2026-09-25T02:34:46.486717701+00:00 "list" "--title" "__FILE__"
+<<BD_INVOKE>> 2026-09-25T02:34:46.496532808+00:00 "list" "--title" "duplicate"
+<<BD_INVOKE>> 2026-09-25T02:34:46.506645284+00:00 "list" "--title" "cpumask_test"
+<<BD_INVOKE>> 2026-09-25T02:34:46.516578059+00:00 "list" "--title" "cgroup_ancestor"
+<<BD_INVOKE>> 2026-09-25T02:34:46.525888595+00:00 "list" "--title" "cgroup_from_id"
+<<BD_INVOKE>> 2026-09-25T02:35:03.216127208+00:00 "show" "sim-ixinx"
+<<BD_INVOKE>> 2026-09-25T02:35:03.226321157+00:00 "show" "sim-2ae49c"
+<<BD_INVOKE>> 2026-09-25T02:35:03.236602288+00:00 "show" "sim-hfvmf"
+<<BD_INVOKE>> 2026-09-25T02:35:03.246331866+00:00 "show" "sim-d9988"
+<<BD_INVOKE>> 2026-09-25T02:35:03.256432404+00:00 "show" "sim-4b77c"
+<<BD_INVOKE>> 2026-09-25T02:38:37.351110207+00:00 "list" "--title" "tickless"
+<<BD_INVOKE>> 2026-09-25T02:38:37.360730600+00:00 "list" "--title" "preempt"
+<<BD_INVOKE>> 2026-09-25T02:42:53.189850530+00:00 "show" "sim-4e4c0a"
+<<BD_INVOKE>> 2026-09-25T02:58:24.250705998+00:00 "show" "sim-5b567"
+<<BD_INVOKE>> 2026-09-25T03:39:29.610245202+00:00 "show" "sim-4b77c"
+<<BD_INVOKE>> 2026-09-25T03:39:29.620546985+00:00 "show" "sim-0qpv9"
+<<BD_INVOKE>> 2026-09-25T03:41:10.599463121+00:00 "comments" "add" "sim-0qpv9" "--body" "Measured, replacing "Not measured here". Release-candidate branch at integration 24d864c6, Rust 1.97.1, the release-candidate scratch consumer built from the extracted .crate files with the full link contract (debug profile). Its `concurrent` binary starts N threads that meet at a barrier. Each thread then loads its own DynamicScheduler, runs the consumer's 1 s, 4-CPU scenario and drops the scheduler, holding SIM_LOCK across load, run and drop in the `lock` mode only. A thread matches when its trace fingerprint and event count equal the single-run baseline and it exits Normal. Each of the 6 bundled schedulers ran at 2, 4 and 8 threads, 5 processes per cell.
+
+With SIM_LOCK held, all 90 processes exit 0 and all 420 thread results match.
+
+Without it:
+- simple: all 15 processes exit 0, and every thread reports Normal with 9906 events, the baseline count. Only 11 of the 70 traces match the baseline: 5/10 at 2 threads, 5/20 at 4, 1/40 at 8. Nothing in a result tells the caller whether it is one of the 11.
+- tickless, cosmos, mitosis, lavd: all 60 processes die with SIGABRT or SIGSEGV, at every thread count. The aborting ones print glibc heap-corruption messages: 'free(): double free detected in tcache 2', 'realloc(): invalid next size', 'realloc(): invalid pointer', 'corrupted size vs. prev_size', 'free(): unaligned chunk detected in tcache 2'.
+- layered: 10 of 70 match. The rest are other Normal traces (1735, 364 and 16359 events, among others), ErrorBpf results ('main.bpf.c:3399: kptr already had cpumask', 'init_task failed for pid=1 rc=-22'), or lost when 2 of the 15 processes aborted.
+
+So an embedder that runs two simulations at once gets heap corruption from code with no `unsafe` in it, or a Normal result that is not its scenario's. `cargo test` runs tests on parallel threads by default, so two tests that each run a simulation are enough. Raising to P1 on that basis.
+
+Two more things for the fix:
+- `prelude` is the documented embed surface. It neither re-exports SIM_LOCK nor mentions it.
+- The doc comment on `apply_layer_config_if_present` in src/bin/scxsim/main.rs says `Simulator::new(sched)` "holds the SIM_LOCK". It does not. The CLI takes the lock itself at each run entry point, so the CLI is safe, but the sentence tells an embedder reading the source the opposite of the truth.
+
+Scripts, the consumer source and the raw summary: experiments/scxsim_cratesio_rc_20260924/ in the harness repo (rrnewton/dev-sched-test), files concurrent_matrix.sh, concurrent_summary.py, consumer/src/bin/concurrent.rs and results/concurrent_summary.txt."
+<<BD_INVOKE>> 2026-09-25T03:41:10.602582840+00:00 "update" "sim-0qpv9" "-p" "1"
+<<BD_INVOKE>> 2026-09-25T03:41:10.605523150+00:00 "show" "sim-0qpv9"
+<<BD_INVOKE>> 2026-09-25T03:41:49.829403402+00:00 "list" "--label" "cratesio"
+<<BD_INVOKE>> 2026-09-25T03:43:12.577189185+00:00 "create" "Scheduler .so files carry their own bodies for 24 of the 55 host-provided names, so a missing host export silently binds a no-op" "-p" "1" "-t" "bug" "-d" "Every bundled scheduler .so carries its own body for 24 of the 55 names the host is supposed to provide: the HostExport::own_definition class in scxsim-build's HOST_EXPORTS (scx_bpf_create_dsq, scx_bpf_dsq_nr_queued, scx_bpf_error_bstr, scx_bpf_kick_cpu, scx_bpf_put_cpumask, scx_bpf_task_cpu, bpf_task_from_pid, bpf_task_release, bpf_rcu_read_lock, bpf_rcu_read_unlock, scx_task_alloc, scx_task_data, scx_task_free, scx_atq_create_internal, scx_atq_insert, scx_atq_insert_vtime, scx_atq_nr_queued, scx_atq_peek, scx_atq_pop, bpf_cgroup_acquire, bpf_cgroup_ancestor, bpf_cgroup_from_id, bpf_cgroup_release, bpf_cpumask_test_cpu). Most are __weak bodies in scxtest/overrides.c that return 0 or NULL or do nothing; the cgroup four are weak bodies in csrc/sim_bpf_stubs.c; bpf_cpumask_test_cpu is a strong duplicate there.
+
+The host's real implementation runs only if the host binary exports the name. If it does not, dlopen succeeds and the .so's own no-op runs, with no error anywhere. That is the No-Stub failure, and it is silent. Measured at integration 24d864c6 with the release-candidate scratch consumer linked through a selective export list: leaving out scx_task_data makes lavd schedule zero tasks while exiting Normal at 1 s and at 5 s; at 40 s it reports ErrorStall, blamed on the scheduler. The weak scx_bpf_error_bstr body is worse in kind: if it binds, every scx_bpf_error() the scheduler raises is discarded and the run continues.
+
+The load-time probe (unexported_symbols in unsafe_impl/ffi.rs, LoadError::HostSymbolsNotExported) now refuses such a host before dlopen, but only for the names in HOST_EXPORTS, which are derived from the bundled six. sim-4b77c tracks the gap for an embedder's own .so. These bodies are what turn that gap into silent stub-binding instead of a load failure.
+
+Fix: delete the .so-side bodies for names the host always provides, so each reference is a strong undefined symbol and a missing export fails RTLD_NOW with 'undefined symbol: <name>' (the dlopen_fails class, which is loud today). Keep the probe: it names the fix (scxsim_build::emit_host_link_args()) where the dlopen error does not. Then move the names to HostExport::dlopen_fails and let tests/symbol_export.rs confirm the reclassification.
+
+Related bodies to decide in the same pass:
+- Five of the 24 have no call sites in any bundled .so (0 relocations): scx_atq_insert, scx_atq_insert_vtime, scx_atq_peek, bpf_rcu_read_lock, bpf_rcu_read_unlock.
+- csrc/sim_bpf_stubs.c defines scx_bpf_cpu_rq and scx_bpf_locked_rq as strong functions returning NULL. They are reached only when a scheduler's scx_bpf_cpu_curr path is unresolved, but they are kfunc no-ops by construction.
+- scxtest/overrides.c also defines '__weak unsigned long CONFIG_NR_CPUS = 1024'.
+
+Found while preparing the crates.io release candidate (tg scxsim-cratesio-release-candidate)." "-l" "cratesio" "-l" "no-stub"
+<<BD_INVOKE>> 2026-09-25T03:43:12.580807467+00:00 "create" "scxtest/overrides.c gives every .so weak scx_minheap_* bodies that report success, hiding an elided lib/minheap.bpf.c" "-p" "1" "-t" "bug" "-d" "scxtest/overrides.c gives every scheduler .so __weak bodies for scx_minheap_pop (returns 0, which is success, without writing *helem), scx_minheap_insert (returns 0 and drops the element) and scx_minheap_alloc (returns NULL). The host provides no scx_minheap_* at all, and the names are not in HOST_EXPORTS, so the load-time probe never checks them. All six bundled .so files export the three names but contain no relocation against them and no call to them.
+
+Upstream uses the API: lib/minheap.bpf.c defines scx_minheap_insert, scx_minheap_pop and scx_minheap_alloc_internal; lib/dhq.bpf.c and scx_p2dq (main.bpf.c, types.h) call it. An embedder that builds such a scheduler through scxsim_build::build_schedulers and forgets to compile lib/minheap.bpf.c into its wrapper links cleanly against these bodies. The scheduler then runs with every heap empty: pop reports success and hands back uninitialized memory. That is the No-Stub 'elided library' failure, silent. Without the weak bodies the same mistake is an 'undefined symbol: scx_minheap_pop' dlopen failure.
+
+The bodies have also drifted from upstream: the weak scx_minheap_alloc(u32) matches no upstream symbol at pin 413031d4, because upstream allocates through scx_minheap_alloc_internal(size_t).
+
+Fix: delete the three bodies. A scheduler that needs a heap compiles the real lib/minheap.bpf.c, the same way lavd compiles lib/cgroup_bw.bpf.c.
+
+Found while preparing the crates.io release candidate (tg scxsim-cratesio-release-candidate)." "-l" "cratesio" "-l" "no-stub"
+<<BD_INVOKE>> 2026-09-25T03:43:12.584180259+00:00 "create" "sim_atq's taskc field offsets are process globals, and their defaults went stale with the scx pin bump (56/64, now 48/56)" "-p" "1" "-t" "bug" "-d" "csrc/sim_atq.c reads and writes two fields inside the scheduler's struct scx_task_common: the int holdcnt and the scx_atq_t *atq back-pointer. Their offsets are process globals set through sim_atq_set_taskc_holdcnt_offset() and sim_atq_set_taskc_atq_offset(). lavd's wrapper.c calls both with __builtin_offsetof from lavd_register_cbw_maps. Every other path gets the file's hard-coded defaults: holdcnt 56, atq 64.
+
+Those defaults went stale with the scx pin bump to 413031d4. Upstream 9ca8390bd ('scx: lib - Add scx_free() and drop the embedded allocation ids') removed 'union sdt_id tid' from struct rbnode, which is the first member of scx_task_common, so the production offsets are now holdcnt 48 and atq 56 (struct size 72). Read from the DWARF of the libscx_lavd.so built by the release-candidate consumer:
+  gdb -batch -ex 'ptype /o struct scx_task_common' <out>/schedulers/libscx_lavd.so
+lavd sets the offsets itself, so the six bundled schedulers are unaffected. Their traces are unchanged across the bump.
+
+Any other ATQ user that does not call the two setters gets the stale defaults. scx_p2dq, for example, uses lib/atq and would have to be built by an embedder. For such a scheduler sim_atq stores the 8-byte back-pointer at offset 64, over 'state' and its padding, and pop(hold=true) and task_drop add to or subtract from the 32 bits at offset 56, which is the low half of the atq pointer. The result is silent memory corruption inside the scheduler's task context, with no error. The comment block above the defaults (a 56-byte rbnode, 'OFFSET 56/64') and the header of tests/atq_operations.rs ('the production offsets 56/64') describe the pre-bump layout.
+
+Fix (No Silent Failures): remove the defaults. Start both offsets at an 'unset' sentinel and make every sim_atq entry point that touches a taskc fail loudly (scx_bpf_error or abort, naming the missing registration) when they are unset. Better still, register the offsets from code compiled into each scheduler's own translation unit (for example from the scxsim-build wrapper preamble), so every .so built through build_schedulers registers its own layout and a layout change cannot desynchronise them. The globals are also shared across loaded schedulers: one process that loads two ATQ schedulers compiled against different layouts would run one of them with the other's offsets.
+
+Found while preparing the crates.io release candidate (tg scxsim-cratesio-release-candidate)." "-l" "cratesio"
+<<BD_INVOKE>> 2026-09-25T03:43:12.587169662+00:00 "create" "Some kfuncs have two definitions per process, and ELF binding or inlining picks the one that runs (lavd's cgroup kfuncs, bpf_cpumask_test_cpu)" "-p" "2" "-t" "bug" "-d" "Some kfuncs have more than one definition in a process. Which body runs is decided by ELF symbol binding, or by clang inlining at compile time, and not by any code that says which one is meant.
+
+1. bpf_cgroup_from_id and bpf_cgroup_ancestor for lavd. schedulers/lavd/wrapper.c defines both as strong functions in the same translation unit as lavd's main.bpf.c and lib/cgroup_bw.bpf.c. clang inlines them into their callers: accounting_timerfn, replenish_timerfn, scx_cgroup_bw_dump and others call sim_get_root_cgroup / sim_cgroup_lookup_by_id directly, and libscx_lavd.so has no relocation against either name. So the host's exported versions in unsafe_impl/kfuncs.rs never run for lavd, whatever the link flags. LD_DEBUG=bindings on the release-candidate consumer (integration 24d864c6, full link contract) shows 38 HOST_EXPORTS names bound from libscx_lavd.so to the executable, and neither cgroup name is among them.
+   - The from_id pair agrees: both delegate to sim_cgroup_lookup_by_id.
+   - The ancestor pair does not. lavd's copy models a flat hierarchy (the root at level 0, NULL at every other level). The host's calls sim_cgroup_lookup_ancestor for any level.
+   - At pin 413031d4 the divergence is latent. lib/cgroup_bw.bpf.c's parent walk now reads cgrp->ancestors[] through cbw_cgroup_ancestor (BPF_CORE_READ, and the sim populates that array; see SIM_CGROUP_ALLOC_SIZE in csrc/sim_task.c). Its one remaining bpf_cgroup_ancestor call asks for level 0, where the two copies agree. Any future caller that asks for a deeper level under lavd gets NULL although the host can answer.
+   - sim-4e4c0a (nested cgroup CPU-bw throttle not enforced) blames 'the bpf_cgroup_ancestor NULL stub (csrc/sim_bpf_stubs.c:323)' for parent_id=0. That path no longer exists upstream and the line reference is stale. Its symptom needs re-measuring at the new pin.
+   - The wrapper bodies inherit the __ksym section attribute and land in .ksyms. On their own they would leave it AX, as in the other five .so files. The same wrapper also defines two __ksym data objects, cpufreq_cpu_data and hw_pressure, and those make lavd's .ksyms WAX, which gives libscx_lavd.so an RWE LOAD segment (the lavd RWE-segment issue filed with this one).
+
+2. bpf_cpumask_test_cpu: csrc/sim_bpf_stubs.c compiles a strong definition into every scheduler .so, and the host has its own in scxtest/scx_test_cpumask.c. Under the full contract the .so's PLT reference binds to the host's copy (measured in the same LD_DEBUG run). The .so copy runs only when the host does not export the name.
+
+3. csrc/sim_bpf_stubs.c also compiles a weak NULL-returning bpf_cgroup_from_id and bpf_cgroup_ancestor into every .so. They run for any non-lavd scheduler whose host does not export the names.
+
+Fix: keep one implementation per kfunc, the host's. Delete lavd's wrapper copies, so lavd reaches kfuncs.rs through HOST_EXPORTS, and confirm lavd's fingerprints are unchanged (they should be, given the level-0-only use). Delete the sim_bpf_stubs.c duplicates together with the own_definition fallback removal.
+
+Found while preparing the crates.io release candidate (tg scxsim-cratesio-release-candidate)." "-l" "cratesio" "-l" "no-stub"
+<<BD_INVOKE>> 2026-09-25T03:43:12.589769527+00:00 "create" "sim_atq.c hand-ports upstream lib/atq with no differential test; decide its No-Stub status" "-p" "2" "-t" "task" "-d" "scx_simulator does not compile upstream lib/atq.bpf.c. It links csrc/sim_atq.c instead: a C port of the whole scx_atq_* API over a glibc-malloc array sorted by vtime. Upstream is an arena rbtree (rb_create(RB_NOALLOC, RB_DUPLICATE)) behind scx_alloc. lavd's compiled-in lib/cgroup_bw.bpf.c calls this API on every throttled-task path.
+
+The port is careful. It models SCX_ATQ_DEAD, the -EALREADY and -ECANCELED claim results, FIFO sequence keys and holdcnt. The No-Stub Rule still names 'BPF helper / library code that the scheduler calls into' and forbids interface-only reimplementations that approximate the BPF semantics. Whether a hand port of library code counts as substrate or as a reimplementation has not been decided in writing. Meanwhile it is kept in sync by hand: the pin bump to 413031d4 changed lib/atq.bpf.c, lib/rbtree.bpf.c and lib/sdt_task.bpf.c, and sim_atq.c was not touched. That was harmless for the port's logic but left its offset defaults stale (sim-6vhbq). No test compares the port with upstream, for example on ordering among equal vtimes or on FIFO behaviour after errors.
+
+Decide one of:
+(a) compile the real lib/atq.bpf.c and lib/rbtree.bpf.c into the host over the sim arena (sim-d9988 tracks full arena support), or
+(b) record an explicit exemption in scx-sim/CLAUDE.md and add a differential test that drives upstream atq.bpf.c (compiled as host C against the sim arena) and sim_atq.c with the same operation sequences and requires identical pop order and return codes.
+
+Found while preparing the crates.io release candidate (tg scxsim-cratesio-release-candidate)." "-l" "cratesio" "-l" "no-stub"
+<<BD_INVOKE>> 2026-09-25T03:43:12.592360018+00:00 "create" "rustdoc: scx_simulator's public docs have 20 errors (12 links to private items, 7 unresolved, 1 bad HTML tag) and no gate runs cargo doc" "-p" "2" "-t" "bug" "-d" "scx_simulator's public docs have 12 links to private items, 7 unresolved links and one unclosed HTML tag. Nothing in the gate runs rustdoc, so nothing catches them.
+
+Measured on the crates.io release-candidate branch (integration 24d864c6), from scx-sim/:
+
+    RUSTDOCFLAGS="-D warnings" cargo +1.97.1 doc --no-deps -p scx_simulator -p scxsim-build -p scx_perf -p scx_layered_alloc -p scx_layered_growth -p scxsim-workload-ir
+
+The other five publish crates document cleanly (the release-candidate branch fixed theirs). scx_simulator fails with 20 errors:
+
+Links from public docs to private items (rustdoc::private_intra_doc_links), 12. docs.rs documents public items only, so each of these points at a page that is never generated:
+- CgroupInfo, CgroupRegistry -> CgroupAlloc
+- destroy_by_name, free_raw -> free_cgroup_raw
+- xnuma_threshold, ForkPlacement -> crate::layered_xnuma
+- the e9patch module -> E9PatchBackend, E9PatchReplayBackend, crate::preempt::E9_SHARED_ADDR
+- E9PatchFns, E9_RIP_SHARED_ADDR -> crate::preempt::E9_SHARED_ADDR
+- E9RipShared -> crate::preempt::E9SharedRbc
+
+Unresolved links (rustdoc::broken_intra_doc_links), 7. These render as literal bracketed text:
+- crate::layered_config (safe/layered.rs)
+- LayerConfigOptions::from_probes (layered_config.rs)
+- dst (layered_xnuma.rs)
+- ScenarioBuilder and LayerMatch (unsafe_impl/ffi.rs)
+- LayeredProbes::lstat_id and LayeredProbes::gstat_id (layered_probes.rs)
+
+Invalid HTML (rustdoc::invalid_html_tags), 1. The prepare_css_iter doc in safe/cgroup.rs writes Arc<Mutex> outside backticks. A browser parses <Mutex> as an unknown element, so the word disappears from the rendered page.
+
+Neither validate.sh nor any workflow under .github/workflows runs cargo doc.
+
+Fix: fix the 20, then add the command above to validate.sh (and so to CI). Without the gate, the next docs.rs build is the first place a regression shows up.
+
+Found while preparing the crates.io release candidate (tg scxsim-cratesio-release-candidate)." "-l" "cratesio"
+<<BD_INVOKE>> 2026-09-25T03:43:12.595131081+00:00 "create" "The engine never consumes a running task's slice: all 128 of scx_tickless's set_slice preemptions are dropped and the run exits Normal" "-p" "1" "-t" "bug" "-d" "The engine does not consume a running task's slice, and does not re-arm slice expiry when a scheduler changes the slice mid-run. A task started with SCX_SLICE_INF therefore keeps its CPU until its phase ends, even after the scheduler has given it a finite slice precisely so that it can be preempted.
+
+In the kernel, task_tick_scx runs update_curr_scx, which subtracts the elapsed runtime from p->scx.slice unless it is SCX_SLICE_INF, calls ops.tick, and then reschedules whenever the slice is 0. Preemption follows the slice value, however the slice got there.
+
+The engine does two narrower things:
+- At run start (the run-start path that pushes SliceExpired), it pushes one SliceExpired at local_t + slice if the slice ends before the phase. It pushes nothing for SCX_SLICE_INF, whose value exceeds any phase.
+- In handle_tick it preempts only on a self-kick with SCX_KICK_PREEMPT, or when ops.tick itself moved the slice from non-zero to 0 (slice_zeroed = pre_tick_slice > 0 && post_tick_slice == 0). Nothing decrements the slice between ticks.
+
+A later write to p->scx.slice (scx_bpf_task_set_slice, or the compat fallback that stores the field directly) is invisible to both.
+
+Measured with scx_tickless at integration 24d864c6 (release-candidate scratch consumer, 4 CPUs, 3 SpinWait tasks and 3 burst/sleep tasks, 1 s). tickless enqueues with SCX_SLICE_INF. Its sched_timerfn, on finding a CPU whose current task has an infinite slice while tasks are queued, calls scx_bpf_task_set_slice(p, slice_ns) and counts it in nr_preemptions:
+- tickless's own counters: nr_preemptions = 128, nr_ticks = 997.
+- The engine's summary: total_preempts = 0, total_ticks = 997.
+- pid 1 (a spinner) was scheduled once and never descheduled in the whole run. Trace::total_runtime reports 0 for it, because the only interval is still open at the end. 5 of the 6 tasks were runnable at exit.
+
+So all 128 preemptions the scheduler asked for were dropped, and the run still exits Normal.
+
+cosmos, lavd, layered and mitosis also call scx_bpf_task_set_slice. Any call that shortens or extends a running task's slice is subject to the same gap. Not measured for those four.
+
+A related point, found by reading the code but not measured: handle_slice_expired deducts task.get_slice() (the slice value when the event fires) from run_remaining_ns, not the time since task_started_at. When the slice changed after the event was armed, the two differ.
+
+sim-5b567 (closed) covered the missing tick callback. This is the accounting that task_tick_scx does around the callback.
+
+Fix: model update_curr_scx. At each tick, and at any point where the engine stops the task, subtract the elapsed runtime from p->scx.slice unless it is SCX_SLICE_INF. After ops.tick, preempt if the slice is 0. Either re-arm SliceExpired from the live slice after every callback that can write it, or drop the pre-armed event and let the tick decide, as the kernel does. Then re-measure tickless's preempt count and every scheduler's fingerprints, which will move.
+
+Found while preparing the crates.io release candidate (tg scxsim-cratesio-release-candidate)." "-l" "cratesio"
+<<BD_INVOKE>> 2026-09-25T03:43:12.598032781+00:00 "create" "libscx_lavd.so has an RWE LOAD segment (two __ksym data definitions make .ksyms WAX), so an MDWE process cannot load it" "-p" "2" "-t" "bug" "-d" "libscx_lavd.so has a writable and executable (RWE) LOAD segment. A process that forbids W+X mappings cannot load it: under prctl(PR_SET_MDWE, PR_MDWE_REFUSE_EXEC_GAIN), which is the mechanism behind systemd's MemoryDenyWriteExecute=yes, dlopen fails with 'failed to map segment from shared object'. The other five bundled .so files have the usual RE / R / RW layout and load there.
+
+Measured at integration 24d864c6 with the release-candidate scratch consumer (full link contract), run under a small wrapper that sets PR_SET_MDWE and then execs it:
+- lavd: load error, 'libscx_lavd.so: failed to map segment from shared object'.
+- simple: loads, exits Normal, fingerprint identical to the run without MDWE.
+
+readelf -lW libscx_lavd.so shows the third LOAD segment as RWE, holding .data.rel.ro .dynamic .got .got.plt .data .ksyms .maps license .bss.
+
+Cause: .ksyms. lavd's sources declare cpufreq_cpu_data and hw_pressure as __ksym externs, and schedulers/lavd/wrapper.c defines them (a struct cpufreq_policy pointer and an unsigned long). A definition inherits the section attribute of the visible declaration, so both land in .ksyms. The same section already holds code, because function definitions of other __ksym names land there too: bpf_cgroup_ancestor and bpf_cgroup_from_id from lavd's wrapper, and the weak bpf_iter_scx_dsq_* bodies present in all six. In the other five .so files .ksyms holds only functions and is AX, so it goes into the RE segment. In lavd the two data objects make it WAX, the linker places it with the writable data, and that whole segment becomes executable. As a result lavd's .data and .bss are executable in every process that loads it.
+
+binutils 2.39 and later warn about an RWX LOAD segment by default. This host links with 2.35.2, so the build is silent here, but a consumer on a newer toolchain will see the warning.
+
+Fix, either of:
+- Define the two objects in a translation unit that does not see their __ksym declarations. They are data the sim provides, not kfuncs.
+- For the sim build, redefine __ksym to nothing after bpf_helpers.h, so no definition inherits the attribute. That also takes the function bodies out of .ksyms, and the duplicate-kfunc cleanup (sim-mlv09) removes lavd's two wrapper functions anyway.
+
+And add a build check that fails on any LOAD segment with both W and X, for example in tests/symbol_export.rs or in scxsim-build right after the link step, so the next such object cannot ship.
+
+Found while preparing the crates.io release candidate (tg scxsim-cratesio-release-candidate)." "-l" "cratesio"
+<<BD_INVOKE>> 2026-09-25T03:43:12.601144929+00:00 "update" "sim-mlv09" "-d" "Some kfuncs have more than one definition in a process. Which body runs is decided by ELF symbol binding, or by clang inlining at compile time, and not by any code that says which one is meant.
+
+1. bpf_cgroup_from_id and bpf_cgroup_ancestor for lavd. schedulers/lavd/wrapper.c defines both as strong functions in the same translation unit as lavd's main.bpf.c and lib/cgroup_bw.bpf.c. clang inlines them into their callers: accounting_timerfn, replenish_timerfn, scx_cgroup_bw_dump and others call sim_get_root_cgroup / sim_cgroup_lookup_by_id directly, and libscx_lavd.so has no relocation against either name. So the host's exported versions in unsafe_impl/kfuncs.rs never run for lavd, whatever the link flags. LD_DEBUG=bindings on the release-candidate consumer (integration 24d864c6, full link contract) shows 38 HOST_EXPORTS names bound from libscx_lavd.so to the executable, and neither cgroup name is among them.
+   - The from_id pair agrees: both delegate to sim_cgroup_lookup_by_id.
+   - The ancestor pair does not. lavd's copy models a flat hierarchy (the root at level 0, NULL at every other level). The host's calls sim_cgroup_lookup_ancestor for any level.
+   - At pin 413031d4 the divergence is latent. lib/cgroup_bw.bpf.c's parent walk now reads cgrp->ancestors[] through cbw_cgroup_ancestor (BPF_CORE_READ, and the sim populates that array; see SIM_CGROUP_ALLOC_SIZE in csrc/sim_task.c). Its one remaining bpf_cgroup_ancestor call asks for level 0, where the two copies agree. Any future caller that asks for a deeper level under lavd gets NULL although the host can answer.
+   - sim-4e4c0a (nested cgroup CPU-bw throttle not enforced) blames 'the bpf_cgroup_ancestor NULL stub (csrc/sim_bpf_stubs.c:323)' for parent_id=0. That path no longer exists upstream and the line reference is stale. Its symptom needs re-measuring at the new pin.
+   - The wrapper bodies inherit the __ksym section attribute and land in .ksyms. On their own they would leave it AX, as in the other five .so files. The same wrapper also defines two __ksym data objects, cpufreq_cpu_data and hw_pressure, and those make lavd's .ksyms WAX, which gives libscx_lavd.so an RWE LOAD segment (sim-c7eca).
+
+2. bpf_cpumask_test_cpu: csrc/sim_bpf_stubs.c compiles a strong definition into every scheduler .so, and the host has its own in scxtest/scx_test_cpumask.c. Under the full contract the .so's PLT reference binds to the host's copy (measured in the same LD_DEBUG run). The .so copy runs only when the host does not export the name.
+
+3. csrc/sim_bpf_stubs.c also compiles a weak NULL-returning bpf_cgroup_from_id and bpf_cgroup_ancestor into every .so. They run for any non-lavd scheduler whose host does not export the names.
+
+Fix: keep one implementation per kfunc, the host's. Delete lavd's wrapper copies, so lavd reaches kfuncs.rs through HOST_EXPORTS, and confirm lavd's fingerprints are unchanged (they should be, given the level-0-only use). Delete the sim_bpf_stubs.c duplicates together with the own_definition fallback removal.
+
+Found while preparing the crates.io release candidate (tg scxsim-cratesio-release-candidate)."
+<<BD_INVOKE>> 2026-09-25T03:43:12.604034862+00:00 "create" "Simulator::run prints an end-of-run report to stdout on every run, with no way for a library caller to turn it off" "-p" "2" "-t" "bug" "-d" "Simulator::run prints an end-of-run report to stdout on every run, with no way for a library caller to turn it off. For an in-process consumer such as ktstr, this is library output mixed into the embedder's own stdout.
+
+The run path ends by calling print_simulation_summary, then preempt::print_structop_summary, then print_preemption_stats (safe/engine.rs). All three use println!. print_simulation_summary is also called on the init_task failure path. In the release-candidate scratch consumer at integration 24d864c6, a 1 s, 4-CPU tickless run wrote 17 lines to stdout before the consumer's own output:
+- 'Simulation complete:' and five stat lines.
+- 'Sched_ext structop summary:', a table header, and one row per CPU plus a total row, so the report grows with the CPU count.
+
+print_preemption_stats adds four more lines when RBC preemption is active. stderr was empty. The consumer had to put its machine-readable result on the last line of stdout so that it could be found after the report.
+
+The information is useful, but it belongs to the CLI. The scxsim binary can keep printing it, while the library returns it.
+
+Fix: move the three calls out of Simulator::run into the CLI (src/bin/scxsim). Trace::summary() already carries part of the data. Add the rest to Trace (the per-CPU structop and kfunc counts, and the preemption stats). If the library still wants a log line, emit it at tracing debug level.
+
+Found while preparing the crates.io release candidate (tg scxsim-cratesio-release-candidate)." "-l" "cratesio"
+<<BD_INVOKE>> 2026-09-25T03:43:12.606810162+00:00 "create" "scx_simulator's build script emits 6 C warnings; two come from headers that disagree about a macro, so include order picks the value" "-p" "3" "-t" "task" "-d" "Building scx_simulator gives 6 compiler warnings from its build script: 3 distinct warnings, each in csrc/sim_task.c and csrc/sim_cgroup.c. Cargo shows them as 52 'warning: scx_simulator@1.0.0:' lines. Two of the three are headers that disagree about a macro, so the value in effect depends on include order.
+
+- __builtin_preserve_field_info: scxtest/overrides.h defines it as 1 (fields exist), and csrc/sim_wrapper.h redefines it as 0 (fields absent, with a comment explaining why 0 is intended). In these two TUs sim_wrapper.h comes last, so the value is 0. Any TU that includes them in the other order gets 1, and bpf_core_field_exists() then answers the opposite way.
+- __kconfig: sim_wrapper.h #undefs it and defines it empty. Its comment says weak __kconfig declarations in the .kconfig section resolve to address 0 in a -nostdlib .so and SIGSEGV. sim_wrapper.h then includes scx/common.bpf.h, and libbpf's bpf_helpers.h redefines __kconfig as __attribute__((section(".kconfig"))). So after that include the override is gone for the rest of the TU.
+- -Wsign-compare in upstream scx/cid.bpf.h (bpf_arena_for(cpu, 0, nr_cpu_ids), s32 vs u32). This is vendored upstream code.
+
+No behavioural effect today, as far as measured: neither sim_task.c nor sim_cgroup.c uses bpf_core_field_exists, bpf_core_type_exists, __kconfig or a CONFIG_ symbol, and neither object, nor any of the six bundled .so files, has a .kconfig section. Scheduler TUs built by scxsim-build were not checked for the same redefinitions, because its compiler output is not shown on success.
+
+After publishing, crates.io consumers will not see these: cargo shows build-script warnings only for path dependencies, unless the build fails.
+
+Fix: decide the one intended value of each macro and state it in one header, with #undef before the #define so the order cannot flip it. Re-assert __kconfig after the common.bpf.h include, or make sure nothing after it relies on the empty form. Silence -Wsign-compare for vendored headers, or fix it upstream.
+
+Found while preparing the crates.io release candidate (tg scxsim-cratesio-release-candidate)." "-l" "cratesio"
+<<BD_INVOKE>> 2026-09-25T03:43:12.609484599+00:00 "create" "scx_simulator turns libbpf-sys's vendored-libbpf and static-libbpf features back on for every embedder, including ktstr's docs.rs build" "-p" "2" "-t" "bug" "-d" "scx_simulator depends on libbpf-sys with default features, and uses it only for headers. Feature unification therefore turns libbpf-sys's vendored-libbpf and static-libbpf features back on for every embedder, including one that has deliberately turned them off.
+
+scx_simulator/Cargo.toml has libbpf-sys = "1.6.1", default features on. Its comment says the headers are the only use: build.rs compiles the scheduler C against them, and no libbpf_sys symbol is referenced. It also says why the default features stay on: without vendored-libbpf, DEP_BPF_INCLUDE names a directory that libbpf-sys never fills.
+
+ktstr sets libbpf-sys = { version = "1.6", default-features = false }, and its [package.metadata.docs.rs] builds with no-default-features. Its Cargo.toml comments explain that docs.rs cannot compile the vendored libbpf C stack (no flex/bison, no network). The release-candidate scratch consumer copies that setup. At integration 24d864c6, cargo tree -e features -i libbpf-sys on it shows:
+
+    libbpf-sys feature "default"
+    └── scx_simulator v1.0.0
+    libbpf-sys feature "static-libbpf"
+    └── libbpf-sys feature "vendored-libbpf"
+        └── libbpf-sys feature "default" (*)
+
+So once ktstr depends on scx_simulator, ktstr's docs.rs build compiles vendored libbpf again. Not measured on docs.rs itself. The same applies to any build of ktstr with default features off. scxsim-workload-ir's ingest feature depends on scx_simulator, so it carries the same effect.
+
+Fix, one of:
+- Vendor the handful of libbpf headers the build uses (bpf_helpers.h and the headers it includes, LGPL-2.1 OR BSD-2-Clause) into scx_simulator and drop the libbpf-sys dependency. This also removes the links = "bpf" one-version constraint that the Cargo.toml comment works around.
+- Or keep libbpf-sys but find the headers without vendored-libbpf (for example from the libbpf-sys source directory), so the dependency can be default-features = false.
+
+Either way, an embedder can then keep its own libbpf-sys feature choice. Until then the release notes should say that depending on scx_simulator enables vendored libbpf, and that an embedder with a docs.rs setup like ktstr's must make the dependency optional and leave it out of the docs.rs feature set.
+
+Found while preparing the crates.io release candidate (tg scxsim-cratesio-release-candidate)." "-l" "cratesio"
+<<BD_INVOKE>> 2026-09-25T03:43:12.611824231+00:00 "create" "KernelConfig::hz changes HZ for scx_tickless alone; the engine tick, jiffies and scx_layered stay at 250" "-p" "2" "-t" "bug" "-d" "scxsim_build::KernelConfig::hz changes HZ for scx_tickless alone, and only when tickless's tick_freq is 0. The engine tick, bpf_jiffies64() and scx_layered stay at 250 Hz. An embedder who follows the doc and passes the kernel under test's HZ gets a model in which parts of one run disagree about HZ.
+
+- hz emits -DSIM_CONFIG_HZ. The only consumer is schedulers/tickless/wrapper.c (unsigned int CONFIG_HZ = SIM_CONFIG_HZ), read by tickless's tick_interval_ns() as the fallback when tick_freq is 0 ('tick_freq ? : CONFIG_HZ'). The bundled tickless manifest sets tick_freq = 250.
+- The engine ticks every engine::TICK_INTERVAL_NS = 4 ms. unsafe_impl/kfuncs.rs derives CONFIG_HZ = 1e9 / TICK_INTERVAL_NS = 250 from it, and bpf_jiffies64() and the jiffies conversions divide by that.
+- schedulers/layered/wrapper.c hardcodes CONFIG_HZ = 250. Its comment says it must match TICK_INTERVAL_NS, because otherwise layered's antistall delay accounting silently drifts. KernelConfig::hz does not reach it.
+
+KernelConfig's doc does call hz 'the tickless fallback, reachable only when tick_freq is 0'. It then concludes that 'an embedder supplying the kernel-under-test's values is correct even where the consumer is presently shadowed'. For hz that conclusion does not hold. With hz = 1000 and tick_freq = 0, tickless arms its timer every 1 ms, while the engine's tick and jiffies still run at 250 Hz.
+
+This matters for the release because KernelConfig is a public struct in a crate about to be published. Removing or changing the meaning of a public field later is a breaking change.
+
+Fix, one of, before publishing:
+- Make hz whole-sim: drive TICK_INTERVAL_NS, the host CONFIG_HZ and layered's CONFIG_HZ from the same value.
+- Or remove hz from the public KernelConfig and keep 250 fixed until that exists.
+
+In both cases, correct the doc sentence.
+
+Found while preparing the crates.io release candidate (tg scxsim-cratesio-release-candidate)." "-l" "cratesio"
+<<BD_INVOKE>> 2026-09-25T03:43:12.614163022+00:00 "create" "Packaged crates carry repo-local references (87 tg refs, sim-IDs, experiments/ paths), repo-bound CLI help, and four copies of the vendored lib/ tree" "-p" "3" "-t" "task" "-d" "The six crates' own files carry references that only resolve inside this repo or on this machine. The published scxsim binary has help text and one mode that assume the repo layout. Two unit tests read files outside the package, and the vendored scx lib/ tree ships four times. Nothing found is secret. All of it is what an external reader of the published crates would trip over.
+
+Measured on the .crate files packaged from the release-candidate branch (integration 24d864c6), extracted, with vendor/ excluded unless stated:
+
+1. Dangling references.
+   - 87 references to tg tasks, naming 21 distinct tasks, all in scx_simulator, across 16 files. The most are in safe/trace.rs (16), safe/perfetto_pb.rs (14), unsafe_impl/ffi.rs (9), schedulers/lavd/wrapper.c (9) and safe/engine.rs (8). tg is machine-local, so no external reader can resolve any of them.
+   - 62 sim-IDs, 24 distinct, 12 of them closed: scx_simulator 51, scxsim-workload-ir 6, scxsim-build 2, and one each in scx_perf, scx_layered_alloc and scx_layered_growth. They resolve in scx-sim/.beads on the public mirror, but nothing in the crate says so.
+   - 17 experiments/ paths, 11 distinct. Nine exist in the public harness repo (rrnewton/dev-sched-test). experiments/bin_cache/ and experiments/lavd_cpubw_stalls_202604/scxsim_stress_runs/errors/ exist nowhere.
+   - 14 ai_docs/ paths, 8 distinct. Seven are under scx-sim/ai_docs/ on the mirror. The eighth, cited in safe/starvation.rs, is only in the harness repo's ai_docs/.
+
+2. The scxsim binary. It has no required-features, so cargo install scx_simulator builds it.
+   - scxsim run --help prints three experiments/ paths: the --trace-format help cites the wprof baseline report, and the --scheduler-file help cites experiments/bin_cache/<sha>/ and the bug1 version-matrix README. clap takes both texts from doc comments in bin/scxsim/main.rs.
+   - RIP-targeted replay cannot work from a registry build. find_e9tool, find_rbc_trampoline and find_rip_trampoline (unsafe_impl/backend/e9patch.rs) look under the grandparent of env!("CARGO_MANIFEST_DIR"), which for a registry build is $CARGO_HOME/registry/src. e9tool falls back to $PATH. The two trampolines have no fallback. The error then says 'Build with: make -C schedulers e9', but no schedulers/Makefile is packaged. Only the CLI reaches this path (bin/scxsim/main.rs calls create_e9rip_so), and the library path an embedder uses does not.
+   - sim-ybrh9 already covers the compile-time SCHEDULER_SO_DIR that the same binary bakes in.
+
+3. Two unit tests in safe/layered_control.rs read files that are not in the package, all relative to env!("CARGO_MANIFEST_DIR"):
+   - upstream_growth_cannot_gain_unreviewed_host_sys_access reads ../../../scx/scheds/rust/scx_layered/src/layer_core_growth.rs and ../scx_layered_growth/src/lib.rs.
+   - flat_target_formulae_have_not_drifted_upstream reads ../../../scx/scheds/rust/scx_layered/src/main.rs.
+   Both panic with 'cannot read ...' when the file is missing. So a distro packager or crater running cargo test on the published crate gets two failures that say nothing about the code. This is from reading the code; the tests were not run from the extracted crate.
+
+4. The vendored lib/ tree ships four times. Upstream's scheds/rust/scx_{cosmos,lavd,layered}/src/bpf/lib are symlinks to the top-level lib/, and cargo package stores each one as a full copy. So scx_simulator carries its 23 lib files four times: 69 extra entries and 987,699 extra bytes uncompressed. The three copies gzip to 265,555 bytes on their own, about 13% of the 2,036,244-byte .crate.
+
+5. Two phrases an external reader may ask about. This is the owner's call, since neither is secret. scxtest/kern_types.h cites 'the CONFIG_NR_CPUS=512 of the fbk kernel', and schedulers/lavd/wrapper.c says '(devserver toolchains)'. A case-insensitive search of own files found only these two. It searched for: fbk, devserver, devvm, fbcode, fbsource, internalfb, facebook.com, @meta.com, @fb.com, tupperware, scuba, buck, phabricator, D- and T-numbers, and facebookexperimental. The search found two other hits, both public: David Vernet's upstream copyright line (dvernet@meta.com) in schedulers/simple/scx_simple.bpf.c, and a link to the public facebookexperimental/hermit repo.
+
+Fix, most valuable first:
+- Replace the tg references with a commit or a public doc where the provenance matters, and drop them where it does not.
+- Make the two --help texts and the e9 error self-contained.
+- Move the two layered_control guards into tests/, which the package's include list already leaves out, so they keep guarding in the repo.
+- Stop shipping the three lib/ copies: resolve lib/ through the one vendored copy, and check that the six fingerprints do not move.
+- Decide the two phrases in item 5.
+Every crate's repository field already points at rrnewton/sched-test, so commit-pinned mirror URLs are the natural replacement for the sim-IDs and the ai_docs/ paths.
+
+Found while preparing the crates.io release candidate (tg scxsim-cratesio-release-candidate)." "-l" "cratesio"
+<<BD_INVOKE>> 2026-09-25T03:43:12.616927466+00:00 "create" "Licensing: scx_simulator's license field lacks the (LGPL-2.1-only OR BSD-2-Clause) term, and scxtest/ is unmarked GPL-2.0-derived code" "-p" "2" "-t" "bug" "-d" "scx_simulator's license field does not cover two upstream headers it ships. Its scxtest/ directory is GPL-2.0 code derived from upstream scx and says so nowhere. The other five crates' fields match the SPDX lines and LICENSE files they ship.
+
+The license fields, as packaged from the release-candidate branch (integration 24d864c6):
+- scx_simulator, scx_layered_alloc, scx_layered_growth: BSD-3-Clause AND GPL-2.0-only. alloc and growth ship upstream's alloc.rs and layer_core_growth.rs under vendor/, with upstream's GPL-2.0 LICENSE beside them.
+- scx_perf: BSD-3-Clause AND BSD-2-Clause, with LICENSE-REVERIE. The Cargo.toml comment says BSD-2-Clause covers the code taken from Reverie and BSD-3-Clause covers this repo's changes to it.
+- scxsim-build, scxsim-workload-ir: BSD-3-Clause.
+
+1. The SPDX lines in scx_simulator's 272 packaged .c/.h/.rs files: 105 GPL-2.0, 4 (GPL-2.0-only OR BSD-2-Clause), 2 (LGPL-2.1 OR BSD-2-Clause), and 161 with no SPDX line. The two dual-licensed headers are vendor/scx/scheds/include/lib/alloc/bpf_helpers_local.h and vendor/scx/scheds/include/scx/task_local_data.bpf.h. Neither of their options is in the expression. bpf_helpers_local.h is also compiled in, because lib/sdt_task.bpf.c, lib/sdt_alloc.bpf.c and lib/sdt_cgroup.bpf.c include it. The four (GPL-2.0-only OR BSD-2-Clause) arena headers are already covered by the GPL-2.0-only term.
+
+2. scxtest/ holds 9 files derived from upstream scx lib/scxtest, which upstream deleted at 54e1ea429 (2026-06-04, 'Remove scxtest BPF unit testing infrastructure'). scx_test.c and scx_test.h are identical to upstream's last version. The other seven have been extended here, for example overrides.c from 185 to 306 lines and scx_test_map.c from 288 to 575. The code is compiled in: scx_simulator's build.rs compiles scx_test.c, scx_test_map.c and scx_test_cpumask.c, and scxsim-build compiles overrides.c into every scheduler .so.
+   - Upstream's copies had no SPDX line and fell under the scx repo's GPL-2.0 LICENSE. Ours have no SPDX line, no copyright notice and no note of their origin.
+   - They sit outside vendor/, so the only licence text beside them is the crate's BSD-3-Clause LICENSE.
+   - The package expression includes GPL-2.0-only, so it is not wrong. But a reader cannot tell which files the GPL term covers. sim-cxpef leaves open whether scxtest is in scope for its header sweep. For a published crate it has to be.
+
+3. scx_perf's src/lib.rs has no copyright or licence header, while LICENSE-REVERIE opens with Reverie's own sentence 'Copyright notices are include in each source file'. Nothing else about scx_perf's licensing looks wrong. Whether to relicense the Reverie-derived code is not raised here.
+
+Fix before publishing:
+- Add the missing term to scx_simulator's field, e.g. 'BSD-3-Clause AND GPL-2.0-only AND (LGPL-2.1-only OR BSD-2-Clause)'. LGPL-2.1 is the deprecated SPDX spelling of LGPL-2.1-only.
+- Give each scxtest/ file an SPDX line (GPL-2.0-only) and a one-line origin note naming upstream lib/scxtest at 54e1ea429^. Or move the directory under vendor/, next to upstream's LICENSE.
+- Give scx_perf's src/lib.rs a header naming its Reverie origin.
+
+Found while preparing the crates.io release candidate (tg scxsim-cratesio-release-candidate)." "-l" "cratesio"
+<<BD_INVOKE>> 2026-09-25T03:43:12.619988847+00:00 "create" "Unsound safe public API: free_raw, task_get_utime/stime and scx_bpf_task_cgroup crash a #![forbid(unsafe_code)] caller" "-p" "1" "-t" "bug" "-d" "Four functions reachable from scx_simulator's crate root take a raw pointer and dereference or free it, and none of them is an `unsafe fn`. A safe Rust function must not cause undefined behaviour for any argument. A consumer file under `#![forbid(unsafe_code)]` crashes the process five ways through them.
+
+Measured on the release-candidate branch (integration 24d864c6) with Rust 1.97.1, built against the extracted .crate files:
+
+| call (no `unsafe` anywhere in the caller) | result |
+|---|---|
+| `reg.free_raw(reg.root_raw())` | SIGABRT, `free(): invalid pointer` |
+| `reg.free_raw(reg.get_raw(id).unwrap())`, then `reg` drops | SIGABRT, `free(): double free detected in tcache 2` |
+| `reg.destroy_by_name("a")`, then `free_raw` on the result twice | SIGABRT, `free(): double free detected in tcache 2` |
+| `task_get_utime(std::ptr::null_mut())` | SIGSEGV |
+| `scx_bpf_task_cgroup(std::ptr::dangling_mut(), 0)` | SIGSEGV |
+
+The shortest reproducer uses only values the API hands out:
+
+```rust
+#![forbid(unsafe_code)]
+fn main() {
+    let reg = scx_simulator::CgroupRegistry::new(4, 16);
+    reg.free_raw(reg.root_raw()); // free(): invalid pointer, SIGABRT
+}
+```
+
+The four functions:
+1. `CgroupRegistry::free_raw(&self, raw: *mut c_void)`. It calls `free_cgroup_raw`, which calls the C `sim_cgroup_free`. That frees `cgrp->kn`, the task_group, the cpuset if there is one, and `cgrp`. The doc comment states a precondition, 'Must only be called with a pointer returned from `destroy_by_name`, and only after `cgroup_exit` has been called for that cgroup', and nothing enforces it. `root_raw()` and `get_raw()` on the same type hand out pointers that break it. The root cgroup, its kernfs node and its task_group are C statics (`sim_root_cgroup`, `sim_root_kn`, `sim_root_task_group` in csrc/sim_task.c), so the first row passes static storage to `free()`.
+2. `task_get_utime` and `task_get_stime`. Each body is `unsafe { sim_task_get_utime(raw) }` (or the stime equivalent), and the C side is `return p->utime;`.
+3. `scx_bpf_task_cgroup(p, subsys_id)`, a `#[no_mangle] pub extern "C"` kfunc. It returns NULL for a NULL `p` and dereferences any other value through `sim_task_get_cgroup`.
+
+The crate's own reasoning holds only for callers inside the crate:
+- The block comment above ffi.rs's safe wrappers says they suppress `clippy::not_unsafe_ptr_arg_deref` because they are 'intentionally safe wrappers', and that 'the engine guarantees that all raw pointers passed to these functions point to valid, live C structs'.
+- kfuncs.rs allows the same lint for the whole module because its callers are C code and 'marking them `unsafe` in Rust would be meaningless'.
+- Both arguments are true while the engine and the BPF code are the only callers. Three root re-exports add Rust callers outside the crate: `pub use ffi::{task_get_stime, task_get_utime}`, `pub use unsafe_impl::kfuncs::scx_bpf_task_cgroup`, and `CgroupRegistry` itself with its pub `free_raw`. For those callers, neither argument holds.
+- The crate has 25 per-function allows plus kfuncs.rs's module-wide one. Three of the 25 are on the reachable paths: task_get_utime, task_get_stime, and free_cgroup_raw under free_raw. The other 22 (18 in ffi.rs, 3 in task_wrapper.rs, 1 in scheduler_wrapper.rs) sit in the pub(crate) `safe` and `unsafe_impl` modules and are not reachable from outside. The public `Scheduler` trait already declares its pointer-taking callbacks, such as select_cpu, enqueue, dispatch, running and stopping, as `unsafe fn`, so the crate follows the right pattern where it thought about external callers.
+
+In-repo callers of the three root re-exports: tests/cputime_accounting.rs (task_get_utime, task_get_stime) and the NULL-contract case in tests/scx_bpf_helpers.rs (scx_bpf_task_cgroup). `free_raw`'s only caller is engine.rs.
+
+Fix before publishing. After publication every one of these is a breaking change.
+- `free_raw`: make it pub(crate), since its only caller is the engine, or make it `unsafe fn` with a `# Safety` section. The clean end state is for `destroy_by_name` to return an owning handle that frees on drop. Most of that RAII work is already done: `CgroupInfo` holds a private `CgroupAlloc`, whose `Owned` variant is a `SimCgroupHandle` that frees in `Drop`. `destroy_by_name` is where ownership leaks back out, because it calls `into_raw()` so the engine can run `cgroup_exit` before the free. Returning the `SimCgroupHandle` instead, with a `raw()` accessor for the `cgroup_exit` call, closes the last gap and removes the need for `free_raw`.
+- `task_get_utime`, `task_get_stime`: declare them `pub unsafe fn`, and the one test gains an `unsafe` block. Or drop the root re-export.
+- `scx_bpf_task_cgroup`: declare it `pub unsafe extern "C" fn`, or drop the root re-export. BPF code binds the symbol by name, so C callers are unaffected. The NULL-contract test gains an `unsafe` block.
+- Drop the allows from the functions that stay reachable, and replace kfuncs.rs's module-wide allow with per-function ones. clippy can then flag the next pointer-taking wrapper that gets re-exported.
+
+sim-0qpv9 is the same class of defect one level up: `SIM_LOCK` is a precondition of the safe `DynamicScheduler`/`Simulator` API that only a doc comment states, and breaking it corrupts the heap from code with no `unsafe` in it.
+
+Found while preparing the crates.io release candidate (tg scxsim-cratesio-release-candidate)." "-l" "cratesio"
+<<BD_INVOKE>> 2026-09-25T03:43:12.622534199+00:00 "create" "The simulated CSS iterator silently drops cgroups beyond 2048, while a scenario may create 10000" "-p" "2" "-t" "bug" "-d" "A scenario may create up to 10000 cgroups, but the simulated CSS iterator holds 2048 and silently drops the rest. A BPF scheduler that walks the hierarchy with `bpf_for_each(css, ...)` then never sees the dropped cgroups. Nothing reports it.
+
+From reading the code on the release-candidate branch (integration 24d864c6). This was not run.
+
+- `Scenario` defaults `max_cgroups` to `DEFAULT_MAX_CGROUPS`, which is 10000 (safe/cgroup.rs). The engine passes it to `CgroupRegistry::new`, so a scenario with more than 2048 cgroups is accepted.
+- Before each walk, the engine calls `CgroupRegistry::prepare_css_iter_from_root`. That collects every descendant in pre-order and post-order and hands both lists to the C side.
+- csrc/sim_cgroup.c keeps those lists in two static arrays of `MAX_CSS_ITER_CGROUPS` (2048) entries. `sim_css_iter_add` and `sim_css_iter_add_post` store an entry only while the count is under 2048. Beyond that they return without storing anything, and there is no error path.
+- The doc comment on the pub `prepare_css_iter` already says cgroups beyond that capacity 'are silently dropped' and suggests bumping the constant.
+- Upstream's lib/cgroup_bw.bpf.c caps its own managed set at `CBW_NR_CGRP_MAX` = 2048, so schedulers built on cgroup_bw hit their own limit at the same point. Schedulers that walk css without cgroup_bw have no such cap, so the simulator drops cgroups the real kernel would visit.
+
+For an external consumer the result is silently wrong: the run ends normally, and the scheduler walked a truncated tree.
+
+Fix: either refuse a scenario whose cgroup count exceeds the iterator capacity, at `Scenario` build time or in `CgroupRegistry::create`, or size the arrays from the registry's `max_cgroups`. Add a test that creates 2049 cgroups and checks that a css walk visits all of them, or that the scenario is refused.
+
+Found while preparing the crates.io release candidate (tg scxsim-cratesio-release-candidate)." "-l" "cratesio"
+<<BD_INVOKE>> 2026-09-25T03:43:12.625341778+00:00 "create" "crates.io publish: owner decisions (scx_ prefix names, 1.0.0 vs 0.1.0, public surface, licence, what blocks the first publish)" "-p" "1" "-t" "task" "-d" "The crates.io release candidate (branch feat/scxsim-cratesio-release-candidate) leaves five decisions to the owner. The release write-up is scx-sim/ai_docs/SCXSIM_CRATESIO_RELEASE_CANDIDATE_20260924.md. Treat a publish as permanent: a published version can be yanked, but yanking does not free the name and the version number cannot be reused.
+
+1. Names, and the scx_ prefix.
+   - All six names are unregistered in both spellings (crates.io sparse index 404 for each, 200 for the controls scx_utils, libbpf-rs and scx_rustland_core; checked 2026-09-25T03:38Z).
+   - A crates.io search for 'scx' returns 75 crates, 32 of them starting scx_ or scx-. Nine declare repository github.com/sched-ext/scx. 21 declare none, among them upstream's scheduler crates scx_layered, scx_lavd, scx_cosmos, scx_tickless and scx_bpfland. Two declare btraven00/scx. scx_utils is owned by htejun, ByteLab-David, davemarchevsky, arighi, likewhatevs, JakeHillion and rrnewton. scx_bpfland, scx_cosmos, scx_cake and scx_arena each list htejun, arighi and rrnewton among their owners.
+   - So scx_simulator, scx_perf, scx_layered_alloc and scx_layered_growth would be published from rrnewton/sched-test into a namespace sched-ext's maintainers publish in. scx_layered_alloc and scx_layered_growth would sit beside upstream's scx_layered and read as parts of it. They are adapters that compile upstream scx_layered's alloc.rs and layer_core_growth.rs. scx_perf reads as a sched-ext crate, and it is a PMU branch counter derived from Reverie.
+   - Options: (a) keep the scx_ names with the sched-ext co-owners' agreement; (b) use the scxsim- prefix that scxsim-build and scxsim-workload-ir already use. Under (b), `[lib] name = "scx_simulator"` keeps every `use scx_simulator::...` path working.
+   - Recommendation: (b) for scx_perf, scx_layered_alloc and scx_layered_growth. Only scx_simulator depends on them, so the rename costs nothing. Settle scx_simulator's own name with the co-owners.
+
+2. scx_simulator 1.0.0 or 0.1.0. The task asked for 1.0.0 and the branch carries it. Recommendation: 0.1.0, like the other five.
+   - sim-c8949e ('1.0 Release Candidate validation', P0) is still open with 22 unchecked items.
+   - The fixes for several release-candidate findings change the public API or its behaviour: sim-4xdj4 (safe functions become `unsafe fn` or lose their re-export), sim-cp5c0 (a public KernelConfig field), sim-0qpv9 (the library takes SIM_LOCK or refuses a second load), sim-yrtox (the stdout report leaves Simulator::run), sim-dneoq (libbpf-sys features). Under 1.0.0 each of those is a 2.0.0. Under 0.1.0 they go into 0.2.0 without breaking a stability promise.
+
+3. The size of the public surface. The crate root re-exports 162 names, besides the 25-name `prelude` that the embed contract documents. Whatever is public at the first release is what semver then protects. Two root re-exports, `unified_alloc` and `LayerDemand`, are items of upstream scx_layered's alloc.rs, compiled by scx_layered_alloc, so an upstream change to them becomes a breaking change of scx_simulator. Recommendation: before publishing, reduce the root to the prelude plus what an embedder needs, and make the rest pub(crate) or put it in a module documented as unstable.
+
+4. Licensing. scx_simulator's expression is a conjunction that includes GPL-2.0-only, so any program that links it takes on GPL-2.0-only for the combined work. ktstr is GPL-2.0-only, so ktstr is compatible. A consumer that must ship its binaries under permissive-only terms cannot depend on it. sim-kqri1 lists the gaps to fix first: a missing (LGPL-2.1-only OR BSD-2-Clause) term, and scxtest/ files with no SPDX line or origin note.
+
+5. What must be fixed before the first publish. Recommendation:
+   - Unsound or silently wrong for an in-process consumer: sim-4xdj4, sim-0qpv9, sim-3geoh, sim-kuhrw, sim-6vhbq, sim-4b77c, sim-ld1ro.
+   - Breaking to change after publication: sim-cp5c0, sim-yrtox, sim-dneoq, sim-jnh26, sim-fmijm, and item 3 above.
+   - Licensing: sim-kqri1.
+   - Everything else filed under the cratesio label can follow a release. Two phrases need a yes or no: 'the fbk kernel' in scxtest/kern_types.h and '(devserver toolchains)' in schedulers/lavd/wrapper.c. Neither is secret. See sim-yc6z3, item 5.
+
+Found while preparing the crates.io release candidate (tg scxsim-cratesio-release-candidate)." "-l" "cratesio"
+<<BD_INVOKE>> 2026-09-25T03:43:21.123374752+00:00 "show" "sim-mlv09"
+<<BD_INVOKE>> 2026-09-25T03:43:21.134415800+00:00 "show" "sim-c7eca"
+<<BD_INVOKE>> 2026-09-25T03:43:21.144832295+00:00 "show" "sim-6gqss"
+<<BD_INVOKE>> 2026-09-25T03:43:21.155398827+00:00 "show" "sim-rzyx9"
+<<BD_INVOKE>> 2026-09-25T03:43:21.165825908+00:00 "show" "sim-rzyx9"
+<<BD_INVOKE>> 2026-09-25T03:43:26.907496306+00:00 "show" "sim-ybrh9"
+<<BD_INVOKE>> 2026-09-25T03:43:26.918109818+00:00 "show" "sim-ybrh9"
+<<BD_INVOKE>> 2026-09-25T03:43:26.929494535+00:00 "show" "sim-4e4c0a"
+<<BD_INVOKE>> 2026-09-25T03:43:26.980277809+00:00 "show" "sim-4e4c0a"
+<<BD_INVOKE>> 2026-09-25T03:43:26.989614375+00:00 "show" "sim-cxpef"
+<<BD_INVOKE>> 2026-09-25T03:43:26.999589042+00:00 "show" "sim-cxpef"
+<<BD_INVOKE>> 2026-09-25T03:43:36.029942489+00:00 "show" "sim-ybrh9"
+<<BD_INVOKE>> 2026-09-25T03:49:03.190537439+00:00 "comments" "add" "sim-4e4c0a" "--body" "Re-read at integration 24d864c6 (scx pin 413031d4) while preparing the crates.io release candidate. This is from reading the code. The nested-ancestor case was not re-run.
+
+1. Upstream cgroup_bw no longer finds a cgroup's parent through the path described above. After the pin bump, lib/cgroup_bw.bpf.c computes the parent in `cbw_eff_parent_cgid()`. That walks `cbw_cgroup_ancestor()`, a CO-RE read of `cgrp->ancestors[level]`, and does not call the `bpf_cgroup_ancestor` kfunc. The field is now `eff_parent_id`, set in `cbw_init_cgx()`. The simulator's `sim_cgroup_alloc()` (csrc/sim_task.c) fills `ancestors[]` from the parent's array. So the NULL return this issue blames is no longer on the parent walk. cgroup_bw still calls `bpf_cgroup_ancestor(cgrp, 0)` to resolve the root.
+
+2. The kfunc has three definitions today:
+   - kfuncs.rs, in the host: looks the ancestor up in the cgroup registry (`sim_cgroup_lookup_ancestor`).
+   - csrc/sim_bpf_stubs.c, in every .so: a weak fallback that returns NULL. It binds only when the host does not export the symbol. It is one of the 24 own_definition names in sim-3geoh.
+   - schedulers/lavd/wrapper.c: a strong copy that returns the root for level 0 and NULL for every other level (a flat-hierarchy model). lavd uses it whatever the host exports.
+
+3. Whether a nested cgroup without its own cpu.max is now bounded by its ancestor's limit needs a re-run. The #[ignore]d spec named above left with cgroup_bw_throttle_cycle.rs (929abf8). tests/cgroup_bw_throttle_unthrottle.rs `test_throttle_unthrottle_in_nested_hierarchy` limits the inner cgroup directly, so no test in the tree covers the ancestor case. If a re-run shows the ancestor limit now holds, this can close with a test. If not, the cause is somewhere other than the kfunc stub."
+<<BD_INVOKE>> 2026-09-25T03:49:03.196526661+00:00 "comments" "add" "sim-c8949e" "--body" "Status check at integration 24d864c6, from the crates.io release candidate (tg scxsim-cratesio-release-candidate).
+
+The release candidate recommends publishing scx_simulator as 0.1.0, not 1.0.0 (sim-rzyx9, item 2). One reason is that this tracker is still open. The other is that several fixes found by the release candidate change the public API.
+
+The tracker is stale:
+- It has 22 unchecked items. 18 name an issue, and 9 of those are closed: sim-09a30, sim-d80a1, sim-d46dd, sim-e5076, sim-ed0d6, sim-c3fd09, sim-ac6b5a, sim-466a13, sim-094402. Still open: sim-010a1, sim-880544, sim-80ce04, sim-943dc0, sim-d9988, sim-6b003, sim-c5dbf, sim-4c1e5, sim-d848e.
+- Two unnamed items look done. 'SimCgroupHandle refactor': `CgroupInfo` (src/safe/cgroup.rs) now holds a `CgroupAlloc` whose variants wrap a `SimCgroupHandle`. 'cgroup.rs: move to safe/': the file is src/safe/cgroup.rs.
+- The P3 item 'RAII migration for CgroupInfo (eliminate remaining unsafe Send/Sync)' has moved rather than gone. `CgroupInfo` has no unsafe impl now, but `CgroupPtr` and `SimCgroupHandle` carry `unsafe impl Send` and `unsafe impl Sync` in unsafe_impl/cgroup_wrapper.rs.
+- The header names branch simulator.v4 at 15a3d0c. The development tip is now integration.
+
+The release candidate filed 17 new issues under the label cratesio. sim-rzyx9 lists the ones it recommends fixing before any publish: sim-4xdj4, sim-0qpv9, sim-3geoh, sim-kuhrw, sim-6vhbq, sim-4b77c and sim-ld1ro (unsound or silently wrong for an in-process consumer); sim-cp5c0, sim-yrtox, sim-dneoq, sim-jnh26 and sim-fmijm (breaking to change after publication); and sim-kqri1 (licensing)."
+<<BD_INVOKE>> 2026-09-25T03:49:03.204000584+00:00 "comments" "add" "sim-cxpef" "--body" "From the crates.io release candidate: scxtest/ has to be in scope, at least for scx_simulator's published files. sim-kqri1 has the detail.
+
+- scxtest/ holds 9 files derived from upstream scx lib/scxtest, which upstream deleted at 54e1ea429. Two are identical to upstream's last version, and seven have been extended here.
+- They are compiled into the published crates. scx_simulator's build.rs compiles scx_test.c, scx_test_map.c and scx_test_cpumask.c, and scxsim-build compiles overrides.c into every scheduler .so.
+- None of the 9 has an SPDX line, a copyright notice or an origin note. They sit outside vendor/, so the only licence text next to them is the crate's BSD-3-Clause LICENSE, while the code is GPL-2.0.
+
+The same packaged-file count applies to the header sweep here. Of scx_simulator's 272 packaged .c/.h/.rs files, 161 have no SPDX line."
+<<BD_INVOKE>> 2026-09-25T03:49:44.369880574+00:00 "comments" "delete" "sim-cxpef" "sim-cxpef-c44e80a8307"
+<<BD_INVOKE>> 2026-09-25T03:49:44.375202588+00:00 "comments" "add" "sim-cxpef" "--body" "From the crates.io release candidate: scxtest/ has to be in scope, at least for scx_simulator's published files. sim-kqri1 has the detail.
+
+- scxtest/ holds 9 files derived from upstream scx lib/scxtest, which upstream deleted at 54e1ea429. Two are identical to upstream's last version, and seven have been extended here.
+- They are compiled into the published crates. scx_simulator's build.rs compiles scx_test.c, scx_test_map.c and scx_test_cpumask.c, and scxsim-build compiles overrides.c into every scheduler .so.
+- None of the 9 has an SPDX line, a copyright notice or an origin note. They sit outside vendor/, so the only licence text next to them is the crate's BSD-3-Clause LICENSE, while the code is GPL-2.0.
+
+For scale: of the 272 .c/.h/.rs files packaged in scx_simulator, vendor/ included, 161 have no SPDX line."
+<<BD_INVOKE>> 2026-09-25T03:50:34.273535062+00:00 "update" "sim-yc6z3" "--search" "It searched for: fbk, devserver, devvm, fbcode, fbsource, internalfb, facebook.com, @meta.com, @fb.com, tupperware, scuba, buck, phabricator, D- and T-numbers, and facebookexperimental." "--replace" "It searched for Meta-internal host, tool, repository and domain names, Meta email domains, diff and task numbers, and facebookexperimental. The term list is in the task's notes, not here, since this issue is public."
