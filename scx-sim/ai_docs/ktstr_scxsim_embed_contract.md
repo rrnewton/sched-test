@@ -132,9 +132,10 @@ binary did not export `scx_task_data` and it loaded lavd:
   trusting the arguments.
 
 The contract on `integration` before this document's release was different.
-It asked consumers to re-emit `EXPORTED_SYMS` (13 names) by hand. Those names
-covered 9 `DlopenFails` and 4 `OwnDefinitionBinds` entries. The other 42
-entries were missing, including all 20 `ResolvesToNull`.
+It asked consumers to re-emit `EXPORTED_SYMS` (15 names) by hand. Those names
+covered 11 `DlopenFails` and 4 `OwnDefinitionBinds` entries. The other 40
+entries were missing, including all 20 `ResolvesToNull`. Before sched-test#191
+the list had 13 names.
 
 ### What the probe does not catch
 
@@ -240,8 +241,9 @@ for arg in scxsim_build::host_link_args() {
 }
 ```
 
-`-tests` reaches `[[test]]` targets only, not the library's unit tests. The
-other scopes are `-bins`, `-bin=<NAME>`, `-examples` and `-benches`. The probe
+`-tests` reaches `[[test]]` targets only, not the library's unit tests. Cargo
+rejects `cargo:rustc-link-arg-tests` in a package with no test target, so emit
+it only from a package that has one. The other scopes are `-bins`, `-bin=<NAME>`, `-examples` and `-benches`. The probe
 checks the result whichever you choose. ktstr's candidate `scxsim` feature
 scopes them this way, because only one of its test targets loads a `.so`.
 
@@ -264,8 +266,8 @@ ends with the fix.
 
 ### 3a. A bundled scheduler: `SimBuildInputs::build_bundled`
 
-This is `crates/embed_harness/build.rs` verbatim. It is the whole build-side
-contract:
+This is `crates/embed_harness/build.rs` with its comments removed. It is the
+whole build-side contract:
 
 ```rust
 use std::env;
@@ -420,7 +422,7 @@ What each field actually changes in the simulator today:
 ```rust
 use scx_simulator::prelude::*;
 
-fn run(so: &std::path::Path, def: &SchedulerDefinition, scenario: Scenario)
+fn run(so: &str, def: &SchedulerDefinition, scenario: Scenario)
     -> Result<Trace, LoadError>
 {
     // The compiled C scheduler has global state: one simulation per process at a time.
@@ -431,8 +433,10 @@ fn run(so: &std::path::Path, def: &SchedulerDefinition, scenario: Scenario)
 ```
 
 - **The load order** is: the host-export probe (§2), then the arena, then
-  `dlopen(RTLD_NOW | RTLD_LOCAL)`, then the ops lookup (`MissingOp`), then
-  rodata (`MissingRodataGlobal`). A `.so` that cannot be opened gives
+  `dlopen(RTLD_NOW | RTLD_LOCAL)`, then `{prefix}_setup(nr_cpus)` if the `.so`
+  defines it, then `sim_arena_mark_persistent`, then the ops lookup
+  (`MissingOp`), then rodata (`MissingRodataGlobal`). So `{prefix}_setup` runs
+  before the definition's rodata is written. A `.so` that cannot be opened gives
   `LibraryOpen`.
 - **`LoadError` is `#[non_exhaustive]`.** Give any `match` on it a wildcard
   arm.
@@ -449,7 +453,7 @@ fn run(so: &std::path::Path, def: &SchedulerDefinition, scenario: Scenario)
   (`crates/embed_harness/tests/embed.rs` has a minimal one-CPU, one-task
   example), or lower ktstr ops with `scxsim_workload_ir::lower` and then call
   `to_scenario` (feature `ingest`).
-- **Checking the result:** `trace.exit_kind()` returns the `ExitKind`.
+- **Checking the result:** `trace.exit_kind()` returns a `&ExitKind`.
   `ExitKind::Normal` means the scenario ran to its end.
 
 ## Who owns what

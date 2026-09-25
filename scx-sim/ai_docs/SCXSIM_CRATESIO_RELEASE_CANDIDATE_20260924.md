@@ -88,9 +88,10 @@ linked into the binary, and today's link happens to pull in all 55 (final
 gate N-rdynamic; row 9, where bare `-rdynamic` matched at three build
 profiles). Nothing guarantees that, so `emit_host_link_args()` adds one
 `--undefined` per name and the probe checks the result. The contract on
-`integration` before this release asked consumers to re-emit 13 names
-(`EXPORTED_SYMS`) by hand. The other 42 of today's 55 were missing, including
-all 20 `ResolvesToNull` (embed contract, "Read this first").
+`integration` before this release asked consumers to re-emit 15 names
+(`EXPORTED_SYMS`) by hand. The other 40 of today's 55 were missing, including
+all 20 `ResolvesToNull` (embed contract, "Read this first"). Before
+sched-test#191 the list had 13 names; gate cell N-old13 reproduces that state.
 
 What the probe does not catch, all open:
 
@@ -99,7 +100,7 @@ What the probe does not catch, all open:
 | sim-4b77c | 1 | it checks the bundled schedulers' names only; a `.so` an embedder builds can still bind its own fallbacks silently |
 | sim-c7ukt | 2 | it checks that a name is present, not that it is the simulator's; a same-named export elsewhere in the process takes the binding |
 | sim-o3kct | 1 | glibc takes the `.so`'s own `calloc`/`free`/`memcpy`/`memset`/`strncmp` bindings, bypassing `sim_deterministic_mem.c` |
-| sim-kuhrw | 1 | `scxtest/overrides.c` gives every `.so` weak `scx_minheap_*` bodies that report success, which hides an elided `lib/minheap.bpf.c` |
+| sim-kuhrw | 1 | `scxtest/overrides.c` gives every `.so` weak `scx_minheap_*` bodies (alloc returns NULL, insert and pop return 0), which hides an elided `lib/minheap.bpf.c` |
 
 ## 2. The test: ktstr calls the simulator in-process
 
@@ -206,9 +207,11 @@ The issues sim-rzyx9 lists as blocking the first publish:
 | sim-fmijm | 2 | the `YieldNotRepresentable` refusal is obsolete and its message is false | |
 | sim-kqri1 | 2 | licensing (section 6) | row 22 |
 
-The first seven are unsound or silently wrong. The next five are API changes
-that would break callers if made after publishing. The same holds for the
-crate root, which re-exports 162 names besides its 25-name prelude, among
+The first seven are unsound or silently wrong. The next five would change the
+API if fixed after publishing, as would the fixes for sim-4xdj4 and sim-0qpv9.
+The same holds for the
+crate root, which re-exports 162 names, 140 of them outside its 25-name
+prelude (145 with `default-features = false`), among
 them upstream scx_layered items such as `unified_alloc` and `LayerDemand`
 (sim-rzyx9).
 
@@ -269,8 +272,9 @@ From sim-rzyx9, with recommendations:
    whose projects use the `scx_` prefix. A `[lib] name` keeps the Rust paths
    unchanged.
 2. **Version.** scx_simulator has been 1.0.0 since sched-test#18. Recommend
-   0.1.0: five open fixes change the API (sim-4xdj4, sim-cp5c0, sim-0qpv9,
-   sim-yrtox, sim-dneoq), and under 1.0.0 each would force a 2.0.0.
+   0.1.0: seven open fixes in section 5 change the API (sim-4xdj4, sim-0qpv9,
+   sim-cp5c0, sim-yrtox, sim-dneoq, sim-jnh26, sim-fmijm), and under 1.0.0
+   each would force a 2.0.0.
 3. **Public surface.** Trim the crate root's re-exports before publishing
    (section 5).
 4. **Licensing.** The license expression includes GPL-2.0-only. ktstr is
@@ -291,7 +295,11 @@ From sim-rzyx9, with recommendations:
   the six packages as registry versions. The gate has 54 rows and 0 failures.
   At rustc 1.97.1 and 1.94.1 with the consumer as committed, and at 1.88.0
   with a fresh lockfile, all six schedulers run in-process and match the
-  baseline. The other rows are the link-mode cells in section 1. The 1.87.0
+  baseline. The other rows are link-mode cells: N-none and L-weak4 in section
+  1; N-rdynamic (bare `-rdynamic`); N-old13 (`-rdynamic` plus the 13-name
+  pre-#191 list); and N-dlopenfails (`-rdynamic` plus the 11 `DlopenFails`
+  names). The three `-rdynamic` cells ran at baseline because today's link
+  pulls in all 55. The 1.87.0
   refusal and the DSL-only build are checked alongside.
 - **ktstr** (rows 23–24), as in section 2.
 - **Not done:** `cargo publish`. Every run was on one x86_64 Linux host,
